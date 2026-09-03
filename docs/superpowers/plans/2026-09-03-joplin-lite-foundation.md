@@ -118,7 +118,6 @@ Create `src/main.tsx` to render `<App />` under `React.StrictMode`. Create `src/
 ```tsx
 import { useEffect, useState } from 'react';
 import { getRuntimeInfo, RuntimeInfo } from './runtime';
-import './styles.css';
 
 type Props = {
   loadRuntimeInfo?: () => Promise<RuntimeInfo>;
@@ -438,7 +437,7 @@ Expected: FAIL because the three semantic regions do not exist.
 
 - [ ] **Step 3: Implement the shell and restrained native styling**
 
-Render:
+Import `./styles.css` from `App.tsx`, then render:
 
 - a 232 px navigation rail with product name and `全部笔记`;
 - a 320 px note-list region with the honest empty message `笔记读取将在兼容层接入后启用`;
