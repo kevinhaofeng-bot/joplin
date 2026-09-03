@@ -5,7 +5,8 @@ three-pane shell and reports only the location of its own application profile.
 
 ## Local commands
 
-Run these commands from the repository root:
+In a supported full-repository environment, run these commands from the
+repository root:
 
 ```bash
 corepack yarn install
@@ -15,11 +16,18 @@ corepack yarn workspace @joplin/app-lite build:web
 corepack yarn workspace @joplin/app-lite dev
 ```
 
-On a fresh clone where dependency installation must avoid package build scripts
-until the local native toolchain is ready, `corepack yarn install --mode=skip-build`
-can prepare the dependency tree. This is a development
-environment convenience only: it does not replace the commands above or the
-test, web-build, Rust-test, formatting, and Clippy verification gates.
+For this Node 23 partial clone, installation must first use:
+
+```bash
+corepack yarn install --mode=skip-build
+```
+
+Do not use ordinary `corepack yarn install` in this environment: its
+repository-wide postinstall fails under Node 23 TypeScript strip-only
+semantics, and `wasm-pack` also times out while downloading from GitHub. The
+skip-build installation only prepares dependencies; it does not satisfy any
+acceptance gate. Run the app-lite test, web build, Rust test, Rust formatting,
+and Clippy verification commands individually afterward.
 
 ## Safety boundary
 

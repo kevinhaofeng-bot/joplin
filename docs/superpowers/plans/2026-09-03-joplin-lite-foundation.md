@@ -75,7 +75,7 @@ Each follow-on plan must reference the same design spec, retain the single-write
 - Consumes: root Yarn workspace discovery through `packages/*`.
 - Produces: workspace `@joplin/app-lite` with `dev:web`, `build:web`, `test`, `test-ci`, `dev`, and `build` scripts; DOM root `#root`; React component `App`.
 
-- [ ] **Step 1: Write the failing application-shell test**
+- [x] **Step 1: Write the failing application-shell test**
 
 Create `src/App.test.tsx` with an injected runtime loader so tests never require a live Tauri process:
 
@@ -98,7 +98,7 @@ describe('App', () => {
 });
 ```
 
-- [ ] **Step 2: Add the package and test configuration, then verify the test fails for the missing component**
+- [x] **Step 2: Add the package and test configuration, then verify the test fails for the missing component**
 
 Pin these package versions in `package.json`: `@tauri-apps/api` 2.11.1, `@tauri-apps/cli` 2.11.4, React/React DOM 19.1.5, Vite 8.2.2, Vitest 4.1.11, `@vitejs/plugin-react` 6.1.1, jsdom 30.0.1, Testing Library React 16.3.3, jest-dom 7.0.1, and the repository's TypeScript 5.9.3. Configure Vite to listen on `127.0.0.1:1420` with `strictPort: true`; configure Vitest for `jsdom` and `src/test/setup.ts`.
 
@@ -111,7 +111,7 @@ corepack yarn workspace @joplin/app-lite test
 
 Expected: FAIL because `src/App.tsx` does not exist.
 
-- [ ] **Step 3: Add the minimal React bootstrap and pending shell**
+- [x] **Step 3: Add the minimal React bootstrap and pending shell**
 
 Create `src/main.tsx` to render `<App />` under `React.StrictMode`. Create `src/App.tsx` with this public contract:
 
@@ -136,13 +136,13 @@ export default function App({ loadRuntimeInfo = getRuntimeInfo }: Props) {
 
 Create a temporary `src/runtime.ts` exporting the shown `RuntimeInfo` type and a `getRuntimeInfo()` that rejects with `new Error('Tauri bridge is not connected')`; Task 4 replaces only that function body.
 
-- [ ] **Step 4: Run the focused frontend test**
+- [x] **Step 4: Run the focused frontend test**
 
 Run: `corepack yarn workspace @joplin/app-lite test --run src/App.test.tsx`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the frontend harness**
+- [x] **Step 5: Commit the frontend harness**
 
 ```bash
 git add packages/app-lite/package.json packages/app-lite/index.html packages/app-lite/tsconfig.json packages/app-lite/vite.config.ts packages/app-lite/src
@@ -162,7 +162,7 @@ git commit -m "feat: scaffold Joplin Lite frontend"
 - Consumes: an application-data root supplied by Tauri.
 - Produces: `ProfilePaths::from_app_data(PathBuf) -> ProfilePaths`, `ProfilePaths::ensure(&self) -> io::Result<()>`, and getters `root()`, `database()`, `resources()`, `indexes()`, `logs()` returning `&Path`.
 
-- [ ] **Step 1: Write profile isolation tests**
+- [x] **Step 1: Write profile isolation tests**
 
 Place unit tests at the bottom of `src-tauri/src/profile.rs`:
 
@@ -188,13 +188,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the Rust test and verify it fails**
+- [x] **Step 2: Run the Rust test and verify it fails**
 
 Run: `cargo test --manifest-path packages/app-lite/src-tauri/Cargo.toml profile::tests`
 
 Expected: FAIL because `ProfilePaths` and `ProfilePathError` are undefined.
 
-- [ ] **Step 3: Implement the minimal safe path type**
+- [x] **Step 3: Implement the minimal safe path type**
 
 Implement:
 
@@ -233,7 +233,7 @@ impl ProfilePaths {
 
 Add focused getters that join only `database.sqlite`, `resources`, `indexes`, and `logs`. Use Rust edition 2024, `tauri = "2.11.1"`, `serde` with `derive`, and `thiserror = "2"`. Do not add SQL, HTTP, shell, or sync dependencies.
 
-- [ ] **Step 4: Run profile tests and Rust formatting**
+- [x] **Step 4: Run profile tests and Rust formatting**
 
 Run:
 
@@ -244,7 +244,7 @@ cargo test --manifest-path packages/app-lite/src-tauri/Cargo.toml profile::tests
 
 Expected: both commands PASS.
 
-- [ ] **Step 5: Commit profile isolation**
+- [x] **Step 5: Commit profile isolation**
 
 ```bash
 git add packages/app-lite/src-tauri
@@ -263,7 +263,7 @@ git commit -m "feat: isolate Joplin Lite profile"
 - Consumes: `ProfilePaths` from Task 2 and `tauri::Manager::path().app_data_dir()`.
 - Produces: serializable `RuntimeInfo { app_name: String, profile_directory: String }`; Tauri command `get_runtime_info`; managed `AppState { profile_paths: ProfilePaths }`.
 
-- [ ] **Step 1: Write the pure runtime-info test**
+- [x] **Step 1: Write the pure runtime-info test**
 
 ```rust
 #[cfg(test)]
@@ -280,13 +280,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [x] **Step 2: Run the focused test and verify it fails**
 
 Run: `cargo test --manifest-path packages/app-lite/src-tauri/Cargo.toml runtime::tests`
 
 Expected: FAIL because `runtime_info_for` is undefined.
 
-- [ ] **Step 3: Implement runtime state and command registration**
+- [x] **Step 3: Implement runtime state and command registration**
 
 Keep serialization names compatible with TypeScript:
 
@@ -313,7 +313,7 @@ fn get_runtime_info(state: tauri::State<'_, AppState>) -> RuntimeInfo {
 
 In `lib.rs`, resolve `app.path().app_data_dir()`, validate and create the profile directories during `setup`, manage `AppState`, and register only `get_runtime_info`. Configure one 1180×760 window, identifier `com.kevinhao.joplin-lite`, `bundle.active: false`, and CSP `default-src 'self'; style-src 'self' 'unsafe-inline'`. The capability file contains only `core:default` for window `main`.
 
-- [ ] **Step 4: Verify the Rust core**
+- [x] **Step 4: Verify the Rust core**
 
 Run:
 
@@ -325,7 +325,7 @@ cargo clippy --manifest-path packages/app-lite/src-tauri/Cargo.toml --all-target
 
 Expected: all commands PASS; no capability references shell, HTTP, or unrestricted filesystem access.
 
-- [ ] **Step 5: Commit the runtime bridge**
+- [x] **Step 5: Commit the runtime bridge**
 
 ```bash
 git add packages/app-lite/src-tauri
@@ -344,7 +344,7 @@ git commit -m "feat: expose Joplin Lite runtime status"
 - Consumes: Tauri command `get_runtime_info` returning camelCase `RuntimeInfo`.
 - Produces: `getRuntimeInfo(): Promise<RuntimeInfo>` and UI states `loading | ready | failed`.
 
-- [ ] **Step 1: Write the IPC contract and failure-state tests**
+- [x] **Step 1: Write the IPC contract and failure-state tests**
 
 Mock `@tauri-apps/api/core` and assert `invoke` receives exactly `get_runtime_info`. Add this UI test:
 
@@ -356,13 +356,13 @@ it('fails closed without implying that notes were changed', async () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests and verify the IPC test fails**
+- [x] **Step 2: Run the tests and verify the IPC test fails**
 
 Run: `corepack yarn workspace @joplin/app-lite test`
 
 Expected: FAIL because the temporary bridge still rejects without calling `invoke` and App has no rejected-promise state.
 
-- [ ] **Step 3: Implement the typed bridge and explicit state machine**
+- [x] **Step 3: Implement the typed bridge and explicit state machine**
 
 Use:
 
@@ -388,7 +388,7 @@ type Initialization =
 
 Ignore completion after unmount, convert unknown errors to a generic Chinese message, and never render stack traces or raw bridge payloads.
 
-- [ ] **Step 4: Run frontend tests and type checking**
+- [x] **Step 4: Run frontend tests and type checking**
 
 Run:
 
@@ -399,7 +399,7 @@ corepack yarn workspace @joplin/app-lite build:web
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the bridge**
+- [x] **Step 5: Commit the bridge**
 
 ```bash
 git add packages/app-lite/src/runtime.ts packages/app-lite/src/runtime.test.ts packages/app-lite/src/App.tsx packages/app-lite/src/App.test.tsx
@@ -417,7 +417,7 @@ git commit -m "feat: connect Joplin Lite runtime bridge"
 - Consumes: ready/failed initialization state from Task 4.
 - Produces: semantic regions labelled `导航`, `笔记列表`, and `编辑区`; visible isolated-profile status; no enabled note actions before note storage exists.
 
-- [ ] **Step 1: Write semantic layout tests**
+- [x] **Step 1: Write semantic layout tests**
 
 For a ready runtime, assert:
 
@@ -429,13 +429,13 @@ expect(screen.getByText('本地资料库已隔离')).toBeInTheDocument();
 expect(screen.queryByRole('button', { name: '同步' })).not.toBeInTheDocument();
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [x] **Step 2: Run the focused test and verify it fails**
 
 Run: `corepack yarn workspace @joplin/app-lite test --run src/App.test.tsx`
 
 Expected: FAIL because the three semantic regions do not exist.
 
-- [ ] **Step 3: Implement the shell and restrained native styling**
+- [x] **Step 3: Implement the shell and restrained native styling**
 
 Import `./styles.css` from `App.tsx`, then render:
 
@@ -447,7 +447,7 @@ Import `./styles.css` from `App.tsx`, then render:
 
 Use system fonts (`-apple-system`, `BlinkMacSystemFont`), support light/dark via `prefers-color-scheme`, maintain 4.5:1 text contrast, show a 2 px focus ring, and collapse the navigation rail below 760 px without hiding the failure message.
 
-- [ ] **Step 4: Verify behavior and production assets**
+- [x] **Step 4: Verify behavior and production assets**
 
 Run:
 
@@ -459,7 +459,7 @@ test -f packages/app-lite/dist/index.html
 
 Expected: all commands PASS and `dist/index.html` exists.
 
-- [ ] **Step 5: Commit the application shell**
+- [x] **Step 5: Commit the application shell**
 
 ```bash
 git add packages/app-lite/src/App.tsx packages/app-lite/src/App.test.tsx packages/app-lite/src/styles.css
