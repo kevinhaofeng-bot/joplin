@@ -74,6 +74,9 @@ docs/**/*.mustache
 packages/generator-joplin/generators/app/templates/script/publish/dist/
 
 # AUTO-GENERATED - EXCLUDED TYPESCRIPT BUILD
+
+# Local isolated implementation worktrees
+.worktrees/
 packages/app-cli/app/LinkSelector.js
 packages/app-cli/app/ResourceServer.js
 packages/app-cli/app/app-gui.js
