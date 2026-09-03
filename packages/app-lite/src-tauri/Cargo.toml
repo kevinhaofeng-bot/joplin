@@ -1,0 +1,13 @@
+[package]
+name = "joplin-lite"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "joplin_lite"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = "2.11.1"
+thiserror = "2"
