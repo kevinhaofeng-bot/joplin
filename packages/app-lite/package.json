@@ -6,10 +6,12 @@
   "scripts": {
     "dev:web": "vite",
     "build:web": "vite build",
-    "test": "vitest",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "test-ci": "vitest run",
+    "tsc": "tsc --noEmit",
     "dev": "tauri dev",
-    "build": "tauri build"
+    "build:native": "tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

@@ -11,9 +11,12 @@ repository root:
 ```bash
 corepack yarn install
 corepack yarn workspace @joplin/app-lite test
+corepack yarn workspace @joplin/app-lite test:watch
+corepack yarn workspace @joplin/app-lite tsc
 cargo test --manifest-path packages/app-lite/src-tauri/Cargo.toml
 corepack yarn workspace @joplin/app-lite build:web
 corepack yarn workspace @joplin/app-lite dev
+corepack yarn workspace @joplin/app-lite build:native
 ```
 
 For this Node 23 partial clone, installation must first use:
@@ -28,6 +31,12 @@ semantics, and `wasm-pack` also times out while downloading from GitHub. The
 skip-build installation only prepares dependencies; it does not satisfy any
 acceptance gate. Run the app-lite test, web build, Rust test, Rust formatting,
 and Clippy verification commands individually afterward.
+
+`test` is the terminating command used by workspace aggregation; use
+`test:watch` only for interactive development. `build:web` is likewise the
+frontend-only build. Native Tauri packaging is deliberately opt-in through
+`build:native`: this experimental workspace has no generic `build` script, so
+the repository's aggregate build workflows do not require Rust or Tauri.
 
 ## Safety boundary
 

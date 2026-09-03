@@ -535,3 +535,14 @@ Verified on 2026-09-03 from the repository root:
 - Native Tauri smoke: `corepack yarn workspace @joplin/app-lite dev` started successfully and exited 0 after the smoke. Computer Use visually checked a real macOS Tauri window titled `Joplin Lite`, showing the navigation, note-list, and editor panes, `本地资料库已隔离`, and `/Users/kevinhao/Library/Application Support/com.kevinhao.joplin-lite`. The observed path does not contain `.config/joplin-desktop`; the smoke window was closed with its native close button.
 
 Warnings: the project verification commands produced no warnings. The unbundled `tauri dev` binary was not exposed in the Computer Use application list, so a temporary local macOS launcher registered the same already-built Tauri binary for the required visual check; it was not a browser smoke and the temporary launcher was closed and moved to Trash afterward. The screenshot helper emitted two `const` redeclaration advisories in its own Node REPL, unrelated to the application or verification commands. The repository pre-commit hook could not run its unrelated `yarn spellcheck` and `yarn validateFilenames` tasks because this worktree lacks the tracked script paths `packages/tools/spellcheck.js` and `packages/tools/validateFilenames.js`; after confirming the Task 6 staged diff and `git diff --check`, the documentation commit used `--no-verify`.
+
+## Post-review amendment — workspace lifecycle boundary
+
+The RED/GREEN and verification evidence above remains historical evidence for
+the original foundation slice. A subsequent hardening review isolates the
+experimental workspace from repository-wide lifecycle aggregation: `test` is a
+terminating `vitest run` command, `test:watch` is explicit, and `tsc` is an
+explicit TypeScript gate. The frontend build remains `build:web`; native Tauri
+packaging is opt-in as `build:native`, and the workspace intentionally has no
+generic `build` script. Its local `/dist/` output is ignored so scoped Vite
+builds do not dirty the worktree.
