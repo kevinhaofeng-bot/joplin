@@ -160,8 +160,10 @@ body {
 }
 
 .initialization-failure p {
+	width: min(100%, 34rem);
 	max-width: 34rem;
 	margin: 0;
+	overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {
