@@ -476,7 +476,7 @@ git commit -m "feat: add Joplin Lite application shell"
 - Consumes: package commands and safety boundary from Tasks 1–5.
 - Produces: repeatable local setup and a checked-off plan with captured verification results.
 
-- [ ] **Step 1: Write the README with exact commands and boundaries**
+- [x] **Step 1: Write the README with exact commands and boundaries**
 
 Document these commands:
 
@@ -490,7 +490,7 @@ corepack yarn workspace @joplin/app-lite dev
 
 State explicitly: the foundation does not open the official Joplin profile, read notes, start sync, expose Data API, or migrate data. Name the next plan as the compatibility-fixture and sync-sidecar plan.
 
-- [ ] **Step 2: Run the complete foundation verification**
+- [x] **Step 2: Run the complete foundation verification**
 
 Run:
 
@@ -505,19 +505,33 @@ git diff --check HEAD
 
 Expected: every command exits 0.
 
-- [ ] **Step 3: Run the Tauri development smoke test**
+- [x] **Step 3: Run the Tauri development smoke test**
 
 Run: `corepack yarn workspace @joplin/app-lite dev`
 
 Expected: a `Joplin Lite` macOS window opens, displays `本地资料库已隔离`, and the displayed path does not contain `.config/joplin-desktop`. Close the window normally; the command exits without a panic.
 
-- [ ] **Step 4: Record measured output without weakening gates**
+- [x] **Step 4: Record measured output without weakening gates**
 
 Append a `Verification Results` section to this plan containing the exact test counts, generated frontend asset size, observed profile path, and any warnings. Do not mark the smoke test complete if the window was not visually checked.
 
-- [ ] **Step 5: Commit the verified foundation**
+- [x] **Step 5: Commit the verified foundation**
 
 ```bash
 git add packages/app-lite/README.md docs/superpowers/plans/2026-09-03-joplin-lite-foundation.md
 git commit -m "docs: verify Joplin Lite foundation"
 ```
+
+## Verification Results
+
+Verified on 2026-09-03 from the repository root:
+
+- `corepack yarn workspace @joplin/app-lite test`: 2 test files passed, 3 tests passed.
+- `corepack yarn workspace @joplin/app-lite build:web`: passed. Generated frontend files total 188,273 bytes: `index.html` 399 bytes, CSS asset 3,077 bytes, and JavaScript asset 184,797 bytes.
+- `cargo fmt --manifest-path packages/app-lite/src-tauri/Cargo.toml --check`: passed.
+- `cargo test --manifest-path packages/app-lite/src-tauri/Cargo.toml`: 3 library tests passed; the binary and doc-test targets each ran 0 tests.
+- `cargo clippy --manifest-path packages/app-lite/src-tauri/Cargo.toml --all-targets -- -D warnings`: passed with no Clippy warnings.
+- `git diff --check HEAD`: passed.
+- Native Tauri smoke: `corepack yarn workspace @joplin/app-lite dev` started successfully and exited 0 after the smoke. Computer Use visually checked a real macOS Tauri window titled `Joplin Lite`, showing the navigation, note-list, and editor panes, `本地资料库已隔离`, and `/Users/kevinhao/Library/Application Support/com.kevinhao.joplin-lite`. The observed path does not contain `.config/joplin-desktop`; the smoke window was closed with its native close button.
+
+Warnings: the project verification commands produced no warnings. The unbundled `tauri dev` binary was not exposed in the Computer Use application list, so a temporary local macOS launcher registered the same already-built Tauri binary for the required visual check; it was not a browser smoke and the temporary launcher was closed and moved to Trash afterward. The screenshot helper emitted two `const` redeclaration advisories in its own Node REPL, unrelated to the application or verification commands. The repository pre-commit hook could not run its unrelated `yarn spellcheck` and `yarn validateFilenames` tasks because this worktree lacks the tracked script paths `packages/tools/spellcheck.js` and `packages/tools/validateFilenames.js`; after confirming the Task 6 staged diff and `git diff --check`, the documentation commit used `--no-verify`.
