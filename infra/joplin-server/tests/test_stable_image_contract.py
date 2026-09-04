@@ -8,6 +8,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class StableImageContractTest(unittest.TestCase):
+    def test_tls_runtime_pem_inserts_a_separator_before_the_key(self):
+        service = (ROOT / "systemd" / "joplin-tls-proxy.service").read_text()
+
+        self.assertIn(
+            "cat \"$TLS_CERT_SOURCE\"; echo; cat \"$TLS_KEY_SOURCE\"",
+            service,
+        )
+
     def test_static_verifier_has_no_pipefail_grep_short_circuit(self):
         verifier = (ROOT / "scripts" / "verify-config.sh").read_text()
 

@@ -80,6 +80,8 @@
 - [ ] Add a certificate path unit that restarts only this proxy after successful configuration validation.
 - [ ] Verify trusted certificate hostname, TLS 1.2/1.3, HTTP health, external access, and unchanged existing 80/443/8006/8080 listeners.
 
+**Task 3 PEM assembly incident (2026-09-04):** The first systemd start reached the reviewed preflight but socat exited because the PVE certificate file has no trailing newline; direct concatenation joined `END CERTIFICATE` and `BEGIN PRIVATE KEY` on one line. Failure cleanup disabled the new units, moved their files into a root-only failure bundle, and left public 22300 closed. Runtime PEM assembly now inserts an explicit blank-line separator between the existing certificate and key. **Cost:** the runtime PEM contains one harmless extra newline; source certificate/key files remain unchanged.
+
 ### Task 4: Configure encrypted NAS backup
 
 - [ ] Create a dedicated NAS directory under `/volume1/Backups/joplin-server` with restrictive ownership and no new daemon.

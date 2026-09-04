@@ -150,6 +150,7 @@ if [ -z "$deploy_env_file" ]; then
   require_literal "$socat_service" 'openssl x509'
   require_literal "$socat_service" 'openssl pkey'
   require_literal "$socat_service" 'cmp -s'
+  require_literal "$socat_service" 'cat "$TLS_CERT_SOURCE"; echo; cat "$TLS_KEY_SOURCE"'
 fi
 
 require_literal "$backup_script" 'RESTIC_PASSWORD_FILE'
