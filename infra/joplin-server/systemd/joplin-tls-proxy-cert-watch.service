@@ -1,0 +1,7 @@
+[Unit]
+Description=Restart Joplin socat TLS proxy after source validation
+After=joplin-tls-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart joplin-tls-proxy.service

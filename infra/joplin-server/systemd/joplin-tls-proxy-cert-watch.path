@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch Joplin TLS proxy source configuration
+
+[Path]
+PathChanged=/etc/joplin-server/tls-proxy.env
+Unit=joplin-tls-proxy-cert-watch.service
+
+[Install]
+WantedBy=multi-user.target

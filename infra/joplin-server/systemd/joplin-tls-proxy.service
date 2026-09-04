@@ -1,0 +1,23 @@
+[Unit]
+Description=Joplin Server TLS proxy on PVE port 22300
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/joplin-server/tls-proxy.env
+RuntimeDirectory=joplin-tls-proxy
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStartPre=/usr/bin/test -s ${TLS_CERT_SOURCE}
+ExecStartPre=/usr/bin/test -s ${TLS_KEY_SOURCE}
+ExecStartPre=/bin/sh -ec 'openssl x509 -in "$TLS_CERT_SOURCE" -noout -pubkey > /run/joplin-tls-proxy/cert.pub; openssl pkey -in "$TLS_KEY_SOURCE" -pubout > /run/joplin-tls-proxy/key.pub; cmp -s /run/joplin-tls-proxy/cert.pub /run/joplin-tls-proxy/key.pub'
+ExecStartPre=/bin/sh -ec 'cat "$TLS_CERT_SOURCE" "$TLS_KEY_SOURCE" > /run/joplin-tls-proxy/server.pem; chmod 0600 /run/joplin-tls-proxy/server.pem'
+ExecStart=/usr/bin/socat OPENSSL-LISTEN:22300,reuseaddr,fork,cert=/run/joplin-tls-proxy/server.pem,key=/run/joplin-tls-proxy/server.pem,verify=0,min-version=TLS1.2 TCP:192.168.3.3:22300
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
