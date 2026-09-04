@@ -30,9 +30,9 @@ mod tests {
 
     #[test]
     fn reports_the_isolated_profile_without_touching_it() {
-        let paths = ProfilePaths::from_app_data(PathBuf::from("/tmp/joplin-lite"));
+        let paths = ProfilePaths::from_app_data(PathBuf::from("/tmp/com.kevinhao.joplin-lite"));
         let info = runtime_info_for(&paths);
         assert_eq!(info.app_name, "Joplin Lite");
-        assert_eq!(info.profile_directory, "/tmp/joplin-lite");
+        assert_eq!(info.profile_directory, "/tmp/com.kevinhao.joplin-lite");
     }
 }
