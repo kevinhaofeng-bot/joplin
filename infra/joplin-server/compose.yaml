@@ -36,7 +36,6 @@ services:
       POSTGRES_DATABASE: ${POSTGRES_DATABASE:?set POSTGRES_DATABASE in .env}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:?set DEFAULT_ADMIN_PASSWORD in .env}
     networks:
       - joplin-server-internal
       - joplin-server-egress

@@ -26,7 +26,10 @@
 ## Files to Add
 
 - `infra/joplin-server/compose.yaml`
+- `infra/joplin-server/compose.bootstrap.yaml`
 - `infra/joplin-server/env.example`
+- `infra/joplin-server/scripts/bootstrap-admin.py`
+- `infra/joplin-server/scripts/initialize.sh`
 - `infra/joplin-server/scripts/backup.sh`
 - `infra/joplin-server/scripts/restore-drill.sh`
 - `infra/joplin-server/scripts/verify-config.sh`
@@ -53,15 +56,16 @@
 
 **Task 1 VM configuration gate (2026-09-04):** VM 101 ran the gate in an automatically cleaned `/tmp/joplin-config.*` directory: `verify-config.sh` passed; Docker Compose 2.32.1 production `config --quiet` passed with generated dummy values; and `sudo env RESTORE_CONFIG_ONLY=1 restore-drill.sh` passed without accessing restic or starting containers. The only output was tar's macOS provenance xattr-ignore notice, which did not affect the configuration gate.
 
-**Task 1 initial-admin hardening (2026-09-04):** The local Joplin Server source confirms `DEFAULT_ADMIN_PASSWORD` is supported and applies the configured default only on first startup. Compose now requires a generated `DEFAULT_ADMIN_PASSWORD` before startup and the example has only a deployment placeholder, preventing use of the upstream `admin` default on a fresh database. **Cost:** changing this environment variable after initialization does not rotate an existing admin password; that remains an authenticated Joplin administrative action.
+**Task 1 initial-admin correction (2026-09-04):** Live authentication testing caught a version-boundary error before public TLS was enabled: stable image `server-v3.7.1` predates upstream support for `DEFAULT_ADMIN_PASSWORD`, so it ignored that variable and initialized the empty database with `admin/admin`. The containers were stopped, and the empty state was verified as one initial user and zero items. The corrected design removes the unsupported variable from the container, starts first initialization through a loopback-only Compose override, rotates the password through Joplin's own authenticated API, proves the default fails and the generated password succeeds, and only then recreates the private-LAN binding. **Cost:** first deployment has a short additional bootstrap/recreate phase and depends on the stable v3.7.1 admin API contract; it fails closed if neither the generated password nor the one-time upstream default authenticates.
 
-**Task 1 deployment-placeholder gate (2026-09-04):** `verify-config.sh` accepts optional `DEPLOY_ENV_FILE` only for a root-run validation of a root:root mode-0600 regular non-symlink production `.env`. It reads password assignments without sourcing or printing them and rejects missing/duplicate, empty, `admin`, placeholder, and under-20-character `POSTGRES_PASSWORD` or `DEFAULT_ADMIN_PASSWORD` values. **Cost:** passwords must be generated in a simple literal dotenv-compatible form before deployment; this gate deliberately does not attempt to rotate initialized credentials.
+**Task 1 deployment-placeholder gate (2026-09-04):** `verify-config.sh` accepts optional `DEPLOY_ENV_FILE` only for a root-run validation of a root:root mode-0600 regular non-symlink production `.env`. It reads password assignments without sourcing or printing them and rejects missing/duplicate, empty, `admin`, placeholder, and under-20-character `POSTGRES_PASSWORD` or `JOPLIN_ADMIN_PASSWORD` values. **Cost:** passwords must be generated in a simple literal dotenv-compatible form before deployment; rotation is handled separately by the fail-closed loopback bootstrap.
 
 ### Task 2: Deploy the private VM stack
 
 - [ ] Confirm ports, free space, Docker health, and existing containers again immediately before mutation.
 - [ ] Create `/srv/joplin-server` and root-only secrets without displaying them; install the reviewed Compose and scripts atomically; before any first `docker compose up`, run `DEPLOY_ENV_FILE=/srv/joplin-server/.env verify-config.sh` as root and require its placeholder/password gate to pass.
 - [ ] Pull the pinned images, start PostgreSQL first, wait healthy, then start Joplin Server.
+- [ ] Run the loopback-only administrator bootstrap, require both credential checks to pass, then recreate Joplin on its private-LAN binding.
 - [ ] Verify database migrations, container health, restart policy, no host 5432 listener, and HTTP readiness from the VM and PVE only.
 - [ ] Record non-secret image IDs, container health, and resource footprint.
 

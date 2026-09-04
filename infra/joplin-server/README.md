@@ -32,11 +32,14 @@ systemd restart policy and external HTTPS health checks provide supervision.
 ## Local configuration checks
 
 Create a real VM `/srv/joplin-server/.env` from `env.example` with a generated
-database password and a separate generated `DEFAULT_ADMIN_PASSWORD`. Do not
-commit that file. Joplin Server applies `DEFAULT_ADMIN_PASSWORD` only during
-first initialization of an empty database; set it before the first start so the
-upstream `admin` default is never used, and manage an existing admin password
-through Joplin rather than expecting a later environment change to replace it.
+database password and a separate generated `JOPLIN_ADMIN_PASSWORD`. Do not
+commit that file. The pinned stable image `joplin/server:3.7.1` does not support `DEFAULT_ADMIN_PASSWORD`;
+that option landed upstream after this release. The
+deployment therefore performs a loopback-only bootstrap: it first overrides
+the application binding to `127.0.0.1:22300`, authenticates with the upstream
+one-time `admin` default, changes the password through Joplin's own API, proves
+that the default fails and the generated password succeeds, and only then
+recreates the app with the production private-LAN binding.
 A local, non-secret validation can use a temporary env file with dummy values:
 
 ```bash
@@ -44,13 +47,14 @@ bash infra/joplin-server/scripts/verify-config.sh
 docker compose --env-file /path/to/dummy.env -f infra/joplin-server/compose.yaml config
 ```
 
-Before the first `docker compose up`, generate both passwords with at least 20
+Before the first start, generate both passwords with at least 20
 characters, place the real `.env` at `/srv/joplin-server/.env` as a root-only
 regular file owned by `root:root` with mode `0600`, then run the deployment
 gate as root:
 
 ```bash
 sudo DEPLOY_ENV_FILE=/srv/joplin-server/.env /srv/joplin-server/scripts/verify-config.sh
+sudo /srv/joplin-server/scripts/initialize.sh
 ```
 
 When `DEPLOY_ENV_FILE` is supplied, the gate never prints its values and
@@ -58,7 +62,11 @@ rejects missing or duplicate password assignments, empty values, `admin`, the
 `__GENERATE_AT_DEPLOYMENT__` placeholder, and passwords shorter than the
 minimum 20 characters. Generate values outside logs (for example with
 `openssl rand -base64 32`) and do not quote them in a way that changes the
-literal `.env` value. The ordinary no-argument check remains an artifact-only
+literal `.env` value. `initialize.sh` reruns this gate, starts the bootstrap
+container only on loopback, and stops both app and database on any error. It is
+idempotent when `JOPLIN_ADMIN_PASSWORD` is already active. If neither that
+password nor the upstream one-time default authenticates, it fails closed
+instead of overwriting an existing administrator. The ordinary no-argument check remains an artifact-only
 contract, not a substitute for this deployment gate. Deployment mode checks
 the VM artifacts only; PVE TLS and backup systemd artifacts remain static
 contracts until their later tasks install them on their respective hosts.
