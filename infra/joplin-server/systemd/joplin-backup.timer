@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Joplin Server encrypted backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=45m
+Persistent=true
+Unit=joplin-backup.service
+
+[Install]
+WantedBy=timers.target

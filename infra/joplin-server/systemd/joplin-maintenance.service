@@ -1,0 +1,17 @@
+[Unit]
+Description=Prune and verify the encrypted Joplin Server backup repository
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/joplin-server/backup.env
+Environment=RESTIC_CACHE_DIR=/srv/joplin-server/.restic-cache
+ExecStart=/usr/bin/flock --wait 600 /srv/joplin-server/.restic-backup.lock /srv/joplin-server/scripts/maintenance.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/joplin-server

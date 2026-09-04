@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch Joplin TLS proxy source configuration
+
+[Path]
+PathChanged=/etc/joplin-server/tls-proxy.env
+PathModified=/etc/pve/local/pveproxy-ssl.pem
+PathModified=/etc/pve/local/pveproxy-ssl.key
+Unit=joplin-tls-proxy-cert-watch.service
+
+[Install]
+WantedBy=multi-user.target

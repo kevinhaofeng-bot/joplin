@@ -1,0 +1,197 @@
+# Joplin Server private infrastructure
+
+This directory defines a private Joplin Server deployment for VM 101. It is a
+local, reviewable artifact set; it does not deploy anything by itself.
+
+## Network boundary
+
+`compose.yaml` publishes no PostgreSQL port. Joplin HTTP binds only to
+`192.168.3.3:22300`, so it is reachable only from the VM/PVE path. PVE exposes
+the public TLS endpoint on `*:22300`: its dedicated systemd socat service
+terminates TLS and forwards plain HTTP only to `192.168.3.3:22300`. Port 22300
+is intentionally reused at two different hops; the PVE listener is public TLS
+while the VM listener is private HTTP. No Joplin container listens directly on
+a public interface.
+
+The PVE service builds `/run/joplin-tls-proxy/server.pem` from the existing
+trusted certificate and key. `/etc/joplin-server/tls-proxy.env` is root-only
+and contains only the source paths (`TLS_CERT_SOURCE` and `TLS_KEY_SOURCE`),
+not certificate contents. Before enabling it, confirm the installed socat
+supports `min-version=TLS1.2`; its startup checks nonempty inputs and matching
+certificate/key public keys before it creates the mode-0600 runtime PEM. The
+certificate-watch path automatically observes the authoritative PVE certificate and key paths,
+`/etc/pve/local/pveproxy-ssl.pem` and
+`/etc/pve/local/pveproxy-ssl.key`, as well as the proxy source configuration.
+It restarts only this unit; the restarted service reruns its nonempty and
+public-key-match checks before replacing the runtime PEM.
+
+The socat choice is a single-backend proxy only: it has no HAProxy health
+checks or load balancing. This is acceptable for a private single-user service;
+systemd restart policy and external HTTPS health checks provide supervision.
+
+PVE live acceptance on 2026-09-04 enabled the proxy and certificate watcher.
+The root-only runtime PEM was parsed successfully after inserting a separator
+between the source certificate and key, and a metadata-only watcher trigger
+restarted the proxy successfully. Public HTTPS returned the healthy Joplin
+ping with a certificate verified for `yun.arielkevin.com` under both TLS 1.2
+and TLS 1.3. Existing 80/443/8006/8080 listeners and old WebDAV behavior were
+unchanged.
+
+## Local configuration checks
+
+Create a real VM `/srv/joplin-server/.env` from `env.example` with a generated
+database password and a separate generated `JOPLIN_ADMIN_PASSWORD`. Do not
+commit that file. The pinned stable image `joplin/server:3.7.1` does not support `DEFAULT_ADMIN_PASSWORD`;
+that option landed upstream after this release. The
+deployment therefore performs a loopback-only bootstrap: it first overrides
+the application binding to `127.0.0.1:22300`, authenticates with the upstream
+one-time `admin` default, changes the password through Joplin's own API, proves
+that the default fails and the generated password succeeds, and only then
+recreates the app with the production private-LAN binding.
+A local, non-secret validation can use a temporary env file with dummy values:
+
+```bash
+bash infra/joplin-server/scripts/verify-config.sh
+docker compose --env-file /path/to/dummy.env -f infra/joplin-server/compose.yaml config
+```
+
+Before the first start, generate both passwords with at least 20
+characters, place the real `.env` at `/srv/joplin-server/.env` as a root-only
+regular file owned by `root:root` with mode `0600`, then run the deployment
+gate as root:
+
+```bash
+sudo DEPLOY_ENV_FILE=/srv/joplin-server/.env /srv/joplin-server/scripts/verify-config.sh
+sudo /srv/joplin-server/scripts/initialize.sh
+```
+
+When `DEPLOY_ENV_FILE` is supplied, the gate never prints its values and
+rejects missing or duplicate password assignments, empty values, `admin`, the
+`__GENERATE_AT_DEPLOYMENT__` placeholder, and passwords shorter than the
+minimum 20 characters. Generate values outside logs (for example with
+`openssl rand -base64 32`) and do not quote them in a way that changes the
+literal `.env` value. `initialize.sh` reruns this gate, starts the bootstrap
+container only on loopback, and stops both app and database on any error. It is
+idempotent when `JOPLIN_ADMIN_PASSWORD` is already active. If neither that
+password nor the upstream one-time default authenticates, it fails closed
+instead of overwriting an existing administrator. The ordinary no-argument check remains an artifact-only
+contract, not a substitute for this deployment gate. Deployment mode checks
+the VM artifacts only; PVE TLS and backup systemd artifacts remain static
+contracts until their later tasks install them on their respective hosts.
+
+The production Compose directory is `/srv/joplin-server`; its database volume
+is local VM storage. The NAS is never a live-database mount.
+
+VM 101 live acceptance on 2026-09-04 completed the loopback bootstrap and
+recreated the app on `192.168.3.3:22300`. Both app and PostgreSQL are healthy
+with `unless-stopped`; PostgreSQL publishes no host port; `admin` authentication
+returns 403 while the generated administrator password returns 200; the empty
+database contains one user and zero items; PVE can reach `/api/ping`; public PVE
+22300 remains closed pending the TLS task; and the old WebDAV endpoint remains
+unchanged. Sampled memory was approximately 337 MiB for Joplin Server and 26
+MiB for PostgreSQL.
+
+The app healthcheck connects only to `127.0.0.1:22300`, but sets its Host header
+from `new URL(process.env.APP_BASE_URL).host`. Joplin validates request
+origins against `APP_BASE_URL`; a bare loopback URL therefore returns an invalid
+origin/404 even when the app is healthy. Do not hardcode the public hostname in
+the probe: the configured base URL remains the single source of truth and must
+be a valid URL before the container starts.
+
+## Encrypted NAS backups
+
+`backup.sh` is installed on VM 101 and run by `joplin-backup.timer` as root.
+`/etc/joplin-server/backup.env` is root-only and supplies `RESTIC_REPOSITORY`
+as an SFTP repository, `RESTIC_PASSWORD_FILE` as a mode-0600 root-only file,
+and the location of the root-only Compose env file. The script streams a
+custom-format `pg_dump` straight to a restic snapshot tagged `joplin-database`;
+it does not write a persistent plaintext database dump. It separately streams
+non-secret deployment metadata under `joplin-metadata`, so the restore drill
+selects the database snapshot unambiguously. The daily job applies the
+14-daily/8-weekly/12-monthly retention selection without running an expensive
+prune over the two-hop SFTP path. `joplin-maintenance.timer` runs prune and a
+full repository check once a week. Both services take the same
+`/srv/joplin-server/.restic-backup.lock` with a bounded wait, so they cannot mutate
+the repository concurrently.
+Before enabling the timer, deployment creates
+`/srv/joplin-server/.restic-cache` as a root-only directory (for example,
+`install -d -o root -g root -m 0700 /srv/joplin-server/.restic-cache`). The
+unit sets `RESTIC_CACHE_DIR` to that path, avoiding a cache write under a
+systemd-protected home directory.
+
+The VM installs `ssh/joplin-backup.conf` as the system include
+`/etc/ssh/ssh_config.d/90-joplin-backup.conf`, so restic's SFTP process resolves
+the dedicated aliases without a custom command-line option. Its root-only
+ED25519 key and pinned host keys live under `/etc/joplin-server/ssh`, which
+remains readable when the backup unit hides `/root`; both aliases ignore the
+global known-hosts database and require the dedicated pinned file. The jump
+account `joplin-backup-jump` on the China router uses the exact authorized-key
+restriction from `router/joplin-backup-authorized-key-options` together with
+the server-side `router/90-joplin-backup-jump.conf`: only local TCP forwarding
+to `192.168.5.170:22` is allowed; remote and stream-local forwarding are
+disabled, and shell or command requests are forced to `/usr/bin/false`.
+On the NAS, `joplin-backup` is locked to public-key
+authentication and `internal-sftp`, chrooted at
+`/volume1/Backups/joplin-server`, with the restic repository at `/repo`.
+Every component reported by
+`namei -l /volume1/Backups/joplin-server` must be owned by root and must not be
+group- or other-writable. The chroot root is specifically `root:root` mode `0755`;
+only its child `/repo` is writable, owned by
+`joplin-backup:joplin-backup` mode `0700`. The NAS authorized key is
+root-managed outside the chroot at `/etc/ssh/authorized_keys/joplin-backup`, so
+the SFTP account cannot replace its own authentication boundary. That file and
+the router's `/etc/ssh/authorized_keys/joplin-backup-jump` are each `root:root` mode `0644`.
+The files contain public keys and must be readable by the target account;
+root ownership and lack of group/other write permission prevent replacement.
+Password login, agent/TCP/stream-local/X11 forwarding, TTY, and tunnels are
+disabled for this account. Validate the NAS drop-in with `sshd -t` before
+reloading SSH. Validate the router drop-in the same way before reloading its
+existing SSH service; neither host requires a new daemon. Before initializing
+restic, connect through the VM alias and use SFTP to create, read, and delete a probe file
+under `/repo`; then prove shell/command requests, a different TCP
+destination, remote TCP forwarding, and local or remote stream-local forwarding
+all fail.
+
+Live backup acceptance on 2026-09-04 installed the official SHA-256-verified
+restic 0.19.1 amd64 binary on VM 101 and created a generated root-only repository
+password. The router and NAS sshd configurations passed syntax and effective-
+configuration checks; SFTP create/read/delete passed, while shell/command,
+wrong-target TCP, remote TCP, and both stream-local forwarding directions were
+denied. Both systemd services created and shared their lock correctly. Nightly
+backup completes in about 40 seconds; weekly prune/check takes several minutes
+over the two-hop SFTP path and completed with no repository errors. Four
+database/metadata snapshots are retained, no active restic lock or plaintext
+dump remains, and both timers are enabled and active.
+
+## Isolated restore drill
+
+`restore-drill.sh` creates a temporary root-only restore directory and uses
+only `joplin-server-restore-drill`, `joplin-server-restore-network`,
+`joplin-server-restore-postgres`, and `127.0.0.1:22301`. It generates a new
+database password in memory, extracts only the explicitly tagged custom-format
+database dump, imports it with `pg_restore --exit-on-error --no-owner
+--no-privileges`, and bounds PostgreSQL readiness to 120 seconds. It then
+checks the loopback health endpoint with its own 120-second deadline and tears down its separate project,
+volume, network, temporary configuration, and plaintext restore material
+through an EXIT trap. It never references the production database volume.
+
+For the VM compose syntax gate without restic access or container startup, run
+`RESTORE_CONFIG_ONLY=1 ./scripts/restore-drill.sh` as root. It creates only
+temporary root-only generated files, runs `docker compose config --quiet`, and
+exits through the cleanup trap.
+
+Live restore acceptance on 2026-09-04 proved that a custom-format archive must
+be supplied to containerized `pg_restore` on standard input without naming
+`/dev/stdin`; the latter is not treated as the same readable archive. The
+corrected isolated drill became healthy and reported `users=1`, `items=0`,
+`item_resources=0`, and `files=1`, matching production, then removed its
+containers, volume, network, generated configuration, and plaintext archive.
+Final checks found both production containers healthy, no PostgreSQL or restore
+listener, verified public TLS 1.2/1.3, and confirmed the old WebDAV endpoint
+still returns 401.
+
+## Scope boundary
+
+This artifact set does not change the current WebDAV target, clients, PVE
+80/443 mediation gateway, or remote servers. Deployment, TLS publication,
+backup initialization, and restore execution are separate reviewed tasks.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly maintenance for encrypted Joplin Server backups
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30:00
+RandomizedDelaySec=2h
+Persistent=true
+Unit=joplin-maintenance.service
+
+[Install]
+WantedBy=timers.target

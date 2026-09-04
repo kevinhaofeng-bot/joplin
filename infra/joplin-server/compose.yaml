@@ -1,0 +1,56 @@
+name: joplin-server
+
+services:
+  db:
+    image: postgres:16.10-bookworm@sha256:94f23d40fdaf5e60cb2fd8a98c22f02a7b8724949f310d95a0ddf075e8c8b208
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DATABASE:?set POSTGRES_DATABASE in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - joplin-server-postgres:/var/lib/postgresql/data
+    networks:
+      - joplin-server-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  app:
+    image: joplin/server:3.7.1@sha256:b9666df06e7e2db20aeb961d2aca19e20664b985ead96995ecd32f9d720f002c
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "192.168.3.3:22300:22300"
+    environment:
+      APP_PORT: 22300
+      APP_BASE_URL: ${APP_BASE_URL:?set APP_BASE_URL in .env}
+      DB_CLIENT: pg
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE:?set POSTGRES_DATABASE in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    networks:
+      - joplin-server-internal
+      - joplin-server-egress
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const http=require('http'); const host=new URL(process.env.APP_BASE_URL).host; const request=http.get({hostname:'127.0.0.1',port:22300,path:'/api/ping',headers:{Host:host}},(response)=>process.exit(response.statusCode===200?0:1)); request.on('error',()=>process.exit(1));\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+networks:
+  joplin-server-internal:
+    internal: true
+  joplin-server-egress: {}
+
+volumes:
+  joplin-server-postgres:
+    name: joplin-server-postgres
