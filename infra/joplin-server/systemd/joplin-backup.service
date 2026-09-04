@@ -8,6 +8,7 @@ Type=oneshot
 User=root
 Group=root
 EnvironmentFile=/etc/joplin-server/backup.env
+Environment=RESTIC_CACHE_DIR=/srv/joplin-server/.restic-cache
 ExecStart=/srv/joplin-server/scripts/backup.sh
 NoNewPrivileges=true
 PrivateTmp=true

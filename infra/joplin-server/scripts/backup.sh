@@ -9,8 +9,18 @@ die() {
   exit 1
 }
 
+require_root_owned_mode_600_file() {
+  local file=$1
+  local description=$2
+  local ownership_and_mode=
+
+  [ -f "$file" ] && [ ! -L "$file" ] || die "missing root-only $description"
+  ownership_and_mode=$(stat -c '%u:%a' "$file") || die "cannot stat $description"
+  [ "$ownership_and_mode" = '0:600' ] || die "$description must be a root-owned regular file with mode 0600"
+}
+
 [ "$(id -u)" -eq 0 ] || die 'must run as root'
-[ -f "$backup_env_file" ] && [ ! -L "$backup_env_file" ] || die 'missing root-only backup environment'
+require_root_owned_mode_600_file "$backup_env_file" 'backup environment'
 
 set -a
 . "$backup_env_file"
@@ -21,9 +31,8 @@ set +a
 : "${RESTIC_REPOSITORY:?missing RESTIC_REPOSITORY}"
 : "${RESTIC_PASSWORD_FILE:?missing RESTIC_PASSWORD_FILE}"
 
-[ -f "$RESTIC_PASSWORD_FILE" ] && [ ! -L "$RESTIC_PASSWORD_FILE" ] || die 'missing restic password file'
-password_mode=$(stat -c '%a' "$RESTIC_PASSWORD_FILE")
-[ "$password_mode" = 600 ] || die 'restic password file must be mode 0600'
+require_root_owned_mode_600_file "$JOPLIN_ENV_FILE" 'Joplin Compose environment'
+require_root_owned_mode_600_file "$RESTIC_PASSWORD_FILE" 'restic password file'
 
 set -a
 . "$JOPLIN_ENV_FILE"

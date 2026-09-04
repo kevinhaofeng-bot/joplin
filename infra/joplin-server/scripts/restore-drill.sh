@@ -3,6 +3,7 @@
 set -euo pipefail
 
 restore_env_file=${BACKUP_ENV_FILE:-/etc/joplin-server/backup.env}
+RESTORE_CONFIG_ONLY=${RESTORE_CONFIG_ONLY:-0}
 RESTORE_PROJECT=joplin-server-restore-drill
 RESTORE_NETWORK=joplin-server-restore-network
 RESTORE_VOLUME=joplin-server-restore-postgres
@@ -11,18 +12,30 @@ RESTORE_ROOT=
 RESTORE_ENV=
 RESTORE_COMPOSE=
 RESTORE_DB_READY_DEADLINE=
+RESTORE_APP_READY_DEADLINE=
+RESTORE_DOCKER_ACTIVE=0
 
 die() {
   printf 'joplin restore drill failed: %s\n' "$*" >&2
   exit 1
 }
 
+require_root_owned_mode_600_file() {
+  local file=$1
+  local description=$2
+  local ownership_and_mode=
+
+  [ -f "$file" ] && [ ! -L "$file" ] || die "missing root-only $description"
+  ownership_and_mode=$(stat -c '%u:%a' "$file") || die "cannot stat $description"
+  [ "$ownership_and_mode" = '0:600' ] || die "$description must be a root-owned regular file with mode 0600"
+}
+
 cleanup() {
-  if [ -n "$RESTORE_COMPOSE" ] && [ -f "$RESTORE_COMPOSE" ]; then
+  if [ "$RESTORE_DOCKER_ACTIVE" = 1 ] && [ -n "$RESTORE_COMPOSE" ] && [ -f "$RESTORE_COMPOSE" ]; then
     docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" down --volumes --remove-orphans || true
+    docker network rm "$RESTORE_NETWORK" >/dev/null 2>&1 || true
+    docker volume rm "$RESTORE_VOLUME" >/dev/null 2>&1 || true
   fi
-  docker network rm "$RESTORE_NETWORK" >/dev/null 2>&1 || true
-  docker volume rm "$RESTORE_VOLUME" >/dev/null 2>&1 || true
   [ -z "$RESTORE_ROOT" ] || rm -rf "$RESTORE_ROOT"
   [ -z "$RESTORE_ENV" ] || rm -f "$RESTORE_ENV"
   [ -z "$RESTORE_COMPOSE" ] || rm -f "$RESTORE_COMPOSE"
@@ -30,20 +43,9 @@ cleanup() {
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || die 'must run as root'
-[ -f "$restore_env_file" ] && [ ! -L "$restore_env_file" ] || die 'missing root-only backup environment'
-
-set -a
-. "$restore_env_file"
-set +a
-
-: "${RESTIC_REPOSITORY:?missing RESTIC_REPOSITORY}"
-: "${RESTIC_PASSWORD_FILE:?missing RESTIC_PASSWORD_FILE}"
-[ -f "$RESTIC_PASSWORD_FILE" ] && [ ! -L "$RESTIC_PASSWORD_FILE" ] || die 'missing restic password file'
-password_mode=$(stat -c '%a' "$RESTIC_PASSWORD_FILE")
-[ "$password_mode" = 600 ] || die 'restic password file must be mode 0600'
+[ "$RESTORE_CONFIG_ONLY" = 0 ] || [ "$RESTORE_CONFIG_ONLY" = 1 ] || die 'RESTORE_CONFIG_ONLY must be 0 or 1'
 
 command -v docker >/dev/null
-command -v restic >/dev/null
 command -v openssl >/dev/null
 
 umask 077
@@ -52,15 +54,14 @@ RESTORE_ENV=$(mktemp /var/tmp/joplin-server-restore-env.XXXXXX)
 RESTORE_COMPOSE=$(mktemp /var/tmp/joplin-server-restore-compose.XXXXXX)
 RESTORE_DB_PASSWORD=$(openssl rand -hex 32)
 
-export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
-restic dump --tag joplin-database latest database.dump > "$RESTORE_ROOT/database.dump"
-[ -s "$RESTORE_ROOT/database.dump" ] || die 'tagged snapshot does not contain database.dump'
-
 cat > "$RESTORE_ENV" <<EOF
 POSTGRES_DATABASE=joplin_restore
 POSTGRES_USER=joplin_restore
 POSTGRES_PASSWORD=$RESTORE_DB_PASSWORD
 APP_BASE_URL=http://127.0.0.1:22301
+RESTORE_NETWORK=$RESTORE_NETWORK
+RESTORE_VOLUME=$RESTORE_VOLUME
+RESTORE_PORT=$RESTORE_PORT
 EOF
 
 cat > "$RESTORE_COMPOSE" <<EOF
@@ -101,6 +102,24 @@ volumes:
     name: \${RESTORE_VOLUME}
 EOF
 
+docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" config --quiet
+[ "$RESTORE_CONFIG_ONLY" = 1 ] && exit 0
+
+require_root_owned_mode_600_file "$restore_env_file" 'backup environment'
+set -a
+. "$restore_env_file"
+set +a
+
+: "${RESTIC_REPOSITORY:?missing RESTIC_REPOSITORY}"
+: "${RESTIC_PASSWORD_FILE:?missing RESTIC_PASSWORD_FILE}"
+require_root_owned_mode_600_file "$RESTIC_PASSWORD_FILE" 'restic password file'
+command -v restic >/dev/null
+
+export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
+restic dump --tag joplin-database latest database.dump > "$RESTORE_ROOT/database.dump"
+[ -s "$RESTORE_ROOT/database.dump" ] || die 'tagged snapshot does not contain database.dump'
+
+RESTORE_DOCKER_ACTIVE=1
 docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" up -d db
 RESTORE_DB_READY_DEADLINE=$((SECONDS + 120))
 until docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" exec -T db pg_isready -U joplin_restore -d joplin_restore; do
@@ -110,4 +129,8 @@ done
 docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" exec -T db \
   pg_restore --exit-on-error --no-owner --no-privileges --username=joplin_restore --dbname=joplin_restore /dev/stdin < "$RESTORE_ROOT/database.dump"
 docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" up -d app
-curl --fail --silent --show-error --max-time 15 "http://$RESTORE_PORT/api/ping" >/dev/null
+RESTORE_APP_READY_DEADLINE=$((SECONDS + 120))
+until curl --fail --silent --show-error --max-time 15 "http://$RESTORE_PORT/api/ping" >/dev/null; do
+  [ "$SECONDS" -lt "$RESTORE_APP_READY_DEADLINE" ] || die 'restore Joplin app did not become ready before the deadline'
+  sleep 2
+done

@@ -36,7 +36,10 @@ require_file "$root_dir/systemd/joplin-tls-proxy-cert-watch.service"
 
 require_literal "$compose_file" 'joplin/server:3.7.1@sha256:b9666df06e7e2db20aeb961d2aca19e20664b985ead96995ecd32f9d720f002c'
 require_literal "$compose_file" 'postgres:16.10-bookworm@sha256:94f23d40fdaf5e60cb2fd8a98c22f02a7b8724949f310d95a0ddf075e8c8b208'
-require_literal "$compose_file" '"${JOPLIN_BIND_ADDRESS}:22300:22300"'
+require_literal "$compose_file" '"192.168.3.3:22300:22300"'
+if grep -Fq -- 'JOPLIN_BIND_ADDRESS' "$compose_file"; then
+  fail 'production Joplin bind address must not be environment-overridable'
+fi
 require_literal "$compose_file" 'healthcheck:'
 require_literal "$compose_file" 'pg_isready'
 require_literal "$compose_file" '/api/ping'
@@ -51,7 +54,6 @@ printf '%s\n' "$app_block" | grep -Fq 'joplin-server-internal' || fail 'Joplin a
 printf '%s\n' "$app_block" | grep -Fq 'joplin-server-egress' || fail 'Joplin app must retain egress for its startup NTP check'
 
 require_literal "$env_example" 'POSTGRES_PASSWORD=__GENERATE_AT_DEPLOYMENT__'
-require_literal "$env_example" 'JOPLIN_BIND_ADDRESS=192.168.3.3'
 if grep -Eq -- '-----BEGIN( [A-Z]+)? PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}' "$root_dir"/{compose.yaml,env.example,README.md,scripts/backup.sh,scripts/restore-drill.sh,systemd/*.service,systemd/*.timer,systemd/*.path}; then
   fail 'infrastructure artifacts must not contain committed credentials'
 fi
@@ -70,8 +72,13 @@ require_literal "$socat_service" 'openssl pkey'
 require_literal "$socat_service" 'cmp -s'
 
 require_literal "$backup_script" 'RESTIC_PASSWORD_FILE'
-require_literal "$backup_script" 'password_mode'
-require_literal "$backup_script" '= 600'
+require_literal "$backup_script" 'require_root_owned_mode_600_file "$backup_env_file"'
+require_literal "$backup_script" 'require_root_owned_mode_600_file "$JOPLIN_ENV_FILE"'
+require_literal "$backup_script" 'require_root_owned_mode_600_file "$RESTIC_PASSWORD_FILE"'
+require_literal "$backup_script" "stat -c '%u:%a'"
+require_literal "$restore_script" 'require_root_owned_mode_600_file "$restore_env_file"'
+require_literal "$restore_script" 'require_root_owned_mode_600_file "$RESTIC_PASSWORD_FILE"'
+require_literal "$restore_script" "stat -c '%u:%a'"
 require_literal "$backup_script" 'pg_dump --format=custom'
 require_literal "$backup_script" '--tag joplin-database'
 require_literal "$backup_script" '--tag joplin-metadata'
@@ -85,11 +92,18 @@ require_literal "$restore_script" 'RESTORE_PROJECT=joplin-server-restore-drill'
 require_literal "$restore_script" 'RESTORE_NETWORK=joplin-server-restore-network'
 require_literal "$restore_script" 'RESTORE_VOLUME=joplin-server-restore-postgres'
 require_literal "$restore_script" 'RESTORE_PORT=127.0.0.1:22301'
+require_literal "$restore_script" 'RESTORE_CONFIG_ONLY=${RESTORE_CONFIG_ONLY:-0}'
+require_literal "$restore_script" 'RESTORE_NETWORK=$RESTORE_NETWORK'
+require_literal "$restore_script" 'RESTORE_VOLUME=$RESTORE_VOLUME'
+require_literal "$restore_script" 'RESTORE_PORT=$RESTORE_PORT'
+require_literal "$restore_script" 'docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" config --quiet'
 require_literal "$restore_script" 'trap cleanup EXIT'
 require_literal "$restore_script" 'restic dump --tag joplin-database latest database.dump'
 require_literal "$restore_script" 'pg_restore --exit-on-error --no-owner --no-privileges'
 require_literal "$restore_script" 'RESTORE_DB_READY_DEADLINE'
 require_literal "$restore_script" ' -lt "$RESTORE_DB_READY_DEADLINE"'
+require_literal "$restore_script" 'RESTORE_APP_READY_DEADLINE'
+require_literal "$restore_script" 'restore Joplin app did not become ready before the deadline'
 require_literal "$restore_script" '- restore-postgres:/var/lib/postgresql/data'
 require_literal "$restore_script" 'restore-postgres:'
 require_literal "$restore_script" 'down --volumes --remove-orphans'
@@ -101,9 +115,13 @@ if grep -Fq -- 'restic restore latest' "$restore_script"; then
 fi
 
 require_literal "$root_dir/systemd/joplin-backup.service" 'EnvironmentFile=/etc/joplin-server/backup.env'
+require_literal "$root_dir/systemd/joplin-backup.service" 'RESTIC_CACHE_DIR=/srv/joplin-server/.restic-cache'
 require_literal "$root_dir/systemd/joplin-backup.timer" 'RandomizedDelaySec='
-require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathChanged='
+require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathModified=/etc/pve/local/pveproxy-ssl.pem'
+require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathModified=/etc/pve/local/pveproxy-ssl.key'
 require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.service" 'systemctl try-restart joplin-tls-proxy.service'
-require_literal "$readme_file" 'does not automatically observe arbitrary certificate or key source paths'
+require_literal "$readme_file" 'automatically observes the authoritative PVE certificate and key paths'
+require_literal "$readme_file" '/srv/joplin-server/.restic-cache'
+require_literal "$readme_file" 'root-only'
 
 printf 'Joplin Server infrastructure static contract: PASS\n'

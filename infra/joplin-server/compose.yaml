@@ -26,7 +26,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "${JOPLIN_BIND_ADDRESS}:22300:22300"
+      - "192.168.3.3:22300:22300"
     environment:
       APP_PORT: 22300
       APP_BASE_URL: ${APP_BASE_URL:?set APP_BASE_URL in .env}

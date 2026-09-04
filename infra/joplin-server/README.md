@@ -19,10 +19,10 @@ and contains only the source paths (`TLS_CERT_SOURCE` and `TLS_KEY_SOURCE`),
 not certificate contents. Before enabling it, confirm the installed socat
 supports `min-version=TLS1.2`; its startup checks nonempty inputs and matching
 certificate/key public keys before it creates the mode-0600 runtime PEM. The
-certificate-watch path restarts only this unit after the source configuration
-is updated. Because a systemd `.path` unit does not automatically observe arbitrary certificate or key source paths named inside an environment file,
-renewal automation must update (or touch) `/etc/joplin-server/tls-proxy.env`
-after a certificate replacement; the restarted service reruns its nonempty and
+certificate-watch path automatically observes the authoritative PVE certificate and key paths,
+`/etc/pve/local/pveproxy-ssl.pem` and
+`/etc/pve/local/pveproxy-ssl.key`, as well as the proxy source configuration.
+It restarts only this unit; the restarted service reruns its nonempty and
 public-key-match checks before replacing the runtime PEM.
 
 The socat choice is a single-backend proxy only: it has no HAProxy health
@@ -53,6 +53,11 @@ custom-format `pg_dump` straight to a restic snapshot tagged `joplin-database`;
 it does not write a persistent plaintext database dump. It separately streams
 non-secret deployment metadata under `joplin-metadata`, so the restore drill
 selects the database snapshot unambiguously and applies retention.
+Before enabling the timer, deployment creates
+`/srv/joplin-server/.restic-cache` as a root-only directory (for example,
+`install -d -o root -g root -m 0700 /srv/joplin-server/.restic-cache`). The
+unit sets `RESTIC_CACHE_DIR` to that path, avoiding a cache write under a
+systemd-protected home directory.
 
 ## Isolated restore drill
 
@@ -62,9 +67,14 @@ only `joplin-server-restore-drill`, `joplin-server-restore-network`,
 database password in memory, extracts only the explicitly tagged custom-format
 database dump, imports it with `pg_restore --exit-on-error --no-owner
 --no-privileges`, and bounds PostgreSQL readiness to 120 seconds. It then
-checks the loopback health endpoint and tears down its separate project,
+checks the loopback health endpoint with its own 120-second deadline and tears down its separate project,
 volume, network, temporary configuration, and plaintext restore material
 through an EXIT trap. It never references the production database volume.
+
+For the VM compose syntax gate without restic access or container startup, run
+`RESTORE_CONFIG_ONLY=1 ./scripts/restore-drill.sh` as root. It creates only
+temporary root-only generated files, runs `docker compose config --quiet`, and
+exits through the cleanup trap.
 
 ## Scope boundary
 
