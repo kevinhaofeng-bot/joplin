@@ -3,6 +3,7 @@
 set -euo pipefail
 
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+deploy_env_file=${DEPLOY_ENV_FILE:-}
 compose_file="$root_dir/compose.yaml"
 env_example="$root_dir/env.example"
 socat_service="$root_dir/systemd/joplin-tls-proxy.service"
@@ -21,6 +22,57 @@ require_file() {
 
 require_literal() {
   grep -Fq -- "$2" "$1" || fail "missing literal in $1: $2"
+}
+
+require_root_owned_mode_600_file() {
+  local file=$1
+  local ownership_and_mode=
+
+  [ -f "$file" ] && [ ! -L "$file" ] || fail "deployment env must be a regular non-symlink file: $file"
+  ownership_and_mode=$(stat -c '%u:%g:%a' "$file") || fail "cannot stat deployment env: $file"
+  [ "$ownership_and_mode" = '0:0:600' ] || fail 'deployment env must be root:root mode 0600'
+}
+
+read_deployment_value() {
+  local key=$1
+  local line=
+  local match_count=0
+  local value=
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key="*)
+        match_count=$((match_count + 1))
+        value=${line#"$key="}
+        value=${value%$'\r'}
+        ;;
+    esac
+  done < "$deploy_env_file"
+
+  [ "$match_count" -eq 1 ] || return 1
+  printf '%s' "$value"
+}
+
+validate_deployment_password() {
+  local key=$1
+  local value=
+  local minimum_password_length=20
+
+  value=$(read_deployment_value "$key") || fail "deployment env must define $key exactly once"
+  case "$value" in
+    ''|admin|__GENERATE_AT_DEPLOYMENT__)
+      fail "$key must not be empty, admin, or the deployment placeholder"
+      ;;
+  esac
+  [ "${#value}" -ge "$minimum_password_length" ] || fail "$key must be at least $minimum_password_length characters"
+}
+
+validate_deployment_env() {
+  [ -n "$deploy_env_file" ] || return 0
+  [ "$(id -u)" -eq 0 ] || fail 'deployment env validation must run as root'
+  require_root_owned_mode_600_file "$deploy_env_file"
+  validate_deployment_password POSTGRES_PASSWORD
+  validate_deployment_password DEFAULT_ADMIN_PASSWORD
 }
 
 require_file "$compose_file"
@@ -130,5 +182,15 @@ require_literal "$readme_file" '/srv/joplin-server/.restic-cache'
 require_literal "$readme_file" 'root-only'
 require_literal "$readme_file" 'DEFAULT_ADMIN_PASSWORD'
 require_literal "$readme_file" 'first initialization'
+require_literal "$readme_file" 'DEPLOY_ENV_FILE'
+require_literal "$readme_file" 'minimum 20 characters'
+require_literal "$0" 'deploy_env_file=${DEPLOY_ENV_FILE:-}'
+require_literal "$0" "stat -c '%u:%g:%a'"
+require_literal "$0" '0:0:600'
+require_literal "$0" 'minimum_password_length=20'
+require_literal "$0" 'validate_deployment_env'
+require_literal "$0" '__GENERATE_AT_DEPLOYMENT__'
+
+validate_deployment_env
 
 printf 'Joplin Server infrastructure static contract: PASS\n'

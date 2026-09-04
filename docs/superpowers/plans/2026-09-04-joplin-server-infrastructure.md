@@ -55,10 +55,12 @@
 
 **Task 1 initial-admin hardening (2026-09-04):** The local Joplin Server source confirms `DEFAULT_ADMIN_PASSWORD` is supported and applies the configured default only on first startup. Compose now requires a generated `DEFAULT_ADMIN_PASSWORD` before startup and the example has only a deployment placeholder, preventing use of the upstream `admin` default on a fresh database. **Cost:** changing this environment variable after initialization does not rotate an existing admin password; that remains an authenticated Joplin administrative action.
 
+**Task 1 deployment-placeholder gate (2026-09-04):** `verify-config.sh` accepts optional `DEPLOY_ENV_FILE` only for a root-run validation of a root:root mode-0600 regular non-symlink production `.env`. It reads password assignments without sourcing or printing them and rejects missing/duplicate, empty, `admin`, placeholder, and under-20-character `POSTGRES_PASSWORD` or `DEFAULT_ADMIN_PASSWORD` values. **Cost:** passwords must be generated in a simple literal dotenv-compatible form before deployment; this gate deliberately does not attempt to rotate initialized credentials.
+
 ### Task 2: Deploy the private VM stack
 
 - [ ] Confirm ports, free space, Docker health, and existing containers again immediately before mutation.
-- [ ] Create `/srv/joplin-server` and root-only secrets without displaying them; install the reviewed Compose and scripts atomically.
+- [ ] Create `/srv/joplin-server` and root-only secrets without displaying them; install the reviewed Compose and scripts atomically; before any first `docker compose up`, run `DEPLOY_ENV_FILE=/srv/joplin-server/.env verify-config.sh` as root and require its placeholder/password gate to pass.
 - [ ] Pull the pinned images, start PostgreSQL first, wait healthy, then start Joplin Server.
 - [ ] Verify database migrations, container health, restart policy, no host 5432 listener, and HTTP readiness from the VM and PVE only.
 - [ ] Record non-secret image IDs, container health, and resource footprint.

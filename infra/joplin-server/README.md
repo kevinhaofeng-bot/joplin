@@ -44,6 +44,23 @@ bash infra/joplin-server/scripts/verify-config.sh
 docker compose --env-file /path/to/dummy.env -f infra/joplin-server/compose.yaml config
 ```
 
+Before the first `docker compose up`, generate both passwords with at least 20
+characters, place the real `.env` at `/srv/joplin-server/.env` as a root-only
+regular file owned by `root:root` with mode `0600`, then run the deployment
+gate as root:
+
+```bash
+sudo DEPLOY_ENV_FILE=/srv/joplin-server/.env /srv/joplin-server/scripts/verify-config.sh
+```
+
+When `DEPLOY_ENV_FILE` is supplied, the gate never prints its values and
+rejects missing or duplicate password assignments, empty values, `admin`, the
+`__GENERATE_AT_DEPLOYMENT__` placeholder, and passwords shorter than the
+minimum 20 characters. Generate values outside logs (for example with
+`openssl rand -base64 32`) and do not quote them in a way that changes the
+literal `.env` value. The ordinary no-argument check remains an artifact-only
+contract, not a substitute for this deployment gate.
+
 The production Compose directory is `/srv/joplin-server`; its database volume
 is local VM storage. The NAS is never a live-database mount.
 
