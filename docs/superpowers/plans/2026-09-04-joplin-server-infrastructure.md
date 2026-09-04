@@ -75,12 +75,14 @@
 
 ### Task 3: Publish the isolated trusted-TLS endpoint
 
-- [ ] Confirm the installed PVE socat supports `min-version=TLS1.2`; do not alter its currently broken apt state or install a proxy package.
-- [ ] Install a dedicated systemd socat listener on `22300`, using a root-only runtime PEM assembled from the existing PVE key/certificate and forwarding to `192.168.3.3:22300`.
-- [ ] Add a certificate path unit that restarts only this proxy after successful configuration validation.
-- [ ] Verify trusted certificate hostname, TLS 1.2/1.3, HTTP health, external access, and unchanged existing 80/443/8006/8080 listeners.
+- [x] Confirm the installed PVE socat supports `min-version=TLS1.2`; do not alter its currently broken apt state or install a proxy package.
+- [x] Install a dedicated systemd socat listener on `22300`, using a root-only runtime PEM assembled from the existing PVE key/certificate and forwarding to `192.168.3.3:22300`.
+- [x] Add a certificate path unit that restarts only this proxy after successful configuration validation.
+- [x] Verify trusted certificate hostname, TLS 1.2/1.3, HTTP health, external access, and unchanged existing 80/443/8006/8080 listeners.
 
 **Task 3 PEM assembly incident (2026-09-04):** The first systemd start reached the reviewed preflight but socat exited because the PVE certificate file has no trailing newline; direct concatenation joined `END CERTIFICATE` and `BEGIN PRIVATE KEY` on one line. Failure cleanup disabled the new units, moved their files into a root-only failure bundle, and left public 22300 closed. Runtime PEM assembly now inserts an explicit blank-line separator between the existing certificate and key. **Cost:** the runtime PEM contains one harmless extra newline; source certificate/key files remain unchanged.
+
+**Task 3 live acceptance (2026-09-04):** The corrected unit passed its regression contract, independent review, a loopback socat probe, and live systemd validation. `joplin-tls-proxy.service` is enabled and running on PVE `0.0.0.0:22300` with a root:root mode-0600 runtime PEM; `joplin-tls-proxy-cert-watch.path` is enabled and waiting. Rewriting only the non-secret source-path env metadata triggered and completed a proxy restart, proving the watcher path. Mac-to-public-IP HTTPS returned Joplin's healthy ping with hostname verification; TLS 1.2 negotiated `ECDHE-RSA-AES256-GCM-SHA384`, TLS 1.3 negotiated `TLS_AES_256_GCM_SHA384`, and both chains verified for `yun.arielkevin.com`. Existing PVE listener address/program fingerprints on 80, 443, 8006, and 8080 remained unchanged, old WebDAV still returned 401, and both backend containers remained healthy. Sampled proxy memory was under 1 MiB. **Cost:** this is a single-backend TLS relay; it relies on systemd restart and the separate path watcher rather than active upstream load-balancer health checks.
 
 ### Task 4: Configure encrypted NAS backup
 

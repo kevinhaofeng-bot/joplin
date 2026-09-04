@@ -29,6 +29,14 @@ The socat choice is a single-backend proxy only: it has no HAProxy health
 checks or load balancing. This is acceptable for a private single-user service;
 systemd restart policy and external HTTPS health checks provide supervision.
 
+PVE live acceptance on 2026-09-04 enabled the proxy and certificate watcher.
+The root-only runtime PEM was parsed successfully after inserting a separator
+between the source certificate and key, and a metadata-only watcher trigger
+restarted the proxy successfully. Public HTTPS returned the healthy Joplin
+ping with a certificate verified for `yun.arielkevin.com` under both TLS 1.2
+and TLS 1.3. Existing 80/443/8006/8080 listeners and old WebDAV behavior were
+unchanged.
+
 ## Local configuration checks
 
 Create a real VM `/srv/joplin-server/.env` from `env.example` with a generated
