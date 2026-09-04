@@ -43,13 +43,15 @@
 
 - [x] Write failing static contract checks for pinned images, internal-only PostgreSQL, non-public application binding, health checks, secret-free examples, restic stdin handling, and isolated restore names.
 - [x] Add the Compose, socat TLS proxy, backup, restore-drill, verification, systemd, and documentation files.
-- [ ] Run `bash infra/joplin-server/scripts/verify-config.sh` and `docker compose --env-file` validation with generated dummy secrets.
+- [x] Run `bash infra/joplin-server/scripts/verify-config.sh` and `docker compose --env-file` validation with generated dummy secrets.
 - [x] Run ShellCheck when available, `git diff --check`, and a repository secret-pattern scan limited to the new files.
 - [x] Commit as `feat: define Joplin Server infrastructure`.
 
 **Task 1 local verification note (2026-09-04):** `verify-config.sh` was written first and failed against the missing `compose.yaml`, then passed after the artifacts were added; its expanded contract also caught and drove fixes for Joplin egress, tagged custom-format database snapshots, restore-volume key isolation, and bounded restore readiness. Bash syntax checks, Ruby YAML boundary assertions, a scoped secret-pattern scan, and `git diff --check` passed. This workstation does not have `docker`, `shellcheck`, or `systemd-analyze` installed, so the generated-dummy `docker compose --env-file ... config` check cannot run locally and this third checkbox remains open for a VM 101 temporary-directory gate. No local tool installation or remote connection was attempted.
 
 **Task 1 review hardening (2026-09-04):** New static contracts were first run red for the fixed private application bind, then passed after the recovery artifacts exported every generated restore boundary into their temporary env and ran `docker compose config --quiet` before any startup. `RESTORE_CONFIG_ONLY=1` is a VM-safe config gate: it needs no restic access and starts no containers. Backup and restore now reject sourced/read sensitive files unless they are regular, non-symlink, root-owned mode-0600 files. The backup unit writes its restic cache only under root-only `/srv/joplin-server/.restic-cache`; the certificate path unit watches both authoritative PVE certificate sources and the proxy env. **Cost:** config-only still needs the VM's Docker Compose CLI, and the real restore/health verification remains a later isolated VM gate; no remote connection was attempted here.
+
+**Task 1 VM configuration gate (2026-09-04):** VM 101 ran the gate in an automatically cleaned `/tmp/joplin-config.*` directory: `verify-config.sh` passed; Docker Compose 2.32.1 production `config --quiet` passed with generated dummy values; and `sudo env RESTORE_CONFIG_ONLY=1 restore-drill.sh` passed without accessing restic or starting containers. The only output was tar's macOS provenance xattr-ignore notice, which did not affect the configuration gate.
 
 ### Task 2: Deploy the private VM stack
 
