@@ -41,7 +41,7 @@ services:
       - joplin-server-internal
       - joplin-server-egress
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:22300/api/ping', (response) => process.exit(response.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      test: ["CMD-SHELL", "node -e \"const http=require('http'); const host=new URL(process.env.APP_BASE_URL).host; const request=http.get({hostname:'127.0.0.1',port:22300,path:'/api/ping',headers:{Host:host}},(response)=>process.exit(response.statusCode===200?0:1)); request.on('error',()=>process.exit(1));\""]
       interval: 15s
       timeout: 5s
       retries: 10

@@ -65,6 +65,8 @@
 - [ ] Verify database migrations, container health, restart policy, no host 5432 listener, and HTTP readiness from the VM and PVE only.
 - [ ] Record non-secret image IDs, container health, and resource footprint.
 
+**Task 2 healthcheck incident (2026-09-04):** The first controlled startup reached the app but its healthcheck sent `GET /api/ping` with loopback origin, which Joplin rejected as `Invalid origin: http://127.0.0.1:22300` (404). The app and database were safely stopped while preserving the volume. The probe now connects to loopback but derives the `Host` header from `new URL(process.env.APP_BASE_URL).host`, matching Joplin's origin validation. **Cost:** `APP_BASE_URL` must remain a syntactically valid URL; a malformed base URL now causes the healthcheck to fail rather than masking a routing configuration error.
+
 ### Task 3: Publish the isolated trusted-TLS endpoint
 
 - [ ] Confirm the installed PVE socat supports `min-version=TLS1.2`; do not alter its currently broken apt state or install a proxy package.

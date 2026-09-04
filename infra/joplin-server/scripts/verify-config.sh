@@ -81,10 +81,13 @@ require_file "$socat_service"
 require_file "$backup_script"
 require_file "$restore_script"
 require_file "$readme_file"
-require_file "$root_dir/systemd/joplin-backup.service"
-require_file "$root_dir/systemd/joplin-backup.timer"
-require_file "$root_dir/systemd/joplin-tls-proxy-cert-watch.path"
-require_file "$root_dir/systemd/joplin-tls-proxy-cert-watch.service"
+# PVE-only static artifacts are not installed on VM 101 during Task 2.
+if [ -z "$deploy_env_file" ]; then
+  require_file "$root_dir/systemd/joplin-backup.service"
+  require_file "$root_dir/systemd/joplin-backup.timer"
+  require_file "$root_dir/systemd/joplin-tls-proxy-cert-watch.path"
+  require_file "$root_dir/systemd/joplin-tls-proxy-cert-watch.service"
+fi
 
 require_literal "$compose_file" 'joplin/server:3.7.1@sha256:b9666df06e7e2db20aeb961d2aca19e20664b985ead96995ecd32f9d720f002c'
 require_literal "$compose_file" 'postgres:16.10-bookworm@sha256:94f23d40fdaf5e60cb2fd8a98c22f02a7b8724949f310d95a0ddf075e8c8b208'
@@ -95,6 +98,9 @@ fi
 require_literal "$compose_file" 'healthcheck:'
 require_literal "$compose_file" 'pg_isready'
 require_literal "$compose_file" '/api/ping'
+require_literal "$compose_file" 'new URL(process.env.APP_BASE_URL).host'
+require_literal "$compose_file" "hostname:'127.0.0.1'"
+require_literal "$compose_file" 'headers:{Host:host}'
 require_literal "$compose_file" 'restart: unless-stopped'
 require_literal "$compose_file" 'joplin-server-egress:'
 
@@ -115,18 +121,20 @@ if grep -Eq -- '-----BEGIN( [A-Z]+)? PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|glpat
   fail 'infrastructure artifacts must not contain committed credentials'
 fi
 
-require_literal "$socat_service" 'RuntimeDirectory=joplin-tls-proxy'
-require_literal "$socat_service" 'RuntimeDirectoryMode=0700'
-require_literal "$socat_service" '/run/joplin-tls-proxy/server.pem'
-require_literal "$socat_service" 'OPENSSL-LISTEN:22300,reuseaddr,fork'
-require_literal "$socat_service" 'min-version=TLS1.2'
-require_literal "$socat_service" 'TCP:192.168.3.3:22300'
-require_literal "$socat_service" 'Restart=on-failure'
-require_literal "$socat_service" 'TLS_CERT_SOURCE'
-require_literal "$socat_service" 'TLS_KEY_SOURCE'
-require_literal "$socat_service" 'openssl x509'
-require_literal "$socat_service" 'openssl pkey'
-require_literal "$socat_service" 'cmp -s'
+if [ -z "$deploy_env_file" ]; then
+  require_literal "$socat_service" 'RuntimeDirectory=joplin-tls-proxy'
+  require_literal "$socat_service" 'RuntimeDirectoryMode=0700'
+  require_literal "$socat_service" '/run/joplin-tls-proxy/server.pem'
+  require_literal "$socat_service" 'OPENSSL-LISTEN:22300,reuseaddr,fork'
+  require_literal "$socat_service" 'min-version=TLS1.2'
+  require_literal "$socat_service" 'TCP:192.168.3.3:22300'
+  require_literal "$socat_service" 'Restart=on-failure'
+  require_literal "$socat_service" 'TLS_CERT_SOURCE'
+  require_literal "$socat_service" 'TLS_KEY_SOURCE'
+  require_literal "$socat_service" 'openssl x509'
+  require_literal "$socat_service" 'openssl pkey'
+  require_literal "$socat_service" 'cmp -s'
+fi
 
 require_literal "$backup_script" 'RESTIC_PASSWORD_FILE'
 require_literal "$backup_script" 'require_root_owned_mode_600_file "$backup_env_file"'
@@ -171,12 +179,14 @@ if grep -Fq -- 'restic restore latest' "$restore_script"; then
   fail 'restore drill must select the tagged database snapshot explicitly'
 fi
 
-require_literal "$root_dir/systemd/joplin-backup.service" 'EnvironmentFile=/etc/joplin-server/backup.env'
-require_literal "$root_dir/systemd/joplin-backup.service" 'RESTIC_CACHE_DIR=/srv/joplin-server/.restic-cache'
-require_literal "$root_dir/systemd/joplin-backup.timer" 'RandomizedDelaySec='
-require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathModified=/etc/pve/local/pveproxy-ssl.pem'
-require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathModified=/etc/pve/local/pveproxy-ssl.key'
-require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.service" 'systemctl try-restart joplin-tls-proxy.service'
+if [ -z "$deploy_env_file" ]; then
+  require_literal "$root_dir/systemd/joplin-backup.service" 'EnvironmentFile=/etc/joplin-server/backup.env'
+  require_literal "$root_dir/systemd/joplin-backup.service" 'RESTIC_CACHE_DIR=/srv/joplin-server/.restic-cache'
+  require_literal "$root_dir/systemd/joplin-backup.timer" 'RandomizedDelaySec='
+  require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathModified=/etc/pve/local/pveproxy-ssl.pem'
+  require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathModified=/etc/pve/local/pveproxy-ssl.key'
+  require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.service" 'systemctl try-restart joplin-tls-proxy.service'
+fi
 require_literal "$readme_file" 'automatically observes the authoritative PVE certificate and key paths'
 require_literal "$readme_file" '/srv/joplin-server/.restic-cache'
 require_literal "$readme_file" 'root-only'
@@ -184,12 +194,15 @@ require_literal "$readme_file" 'DEFAULT_ADMIN_PASSWORD'
 require_literal "$readme_file" 'first initialization'
 require_literal "$readme_file" 'DEPLOY_ENV_FILE'
 require_literal "$readme_file" 'minimum 20 characters'
+require_literal "$readme_file" 'Host header'
+require_literal "$readme_file" 'APP_BASE_URL'
 require_literal "$0" 'deploy_env_file=${DEPLOY_ENV_FILE:-}'
 require_literal "$0" "stat -c '%u:%g:%a'"
 require_literal "$0" '0:0:600'
 require_literal "$0" 'minimum_password_length=20'
 require_literal "$0" 'validate_deployment_env'
 require_literal "$0" '__GENERATE_AT_DEPLOYMENT__'
+require_literal "$0" 'PVE-only static artifacts are not installed on VM 101 during Task 2.'
 
 validate_deployment_env
 

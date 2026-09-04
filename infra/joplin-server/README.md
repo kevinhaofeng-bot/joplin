@@ -59,10 +59,19 @@ rejects missing or duplicate password assignments, empty values, `admin`, the
 minimum 20 characters. Generate values outside logs (for example with
 `openssl rand -base64 32`) and do not quote them in a way that changes the
 literal `.env` value. The ordinary no-argument check remains an artifact-only
-contract, not a substitute for this deployment gate.
+contract, not a substitute for this deployment gate. Deployment mode checks
+the VM artifacts only; PVE TLS and backup systemd artifacts remain static
+contracts until their later tasks install them on their respective hosts.
 
 The production Compose directory is `/srv/joplin-server`; its database volume
 is local VM storage. The NAS is never a live-database mount.
+
+The app healthcheck connects only to `127.0.0.1:22300`, but sets its Host header
+from `new URL(process.env.APP_BASE_URL).host`. Joplin validates request
+origins against `APP_BASE_URL`; a bare loopback URL therefore returns an invalid
+origin/404 even when the app is healthy. Do not hardcode the public hostname in
+the probe: the configured base URL remains the single source of truth and must
+be a valid URL before the container starts.
 
 ## Encrypted NAS backups
 
