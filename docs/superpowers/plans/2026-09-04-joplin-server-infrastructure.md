@@ -62,14 +62,16 @@
 
 ### Task 2: Deploy the private VM stack
 
-- [ ] Confirm ports, free space, Docker health, and existing containers again immediately before mutation.
-- [ ] Create `/srv/joplin-server` and root-only secrets without displaying them; install the reviewed Compose and scripts atomically; before any first `docker compose up`, run `DEPLOY_ENV_FILE=/srv/joplin-server/.env verify-config.sh` as root and require its placeholder/password gate to pass.
-- [ ] Pull the pinned images, start PostgreSQL first, wait healthy, then start Joplin Server.
-- [ ] Run the loopback-only administrator bootstrap, require both credential checks to pass, then recreate Joplin on its private-LAN binding.
-- [ ] Verify database migrations, container health, restart policy, no host 5432 listener, and HTTP readiness from the VM and PVE only.
-- [ ] Record non-secret image IDs, container health, and resource footprint.
+- [x] Confirm ports, free space, Docker health, and existing containers again immediately before mutation.
+- [x] Create `/srv/joplin-server` and root-only secrets without displaying them; install the reviewed Compose and scripts atomically; before any first `docker compose up`, run `DEPLOY_ENV_FILE=/srv/joplin-server/.env verify-config.sh` as root and require its placeholder/password gate to pass.
+- [x] Pull the pinned images, start PostgreSQL first, wait healthy, then start Joplin Server.
+- [x] Run the loopback-only administrator bootstrap, require both credential checks to pass, then recreate Joplin on its private-LAN binding.
+- [x] Verify database migrations, container health, restart policy, no host 5432 listener, and HTTP readiness from the VM and PVE only.
+- [x] Record non-secret image IDs, container health, and resource footprint.
 
 **Task 2 healthcheck incident (2026-09-04):** The first controlled startup reached the app but its healthcheck sent `GET /api/ping` with loopback origin, which Joplin rejected as `Invalid origin: http://127.0.0.1:22300` (404). The app and database were safely stopped while preserving the volume. The probe now connects to loopback but derives the `Host` header from `new URL(process.env.APP_BASE_URL).host`, matching Joplin's origin validation. **Cost:** `APP_BASE_URL` must remain a syntactically valid URL; a malformed base URL now causes the healthcheck to fail rather than masking a routing configuration error.
+
+**Task 2 live acceptance (2026-09-04):** Before replacement, both containers were stopped and the existing database was confirmed to contain one initial user and zero items. The corrected bootstrap artifacts passed independent review, 11 local tests, 11 VM tests, both production/bootstrap Compose parses, and the VM deployment contract 50 consecutive times. The root-only administrator secret was migrated by key name without printing or changing its value; the bootstrap app then ran only on `127.0.0.1:22300`, rotated through the stable Joplin API, proved `admin` returns 403 and the generated password returns 200, and was removed before the production app was recreated on `192.168.3.3:22300`. Both containers are healthy with `unless-stopped`; PostgreSQL has no host listener; PVE-to-VM `/api/ping` returns 200; public PVE 22300 remains closed; and the old WebDAV endpoint still returns its expected 401 challenge. The empty database remains one user and zero items/resources. Image IDs are app `sha256:20a912e7f3909aa4fe43b901b011a8bc4f3f091b95056738fc2e868338b3f929` and database `sha256:8ba5ca87c6a43b60d370510edff66a43c3c655961b68881590e06605335694cd`; the sampled footprint was about 337 MiB for the app and 26 MiB for PostgreSQL. **Cost:** the live server is intentionally empty and private; no real client has been migrated, and TLS/backup/restore remain later gates.
 
 ### Task 3: Publish the isolated trusted-TLS endpoint
 

@@ -74,6 +74,15 @@ contracts until their later tasks install them on their respective hosts.
 The production Compose directory is `/srv/joplin-server`; its database volume
 is local VM storage. The NAS is never a live-database mount.
 
+VM 101 live acceptance on 2026-09-04 completed the loopback bootstrap and
+recreated the app on `192.168.3.3:22300`. Both app and PostgreSQL are healthy
+with `unless-stopped`; PostgreSQL publishes no host port; `admin` authentication
+returns 403 while the generated administrator password returns 200; the empty
+database contains one user and zero items; PVE can reach `/api/ping`; public PVE
+22300 remains closed pending the TLS task; and the old WebDAV endpoint remains
+unchanged. Sampled memory was approximately 337 MiB for Joplin Server and 26
+MiB for PostgreSQL.
+
 The app healthcheck connects only to `127.0.0.1:22300`, but sets its Host header
 from `new URL(process.env.APP_BASE_URL).host`. Joplin validates request
 origins against `APP_BASE_URL`; a bare loopback URL therefore returns an invalid
