@@ -70,7 +70,7 @@ class BackupSshContractTest(unittest.TestCase):
         self.assertIn("joplin-backup:joplin-backup` mode `0700", readme)
         self.assertIn("/etc/ssh/authorized_keys/joplin-backup-jump", readme)
         self.assertIn("/etc/ssh/authorized_keys/joplin-backup", readme)
-        self.assertIn("root:root` mode `0600", readme)
+        self.assertIn("root:root` mode `0644", readme)
         self.assertIn("create, read, and delete a probe file", readme)
 
 

@@ -107,7 +107,12 @@ and the location of the root-only Compose env file. The script streams a
 custom-format `pg_dump` straight to a restic snapshot tagged `joplin-database`;
 it does not write a persistent plaintext database dump. It separately streams
 non-secret deployment metadata under `joplin-metadata`, so the restore drill
-selects the database snapshot unambiguously and applies retention.
+selects the database snapshot unambiguously. The daily job applies the
+14-daily/8-weekly/12-monthly retention selection without running an expensive
+prune over the two-hop SFTP path. `joplin-maintenance.timer` runs prune and a
+full repository check once a week. Both services take the same
+`/srv/joplin-server/.restic-backup.lock` with a bounded wait, so they cannot mutate
+the repository concurrently.
 Before enabling the timer, deployment creates
 `/srv/joplin-server/.restic-cache` as a root-only directory (for example,
 `install -d -o root -g root -m 0700 /srv/joplin-server/.restic-cache`). The
@@ -135,7 +140,9 @@ only its child `/repo` is writable, owned by
 `joplin-backup:joplin-backup` mode `0700`. The NAS authorized key is
 root-managed outside the chroot at `/etc/ssh/authorized_keys/joplin-backup`, so
 the SFTP account cannot replace its own authentication boundary. That file and
-the router's `/etc/ssh/authorized_keys/joplin-backup-jump` are each `root:root` mode `0600`.
+the router's `/etc/ssh/authorized_keys/joplin-backup-jump` are each `root:root` mode `0644`.
+The files contain public keys and must be readable by the target account;
+root ownership and lack of group/other write permission prevent replacement.
 Password login, agent/TCP/stream-local/X11 forwarding, TTY, and tunnels are
 disabled for this account. Validate the NAS drop-in with `sshd -t` before
 reloading SSH. Validate the router drop-in the same way before reloading its
@@ -144,6 +151,17 @@ restic, connect through the VM alias and use SFTP to create, read, and delete a 
 under `/repo`; then prove shell/command requests, a different TCP
 destination, remote TCP forwarding, and local or remote stream-local forwarding
 all fail.
+
+Live backup acceptance on 2026-09-04 installed the official SHA-256-verified
+restic 0.19.1 amd64 binary on VM 101 and created a generated root-only repository
+password. The router and NAS sshd configurations passed syntax and effective-
+configuration checks; SFTP create/read/delete passed, while shell/command,
+wrong-target TCP, remote TCP, and both stream-local forwarding directions were
+denied. Both systemd services created and shared their lock correctly. Nightly
+backup completes in about 40 seconds; weekly prune/check takes several minutes
+over the two-hop SFTP path and completed with no repository errors. Four
+database/metadata snapshots are retained, no active restic lock or plaintext
+dump remains, and both timers are enabled and active.
 
 ## Isolated restore drill
 
@@ -161,6 +179,16 @@ For the VM compose syntax gate without restic access or container startup, run
 `RESTORE_CONFIG_ONLY=1 ./scripts/restore-drill.sh` as root. It creates only
 temporary root-only generated files, runs `docker compose config --quiet`, and
 exits through the cleanup trap.
+
+Live restore acceptance on 2026-09-04 proved that a custom-format archive must
+be supplied to containerized `pg_restore` on standard input without naming
+`/dev/stdin`; the latter is not treated as the same readable archive. The
+corrected isolated drill became healthy and reported `users=1`, `items=0`,
+`item_resources=0`, and `files=1`, matching production, then removed its
+containers, volume, network, generated configuration, and plaintext archive.
+Final checks found both production containers healthy, no PostgreSQL or restore
+listener, verified public TLS 1.2/1.3, and confirmed the old WebDAV endpoint
+still returns 401.
 
 ## Scope boundary
 

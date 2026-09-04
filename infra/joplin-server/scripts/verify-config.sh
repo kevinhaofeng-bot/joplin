@@ -9,6 +9,7 @@ bootstrap_compose_file="$root_dir/compose.bootstrap.yaml"
 env_example="$root_dir/env.example"
 socat_service="$root_dir/systemd/joplin-tls-proxy.service"
 backup_script="$root_dir/scripts/backup.sh"
+maintenance_script="$root_dir/scripts/maintenance.sh"
 restore_script="$root_dir/scripts/restore-drill.sh"
 bootstrap_script="$root_dir/scripts/bootstrap-admin.py"
 initialize_script="$root_dir/scripts/initialize.sh"
@@ -87,6 +88,7 @@ require_file "$bootstrap_compose_file"
 require_file "$env_example"
 require_file "$socat_service"
 require_file "$backup_script"
+require_file "$maintenance_script"
 require_file "$restore_script"
 require_file "$bootstrap_script"
 require_file "$initialize_script"
@@ -99,6 +101,8 @@ require_file "$readme_file"
 if [ -z "$deploy_env_file" ]; then
   require_file "$root_dir/systemd/joplin-backup.service"
   require_file "$root_dir/systemd/joplin-backup.timer"
+  require_file "$root_dir/systemd/joplin-maintenance.service"
+  require_file "$root_dir/systemd/joplin-maintenance.timer"
   require_file "$root_dir/systemd/joplin-tls-proxy-cert-watch.path"
   require_file "$root_dir/systemd/joplin-tls-proxy-cert-watch.service"
 fi
@@ -141,7 +145,7 @@ fi
 if grep -Fq -- 'JOPLIN_ADMIN_PASSWORD=admin' "$env_example"; then
   fail 'example must not provide the upstream admin default password'
 fi
-if grep -Eq -- '-----BEGIN( [A-Z]+)? PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}' "$root_dir"/{compose.yaml,compose.bootstrap.yaml,env.example,README.md,nas/*.conf,router/*,scripts/backup.sh,scripts/bootstrap-admin.py,scripts/initialize.sh,scripts/restore-drill.sh,ssh/*.conf,systemd/*.service,systemd/*.timer,systemd/*.path}; then
+if grep -Eq -- '-----BEGIN( [A-Z]+)? PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}' "$root_dir"/{compose.yaml,compose.bootstrap.yaml,env.example,README.md,nas/*.conf,router/*,scripts/backup.sh,scripts/bootstrap-admin.py,scripts/initialize.sh,scripts/maintenance.sh,scripts/restore-drill.sh,ssh/*.conf,systemd/*.service,systemd/*.timer,systemd/*.path}; then
   fail 'infrastructure artifacts must not contain committed credentials'
 fi
 
@@ -174,6 +178,13 @@ require_literal "$backup_script" '--tag joplin-database'
 require_literal "$backup_script" '--tag joplin-metadata'
 require_literal "$backup_script" 'database.dump'
 require_literal "$backup_script" 'restic backup'
+if grep -Fq -- '--prune' "$backup_script"; then
+  fail 'daily backup must leave expensive prune work to weekly maintenance'
+fi
+require_literal "$maintenance_script" 'require_root_owned_mode_600_file "$backup_env_file"'
+require_literal "$maintenance_script" 'require_root_owned_mode_600_file "$RESTIC_PASSWORD_FILE"'
+require_literal "$maintenance_script" 'restic prune'
+require_literal "$maintenance_script" 'restic check'
 require_literal "$backup_ssh_config" 'Host joplin-backup-nas'
 require_literal "$backup_ssh_config" 'ProxyJump joplin-backup-router'
 require_literal "$backup_ssh_config" 'User joplin-backup-jump'
@@ -231,7 +242,12 @@ fi
 if [ -z "$deploy_env_file" ]; then
   require_literal "$root_dir/systemd/joplin-backup.service" 'EnvironmentFile=/etc/joplin-server/backup.env'
   require_literal "$root_dir/systemd/joplin-backup.service" 'RESTIC_CACHE_DIR=/srv/joplin-server/.restic-cache'
+  require_literal "$root_dir/systemd/joplin-backup.service" '/usr/bin/flock --wait 600 /srv/joplin-server/.restic-backup.lock'
   require_literal "$root_dir/systemd/joplin-backup.timer" 'RandomizedDelaySec='
+  require_literal "$root_dir/systemd/joplin-maintenance.service" '/usr/bin/flock --wait 600 /srv/joplin-server/.restic-backup.lock'
+  require_literal "$root_dir/systemd/joplin-maintenance.service" 'RESTIC_CACHE_DIR=/srv/joplin-server/.restic-cache'
+  require_literal "$root_dir/systemd/joplin-maintenance.timer" 'OnCalendar=Sun *-*-* 05:30:00'
+  require_literal "$root_dir/systemd/joplin-maintenance.timer" 'RandomizedDelaySec=2h'
   require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathModified=/etc/pve/local/pveproxy-ssl.pem'
   require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.path" 'PathModified=/etc/pve/local/pveproxy-ssl.key'
   require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.service" 'systemctl try-restart joplin-tls-proxy.service'

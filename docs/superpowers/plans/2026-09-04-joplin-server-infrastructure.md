@@ -35,10 +35,13 @@
 - `infra/joplin-server/router/joplin-backup-authorized-key-options`
 - `infra/joplin-server/router/90-joplin-backup-jump.conf`
 - `infra/joplin-server/scripts/backup.sh`
+- `infra/joplin-server/scripts/maintenance.sh`
 - `infra/joplin-server/scripts/restore-drill.sh`
 - `infra/joplin-server/scripts/verify-config.sh`
 - `infra/joplin-server/systemd/joplin-backup.service`
 - `infra/joplin-server/systemd/joplin-backup.timer`
+- `infra/joplin-server/systemd/joplin-maintenance.service`
+- `infra/joplin-server/systemd/joplin-maintenance.timer`
 - `infra/joplin-server/systemd/joplin-tls-proxy.service`
 - `infra/joplin-server/systemd/joplin-tls-proxy-cert-watch.path`
 - `infra/joplin-server/systemd/joplin-tls-proxy-cert-watch.service`
@@ -90,20 +93,33 @@
 
 ### Task 4: Configure encrypted NAS backup
 
-- [ ] Create `/volume1/Backups/joplin-server` as a root-owned mode-0755 chroot whose full `namei -l` parent chain is root-owned and not group/other writable; create only `/repo` as mode-0700 and writable by `joplin-backup`; install both external authorized-key files as root:root mode-0600; add no daemon.
-- [ ] Create a dedicated VM-to-NAS SSH key and independent router jump account; prove only SFTP plus local TCP forwarding to `192.168.5.170:22` succeed, while shell/command, other TCP targets, remote TCP forwarding, and both stream-local directions fail.
-- [ ] Through the VM alias, create, read, and delete an SFTP probe inside `/repo` before repository initialization.
-- [ ] Initialize a restic repository using a generated root-only password file; run the backup script manually.
-- [ ] Install and enable the nightly systemd timer with randomized delay and failure-visible journal status.
-- [ ] Verify `restic check`, snapshot contents, retention dry-run, repository permissions, and that no plaintext dump remains on VM or NAS.
+- [x] Create `/volume1/Backups/joplin-server` as a root-owned mode-0755 chroot whose full `namei -l` parent chain is root-owned and not group/other writable; create only `/repo` as mode-0700 and writable by `joplin-backup`; install both external public-key files as root:root mode-0644 so sshd can read them while the target users cannot replace them; add no daemon.
+- [x] Create a dedicated VM-to-NAS SSH key and independent router jump account; prove only SFTP plus local TCP forwarding to `192.168.5.170:22` succeed, while shell/command, other TCP targets, remote TCP forwarding, and both stream-local directions fail.
+- [x] Through the VM alias, create, read, and delete an SFTP probe inside `/repo` before repository initialization.
+- [x] Initialize a restic repository using a generated root-only password file; run the backup script manually.
+- [x] Install and enable the nightly systemd timer with randomized delay and failure-visible journal status.
+- [x] Keep daily retention fast by separating weekly prune/check maintenance; serialize both services with one bounded flock under the shared `/srv/joplin-server` write boundary.
+- [x] Verify `restic check`, snapshot contents, retention dry-run, repository permissions, and that no plaintext dump remains on VM or NAS.
+
+**Task 4 SSH authentication incident (2026-09-04):** The first end-to-end SFTP probe reached the router but public-key authentication failed. Temporary DEBUG3 logging showed that sshd dropped to the target account before opening the external `AuthorizedKeysFile`, so a root:root mode-0600 public-key file was unreadable. Both external files are now root:root mode-0644: the service accounts can read the public keys but cannot replace them. The temporary debug drop-in was removed and the ordinary log level restored. **Cost:** these public keys are locally readable; no private key or restic password is exposed.
+
+**Task 4 maintenance incident (2026-09-04):** An interactive repository inspection left one lock whose recorded PID no longer existed. The first systemd backup still wrote both snapshots, then failed closed at retention. `restic unlock` removed exactly that stale lock; subsequent runs finished successfully and the final lock count is zero. A daily `forget --prune` also took about 3 minutes 28 seconds over the two-hop SFTP path, while a daily backup without prune took about 40 seconds. **Cost:** unreferenced encrypted packs may remain until the weekly maintenance window; retention selection still runs after every daily backup.
+
+**Ruling:** Keep the fast nightly backup and retention selection separate from a weekly prune plus full repository check, and serialize both with the same bounded flock inside `/srv/joplin-server`. **Cost:** physical space reclamation is delayed by at most one maintenance interval, and the weekly job takes several minutes because restic enumerates its repository over two SSH hops.
+
+**Task 4 live acceptance (2026-09-04):** VM 101 runs restic 0.19.1 from the official SHA-256-verified amd64 binary. The dedicated VM key uses pinned ED25519 host keys and a system SSH include. Router account `joplin-backup-jump` permits only local TCP forwarding to `192.168.5.170:22`; shell/command, another TCP target, remote TCP forwarding, and local/remote stream-local forwarding all failed in live tests. The NAS chroot parent chain is root-owned mode-0755, only `/repo` is `joplin-backup:joplin-backup` mode-0700, and SFTP created, read, and removed probe files. Manual and sandboxed systemd backups succeeded; first lock creation and delayed execution behind an already-held lock were proven. Weekly prune plus `restic check` completed with `no errors were found`. Four retained snapshots cover the oldest and current database/metadata generations, the active lock count is zero, no plaintext dump remains, and both timers are enabled and active.
 
 ### Task 5: Prove isolated restore and acceptance
 
-- [ ] Restore the newest snapshot to a temporary root-only directory, validate checksums and dump structure, and start a separate PostgreSQL restore project.
-- [ ] Import the dump, start a separate Joplin Server bound only to `127.0.0.1` on a different port, and verify readiness plus database row counts.
-- [ ] Tear down the restore project and remove plaintext restore material while preserving logs/evidence without note content.
-- [ ] Re-run config checks, production health, TLS, backup repository check, active timer state, listener boundary, and old WebDAV health.
-- [ ] Append exact non-secret evidence to this plan and `infra/joplin-server/README.md`; commit as `docs: verify Joplin Server deployment`.
+- [x] Restore the newest snapshot to a temporary root-only directory, validate checksums and dump structure, and start a separate PostgreSQL restore project.
+- [x] Import the dump, start a separate Joplin Server bound only to `127.0.0.1` on a different port, and verify readiness plus database row counts.
+- [x] Tear down the restore project and remove plaintext restore material while preserving logs/evidence without note content.
+- [x] Re-run config checks, production health, TLS, backup repository check, active timer state, listener boundary, and old WebDAV health.
+- [x] Append exact non-secret evidence to this plan and `infra/joplin-server/README.md`; commit as `docs: verify Joplin Server deployment`.
+
+**Task 5 restore incident (2026-09-04):** The first isolated import failed with `did not find magic string in file header`, even though both the snapshot and a freshly generated dump began with `PGDMP`. A controlled, non-mutating comparison proved `pg_restore` succeeds when the custom archive is supplied on standard input without a filename but fails when `/dev/stdin` is passed as a filename in the container. The script now omits that filename and a regression test enforces the contract. **Cost:** restore still materializes one root-only temporary custom archive because `pg_restore` needs a repeatable input for the isolated drill; the EXIT trap removes it.
+
+**Task 5 live acceptance (2026-09-04):** The corrected drill restored the newest tagged snapshot into the separate `joplin-server-restore-drill` project, volume, network, and `127.0.0.1:22301` endpoint. The isolated app became healthy and reported `users=1`, `items=0`, `item_resources=0`, and `files=1`, exactly matching production. The app, database, volume, network, generated env/Compose files, and plaintext archive were then removed. Final checks passed the deployment contract, found both production containers healthy, exposed only private VM `192.168.3.3:22300` with no 5432 or 22301 listener, verified public TLS 1.2 and 1.3 for `yun.arielkevin.com`, found both backup timers active with successful last service results, and confirmed the unchanged WebDAV endpoint still returns 401.
 
 ## Migration Gate (Not Part of This Plan)
 

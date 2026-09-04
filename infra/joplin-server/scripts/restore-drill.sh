@@ -127,10 +127,18 @@ until docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTOR
   sleep 2
 done
 docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" exec -T db \
-  pg_restore --exit-on-error --no-owner --no-privileges --username=joplin_restore --dbname=joplin_restore /dev/stdin < "$RESTORE_ROOT/database.dump"
+  pg_restore --exit-on-error --no-owner --no-privileges --username=joplin_restore --dbname=joplin_restore < "$RESTORE_ROOT/database.dump"
 docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" up -d app
 RESTORE_APP_READY_DEADLINE=$((SECONDS + 120))
 until curl --fail --silent --show-error --max-time 15 "http://$RESTORE_PORT/api/ping" >/dev/null; do
   [ "$SECONDS" -lt "$RESTORE_APP_READY_DEADLINE" ] || die 'restore Joplin app did not become ready before the deadline'
   sleep 2
 done
+printf 'restore_table_counts_begin\n'
+docker compose -p "$RESTORE_PROJECT" --env-file "$RESTORE_ENV" -f "$RESTORE_COMPOSE" exec -T db \
+  psql -At --username=joplin_restore --dbname=joplin_restore -c \
+  "SELECT 'users=' || count(*) FROM users;
+SELECT 'items=' || count(*) FROM items;
+SELECT 'item_resources=' || count(*) FROM item_resources;
+SELECT 'files=' || count(*) FROM files;"
+printf 'restore_table_counts_end\n'
