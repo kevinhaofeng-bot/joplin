@@ -55,6 +55,7 @@ pub fn get_runtime_info(state: tauri::State<'_, AppState>) -> Result<RuntimeInfo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -137,5 +138,23 @@ mod tests {
         let info = runtime_info_for(&paths);
         assert_eq!(info.app_name, "Joplin Lite");
         assert_eq!(info.profile_directory, "/tmp/com.kevinhao.joplin-lite");
+    }
+
+    #[test]
+    fn serializes_runtime_info_with_camel_case_json_keys() {
+        let paths = ProfilePaths::from_app_data(PathBuf::from("/tmp/com.kevinhao.joplin-lite"));
+
+        let json = serde_json::to_value(runtime_info_for(&paths)).unwrap();
+
+        assert_eq!(
+            json.get("appName"),
+            Some(&Value::String("Joplin Lite".into()))
+        );
+        assert_eq!(
+            json.get("profileDirectory"),
+            Some(&Value::String("/tmp/com.kevinhao.joplin-lite".into()))
+        );
+        assert!(json.get("app_name").is_none());
+        assert!(json.get("profile_directory").is_none());
     }
 }
