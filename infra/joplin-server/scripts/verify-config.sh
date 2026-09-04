@@ -12,6 +12,10 @@ backup_script="$root_dir/scripts/backup.sh"
 restore_script="$root_dir/scripts/restore-drill.sh"
 bootstrap_script="$root_dir/scripts/bootstrap-admin.py"
 initialize_script="$root_dir/scripts/initialize.sh"
+backup_ssh_config="$root_dir/ssh/joplin-backup.conf"
+nas_sshd_config="$root_dir/nas/90-joplin-backup.conf"
+router_key_options="$root_dir/router/joplin-backup-authorized-key-options"
+router_sshd_config="$root_dir/router/90-joplin-backup-jump.conf"
 readme_file="$root_dir/README.md"
 
 fail() {
@@ -86,6 +90,10 @@ require_file "$backup_script"
 require_file "$restore_script"
 require_file "$bootstrap_script"
 require_file "$initialize_script"
+require_file "$backup_ssh_config"
+require_file "$nas_sshd_config"
+require_file "$router_key_options"
+require_file "$router_sshd_config"
 require_file "$readme_file"
 # PVE-only static artifacts are not installed on VM 101 during Task 2.
 if [ -z "$deploy_env_file" ]; then
@@ -133,7 +141,7 @@ fi
 if grep -Fq -- 'JOPLIN_ADMIN_PASSWORD=admin' "$env_example"; then
   fail 'example must not provide the upstream admin default password'
 fi
-if grep -Eq -- '-----BEGIN( [A-Z]+)? PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}' "$root_dir"/{compose.yaml,compose.bootstrap.yaml,env.example,README.md,scripts/backup.sh,scripts/bootstrap-admin.py,scripts/initialize.sh,scripts/restore-drill.sh,systemd/*.service,systemd/*.timer,systemd/*.path}; then
+if grep -Eq -- '-----BEGIN( [A-Z]+)? PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}' "$root_dir"/{compose.yaml,compose.bootstrap.yaml,env.example,README.md,nas/*.conf,router/*,scripts/backup.sh,scripts/bootstrap-admin.py,scripts/initialize.sh,scripts/restore-drill.sh,ssh/*.conf,systemd/*.service,systemd/*.timer,systemd/*.path}; then
   fail 'infrastructure artifacts must not contain committed credentials'
 fi
 
@@ -166,6 +174,30 @@ require_literal "$backup_script" '--tag joplin-database'
 require_literal "$backup_script" '--tag joplin-metadata'
 require_literal "$backup_script" 'database.dump'
 require_literal "$backup_script" 'restic backup'
+require_literal "$backup_ssh_config" 'Host joplin-backup-nas'
+require_literal "$backup_ssh_config" 'ProxyJump joplin-backup-router'
+require_literal "$backup_ssh_config" 'User joplin-backup-jump'
+require_literal "$backup_ssh_config" 'IdentityFile /etc/joplin-server/ssh/joplin-backup-ed25519'
+require_literal "$backup_ssh_config" 'UserKnownHostsFile /etc/joplin-server/ssh/known_hosts'
+require_literal "$backup_ssh_config" 'GlobalKnownHostsFile /dev/null'
+require_literal "$nas_sshd_config" 'Match User joplin-backup'
+require_literal "$nas_sshd_config" 'ChrootDirectory /volume1/Backups/joplin-server'
+require_literal "$nas_sshd_config" 'ForceCommand internal-sftp -d /repo'
+require_literal "$nas_sshd_config" 'AuthorizedKeysFile /etc/ssh/authorized_keys/joplin-backup'
+require_literal "$nas_sshd_config" 'AuthenticationMethods publickey'
+require_literal "$nas_sshd_config" 'AllowTcpForwarding no'
+require_literal "$nas_sshd_config" 'AllowStreamLocalForwarding no'
+if grep -Fq -- 'PermitUserEnvironment' "$nas_sshd_config"; then
+  fail 'PermitUserEnvironment is not valid inside this NAS Match block'
+fi
+require_literal "$router_key_options" 'restrict,port-forwarding,permitopen="192.168.5.170:22",command="/usr/bin/false"'
+require_literal "$router_sshd_config" 'Match User joplin-backup-jump'
+require_literal "$router_sshd_config" 'AuthorizedKeysFile /etc/ssh/authorized_keys/joplin-backup-jump'
+require_literal "$router_sshd_config" 'AuthenticationMethods publickey'
+require_literal "$router_sshd_config" 'AllowTcpForwarding local'
+require_literal "$router_sshd_config" 'AllowStreamLocalForwarding no'
+require_literal "$router_sshd_config" 'PermitOpen 192.168.5.170:22'
+require_literal "$router_sshd_config" 'ForceCommand /usr/bin/false'
 if grep -Fq -- 'RESTIC_PASSWORD=' "$backup_script"; then
   fail 'backup must use a root-only password file, not RESTIC_PASSWORD'
 fi
@@ -214,6 +246,7 @@ require_literal "$readme_file" 'DEPLOY_ENV_FILE'
 require_literal "$readme_file" 'minimum 20 characters'
 require_literal "$readme_file" 'Host header'
 require_literal "$readme_file" 'APP_BASE_URL'
+require_literal "$readme_file" '/etc/ssh/ssh_config.d/90-joplin-backup.conf'
 require_literal "$0" 'deploy_env_file=${DEPLOY_ENV_FILE:-}'
 require_literal "$0" "stat -c '%u:%g:%a'"
 require_literal "$0" '0:0:600'

@@ -30,6 +30,10 @@
 - `infra/joplin-server/env.example`
 - `infra/joplin-server/scripts/bootstrap-admin.py`
 - `infra/joplin-server/scripts/initialize.sh`
+- `infra/joplin-server/ssh/joplin-backup.conf`
+- `infra/joplin-server/nas/90-joplin-backup.conf`
+- `infra/joplin-server/router/joplin-backup-authorized-key-options`
+- `infra/joplin-server/router/90-joplin-backup-jump.conf`
 - `infra/joplin-server/scripts/backup.sh`
 - `infra/joplin-server/scripts/restore-drill.sh`
 - `infra/joplin-server/scripts/verify-config.sh`
@@ -86,8 +90,9 @@
 
 ### Task 4: Configure encrypted NAS backup
 
-- [ ] Create a dedicated NAS directory under `/volume1/Backups/joplin-server` with restrictive ownership and no new daemon.
-- [ ] Create a dedicated VM-to-NAS SSH key restricted to the backup target or the narrowest available command boundary.
+- [ ] Create `/volume1/Backups/joplin-server` as a root-owned mode-0755 chroot whose full `namei -l` parent chain is root-owned and not group/other writable; create only `/repo` as mode-0700 and writable by `joplin-backup`; install both external authorized-key files as root:root mode-0600; add no daemon.
+- [ ] Create a dedicated VM-to-NAS SSH key and independent router jump account; prove only SFTP plus local TCP forwarding to `192.168.5.170:22` succeed, while shell/command, other TCP targets, remote TCP forwarding, and both stream-local directions fail.
+- [ ] Through the VM alias, create, read, and delete an SFTP probe inside `/repo` before repository initialization.
 - [ ] Initialize a restic repository using a generated root-only password file; run the backup script manually.
 - [ ] Install and enable the nightly systemd timer with randomized delay and failure-visible journal status.
 - [ ] Verify `restic check`, snapshot contents, retention dry-run, repository permissions, and that no plaintext dump remains on VM or NAS.

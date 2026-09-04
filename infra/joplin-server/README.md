@@ -114,6 +114,37 @@ Before enabling the timer, deployment creates
 unit sets `RESTIC_CACHE_DIR` to that path, avoiding a cache write under a
 systemd-protected home directory.
 
+The VM installs `ssh/joplin-backup.conf` as the system include
+`/etc/ssh/ssh_config.d/90-joplin-backup.conf`, so restic's SFTP process resolves
+the dedicated aliases without a custom command-line option. Its root-only
+ED25519 key and pinned host keys live under `/etc/joplin-server/ssh`, which
+remains readable when the backup unit hides `/root`; both aliases ignore the
+global known-hosts database and require the dedicated pinned file. The jump
+account `joplin-backup-jump` on the China router uses the exact authorized-key
+restriction from `router/joplin-backup-authorized-key-options` together with
+the server-side `router/90-joplin-backup-jump.conf`: only local TCP forwarding
+to `192.168.5.170:22` is allowed; remote and stream-local forwarding are
+disabled, and shell or command requests are forced to `/usr/bin/false`.
+On the NAS, `joplin-backup` is locked to public-key
+authentication and `internal-sftp`, chrooted at
+`/volume1/Backups/joplin-server`, with the restic repository at `/repo`.
+Every component reported by
+`namei -l /volume1/Backups/joplin-server` must be owned by root and must not be
+group- or other-writable. The chroot root is specifically `root:root` mode `0755`;
+only its child `/repo` is writable, owned by
+`joplin-backup:joplin-backup` mode `0700`. The NAS authorized key is
+root-managed outside the chroot at `/etc/ssh/authorized_keys/joplin-backup`, so
+the SFTP account cannot replace its own authentication boundary. That file and
+the router's `/etc/ssh/authorized_keys/joplin-backup-jump` are each `root:root` mode `0600`.
+Password login, agent/TCP/stream-local/X11 forwarding, TTY, and tunnels are
+disabled for this account. Validate the NAS drop-in with `sshd -t` before
+reloading SSH. Validate the router drop-in the same way before reloading its
+existing SSH service; neither host requires a new daemon. Before initializing
+restic, connect through the VM alias and use SFTP to create, read, and delete a probe file
+under `/repo`; then prove shell/command requests, a different TCP
+destination, remote TCP forwarding, and local or remote stream-local forwarding
+all fail.
+
 ## Isolated restore drill
 
 `restore-drill.sh` creates a temporary root-only restore directory and uses
