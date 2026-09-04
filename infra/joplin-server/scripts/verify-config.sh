@@ -52,8 +52,13 @@ printf '%s\n' "$db_block" | grep -Fq 'joplin-server-internal' || fail 'PostgreSQ
 app_block=$(awk '/^  app:/{inside=1; next} /^  [[:alnum:]_-]+:/{if (inside) exit} inside {print}' "$compose_file")
 printf '%s\n' "$app_block" | grep -Fq 'joplin-server-internal' || fail 'Joplin app must reach PostgreSQL over the internal network'
 printf '%s\n' "$app_block" | grep -Fq 'joplin-server-egress' || fail 'Joplin app must retain egress for its startup NTP check'
+require_literal "$compose_file" 'DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:?set DEFAULT_ADMIN_PASSWORD in .env}'
 
 require_literal "$env_example" 'POSTGRES_PASSWORD=__GENERATE_AT_DEPLOYMENT__'
+require_literal "$env_example" 'DEFAULT_ADMIN_PASSWORD=__GENERATE_AT_DEPLOYMENT__'
+if grep -Fq -- 'DEFAULT_ADMIN_PASSWORD=admin' "$env_example"; then
+  fail 'example must not provide the upstream admin default password'
+fi
 if grep -Eq -- '-----BEGIN( [A-Z]+)? PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}' "$root_dir"/{compose.yaml,env.example,README.md,scripts/backup.sh,scripts/restore-drill.sh,systemd/*.service,systemd/*.timer,systemd/*.path}; then
   fail 'infrastructure artifacts must not contain committed credentials'
 fi
@@ -123,5 +128,7 @@ require_literal "$root_dir/systemd/joplin-tls-proxy-cert-watch.service" 'systemc
 require_literal "$readme_file" 'automatically observes the authoritative PVE certificate and key paths'
 require_literal "$readme_file" '/srv/joplin-server/.restic-cache'
 require_literal "$readme_file" 'root-only'
+require_literal "$readme_file" 'DEFAULT_ADMIN_PASSWORD'
+require_literal "$readme_file" 'first initialization'
 
 printf 'Joplin Server infrastructure static contract: PASS\n'

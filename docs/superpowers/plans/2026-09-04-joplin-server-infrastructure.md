@@ -53,6 +53,8 @@
 
 **Task 1 VM configuration gate (2026-09-04):** VM 101 ran the gate in an automatically cleaned `/tmp/joplin-config.*` directory: `verify-config.sh` passed; Docker Compose 2.32.1 production `config --quiet` passed with generated dummy values; and `sudo env RESTORE_CONFIG_ONLY=1 restore-drill.sh` passed without accessing restic or starting containers. The only output was tar's macOS provenance xattr-ignore notice, which did not affect the configuration gate.
 
+**Task 1 initial-admin hardening (2026-09-04):** The local Joplin Server source confirms `DEFAULT_ADMIN_PASSWORD` is supported and applies the configured default only on first startup. Compose now requires a generated `DEFAULT_ADMIN_PASSWORD` before startup and the example has only a deployment placeholder, preventing use of the upstream `admin` default on a fresh database. **Cost:** changing this environment variable after initialization does not rotate an existing admin password; that remains an authenticated Joplin administrative action.
+
 ### Task 2: Deploy the private VM stack
 
 - [ ] Confirm ports, free space, Docker health, and existing containers again immediately before mutation.

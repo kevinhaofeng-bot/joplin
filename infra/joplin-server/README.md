@@ -32,8 +32,12 @@ systemd restart policy and external HTTPS health checks provide supervision.
 ## Local configuration checks
 
 Create a real VM `/srv/joplin-server/.env` from `env.example` with a generated
-database password. Do not commit that file. A local, non-secret validation can
-use a temporary env file with dummy values:
+database password and a separate generated `DEFAULT_ADMIN_PASSWORD`. Do not
+commit that file. Joplin Server applies `DEFAULT_ADMIN_PASSWORD` only during
+first initialization of an empty database; set it before the first start so the
+upstream `admin` default is never used, and manage an existing admin password
+through Joplin rather than expecting a later environment change to replace it.
+A local, non-secret validation can use a temporary env file with dummy values:
 
 ```bash
 bash infra/joplin-server/scripts/verify-config.sh
