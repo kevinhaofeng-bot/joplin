@@ -1,4 +1,4 @@
-import { Readable, Writable } from 'node:stream';
+import { PassThrough, Readable, Writable } from 'node:stream';
 import { MAX_FRAME_BYTES } from './protocol';
 
 type Server = { runServer(input: Readable, output: Writable): Promise<void> };
@@ -32,15 +32,51 @@ describe('stdio sidecar server', () => {
 	test('rejects invalid UTF-8 fatally without replacement or raw-byte leakage', async () => {
 		const { runServer } = require('./server') as Server;
 		const { output, lines } = memoryOutput();
-		const valid = Buffer.from(frame('utf8', 'hello'), 'utf8');
-		const marker = Buffer.from('secret-marker', 'utf8');
-		const invalid = Buffer.concat([valid.subarray(0, valid.length - 10), Buffer.from([0xc3, 0x28]), marker, Buffer.from('"}\n', 'utf8')]);
+		const valid = Buffer.from(`${frame('utf8', 'hello', { marker: 'secret-marker' })}\n`, 'utf8');
+		const invalid = Buffer.from(valid);
+		const idByte = valid.indexOf(Buffer.from('"utf8"', 'utf8')) + 2;
+		invalid[idByte] = 0xff;
 
 		await runServer(Readable.from([invalid]), output);
 
 		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'INVALID_REQUEST', message: '请求格式无效' } });
 		expect(lines[0]).not.toContain('\ufffd');
 		expect(lines[0]).not.toContain('secret-marker');
+	});
+
+	test('completes shutdown promptly while stdin remains open for a single frame', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		const input = new PassThrough();
+		const running = runServer(input, output);
+
+		input.write(`${frame('stop', 'shutdown')}\n`);
+		await expect(Promise.race([
+			running,
+			new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown waited for EOF')), 500)),
+		])).resolves.toBeUndefined();
+
+		expect(input.destroyed).toBe(true);
+		expect(lines.map(line => JSON.parse(line))).toEqual([{ id: 'stop', ok: true, result: { stopped: true } }]);
+	});
+
+	test('completes shutdown promptly when hello and shutdown share an open stdin chunk', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		const input = new PassThrough();
+		const running = runServer(input, output);
+
+		input.write(`${frame('hello', 'hello')}\n${frame('stop', 'shutdown')}\n`);
+		await expect(Promise.race([
+			running,
+			new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown waited for EOF')), 500)),
+		])).resolves.toBeUndefined();
+
+		expect(input.destroyed).toBe(true);
+		expect(lines.map(line => JSON.parse(line))).toMatchObject([
+			{ id: 'hello', ok: true },
+			{ id: 'stop', ok: true, result: { stopped: true } },
+		]);
 	});
 
 	test('returns promptly when an open delimiter-free input reaches the limit', async () => {

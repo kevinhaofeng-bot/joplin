@@ -69,7 +69,10 @@ export async function runServer(input: Readable, output: Writable): Promise<void
 			await handleFrame(Buffer.concat([pending, source.subarray(0, lf + 1)]));
 			pending = Buffer.alloc(0);
 			source = source.subarray(lf + 1);
-			if (stopping) break;
+			if (stopping) {
+				input.destroy();
+				return;
+			}
 		}
 		while (!stopping && source.length) {
 			const lf = source.indexOf(0x0a);
@@ -84,6 +87,10 @@ export async function runServer(input: Readable, output: Writable): Promise<void
 			}
 			await handleFrame(source.subarray(0, lf + 1));
 			source = source.subarray(lf + 1);
+		}
+		if (stopping) {
+			input.destroy();
+			return;
 		}
 	}
 	if (!stopping && pending.length) await writeResponse(failureFrame('', 'INVALID_REQUEST', '请求格式无效'));

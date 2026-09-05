@@ -44,6 +44,12 @@ async fn official_node_sidecar_round_trips_note_fixture() {
             .contains("第二行中文")
     );
 
+    let shutdown_started = std::time::Instant::now();
     client.shutdown().await.expect("shutdown");
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(2),
+        "sidecar shutdown consumed the grace period: {:?}",
+        shutdown_started.elapsed()
+    );
     assert_eq!(client.state(), SidecarState::Stopped);
 }
