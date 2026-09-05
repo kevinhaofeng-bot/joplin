@@ -11,6 +11,16 @@
     "forceConsistentCasingInFileNames": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "baseUrl": ".",
+    "paths": {
+      "@joplin/editor/ProseMirror": ["src/vendor/editor-prosemirror.d.ts"],
+      "@joplin/editor/ProseMirror/types": ["src/vendor/editor-prosemirror-types.d.ts"],
+      "@joplin/editor/events": ["src/vendor/editor-events.d.ts"],
+      "@joplin/editor/types": ["src/vendor/editor-types.d.ts"],
+      "@joplin/renderer": ["src/vendor/renderer.d.ts"],
+      "@joplin/turndown": ["src/vendor/turndown.d.ts"],
+      "@joplin/turndown-plugin-gfm": ["src/vendor/turndown-gfm.d.ts"]
+    },
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,

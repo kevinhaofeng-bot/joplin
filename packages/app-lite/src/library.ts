@@ -34,6 +34,30 @@ export interface TrashResult { id: string; deletedTime: number }
 export interface DeleteResult { id: string; deleted: boolean }
 export interface SetNoteTagsResult { noteId: string; tagIds: string[]; updatedTime: number; changed: boolean }
 
+const stableMessages: Record<string, string> = {
+	SIDECAR_UNAVAILABLE: '本地资料库不可用', PROFILE_IN_USE: '资料库正在被使用', PROFILE_LOCK_REQUIRED: '资料库写入租约无效',
+	PROFILE_INVALID: '资料库路径无效', PROFILE_NOT_OWNED: '资料库不属于 Joplin Lite', PROFILE_ALREADY_OPEN: '资料库已经打开',
+	PROFILE_NOT_OPEN: '资料库尚未打开', PROFILE_OPEN_FAILED: '无法打开资料库', STORAGE_ERROR: '无法保存资料库',
+	NOT_FOUND: '项目不存在', VALIDATION_FAILED: '输入内容无效', CONFLICT: '项目已被其他操作修改',
+	SIDECAR_FAILED: '本地资料库操作失败',
+};
+
+export class LibraryClientError extends Error {
+	readonly code: string;
+	constructor(code: string, message?: string) {
+		const safeCode = code in stableMessages ? code : 'SIDECAR_FAILED';
+		super(stableMessages[safeCode] ?? message ?? stableMessages.SIDECAR_FAILED);
+		this.name = 'LibraryClientError';
+		this.code = safeCode;
+	}
+}
+
+export function normalizeLibraryError(error: unknown): LibraryClientError {
+	if (error instanceof LibraryClientError) return error;
+	if (isRecord(error) && typeof error.code === 'string') return new LibraryClientError(error.code);
+	return new LibraryClientError('SIDECAR_FAILED');
+}
+
 const INVALID_LIBRARY_RESPONSE = '本地资料库响应无效';
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
@@ -103,8 +127,13 @@ function guardPage(value: unknown): NotePage {
 	return { items: guardArray(value.items, guardNoteSummary), page: value.page, hasMore: value.hasMore };
 }
 async function call<T>(command: string, guard: (value: unknown)=> T, params?: unknown): Promise<T> {
-	const value = params === undefined ? await invoke<unknown>(command) : await invoke<unknown>(command, { params });
-	return guard(value);
+	try {
+		const value = params === undefined ? await invoke<unknown>(command) : await invoke<unknown>(command, { params });
+		return guard(value);
+	} catch (error) {
+		if (error instanceof Error && error.message === INVALID_LIBRARY_RESPONSE) throw error;
+		throw normalizeLibraryError(error);
+	}
 }
 
 export const profileStatus = () => call('profile_status', guardProfileStatus);
@@ -130,3 +159,17 @@ export const trashNote = (params: ExpectedUpdatedTimeParams) => call('trash_note
 export const setNoteTags = (params: SetNoteTagsParams) => call('set_note_tags', guardSetTags, params);
 
 export { INVALID_LIBRARY_RESPONSE };
+
+export interface LibraryApi {
+	openLibrary: typeof openLibrary; retryLibrary: typeof retryLibrary; shutdownLibrary: typeof shutdownLibrary;
+	profileStatus: typeof profileStatus; listFolders: typeof listFolders; createFolder: typeof createFolder;
+	updateFolder: typeof updateFolder; trashFolder: typeof trashFolder; listTags: typeof listTags;
+	createTag: typeof createTag; updateTag: typeof updateTag; deleteTag: typeof deleteTag;
+	listNotes: typeof listNotes; getNote: typeof getNote; createNote: typeof createNote;
+	updateNote: typeof updateNote; trashNote: typeof trashNote; setNoteTags: typeof setNoteTags;
+}
+
+export const libraryApi: LibraryApi = {
+	openLibrary, retryLibrary, shutdownLibrary, profileStatus, listFolders, createFolder, updateFolder, trashFolder,
+	listTags, createTag, updateTag, deleteTag, listNotes, getNote, createNote, updateNote, trashNote, setNoteTags,
+};
