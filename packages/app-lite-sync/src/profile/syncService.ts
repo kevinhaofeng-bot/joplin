@@ -30,6 +30,37 @@ export type SyncAdapter = {
 	syncNow: ()=> Promise<SyncSummary>;
 };
 
+export type SyncKeytar = {
+	getPassword: (service: string, account: string)=> Promise<string|null>;
+	setPassword: (service: string, account: string, password: string)=> Promise<void>;
+	deletePassword: (service: string, account: string)=> Promise<void>;
+};
+
+export type SyncSecretStore = {
+	read: ()=> Promise<string|null>;
+	write: (password: string)=> Promise<boolean>;
+	remove: ()=> Promise<void>;
+};
+
+export function createSyncSecretStore(keytar: SyncKeytar|null, service: string, account: string): SyncSecretStore|null {
+	if (!keytar) return null;
+	return {
+		read: () => keytar.getPassword(service, account),
+		write: async password => {
+			await keytar.setPassword(service, account, password);
+			return true;
+		},
+		remove: () => keytar.deletePassword(service, account),
+	};
+}
+
+export function syncConfigFromMetadata(target: unknown, targetId: unknown, url: unknown, username: unknown): SyncConfig {
+	const configured = target === targetId
+		&& typeof url === 'string' && url.length > 0
+		&& typeof username === 'string' && username.length > 0;
+	return configured ? { configured: true, url: url as string, username: username as string } : { configured: false };
+}
+
 const stableCodes = new Set(['SYNC_NOT_CONFIGURED', 'SYNC_AUTH_FAILED', 'SYNC_NETWORK', 'SYNC_BUSY', 'SYNC_FAILED']);
 
 export function syncError(code: string): Error & { code: string } {

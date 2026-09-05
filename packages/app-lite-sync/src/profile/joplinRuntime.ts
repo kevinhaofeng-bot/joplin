@@ -4,6 +4,7 @@ import { shimInit } from '../../../lib/shim-init-node';
 import initLib from '../../../lib/initLib';
 import JoplinDatabase from '../../../lib/JoplinDatabase';
 import { DatabaseDriverNode } from '../../../lib/database-driver-node';
+import shim from '../../../lib/shim';
 import BaseModel from '../../../lib/BaseModel';
 import BaseItem from '../../../lib/models/BaseItem';
 import Setting, { AppType, Env } from '../../../lib/models/Setting';
@@ -11,8 +12,6 @@ import ItemChange from '../../../lib/models/ItemChange';
 import { loadKeychainServiceAndSettings } from '../../../lib/services/SettingUtils';
 import RevisionService from '../../../lib/services/RevisionService';
 import BaseService from '../../../lib/services/BaseService';
-import KeychainService from '../../../lib/services/keychain/KeychainService';
-import KeychainServiceDriverNode from '../../../lib/services/keychain/KeychainServiceDriver.node';
 import ResourceService from '../../../lib/services/ResourceService';
 import ResourceFetcher from '../../../lib/services/ResourceFetcher';
 import SyncTargetJoplinServer from '../../../lib/SyncTargetJoplinServer';
@@ -27,7 +26,7 @@ import { reg } from '../../../lib/registry';
 import Logger from '../../../utils/Logger';
 import { registerItemClasses } from '../codec';
 import type { ValidatedProfilePaths } from './pathPolicy';
-import { syncError, SyncService, type SyncConfig, type SyncConfigInput, type SyncStatus, type SyncSummary } from './syncService';
+import { createSyncSecretStore, syncConfigFromMetadata, syncError, SyncService, type SyncConfig, type SyncConfigInput, type SyncStatus, type SyncSummary, type SyncSecretStore } from './syncService';
 
 const joplinVersion: string = require('../../../lib/package.json').version;
 
@@ -91,8 +90,7 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 			dispatch: (_action: unknown): undefined => undefined,
 		} as unknown as Parameters<ShareService['initialize']>[0];
 		ShareService.instance().initialize(shareStore, encryptionService);
-		await loadKeychainServiceAndSettings([KeychainServiceDriverNode]);
-		await KeychainService.instance().detectIfKeychainSupported();
+		await loadKeychainServiceAndSettings([]);
 		const clearPersistedSyncPassword = async () => {
 			Setting.setValue('sync.9.password', '');
 			await Setting.db().exec('DELETE FROM settings WHERE key = ?', ['sync.9.password']);
@@ -101,16 +99,20 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 		BaseItem.revisionService_ = RevisionService.instance();
 		SyncTargetRegistry.addClass(SyncTargetJoplinServer);
 		const syncPasswordKey = 'joplinLite.sync.9.password';
+		const syncSecretStore: SyncSecretStore|null = createSyncSecretStore(
+			shim.keytar?.() ?? null,
+			`${Setting.value('appId')}.${syncPasswordKey}`,
+			`${Setting.value('clientId')}@joplin`,
+		);
 
 		const syncService = new SyncService({
 			readConfig: async () => {
 				const url = Setting.value('sync.9.path');
 				const username = Setting.value('sync.9.username');
-				const configured = Setting.value('sync.target') === SyncTargetJoplinServer.id() && !!url && !!username && !!(await KeychainService.instance().password(syncPasswordKey));
-				return configured ? { configured: true, url, username } : { configured: false };
+				return syncConfigFromMetadata(Setting.value('sync.target'), SyncTargetJoplinServer.id(), url, username);
 			},
 			configure: async (input) => {
-				if (Setting.value('keychain.supported') !== 1 || !KeychainService.instance().enabled) throw syncError('SYNC_AUTH_FAILED');
+				if (!syncSecretStore) throw syncError('SYNC_AUTH_FAILED');
 				const check = await SyncTargetJoplinServer.checkConfig({
 					path: () => input.url,
 					userContentPath: () => '',
@@ -129,10 +131,10 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 					if (leaked.length) await Setting.db().exec('DELETE FROM settings WHERE key = ?', ['sync.9.password']);
 				};
 				try {
-					previousPassword = await KeychainService.instance().password(syncPasswordKey);
+					previousPassword = await syncSecretStore.read();
 					previousPasswordRead = true;
-					const saved = await KeychainService.instance().setPassword(syncPasswordKey, input.password);
-					if (!saved || await KeychainService.instance().password(syncPasswordKey) !== input.password) throw syncError('SYNC_AUTH_FAILED');
+					const saved = await syncSecretStore.write(input.password);
+					if (!saved || await syncSecretStore.read() !== input.password) throw syncError('SYNC_AUTH_FAILED');
 					Setting.setValue('sync.target', SyncTargetJoplinServer.id());
 					Setting.setValue('sync.9.path', input.url);
 					Setting.setValue('sync.9.username', input.username);
@@ -148,8 +150,8 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 				} catch (error) {
 					if (previousPasswordRead) {
 						try {
-							if (previousPassword) await KeychainService.instance().setPassword(syncPasswordKey, previousPassword);
-							else await KeychainService.instance().deletePassword(syncPasswordKey);
+							if (previousPassword) await syncSecretStore.write(previousPassword);
+							else await syncSecretStore.remove();
 						} catch {
 							// Preserve the stable original error and never expose keychain details.
 						}
@@ -172,7 +174,7 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 			syncNow: async () => {
 				const config = Setting.value('sync.9.path');
 				const username = Setting.value('sync.9.username');
-				const password = await KeychainService.instance().password(syncPasswordKey);
+				const password = await syncSecretStore?.read();
 				if (Setting.value('sync.target') !== SyncTargetJoplinServer.id() || !config || !username || !password) throw syncError('SYNC_NOT_CONFIGURED');
 				let report: { completedTime?: number; createLocal?: number; createRemote?: number; updateLocal?: number; updateRemote?: number; deleteLocal?: number; deleteRemote?: number; fetchingProcessed?: number } = {};
 				const contextRaw = Setting.value('sync.9.context');

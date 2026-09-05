@@ -1,4 +1,4 @@
-import { SyncService, type SyncAdapter } from './syncService';
+import { createSyncSecretStore, syncConfigFromMetadata, SyncService, type SyncAdapter } from './syncService';
 
 function adapter(overrides: Partial<SyncAdapter> = {}): SyncAdapter {
 	return {
@@ -10,6 +10,26 @@ function adapter(overrides: Partial<SyncAdapter> = {}): SyncAdapter {
 }
 
 describe('SyncService', () => {
+	test('does not create a keychain reader for ordinary runtime metadata', async () => {
+		expect(createSyncSecretStore(null, 'service', 'account')).toBeNull();
+	});
+
+	test('getConfig uses sync metadata without reading the keychain password', async () => {
+		const service = new SyncService(adapter({
+			readConfig: async () => syncConfigFromMetadata(9, 9, 'https://sync.example.test', 'user@example.test'),
+		}));
+
+		expect(await service.getConfig()).toEqual({ configured: true, url: 'https://sync.example.test', username: 'user@example.test' });
+	});
+
+	test('getConfig reports unconfigured when sync metadata is incomplete', async () => {
+		const service = new SyncService(adapter({
+			readConfig: async () => syncConfigFromMetadata(0, 9, 'https://sync.example.test', 'user@example.test'),
+		}));
+
+		expect(await service.getConfig()).toEqual({ configured: false });
+	});
+
 	test('never exposes the configured password', async () => {
 		const service = new SyncService(adapter());
 		expect(await service.getConfig()).toEqual({ configured: true, url: 'https://old.example.test', username: 'old@example.test' });
