@@ -468,6 +468,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let mut cleanup_esrch = observed_esrch;
         if !observed_esrch {
             let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
             let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -475,6 +476,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
                 if unsafe { libc::kill(pid, 0) } == -1
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
                 {
+                    cleanup_esrch = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -483,6 +485,11 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         let marker_present = marker.exists();
         let _ = std::fs::remove_file(marker);
         let _ = std::fs::remove_file(pid_path);
+        eprintln!(
+            "drop evidence pid={} observed_esrch={} cleanup_esrch={}",
+            pid, observed_esrch, cleanup_esrch
+        );
+        assert!(cleanup_esrch, "cleanup did not reach ESRCH");
         assert!(observed_esrch, "child did not disappear with ESRCH");
         assert!(!marker_present, "child continued running after drop");
     }
