@@ -4,6 +4,13 @@ import {
 	parseRequestFrame,
 } from './protocol';
 
+function frameWithPayloadBytes(byteLength: number): string {
+	const frame = { id: 'boundary', protocolVersion: 1, command: 'hello', params: { padding: '' } };
+	const emptyLength = Buffer.byteLength(JSON.stringify(frame), 'utf8');
+	frame.params.padding = 'x'.repeat(byteLength - emptyLength);
+	return JSON.stringify(frame);
+}
+
 describe('parseRequestFrame', () => {
 	test('accepts a valid hello request frame', () => {
 		expect(parseRequestFrame('{"id":"r1","protocolVersion":1,"command":"hello","params":{}}')).toEqual({
@@ -33,4 +40,14 @@ describe('parseRequestFrame', () => {
 
 test('failure frames do not expose an Error stack', () => {
 	expect(failureFrame('r1', 'INVALID_REQUEST', '请求格式无效')).not.toHaveProperty('stack');
+});
+
+test('counts the terminating LF in the exact maximum request frame boundary', () => {
+	const payloadAtMaxMinusOne = frameWithPayloadBytes(MAX_FRAME_BYTES - 1);
+	expect(Buffer.byteLength(payloadAtMaxMinusOne, 'utf8') + 1).toBe(MAX_FRAME_BYTES);
+	expect(parseRequestFrame(payloadAtMaxMinusOne).id).toBe('boundary');
+
+	const payloadAtMax = frameWithPayloadBytes(MAX_FRAME_BYTES);
+	expect(Buffer.byteLength(payloadAtMax, 'utf8') + 1).toBe(MAX_FRAME_BYTES + 1);
+	expect(() => parseRequestFrame(payloadAtMax)).toThrow(expect.objectContaining({ code: 'FRAME_TOO_LARGE' }));
 });

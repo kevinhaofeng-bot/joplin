@@ -20,3 +20,4 @@ futures-util = { version = "0.3", features = ["sink"] }
 tauri-build = { version = "2.6.3", features = [] }
 
 [dev-dependencies]
+libc = "0.2"

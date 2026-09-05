@@ -122,7 +122,9 @@ impl SidecarClient {
         }
         if !response.ok {
             let error = classify_response_error(&response);
-            self.fail(error.kind()).await;
+            if error.kind() == SidecarErrorKind::ProtocolMismatch {
+                self.fail(error.kind()).await;
+            }
             return Err(error);
         }
         match response.result {
@@ -140,6 +142,10 @@ impl SidecarClient {
     }
 
     pub async fn shutdown(&mut self) -> Result<(), SidecarError> {
+        self.shutdown_with_budget(Duration::from_secs(5)).await
+    }
+
+    async fn shutdown_with_budget(&mut self, budget: Duration) -> Result<(), SidecarError> {
         if self.state == SidecarState::Stopped {
             return Ok(());
         }
@@ -151,11 +157,9 @@ impl SidecarClient {
         self.state = SidecarState::Stopping;
         let id = format!("request-{}", self.next_request);
         self.next_request += 1;
-        let shutdown_result = timeout(
-            Duration::from_secs(5),
-            self.exchange(&id, "shutdown", json!({})),
-        )
-        .await;
+        let deadline = tokio::time::Instant::now() + budget;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let shutdown_result = timeout(remaining, self.exchange(&id, "shutdown", json!({}))).await;
         let result = match shutdown_result {
             Ok(Ok(response)) => {
                 if validate_response_id(&response, &id).is_err() || !response.ok {
@@ -173,8 +177,9 @@ impl SidecarClient {
                 "shutdown timeout",
             )),
         };
-        let _ = timeout(Duration::from_secs(5), self.child.wait()).await;
-        if self.child.try_wait().ok().flatten().is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let waited = timeout(remaining, self.child.wait()).await;
+        if waited.is_err() || self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill().await;
             let _ = self.child.wait().await;
         }
@@ -270,6 +275,11 @@ const rl=require('readline').createInterface({input:process.stdin});
 rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
 "#;
 
+    const DOMAIN_FAILURE_SCRIPT: &str = r#"
+const rl=require('readline').createInterface({input:process.stdin});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='domain')process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'INVALID_ITEM',message:'secret-domain-detail'}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
+"#;
+
     #[tokio::test]
     async fn valid_hello_and_echo_are_correlated() {
         let mut client = SidecarClient::start(command(ECHO_SCRIPT), Duration::from_secs(1))
@@ -283,6 +293,27 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         assert_eq!(result["value"], "ok");
         client.shutdown().await.expect("shutdown");
         assert_eq!(client.state(), SidecarState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn domain_failure_is_redacted_and_keeps_client_ready() {
+        let mut client =
+            SidecarClient::start(command(DOMAIN_FAILURE_SCRIPT), Duration::from_secs(1))
+                .await
+                .expect("sidecar starts");
+        let error = client
+            .request("domain", json!({"secret":"secret-marker"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::InvalidResponse);
+        assert_eq!(error.to_string(), "兼容组件响应无效");
+        assert!(!error.to_string().contains("secret-domain-detail"));
+        assert_eq!(client.state(), SidecarState::Ready);
+        assert_eq!(
+            client.request("echo", json!({"after":true})).await.unwrap()["after"],
+            true
+        );
+        client.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -337,6 +368,42 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){process.std
         assert_eq!(client.state(), SidecarState::Failed);
     }
 
+    fn exact_boundary_script(target_payload_bytes: usize) -> String {
+        format!(
+            "const rl=require('readline').createInterface({{input:process.stdin}});const make=(id)=>{{const o={{id,ok:true,result:{{padding:''}}}};const empty=JSON.stringify(o);o.result.padding='x'.repeat({}-Buffer.byteLength(empty));return JSON.stringify(o);}};rl.on('line',line=>{{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({{id:r.id,ok:true,result:{{protocolVersion:1}}}})+'\\n');else if(r.command==='shutdown'){{process.stdout.write(JSON.stringify({{id:r.id,ok:true,result:{{}}}})+'\\n');process.exit(0);}}else process.stdout.write(make(r.id)+'\\n');}});",
+            target_payload_bytes
+        )
+    }
+
+    #[tokio::test]
+    async fn exact_max_minus_one_payload_plus_lf_is_accepted() {
+        let mut client = SidecarClient::start(
+            command(&exact_boundary_script(MAX_FRAME_BYTES - 1)),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("start");
+        let result = client
+            .request("echo", json!({}))
+            .await
+            .expect("boundary response");
+        assert!(result["padding"].as_str().expect("padding").len() > MAX_FRAME_BYTES - 100);
+        client.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn exact_max_payload_plus_lf_is_rejected() {
+        let mut client = SidecarClient::start(
+            command(&exact_boundary_script(MAX_FRAME_BYTES)),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("start");
+        let error = client.request("echo", json!({})).await.unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::FrameTooLarge);
+        assert_eq!(client.state(), SidecarState::Failed);
+    }
+
     #[tokio::test]
     async fn shutdown_reaps_child() {
         let mut client = SidecarClient::start(command(ECHO_SCRIPT), Duration::from_secs(1))
@@ -348,21 +415,56 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){process.std
     }
 
     #[tokio::test]
+    async fn shutdown_budget_covers_silent_response_and_reap() {
+        let script = r#"
+const rl=require('readline').createInterface({input:process.stdin});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');});
+"#;
+        let mut client = SidecarClient::start(command(script), Duration::from_secs(10))
+            .await
+            .expect("start");
+        let started = std::time::Instant::now();
+        let error = client
+            .shutdown_with_budget(Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(client.state(), SidecarState::Stopped);
+        assert!(client.child.try_wait().expect("wait status").is_some());
+    }
+
+    #[tokio::test]
     async fn dropping_live_client_does_not_leave_marker() {
         let marker =
             std::env::temp_dir().join(format!("joplin-sidecar-drop-{}", std::process::id()));
+        let pid_path =
+            std::env::temp_dir().join(format!("joplin-sidecar-pid-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
-        let script = "const fs=require('fs');const p=process.argv[1];const rl=require('readline').createInterface({input:process.stdin});rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\\n');setTimeout(()=>fs.writeFileSync(p,'survived'),300);}});".to_string();
+        let _ = std::fs::remove_file(&pid_path);
+        let script = "const fs=require('fs');const p=process.argv[1];const pid=process.argv[2];const rl=require('readline').createInterface({input:process.stdin});rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){fs.writeFileSync(pid,String(process.pid));process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\\n');setTimeout(()=>fs.writeFileSync(p,'survived'),300);}});".to_string();
         let mut args_command = command(&script);
         args_command
             .args
             .push(marker.to_string_lossy().into_owned());
+        args_command
+            .args
+            .push(pid_path.to_string_lossy().into_owned());
         let client = SidecarClient::start(args_command, Duration::from_secs(1))
             .await
             .expect("start");
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+            .expect("child pid")
+            .parse()
+            .expect("numeric pid");
         drop(client);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline && unsafe { libc::kill(pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child still exists");
         assert!(!marker.exists());
         let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_file(pid_path);
     }
 }

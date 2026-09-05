@@ -43,16 +43,18 @@ mod protocol_tests {
     #[test]
     fn public_errors_are_fixed_and_redacted() {
         let secret = "supplied-secret-marker";
-        for kind in [
-            SidecarErrorKind::SpawnFailed,
-            SidecarErrorKind::Timeout,
-            SidecarErrorKind::SidecarExited,
-            SidecarErrorKind::ProtocolMismatch,
-            SidecarErrorKind::InvalidResponse,
-            SidecarErrorKind::FrameTooLarge,
-            SidecarErrorKind::Io,
+        for (kind, expected_message) in [
+            (SidecarErrorKind::SpawnFailed, "无法启动兼容组件"),
+            (SidecarErrorKind::Timeout, "兼容组件响应超时"),
+            (SidecarErrorKind::SidecarExited, "兼容组件已退出"),
+            (SidecarErrorKind::ProtocolMismatch, "兼容协议版本不匹配"),
+            (SidecarErrorKind::InvalidResponse, "兼容组件响应无效"),
+            (SidecarErrorKind::FrameTooLarge, "兼容组件响应过大"),
+            (SidecarErrorKind::Io, "兼容组件通信失败"),
         ] {
             let error = SidecarError::new(kind, secret);
+            assert_eq!(error.message(), expected_message);
+            assert_eq!(error.to_string(), expected_message);
             assert!(!error.to_string().contains(secret));
             assert!(!error.message().contains(secret));
         }

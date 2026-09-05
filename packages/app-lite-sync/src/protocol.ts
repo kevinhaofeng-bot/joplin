@@ -27,7 +27,7 @@ const invalidRequest = (): ProtocolError => new ProtocolError('INVALID_REQUEST',
 
 export function parseRequestFrame(line: string): RequestFrame {
 	if (typeof line !== 'string') throw invalidRequest();
-	if (Buffer.byteLength(line, 'utf8') > MAX_FRAME_BYTES) {
+	if (Buffer.byteLength(line, 'utf8') + 1 > MAX_FRAME_BYTES) {
 		throw new ProtocolError('FRAME_TOO_LARGE', '协议帧过大');
 	}
 

@@ -21,6 +21,13 @@ const frame = (id: string, command: string, params: Record<string, unknown> = {}
 	params,
 });
 
+const frameWithPayloadBytes = (byteLength: number): string => {
+	const value = { id: 'boundary', protocolVersion: 1, command: 'hello', params: { padding: '' } };
+	const emptyLength = Buffer.byteLength(JSON.stringify(value), 'utf8');
+	value.params.padding = 'x'.repeat(byteLength - emptyLength);
+	return JSON.stringify(value);
+};
+
 describe('stdio sidecar server', () => {
 	test('writes one JSON response per request and stops after shutdown', async () => {
 		const { runServer } = require('./server') as Server;
@@ -108,5 +115,27 @@ describe('stdio sidecar server', () => {
 		expect(Buffer.byteLength(lines[0], 'utf8')).toBeLessThanOrEqual(MAX_FRAME_BYTES);
 		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
 		expect(lines[0]).not.toContain(marker);
+	});
+
+	test('accepts payload of MAX minus one because its LF completes MAX bytes', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		const payload = frameWithPayloadBytes(MAX_FRAME_BYTES - 1);
+		expect(Buffer.byteLength(payload, 'utf8') + 1).toBe(MAX_FRAME_BYTES);
+
+		await runServer(Readable.from([`${payload}\n`]), output);
+
+		expect(JSON.parse(lines[0])).toMatchObject({ id: 'boundary', ok: true, result: { protocolVersion: 1 } });
+	});
+
+	test('rejects payload of MAX because its LF makes the frame oversized', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		const payload = frameWithPayloadBytes(MAX_FRAME_BYTES);
+		expect(Buffer.byteLength(payload, 'utf8') + 1).toBe(MAX_FRAME_BYTES + 1);
+
+		await runServer(Readable.from([`${payload}\n`]), output);
+
+		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
 	});
 });
