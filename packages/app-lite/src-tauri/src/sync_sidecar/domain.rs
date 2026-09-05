@@ -121,15 +121,6 @@ pub struct JexImportSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum JexImportState {
-    Idle,
-    Running,
-    Succeeded,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JexImportCode {
     ImportInvalid,
@@ -137,14 +128,49 @@ pub enum JexImportCode {
     ImportFailed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct JexImportStatus {
-    pub state: JexImportState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<JexImportSummary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<JexImportCode>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum JexImportStatus {
+    Idle,
+    Running,
+    Succeeded { summary: JexImportSummary },
+    Failed { code: JexImportCode },
+}
+
+impl<'de> Deserialize<'de> for JexImportStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("JEX status must be an object"))?;
+        let state = object
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("JEX status state missing"))?;
+        let has_only = |keys: &[&str]| {
+            object.keys().all(|key| keys.contains(&key.as_str()))
+                && keys.iter().all(|key| object.contains_key(*key))
+        };
+        match state {
+            "idle" if has_only(&["state"]) => Ok(Self::Idle),
+            "running" if has_only(&["state"]) => Ok(Self::Running),
+            "succeeded" if has_only(&["state", "summary"]) => {
+                let summary =
+                    serde_json::from_value(object.get("summary").cloned().unwrap_or_default())
+                        .map_err(serde::de::Error::custom)?;
+                Ok(Self::Succeeded { summary })
+            }
+            "failed" if has_only(&["state", "code"]) => {
+                let code = serde_json::from_value(object.get("code").cloned().unwrap_or_default())
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::Failed { code })
+            }
+            _ => Err(serde::de::Error::custom("invalid JEX status")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,7 +479,23 @@ mod tests {
 
     #[test]
     fn jex_status_is_strict_and_safe() {
-        let value = serde_json::json!({ "state": "succeeded", "summary": { "notes": 1, "folders": 1, "tags": 0, "resources": 1 }, "unexpected": true });
-        assert!(serde_json::from_value::<JexImportStatus>(value).is_err());
+        for (index, value) in [
+            serde_json::json!({ "state": "idle", "summary": { "notes": 1, "folders": 0, "tags": 0, "resources": 0 } }),
+            serde_json::json!({ "state": "running", "code": "IMPORT_BUSY" }),
+            serde_json::json!({ "state": "succeeded", "code": "IMPORT_FAILED" }),
+            serde_json::json!({ "state": "failed", "summary": { "notes": 1, "folders": 0, "tags": 0, "resources": 0 } }),
+            serde_json::json!({ "state": "failed" }),
+            serde_json::json!({ "state": "failed", "code": "SECRET_ERROR" }),
+            serde_json::json!({ "state": "unknown" }),
+            serde_json::json!({ "state": "succeeded", "summary": { "notes": 1, "folders": 1, "tags": 0, "resources": 1 }, "unexpected": true }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(serde_json::from_value::<JexImportStatus>(value).is_err(), "accepted invalid JEX status at index {index}");
+        }
+
+        let succeeded = serde_json::json!({ "state": "succeeded", "summary": { "notes": 1, "folders": 1, "tags": 0, "resources": 1 } });
+        assert!(serde_json::from_value::<JexImportStatus>(succeeded).is_ok());
     }
 }

@@ -314,7 +314,7 @@ export default function App({
 						<label>密码<input aria-label="密码" type="password" value={syncPassword} onChange={event => setSyncPassword(event.target.value)} required /></label>
 						<button type="submit" disabled={syncState === 'saving'}>{syncState === 'saving' ? '连接中…' : '连接并保存'}</button>
 					</form> : null}
-					<button type="button" className="sync-settings" onClick={() => { void importJex(); }} disabled={jexStatus.state === 'running'}>{jexStatus.state === 'running' ? '导入中…' : '从 JEX 导入'}</button>
+					<button type="button" className="sync-settings" onClick={() => { void importJex(); }} disabled={jexStatus.state === 'running' || syncState === 'saving' || syncState === 'syncing'}>{jexStatus.state === 'running' ? '导入中…' : '从 JEX 导入'}</button>
 					{jexStatus.state === 'succeeded' ? <small role="status">已导入 {jexStatus.summary.notes} 篇笔记</small> : null}
 					{jexStatus.state === 'failed' ? <small role="status">JEX 导入失败，可重试</small> : null}
 				</div>

@@ -244,6 +244,7 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 			const before = await countItems();
 			await InteropService.instance().import({ path, format: 'jex' });
 			await ItemChange.waitForAllSaved();
+			await ResourceService.instance().indexNoteResources();
 			await Setting.saveAll();
 			return countImported(before);
 		});

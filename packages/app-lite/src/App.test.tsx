@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
-import { LibraryClientError, type LibraryApi, type NoteDetail } from './library';
+import { LibraryClientError, type LibraryApi, type NoteDetail, type SyncStatus } from './library';
 import type { RichTextEditorProps } from './RichTextEditor';
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/tmp/export.jex') }));
@@ -119,20 +119,23 @@ describe('App', () => {
 	});
 
 	it('polls background sync without blocking an autosave', async () => {
+		let releaseSyncStatus!: ()=> void;
 		const api = makeApi({
 			listNotes: vi.fn(async () => ({ items: [note], page: 1, hasMore: false })),
 			getSyncConfig: vi.fn(async () => ({ configured: true, url: 'https://sync.example.test', username: 'user@example.test' })),
 			startSync: vi.fn(async () => ({ state: 'running' as const })),
-			getSyncStatus: vi.fn(async () => ({ state: 'succeeded' as const, summary: { completedAt: 2, created: 0, updated: 1, deleted: 0, fetched: 0 } })),
+			getSyncStatus: vi.fn((): Promise<SyncStatus> => new Promise(resolve => { releaseSyncStatus = () => resolve({ state: 'succeeded' as const, summary: { completedAt: 2, created: 0, updated: 1, deleted: 0, fetched: 0 } }); })),
 		});
 		render(<App loadRuntimeInfo={runtime} library={api} EditorComponent={FakeEditor} />);
 		fireEvent.click(await screen.findByRole('button', { name: '未命名笔记' }));
 		const body = await screen.findByRole('textbox', { name: '正文' });
 		fireEvent.click(screen.getByRole('button', { name: '同步' }));
 		await waitFor(() => expect(api.startSync).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(api.getSyncStatus).toHaveBeenCalledTimes(1), { timeout: 1500 });
+		expect(screen.getByRole('button', { name: '从 JEX 导入' })).toBeDisabled();
 		fireEvent.change(body, { target: { value: '同步期间的编辑' } });
 		await waitFor(() => expect(api.updateNote).toHaveBeenCalledWith(expect.objectContaining({ body: '同步期间的编辑' })), { timeout: 1500 });
-		await waitFor(() => expect(api.getSyncStatus).toHaveBeenCalledTimes(1), { timeout: 1500 });
+		releaseSyncStatus();
 	});
 
 	it('debounces note search and Escape restores the regular list', async () => {
