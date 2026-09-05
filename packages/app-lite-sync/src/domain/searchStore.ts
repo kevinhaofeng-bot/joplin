@@ -18,7 +18,7 @@ type SearchRunner = (query: string)=> Promise<{ notes: NoteEntity[]; results: Se
 function input(input: SearchNotesInput): { query: string; limit: number } {
 	if (typeof input?.query !== 'string') throw validationError();
 	const query = input.query.trim();
-	if (!query || query.length > MAX_QUERY_LENGTH || query.includes('\0')) throw validationError();
+	if (!query || Array.from(query).length > MAX_QUERY_LENGTH || query.includes('\0')) throw validationError();
 	const limit = input.limit === undefined ? 50 : input.limit;
 	if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT) throw validationError();
 	return { query, limit };

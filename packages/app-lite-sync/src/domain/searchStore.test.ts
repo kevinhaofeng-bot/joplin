@@ -29,4 +29,13 @@ describe('SearchStore', () => {
 			}],
 		});
 	});
+
+	test('counts Unicode code points for the query limit', async () => {
+		const acceptedQuery = '中'.repeat(256);
+		const store = new SearchStore(async () => ({ notes: [], results: [] }));
+
+		await expect(store.search({ query: acceptedQuery })).resolves.toMatchObject({ query: acceptedQuery });
+		await expect(store.search({ query: `${acceptedQuery}中` })).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
+		await expect(store.search({ query: '😀'.repeat(256) })).resolves.toMatchObject({ query: '😀'.repeat(256) });
+	});
 });

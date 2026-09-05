@@ -272,7 +272,7 @@ impl LibraryState {
         params: SearchNotesParams,
     ) -> Result<SearchNotePage, LibraryError> {
         if params.query.trim().is_empty()
-            || params.query.len() > 256
+            || params.query.chars().count() > 256
             || params.query.contains('\0')
             || params
                 .limit
@@ -643,5 +643,27 @@ mod tests {
         let max_encoded = MAX_PASTED_IMAGE_BYTES.div_ceil(3) * 4 + 4;
         assert!(max_encoded < 15 * 1024 * 1024);
         assert!(max_encoded > MAX_PASTED_IMAGE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn search_query_limit_counts_unicode_code_points() {
+        let state = LibraryState::unavailable();
+        let accepted = state
+            .search_notes(SearchNotesParams {
+                query: "中".repeat(256),
+                limit: None,
+            })
+            .await
+            .expect_err("the unavailable state should be reached after validation");
+        assert_eq!(accepted.code, SIDECAR_UNAVAILABLE_CODE);
+
+        let rejected = state
+            .search_notes(SearchNotesParams {
+                query: "中".repeat(257),
+                limit: None,
+            })
+            .await
+            .expect_err("queries above the code-point limit must be rejected");
+        assert_eq!(rejected.code, "VALIDATION_FAILED");
     }
 }
