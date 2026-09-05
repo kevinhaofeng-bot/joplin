@@ -1,5 +1,13 @@
 export const PROTOCOL_VERSION = 1 as const;
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+export const PROFILE_DIRECTORY_NAME = 'com.kevinhao.joplin-lite';
+export const PROFILE_FORMAT_VERSION = 1 as const;
+export const PROFILE_ERROR_MESSAGES = {
+	PROFILE_INVALID: '资料库路径无效',
+	PROFILE_NOT_OWNED: '资料库不属于 Joplin Lite',
+} as const;
+
+export type ProfileErrorCode = keyof typeof PROFILE_ERROR_MESSAGES;
 
 export type RequestFrame = {
 	id: string;
@@ -21,6 +29,10 @@ export class ProtocolError extends Error {
 		super(message);
 		this.name = 'ProtocolError';
 	}
+}
+
+export function profileError(code: ProfileErrorCode): ProtocolError {
+	return new ProtocolError(code, PROFILE_ERROR_MESSAGES[code]);
 }
 
 const invalidRequest = (): ProtocolError => new ProtocolError('INVALID_REQUEST', '请求格式无效');
