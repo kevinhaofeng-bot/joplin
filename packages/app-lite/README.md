@@ -48,3 +48,9 @@ implement note CRUD, E2EE, OCR, or access to the real Joplin profile.
 The next plan is the **compatibility-fixture and sync-sidecar plan**. That work
 must keep this isolated, no-existing-data boundary until its own compatibility
 and migration acceptance criteria are met.
+
+The compatibility sidecar now exists as a supervised, testable boundary, but
+the application does not start it yet. This phase uses no real Joplin profile,
+network, server, credentials, or user data. Local canonical profile creation
+and Note/Folder/Tag CRUD are the next plan. Final packaging will bundle a
+fixed Node runtime rather than depend on the user's system Node installation.

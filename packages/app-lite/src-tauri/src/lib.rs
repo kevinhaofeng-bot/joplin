@@ -1,5 +1,6 @@
 pub mod profile;
 pub mod runtime;
+pub mod sync_sidecar;
 
 use tauri::Manager;
 
