@@ -369,24 +369,6 @@ impl SidecarClient {
     }
 }
 
-impl Drop for SidecarClient {
-    fn drop(&mut self) {
-        if self.lease.is_none() {
-            return;
-        }
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.start_kill();
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while self.child.try_wait().ok().flatten().is_none()
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        self.lease.take();
-    }
-}
-
 fn map_frame_error(error: FrameError) -> SidecarError {
     match error {
         FrameError::TooLarge => {
