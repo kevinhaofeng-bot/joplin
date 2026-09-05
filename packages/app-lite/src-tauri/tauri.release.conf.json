@@ -5,6 +5,9 @@
   },
   "bundle": {
     "active": true,
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "resources": {
       "resources/sidecar/": "sidecar/"
     }
