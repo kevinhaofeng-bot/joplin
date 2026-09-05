@@ -425,11 +425,11 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
             .expect("start");
         let started = std::time::Instant::now();
         let error = client
-            .shutdown_with_budget(Duration::from_millis(100))
+            .shutdown_with_budget(Duration::from_millis(250))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::Timeout);
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_millis(400));
         assert_eq!(client.state(), SidecarState::Stopped);
         assert!(client.child.try_wait().expect("wait status").is_some());
     }
@@ -442,7 +442,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
             std::env::temp_dir().join(format!("joplin-sidecar-pid-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let _ = std::fs::remove_file(&pid_path);
-        let script = "const fs=require('fs');const p=process.argv[1];const pid=process.argv[2];const rl=require('readline').createInterface({input:process.stdin});rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){fs.writeFileSync(pid,String(process.pid));process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\\n');setTimeout(()=>fs.writeFileSync(p,'survived'),300);}});".to_string();
+        let script = "const fs=require('fs');const p=process.argv[1];const pid=process.argv[2];setInterval(()=>{},1000);const rl=require('readline').createInterface({input:process.stdin});rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){fs.writeFileSync(pid,String(process.pid));process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\\n');setTimeout(()=>fs.writeFileSync(p,'survived'),300);}});".to_string();
         let mut args_command = command(&script);
         args_command
             .args
@@ -459,12 +459,31 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
             .expect("numeric pid");
         drop(client);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        while tokio::time::Instant::now() < deadline && unsafe { libc::kill(pid, 0) } == 0 {
+        let mut observed_esrch = false;
+        while tokio::time::Instant::now() < deadline {
+            let result = unsafe { libc::kill(pid, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                observed_esrch = true;
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child still exists");
-        assert!(!marker.exists());
+        if !observed_esrch {
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+            while tokio::time::Instant::now() < cleanup_deadline {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let marker_present = marker.exists();
         let _ = std::fs::remove_file(marker);
         let _ = std::fs::remove_file(pid_path);
+        assert!(observed_esrch, "child did not disappear with ESRCH");
+        assert!(!marker_present, "child continued running after drop");
     }
 }
