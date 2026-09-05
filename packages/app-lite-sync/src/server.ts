@@ -3,6 +3,10 @@ import type { Readable, Writable } from 'node:stream';
 import { handleRequest } from './handler';
 import { MAX_FRAME_BYTES, parseRequestFrame, failureFrame, ProtocolError } from './protocol';
 
+function frameByteLength(serialized: string): number {
+	return Buffer.byteLength(`${serialized}\n`, 'utf8');
+}
+
 export async function runServer(input: Readable, output: Writable): Promise<void> {
 	const lines = createInterface({ input, crlfDelay: Infinity });
 
@@ -30,8 +34,16 @@ export async function runServer(input: Readable, output: Writable): Promise<void
 			}
 
 			let serialized = JSON.stringify(response);
-			if (Buffer.byteLength(serialized, 'utf8') > MAX_FRAME_BYTES) {
+			if (frameByteLength(serialized) > MAX_FRAME_BYTES) {
 				response = failureFrame(requestId, 'FRAME_TOO_LARGE', '协议帧过大');
+				serialized = JSON.stringify(response);
+				if (frameByteLength(serialized) > MAX_FRAME_BYTES) {
+					response = failureFrame('', 'FRAME_TOO_LARGE', '协议帧过大');
+					serialized = JSON.stringify(response);
+				}
+			}
+			if (frameByteLength(serialized) > MAX_FRAME_BYTES) {
+				response = failureFrame('', 'FRAME_TOO_LARGE', '协议帧过大');
 				serialized = JSON.stringify(response);
 			}
 			output.write(`${serialized}\n`);

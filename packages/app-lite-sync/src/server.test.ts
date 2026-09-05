@@ -93,4 +93,20 @@ describe('stdio sidecar server', () => {
 		expect(JSON.parse(lines[0])).toEqual({ id: 'oversize', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
 		expect(lines[0]).not.toContain(item.body);
 	});
+
+	test('falls back to an empty id when a long-id response error would exceed the frame limit', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		const marker = 'LONG-ID-MARKER-';
+		const id = marker + 'i'.repeat(MAX_FRAME_BYTES - 60 - marker.length);
+		const line = JSON.stringify({ id, protocolVersion: 1, command: 'hello', params: {} });
+
+		expect(Buffer.byteLength(line, 'utf8')).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+		await runServer(Readable.from([`${line}\n`]), output);
+
+		expect(lines).toHaveLength(1);
+		expect(Buffer.byteLength(lines[0], 'utf8')).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
+		expect(lines[0]).not.toContain(marker);
+	});
 });
