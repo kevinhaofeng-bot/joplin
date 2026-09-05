@@ -251,6 +251,14 @@ impl SidecarClient {
         }
         if !response.ok {
             let error = classify_response_error(&response);
+            if matches!(
+                error.kind(),
+                SidecarErrorKind::ProfileLockRequired
+                    | SidecarErrorKind::ProfileOpenFailed
+                    | SidecarErrorKind::StorageError
+            ) {
+                self.fail(error.kind()).await;
+            }
             return Err(error);
         }
         match response.result {

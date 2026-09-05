@@ -1,7 +1,7 @@
 import { PassThrough, Readable, Writable } from 'node:stream';
 import { MAX_FRAME_BYTES } from './protocol';
 
-type Server = { runServer(input: Readable, output: Writable): Promise<void> };
+type Server = { runServer(input: Readable, output: Writable, makeSession?: ()=> any): Promise<0 | 1> };
 
 function memoryOutput(): { output: Writable; lines: string[] } {
 	const lines: string[] = [];
@@ -22,7 +22,7 @@ const frame = (id: string, command: string, params: Record<string, unknown> = {}
 });
 
 const frameWithPayloadBytes = (byteLength: number): string => {
-	const value = { id: 'boundary', protocolVersion: 1, command: 'hello', params: { padding: '' } };
+	const value = { id: 'boundary', protocolVersion: 1, command: 'not-real', params: { padding: '' } };
 	const emptyLength = Buffer.byteLength(JSON.stringify(value), 'utf8');
 	value.params.padding = 'x'.repeat(byteLength - emptyLength);
 	return JSON.stringify(value);
@@ -54,7 +54,7 @@ describe('stdio sidecar server', () => {
 		await expect(Promise.race([
 			running,
 			new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown waited for EOF')), 500)),
-		])).resolves.toBeUndefined();
+		])).resolves.toBe(0);
 
 		expect(input.destroyed).toBe(true);
 		expect(lines.map(line => JSON.parse(line))).toEqual([{ id: 'stop', ok: true, result: { stopped: true } }]);
@@ -70,7 +70,7 @@ describe('stdio sidecar server', () => {
 		await expect(Promise.race([
 			running,
 			new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown waited for EOF')), 500)),
-		])).resolves.toBeUndefined();
+		])).resolves.toBe(0);
 
 		expect(input.destroyed).toBe(true);
 		expect(lines.map(line => JSON.parse(line))).toMatchObject([
@@ -95,7 +95,7 @@ describe('stdio sidecar server', () => {
 		await expect(Promise.race([
 			runServer(input, output),
 			new Promise((_, reject) => setTimeout(() => reject(new Error('server waited for EOF')), 500)),
-		])).resolves.toBeUndefined();
+		])).resolves.toBe(1);
 		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
 	});
 
@@ -210,7 +210,7 @@ describe('stdio sidecar server', () => {
 
 		await runServer(Readable.from([`${payload}\n`]), output);
 
-		expect(JSON.parse(lines[0])).toMatchObject({ id: 'boundary', ok: true, result: { protocolVersion: 1 } });
+		expect(JSON.parse(lines[0])).toMatchObject({ id: 'boundary', ok: false, error: { code: 'UNKNOWN_COMMAND' } });
 	});
 
 	test('rejects payload of MAX because its LF makes the frame oversized', async () => {

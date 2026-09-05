@@ -7,6 +7,10 @@ export const PROFILE_ERROR_MESSAGES = {
 	PROFILE_NOT_OWNED: '资料库不属于 Joplin Lite',
 	PROFILE_IN_USE: '资料库正在被使用',
 	PROFILE_LOCK_REQUIRED: '资料库写入租约无效',
+	PROFILE_NOT_OPEN: '资料库尚未打开',
+	PROFILE_ALREADY_OPEN: '资料库已经打开',
+	PROFILE_OPEN_FAILED: '无法打开资料库',
+	STORAGE_ERROR: '无法保存资料库',
 } as const;
 
 export type ProfileErrorCode = keyof typeof PROFILE_ERROR_MESSAGES;

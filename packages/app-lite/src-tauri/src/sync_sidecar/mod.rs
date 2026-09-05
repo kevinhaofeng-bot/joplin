@@ -54,6 +54,15 @@ mod protocol_tests {
             (SidecarErrorKind::Io, "兼容组件通信失败"),
             (SidecarErrorKind::ProfileInUse, "资料库正在被使用"),
             (SidecarErrorKind::ProfileLockRequired, "资料库写入租约无效"),
+            (SidecarErrorKind::ProfileInvalid, "资料库路径无效"),
+            (
+                SidecarErrorKind::ProfileNotOwned,
+                "资料库不属于 Joplin Lite",
+            ),
+            (SidecarErrorKind::ProfileAlreadyOpen, "资料库已经打开"),
+            (SidecarErrorKind::ProfileNotOpen, "资料库尚未打开"),
+            (SidecarErrorKind::ProfileOpenFailed, "无法打开资料库"),
+            (SidecarErrorKind::StorageError, "无法保存资料库"),
         ] {
             let error = SidecarError::new(kind, secret);
             assert_eq!(error.message(), expected_message);

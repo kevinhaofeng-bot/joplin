@@ -28,6 +28,12 @@ pub enum SidecarErrorKind {
     Io,
     ProfileInUse,
     ProfileLockRequired,
+    ProfileInvalid,
+    ProfileNotOwned,
+    ProfileAlreadyOpen,
+    ProfileNotOpen,
+    ProfileOpenFailed,
+    StorageError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +76,12 @@ fn public_message(kind: SidecarErrorKind) -> &'static str {
         SidecarErrorKind::Io => "兼容组件通信失败",
         SidecarErrorKind::ProfileInUse => "资料库正在被使用",
         SidecarErrorKind::ProfileLockRequired => "资料库写入租约无效",
+        SidecarErrorKind::ProfileInvalid => "资料库路径无效",
+        SidecarErrorKind::ProfileNotOwned => "资料库不属于 Joplin Lite",
+        SidecarErrorKind::ProfileAlreadyOpen => "资料库已经打开",
+        SidecarErrorKind::ProfileNotOpen => "资料库尚未打开",
+        SidecarErrorKind::ProfileOpenFailed => "无法打开资料库",
+        SidecarErrorKind::StorageError => "无法保存资料库",
     }
 }
 
@@ -174,6 +186,22 @@ pub(crate) fn classify_response_error(response: &ResponseFrame) -> SidecarError 
             SidecarErrorKind::ProfileLockRequired,
             "profile lock required",
         ),
+        Some("PROFILE_INVALID") => {
+            SidecarError::new(SidecarErrorKind::ProfileInvalid, "profile invalid")
+        }
+        Some("PROFILE_NOT_OWNED") => {
+            SidecarError::new(SidecarErrorKind::ProfileNotOwned, "profile not owned")
+        }
+        Some("PROFILE_ALREADY_OPEN") => {
+            SidecarError::new(SidecarErrorKind::ProfileAlreadyOpen, "profile already open")
+        }
+        Some("PROFILE_NOT_OPEN") => {
+            SidecarError::new(SidecarErrorKind::ProfileNotOpen, "profile not open")
+        }
+        Some("PROFILE_OPEN_FAILED") => {
+            SidecarError::new(SidecarErrorKind::ProfileOpenFailed, "profile open failed")
+        }
+        Some("STORAGE_ERROR") => SidecarError::new(SidecarErrorKind::StorageError, "storage error"),
         Some("PROTOCOL_MISMATCH") => {
             SidecarError::new(SidecarErrorKind::ProtocolMismatch, "protocol mismatch")
         }
