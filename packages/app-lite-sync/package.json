@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@joplin/lib": "~3.7",
+    "keytar": "7.9.0",
     "sqlite3": "5.1.6"
   },
   "devDependencies": {

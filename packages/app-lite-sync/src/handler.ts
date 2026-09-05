@@ -17,13 +17,13 @@ import { ResourceStore, type CreateResourceInput } from './domain/resourceStore'
 import { exactKeys, validationError } from './domain/validation';
 
 const joplinVersion: string = require('../../lib/package.json').version;
-const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources'] as const;
+const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'syncNow'] as const;
 const terminalCodes = new Set(['PROFILE_LOCK_REQUIRED', 'PROFILE_OPEN_FAILED', 'STORAGE_ERROR']);
-const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES)]);
+const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES), 'SYNC_NOT_CONFIGURED', 'SYNC_AUTH_FAILED', 'SYNC_NETWORK', 'SYNC_BUSY', 'SYNC_FAILED']);
 
 type HandledRequest = { response: ResponseFrame; shouldExit: boolean };
 export type RequestHandler = { handleRequest(request: RequestFrame): Promise<HandledRequest> };
-type SessionLike = Pick<ProfileSession, 'status' | 'open' | 'flush' | 'close' | 'requireOpen'>;
+type SessionLike = Pick<ProfileSession, 'status' | 'open' | 'flush' | 'close' | 'requireOpen'> & Partial<Pick<ProfileSession, 'getSyncConfig' | 'configureJoplinServer' | 'syncNow'>>;
 
 function invalidRequest(): ProtocolError {
 	return new ProtocolError('INVALID_REQUEST', '请求格式无效');
@@ -51,6 +51,7 @@ function fixedError(error: unknown, fallback: string): ProtocolError {
 	if (error instanceof ProtocolError && stableCodes.has(error.code)) {
 		if (Object.prototype.hasOwnProperty.call(PROFILE_ERROR_MESSAGES, error.code)) return profileError(error.code as keyof typeof PROFILE_ERROR_MESSAGES);
 		if (error.code === 'INVALID_ITEM') return new ProtocolError('INVALID_ITEM', 'Joplin 项目格式无效');
+		if (error.code.startsWith('SYNC_')) return new ProtocolError(error.code, PROFILE_ERROR_MESSAGES[error.code as keyof typeof PROFILE_ERROR_MESSAGES]);
 		return new ProtocolError('INVALID_REQUEST', '请求格式无效');
 	}
 	if (fallback === 'INVALID_REQUEST') return new ProtocolError('INVALID_REQUEST', '请求格式无效');
@@ -150,6 +151,21 @@ export function createHandler(session: SessionLike): RequestHandler {
 					if (!hasOnly(request.params, [])) throw invalidRequest();
 					await session.close();
 					return { response: successFrame(request.id, { stopped: true }), shouldExit: true };
+				case 'getSyncConfig':
+					if (!hasOnly(request.params, [])) throw invalidRequest();
+					requireOpen(session);
+					if (!session.getSyncConfig) throw new ProtocolError('STORAGE_ERROR', 'sync unavailable');
+					return { response: successFrame(request.id, await session.getSyncConfig()), shouldExit: false };
+				case 'configureJoplinServer':
+					if (!isObject(request.params) || !hasOnly(request.params, ['url', 'username', 'password']) || typeof request.params.url !== 'string' || typeof request.params.username !== 'string' || typeof request.params.password !== 'string') throw invalidRequest();
+					requireOpen(session);
+					if (!session.configureJoplinServer) throw new ProtocolError('STORAGE_ERROR', 'sync unavailable');
+					return { response: successFrame(request.id, await session.configureJoplinServer(request.params as { url: string; username: string; password: string })), shouldExit: false };
+				case 'syncNow':
+					if (!hasOnly(request.params, [])) throw invalidRequest();
+					requireOpen(session);
+					if (!session.syncNow) throw new ProtocolError('STORAGE_ERROR', 'sync unavailable');
+					return { response: successFrame(request.id, await session.syncNow()), shouldExit: false };
 				default:
 					return { response: failureFrame(request.id, 'UNKNOWN_COMMAND', '未知命令'), shouldExit: false };
 				}

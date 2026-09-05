@@ -11,10 +11,17 @@ import ItemChange from '../../../lib/models/ItemChange';
 import { loadKeychainServiceAndSettings } from '../../../lib/services/SettingUtils';
 import RevisionService from '../../../lib/services/RevisionService';
 import BaseService from '../../../lib/services/BaseService';
+import KeychainService from '../../../lib/services/keychain/KeychainService';
+import KeychainServiceDriverNode from '../../../lib/services/keychain/KeychainServiceDriver.node';
+import ResourceService from '../../../lib/services/ResourceService';
+import ResourceFetcher from '../../../lib/services/ResourceFetcher';
+import SyncTargetJoplinServer from '../../../lib/SyncTargetJoplinServer';
+import SyncTargetRegistry from '../../../lib/SyncTargetRegistry';
 import { reg } from '../../../lib/registry';
 import Logger from '../../../utils/Logger';
 import { registerItemClasses } from '../codec';
 import type { ValidatedProfilePaths } from './pathPolicy';
+import { syncError, SyncService, type SyncConfig, type SyncConfigInput, type SyncSummary } from './syncService';
 
 const joplinVersion: string = require('../../../lib/package.json').version;
 
@@ -22,6 +29,9 @@ export type RuntimeHandle = Readonly<{
 	schemaVersion: number;
 	flush: ()=> Promise<void>;
 	close: ()=> Promise<void>;
+	getSyncConfig?: ()=> Promise<SyncConfig>;
+	configureJoplinServer?: (input: SyncConfigInput)=> Promise<SyncConfig>;
+	syncNow?: ()=> Promise<SyncSummary>;
 }>;
 
 function initializeSettings(paths: ValidatedProfilePaths): void {
@@ -45,7 +55,7 @@ function initializeSettings(paths: ValidatedProfilePaths): void {
 export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<RuntimeHandle> {
 	let database: JoplinDatabase | undefined;
 	try {
-		shimInit({ nodeSqlite: require('sqlite3'), appVersion: () => joplinVersion });
+		shimInit({ nodeSqlite: require('sqlite3'), keytar: require('keytar'), appVersion: () => joplinVersion });
 		const logger = new Logger();
 		logger.enabled = false;
 		Logger.initializeGlobalLogger(logger);
@@ -62,8 +72,126 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 		await database.open({ name: paths.database });
 		BaseModel.setDb(database);
 		reg.setDb(database);
-		await loadKeychainServiceAndSettings([]);
+		await loadKeychainServiceAndSettings([KeychainServiceDriverNode]);
+		await KeychainService.instance().detectIfKeychainSupported();
+		const clearPersistedSyncPassword = async () => {
+			Setting.setValue('sync.9.password', '');
+			await Setting.db().exec('DELETE FROM settings WHERE key = ?', ['sync.9.password']);
+		};
+		await clearPersistedSyncPassword();
 		BaseItem.revisionService_ = RevisionService.instance();
+		SyncTargetRegistry.addClass(SyncTargetJoplinServer);
+		const syncPasswordKey = 'joplinLite.sync.9.password';
+
+		const syncService = new SyncService({
+			readConfig: async () => {
+				const url = Setting.value('sync.9.path');
+				const username = Setting.value('sync.9.username');
+				const configured = Setting.value('sync.target') === SyncTargetJoplinServer.id() && !!url && !!username && !!(await KeychainService.instance().password(syncPasswordKey));
+				return configured ? { configured: true, url, username } : { configured: false };
+			},
+			configure: async (input) => {
+				if (Setting.value('keychain.supported') !== 1 || !KeychainService.instance().enabled) throw syncError('SYNC_AUTH_FAILED');
+				const check = await SyncTargetJoplinServer.checkConfig({
+					path: () => input.url,
+					userContentPath: () => '',
+					username: () => input.username,
+					password: () => input.password,
+					apiKey: () => '',
+				}, SyncTargetJoplinServer.id());
+				if (!check.ok) throw syncError('SYNC_AUTH_FAILED');
+				const previous = {
+					target: Setting.value('sync.target'), path: Setting.value('sync.9.path'), username: Setting.value('sync.9.username'),
+				};
+				let previousPassword: string | null = null;
+				let previousPasswordRead = false;
+				const clearPersistedPassword = async () => {
+					const leaked = await Setting.db().selectAll<{ value: string }>('SELECT value FROM settings WHERE key = ?', ['sync.9.password']);
+					if (leaked.length) await Setting.db().exec('DELETE FROM settings WHERE key = ?', ['sync.9.password']);
+				};
+				try {
+					previousPassword = await KeychainService.instance().password(syncPasswordKey);
+					previousPasswordRead = true;
+					const saved = await KeychainService.instance().setPassword(syncPasswordKey, input.password);
+					if (!saved || await KeychainService.instance().password(syncPasswordKey) !== input.password) throw syncError('SYNC_AUTH_FAILED');
+					Setting.setValue('sync.target', SyncTargetJoplinServer.id());
+					Setting.setValue('sync.9.path', input.url);
+					Setting.setValue('sync.9.username', input.username);
+					Setting.setValue('sync.9.password', '');
+					await Setting.saveAll();
+					const leaked = await Setting.db().selectAll<{ value: string }>('SELECT value FROM settings WHERE key = ?', ['sync.9.password']);
+					if (leaked.some(row => !!row.value)) {
+						await clearPersistedPassword();
+						Setting.setValue('sync.9.password', '');
+						throw syncError('SYNC_AUTH_FAILED');
+					}
+					reg.resetSyncTarget(SyncTargetJoplinServer.id());
+				} catch (error) {
+					if (previousPasswordRead) {
+						try {
+							if (previousPassword) await KeychainService.instance().setPassword(syncPasswordKey, previousPassword);
+							else await KeychainService.instance().deletePassword(syncPasswordKey);
+						} catch {
+							// Preserve the stable original error and never expose keychain details.
+						}
+					}
+					Setting.setValue('sync.target', previous.target);
+					Setting.setValue('sync.9.path', previous.path);
+					Setting.setValue('sync.9.username', previous.username);
+					Setting.setValue('sync.9.password', '');
+					try {
+						await Setting.saveAll();
+						await clearPersistedPassword();
+					} catch {
+						try { await clearPersistedPassword(); } catch {
+							// Keep the public failure fixed even if database cleanup is unavailable.
+						}
+					}
+					throw error;
+				}
+			},
+			syncNow: async () => {
+				const config = Setting.value('sync.9.path');
+				const username = Setting.value('sync.9.username');
+				const password = await KeychainService.instance().password(syncPasswordKey);
+				if (Setting.value('sync.target') !== SyncTargetJoplinServer.id() || !config || !username || !password) throw syncError('SYNC_NOT_CONFIGURED');
+				let report: { completedTime?: number; createLocal?: number; createRemote?: number; updateLocal?: number; updateRemote?: number; deleteLocal?: number; deleteRemote?: number; fetchingProcessed?: number } = {};
+				const contextRaw = Setting.value('sync.9.context');
+				let context: Record<string, unknown> = {};
+				try { context = contextRaw ? JSON.parse(contextRaw) : {}; } catch { context = {}; }
+				let nextContext: Record<string, unknown> = {};
+				try {
+					Setting.setValue('sync.9.password', password);
+					const target = new SyncTargetJoplinServer(database);
+					target.setLogger(logger);
+					const synchronizer = await target.synchronizer();
+					nextContext = await synchronizer.start({
+						context,
+						throwOnError: true,
+						onProgress: next => { report = next; },
+						saveContextHandler: next => { Setting.setValue('sync.9.context', JSON.stringify(next)); },
+					});
+					const fileApi = await target.fileApi();
+					const fetcher = ResourceFetcher.instance();
+					fetcher.setLogger(logger);
+					fetcher.setFileApi(() => fileApi);
+					await fetcher.fetchAll();
+					await fetcher.waitForAllFinished();
+				} finally {
+					Setting.setValue('sync.9.password', '');
+				}
+				Setting.setValue('sync.9.context', JSON.stringify(nextContext));
+				await ResourceService.instance().indexNoteResources();
+				await Setting.saveAll();
+				return {
+					completedAt: report.completedTime ?? Date.now(),
+					created: (report.createLocal ?? 0) + (report.createRemote ?? 0),
+					updated: (report.updateLocal ?? 0) + (report.updateRemote ?? 0),
+					deleted: (report.deleteLocal ?? 0) + (report.deleteRemote ?? 0),
+					fetched: report.fetchingProcessed ?? 0,
+				};
+			},
+		});
 
 		const handle: RuntimeHandle = {
 			schemaVersion: database.version(),
@@ -76,6 +204,9 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 				await Setting.saveAll();
 				await database?.close();
 			},
+			getSyncConfig: () => syncService.getConfig(),
+			configureJoplinServer: input => syncService.configure(input),
+			syncNow: () => syncService.syncNow(),
 		};
 		return handle;
 	} catch {

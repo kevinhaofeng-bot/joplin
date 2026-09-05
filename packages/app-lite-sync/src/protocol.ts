@@ -14,6 +14,11 @@ export const PROFILE_ERROR_MESSAGES = {
 	NOT_FOUND: '项目不存在',
 	VALIDATION_FAILED: '输入内容无效',
 	CONFLICT: '项目已被其他操作修改',
+	SYNC_NOT_CONFIGURED: '尚未配置同步',
+	SYNC_AUTH_FAILED: '同步认证失败',
+	SYNC_NETWORK: '同步网络不可用',
+	SYNC_BUSY: '同步正在进行',
+	SYNC_FAILED: '同步失败',
 } as const;
 
 export type ProfileErrorCode = keyof typeof PROFILE_ERROR_MESSAGES;

@@ -2,6 +2,7 @@ import { claimProfile } from './profileMarker';
 import { revalidateProfilePath, validateProfilePath, type ValidatedProfilePaths } from './pathPolicy';
 import { verifyInheritedLease, type InheritedLease } from './inheritedLease';
 import { openJoplinRuntime, type RuntimeHandle } from './joplinRuntime';
+import type { SyncConfig, SyncConfigInput, SyncSummary } from './syncService';
 import { profileError, ProtocolError } from '../protocol';
 
 export type ProfileState = 'closed' | 'open';
@@ -14,6 +15,9 @@ export interface ProfileSession {
 	open(profilePath: unknown): Promise<OpenProfileResult>;
 	flush(): Promise<void>;
 	close(): Promise<void>;
+	getSyncConfig(): Promise<SyncConfig>;
+	configureJoplinServer(input: SyncConfigInput): Promise<SyncConfig>;
+	syncNow(): Promise<SyncSummary>;
 }
 
 export type ProfileRuntimeFactory = (paths: ValidatedProfilePaths)=> Promise<RuntimeHandle>;
@@ -137,6 +141,24 @@ export class ProfileSession implements ProfileSession {
 		}
 	}
 
+	public async getSyncConfig(): Promise<SyncConfig> {
+		this.requireOpen();
+		if (!this.runtime?.getSyncConfig) throw profileError('STORAGE_ERROR');
+		try { return await this.runtime.getSyncConfig(); } catch { throw profileError('STORAGE_ERROR'); }
+	}
+
+	public async configureJoplinServer(input: SyncConfigInput): Promise<SyncConfig> {
+		this.requireOpen();
+		if (!this.runtime?.configureJoplinServer) throw profileError('STORAGE_ERROR');
+		try { return await this.runtime.configureJoplinServer(input); } catch (error) { throw this.fixedSyncError(error); }
+	}
+
+	public async syncNow(): Promise<SyncSummary> {
+		this.requireOpen();
+		if (!this.runtime?.syncNow) throw profileError('STORAGE_ERROR');
+		try { return await this.runtime.syncNow(); } catch (error) { throw this.fixedSyncError(error); }
+	}
+
 	private async cleanupPartialOpen(): Promise<void> {
 		try {
 			if (this.runtime) await this.runtime.close();
@@ -158,5 +180,11 @@ export class ProfileSession implements ProfileSession {
 		const code = errorCode(error);
 		if (code === 'PROFILE_INVALID' || code === 'PROFILE_NOT_OWNED' || code === 'PROFILE_LOCK_REQUIRED') return profileError(code);
 		return profileError(fallback);
+	}
+
+	private fixedSyncError(error: unknown): ProtocolError {
+		const code = errorCode(error);
+		if (code && ['SYNC_NOT_CONFIGURED', 'SYNC_AUTH_FAILED', 'SYNC_NETWORK', 'SYNC_BUSY', 'SYNC_FAILED'].includes(code)) return new ProtocolError(code, '同步操作失败');
+		return profileError('STORAGE_ERROR');
 	}
 }

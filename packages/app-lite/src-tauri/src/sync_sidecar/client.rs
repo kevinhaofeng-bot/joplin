@@ -13,10 +13,11 @@ use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use crate::profile::ProfilePaths;
 
 use super::domain::{
-    CreateFolderParams, CreateNoteParams, CreateResourceFromPathParams, CreateResult,
-    CreateTagParams, DeleteResult, EmptyParams, ExpectedUpdatedTimeParams, Folder, GetByIdParams,
-    ListNoteResourcesParams, ListNotesParams, NoteDetail, NotePage, OpenProfile, ProfilePathParams,
-    ProfileStatus, Resource, SetNoteTagsParams, SetNoteTagsResult, ShutdownResult, Tag,
+    ConfigureJoplinServerParams, CreateFolderParams, CreateNoteParams,
+    CreateResourceFromPathParams, CreateResult, CreateTagParams, DeleteResult, EmptyParams,
+    ExpectedUpdatedTimeParams, Folder, GetByIdParams, ListNoteResourcesParams, ListNotesParams,
+    NoteDetail, NotePage, OpenProfile, ProfilePathParams, ProfileStatus, Resource,
+    SetNoteTagsParams, SetNoteTagsResult, ShutdownResult, SyncConfig, SyncSummary, Tag,
     TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
 };
 use super::profile_lease::ProfileLease;
@@ -240,7 +241,12 @@ impl SidecarClient {
         Ok(client)
     }
 
-    async fn request_value(&mut self, command: &str, params: Value) -> Result<Value, SidecarError> {
+    async fn request_value_with_timeout(
+        &mut self,
+        command: &str,
+        params: Value,
+        request_timeout: Duration,
+    ) -> Result<Value, SidecarError> {
         if self.state != SidecarState::Ready {
             return Err(SidecarError::new(
                 SidecarErrorKind::InvalidResponse,
@@ -249,7 +255,7 @@ impl SidecarClient {
         }
         let id = format!("request-{}", self.next_request);
         self.next_request += 1;
-        let exchange = timeout(self.request_timeout, self.exchange(&id, command, params)).await;
+        let exchange = timeout(request_timeout, self.exchange(&id, command, params)).await;
         let response = match exchange {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
@@ -294,6 +300,11 @@ impl SidecarClient {
         }
     }
 
+    async fn request_value(&mut self, command: &str, params: Value) -> Result<Value, SidecarError> {
+        self.request_value_with_timeout(command, params, self.request_timeout)
+            .await
+    }
+
     async fn request_typed<P, R>(&mut self, command: &str, params: &P) -> Result<R, SidecarError>
     where
         P: Serialize,
@@ -302,6 +313,31 @@ impl SidecarClient {
         let params = serde_json::to_value(params)
             .map_err(|_| SidecarError::new(SidecarErrorKind::Io, "serialize params"))?;
         let result = self.request_value(command, params).await?;
+        match serde_json::from_value(result) {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                let error = SidecarError::new(SidecarErrorKind::InvalidResponse, "invalid result");
+                self.fail(error.kind()).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn request_typed_with_timeout<P, R>(
+        &mut self,
+        command: &str,
+        params: &P,
+        timeout: Duration,
+    ) -> Result<R, SidecarError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let params = serde_json::to_value(params)
+            .map_err(|_| SidecarError::new(SidecarErrorKind::Io, "serialize params"))?;
+        let result = self
+            .request_value_with_timeout(command, params, timeout)
+            .await?;
         match serde_json::from_value(result) {
             Ok(value) => Ok(value),
             Err(_) => {
@@ -435,6 +471,22 @@ impl SidecarClient {
         params: ListNoteResourcesParams,
     ) -> Result<Vec<Resource>, SidecarError> {
         self.request_typed("listNoteResources", &params).await
+    }
+
+    pub async fn get_sync_config(&mut self) -> Result<SyncConfig, SidecarError> {
+        self.request_typed("getSyncConfig", &EmptyParams {}).await
+    }
+
+    pub async fn configure_joplin_server(
+        &mut self,
+        params: ConfigureJoplinServerParams,
+    ) -> Result<SyncConfig, SidecarError> {
+        self.request_typed("configureJoplinServer", &params).await
+    }
+
+    pub async fn sync_now(&mut self) -> Result<SyncSummary, SidecarError> {
+        self.request_typed_with_timeout("syncNow", &EmptyParams {}, Duration::from_secs(15 * 60))
+            .await
     }
 
     pub fn state(&self) -> SidecarState {

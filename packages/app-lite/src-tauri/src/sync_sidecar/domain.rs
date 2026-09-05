@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,4 +274,60 @@ pub struct ListNoteResourcesParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShutdownResult {
     pub stopped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyncConfig {
+    pub configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigureJoplinServerParams {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for ConfigureJoplinServerParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigureJoplinServerParams")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyncSummary {
+    pub completed_at: u64,
+    pub created: u64,
+    pub updated: u64,
+    pub deleted: u64,
+    pub fetched: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigureJoplinServerParams;
+
+    #[test]
+    fn configure_debug_redacts_password() {
+        let value = ConfigureJoplinServerParams {
+            url: "https://example.test".into(),
+            username: "user@example.test".into(),
+            password: "secret-marker".into(),
+        };
+        let debug = format!("{value:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret-marker"));
+    }
 }

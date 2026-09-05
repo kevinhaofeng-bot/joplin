@@ -37,6 +37,11 @@ pub enum SidecarErrorKind {
     NotFound,
     ValidationFailed,
     Conflict,
+    SyncNotConfigured,
+    SyncAuthFailed,
+    SyncNetwork,
+    SyncBusy,
+    SyncFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +93,11 @@ fn public_message(kind: SidecarErrorKind) -> &'static str {
         SidecarErrorKind::NotFound => "项目不存在",
         SidecarErrorKind::ValidationFailed => "输入内容无效",
         SidecarErrorKind::Conflict => "项目已被其他操作修改",
+        SidecarErrorKind::SyncNotConfigured => "尚未配置同步",
+        SidecarErrorKind::SyncAuthFailed => "同步认证失败",
+        SidecarErrorKind::SyncNetwork => "同步网络不可用",
+        SidecarErrorKind::SyncBusy => "同步正在进行",
+        SidecarErrorKind::SyncFailed => "同步失败",
     }
 }
 
@@ -98,7 +108,7 @@ pub struct SidecarCommand {
     pub current_dir: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RequestFrame {
     pub id: String,
@@ -213,6 +223,18 @@ pub(crate) fn classify_response_error(response: &ResponseFrame) -> SidecarError 
             SidecarError::new(SidecarErrorKind::ValidationFailed, "validation failed")
         }
         Some("CONFLICT") => SidecarError::new(SidecarErrorKind::Conflict, "conflict"),
+        Some("SYNC_NOT_CONFIGURED") => {
+            SidecarError::new(SidecarErrorKind::SyncNotConfigured, "sync not configured")
+        }
+        Some("SYNC_AUTH_FAILED") => SidecarError::new(
+            SidecarErrorKind::SyncAuthFailed,
+            "sync authentication failed",
+        ),
+        Some("SYNC_NETWORK") => {
+            SidecarError::new(SidecarErrorKind::SyncNetwork, "sync network unavailable")
+        }
+        Some("SYNC_BUSY") => SidecarError::new(SidecarErrorKind::SyncBusy, "sync busy"),
+        Some("SYNC_FAILED") => SidecarError::new(SidecarErrorKind::SyncFailed, "sync failed"),
         Some("PROTOCOL_MISMATCH") => {
             SidecarError::new(SidecarErrorKind::ProtocolMismatch, "protocol mismatch")
         }
@@ -233,5 +255,10 @@ pub(crate) fn is_recoverable_error_code(code: &str) -> bool {
             | "CONFLICT"
             | "INVALID_REQUEST"
             | "INVALID_ITEM"
+            | "SYNC_NOT_CONFIGURED"
+            | "SYNC_AUTH_FAILED"
+            | "SYNC_NETWORK"
+            | "SYNC_BUSY"
+            | "SYNC_FAILED"
     )
 }

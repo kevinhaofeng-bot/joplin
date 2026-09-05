@@ -117,6 +117,9 @@ pub fn run() {
             library::list_note_resources,
             library::create_image_resource,
             library::open_resource,
+            library::get_sync_config,
+            library::configure_joplin_server,
+            library::sync_now,
             library::shutdown_library
         ])
         .run(tauri::generate_context!())

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState, type ComponentType } from 'react';
+import { useCallback, useEffect, useRef, useState, type ComponentType, type FormEvent } from 'react';
 import { getRuntimeInfo, type RuntimeInfo } from './runtime';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
 	LibraryClientError, libraryApi, type Folder, type LibraryApi, type NoteDetail, type NoteSummary, type Resource,
+	type SyncConfig,
 } from './library';
 import RichTextEditor, { type RichTextEditorProps } from './RichTextEditor';
 import './styles.css';
@@ -23,6 +24,11 @@ type SaveState = 'saved' | 'saving' | 'conflict' | 'failed';
 const safeErrorMessage = (error: unknown, fallback: string) => {
 	if (error instanceof LibraryClientError && error.code === 'CONFLICT') return '笔记已在别处修改，请重新载入';
 	if (error instanceof LibraryClientError && error.code === 'SIDECAR_UNAVAILABLE') return '本地资料库不可用';
+	if (error instanceof LibraryClientError && error.code === 'SYNC_NOT_CONFIGURED') return '尚未配置同步';
+	if (error instanceof LibraryClientError && error.code === 'SYNC_AUTH_FAILED') return '同步认证失败';
+	if (error instanceof LibraryClientError && error.code === 'SYNC_NETWORK') return '同步网络不可用';
+	if (error instanceof LibraryClientError && error.code === 'SYNC_BUSY') return '同步正在进行';
+	if (error instanceof LibraryClientError && error.code === 'SYNC_FAILED') return '同步失败';
 	return fallback;
 };
 
@@ -41,6 +47,12 @@ export default function App({
 	const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
 	const [detail, setDetail] = useState<NoteDetail | null>(null);
 	const [resources, setResources] = useState<Resource[]>([]);
+	const [syncConfig, setSyncConfig] = useState<SyncConfig>({ configured: false });
+	const [syncFormOpen, setSyncFormOpen] = useState(false);
+	const [syncUrl, setSyncUrl] = useState('');
+	const [syncUsername, setSyncUsername] = useState('');
+	const [syncPassword, setSyncPassword] = useState('');
+	const [syncState, setSyncState] = useState<'idle'|'saving'|'syncing'|'success'|'failed'>('idle');
 	const [saveState, setSaveState] = useState<SaveState>('saved');
 	const [errorMessage, setErrorMessage] = useState('');
 	const [busy, setBusy] = useState(false);
@@ -73,6 +85,7 @@ export default function App({
 			]);
 			setFolders(loadedFolders.filter(folder => folder.deletedTime === 0));
 			setNotes(page.items);
+			setSyncConfig(await library.getSyncConfig().catch(() => ({ configured: false })));
 			setInitialization({ kind: 'ready', runtime });
 		} catch (error) {
 			setInitialization({ kind: 'failed', message: safeErrorMessage(error, '本地资料库不可用。没有修改现有笔记或资料库。') });
@@ -169,6 +182,32 @@ export default function App({
 		} catch (error) { setErrorMessage(safeErrorMessage(error, '无法重新载入笔记')); }
 	}, [library, selectedNoteId, setCurrentDetail]);
 
+	const configureSync = useCallback(async (event: FormEvent) => {
+		event.preventDefault();
+		setSyncState('saving'); setErrorMessage('');
+		try {
+			const config = await library.configureJoplinServer({ url: syncUrl, username: syncUsername, password: syncPassword });
+			setSyncConfig(config); setSyncPassword(''); setSyncFormOpen(false); setSyncState('success');
+		} catch (error) { setSyncState('failed'); setErrorMessage(safeErrorMessage(error, '同步配置失败')); }
+	}, [library, syncPassword, syncUrl, syncUsername]);
+
+	const runSync = useCallback(async () => {
+		if (!await flushSave()) return;
+		setSyncState('syncing'); setErrorMessage('');
+		try {
+			await library.syncNow();
+			const [loadedFolders, page] = await Promise.all([library.listFolders(), library.listNotes(selectedFolderId ? { parentId: selectedFolderId } : {})]);
+			setFolders(loadedFolders.filter(folder => folder.deletedTime === 0)); setNotes(page.items);
+			if (selectedNoteId) {
+				const loaded = await library.getNote({ id: selectedNoteId });
+				let loadedResources: Resource[] = [];
+				try { loadedResources = await library.listNoteResources({ noteId: selectedNoteId }); } catch { setErrorMessage('部分附件暂不可用'); }
+				setCurrentDetail(loaded); setResources(loadedResources);
+			}
+			setSyncState('success');
+		} catch (error) { setSyncState('failed'); setErrorMessage(safeErrorMessage(error, '同步失败')); }
+	}, [flushSave, library, selectedFolderId, selectedNoteId, setCurrentDetail]);
+
 	const chooseResource = useCallback(async (): Promise<Resource | null> => {
 		const selected = await open({ multiple: false, directory: false, title: '添加附件' });
 		if (!selected || Array.isArray(selected)) return null;
@@ -191,7 +230,18 @@ export default function App({
 				<p className="product-name">Joplin Lite</p>
 				<button type="button" className={`navigation-item ${selectedFolderId === null ? 'is-active' : ''}`} aria-current={selectedFolderId === null ? 'page' : undefined} onClick={() => { void selectFolder(null); }}>全部笔记</button>
 				<div className="folder-navigation"><p className="section-label">笔记本</p>{folders.map(folder => <button type="button" className="navigation-item" key={folder.id} aria-current={selectedFolderId === folder.id ? 'page' : undefined} onClick={() => { void selectFolder(folder.id); }}>{folder.title}</button>)}</div>
-				<p className="sync-status" title="同步功能尚未接入">仅本地 · 尚未同步</p>
+				<div className="sync-panel">
+					<button type="button" className="sync-status" onClick={() => syncConfig.configured ? void runSync() : setSyncFormOpen(previous => !previous)} disabled={syncState === 'saving' || syncState === 'syncing'}>{syncState === 'syncing' ? '同步中…' : syncConfig.configured ? '同步' : '设置同步'}</button>
+					{syncConfig.configured ? <button type="button" className="sync-settings" onClick={() => { setSyncUrl(syncConfig.url ?? ''); setSyncUsername(syncConfig.username ?? ''); setSyncPassword(''); setSyncFormOpen(true); }}>设置</button> : null}
+					{syncConfig.configured && syncState === 'success' ? <small>刚刚同步</small> : null}
+					{syncState === 'failed' ? <small role="status">同步失败，可重试</small> : null}
+					{syncFormOpen ? <form className="sync-form" onSubmit={configureSync}>
+						<label>服务器地址<input aria-label="服务器地址" value={syncUrl} onChange={event => setSyncUrl(event.target.value)} placeholder="https://…" required /></label>
+						<label>邮箱<input aria-label="邮箱" type="email" value={syncUsername} onChange={event => setSyncUsername(event.target.value)} required /></label>
+						<label>密码<input aria-label="密码" type="password" value={syncPassword} onChange={event => setSyncPassword(event.target.value)} required /></label>
+						<button type="submit" disabled={syncState === 'saving'}>{syncState === 'saving' ? '连接中…' : '连接并保存'}</button>
+					</form> : null}
+				</div>
 			</nav>
 			<aside className="note-list" aria-label="笔记列表">
 				<header className="pane-header"><div><p className="eyebrow">{selectedFolderId ? '笔记本' : '全部笔记'}</p><h2>笔记</h2></div><button type="button" className="new-note-button" onClick={() => { void createNote(); }} disabled={busy}>新建笔记</button></header>

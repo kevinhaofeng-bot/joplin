@@ -32,7 +32,15 @@ button:disabled { cursor: default; opacity: .52; }
 .navigation-item:hover, .navigation-item.is-active { color: #1d5c60; background: var(--teal-wash); }
 .folder-navigation { display: grid; gap: 4px; }
 .section-label, .eyebrow { margin: 0 8px 5px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
-.sync-status { margin: auto 8px 0; color: var(--muted); font-size: 11px; }
+.sync-panel { position: relative; margin: auto 8px 0; color: var(--muted); font-size: 11px; }
+.sync-status { min-height: 28px; padding: 4px 0; border: 0; color: inherit; background: transparent; font-size: inherit; }
+.sync-status:hover { color: var(--teal); }
+.sync-panel small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
+.sync-settings { margin-left: 6px; padding: 0; border: 0; color: var(--teal); background: transparent; font-size: 10px; }
+.sync-form { display: grid; gap: 8px; width: 180px; margin-top: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); box-shadow: 0 4px 14px rgb(40 50 55 / 10%); }
+.sync-form label { display: grid; gap: 3px; color: var(--ink); font-size: 10px; }
+.sync-form input { width: 100%; min-height: 28px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 3px; background: #fff; font-size: 11px; }
+.sync-form button { min-height: 28px; border: 1px solid var(--teal); border-radius: 3px; color: #fff; background: var(--teal); font-size: 11px; }
 
 .note-list { display: flex; flex-direction: column; background: #f8f6f1; border-right: 1px solid var(--line); }
 .pane-header { display: flex; align-items: end; justify-content: space-between; gap: 12px; padding: 30px 22px 20px; border-bottom: 1px solid var(--line); }

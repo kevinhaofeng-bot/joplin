@@ -12698,6 +12698,7 @@ __metadata:
     "@types/jest": "npm:29.5.14"
     "@types/node": "npm:18.19.130"
     jest: "npm:29.7.0"
+    keytar: "npm:7.9.0"
     sqlite3: "npm:5.1.6"
     ts-jest: "npm:29.4.11"
     ts-node: "npm:10.9.2"

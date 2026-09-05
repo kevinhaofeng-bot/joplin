@@ -69,6 +69,11 @@ impl From<SidecarError> for LibraryError {
             SidecarErrorKind::NotFound => ("NOT_FOUND", error.message()),
             SidecarErrorKind::ValidationFailed => ("VALIDATION_FAILED", error.message()),
             SidecarErrorKind::Conflict => ("CONFLICT", error.message()),
+            SidecarErrorKind::SyncNotConfigured => ("SYNC_NOT_CONFIGURED", error.message()),
+            SidecarErrorKind::SyncAuthFailed => ("SYNC_AUTH_FAILED", error.message()),
+            SidecarErrorKind::SyncNetwork => ("SYNC_NETWORK", error.message()),
+            SidecarErrorKind::SyncBusy => ("SYNC_BUSY", error.message()),
+            SidecarErrorKind::SyncFailed => ("SYNC_FAILED", error.message()),
             SidecarErrorKind::SpawnFailed => (SIDECAR_UNAVAILABLE_CODE, "本地兼容组件不可用"),
             _ => (SIDECAR_FAILED_CODE, SIDECAR_FAILED_MESSAGE),
         };
@@ -337,6 +342,35 @@ impl LibraryState {
             .await
     }
 
+    pub async fn get_sync_config(&self) -> Result<SyncConfig, LibraryError> {
+        self.with_client(|client| Box::pin(client.get_sync_config()))
+            .await
+    }
+
+    pub async fn configure_joplin_server(
+        &self,
+        params: ConfigureJoplinServerParams,
+    ) -> Result<SyncConfig, LibraryError> {
+        if params.url.len() > 4096
+            || params.username.len() > 4096
+            || params.password.len() > 4096
+            || params.url.contains('\0')
+            || params.username.contains('\0')
+            || params.password.contains('\0')
+        {
+            return Err(LibraryError {
+                code: "VALIDATION_FAILED",
+                message: "输入内容无效",
+            });
+        }
+        self.with_client(|client| Box::pin(client.configure_joplin_server(params)))
+            .await
+    }
+
+    pub async fn sync_now(&self) -> Result<SyncSummary, LibraryError> {
+        self.with_client(|client| Box::pin(client.sync_now())).await
+    }
+
     pub async fn create_image_resource(
         &self,
         params: CreateImageResourceParams,
@@ -522,6 +556,8 @@ noarg_library_commands! {
     profile_status(profile_status) -> ProfileStatus,
     list_folders(list_folders) -> Vec<Folder>,
     list_tags(list_tags) -> Vec<Tag>,
+    get_sync_config(get_sync_config) -> SyncConfig,
+    sync_now(sync_now) -> SyncSummary,
 }
 
 arg_library_commands! {
@@ -539,6 +575,7 @@ arg_library_commands! {
     set_note_tags(set_note_tags, SetNoteTagsParams) -> SetNoteTagsResult,
     create_resource_from_path(create_resource_from_path, CreateResourceFromPathParams) -> Resource,
     list_note_resources(list_note_resources, ListNoteResourcesParams) -> Vec<Resource>,
+    configure_joplin_server(configure_joplin_server, ConfigureJoplinServerParams) -> SyncConfig,
 }
 
 #[tauri::command]
