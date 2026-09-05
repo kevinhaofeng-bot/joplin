@@ -69,4 +69,28 @@ describe('stdio sidecar server', () => {
 
 		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
 	});
+
+	test('replaces an oversized encode response with a bounded correlated failure', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		const item = {
+			id: '11111111111111111111111111111111',
+			type_: 1,
+			title: 'Fixture note',
+			body: 'x'.repeat(MAX_FRAME_BYTES - 500),
+			parent_id: '22222222222222222222222222222222',
+			is_todo: 1,
+			created_time: 1788566400000,
+			updated_time: 1788566460000,
+		};
+		const line = JSON.stringify({ id: 'oversize', protocolVersion: 1, command: 'encodeItem', params: { item } });
+
+		expect(Buffer.byteLength(line, 'utf8')).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+		await runServer(Readable.from([`${line}\n`]), output);
+
+		expect(lines).toHaveLength(1);
+		expect(Buffer.byteLength(lines[0], 'utf8')).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+		expect(JSON.parse(lines[0])).toEqual({ id: 'oversize', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
+		expect(lines[0]).not.toContain(item.body);
+	});
 });
