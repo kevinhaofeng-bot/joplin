@@ -29,6 +29,55 @@ const frameWithPayloadBytes = (byteLength: number): string => {
 };
 
 describe('stdio sidecar server', () => {
+	test('rejects invalid UTF-8 fatally without replacement or raw-byte leakage', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		const valid = Buffer.from(frame('utf8', 'hello'), 'utf8');
+		const marker = Buffer.from('secret-marker', 'utf8');
+		const invalid = Buffer.concat([valid.subarray(0, valid.length - 10), Buffer.from([0xc3, 0x28]), marker, Buffer.from('"}\n', 'utf8')]);
+
+		await runServer(Readable.from([invalid]), output);
+
+		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'INVALID_REQUEST', message: '请求格式无效' } });
+		expect(lines[0]).not.toContain('\ufffd');
+		expect(lines[0]).not.toContain('secret-marker');
+	});
+
+	test('returns promptly when an open delimiter-free input reaches the limit', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		let emitted = false;
+		const input = new Readable({
+			read() {
+				if (!emitted) {
+					emitted = true;
+					this.push(Buffer.alloc(MAX_FRAME_BYTES, 0x78));
+				}
+			},
+		});
+
+		await expect(Promise.race([
+			runServer(input, output),
+			new Promise((_, reject) => setTimeout(() => reject(new Error('server waited for EOF')), 500)),
+		])).resolves.toBeUndefined();
+		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
+	});
+
+	test('rejects a CRLF frame whose raw CR and LF exceed the maximum', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		const payload = Buffer.from(frameWithPayloadBytes(MAX_FRAME_BYTES - 1), 'utf8');
+		await runServer(Readable.from([Buffer.concat([payload, Buffer.from('\r\n')])]), output);
+		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'FRAME_TOO_LARGE', message: '协议帧过大' } });
+	});
+
+	test('rejects a valid JSON tail at EOF without LF and never dispatches it', async () => {
+		const { runServer } = require('./server') as Server;
+		const { output, lines } = memoryOutput();
+		await runServer(Readable.from([Buffer.from(frame('tail', 'hello'), 'utf8')]), output);
+		expect(JSON.parse(lines[0])).toEqual({ id: '', ok: false, error: { code: 'INVALID_REQUEST', message: '请求格式无效' } });
+		expect(lines).toHaveLength(1);
+	});
 	test('writes one JSON response per request and stops after shutdown', async () => {
 		const { runServer } = require('./server') as Server;
 		const { output, lines } = memoryOutput();

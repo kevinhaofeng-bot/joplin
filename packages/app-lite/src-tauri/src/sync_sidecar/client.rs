@@ -1,12 +1,13 @@
-use std::{process::Stdio, time::Duration};
+use std::{fmt, io, process::Stdio, time::Duration};
 
+use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
     process::{Child, Command},
     time::timeout,
 };
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
+use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 use super::protocol::{
     MAX_FRAME_BYTES, ResponseFrame, STARTUP_TIMEOUT, SidecarCommand, SidecarError,
@@ -14,8 +15,79 @@ use super::protocol::{
     validate_hello, validate_response_id,
 };
 
-type SidecarReader = FramedRead<tokio::process::ChildStdout, LinesCodec>;
-type SidecarWriter = FramedWrite<tokio::process::ChildStdin, LinesCodec>;
+type SidecarReader = FramedRead<tokio::process::ChildStdout, RawNdjsonCodec>;
+type SidecarWriter = FramedWrite<tokio::process::ChildStdin, RawNdjsonCodec>;
+
+#[derive(Debug)]
+enum FrameError {
+    TooLarge,
+    Truncated,
+    Io(io::Error),
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge => formatter.write_str("frame too large"),
+            Self::Truncated => formatter.write_str("truncated frame"),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+impl std::error::Error for FrameError {}
+impl From<io::Error> for FrameError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RawNdjsonCodec;
+
+impl Decoder for RawNdjsonCodec {
+    type Item = Vec<u8>;
+    type Error = FrameError;
+
+    fn decode(&mut self, source: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if let Some(index) = source.iter().position(|byte| *byte == b'\n') {
+            let frame_length = index + 1;
+            if frame_length > MAX_FRAME_BYTES {
+                return Err(FrameError::TooLarge);
+            }
+            let frame = source.split_to(frame_length);
+            let mut payload = frame[..index].to_vec();
+            if payload.last() == Some(&b'\r') {
+                payload.pop();
+            }
+            return Ok(Some(payload));
+        }
+        if source.len() >= MAX_FRAME_BYTES {
+            return Err(FrameError::TooLarge);
+        }
+        Ok(None)
+    }
+
+    fn decode_eof(&mut self, source: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if source.is_empty() {
+            Ok(None)
+        } else {
+            Err(FrameError::Truncated)
+        }
+    }
+}
+
+impl Encoder<String> for RawNdjsonCodec {
+    type Error = FrameError;
+    fn encode(&mut self, frame: String, destination: &mut BytesMut) -> Result<(), Self::Error> {
+        if frame.len() + 1 > MAX_FRAME_BYTES {
+            return Err(FrameError::TooLarge);
+        }
+        destination.reserve(frame.len() + 1);
+        destination.extend_from_slice(frame.as_bytes());
+        destination.extend_from_slice(b"\n");
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct SidecarClient {
@@ -53,8 +125,8 @@ impl SidecarClient {
             .ok_or_else(|| SidecarError::new(SidecarErrorKind::Io, "sidecar stdout unavailable"))?;
         let mut client = Self {
             child,
-            reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
-            writer: FramedWrite::new(stdin, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
+            reader: FramedRead::new(stdout, RawNdjsonCodec),
+            writer: FramedWrite::new(stdin, RawNdjsonCodec),
             state: SidecarState::Starting,
             request_timeout,
             next_request: 2,
@@ -122,9 +194,6 @@ impl SidecarClient {
         }
         if !response.ok {
             let error = classify_response_error(&response);
-            if error.kind() == SidecarErrorKind::ProtocolMismatch {
-                self.fail(error.kind()).await;
-            }
             return Err(error);
         }
         match response.result {
@@ -202,19 +271,16 @@ impl SidecarClient {
             ));
         }
         if let Err(error) = self.writer.send(frame).await {
-            return Err(self.map_codec_error(error));
+            return Err(self.map_frame_error(error));
         }
         match self.reader.next().await {
-            Some(Ok(line)) => {
-                if line.len() + 1 > MAX_FRAME_BYTES {
-                    return Err(SidecarError::new(
-                        SidecarErrorKind::FrameTooLarge,
-                        "response too large",
-                    ));
-                }
+            Some(Ok(bytes)) => {
+                let line = String::from_utf8(bytes).map_err(|_| {
+                    SidecarError::new(SidecarErrorKind::InvalidResponse, "invalid utf8")
+                })?;
                 decode_response(&line)
             }
-            Some(Err(error)) => Err(self.map_codec_error(error)),
+            Some(Err(error)) => Err(self.map_frame_error(error)),
             None => Err(SidecarError::new(
                 SidecarErrorKind::SidecarExited,
                 "sidecar eof",
@@ -235,22 +301,24 @@ impl SidecarClient {
         let _ = self.child.wait().await;
     }
 
-    fn map_codec_error(&mut self, error: LinesCodecError) -> SidecarError {
-        if matches!(error, LinesCodecError::Io(_)) && self.child.try_wait().ok().flatten().is_some()
-        {
+    fn map_frame_error(&mut self, error: FrameError) -> SidecarError {
+        if matches!(error, FrameError::Io(_)) && self.child.try_wait().ok().flatten().is_some() {
             SidecarError::new(SidecarErrorKind::SidecarExited, "sidecar exited")
         } else {
-            map_codec_error(error)
+            map_frame_error(error)
         }
     }
 }
 
-fn map_codec_error(error: LinesCodecError) -> SidecarError {
+fn map_frame_error(error: FrameError) -> SidecarError {
     match error {
-        LinesCodecError::MaxLineLengthExceeded => {
+        FrameError::TooLarge => {
             SidecarError::new(SidecarErrorKind::FrameTooLarge, "frame too large")
         }
-        LinesCodecError::Io(_) => SidecarError::new(SidecarErrorKind::Io, "codec io"),
+        FrameError::Truncated => {
+            SidecarError::new(SidecarErrorKind::InvalidResponse, "truncated frame")
+        }
+        FrameError::Io(_) => SidecarError::new(SidecarErrorKind::Io, "codec io"),
     }
 }
 
@@ -278,6 +346,11 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
     const DOMAIN_FAILURE_SCRIPT: &str = r#"
 const rl=require('readline').createInterface({input:process.stdin});
 rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='domain')process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'INVALID_ITEM',message:'secret-domain-detail'}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
+"#;
+
+    const PROTOCOL_MISMATCH_FAILURE_SCRIPT: &str = r#"
+const rl=require('readline').createInterface({input:process.stdin});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='mismatch')process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'PROTOCOL_MISMATCH',message:'secret-version-detail'}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
 "#;
 
     #[tokio::test]
@@ -308,6 +381,25 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         assert_eq!(error.kind(), SidecarErrorKind::InvalidResponse);
         assert_eq!(error.to_string(), "兼容组件响应无效");
         assert!(!error.to_string().contains("secret-domain-detail"));
+        assert_eq!(client.state(), SidecarState::Ready);
+        assert_eq!(
+            client.request("echo", json!({"after":true})).await.unwrap()["after"],
+            true
+        );
+        client.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn ordinary_protocol_mismatch_is_redacted_and_keeps_client_ready() {
+        let mut client = SidecarClient::start(
+            command(PROTOCOL_MISMATCH_FAILURE_SCRIPT),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("sidecar starts");
+        let error = client.request("mismatch", json!({})).await.unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::ProtocolMismatch);
+        assert_eq!(error.to_string(), "兼容协议版本不匹配");
         assert_eq!(client.state(), SidecarState::Ready);
         assert_eq!(
             client.request("echo", json!({"after":true})).await.unwrap()["after"],
@@ -351,6 +443,60 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){process.std
         tokio::time::sleep(Duration::from_millis(80)).await;
         let error = client.request("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::SidecarExited);
+        assert_eq!(client.state(), SidecarState::Failed);
+    }
+
+    #[tokio::test]
+    async fn hello_without_lf_then_exit_is_not_ready() {
+        let script = r#"process.stdin.on('data',()=>{process.stdout.write('{"id":"request-1","ok":true,"result":{"protocolVersion":1}}');process.exit(0);});"#;
+        let error = SidecarClient::start(command(script), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::InvalidResponse);
+    }
+
+    #[tokio::test]
+    async fn ordinary_response_without_lf_then_exit_is_fatal() {
+        let script = r#"
+const rl=require('readline').createInterface({input:process.stdin});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else {process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}}));process.exit(0);}});
+"#;
+        let mut client = SidecarClient::start(command(script), Duration::from_secs(1))
+            .await
+            .expect("start");
+        let error = client.request("echo", json!({})).await.unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::InvalidResponse);
+        assert_eq!(client.state(), SidecarState::Failed);
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_response_is_fatal_and_redacted() {
+        let script = r#"
+const rl=require('readline').createInterface({input:process.stdin});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else process.stdout.write(Buffer.from([123,34,105,100,34,58,34,114,101,113,117,101,115,116,45,50,34,44,34,111,107,34,58,116,114,117,101,44,34,114,101,115,117,108,116,34,58,34,0xc3,0x28,34,125,10]));});
+"#;
+        let mut client = SidecarClient::start(command(script), Duration::from_secs(1))
+            .await
+            .expect("start");
+        let error = client.request("echo", json!({})).await.unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::InvalidResponse);
+        assert_eq!(error.to_string(), "兼容组件响应无效");
+        assert_eq!(client.state(), SidecarState::Failed);
+    }
+
+    #[tokio::test]
+    async fn delimiter_free_oversized_response_fails_promptly() {
+        let script = format!(
+            "const rl=require('readline').createInterface({{input:process.stdin}});rl.on('line',line=>{{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({{id:r.id,ok:true,result:{{protocolVersion:1}}}})+'\\n');else process.stdout.write('x'.repeat({}));}});",
+            MAX_FRAME_BYTES
+        );
+        let mut client = SidecarClient::start(command(&script), Duration::from_secs(5))
+            .await
+            .expect("start");
+        let started = std::time::Instant::now();
+        let error = client.request("echo", json!({})).await.unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::FrameTooLarge);
+        assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(client.state(), SidecarState::Failed);
     }
 
@@ -399,6 +545,20 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){process.std
         )
         .await
         .expect("start");
+        let error = client.request("echo", json!({})).await.unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::FrameTooLarge);
+        assert_eq!(client.state(), SidecarState::Failed);
+    }
+
+    #[tokio::test]
+    async fn exact_max_minus_one_payload_plus_crlf_is_rejected() {
+        let script = format!(
+            "const rl=require('readline').createInterface({{input:process.stdin}});const make=(id)=>{{const o={{id,ok:true,result:{{padding:''}}}};const empty=JSON.stringify(o);o.result.padding='x'.repeat({}-Buffer.byteLength(empty));return JSON.stringify(o);}};rl.on('line',line=>{{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({{id:r.id,ok:true,result:{{protocolVersion:1}}}})+'\\n');else process.stdout.write(make(r.id)+'\\r\\n');}});",
+            MAX_FRAME_BYTES - 1
+        );
+        let mut client = SidecarClient::start(command(&script), Duration::from_secs(5))
+            .await
+            .expect("start");
         let error = client.request("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::FrameTooLarge);
         assert_eq!(client.state(), SidecarState::Failed);

@@ -69,4 +69,24 @@ type Codec = {
 		});
 		await expect(decodeItem(`id: 33333333333333333333333333333333\nfile_extension: ${malicious}\ntype_: 4`)).rejects.not.toHaveProperty('message', expect.stringContaining(malicious));
 	});
+
+	test('encode rejects dangerous IDs and extensions through official validation', async () => {
+		const { encodeItem, registerItemClasses } = require('./codec') as Codec;
+		registerItemClasses();
+		const maliciousId = '../../escape';
+		const maliciousExtension = '../png';
+		await expect(encodeItem({ id: maliciousId, type_: 2, title: 'bad' })).rejects.toMatchObject({ code: 'INVALID_ITEM', message: 'Joplin 项目格式无效' });
+		await expect(encodeItem({ id: '33333333333333333333333333333333', type_: 4, file_extension: maliciousExtension, title: 'bad' })).rejects.toMatchObject({ code: 'INVALID_ITEM', message: 'Joplin 项目格式无效' });
+	});
+
+	test('encoded official fixtures contain exactly one type_ property', async () => {
+		const manifest = JSON.parse(await readFile(join(fixtureDir, 'manifest.json'), 'utf8')) as Record<string, string[]>;
+		const { decodeItem, encodeItem, registerItemClasses } = require('./codec') as Codec;
+		registerItemClasses();
+		for (const filename of Object.keys(manifest)) {
+			const decoded = await decodeItem(await readFile(join(fixtureDir, filename), 'utf8'));
+			const encoded = await encodeItem(decoded);
+			expect(encoded.split('\n').filter(line => line.startsWith('type_:')).length).toBe(1);
+		}
+	});
 });

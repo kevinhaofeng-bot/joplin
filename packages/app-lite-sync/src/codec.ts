@@ -37,12 +37,12 @@ const codecDatabase = {
 	tableFieldNames(tableName: string): string[] {
 		const fields = codecSchemas[tableName];
 		if (!fields) throw new Error(`Unknown table: ${tableName}`);
-		return Object.keys(fields);
+		return Object.keys(fields).filter(name => name !== 'type_');
 	},
 	tableFields(tableName: string): { name: string; type: number }[] {
 		const fields = codecSchemas[tableName];
 		if (!fields) throw new Error(`Unknown table: ${tableName}`);
-		return Object.entries(fields).map(([name, field]) => ({
+		return Object.entries(fields).filter(([name]) => name !== 'type_').map(([name, field]) => ({
 			name,
 			type: field.type === 'number' ? Database.TYPE_NUMERIC : Database.TYPE_TEXT,
 		}));
@@ -81,7 +81,9 @@ export async function encodeItem(item: Record<string, unknown>): Promise<string>
 	registerItemClasses();
 	try {
 		const itemClass = BaseItem.itemClass(item);
-		return await itemClass.serialize(item);
+		const serialized = await itemClass.serialize(item);
+		await BaseItem.unserialize(serialized);
+		return serialized;
 	} catch {
 		throw invalidItem();
 	}

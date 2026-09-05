@@ -45,9 +45,9 @@ This foundation uses the Tauri application-data directory for
 read notes, start sync, expose the Data API, or migrate data. It does not yet
 implement note CRUD, E2EE, OCR, or access to the real Joplin profile.
 
-The next plan is the **compatibility-fixture and sync-sidecar plan**. That work
-must keep this isolated, no-existing-data boundary until its own compatibility
-and migration acceptance criteria are met.
+The compatibility-fixture and sync-sidecar work is implemented while keeping
+this isolated, no-existing-data boundary. Its compatibility and migration
+acceptance criteria remain prerequisites for any real-data operation.
 
 The compatibility sidecar now exists as a supervised, testable boundary, but
 the application does not start it yet. This phase uses no real Joplin profile,
