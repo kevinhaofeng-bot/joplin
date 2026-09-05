@@ -19,6 +19,8 @@
     "@joplin/turndown": "~4.0.80",
     "@joplin/turndown-plugin-gfm": "~1.0.62",
     "@tauri-apps/api": "2.11.1",
+    "dompurify": "3.4.8",
+    "events": "3.3.0",
     "react": "19.1.5",
     "react-dom": "19.1.5"
   },

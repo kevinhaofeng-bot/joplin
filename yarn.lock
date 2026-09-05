@@ -12721,6 +12721,8 @@ __metadata:
     "@types/react": "npm:19.1.10"
     "@types/react-dom": "npm:19.1.7"
     "@vitejs/plugin-react": "npm:6.1.1"
+    dompurify: "npm:3.4.8"
+    events: "npm:3.3.0"
     jsdom: "npm:30.0.1"
     react: "npm:19.1.5"
     react-dom: "npm:19.1.5"
