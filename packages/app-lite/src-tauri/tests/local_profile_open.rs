@@ -117,6 +117,106 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
             cycle.unwrap_err().kind(),
             SidecarErrorKind::ValidationFailed
         );
+        let tag_id = "cccccccccccccccccccccccccccccccc";
+        let second_tag_id = "dddddddddddddddddddddddddddddddd";
+        let tag = first
+            .request(
+                "createTag",
+                json!({ "id": tag_id, "title": "  Cafe\u{0301}  " }),
+            )
+            .await
+            .expect("create tag");
+        assert_eq!(tag["item"]["title"], "Café");
+        assert_eq!(tag["item"]["noteCount"], 0);
+        first
+            .request(
+                "createTag",
+                json!({ "id": second_tag_id, "title": "Second" }),
+            )
+            .await
+            .expect("create second tag");
+
+        let note_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let created_note = first
+            .request(
+                "createNote",
+                json!({ "id": note_id, "parentId": child_id, "title": "Local note", "body": "Hello from the local profile" }),
+            )
+            .await
+            .expect("create note");
+        assert_eq!(created_note["item"]["body"], "Hello from the local profile");
+        assert_eq!(
+            first
+                .request(
+                    "createNote",
+                    json!({ "id": note_id, "parentId": child_id, "title": "Local note", "body": "Hello from the local profile" }),
+                )
+                .await
+                .expect("replay note")["created"],
+            false
+        );
+        let listed_notes = first
+            .request("listNotes", json!({ "parentId": child_id }))
+            .await
+            .expect("list notes");
+        assert!(listed_notes["items"][0].get("body").is_none());
+        assert_eq!(
+            first
+                .request("getNote", json!({ "id": note_id }))
+                .await
+                .expect("get note")["body"],
+            "Hello from the local profile"
+        );
+        let note_updated_time = created_note["item"]["updatedTime"]
+            .as_u64()
+            .expect("note timestamp");
+        let tagged = first
+            .request(
+                "setNoteTags",
+                json!({ "noteId": note_id, "expectedUpdatedTime": note_updated_time, "tagIds": [second_tag_id, tag_id] }),
+            )
+            .await
+            .expect("set note tags");
+        assert_eq!(tagged["tagIds"], json!([tag_id, second_tag_id]));
+        let replaced = first
+            .request(
+                "setNoteTags",
+                json!({ "noteId": note_id, "expectedUpdatedTime": tagged["updatedTime"], "tagIds": [second_tag_id] }),
+            )
+            .await
+            .expect("replace note tags");
+        assert_eq!(replaced["tagIds"], json!([second_tag_id]));
+        let updated_note = first
+            .request(
+                "updateNote",
+                json!({ "id": note_id, "expectedUpdatedTime": replaced["updatedTime"], "body": "Updated local profile note" }),
+            )
+            .await
+            .expect("update note");
+        let stale_note = first
+            .request(
+                "updateNote",
+                json!({ "id": note_id, "expectedUpdatedTime": replaced["updatedTime"], "title": "stale" }),
+            )
+            .await;
+        assert_eq!(stale_note.unwrap_err().kind(), SidecarErrorKind::Conflict);
+        first
+            .request(
+                "trashNote",
+                json!({ "id": note_id, "expectedUpdatedTime": updated_note["item"]["updatedTime"] }),
+            )
+            .await
+            .expect("trash note");
+        assert!(
+            first
+                .request("listNotes", json!({ "parentId": child_id }))
+                .await
+                .expect("notes after trash")["items"]
+                .as_array()
+                .expect("note list")
+                .is_empty()
+        );
+
         first
             .request(
                 "trashFolder",
@@ -135,43 +235,6 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
             0
         );
 
-        let tag_id = "cccccccccccccccccccccccccccccccc";
-        let tag = first
-            .request(
-                "createTag",
-                json!({ "id": tag_id, "title": "  Cafe\u{0301}  " }),
-            )
-            .await
-            .expect("create tag");
-        assert_eq!(tag["item"]["title"], "Café");
-        assert_eq!(tag["item"]["noteCount"], 0);
-        let tag_updated_time = tag["item"]["updatedTime"].as_u64().expect("tag timestamp");
-        let updated_tag = first
-            .request(
-                "updateTag",
-                json!({ "id": tag_id, "expectedUpdatedTime": tag_updated_time, "title": "Updated" }),
-            )
-            .await
-            .expect("update tag");
-        let updated_tag_time = updated_tag["item"]["updatedTime"]
-            .as_u64()
-            .expect("updated tag timestamp");
-        first
-            .request(
-                "deleteTag",
-                json!({ "id": tag_id, "expectedUpdatedTime": updated_tag_time }),
-            )
-            .await
-            .expect("delete tag");
-        assert!(
-            first
-                .request("listTags", json!({}))
-                .await
-                .expect("tags after delete")
-                .as_array()
-                .expect("tag list")
-                .is_empty()
-        );
         first.shutdown().await.expect("first shutdown");
         assert_eq!(first.state(), SidecarState::Stopped);
 
@@ -186,12 +249,20 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
         assert_eq!(reopened["state"], "open");
         assert!(
             second
-                .request("listFolders", json!({}))
+                .request("listNotes", json!({}))
                 .await
-                .expect("reopened folders")
+                .expect("reopened notes")["items"]
                 .as_array()
-                .expect("folder list")
+                .expect("note list")
                 .is_empty()
+        );
+        assert_eq!(
+            second
+                .request("getNote", json!({ "id": note_id }))
+                .await
+                .unwrap_err()
+                .kind(),
+            SidecarErrorKind::NotFound
         );
         second.shutdown().await.expect("second shutdown");
     };

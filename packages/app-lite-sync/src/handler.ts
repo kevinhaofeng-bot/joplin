@@ -12,10 +12,11 @@ import type { ProfileSession } from './profile/profileSession';
 import { FolderStore, type CreateFolderInput, type UpdateFolderInput } from './domain/folderStore';
 import { TagStore } from './domain/tagStore';
 import type { CreateTagInput, UpdateTagInput } from './domain/tagStore';
+import { NoteStore, type CreateNoteInput, type SetNoteTagsInput, type UpdateNoteInput } from './domain/noteStore';
 import { exactKeys, validationError } from './domain/validation';
 
 const joplinVersion: string = require('../../lib/package.json').version;
-const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag'] as const;
+const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags'] as const;
 const terminalCodes = new Set(['PROFILE_LOCK_REQUIRED', 'PROFILE_OPEN_FAILED', 'STORAGE_ERROR']);
 const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES)]);
 
@@ -58,6 +59,7 @@ function fixedError(error: unknown, fallback: string): ProtocolError {
 export function createHandler(session: SessionLike): RequestHandler {
 	const folderStore = new FolderStore();
 	const tagStore = new TagStore();
+	const noteStore = new NoteStore();
 	return {
 		handleRequest: async (request: RequestFrame): Promise<HandledRequest> => {
 			try {
@@ -110,6 +112,30 @@ export function createHandler(session: SessionLike): RequestHandler {
 					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime'])) throw validationError();
 					requireOpen(session);
 					return { response: successFrame(request.id, await tagStore.delete(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
+				case 'listNotes':
+					if (!isObject(request.params) || !hasAllowed(request.params, [], ['parentId', 'page', 'limit'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await noteStore.list(request.params)), shouldExit: false };
+				case 'getNote':
+					if (!isObject(request.params) || !hasOnly(request.params, ['id'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await noteStore.get(request.params.id)), shouldExit: false };
+				case 'createNote':
+					if (!isObject(request.params) || !hasAllowed(request.params, ['parentId', 'title', 'body'], ['id', 'isTodo', 'todoDue'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await noteStore.create(request.params as CreateNoteInput)), shouldExit: false };
+				case 'updateNote':
+					if (!isObject(request.params) || !hasAllowed(request.params, ['id', 'expectedUpdatedTime'], ['title', 'body', 'parentId', 'isTodo', 'todoDue', 'todoCompleted'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await noteStore.update(request.params as UpdateNoteInput)), shouldExit: false };
+				case 'trashNote':
+					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await noteStore.trash(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
+				case 'setNoteTags':
+					if (!isObject(request.params) || !hasOnly(request.params, ['noteId', 'expectedUpdatedTime', 'tagIds'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await noteStore.setNoteTags(request.params as SetNoteTagsInput)), shouldExit: false };
 				case 'shutdown':
 					if (!hasOnly(request.params, [])) throw invalidRequest();
 					await session.close();
