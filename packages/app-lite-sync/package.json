@@ -6,6 +6,7 @@
     "test": "jest --config jest.config.js --runInBand",
     "test-ci": "yarn test",
     "tsc": "tsc --noEmit --project tsconfig.json",
+    "verify:clean": "yarn workspace @joplin/fork-htmlparser2 build && yarn workspace @joplin/utils build && yarn workspace @joplin/lib tsc && yarn test && yarn tsc",
     "start:stdio": "node -r ts-node/register/transpile-only src/main.ts"
   },
   "dependencies": {
