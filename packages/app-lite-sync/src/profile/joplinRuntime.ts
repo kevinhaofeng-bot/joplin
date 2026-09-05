@@ -17,6 +17,11 @@ import ResourceService from '../../../lib/services/ResourceService';
 import ResourceFetcher from '../../../lib/services/ResourceFetcher';
 import SyncTargetJoplinServer from '../../../lib/SyncTargetJoplinServer';
 import SyncTargetRegistry from '../../../lib/SyncTargetRegistry';
+import KvStore from '../../../lib/services/KvStore';
+import EncryptionService from '../../../lib/services/e2ee/EncryptionService';
+import { setRSA } from '../../../lib/services/e2ee/ppk/ppk';
+import RSA from '../../../lib/services/e2ee/ppk/RSA.node';
+import ShareService from '../../../lib/services/share/ShareService';
 import { reg } from '../../../lib/registry';
 import Logger from '../../../utils/Logger';
 import { registerItemClasses } from '../codec';
@@ -72,6 +77,15 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 		await database.open({ name: paths.database });
 		BaseModel.setDb(database);
 		reg.setDb(database);
+		KvStore.instance().setDb(database);
+		setRSA(RSA);
+		const encryptionService = EncryptionService.instance();
+		BaseItem.encryptionService_ = encryptionService;
+		const shareStore = {
+			getState: (): { shareService: { shares: never[]; shareUsers: Record<string, never>; shareInvitations: never[]; processingShareInvitationResponse: boolean } } => ({ shareService: { shares: [], shareUsers: {}, shareInvitations: [], processingShareInvitationResponse: false } }),
+			dispatch: (_action: unknown): undefined => undefined,
+		} as unknown as Parameters<ShareService['initialize']>[0];
+		ShareService.instance().initialize(shareStore, encryptionService);
 		await loadKeychainServiceAndSettings([KeychainServiceDriverNode]);
 		await KeychainService.instance().detectIfKeychainSupported();
 		const clearPersistedSyncPassword = async () => {
@@ -165,6 +179,7 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 					const target = new SyncTargetJoplinServer(database);
 					target.setLogger(logger);
 					const synchronizer = await target.synchronizer();
+					synchronizer.setEncryptionService(encryptionService);
 					nextContext = await synchronizer.start({
 						context,
 						throwOnError: true,
