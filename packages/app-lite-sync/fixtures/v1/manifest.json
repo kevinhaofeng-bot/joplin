@@ -1,0 +1,9 @@
+{
+  "note.txt": ["id", "parent_id", "title", "body", "is_todo", "created_time", "updated_time", "type_"],
+  "folder.txt": ["id", "parent_id", "title", "created_time", "updated_time", "type_"],
+  "resource.txt": ["id", "title", "mime", "file_extension", "size", "created_time", "updated_time", "type_"],
+  "tag.txt": ["id", "title", "created_time", "updated_time", "type_"],
+  "note-tag.txt": ["id", "note_id", "tag_id", "created_time", "updated_time", "type_"],
+  "master-key.txt": ["id", "content", "created_time", "updated_time", "type_"],
+  "revision.txt": ["id", "item_id", "item_type", "title_diff", "body_diff", "metadata_diff", "created_time", "updated_time", "type_"]
+}
