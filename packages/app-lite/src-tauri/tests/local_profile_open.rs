@@ -4,9 +4,10 @@ use std::{path::PathBuf, time::Duration};
 
 use joplin_lite::profile::ProfilePaths;
 use joplin_lite::sync_sidecar::{
-    CreateFolderParams, CreateNoteParams, CreateTagParams, ExpectedUpdatedTimeParams,
-    GetByIdParams, ListNotesParams, MarkupLanguage, ProfileState, SetNoteTagsParams, SidecarClient,
-    SidecarCommand, SidecarErrorKind, SidecarState, UpdateFolderParams, UpdateNoteParams,
+    CreateFolderParams, CreateNoteParams, CreateResourceFromPathParams, CreateTagParams,
+    ExpectedUpdatedTimeParams, GetByIdParams, ListNoteResourcesParams, ListNotesParams,
+    MarkupLanguage, ProfileState, SetNoteTagsParams, SidecarClient, SidecarCommand,
+    SidecarErrorKind, SidecarState, UpdateFolderParams, UpdateNoteParams,
 };
 
 fn command(repo_root: PathBuf) -> SidecarCommand {
@@ -34,6 +35,8 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
     ));
     let root = parent.join("com.kevinhao.joplin-lite");
     std::fs::create_dir_all(&parent).expect("temporary parent");
+    let resource_path = parent.join("picture.png");
+    std::fs::write(&resource_path, b"resource-data").expect("temporary resource");
     let paths = ProfilePaths::try_from_app_data(root.clone()).expect("profile paths");
     paths.ensure().expect("profile scaffold");
 
@@ -195,12 +198,21 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
             })
             .await
             .expect("replace note tags");
+        let resource = first
+            .create_resource_from_path(CreateResourceFromPathParams {
+                path: resource_path.to_string_lossy().into_owned(),
+                title: Some("picture.png".into()),
+            })
+            .await
+            .expect("create official resource");
+        assert_eq!(resource.file_extension, "png");
+        assert!(resource.markup.contains(&resource.id));
         let updated_note = first
             .update_note(UpdateNoteParams {
                 id: note_id.clone(),
                 expected_updated_time: replaced.updated_time,
                 title: None,
-                body: Some("Updated local profile note".into()),
+                body: Some(format!("Updated local profile note\n\n{}", resource.markup)),
                 parent_id: None,
                 is_todo: None,
                 todo_due: None,
@@ -208,7 +220,19 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
             })
             .await
             .expect("update note");
-        assert_eq!(updated_note.item.body, "Updated local profile note");
+        assert!(updated_note.item.body.contains(&resource.id));
+        assert_eq!(
+            first
+                .list_note_resources(ListNoteResourcesParams {
+                    note_id: note_id.clone(),
+                })
+                .await
+                .expect("list associated resources")
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![resource.id.as_str()]
+        );
         let stale_note = first
             .update_note(UpdateNoteParams {
                 id: note_id.clone(),
@@ -244,7 +268,19 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
             })
             .await
             .expect("reopened note");
-        assert_eq!(reopened_detail.body, "Updated local profile note");
+        assert!(reopened_detail.body.contains(&resource.id));
+        assert_eq!(
+            second
+                .list_note_resources(ListNoteResourcesParams {
+                    note_id: note_id.clone()
+                })
+                .await
+                .expect("reopened resources")
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![resource.id.as_str()]
+        );
         assert_eq!(
             reopened_detail.tag_ids,
             vec!["dddddddddddddddddddddddddddddddd"]

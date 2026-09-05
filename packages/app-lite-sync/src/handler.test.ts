@@ -26,7 +26,7 @@ describe('sidecar command handler', () => {
 		const { handleRequest } = codecHandler();
 
 		await expect(handleRequest(request('hello', {}))).resolves.toMatchObject({
-			response: { ok: true, result: { protocolVersion: 1, joplinVersion: '3.7.0', capabilities: ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags'] } },
+			response: { ok: true, result: { protocolVersion: 1, joplinVersion: '3.7.0', capabilities: ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources'] } },
 			shouldExit: false,
 		});
 	});
@@ -101,6 +101,12 @@ describe('sidecar command handler', () => {
 	test('requires an open profile before domain operations', async () => {
 		const session = { status: () => ({ state: 'closed' as const, formatVersion: 1 as const }), requireOpen: (): void => { throw profileError('PROFILE_NOT_OPEN'); }, open: jest.fn(), flush: async (): Promise<void> => undefined, close: async (): Promise<void> => undefined };
 		const response = await createHandler(session).handleRequest(request('listFolders', {}));
+		expect(response).toEqual({ response: failureFrame('r1', 'PROFILE_NOT_OPEN', '资料库尚未打开'), shouldExit: false });
+	});
+
+	test('requires an open profile before resource operations', async () => {
+		const session = { status: () => ({ state: 'closed' as const, formatVersion: 1 as const }), requireOpen: (): void => { throw profileError('PROFILE_NOT_OPEN'); }, open: jest.fn(), flush: async (): Promise<void> => undefined, close: async (): Promise<void> => undefined };
+		const response = await createHandler(session).handleRequest(request('listNoteResources', { noteId: 'a'.repeat(32) }));
 		expect(response).toEqual({ response: failureFrame('r1', 'PROFILE_NOT_OPEN', '资料库尚未打开'), shouldExit: false });
 	});
 

@@ -61,4 +61,25 @@ describe('note store', () => {
 		const store = new NoteStore({ model: model as any, folderModel: { load: async (): Promise<any> => ({ id: idB, deleted_time: 0 }) } as any, tagModel: { tagsByNoteId: async (): Promise<any[]> => [], byIds: async (): Promise<any[]> => [], setNoteTagsByIds: async (): Promise<void> => undefined } as any });
 		await expect(store.create({ id: idA, parentId: idB, title: idA, body: `body-${idA}` })).rejects.toMatchObject({ code: 'CONFLICT' });
 	});
+
+	test('refreshes official note-resource associations after saving note body', async () => {
+		const notes = new Map<string, any>();
+		const savedBody = `![image](:/${idC})`;
+		const association = jest.fn(async (): Promise<void> => undefined);
+		const model = {
+			load: async (id: string) => notes.get(id) || null,
+			save: async (item: any) => { const result = { created_time: 1, updated_time: 1, deleted_time: 0, ...item }; notes.set(result.id, result); return result; },
+			previews: async (): Promise<any[]> => [], delete: async (): Promise<void> => undefined,
+		};
+		const store = new NoteStore({
+			model: model as any,
+			folderModel: { load: async (): Promise<any> => ({ id: idB, deleted_time: 0 }) } as any,
+			tagModel: { tagsByNoteId: async (): Promise<any[]> => [], byIds: async (): Promise<any[]> => [], setNoteTagsByIds: async (): Promise<void> => undefined } as any,
+			barrier: { begin: async (): Promise<number> => 0, end: async (): Promise<void> => undefined } as any,
+			setAssociatedResources: association,
+		});
+
+		await store.create({ id: idA, parentId: idB, title: 'with image', body: savedBody });
+		expect(association).toHaveBeenCalledWith(idA, savedBody);
+	});
 });

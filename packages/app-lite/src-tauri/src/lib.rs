@@ -42,6 +42,8 @@ pub fn run() {
             library::update_note,
             library::trash_note,
             library::set_note_tags,
+            library::create_resource_from_path,
+            library::list_note_resources,
             library::shutdown_library
         ])
         .run(tauri::generate_context!())

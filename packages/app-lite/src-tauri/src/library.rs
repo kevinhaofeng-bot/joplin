@@ -3,7 +3,10 @@ use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::{profile::ProfilePaths, sync_sidecar::*};
+use crate::{
+    profile::{ProfilePaths, validate_resource_file},
+    sync_sidecar::*,
+};
 
 pub const SIDECAR_UNAVAILABLE_CODE: &str = "SIDECAR_UNAVAILABLE";
 pub const SIDECAR_UNAVAILABLE_MESSAGE: &str = "本地资料库不可用";
@@ -256,6 +259,48 @@ impl LibraryState {
         self.with_client(|client| Box::pin(client.set_note_tags(params)))
             .await
     }
+
+    pub async fn create_resource_from_path(
+        &self,
+        params: CreateResourceFromPathParams,
+    ) -> Result<Resource, LibraryError> {
+        if params
+            .title
+            .as_deref()
+            .is_some_and(|title| title.len() > 4096 || title.contains('\0'))
+        {
+            return Err(LibraryError {
+                code: "VALIDATION_FAILED",
+                message: "输入内容无效",
+            });
+        }
+        validate_resource_file(std::path::Path::new(&params.path)).map_err(|_| LibraryError {
+            code: "VALIDATION_FAILED",
+            message: "输入内容无效",
+        })?;
+        let path = std::fs::canonicalize(&params.path).map_err(|_| LibraryError {
+            code: "VALIDATION_FAILED",
+            message: "输入内容无效",
+        })?;
+        validate_resource_file(&path).map_err(|_| LibraryError {
+            code: "VALIDATION_FAILED",
+            message: "输入内容无效",
+        })?;
+        let params = CreateResourceFromPathParams {
+            path: path.to_string_lossy().into_owned(),
+            title: params.title,
+        };
+        self.with_client(|client| Box::pin(client.create_resource_from_path(params)))
+            .await
+    }
+
+    pub async fn list_note_resources(
+        &self,
+        params: ListNoteResourcesParams,
+    ) -> Result<Vec<Resource>, LibraryError> {
+        self.with_client(|client| Box::pin(client.list_note_resources(params)))
+            .await
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -338,6 +383,8 @@ arg_library_commands! {
     update_note(update_note, UpdateNoteParams) -> UpdateResult<NoteDetail>,
     trash_note(trash_note, ExpectedUpdatedTimeParams) -> TrashResult,
     set_note_tags(set_note_tags, SetNoteTagsParams) -> SetNoteTagsResult,
+    create_resource_from_path(create_resource_from_path, CreateResourceFromPathParams) -> Resource,
+    list_note_resources(list_note_resources, ListNoteResourcesParams) -> Vec<Resource>,
 }
 
 #[tauri::command]

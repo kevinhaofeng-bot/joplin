@@ -243,6 +243,33 @@ pub struct DeleteResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Resource {
+    pub id: String,
+    pub title: String,
+    pub mime: String,
+    pub file_extension: String,
+    pub size: u64,
+    pub created_time: u64,
+    pub updated_time: u64,
+    pub markup: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateResourceFromPathParams {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListNoteResourcesParams {
+    pub note_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShutdownResult {
     pub stopped: bool,
 }

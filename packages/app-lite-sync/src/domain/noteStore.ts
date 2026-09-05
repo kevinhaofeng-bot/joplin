@@ -3,6 +3,7 @@ import Folder from '../../../lib/models/Folder';
 import ItemChange from '../../../lib/models/ItemChange';
 import Note from '../../../lib/models/Note';
 import Tag from '../../../lib/models/Tag';
+import ResourceService from '../../../lib/services/ResourceService';
 import type { NoteEntity } from '../../../lib/services/database/types';
 import { ProtocolError } from '../protocol';
 import { noteDetailDto, noteSummaryDto, type NoteDetailDto, type NoteSummaryDto } from './dto';
@@ -30,6 +31,7 @@ type StoreOptions = {
 	tagModel?: TagModel;
 	barrier?: ChangeBarrier;
 	now?: () => number;
+	setAssociatedResources?: (noteId: string, body: string)=> Promise<void>;
 };
 
 function fixedStorage(error: unknown): never {
@@ -65,6 +67,7 @@ export class NoteStore {
 	private readonly tagModel: TagModel;
 	private readonly barrier: ChangeBarrier;
 	private readonly now: () => number;
+	private readonly setAssociatedResources: (noteId: string, body: string)=> Promise<void>;
 
 	public constructor(options: StoreOptions = {}) {
 		this.model = options.model ?? Note;
@@ -72,6 +75,7 @@ export class NoteStore {
 		this.tagModel = options.tagModel ?? Tag;
 		this.barrier = options.barrier ?? defaultBarrier();
 		this.now = options.now ?? Date.now;
+		this.setAssociatedResources = options.setAssociatedResources ?? ((noteId, body) => ResourceService.instance().setAssociatedResources(noteId, body));
 	}
 
 	public async list(input: ListNotesInput = {}): Promise<{ items: NoteSummaryDto[]; page: number; hasMore: boolean }> {
@@ -126,6 +130,7 @@ export class NoteStore {
 			const savedId = saved.id || id;
 			if (!savedId) throw storageError();
 			await this.barrier.end(barrier, savedId, ItemChange.TYPE_CREATE);
+			await this.setAssociatedResources(savedId, body);
 			const result = await this.model.load(savedId);
 			if (!result) throw storageError();
 			return { item: noteDetailDto(result, await this.tagIds(savedId)), created: true };
@@ -164,6 +169,7 @@ export class NoteStore {
 			const barrier = await this.barrier.begin();
 			const saved = await this.model.save({ ...current, ...values, updated_time: updatedTime, ...(userChanged ? { user_updated_time: updatedTime } : { user_updated_time: current.user_updated_time }) }, { isNew: false, autoTimestamp: false, userSideValidation: true });
 			await this.barrier.end(barrier, id, ItemChange.TYPE_UPDATE);
+			if (body !== undefined) await this.setAssociatedResources(id, values.body ?? current.body ?? '');
 			const result = await this.model.load(id) || saved;
 			return { item: noteDetailDto(result, await this.tagIds(id)), changed: true };
 		} catch (error) {

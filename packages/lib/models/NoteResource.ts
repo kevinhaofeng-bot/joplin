@@ -82,6 +82,11 @@ export default class NoteResource extends BaseModel {
 		return rows.map((r: { note_id: string }) => r.note_id);
 	}
 
+	public static async associatedResourceIds(noteId: string): Promise<string[]> {
+		const rows = await this.modelSelectAll('SELECT resource_id FROM note_resources WHERE note_id = ? AND is_associated = 1', [noteId]);
+		return rows.map((r: { resource_id: string }) => r.resource_id);
+	}
+
 	public static async associatedResourceNotes(resourceIds: string[], options: LoadOptions = null): Promise<Record<string, AssociatedResourceNote[]>> {
 		if (!resourceIds.length) return {};
 

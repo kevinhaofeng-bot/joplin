@@ -13,10 +13,11 @@ use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use crate::profile::ProfilePaths;
 
 use super::domain::{
-    CreateFolderParams, CreateNoteParams, CreateResult, CreateTagParams, DeleteResult, EmptyParams,
-    ExpectedUpdatedTimeParams, Folder, GetByIdParams, ListNotesParams, NoteDetail, NotePage,
-    OpenProfile, ProfilePathParams, ProfileStatus, SetNoteTagsParams, SetNoteTagsResult,
-    ShutdownResult, Tag, TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
+    CreateFolderParams, CreateNoteParams, CreateResourceFromPathParams, CreateResult,
+    CreateTagParams, DeleteResult, EmptyParams, ExpectedUpdatedTimeParams, Folder, GetByIdParams,
+    ListNoteResourcesParams, ListNotesParams, NoteDetail, NotePage, OpenProfile, ProfilePathParams,
+    ProfileStatus, Resource, SetNoteTagsParams, SetNoteTagsResult, ShutdownResult, Tag,
+    TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
 };
 use super::profile_lease::ProfileLease;
 use super::protocol::{
@@ -420,6 +421,20 @@ impl SidecarClient {
         params: SetNoteTagsParams,
     ) -> Result<SetNoteTagsResult, SidecarError> {
         self.request_typed("setNoteTags", &params).await
+    }
+
+    pub async fn create_resource_from_path(
+        &mut self,
+        params: CreateResourceFromPathParams,
+    ) -> Result<Resource, SidecarError> {
+        self.request_typed("createResourceFromPath", &params).await
+    }
+
+    pub async fn list_note_resources(
+        &mut self,
+        params: ListNoteResourcesParams,
+    ) -> Result<Vec<Resource>, SidecarError> {
+        self.request_typed("listNoteResources", &params).await
     }
 
     pub fn state(&self) -> SidecarState {

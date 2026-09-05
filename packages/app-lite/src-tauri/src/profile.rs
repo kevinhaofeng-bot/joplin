@@ -4,6 +4,7 @@ use std::{
 };
 
 pub const EXPECTED_PROFILE_DIRECTORY_NAME: &str = "com.kevinhao.joplin-lite";
+pub const MAX_RESOURCE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProfilePathError {
@@ -24,6 +25,27 @@ pub struct ProfilePaths {
     resources: PathBuf,
     indexes: PathBuf,
     logs: PathBuf,
+}
+
+pub fn validate_resource_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn validate_resource_file(path: &Path) -> io::Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_RESOURCE_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resource file rejected",
+        ));
+    }
+    Ok(metadata)
 }
 
 impl ProfilePaths {
@@ -238,5 +260,40 @@ mod tests {
         symlink(&target, &root).unwrap();
 
         assert!(paths.ensure().is_err());
+    }
+
+    #[test]
+    fn resource_input_requires_a_regular_non_symlink_file_within_the_size_limit() {
+        let temporary_directory = TemporaryDirectory::new();
+        let file = temporary_directory.path().join("picture.png");
+        fs::write(&file, b"image").unwrap();
+        assert!(validate_resource_file(&file).is_ok());
+
+        let link = temporary_directory.path().join("link.png");
+        symlink(&file, &link).unwrap();
+        assert!(validate_resource_file(&link).is_err());
+
+        let directory = temporary_directory.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(validate_resource_file(&directory).is_err());
+
+        let oversized = temporary_directory.path().join("oversized.bin");
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&oversized)
+            .unwrap()
+            .set_len(MAX_RESOURCE_BYTES + 1)
+            .unwrap();
+        assert!(validate_resource_file(&oversized).is_err());
+    }
+
+    #[test]
+    fn resource_ids_are_exact_lowercase_hex() {
+        assert!(validate_resource_id(&"a".repeat(32)));
+        assert!(!validate_resource_id(&"A".repeat(32)));
+        assert!(!validate_resource_id(&"a".repeat(31)));
+        assert!(!validate_resource_id(&format!("{}g", "a".repeat(31))));
     }
 }

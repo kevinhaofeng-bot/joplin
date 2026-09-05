@@ -13,10 +13,11 @@ import { FolderStore, type CreateFolderInput, type UpdateFolderInput } from './d
 import { TagStore } from './domain/tagStore';
 import type { CreateTagInput, UpdateTagInput } from './domain/tagStore';
 import { NoteStore, type CreateNoteInput, type SetNoteTagsInput, type UpdateNoteInput } from './domain/noteStore';
+import { ResourceStore, type CreateResourceInput } from './domain/resourceStore';
 import { exactKeys, validationError } from './domain/validation';
 
 const joplinVersion: string = require('../../lib/package.json').version;
-const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags'] as const;
+const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources'] as const;
 const terminalCodes = new Set(['PROFILE_LOCK_REQUIRED', 'PROFILE_OPEN_FAILED', 'STORAGE_ERROR']);
 const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES)]);
 
@@ -60,6 +61,7 @@ export function createHandler(session: SessionLike): RequestHandler {
 	const folderStore = new FolderStore();
 	const tagStore = new TagStore();
 	const noteStore = new NoteStore();
+	const resourceStore = new ResourceStore();
 	return {
 		handleRequest: async (request: RequestFrame): Promise<HandledRequest> => {
 			try {
@@ -136,6 +138,14 @@ export function createHandler(session: SessionLike): RequestHandler {
 					if (!isObject(request.params) || !hasOnly(request.params, ['noteId', 'expectedUpdatedTime', 'tagIds'])) throw validationError();
 					requireOpen(session);
 					return { response: successFrame(request.id, await noteStore.setNoteTags(request.params as SetNoteTagsInput)), shouldExit: false };
+				case 'createResourceFromPath':
+					if (!isObject(request.params) || !hasAllowed(request.params, ['path'], ['title']) || typeof request.params.path !== 'string' || (request.params.title !== undefined && typeof request.params.title !== 'string')) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await resourceStore.createFromPath(request.params as CreateResourceInput)), shouldExit: false };
+				case 'listNoteResources':
+					if (!isObject(request.params) || !hasOnly(request.params, ['noteId']) || typeof request.params.noteId !== 'string') throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await resourceStore.listForNote(request.params.noteId)), shouldExit: false };
 				case 'shutdown':
 					if (!hasOnly(request.params, [])) throw invalidRequest();
 					await session.close();
