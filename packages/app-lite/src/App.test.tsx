@@ -28,7 +28,10 @@ function makeApi(overrides: Partial<LibraryApi> = {}): LibraryApi {
 		updateNote: vi.fn(async (params) => ({ changed: true, item: { ...note, ...params, updatedTime: params.expectedUpdatedTime + 1 } })),
 		trashNote: vi.fn(), setNoteTags: vi.fn(), createResourceFromPath: vi.fn(), listNoteResources: vi.fn(async () => []),
 		createImageResource: vi.fn(), openResource: vi.fn(), getSyncConfig: vi.fn(async () => ({ configured: false })),
-		configureJoplinServer: vi.fn(async () => ({ configured: true, url: 'https://sync.example.test', username: 'user@example.test' })), syncNow: vi.fn(async () => ({ completedAt: 1, created: 1, updated: 0, deleted: 0, fetched: 0 })), ...overrides,
+		configureJoplinServer: vi.fn(async () => ({ configured: true, url: 'https://sync.example.test', username: 'user@example.test' })),
+		startSync: vi.fn(async () => ({ state: 'succeeded' as const, summary: { completedAt: 1, created: 1, updated: 0, deleted: 0, fetched: 0 } })),
+		getSyncStatus: vi.fn(async () => ({ state: 'succeeded' as const, summary: { completedAt: 1, created: 1, updated: 0, deleted: 0, fetched: 0 } })),
+		syncNow: vi.fn(async () => ({ completedAt: 1, created: 1, updated: 0, deleted: 0, fetched: 0 })), ...overrides,
 	};
 }
 
@@ -107,9 +110,27 @@ describe('App', () => {
 		fireEvent.click(screen.getByRole('button', { name: '连接并保存' }));
 		await screen.findByRole('button', { name: '同步' });
 		fireEvent.click(screen.getByRole('button', { name: '同步' }));
-		await waitFor(() => expect(api.syncNow).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(api.startSync).toHaveBeenCalledTimes(1));
+		expect(api.syncNow).not.toHaveBeenCalled();
 		expect(api.listFolders).toHaveBeenCalled();
 		expect(api.listNotes).toHaveBeenCalled();
+	});
+
+	it('polls background sync without blocking an autosave', async () => {
+		const api = makeApi({
+			listNotes: vi.fn(async () => ({ items: [note], page: 1, hasMore: false })),
+			getSyncConfig: vi.fn(async () => ({ configured: true, url: 'https://sync.example.test', username: 'user@example.test' })),
+			startSync: vi.fn(async () => ({ state: 'running' as const })),
+			getSyncStatus: vi.fn(async () => ({ state: 'succeeded' as const, summary: { completedAt: 2, created: 0, updated: 1, deleted: 0, fetched: 0 } })),
+		});
+		render(<App loadRuntimeInfo={runtime} library={api} EditorComponent={FakeEditor} />);
+		fireEvent.click(await screen.findByRole('button', { name: '未命名笔记' }));
+		const body = await screen.findByRole('textbox', { name: '正文' });
+		fireEvent.click(screen.getByRole('button', { name: '同步' }));
+		await waitFor(() => expect(api.startSync).toHaveBeenCalledTimes(1));
+		fireEvent.change(body, { target: { value: '同步期间的编辑' } });
+		await waitFor(() => expect(api.updateNote).toHaveBeenCalledWith(expect.objectContaining({ body: '同步期间的编辑' })), { timeout: 1500 });
+		await waitFor(() => expect(api.getSyncStatus).toHaveBeenCalledTimes(1), { timeout: 1500 });
 	});
 
 	it('debounces note search and Escape restores the regular list', async () => {

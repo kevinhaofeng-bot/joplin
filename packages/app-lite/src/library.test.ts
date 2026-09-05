@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createFolder, createImageResource, createResourceFromPath, listNoteResources, listNotes, openLibrary, resourceUrl } from './library';
+import { createFolder, createImageResource, createResourceFromPath, getSyncStatus, listNoteResources, listNotes, openLibrary, resourceUrl, startSync } from './library';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 
@@ -46,6 +46,15 @@ describe('library invoke client', () => {
 		expect(await openLibrary()).toEqual({ state: 'open', schemaVersion: 53, formatVersion: 1 });
 		vi.mocked(invoke).mockResolvedValue({ state: 'open', schemaVersion: -1, formatVersion: 1 });
 		await expect(openLibrary()).rejects.toThrow('本地资料库响应无效');
+	});
+
+	it('guards the non-blocking sync lifecycle status', async () => {
+		vi.mocked(invoke).mockResolvedValueOnce({ state: 'running' });
+		await expect(startSync()).resolves.toEqual({ state: 'running' });
+		vi.mocked(invoke).mockResolvedValueOnce({ state: 'failed', code: 'SYNC_NETWORK' });
+		await expect(getSyncStatus()).resolves.toEqual({ state: 'failed', code: 'SYNC_NETWORK' });
+		vi.mocked(invoke).mockResolvedValueOnce({ state: 'failed', code: 'SECRET_ERROR' });
+		await expect(getSyncStatus()).rejects.toThrow('本地资料库响应无效');
 	});
 
 	it('guards and sends official resource DTOs without exposing paths', async () => {

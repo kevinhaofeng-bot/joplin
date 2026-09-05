@@ -386,6 +386,16 @@ impl LibraryState {
             .await
     }
 
+    pub async fn start_sync(&self) -> Result<SyncStatus, LibraryError> {
+        self.with_client(|client| Box::pin(client.start_sync()))
+            .await
+    }
+
+    pub async fn get_sync_status(&self) -> Result<SyncStatus, LibraryError> {
+        self.with_client(|client| Box::pin(client.get_sync_status()))
+            .await
+    }
+
     pub async fn sync_now(&self) -> Result<SyncSummary, LibraryError> {
         self.with_client(|client| Box::pin(client.sync_now())).await
     }
@@ -576,6 +586,8 @@ noarg_library_commands! {
     list_folders(list_folders) -> Vec<Folder>,
     list_tags(list_tags) -> Vec<Tag>,
     get_sync_config(get_sync_config) -> SyncConfig,
+    start_sync(start_sync) -> SyncStatus,
+    get_sync_status(get_sync_status) -> SyncStatus,
     sync_now(sync_now) -> SyncSummary,
 }
 

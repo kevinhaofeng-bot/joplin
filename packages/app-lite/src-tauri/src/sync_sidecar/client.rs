@@ -18,7 +18,7 @@ use super::domain::{
     ExpectedUpdatedTimeParams, Folder, GetByIdParams, ListNoteResourcesParams, ListNotesParams,
     NoteDetail, NotePage, OpenProfile, ProfilePathParams, ProfileStatus, Resource, SearchNotePage,
     SearchNotesParams, SetNoteTagsParams, SetNoteTagsResult, ShutdownResult, SyncConfig,
-    SyncSummary, Tag, TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
+    SyncStatus, SyncSummary, Tag, TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
 };
 use super::profile_lease::ProfileLease;
 use super::protocol::{
@@ -482,6 +482,14 @@ impl SidecarClient {
         params: ConfigureJoplinServerParams,
     ) -> Result<SyncConfig, SidecarError> {
         self.request_typed("configureJoplinServer", &params).await
+    }
+
+    pub async fn start_sync(&mut self) -> Result<SyncStatus, SidecarError> {
+        self.request_typed("startSync", &EmptyParams {}).await
+    }
+
+    pub async fn get_sync_status(&mut self) -> Result<SyncStatus, SidecarError> {
+        self.request_typed("getSyncStatus", &EmptyParams {}).await
     }
 
     pub async fn sync_now(&mut self) -> Result<SyncSummary, SidecarError> {

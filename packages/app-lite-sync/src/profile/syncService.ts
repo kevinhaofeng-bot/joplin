@@ -18,6 +18,12 @@ export type SyncSummary = {
 	fetched: number;
 };
 
+export type SyncCode = 'SYNC_NOT_CONFIGURED' | 'SYNC_AUTH_FAILED' | 'SYNC_NETWORK' | 'SYNC_BUSY' | 'SYNC_FAILED';
+export type SyncStatus =
+	| { state: 'idle' | 'running' }
+	| { state: 'succeeded'; summary: SyncSummary }
+	| { state: 'failed'; code: Exclude<SyncCode, 'SYNC_BUSY'> };
+
 export type SyncAdapter = {
 	readConfig: ()=> Promise<SyncConfig>;
 	configure: (input: SyncConfigInput)=> Promise<void>;
@@ -43,7 +49,8 @@ export function normalizeSyncUrl(value: string): string {
 }
 
 export class SyncService {
-	private busy = false;
+	private status: SyncStatus = { state: 'idle' };
+	private active: { result: Promise<SyncSummary>; settled: Promise<void> } | undefined;
 
 	public constructor(private readonly adapter: SyncAdapter) {}
 
@@ -68,16 +75,42 @@ export class SyncService {
 		return this.getConfig();
 	}
 
+	public getSyncStatus(): SyncStatus {
+		if (this.status.state === 'succeeded') return { state: 'succeeded', summary: { ...this.status.summary } };
+		return this.status;
+	}
+
+	public async startSync(): Promise<SyncStatus> {
+		this.beginSync();
+		return this.getSyncStatus();
+	}
+
+	public async waitForIdle(): Promise<void> {
+		await this.active?.settled;
+	}
+
 	public async syncNow(): Promise<SyncSummary> {
-		if (this.busy) throw syncError('SYNC_BUSY');
-		this.busy = true;
-		try {
-			return await this.adapter.syncNow();
-		} catch (error) {
+		return this.beginSync();
+	}
+
+	private beginSync(): Promise<SyncSummary> {
+		if (this.active) throw syncError('SYNC_BUSY');
+		this.status = { state: 'running' };
+		const result = Promise.resolve().then(() => this.adapter.syncNow()).then(summary => {
+			this.status = { state: 'succeeded', summary };
+			return summary;
+		}, error => {
 			const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : 'SYNC_FAILED';
-			throw syncError(code);
-		} finally {
-			this.busy = false;
-		}
+			const fixed = syncError(code);
+			this.status = { state: 'failed', code: fixed.code as Exclude<SyncCode, 'SYNC_BUSY'> };
+			throw fixed;
+		});
+		const settled = result.then((): void => undefined, (): void => undefined);
+		this.active = { result, settled };
+		void result.catch((): void => undefined);
+		void settled.then(() => {
+			if (this.active?.settled === settled) this.active = undefined;
+		});
+		return result;
 	}
 }

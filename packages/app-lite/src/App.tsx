@@ -58,6 +58,7 @@ export default function App({
 	const [syncUsername, setSyncUsername] = useState('');
 	const [syncPassword, setSyncPassword] = useState('');
 	const [syncState, setSyncState] = useState<'idle'|'saving'|'syncing'|'success'|'failed'>('idle');
+	const syncPollSequence = useRef(0);
 	const [saveState, setSaveState] = useState<SaveState>('saved');
 	const [errorMessage, setErrorMessage] = useState('');
 	const [busy, setBusy] = useState(false);
@@ -80,6 +81,7 @@ export default function App({
 	}, [library, selectedFolderId]);
 
 	const bootstrap = useCallback(async (retry = false) => {
+		syncPollSequence.current++;
 		setInitialization({ kind: 'loading' });
 		try {
 			const [runtime] = await Promise.all([
@@ -226,9 +228,17 @@ export default function App({
 
 	const runSync = useCallback(async () => {
 		if (!await flushSave()) return;
+		const pollSequence = ++syncPollSequence.current;
 		setSyncState('syncing'); setErrorMessage('');
 		try {
-			await library.syncNow();
+			let status = await library.startSync();
+			while (status.state === 'running') {
+				await new Promise<void>(resolve => setTimeout(resolve, 1000));
+				if (pollSequence !== syncPollSequence.current) return;
+				status = await library.getSyncStatus();
+			}
+			if (pollSequence !== syncPollSequence.current) return;
+			if (status.state === 'failed') throw new LibraryClientError(status.code);
 			const [loadedFolders, page] = await Promise.all([library.listFolders(), library.listNotes(selectedFolderId ? { parentId: selectedFolderId } : {})]);
 			setFolders(loadedFolders.filter(folder => folder.deletedTime === 0)); setNotes(page.items);
 			if (selectedNoteId) {
@@ -252,7 +262,7 @@ export default function App({
 		try { await library.openResource({ id: resource.id, fileExtension: resource.fileExtension }); } catch (error) { setErrorMessage(safeErrorMessage(error, '无法打开附件')); }
 	}, [library]);
 
-	useEffect(() => () => { void flushSave(); }, [flushSave]);
+	useEffect(() => () => { syncPollSequence.current++; void flushSave(); }, [flushSave]);
 
 	if (initialization.kind === 'loading') return <main className="initialization-shell">正在打开本地资料库…</main>;
 	if (initialization.kind === 'failed') return <section className="initialization-failure" role="alert"><p>{initialization.message}</p><button type="button" onClick={() => { void bootstrap(true); }}>重试打开资料库</button></section>;

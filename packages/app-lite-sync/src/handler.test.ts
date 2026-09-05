@@ -26,7 +26,7 @@ describe('sidecar command handler', () => {
 		const { handleRequest } = codecHandler();
 
 		await expect(handleRequest(request('hello', {}))).resolves.toMatchObject({
-			response: { ok: true, result: { protocolVersion: 1, joplinVersion: '3.7.0', capabilities: ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'syncNow', 'searchNotes'] } },
+			response: { ok: true, result: { protocolVersion: 1, joplinVersion: '3.7.0', capabilities: ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'startSync', 'getSyncStatus', 'syncNow', 'searchNotes'] } },
 			shouldExit: false,
 		});
 	});
@@ -122,12 +122,16 @@ describe('sidecar command handler', () => {
 			open: jest.fn(), flush: async (): Promise<void> => undefined, close: async (): Promise<void> => undefined,
 			getSyncConfig: async () => ({ configured: true, url: 'https://sync.example.test', username: 'user@example.test' }),
 			configureJoplinServer: jest.fn(async () => ({ configured: true, url: 'https://sync.example.test', username: 'user@example.test' })),
+			startSync: jest.fn(async () => ({ state: 'succeeded' as const, summary: { completedAt: 2, created: 1, updated: 2, deleted: 0, fetched: 3 } })),
+			getSyncStatus: jest.fn(async () => ({ state: 'succeeded' as const, summary: { completedAt: 2, created: 1, updated: 2, deleted: 0, fetched: 3 } })),
 			syncNow: jest.fn(async () => ({ completedAt: 2, created: 1, updated: 2, deleted: 0, fetched: 3 })),
 		};
 		const handler = createHandler(session);
 		await expect(handler.handleRequest(request('getSyncConfig', {}))).resolves.toMatchObject({ response: { ok: true, result: { configured: true, username: 'user@example.test' } } });
 		const configured = await handler.handleRequest(request('configureJoplinServer', { url: 'https://sync.example.test', username: 'user@example.test', password: 'secret-marker' }));
 		expect(JSON.stringify(configured)).not.toContain('secret-marker');
+		await expect(handler.handleRequest(request('startSync', {}))).resolves.toMatchObject({ response: { ok: true, result: { state: 'succeeded' } } });
+		await expect(handler.handleRequest(request('getSyncStatus', {}))).resolves.toMatchObject({ response: { ok: true, result: { state: 'succeeded' } } });
 		await expect(handler.handleRequest(request('syncNow', {}))).resolves.toMatchObject({ response: { ok: true, result: { fetched: 3 } } });
 	});
 });

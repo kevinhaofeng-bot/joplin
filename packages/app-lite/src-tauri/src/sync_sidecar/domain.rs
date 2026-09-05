@@ -316,6 +316,34 @@ pub struct SyncSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncStatusState {
+    Idle,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SyncStatusCode {
+    SyncNotConfigured,
+    SyncAuthFailed,
+    SyncNetwork,
+    SyncFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyncStatus {
+    pub state: SyncStatusState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SyncSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<SyncStatusCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchNotesParams {
     pub query: String,
@@ -349,7 +377,7 @@ pub struct SearchNotePage {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigureJoplinServerParams, SearchNotesParams};
+    use super::{ConfigureJoplinServerParams, SearchNotesParams, SyncStatus};
 
     #[test]
     fn configure_debug_redacts_password() {
@@ -367,5 +395,17 @@ mod tests {
     fn search_params_reject_unknown_fields() {
         let value = serde_json::json!({ "query": "body", "unexpected": true });
         assert!(serde_json::from_value::<SearchNotesParams>(value).is_err());
+    }
+
+    #[test]
+    fn sync_status_rejects_unknown_fields() {
+        let value = serde_json::json!({ "state": "running", "unexpected": true });
+        assert!(serde_json::from_value::<SyncStatus>(value).is_err());
+    }
+
+    #[test]
+    fn sync_status_rejects_unknown_error_codes() {
+        let value = serde_json::json!({ "state": "failed", "code": "SECRET_ERROR" });
+        assert!(serde_json::from_value::<SyncStatus>(value).is_err());
     }
 }

@@ -22,6 +22,10 @@ export interface Resource {
 export interface SyncConfig { configured: boolean; url?: string; username?: string }
 export interface ConfigureJoplinServerParams { url: string; username: string; password: string }
 export interface SyncSummary { completedAt: number; created: number; updated: number; deleted: number; fetched: number }
+export type SyncStatus =
+	| { state: 'idle' | 'running' }
+	| { state: 'succeeded'; summary: SyncSummary }
+	| { state: 'failed'; code: 'SYNC_NOT_CONFIGURED' | 'SYNC_AUTH_FAILED' | 'SYNC_NETWORK' | 'SYNC_FAILED' };
 
 export interface CreateFolderParams { id?: string; parentId: string; title: string }
 export interface UpdateFolderParams { id: string; expectedUpdatedTime: number; title?: string; parentId?: string }
@@ -155,6 +159,22 @@ function guardSyncSummary(value: unknown): SyncSummary {
 	if (!isRecord(value) || !isTime(value.completedAt) || !isTime(value.created) || !isTime(value.updated) || !isTime(value.deleted) || !isTime(value.fetched)) return invalid();
 	return value as unknown as SyncSummary;
 }
+function guardSyncStatus(value: unknown): SyncStatus {
+	if (!isRecord(value) || typeof value.state !== 'string') return invalid();
+	if (value.state === 'idle' || value.state === 'running') {
+		if (!hasExactKeys(value, ['state'])) return invalid();
+		return value as SyncStatus;
+	}
+	if (value.state === 'succeeded') {
+		if (!hasExactKeys(value, ['state', 'summary'])) return invalid();
+		return { state: 'succeeded', summary: guardSyncSummary(value.summary) };
+	}
+	if (value.state === 'failed') {
+		if (!hasExactKeys(value, ['state', 'code']) || typeof value.code !== 'string' || !['SYNC_NOT_CONFIGURED', 'SYNC_AUTH_FAILED', 'SYNC_NETWORK', 'SYNC_FAILED'].includes(value.code)) return invalid();
+		return { state: 'failed', code: value.code as Extract<SyncStatus, { state: 'failed' }>['code'] };
+	}
+	return invalid();
+}
 function guardPage(value: unknown): NotePage {
 	if (!isRecord(value) || !isPositiveTime(value.page) || typeof value.hasMore !== 'boolean') return invalid();
 	return { items: guardArray(value.items, guardNoteSummary), page: value.page, hasMore: value.hasMore };
@@ -208,6 +228,8 @@ export const openResource = (params: { id: string; fileExtension?: string }) => 
 }, params);
 export const getSyncConfig = () => call('get_sync_config', guardSyncConfig);
 export const configureJoplinServer = (params: ConfigureJoplinServerParams) => call('configure_joplin_server', guardSyncConfig, params);
+export const startSync = () => call('start_sync', guardSyncStatus);
+export const getSyncStatus = () => call('get_sync_status', guardSyncStatus);
 export const syncNow = () => call('sync_now', guardSyncSummary);
 
 export function resourceUrl(resource: Pick<Resource, 'id'|'fileExtension'|'updatedTime'>): string {
@@ -228,12 +250,12 @@ export interface LibraryApi {
 	updateNote: typeof updateNote; trashNote: typeof trashNote; setNoteTags: typeof setNoteTags;
 	createResourceFromPath: typeof createResourceFromPath; listNoteResources: typeof listNoteResources;
 	createImageResource: typeof createImageResource; openResource: typeof openResource;
-	getSyncConfig: typeof getSyncConfig; configureJoplinServer: typeof configureJoplinServer; syncNow: typeof syncNow;
+	getSyncConfig: typeof getSyncConfig; configureJoplinServer: typeof configureJoplinServer; startSync: typeof startSync; getSyncStatus: typeof getSyncStatus; syncNow: typeof syncNow;
 }
 
 export const libraryApi: LibraryApi = {
 	openLibrary, retryLibrary, shutdownLibrary, profileStatus, listFolders, createFolder, updateFolder, trashFolder,
 	listTags, createTag, updateTag, deleteTag, listNotes, searchNotes, getNote, createNote, updateNote, trashNote, setNoteTags,
 	createResourceFromPath, listNoteResources, createImageResource, openResource,
-	getSyncConfig, configureJoplinServer, syncNow,
+	getSyncConfig, configureJoplinServer, startSync, getSyncStatus, syncNow,
 };

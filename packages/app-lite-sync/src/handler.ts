@@ -18,13 +18,13 @@ import { SearchStore, type SearchNotesInput } from './domain/searchStore';
 import { exactKeys, validationError } from './domain/validation';
 
 const joplinVersion: string = require('../../lib/package.json').version;
-const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'syncNow', 'searchNotes'] as const;
+const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'startSync', 'getSyncStatus', 'syncNow', 'searchNotes'] as const;
 const terminalCodes = new Set(['PROFILE_LOCK_REQUIRED', 'PROFILE_OPEN_FAILED', 'STORAGE_ERROR']);
 const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES), 'SYNC_NOT_CONFIGURED', 'SYNC_AUTH_FAILED', 'SYNC_NETWORK', 'SYNC_BUSY', 'SYNC_FAILED']);
 
 type HandledRequest = { response: ResponseFrame; shouldExit: boolean };
 export type RequestHandler = { handleRequest(request: RequestFrame): Promise<HandledRequest> };
-type SessionLike = Pick<ProfileSession, 'status' | 'open' | 'flush' | 'close' | 'requireOpen'> & Partial<Pick<ProfileSession, 'getSyncConfig' | 'configureJoplinServer' | 'syncNow'>>;
+type SessionLike = Pick<ProfileSession, 'status' | 'open' | 'flush' | 'close' | 'requireOpen'> & Partial<Pick<ProfileSession, 'getSyncConfig' | 'configureJoplinServer' | 'startSync' | 'getSyncStatus' | 'syncNow'>>;
 
 function invalidRequest(): ProtocolError {
 	return new ProtocolError('INVALID_REQUEST', '请求格式无效');
@@ -163,6 +163,16 @@ export function createHandler(session: SessionLike): RequestHandler {
 					requireOpen(session);
 					if (!session.configureJoplinServer) throw new ProtocolError('STORAGE_ERROR', 'sync unavailable');
 					return { response: successFrame(request.id, await session.configureJoplinServer(request.params as { url: string; username: string; password: string })), shouldExit: false };
+				case 'startSync':
+					if (!hasOnly(request.params, [])) throw invalidRequest();
+					requireOpen(session);
+					if (!session.startSync) throw new ProtocolError('STORAGE_ERROR', 'sync unavailable');
+					return { response: successFrame(request.id, await session.startSync()), shouldExit: false };
+				case 'getSyncStatus':
+					if (!hasOnly(request.params, [])) throw invalidRequest();
+					requireOpen(session);
+					if (!session.getSyncStatus) throw new ProtocolError('STORAGE_ERROR', 'sync unavailable');
+					return { response: successFrame(request.id, await session.getSyncStatus()), shouldExit: false };
 				case 'syncNow':
 					if (!hasOnly(request.params, [])) throw invalidRequest();
 					requireOpen(session);

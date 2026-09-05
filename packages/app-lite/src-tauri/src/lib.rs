@@ -120,6 +120,8 @@ pub fn run() {
             library::open_resource,
             library::get_sync_config,
             library::configure_joplin_server,
+            library::start_sync,
+            library::get_sync_status,
             library::sync_now,
             library::shutdown_library
         ])

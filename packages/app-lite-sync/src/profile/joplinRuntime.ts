@@ -27,7 +27,7 @@ import { reg } from '../../../lib/registry';
 import Logger from '../../../utils/Logger';
 import { registerItemClasses } from '../codec';
 import type { ValidatedProfilePaths } from './pathPolicy';
-import { syncError, SyncService, type SyncConfig, type SyncConfigInput, type SyncSummary } from './syncService';
+import { syncError, SyncService, type SyncConfig, type SyncConfigInput, type SyncStatus, type SyncSummary } from './syncService';
 
 const joplinVersion: string = require('../../../lib/package.json').version;
 
@@ -37,6 +37,8 @@ export type RuntimeHandle = Readonly<{
 	close: ()=> Promise<void>;
 	getSyncConfig?: ()=> Promise<SyncConfig>;
 	configureJoplinServer?: (input: SyncConfigInput)=> Promise<SyncConfig>;
+	getSyncStatus?: ()=> Promise<SyncStatus>;
+	startSync?: ()=> Promise<SyncStatus>;
 	syncNow?: ()=> Promise<SyncSummary>;
 }>;
 
@@ -218,12 +220,15 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 				await Setting.saveAll();
 			},
 			close: async () => {
+				await syncService.waitForIdle();
 				await ItemChange.waitForAllSaved();
 				await Setting.saveAll();
 				await database?.close();
 			},
 			getSyncConfig: () => syncService.getConfig(),
 			configureJoplinServer: input => syncService.configure(input),
+			getSyncStatus: async () => syncService.getSyncStatus(),
+			startSync: async () => syncService.startSync(),
 			syncNow: () => syncService.syncNow(),
 		};
 		return handle;

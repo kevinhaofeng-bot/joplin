@@ -2,7 +2,7 @@ import { claimProfile } from './profileMarker';
 import { revalidateProfilePath, validateProfilePath, type ValidatedProfilePaths } from './pathPolicy';
 import { verifyInheritedLease, type InheritedLease } from './inheritedLease';
 import { openJoplinRuntime, type RuntimeHandle } from './joplinRuntime';
-import type { SyncConfig, SyncConfigInput, SyncSummary } from './syncService';
+import type { SyncConfig, SyncConfigInput, SyncStatus, SyncSummary } from './syncService';
 import { profileError, ProtocolError } from '../protocol';
 
 export type ProfileState = 'closed' | 'open';
@@ -17,6 +17,8 @@ export interface ProfileSession {
 	close(): Promise<void>;
 	getSyncConfig(): Promise<SyncConfig>;
 	configureJoplinServer(input: SyncConfigInput): Promise<SyncConfig>;
+	getSyncStatus(): Promise<SyncStatus>;
+	startSync(): Promise<SyncStatus>;
 	syncNow(): Promise<SyncSummary>;
 }
 
@@ -157,6 +159,18 @@ export class ProfileSession implements ProfileSession {
 		this.requireOpen();
 		if (!this.runtime?.syncNow) throw profileError('STORAGE_ERROR');
 		try { return await this.runtime.syncNow(); } catch (error) { throw this.fixedSyncError(error); }
+	}
+
+	public async getSyncStatus(): Promise<SyncStatus> {
+		this.requireOpen();
+		if (!this.runtime?.getSyncStatus) throw profileError('STORAGE_ERROR');
+		return this.runtime.getSyncStatus();
+	}
+
+	public async startSync(): Promise<SyncStatus> {
+		this.requireOpen();
+		if (!this.runtime?.startSync) throw profileError('STORAGE_ERROR');
+		try { return await this.runtime.startSync(); } catch (error) { throw this.fixedSyncError(error); }
 	}
 
 	private async cleanupPartialOpen(): Promise<void> {

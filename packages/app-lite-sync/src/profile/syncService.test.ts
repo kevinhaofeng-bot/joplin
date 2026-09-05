@@ -33,4 +33,32 @@ describe('SyncService', () => {
 		release();
 		await expect(first).resolves.toEqual({ completedAt: 2, created: 1, updated: 0, deleted: 0, fetched: 0 });
 	});
+
+	test('starts quickly, exposes completion, and waits for background work', async () => {
+		let release!: ()=> void;
+		const summary = { completedAt: 3, created: 1, updated: 2, deleted: 0, fetched: 4 };
+		const backend = adapter({ syncNow: jest.fn(() => new Promise(resolve => { release = () => resolve(summary); })) });
+		const service = new SyncService(backend);
+
+		await expect(service.startSync()).resolves.toEqual({ state: 'running' });
+		expect(service.getSyncStatus()).toEqual({ state: 'running' });
+		await expect(service.startSync()).rejects.toMatchObject({ code: 'SYNC_BUSY' });
+
+		let closed = false;
+		const waiting = service.waitForIdle().then(() => { closed = true; });
+		await Promise.resolve();
+		expect(closed).toBe(false);
+		release();
+		await waiting;
+		expect(service.getSyncStatus()).toEqual({ state: 'succeeded', summary });
+	});
+
+	test('records only a fixed sync error after background failure', async () => {
+		const backend = adapter({ syncNow: jest.fn(async () => { throw Object.assign(new Error('secret detail'), { code: 'SYNC_NETWORK' }); }) });
+		const service = new SyncService(backend);
+
+		await expect(service.startSync()).resolves.toEqual({ state: 'running' });
+		await service.waitForIdle();
+		expect(service.getSyncStatus()).toEqual({ state: 'failed', code: 'SYNC_NETWORK' });
+	});
 });
