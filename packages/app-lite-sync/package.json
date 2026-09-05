@@ -1,12 +1,14 @@
 {
   "name": "@joplin/app-lite-sync",
-  "version": "0.1.0",
+  "version": "0.9.0",
   "private": true,
   "scripts": {
     "test": "jest --config jest.config.js --runInBand",
     "test-ci": "yarn test",
     "tsc": "tsc --noEmit --project tsconfig.json",
+    "test:bundle": "node scripts/build-sidecar-bundle.test.cjs",
     "verify:clean": "node scripts/bootstrap-sqlite3.cjs && yarn workspace @joplin/fork-htmlparser2 build && yarn workspace @joplin/utils build && yarn workspace @joplin/lib tsc && yarn test && yarn tsc",
+    "build:release": "bun scripts/build-sidecar-bundle.cjs",
     "start:stdio": "node -r ts-node/register/transpile-only src/main.ts"
   },
   "dependencies": {

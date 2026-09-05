@@ -5,7 +5,7 @@ pub mod sync_sidecar;
 
 use tauri::{Manager, http::Response};
 
-use library::library_state_for_app_data;
+use library::library_state_for_app_data_with_resources;
 use profile::{ProfilePaths, resource_path};
 use runtime::{AppState, app_state_for_app_data, get_runtime_info};
 
@@ -87,8 +87,9 @@ pub fn run() {
                 .as_ref()
                 .map(|path| app_state_for_app_data(path.clone()))
                 .unwrap_or_else(|_| AppState::failed());
+            let resource_dir = app.path().resource_dir().ok();
             let library_state = app_data
-                .map(library_state_for_app_data)
+                .map(|path| library_state_for_app_data_with_resources(path, resource_dir))
                 .unwrap_or_else(|_| library::LibraryState::unavailable());
             app.manage(runtime_state);
             app.manage(library_state);

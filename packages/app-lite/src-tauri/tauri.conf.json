@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Joplin Lite",
-  "version": "0.1.0",
+  "version": "0.9.0",
   "identifier": "com.kevinhao.joplin-lite",
   "build": {
     "beforeDevCommand": "yarn dev:web",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "yarn build:web",
+    "beforeBuildCommand": "yarn build:web && yarn workspace @joplin/app-lite-sync build:release",
     "frontendDist": "../dist"
   },
   "app": {
@@ -23,6 +23,9 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "resources": {
+      "resources/sidecar/": "sidecar/"
+    }
   }
 }

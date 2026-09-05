@@ -1,5 +1,11 @@
 use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
+#[cfg(any(not(debug_assertions), test))]
+use std::{
+    fs, io,
+    path::{Component, Path},
+};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use tempfile::Builder as TempFileBuilder;
@@ -534,9 +540,133 @@ fn debug_sidecar_command() -> SidecarCommand {
     }
 }
 
-pub fn library_state_for_app_data(app_data: PathBuf) -> LibraryState {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(any(not(debug_assertions), test))]
+struct SidecarManifest {
+    format_version: u32,
+    platform: String,
+    arch: String,
+    node_path: String,
+    entry_path: String,
+    current_dir: String,
+    node_version: String,
+    bun_version: String,
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn reject_symlink_components(base: &Path, relative: &Path) -> io::Result<()> {
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bundle path must be relative",
+                ));
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                current.push(name);
+                if fs::symlink_metadata(&current)?.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "bundle path cannot contain symlinks",
+                    ));
+                }
+            }
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bundle path cannot contain parent components",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn bundle_path(bundle: &Path, relative: &str, directory: bool) -> io::Result<PathBuf> {
+    let relative_path = Path::new(relative);
+    if relative.is_empty() || relative_path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bundle path must be relative",
+        ));
+    }
+    let path = bundle.join(relative_path);
+    reject_symlink_components(bundle, relative_path)?;
+    let canonical_bundle = fs::canonicalize(bundle)?;
+    let canonical = fs::canonicalize(&path)?;
+    if !canonical.starts_with(&canonical_bundle) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bundle path escapes resource directory",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    let valid = if directory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    } && !metadata.file_type().is_symlink();
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid bundle resource",
+        ));
+    }
+    Ok(canonical)
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn release_sidecar_command(bundle: &Path) -> io::Result<SidecarCommand> {
+    let bundle_metadata = fs::symlink_metadata(bundle)?;
+    if bundle_metadata.file_type().is_symlink() || !bundle_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid sidecar bundle",
+        ));
+    }
+    let manifest_path = bundle.join("manifest.json");
+    let manifest_metadata = fs::symlink_metadata(&manifest_path)?;
+    if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid sidecar manifest",
+        ));
+    }
+    let manifest: SidecarManifest = serde_json::from_slice(&fs::read(manifest_path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if manifest.format_version != 1
+        || manifest.platform != "darwin"
+        || manifest.arch != "arm64"
+        || manifest.node_version.is_empty()
+        || manifest.bun_version.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported sidecar bundle",
+        ));
+    }
+    let node = bundle_path(bundle, &manifest.node_path, false)?;
+    let entry = bundle_path(bundle, &manifest.entry_path, false)?;
+    let current_dir = bundle_path(bundle, &manifest.current_dir, true)?;
+    Ok(SidecarCommand {
+        executable: node,
+        args: vec![entry.to_string_lossy().into_owned()],
+        current_dir,
+    })
+}
+
+pub fn library_state_for_app_data_with_resources(
+    app_data: PathBuf,
+    resource_dir: Option<PathBuf>,
+) -> LibraryState {
     #[cfg(debug_assertions)]
     {
+        let _ = resource_dir;
         let Ok(profile) = ProfilePaths::try_from_app_data(app_data) else {
             return LibraryState::unavailable();
         };
@@ -547,8 +677,86 @@ pub fn library_state_for_app_data(app_data: PathBuf) -> LibraryState {
     }
     #[cfg(not(debug_assertions))]
     {
-        let _ = app_data;
-        LibraryState::unavailable()
+        let Ok(profile) = ProfilePaths::try_from_app_data(app_data) else {
+            return LibraryState::unavailable();
+        };
+        if profile.ensure().is_err() {
+            return LibraryState::unavailable();
+        }
+        let Some(resource_dir) = resource_dir else {
+            return LibraryState::unavailable();
+        };
+        let sidecar_bundle = resource_dir.join("sidecar");
+        let Ok(command) = release_sidecar_command(&sidecar_bundle) else {
+            return LibraryState::unavailable();
+        };
+        LibraryState::new(profile, command)
+    }
+}
+
+pub fn library_state_for_app_data(app_data: PathBuf) -> LibraryState {
+    library_state_for_app_data_with_resources(app_data, None)
+}
+
+#[cfg(test)]
+mod release_sidecar_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write_manifest(root: &std::path::Path, node: &str, entry: &str, current_dir: &str) {
+        fs::write(
+            root.join("manifest.json"),
+            format!(
+                r#"{{"formatVersion":1,"platform":"darwin","arch":"arm64","nodePath":"{node}","entryPath":"{entry}","currentDir":"{current_dir}","nodeVersion":"test","bunVersion":"test"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn release_manifest_resolves_only_bundle_files() {
+        let temp = tempdir().unwrap();
+        let bundle = temp.path().join("sidecar");
+        fs::create_dir_all(bundle.join("bin")).unwrap();
+        fs::write(bundle.join("bin/node"), b"node").unwrap();
+        fs::write(bundle.join("sidecar.cjs"), b"sidecar").unwrap();
+        write_manifest(&bundle, "bin/node", "sidecar.cjs", ".");
+
+        let command = release_sidecar_command(&bundle).unwrap();
+        assert_eq!(
+            command.executable,
+            fs::canonicalize(bundle.join("bin/node")).unwrap()
+        );
+        assert_eq!(
+            command.args,
+            vec![
+                fs::canonicalize(bundle.join("sidecar.cjs"))
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+        assert_eq!(command.current_dir, fs::canonicalize(bundle).unwrap());
+    }
+
+    #[test]
+    fn release_manifest_rejects_parent_paths_and_symlinked_files() {
+        let temp = tempdir().unwrap();
+        let bundle = temp.path().join("sidecar");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(temp.path().join("outside-node"), b"node").unwrap();
+        write_manifest(&bundle, "../outside-node", "sidecar.cjs", ".");
+        assert!(release_sidecar_command(&bundle).is_err());
+
+        fs::write(bundle.join("sidecar.cjs"), b"sidecar").unwrap();
+        write_manifest(&bundle, "node", "sidecar.cjs", ".");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(temp.path().join("outside-node"), bundle.join("node")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(temp.path().join("outside-node"), bundle.join("node"))
+            .unwrap();
+        assert!(release_sidecar_command(&bundle).is_err());
     }
 }
 
