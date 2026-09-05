@@ -11,6 +11,9 @@ export const PROFILE_ERROR_MESSAGES = {
 	PROFILE_ALREADY_OPEN: '资料库已经打开',
 	PROFILE_OPEN_FAILED: '无法打开资料库',
 	STORAGE_ERROR: '无法保存资料库',
+	NOT_FOUND: '项目不存在',
+	VALIDATION_FAILED: '输入内容无效',
+	CONFLICT: '项目已被其他操作修改',
 } as const;
 
 export type ProfileErrorCode = keyof typeof PROFILE_ERROR_MESSAGES;

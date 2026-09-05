@@ -34,6 +34,9 @@ pub enum SidecarErrorKind {
     ProfileNotOpen,
     ProfileOpenFailed,
     StorageError,
+    NotFound,
+    ValidationFailed,
+    Conflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +85,9 @@ fn public_message(kind: SidecarErrorKind) -> &'static str {
         SidecarErrorKind::ProfileNotOpen => "资料库尚未打开",
         SidecarErrorKind::ProfileOpenFailed => "无法打开资料库",
         SidecarErrorKind::StorageError => "无法保存资料库",
+        SidecarErrorKind::NotFound => "项目不存在",
+        SidecarErrorKind::ValidationFailed => "输入内容无效",
+        SidecarErrorKind::Conflict => "项目已被其他操作修改",
     }
 }
 
@@ -202,6 +208,11 @@ pub(crate) fn classify_response_error(response: &ResponseFrame) -> SidecarError 
             SidecarError::new(SidecarErrorKind::ProfileOpenFailed, "profile open failed")
         }
         Some("STORAGE_ERROR") => SidecarError::new(SidecarErrorKind::StorageError, "storage error"),
+        Some("NOT_FOUND") => SidecarError::new(SidecarErrorKind::NotFound, "not found"),
+        Some("VALIDATION_FAILED") => {
+            SidecarError::new(SidecarErrorKind::ValidationFailed, "validation failed")
+        }
+        Some("CONFLICT") => SidecarError::new(SidecarErrorKind::Conflict, "conflict"),
         Some("PROTOCOL_MISMATCH") => {
             SidecarError::new(SidecarErrorKind::ProtocolMismatch, "protocol mismatch")
         }

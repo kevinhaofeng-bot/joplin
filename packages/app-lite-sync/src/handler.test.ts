@@ -1,11 +1,12 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { failureFrame, type RequestFrame } from './protocol';
+import { failureFrame, profileError, type RequestFrame } from './protocol';
 import { createHandler, type RequestHandler } from './handler';
 
 function codecHandler(): RequestHandler {
 	return createHandler({
 		status: () => ({ state: 'closed', formatVersion: 1 }),
+		requireOpen: () => undefined,
 		open: async () => ({ state: 'open', schemaVersion: 0, formatVersion: 1 }),
 		flush: async (): Promise<void> => undefined,
 		close: async (): Promise<void> => undefined,
@@ -25,7 +26,7 @@ describe('sidecar command handler', () => {
 		const { handleRequest } = codecHandler();
 
 		await expect(handleRequest(request('hello', {}))).resolves.toMatchObject({
-			response: { ok: true, result: { protocolVersion: 1, joplinVersion: '3.7.0', capabilities: ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile'] } },
+			response: { ok: true, result: { protocolVersion: 1, joplinVersion: '3.7.0', capabilities: ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag'] } },
 			shouldExit: false,
 		});
 	});
@@ -76,6 +77,7 @@ describe('sidecar command handler', () => {
 	test('uses one injected session for profile status, open, and shutdown', async () => {
 		const session = {
 			status: jest.fn(() => ({ state: 'closed' as const, formatVersion: 1 as const })),
+			requireOpen: jest.fn((): void => undefined),
 			open: jest.fn(async () => ({ state: 'open' as const, schemaVersion: 34, formatVersion: 1 as const })),
 			flush: jest.fn(async (): Promise<void> => undefined),
 			close: jest.fn(async (): Promise<void> => undefined),
@@ -90,9 +92,21 @@ describe('sidecar command handler', () => {
 	});
 
 	test('rejects extra profile fields without echoing the path', async () => {
-		const session = { status: () => ({ state: 'closed' as const, formatVersion: 1 as const }), open: jest.fn(), flush: async (): Promise<void> => undefined, close: async (): Promise<void> => undefined };
+		const session = { status: () => ({ state: 'closed' as const, formatVersion: 1 as const }), requireOpen: (): void => { throw profileError('PROFILE_NOT_OPEN'); }, open: jest.fn(), flush: async (): Promise<void> => undefined, close: async (): Promise<void> => undefined };
 		const response = await createHandler(session).handleRequest(request('openProfile', { profilePath: '/secret/path', extra: 'secret-marker' }));
 		expect(response).toEqual({ response: failureFrame('r1', 'INVALID_REQUEST', '请求格式无效'), shouldExit: false });
 		expect(JSON.stringify(response)).not.toContain('secret-marker');
+	});
+
+	test('requires an open profile before domain operations', async () => {
+		const session = { status: () => ({ state: 'closed' as const, formatVersion: 1 as const }), requireOpen: (): void => { throw profileError('PROFILE_NOT_OPEN'); }, open: jest.fn(), flush: async (): Promise<void> => undefined, close: async (): Promise<void> => undefined };
+		const response = await createHandler(session).handleRequest(request('listFolders', {}));
+		expect(response).toEqual({ response: failureFrame('r1', 'PROFILE_NOT_OPEN', '资料库尚未打开'), shouldExit: false });
+	});
+
+	test('maps domain command parameter errors to validation failed', async () => {
+		const session = { status: () => ({ state: 'open' as const, formatVersion: 1 as const }), requireOpen: (): void => undefined, open: jest.fn(), flush: async (): Promise<void> => undefined, close: async (): Promise<void> => undefined };
+		const response = await createHandler(session).handleRequest(request('createFolder', { parentId: '', title: 'Root', extra: 'ignored' }));
+		expect(response).toEqual({ response: failureFrame('r1', 'VALIDATION_FAILED', '输入内容无效'), shouldExit: false });
 	});
 });

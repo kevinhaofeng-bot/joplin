@@ -3,7 +3,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use joplin_lite::profile::ProfilePaths;
-use joplin_lite::sync_sidecar::{SidecarClient, SidecarCommand, SidecarState};
+use joplin_lite::sync_sidecar::{SidecarClient, SidecarCommand, SidecarErrorKind, SidecarState};
 use serde_json::json;
 
 fn command(repo_root: PathBuf) -> SidecarCommand {
@@ -64,6 +64,114 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
                 .len()
                 > 0
         );
+
+        let folder_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let child_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let created_folder = first
+            .request(
+                "createFolder",
+                json!({ "id": folder_id, "parentId": "", "title": "/Root" }),
+            )
+            .await
+            .expect("create root folder");
+        assert_eq!(created_folder["item"]["title"], "Root");
+        assert_eq!(
+            first
+                .request(
+                    "createFolder",
+                    json!({ "id": folder_id, "parentId": "", "title": "Root" }),
+                )
+                .await
+                .expect("replay root folder")["created"],
+            false
+        );
+        first
+            .request(
+                "createFolder",
+                json!({ "id": child_id, "parentId": folder_id, "title": "Child" }),
+            )
+            .await
+            .expect("create child folder");
+        let root_updated_time = created_folder["item"]["updatedTime"]
+            .as_u64()
+            .expect("root timestamp");
+        let child = first
+            .request(
+                "updateFolder",
+                json!({ "id": child_id, "expectedUpdatedTime": 0, "title": "Child 2" }),
+            )
+            .await;
+        assert_eq!(child.unwrap_err().kind(), SidecarErrorKind::Conflict);
+        let child = first
+            .request("listFolders", json!({}))
+            .await
+            .expect("list folders");
+        assert_eq!(child.as_array().expect("folder list").len(), 2);
+        let cycle = first
+            .request(
+                "updateFolder",
+                json!({ "id": folder_id, "expectedUpdatedTime": root_updated_time, "parentId": child_id }),
+            )
+            .await;
+        assert_eq!(
+            cycle.unwrap_err().kind(),
+            SidecarErrorKind::ValidationFailed
+        );
+        first
+            .request(
+                "trashFolder",
+                json!({ "id": folder_id, "expectedUpdatedTime": root_updated_time }),
+            )
+            .await
+            .expect("trash folder");
+        assert_eq!(
+            first
+                .request("listFolders", json!({}))
+                .await
+                .expect("folders after trash")
+                .as_array()
+                .expect("folder list")
+                .len(),
+            0
+        );
+
+        let tag_id = "cccccccccccccccccccccccccccccccc";
+        let tag = first
+            .request(
+                "createTag",
+                json!({ "id": tag_id, "title": "  Cafe\u{0301}  " }),
+            )
+            .await
+            .expect("create tag");
+        assert_eq!(tag["item"]["title"], "Café");
+        assert_eq!(tag["item"]["noteCount"], 0);
+        let tag_updated_time = tag["item"]["updatedTime"].as_u64().expect("tag timestamp");
+        let updated_tag = first
+            .request(
+                "updateTag",
+                json!({ "id": tag_id, "expectedUpdatedTime": tag_updated_time, "title": "Updated" }),
+            )
+            .await
+            .expect("update tag");
+        let updated_tag_time = updated_tag["item"]["updatedTime"]
+            .as_u64()
+            .expect("updated tag timestamp");
+        first
+            .request(
+                "deleteTag",
+                json!({ "id": tag_id, "expectedUpdatedTime": updated_tag_time }),
+            )
+            .await
+            .expect("delete tag");
+        assert!(
+            first
+                .request("listTags", json!({}))
+                .await
+                .expect("tags after delete")
+                .as_array()
+                .expect("tag list")
+                .is_empty()
+        );
         first.shutdown().await.expect("first shutdown");
         assert_eq!(first.state(), SidecarState::Stopped);
 
@@ -76,6 +184,15 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
             .await
             .expect("reopen profile");
         assert_eq!(reopened["state"], "open");
+        assert!(
+            second
+                .request("listFolders", json!({}))
+                .await
+                .expect("reopened folders")
+                .as_array()
+                .expect("folder list")
+                .is_empty()
+        );
         second.shutdown().await.expect("second shutdown");
     };
 

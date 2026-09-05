@@ -10,6 +10,7 @@ export type OpenProfileResult = { state: 'open'; schemaVersion: number; formatVe
 
 export interface ProfileSession {
 	status(): ProfileStatus;
+	requireOpen(): void;
 	open(profilePath: unknown): Promise<OpenProfileResult>;
 	flush(): Promise<void>;
 	close(): Promise<void>;
@@ -43,6 +44,10 @@ export class ProfileSession implements ProfileSession {
 
 	public status(): ProfileStatus {
 		return { state: this.state, formatVersion: 1 };
+	}
+
+	public requireOpen(): void {
+		if (!this.runtime || this.state !== 'open') throw profileError('PROFILE_NOT_OPEN');
 	}
 
 	public async open(profilePath: unknown): Promise<OpenProfileResult> {

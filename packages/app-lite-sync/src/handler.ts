@@ -9,15 +9,19 @@ import {
 	type ResponseFrame,
 } from './protocol';
 import type { ProfileSession } from './profile/profileSession';
+import { FolderStore, type CreateFolderInput, type UpdateFolderInput } from './domain/folderStore';
+import { TagStore } from './domain/tagStore';
+import type { CreateTagInput, UpdateTagInput } from './domain/tagStore';
+import { exactKeys, validationError } from './domain/validation';
 
 const joplinVersion: string = require('../../lib/package.json').version;
-const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile'] as const;
+const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag'] as const;
 const terminalCodes = new Set(['PROFILE_LOCK_REQUIRED', 'PROFILE_OPEN_FAILED', 'STORAGE_ERROR']);
 const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES)]);
 
 type HandledRequest = { response: ResponseFrame; shouldExit: boolean };
 export type RequestHandler = { handleRequest(request: RequestFrame): Promise<HandledRequest> };
-type SessionLike = Pick<ProfileSession, 'status' | 'open' | 'flush' | 'close'>;
+type SessionLike = Pick<ProfileSession, 'status' | 'open' | 'flush' | 'close' | 'requireOpen'>;
 
 function invalidRequest(): ProtocolError {
 	return new ProtocolError('INVALID_REQUEST', '请求格式无效');
@@ -28,7 +32,17 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 function hasOnly(params: Record<string, unknown>, keys: readonly string[]): boolean {
-	return Object.keys(params).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(params, key));
+	return exactKeys(params, keys);
+}
+
+function hasAllowed(params: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+	const allowed = new Set([...required, ...optional]);
+	return required.every(key => Object.prototype.hasOwnProperty.call(params, key)) && Object.keys(params).every(key => allowed.has(key));
+}
+
+function requireOpen(session: SessionLike): void {
+	if (session.requireOpen) return session.requireOpen();
+	if (session.status().state !== 'open') throw profileError('PROFILE_NOT_OPEN');
 }
 
 function fixedError(error: unknown, fallback: string): ProtocolError {
@@ -42,6 +56,8 @@ function fixedError(error: unknown, fallback: string): ProtocolError {
 }
 
 export function createHandler(session: SessionLike): RequestHandler {
+	const folderStore = new FolderStore();
+	const tagStore = new TagStore();
 	return {
 		handleRequest: async (request: RequestFrame): Promise<HandledRequest> => {
 			try {
@@ -62,6 +78,38 @@ export function createHandler(session: SessionLike): RequestHandler {
 				case 'encodeItem':
 					if (!isObject(request.params.item)) throw invalidRequest();
 					return { response: successFrame(request.id, await encodeItem(request.params.item)), shouldExit: false };
+				case 'listFolders':
+					if (!isObject(request.params) || !hasOnly(request.params, [])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await folderStore.list()), shouldExit: false };
+				case 'createFolder':
+					if (!isObject(request.params) || !hasAllowed(request.params, ['parentId', 'title'], ['id'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await folderStore.create(request.params as CreateFolderInput)), shouldExit: false };
+				case 'updateFolder':
+					if (!isObject(request.params) || !hasAllowed(request.params, ['id', 'expectedUpdatedTime'], ['title', 'parentId'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await folderStore.update(request.params as UpdateFolderInput)), shouldExit: false };
+				case 'trashFolder':
+					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await folderStore.trash(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
+				case 'listTags':
+					if (!isObject(request.params) || !hasOnly(request.params, [])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await tagStore.list()), shouldExit: false };
+				case 'createTag':
+					if (!isObject(request.params) || !hasAllowed(request.params, ['title'], ['id'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await tagStore.create(request.params as CreateTagInput)), shouldExit: false };
+				case 'updateTag':
+					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime', 'title'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await tagStore.update(request.params as UpdateTagInput)), shouldExit: false };
+				case 'deleteTag':
+					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await tagStore.delete(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
 				case 'shutdown':
 					if (!hasOnly(request.params, [])) throw invalidRequest();
 					await session.close();

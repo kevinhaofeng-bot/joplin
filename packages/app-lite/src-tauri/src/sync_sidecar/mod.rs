@@ -63,6 +63,9 @@ mod protocol_tests {
             (SidecarErrorKind::ProfileNotOpen, "资料库尚未打开"),
             (SidecarErrorKind::ProfileOpenFailed, "无法打开资料库"),
             (SidecarErrorKind::StorageError, "无法保存资料库"),
+            (SidecarErrorKind::NotFound, "项目不存在"),
+            (SidecarErrorKind::ValidationFailed, "输入内容无效"),
+            (SidecarErrorKind::Conflict, "项目已被其他操作修改"),
         ] {
             let error = SidecarError::new(kind, secret);
             assert_eq!(error.message(), expected_message);
