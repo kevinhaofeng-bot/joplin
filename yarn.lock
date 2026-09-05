@@ -12715,6 +12715,7 @@ __metadata:
     "@joplin/turndown-plugin-gfm": "npm:~1.0.62"
     "@tauri-apps/api": "npm:2.11.1"
     "@tauri-apps/cli": "npm:2.11.4"
+    "@tauri-apps/plugin-dialog": "npm:2.4.2"
     "@testing-library/dom": "npm:10.4.1"
     "@testing-library/jest-dom": "npm:7.0.1"
     "@testing-library/react": "npm:16.3.3"
@@ -18225,7 +18226,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tauri-apps/api@npm:2.11.1":
+"@tauri-apps/api@npm:2.11.1, @tauri-apps/api@npm:^2.8.0":
   version: 2.11.1
   resolution: "@tauri-apps/api@npm:2.11.1"
   checksum: 10/95ff573095f03fee3cef9a6a52dbb4e27fd25de8793a2f5d7f2f9850ba85b56777f8fa697e6e863927345432a0c6af0649e55dafbc0de4f84a34f0c08637a662
@@ -18350,6 +18351,15 @@ __metadata:
   bin:
     tauri: tauri.js
   checksum: 10/581c5c6ee0ba3a609dcea7504774737b80da3a2e47aa54462c2694bdc9ca304d0ecaf5e94200e928ce53ff58d0acbf0c30799714877d98eb2d1ef8d9e11ad2a1
+  languageName: node
+  linkType: hard
+
+"@tauri-apps/plugin-dialog@npm:2.4.2":
+  version: 2.4.2
+  resolution: "@tauri-apps/plugin-dialog@npm:2.4.2"
+  dependencies:
+    "@tauri-apps/api": "npm:^2.8.0"
+  checksum: 10/04c02eba025070df85f2345ce4326514421139b26e9e339236f21090d2c30112c1795e818ad2838eca95ba8e3b2d7c2f692f1474c1d8f119c24780a665d57dca
   languageName: node
   linkType: hard
 

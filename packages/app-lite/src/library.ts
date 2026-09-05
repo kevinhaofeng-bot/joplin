@@ -13,6 +13,10 @@ export interface NoteSummary {
 }
 export interface NoteDetail extends NoteSummary { body: string; markupLanguage: MarkupLanguage; tagIds: string[] }
 export interface NotePage { items: NoteSummary[]; page: number; hasMore: boolean }
+export interface Resource {
+	id: string; title: string; mime: string; fileExtension: string; size: number;
+	createdTime: number; updatedTime: number; markup: string;
+}
 
 export interface CreateFolderParams { id?: string; parentId: string; title: string }
 export interface UpdateFolderParams { id: string; expectedUpdatedTime: number; title?: string; parentId?: string }
@@ -33,6 +37,8 @@ export interface UpdateResult<T> { item: T; changed: boolean }
 export interface TrashResult { id: string; deletedTime: number }
 export interface DeleteResult { id: string; deleted: boolean }
 export interface SetNoteTagsResult { noteId: string; tagIds: string[]; updatedTime: number; changed: boolean }
+export interface CreateResourceFromPathParams { path: string; title?: string }
+export interface CreateImageResourceParams { title: string; mime: string; base64: string }
 
 const stableMessages: Record<string, string> = {
 	SIDECAR_UNAVAILABLE: '本地资料库不可用', PROFILE_IN_USE: '资料库正在被使用', PROFILE_LOCK_REQUIRED: '资料库写入租约无效',
@@ -60,6 +66,7 @@ export function normalizeLibraryError(error: unknown): LibraryClientError {
 
 const INVALID_LIBRARY_RESPONSE = '本地资料库响应无效';
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const hasExactKeys = (value: Record<string, unknown>, keys: readonly string[]) => Object.keys(value).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key));
 const isId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
 const isTime = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const isPositiveTime = (value: unknown): value is number => isTime(value) && value > 0;
@@ -122,6 +129,12 @@ function guardSetTags(value: unknown): SetNoteTagsResult {
 		!isTime(value.updatedTime) || typeof value.changed !== 'boolean') return invalid();
 	return value as unknown as SetNoteTagsResult;
 }
+function guardResource(value: unknown): Resource {
+	if (!isRecord(value) || !hasExactKeys(value, ['id', 'title', 'mime', 'fileExtension', 'size', 'createdTime', 'updatedTime', 'markup']) || !isId(value.id) || typeof value.title !== 'string' || typeof value.mime !== 'string' ||
+		typeof value.fileExtension !== 'string' || !/^[A-Za-z0-9]{0,10}$/.test(value.fileExtension) || !isTime(value.size) ||
+		!isTime(value.createdTime) || !isTime(value.updatedTime) || typeof value.markup !== 'string') return invalid();
+	return value as unknown as Resource;
+}
 function guardPage(value: unknown): NotePage {
 	if (!isRecord(value) || !isPositiveTime(value.page) || typeof value.hasMore !== 'boolean') return invalid();
 	return { items: guardArray(value.items, guardNoteSummary), page: value.page, hasMore: value.hasMore };
@@ -157,6 +170,19 @@ export const createNote = (params: CreateNoteParams) => call('create_note', valu
 export const updateNote = (params: UpdateNoteParams) => call('update_note', value => guardUpdate(value, guardNote), params);
 export const trashNote = (params: ExpectedUpdatedTimeParams) => call('trash_note', guardTrash, params);
 export const setNoteTags = (params: SetNoteTagsParams) => call('set_note_tags', guardSetTags, params);
+export const createResourceFromPath = (params: CreateResourceFromPathParams) => call('create_resource_from_path', guardResource, params);
+export const listNoteResources = (params: { noteId: string }) => call('list_note_resources', value => guardArray(value, guardResource), params);
+export const createImageResource = (params: CreateImageResourceParams) => call('create_image_resource', guardResource, params);
+export const openResource = (params: { id: string; fileExtension?: string }) => call('open_resource', value => {
+	if (value !== null && value !== undefined) return invalid();
+	return undefined;
+}, params);
+
+export function resourceUrl(resource: Pick<Resource, 'id'|'fileExtension'|'updatedTime'>): string {
+	if (!isId(resource.id) || !/^[A-Za-z0-9]{0,10}$/.test(resource.fileExtension)) return invalid();
+	const extension = resource.fileExtension ? `.${resource.fileExtension}` : '';
+	return `joplin-resource://localhost/${resource.id}${extension}?t=${resource.updatedTime}`;
+}
 
 export { INVALID_LIBRARY_RESPONSE };
 
@@ -167,9 +193,12 @@ export interface LibraryApi {
 	createTag: typeof createTag; updateTag: typeof updateTag; deleteTag: typeof deleteTag;
 	listNotes: typeof listNotes; getNote: typeof getNote; createNote: typeof createNote;
 	updateNote: typeof updateNote; trashNote: typeof trashNote; setNoteTags: typeof setNoteTags;
+	createResourceFromPath: typeof createResourceFromPath; listNoteResources: typeof listNoteResources;
+	createImageResource: typeof createImageResource; openResource: typeof openResource;
 }
 
 export const libraryApi: LibraryApi = {
 	openLibrary, retryLibrary, shutdownLibrary, profileStatus, listFolders, createFolder, updateFolder, trashFolder,
 	listTags, createTag, updateTag, deleteTag, listNotes, getNote, createNote, updateNote, trashNote, setNoteTags,
+	createResourceFromPath, listNoteResources, createImageResource, openResource,
 };

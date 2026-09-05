@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ComponentType } from 'react';
 import { getRuntimeInfo, type RuntimeInfo } from './runtime';
+import { open } from '@tauri-apps/plugin-dialog';
 import {
-	LibraryClientError, libraryApi, type Folder, type LibraryApi, type NoteDetail, type NoteSummary,
+	LibraryClientError, libraryApi, type Folder, type LibraryApi, type NoteDetail, type NoteSummary, type Resource,
 } from './library';
 import RichTextEditor, { type RichTextEditorProps } from './RichTextEditor';
 import './styles.css';
@@ -39,6 +40,7 @@ export default function App({
 	const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
 	const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
 	const [detail, setDetail] = useState<NoteDetail | null>(null);
+	const [resources, setResources] = useState<Resource[]>([]);
 	const [saveState, setSaveState] = useState<SaveState>('saved');
 	const [errorMessage, setErrorMessage] = useState('');
 	const [busy, setBusy] = useState(false);
@@ -104,7 +106,7 @@ export default function App({
 				setErrorMessage(safeErrorMessage(error, '保存失败，请重试'));
 			}
 		});
-		}, [library, setCurrentDetail]);
+	}, [library, setCurrentDetail]);
 
 	const flushSave = useCallback(async (): Promise<boolean> => {
 		if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; }
@@ -125,15 +127,17 @@ export default function App({
 		setBusy(true);
 		try {
 			const loaded = await library.getNote({ id: noteId });
-			setSelectedNoteId(noteId); setCurrentDetail(loaded); draftRef.current = {}; autoSaveDisabled.current = false;
-			saveSucceeded.current = true; setSaveState('saved'); setErrorMessage('');
-		} catch (error) { setErrorMessage(safeErrorMessage(error, '无法打开这篇笔记')); }
-		finally { setBusy(false); }
+			let loadedResources: Resource[] = [];
+			let resourcesUnavailable = false;
+			try { loadedResources = await library.listNoteResources({ noteId }); } catch { resourcesUnavailable = true; }
+			setSelectedNoteId(noteId); setCurrentDetail(loaded); setResources(loadedResources); draftRef.current = {}; autoSaveDisabled.current = false;
+			saveSucceeded.current = true; setSaveState('saved'); setErrorMessage(resourcesUnavailable ? '部分附件暂不可用' : '');
+		} catch (error) { setErrorMessage(safeErrorMessage(error, '无法打开这篇笔记')); } finally { setBusy(false); }
 	}, [flushSave, library, setCurrentDetail]);
 
 	const selectFolder = useCallback(async (folderId: string | null) => {
 		if (!await flushSave()) return;
-		setSelectedFolderId(folderId); setSelectedNoteId(null); setCurrentDetail(null);
+		setSelectedFolderId(folderId); setSelectedNoteId(null); setCurrentDetail(null); setResources([]);
 		try { await refreshNotes(folderId); } catch (error) { setErrorMessage(safeErrorMessage(error, '无法读取笔记')); }
 	}, [flushSave, refreshNotes, setCurrentDetail]);
 
@@ -148,20 +152,33 @@ export default function App({
 				setFolders(previous => [...previous, targetFolder!]);
 			}
 			const result = await library.createNote({ parentId: targetFolder.id, title: '', body: '' });
-			setSelectedFolderId(targetFolder.id); setSelectedNoteId(result.item.id); setCurrentDetail(result.item);
+			setSelectedFolderId(targetFolder.id); setSelectedNoteId(result.item.id); setCurrentDetail(result.item); setResources([]);
 			setNotes(previous => [result.item, ...previous.filter(item => item.id !== result.item.id)]);
 			setSaveState('saved'); autoSaveDisabled.current = false; saveSucceeded.current = true;
-		} catch (error) { setErrorMessage(safeErrorMessage(error, '无法新建笔记')); }
-		finally { setBusy(false); }
+		} catch (error) { setErrorMessage(safeErrorMessage(error, '无法新建笔记')); } finally { setBusy(false); }
 	}, [folders, library, selectedFolderId, flushSave, setCurrentDetail]);
 
 	const reloadNote = useCallback(async () => {
 		if (!selectedNoteId) return;
 		try {
 			const loaded = await library.getNote({ id: selectedNoteId });
-			setCurrentDetail(loaded); draftRef.current = {}; autoSaveDisabled.current = false; saveSucceeded.current = true; setSaveState('saved'); setErrorMessage('');
+			let loadedResources: Resource[] = [];
+			let resourcesUnavailable = false;
+			try { loadedResources = await library.listNoteResources({ noteId: selectedNoteId }); } catch { resourcesUnavailable = true; }
+			setCurrentDetail(loaded); setResources(loadedResources); draftRef.current = {}; autoSaveDisabled.current = false; saveSucceeded.current = true; setSaveState('saved'); setErrorMessage(resourcesUnavailable ? '部分附件暂不可用' : '');
 		} catch (error) { setErrorMessage(safeErrorMessage(error, '无法重新载入笔记')); }
 	}, [library, selectedNoteId, setCurrentDetail]);
+
+	const chooseResource = useCallback(async (): Promise<Resource | null> => {
+		const selected = await open({ multiple: false, directory: false, title: '添加附件' });
+		if (!selected || Array.isArray(selected)) return null;
+		const title = selected.split(/[\\/]/).pop() || '附件';
+		return library.createResourceFromPath({ path: selected, title });
+	}, [library]);
+
+	const openResource = useCallback(async (resource: Resource) => {
+		try { await library.openResource({ id: resource.id, fileExtension: resource.fileExtension }); } catch (error) { setErrorMessage(safeErrorMessage(error, '无法打开附件')); }
+	}, [library]);
 
 	useEffect(() => () => { void flushSave(); }, [flushSave]);
 
@@ -184,7 +201,7 @@ export default function App({
 				{detail ? <>
 					<header className="editor-header"><label className="sr-only" htmlFor="note-title">标题</label><input id="note-title" aria-label="标题" className="note-title-input" disabled={detail.markupLanguage === 'html'} value={detail.title} onChange={event => { const title = event.target.value; setCurrentDetail({ ...detail, title }); scheduleSave({ title }); }} placeholder="无标题" /><span className={`save-state save-state-${saveState}`}>{saveState === 'saved' ? '已保存' : saveState === 'saving' ? '保存中…' : saveState === 'conflict' ? '需要重载' : '保存失败'}</span></header>
 					{detail.markupLanguage === 'html' ? <p className="editor-notice" role="status">此 HTML 笔记仅可在官方 Joplin 编辑。</p> : null}
-					<EditorComponent noteId={detail.id} markdown={detail.body} readOnly={detail.markupLanguage === 'html'} onChange={body => { if (detail.markupLanguage === 'html') return; setCurrentDetail({ ...detail, body }); scheduleSave({ body }); }} />
+					<EditorComponent noteId={detail.id} markdown={detail.body} resources={resources} onCreateImageResource={library.createImageResource} onChooseResource={chooseResource} onResourceCreated={resource => { setResources(previous => [...previous.filter(item => item.id !== resource.id), resource]); }} onOpenResource={openResource} readOnly={detail.markupLanguage === 'html'} onChange={body => { if (detail.markupLanguage === 'html') return; setCurrentDetail({ ...detail, body }); scheduleSave({ body }); }} />
 					{errorMessage ? <div className="editor-error" role="alert"><span>{errorMessage}</span>{saveState === 'conflict' ? <button type="button" onClick={() => { void reloadNote(); }}>重新载入</button> : <button type="button" onClick={() => { autoSaveDisabled.current = false; setErrorMessage(''); scheduleSave(draftRef.current); }}>重试保存</button>}</div> : null}
 				</> : <section className="editor-empty"><p className="eyebrow">一页空白</p><h1>把想法放下来。</h1><p>选择一篇笔记，或创建一篇新的。</p><button type="button" className="new-note-button" onClick={() => { void createNote(); }}>新建笔记</button></section>}
 			</main>

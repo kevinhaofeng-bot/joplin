@@ -48,6 +48,58 @@ pub fn validate_resource_file(path: &Path) -> io::Result<std::fs::Metadata> {
     Ok(metadata)
 }
 
+pub fn resource_path(
+    paths: &ProfilePaths,
+    id: &str,
+    file_extension: Option<&str>,
+) -> io::Result<PathBuf> {
+    if !validate_resource_id(id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resource id rejected",
+        ));
+    }
+    let extension = file_extension.unwrap_or("");
+    if !extension.is_empty()
+        && (extension.len() > 10 || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resource extension rejected",
+        ));
+    }
+    let root = std::fs::canonicalize(paths.root())?;
+    let resource_metadata = std::fs::symlink_metadata(paths.resources())?;
+    if resource_metadata.file_type().is_symlink() || !resource_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resource directory rejected",
+        ));
+    }
+    let resources = std::fs::canonicalize(paths.resources())?;
+    if resources.parent() != Some(root.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resource directory rejected",
+        ));
+    }
+    let suffix = if extension.is_empty() {
+        String::new()
+    } else {
+        format!(".{extension}")
+    };
+    let candidate = paths.resources().join(format!("{id}{suffix}"));
+    validate_resource_file(&candidate)?;
+    let canonical = std::fs::canonicalize(candidate)?;
+    if canonical.parent() != Some(resources.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resource path rejected",
+        ));
+    }
+    Ok(canonical)
+}
+
 impl ProfilePaths {
     pub fn try_from_app_data(root: PathBuf) -> Result<Self, ProfilePathError> {
         validate_root(&root)?;
@@ -69,7 +121,22 @@ impl ProfilePaths {
         validate_root(&self.root).map_err(ProfilePathError::into_io_error)?;
 
         for path in [self.root(), self.resources(), self.indexes(), self.logs()] {
+            if let Ok(metadata) = std::fs::symlink_metadata(path)
+                && (metadata.file_type().is_symlink() || !metadata.is_dir())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed profile path rejected",
+                ));
+            }
             std::fs::create_dir_all(path)?;
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed profile path rejected",
+                ));
+            }
         }
         Ok(())
     }
@@ -295,5 +362,40 @@ mod tests {
         assert!(!validate_resource_id(&"A".repeat(32)));
         assert!(!validate_resource_id(&"a".repeat(31)));
         assert!(!validate_resource_id(&format!("{}g", "a".repeat(31))));
+    }
+
+    #[test]
+    fn resource_path_rejects_traversal_and_symlink_files() {
+        let temporary_directory = TemporaryDirectory::new();
+        let root = temporary_directory
+            .path()
+            .join(EXPECTED_PROFILE_DIRECTORY_NAME);
+        let paths = ProfilePaths::try_from_app_data(root).unwrap();
+        paths.ensure().unwrap();
+        let id = "a".repeat(32);
+        let resource = paths.resources().join(format!("{id}.png"));
+        fs::write(&resource, b"png").unwrap();
+        assert_eq!(
+            resource_path(&paths, &id, Some("png")).unwrap(),
+            fs::canonicalize(&resource).unwrap()
+        );
+        assert!(resource_path(&paths, &id, Some("../secret")).is_err());
+        let link = paths.resources().join(format!("{id}.jpg"));
+        symlink(&resource, &link).unwrap();
+        assert!(resource_path(&paths, &id, Some("jpg")).is_err());
+    }
+
+    #[test]
+    fn managed_resource_directory_symlink_is_rejected() {
+        let temporary_directory = TemporaryDirectory::new();
+        let root = temporary_directory
+            .path()
+            .join(EXPECTED_PROFILE_DIRECTORY_NAME);
+        fs::create_dir_all(&root).unwrap();
+        let outside = temporary_directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("resources")).unwrap();
+        let paths = ProfilePaths::try_from_app_data(root).unwrap();
+        assert!(paths.ensure().is_err());
     }
 }

@@ -26,7 +26,8 @@ function makeApi(overrides: Partial<LibraryApi> = {}): LibraryApi {
 		listNotes: vi.fn(async () => ({ items: [], page: 1, hasMore: false })), getNote: vi.fn(async () => note),
 		createNote: vi.fn(async () => ({ created: true, item: note })),
 		updateNote: vi.fn(async (params) => ({ changed: true, item: { ...note, ...params, updatedTime: params.expectedUpdatedTime + 1 } })),
-		trashNote: vi.fn(), setNoteTags: vi.fn(), ...overrides,
+		trashNote: vi.fn(), setNoteTags: vi.fn(), createResourceFromPath: vi.fn(), listNoteResources: vi.fn(async () => []),
+		createImageResource: vi.fn(), openResource: vi.fn(), ...overrides,
 	};
 }
 
@@ -80,5 +81,17 @@ describe('App', () => {
 
 		await screen.findByRole('alert');
 		expect(screen.getByRole('button', { name: '重试打开资料库' })).toBeInTheDocument();
+	});
+
+	it('keeps the note open when resource metadata is temporarily unavailable', async () => {
+		const api = makeApi({
+			listNotes: vi.fn(async () => ({ items: [note], page: 1, hasMore: false })),
+			getNote: vi.fn(async () => note),
+			listNoteResources: vi.fn(async () => { throw new LibraryClientError('STORAGE_ERROR', '无法保存资料库'); }),
+		});
+		render(<App loadRuntimeInfo={runtime} library={api} EditorComponent={FakeEditor} />);
+		fireEvent.click(await screen.findByRole('button', { name: '未命名笔记' }));
+		expect(await screen.findByRole('textbox', { name: '正文' })).toHaveValue('');
+		expect(await screen.findByText('部分附件暂不可用')).toBeInTheDocument();
 	});
 });

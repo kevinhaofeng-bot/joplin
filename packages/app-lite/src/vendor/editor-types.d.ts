@@ -1,5 +1,6 @@
 export enum EditorLanguageType { Markdown = 'markdown', Html = 'html' }
 export enum EditorKeymap { Default = 'default', Vim = 'vim', Emacs = 'emacs' }
+export enum UserEventSource { Paste = 'input.paste', Drop = 'input.drop' }
 export interface EditorControl {
 	supportsCommand(name: string): boolean | Promise<boolean>;
 	execCommand(name: string, ...args: unknown[]): void | Promise<unknown>;

@@ -1,10 +1,12 @@
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, io::Write, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
-use serde::Serialize;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
+use tempfile::Builder as TempFileBuilder;
 use tokio::sync::Mutex;
 
 use crate::{
-    profile::{ProfilePaths, validate_resource_file},
+    profile::{ProfilePaths, resource_path, validate_resource_file},
     sync_sidecar::*,
 };
 
@@ -12,6 +14,39 @@ pub const SIDECAR_UNAVAILABLE_CODE: &str = "SIDECAR_UNAVAILABLE";
 pub const SIDECAR_UNAVAILABLE_MESSAGE: &str = "本地资料库不可用";
 pub const SIDECAR_FAILED_CODE: &str = "SIDECAR_FAILED";
 pub const SIDECAR_FAILED_MESSAGE: &str = "本地资料库操作失败";
+const MAX_PASTED_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+fn image_signature_matches(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "image/bmp" => bytes.starts_with(b"BM"),
+        "image/avif" => {
+            bytes.len() >= 12
+                && &bytes[4..8] == b"ftyp"
+                && (&bytes[8..12] == b"avif" || &bytes[8..12] == b"avis")
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateImageResourceParams {
+    pub title: String,
+    pub mime: String,
+    pub base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenResourceParams {
+    pub id: String,
+    #[serde(default)]
+    pub file_extension: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -301,6 +336,125 @@ impl LibraryState {
         self.with_client(|client| Box::pin(client.list_note_resources(params)))
             .await
     }
+
+    pub async fn create_image_resource(
+        &self,
+        params: CreateImageResourceParams,
+    ) -> Result<Resource, LibraryError> {
+        let extension = match params.mime.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            "image/avif" => "avif",
+            "image/bmp" => "bmp",
+            _ => {
+                return Err(LibraryError {
+                    code: "VALIDATION_FAILED",
+                    message: "输入内容无效",
+                });
+            }
+        };
+        if params.title.is_empty() || params.title.len() > 4096 || params.title.contains('\0') {
+            return Err(LibraryError {
+                code: "VALIDATION_FAILED",
+                message: "输入内容无效",
+            });
+        }
+        let max_encoded = MAX_PASTED_IMAGE_BYTES.div_ceil(3) * 4 + 4;
+        if params.base64.is_empty() || params.base64.len() > max_encoded {
+            return Err(LibraryError {
+                code: "VALIDATION_FAILED",
+                message: "输入内容无效",
+            });
+        }
+        let bytes = STANDARD.decode(params.base64).map_err(|_| LibraryError {
+            code: "VALIDATION_FAILED",
+            message: "输入内容无效",
+        })?;
+        if bytes.is_empty()
+            || bytes.len() > MAX_PASTED_IMAGE_BYTES
+            || !image_signature_matches(&params.mime, &bytes)
+        {
+            return Err(LibraryError {
+                code: "VALIDATION_FAILED",
+                message: "输入内容无效",
+            });
+        }
+        let Some(profile) = self.profile.as_ref() else {
+            return Err(LibraryError {
+                code: SIDECAR_UNAVAILABLE_CODE,
+                message: SIDECAR_UNAVAILABLE_MESSAGE,
+            });
+        };
+        profile.ensure().map_err(|_| LibraryError {
+            code: SIDECAR_UNAVAILABLE_CODE,
+            message: SIDECAR_UNAVAILABLE_MESSAGE,
+        })?;
+        let suffix = format!(".{extension}");
+        let mut temporary = TempFileBuilder::new()
+            .prefix(".joplin-lite-resource-")
+            .suffix(&suffix)
+            .tempfile_in(profile.root())
+            .map_err(|_| LibraryError {
+                code: "STORAGE_ERROR",
+                message: "无法保存资料库",
+            })?;
+        temporary.write_all(&bytes).map_err(|_| LibraryError {
+            code: "STORAGE_ERROR",
+            message: "无法保存资料库",
+        })?;
+        temporary.flush().map_err(|_| LibraryError {
+            code: "STORAGE_ERROR",
+            message: "无法保存资料库",
+        })?;
+        self.create_resource_from_path(CreateResourceFromPathParams {
+            path: temporary.path().to_string_lossy().into_owned(),
+            title: Some(params.title),
+        })
+        .await
+    }
+
+    pub async fn open_resource(&self, params: OpenResourceParams) -> Result<(), LibraryError> {
+        let Some(profile) = self.profile.as_ref() else {
+            return Err(LibraryError {
+                code: SIDECAR_UNAVAILABLE_CODE,
+                message: SIDECAR_UNAVAILABLE_MESSAGE,
+            });
+        };
+        let path =
+            resource_path(profile, &params.id, params.file_extension.as_deref()).map_err(|_| {
+                LibraryError {
+                    code: "VALIDATION_FAILED",
+                    message: "输入内容无效",
+                }
+            })?;
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("/usr/bin/open")
+                .arg(path)
+                .status()
+                .map_err(|_| LibraryError {
+                    code: "STORAGE_ERROR",
+                    message: "无法打开附件",
+                })?;
+            if !status.success() {
+                return Err(LibraryError {
+                    code: "STORAGE_ERROR",
+                    message: "无法打开附件",
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            Err(LibraryError {
+                code: SIDECAR_UNAVAILABLE_CODE,
+                message: SIDECAR_UNAVAILABLE_MESSAGE,
+            })
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -388,6 +542,49 @@ arg_library_commands! {
 }
 
 #[tauri::command]
+pub async fn create_image_resource(
+    state: tauri::State<'_, LibraryState>,
+    params: CreateImageResourceParams,
+) -> Result<Resource, LibraryError> {
+    state.create_image_resource(params).await
+}
+
+#[tauri::command]
+pub async fn open_resource(
+    state: tauri::State<'_, LibraryState>,
+    params: OpenResourceParams,
+) -> Result<(), LibraryError> {
+    state.open_resource(params).await
+}
+
+#[tauri::command]
 pub async fn shutdown_library(state: tauri::State<'_, LibraryState>) -> Result<(), LibraryError> {
     state.shutdown().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_payload_requires_matching_raster_signature() {
+        assert!(image_signature_matches(
+            "image/png",
+            b"\x89PNG\r\n\x1a\nrest"
+        ));
+        assert!(!image_signature_matches("image/png", b"not a png"));
+        assert!(image_signature_matches(
+            "image/jpeg",
+            &[0xff, 0xd8, 0xff, 0xe0]
+        ));
+        assert!(image_signature_matches("image/webp", b"RIFFxxxxWEBPdata"));
+        assert!(!image_signature_matches("image/svg+xml", b"<svg/>"));
+    }
+
+    #[test]
+    fn image_payload_encoded_size_limit_is_bounded_before_decode() {
+        let max_encoded = MAX_PASTED_IMAGE_BYTES.div_ceil(3) * 4 + 4;
+        assert!(max_encoded < 15 * 1024 * 1024);
+        assert!(max_encoded > MAX_PASTED_IMAGE_BYTES);
+    }
 }

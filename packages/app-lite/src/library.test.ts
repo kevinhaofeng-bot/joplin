@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createFolder, listNotes, openLibrary } from './library';
+import { createFolder, createImageResource, createResourceFromPath, listNoteResources, listNotes, openLibrary, resourceUrl } from './library';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 
@@ -46,5 +46,21 @@ describe('library invoke client', () => {
 		expect(await openLibrary()).toEqual({ state: 'open', schemaVersion: 53, formatVersion: 1 });
 		vi.mocked(invoke).mockResolvedValue({ state: 'open', schemaVersion: -1, formatVersion: 1 });
 		await expect(openLibrary()).rejects.toThrow('本地资料库响应无效');
+	});
+
+	it('guards and sends official resource DTOs without exposing paths', async () => {
+		const resource = { id: 'a'.repeat(32), title: 'picture.png', mime: 'image/png', fileExtension: 'png', size: 3, createdTime: 1, updatedTime: 2, markup: '![]( :/bad )' };
+		vi.mocked(invoke).mockResolvedValue(resource);
+		await expect(createResourceFromPath({ path: '/trusted/picture.png' })).resolves.toEqual(resource);
+		expect(invoke).toHaveBeenCalledWith('create_resource_from_path', { params: { path: '/trusted/picture.png' } });
+		vi.mocked(invoke).mockResolvedValue([resource]);
+		await expect(listNoteResources({ noteId: 'b'.repeat(32) })).resolves.toEqual([resource]);
+	});
+
+	it('rejects malformed resources and creates a controlled resource URL', async () => {
+		vi.mocked(invoke).mockResolvedValue({ id: 'a'.repeat(32), title: '', mime: 'image/png', fileExtension: 'png', size: 1, createdTime: 1, updatedTime: 1, markup: '', secret: '/tmp/x' });
+		await expect(createImageResource({ title: 'x.png', mime: 'image/png', base64: 'eA==' })).rejects.toThrow('本地资料库响应无效');
+		expect(resourceUrl({ id: 'a'.repeat(32), fileExtension: 'png', updatedTime: 2 })).toBe('joplin-resource://localhost/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png?t=2');
+		expect(() => resourceUrl({ id: '../bad', fileExtension: 'png', updatedTime: 2 })).toThrow('本地资料库响应无效');
 	});
 });

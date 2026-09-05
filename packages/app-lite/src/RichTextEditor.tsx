@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createEditor } from '@joplin/editor/ProseMirror';
 import { EditorEventType, type EditorEvent } from '@joplin/editor/events';
-import { EditorKeymap, EditorLanguageType, type EditorControl, type EditorProps, type EditorSettings } from '@joplin/editor/types';
+import { EditorKeymap, EditorLanguageType, UserEventSource, type EditorControl, type EditorProps, type EditorSettings } from '@joplin/editor/types';
 import type { OnCreateCodeEditor, RendererControl } from '@joplin/editor/ProseMirror/types';
 import { MarkupToHtml, MarkupLanguage } from '@joplin/renderer';
 // These packages intentionally mirror Joplin mobile's renderer adapter. They do not ship
@@ -9,11 +9,18 @@ import { MarkupToHtml, MarkupLanguage } from '@joplin/renderer';
 import TurndownService from '@joplin/turndown';
 import { gfm } from '@joplin/turndown-plugin-gfm';
 import '@joplin/editor/ProseMirror/styles';
+import { createImageFromFile } from './resource';
+import { resourceUrl, type Resource, type CreateImageResourceParams } from './library';
 
 export interface RichTextEditorProps {
 	noteId: string;
 	markdown: string;
 	onChange: (markdown: string)=> void;
+	resources?: Resource[];
+	onCreateImageResource?: (params: CreateImageResourceParams)=> Promise<Resource>;
+	onChooseResource?: ()=> Promise<Resource | null>;
+	onResourceCreated?: (resource: Resource)=> void;
+	onOpenResource?: (resource: Resource)=> Promise<void> | void;
 	ariaLabel?: string;
 	readOnly?: boolean;
 }
@@ -24,14 +31,30 @@ const rendererTheme = {
 	urlColor: '#1b6870', tableBackgroundColor: '#f5f2eb', fontSize: 15, lineHeight: '1.65',
 };
 
-const markdownRenderer = new MarkupToHtml({ isSafeMode: false });
+const browserResourceModel = {
+	isResourceUrl: (url: string) => /^:\/[0-9a-f]{32}$/.test(url),
+	urlToId: (url: string) => url.slice(2),
+	filename: (resource: { id?: string; file_extension?: string }) => `${resource.id || ''}${resource.file_extension ? `.${resource.file_extension}` : ''}`,
+	isSupportedImageMimeType: (mime: string) => ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp'].includes(mime.toLowerCase()),
+};
+const markdownRenderer = new MarkupToHtml({ isSafeMode: false, ResourceModel: browserResourceModel });
 
-export async function markdownToHtml(markdown: string): Promise<string> {
+export async function markdownToHtml(markdown: string, resources: Resource[] = []): Promise<string> {
+	const resourceMap = Object.fromEntries(resources.map(resource => [resource.id, {
+		item: { id: resource.id, title: resource.title, mime: resource.mime, file_extension: resource.fileExtension, size: resource.size, updated_time: resource.updatedTime },
+		localState: { fetch_status: 2 },
+	}]));
 	const result = await markdownRenderer.render(
 		MarkupLanguage.Markdown,
 		markdown,
 		rendererTheme,
-		{ bodyOnly: true, theme: rendererTheme, platformName: 'desktop' },
+		{
+			bodyOnly: true, theme: rendererTheme, platformName: 'desktop', resources: resourceMap,
+			itemIdToUrl: (id: string) => {
+				const resource = resources.find(item => item.id === id);
+				return resource ? resourceUrl(resource) : '';
+			},
+		},
 	);
 	return result.html;
 }
@@ -69,7 +92,7 @@ const editorSettings: EditorSettings = {
 	useExternalSearch: true, automatchBraces: true, autocompleteMarkup: false, ignoreModifiers: false,
 	language: EditorLanguageType.Markdown, keymap: EditorKeymap.Default, preferMacShortcuts: true, tabMovesFocus: false,
 	markdownMarkEnabled: true, markdownInsertEnabled: true, katexEnabled: false, spellcheckEnabled: true,
-	inlineRenderingEnabled: true, tableEditingEnabled: true, imageRenderingEnabled: false, readOnly: false,
+	inlineRenderingEnabled: true, tableEditingEnabled: true, imageRenderingEnabled: true, readOnly: false,
 	highlightActiveLine: false, indentWithTabs: false, editorLabel: '正文',
 };
 
@@ -86,9 +109,9 @@ function createCodeEditor(parent: HTMLElement, _language: unknown, onChange: (va
 	};
 }
 
-function createRenderer(): RendererControl {
+function createRenderer(resourcesRef: { current: Resource[] }): RendererControl {
 	return {
-		renderMarkupToHtml: async (markup, _options) => ({ html: await markdownToHtml(markup), cssStrings: [], pluginAssets: [] }),
+		renderMarkupToHtml: async (markup, _options) => ({ html: await markdownToHtml(markup, resourcesRef.current), cssStrings: [], pluginAssets: [] }),
 		renderHtmlToMarkup: htmlToMarkdown,
 	};
 }
@@ -98,34 +121,58 @@ const commandButtons = [
 	['textBulletedList', '项目列表'], ['textCheckbox', '待办'], ['textCodeBlock', '代码块'],
 ] as const;
 
-export default function RichTextEditor({ noteId, markdown, onChange, ariaLabel = '正文', readOnly = false }: RichTextEditorProps) {
+export default function RichTextEditor({ noteId, markdown, onChange, resources = [], onCreateImageResource, onChooseResource, onResourceCreated, onOpenResource, ariaLabel = '正文', readOnly = false }: RichTextEditorProps) {
 	const host = useRef<HTMLDivElement>(null);
 	const editor = useRef<EditorControl | null>(null);
 	const latestMarkdown = useRef(markdown);
 	const onChangeRef = useRef(onChange);
+	const resourcesRef = useRef(resources);
+	const createImageRef = useRef(onCreateImageResource);
+	const chooseResourceRef = useRef(onChooseResource);
+	const resourceCreatedRef = useRef(onResourceCreated);
+	const openResourceRef = useRef(onOpenResource);
 	const [pasteMessage, setPasteMessage] = useState('');
+	const [attachmentBusy, setAttachmentBusy] = useState(false);
 	const [editorReady, setEditorReady] = useState(false);
-	const renderer = useMemo(createRenderer, []);
+	resourcesRef.current = resources;
+	createImageRef.current = onCreateImageResource;
+	chooseResourceRef.current = onChooseResource;
+	resourceCreatedRef.current = onResourceCreated;
+	openResourceRef.current = onOpenResource;
+	const renderer = useMemo(() => createRenderer(resourcesRef), []);
 	onChangeRef.current = onChange;
 
 	useEffect(() => {
 		let mounted = true;
 		if (!host.current) return undefined;
 		latestMarkdown.current = markdown;
+		const insertResource = (resource: Resource, source: UserEventSource) => {
+			resourcesRef.current = [...resourcesRef.current.filter(item => item.id !== resource.id), resource];
+			resourceCreatedRef.current?.(resource);
+			editor.current?.insertText(resource.markup, source);
+		};
 		const props: EditorProps = {
 			settings: { ...editorSettings, editorLabel: ariaLabel, readOnly }, initialText: markdown, initialNoteId: noteId,
-			onLocalize: input => input, onPasteFile: async () => { setPasteMessage('附件将在下一里程碑接入'); },
+			onLocalize: input => input, onPasteFile: async file => {
+				if (!createImageRef.current || readOnly) return;
+				setAttachmentBusy(true); setPasteMessage('');
+				try { insertResource(await createImageFromFile(file, createImageRef.current), UserEventSource.Paste); } catch (error) { setPasteMessage(error instanceof Error ? error.message : '附件添加失败'); } finally { setAttachmentBusy(false); }
+			},
 			onEvent: (event: unknown) => {
 				const change = event as EditorEvent;
 				if (change.kind === EditorEventType.Change) {
 					latestMarkdown.current = change.value;
 					onChangeRef.current(change.value);
 				}
+				if (change.kind === EditorEventType.FollowLink && change.link.startsWith(':/')) {
+					const resourceId = change.link.slice(2).split(/[?#]/, 1)[0];
+					const resource = resourcesRef.current.find(item => item.id === resourceId);
+					if (resource) void openResourceRef.current?.(resource);
+				}
 			}, onLogMessage: () => {},
 		};
 		void createEditor(host.current, props, renderer, createCodeEditor).then(control => {
-			if (mounted) { editor.current = control; setEditorReady(true); }
-			else control.remove();
+			if (mounted) { editor.current = control; setEditorReady(true); } else { control.remove(); }
 		});
 		return () => {
 			mounted = false;
@@ -145,10 +192,22 @@ export default function RichTextEditor({ noteId, markdown, onChange, ariaLabel =
 			<div className="editor-toolbar" role="toolbar" aria-label="格式工具">
 				{commandButtons.map(([command, label]) => (
 					<button key={command} type="button" className="toolbar-button" aria-label={label}
-						 disabled={!editorReady || readOnly} onClick={() => { void editor.current?.execCommand(command); }}>
+						disabled={!editorReady || readOnly} onClick={() => { void editor.current?.execCommand(command); }}>
 						{label}
 					</button>
 				))}
+				<button type="button" className="toolbar-button" aria-label="附件" disabled={!editorReady || readOnly || attachmentBusy || !chooseResourceRef.current} onClick={async () => {
+					if (!chooseResourceRef.current) return;
+					setAttachmentBusy(true); setPasteMessage('');
+					try {
+						const resource = await chooseResourceRef.current();
+						if (resource) {
+							resourcesRef.current = [...resourcesRef.current.filter(item => item.id !== resource.id), resource];
+							resourceCreatedRef.current?.(resource);
+							editor.current?.insertText(resource.markup, UserEventSource.Paste);
+						}
+					} catch (error) { setPasteMessage(error instanceof Error ? error.message : '附件添加失败'); } finally { setAttachmentBusy(false); }
+				}}>{attachmentBusy ? '添加中…' : '附件'}</button>
 			</div>
 			<div className="editor-host" ref={host} />
 			{pasteMessage ? <p className="editor-notice" role="status">{pasteMessage}</p> : null}
