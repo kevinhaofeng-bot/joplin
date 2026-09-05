@@ -124,12 +124,14 @@ describe('claimProfile', () => {
 		await expect(access(outside)).rejects.toThrow();
 	});
 
-	test('derives child paths from the root even if a validated object is mutated', async () => {
+	test('freezes the validated facade and never trusts forged child paths', async () => {
 		const paths = await scaffold();
 		const outside = join(paths.root, '..', 'mutated-marker');
-		(paths as { marker: string }).marker = outside;
+		expect(Object.isFrozen(paths)).toBe(true);
+		const forged = { ...paths, marker: outside } as ValidatedProfilePaths;
+		await expect(claimProfile(forged)).rejects.toMatchObject({ code: 'PROFILE_INVALID' });
+		await expect(access(outside)).rejects.toThrow();
 		await claimProfile(paths);
 		await expect(readFile(join(paths.root, '.joplin-lite-profile.json'), 'utf8')).resolves.toBe(PROFILE_MARKER_CONTENT);
-		await expect(access(outside)).rejects.toThrow();
 	});
 });

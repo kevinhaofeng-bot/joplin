@@ -46,7 +46,8 @@ describe('validateProfilePath', () => {
 
 	test('rejects legacy components before resolving dot-dot segments', async () => {
 		const parent = await tempParent();
-		await expectInvalid(join(parent, 'joplin-desktop', '..', PROFILE_DIRECTORY_NAME));
+		await profileRoot(parent);
+		await expectInvalid(`${parent}/joplin-desktop/../${PROFILE_DIRECTORY_NAME}`);
 	});
 
 	test('rejects a canonical parent whose real path contains the legacy component', async () => {
@@ -125,6 +126,27 @@ describe('validateProfilePath', () => {
 		await rm(paths.resources, { recursive: true, force: true });
 		await symlink(paths.logs, paths.resources);
 		await expect(revalidateProfilePath(paths)).rejects.toMatchObject({ code: INVALID, message: '资料库路径无效' });
+	});
+
+	test('returns one canonical facade and advances one shared snapshot', async () => {
+		const root = await profileRoot();
+		await Promise.all(['resources', 'indexes', 'logs'].map(name => mkdir(join(root, name))));
+		const paths = await validateProfilePath(root);
+		const samePaths = await revalidateProfilePath(paths);
+		expect(samePaths).toBe(paths);
+		expect(Object.isFrozen(paths)).toBe(true);
+	});
+
+	test('keeps one shared snapshot across old and current facade references', async () => {
+		const root = await profileRoot();
+		await Promise.all(['resources', 'indexes', 'logs'].map(name => mkdir(join(root, name))));
+		const paths = await validateProfilePath(root);
+		const current = await revalidateProfilePath(paths);
+		await writeFile(join(root, 'database.sqlite'), 'created after validation');
+		await expect(revalidateProfilePath(current)).resolves.toBe(paths);
+		await rm(join(root, 'database.sqlite'));
+		await expect(revalidateProfilePath(paths)).rejects.toMatchObject({ code: INVALID });
+		await expect(revalidateProfilePath(current)).rejects.toMatchObject({ code: INVALID });
 	});
 
 	test('rejects a root renamed and recreated at the same path', async () => {

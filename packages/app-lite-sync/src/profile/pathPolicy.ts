@@ -1,3 +1,4 @@
+import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, resolve, join, sep } from 'node:path';
 import { PROFILE_DIRECTORY_NAME, profileError } from '../protocol';
@@ -26,8 +27,16 @@ type IdentitySnapshot = {
 	parentIdentity: Identity;
 	entries: Map<string, Identity>;
 };
+type ValidationState = {
+	facade: ValidatedProfilePaths;
+	root: string;
+	snapshot: IdentitySnapshot;
+	generation: number;
+	queue: Promise<void>;
+	inFlight: boolean;
+};
 
-const snapshots = new WeakMap<object, IdentitySnapshot>();
+const states = new WeakMap<object, ValidationState>();
 
 const directories = ['resources', 'indexes', 'logs', 'tmp', 'cache'] as const;
 const files = ['database.sqlite', 'database.sqlite-journal', 'database.sqlite-wal', 'database.sqlite-shm', 'settings.json', '.joplin-lite-profile.json'] as const;
@@ -56,11 +65,20 @@ async function safeLstat(path: string): Promise<Awaited<ReturnType<typeof lstat>
 	}
 }
 
-function requireDirectory(stat: Awaited<ReturnType<typeof lstat>> | undefined): void {
+function safeLstatSync(path: string): ReturnType<typeof lstatSync> | undefined {
+	try {
+		return lstatSync(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+		invalid();
+	}
+}
+
+function requireDirectory(stat: { isSymbolicLink(): boolean; isDirectory(): boolean } | undefined): void {
 	if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) invalid();
 }
 
-function identity(stat: Awaited<ReturnType<typeof lstat>>, type: EntryType): Identity {
+function identity(stat: { dev: number | bigint; ino: number | bigint }, type: EntryType): Identity {
 	return { dev: stat.dev, ino: stat.ino, type };
 }
 
@@ -82,18 +100,15 @@ function pathsFor(root: string): ValidatedProfilePaths {
 	};
 }
 
-export async function validateProfilePath(input: unknown): Promise<ValidatedProfilePaths> {
-	const root = rawProfilePath(input);
-
+async function scanProfilePath(root: string): Promise<IdentitySnapshot> {
 	const rootStat = await safeLstat(root);
 	requireDirectory(rootStat);
 
-	const parent = dirname(root);
 	let rootRealPath: string;
 	let canonicalParent: string;
 	try {
 		rootRealPath = await realpath(root);
-		canonicalParent = await realpath(parent);
+		canonicalParent = await realpath(dirname(root));
 	} catch {
 		invalid();
 	}
@@ -101,7 +116,6 @@ export async function validateProfilePath(input: unknown): Promise<ValidatedProf
 	const canonicalParentStat = await safeLstat(canonicalParent);
 	requireDirectory(canonicalParentStat);
 
-	const paths = pathsFor(root);
 	const entries = new Map<string, Identity>();
 	for (const name of directories) {
 		const path = join(root, name);
@@ -115,8 +129,7 @@ export async function validateProfilePath(input: unknown): Promise<ValidatedProf
 		if (stat && (stat.isSymbolicLink() || !stat.isFile())) invalid();
 		if (stat) entries.set(path, identity(stat, 'file'));
 	}
-
-	const snapshot: IdentitySnapshot = {
+	return {
 		root,
 		rootRealPath,
 		rootIdentity: identity(rootStat, 'directory'),
@@ -124,23 +137,88 @@ export async function validateProfilePath(input: unknown): Promise<ValidatedProf
 		parentIdentity: identity(canonicalParentStat, 'directory'),
 		entries,
 	};
-	snapshots.set(paths, snapshot);
-	return paths;
+}
+
+function scanProfilePathSync(root: string): IdentitySnapshot {
+	const rootStat = safeLstatSync(root);
+	requireDirectory(rootStat);
+
+	let rootRealPath: string;
+	let canonicalParent: string;
+	try {
+		rootRealPath = realpathSync(root);
+		canonicalParent = realpathSync(dirname(root));
+	} catch {
+		invalid();
+	}
+	if (includesLegacyComponent(canonicalParent)) invalid();
+	const canonicalParentStat = safeLstatSync(canonicalParent);
+	requireDirectory(canonicalParentStat);
+
+	const entries = new Map<string, Identity>();
+	for (const name of directories) {
+		const path = join(root, name);
+		const stat = safeLstatSync(path);
+		if (stat && (stat.isSymbolicLink() || !stat.isDirectory())) invalid();
+		if (stat) entries.set(path, identity(stat, 'directory'));
+	}
+	for (const name of files) {
+		const path = join(root, name);
+		const stat = safeLstatSync(path);
+		if (stat && (stat.isSymbolicLink() || !stat.isFile())) invalid();
+		if (stat) entries.set(path, identity(stat, 'file'));
+	}
+	return {
+		root,
+		rootRealPath,
+		rootIdentity: identity(rootStat, 'directory'),
+		parentRealPath: canonicalParent,
+		parentIdentity: identity(canonicalParentStat, 'directory'),
+		entries,
+	};
+}
+
+function advanceState(state: ValidationState, current: IdentitySnapshot): void {
+	const previous = state.snapshot;
+	if (current.rootRealPath !== previous.rootRealPath || current.parentRealPath !== previous.parentRealPath ||
+		!sameIdentity(current.rootIdentity, previous.rootIdentity) || !sameIdentity(current.parentIdentity, previous.parentIdentity)) invalid();
+	for (const [path, previousIdentity] of previous.entries) {
+		const currentIdentity = current.entries.get(path);
+		if (!currentIdentity || !sameIdentity(currentIdentity, previousIdentity)) invalid();
+	}
+	state.snapshot = current;
+	state.generation += 1;
+}
+
+export async function validateProfilePath(input: unknown): Promise<ValidatedProfilePaths> {
+	const root = rawProfilePath(input);
+	const snapshot = await scanProfilePath(root);
+	const facade = Object.freeze(pathsFor(root));
+	const state: ValidationState = { facade, root, snapshot, generation: 0, queue: Promise.resolve(), inFlight: false };
+	states.set(facade, state);
+	return facade;
 }
 
 export async function revalidateProfilePath(paths: ValidatedProfilePaths): Promise<ValidatedProfilePaths> {
-	const original = snapshots.get(paths as object);
-	if (!original) invalid();
-	const current = await validateProfilePath(original.root);
-	const currentSnapshot = snapshots.get(current as object);
-	if (!currentSnapshot || currentSnapshot.rootRealPath !== original.rootRealPath || currentSnapshot.parentRealPath !== original.parentRealPath ||
-		!sameIdentity(currentSnapshot.rootIdentity, original.rootIdentity) || !sameIdentity(currentSnapshot.parentIdentity, original.parentIdentity)) invalid();
-	for (const [path, previousIdentity] of original.entries) {
-		const currentIdentity = currentSnapshot.entries.get(path);
-		if (!currentIdentity || !sameIdentity(currentIdentity, previousIdentity)) invalid();
-	}
-	// New managed entries (including SQLite auxiliary files) may appear between
-	// validation phases; once observed, their identity is pinned for later calls.
-	snapshots.set(paths as object, currentSnapshot);
-	return current;
+	const state = states.get(paths as object);
+	if (!state) invalid();
+	const run = state.queue.then(async () => {
+		state.inFlight = true;
+		try {
+			advanceState(state, await scanProfilePath(state.root));
+			return state.facade;
+		} finally {
+			state.inFlight = false;
+		}
+	});
+	state.queue = run.then((): void => undefined, (): void => undefined);
+	return run;
+}
+
+/** Final synchronous identity check used immediately before marker O_EXCL open. */
+export function revalidateProfilePathSync(paths: ValidatedProfilePaths): ValidatedProfilePaths {
+	const state = states.get(paths as object);
+	if (!state) invalid();
+	advanceState(state, scanProfilePathSync(state.root));
+	return state.facade;
 }

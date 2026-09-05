@@ -1,7 +1,8 @@
-import { constants } from 'node:fs';
-import { lstat, open, readdir } from 'node:fs/promises';
+import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, writeSync } from 'node:fs';
+import { lstat, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { profileError } from '../protocol';
-import { revalidateProfilePath, type ValidatedProfilePaths } from './pathPolicy';
+import { revalidateProfilePath, revalidateProfilePathSync, type ValidatedProfilePaths } from './pathPolicy';
 
 export const PROFILE_MARKER_CONTENT = '{"owner":"com.kevinhao.joplin-lite","formatVersion":1}';
 
@@ -14,23 +15,34 @@ function notOwned(): never {
 	throw profileError('PROFILE_NOT_OWNED');
 }
 
-async function existingOwnedMarker(path: string): Promise<boolean> {
-	let marker;
+function existingOwnedMarker(path: string): boolean {
+	let marker: number;
 	try {
-		marker = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | O_CLOEXEC);
+		marker = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | O_CLOEXEC);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
 		notOwned();
 	}
+
+	let owned = false;
+	let failed = false;
 	try {
-		const stat = await marker.stat();
-		if (stat.isSymbolicLink() || !stat.isFile()) notOwned();
-		return (await marker.readFile({ encoding: 'utf8' })) === PROFILE_MARKER_CONTENT;
+		const stat = fstatSync(marker);
+		if (!stat.isFile()) notOwned();
+		const pathStat = lstatSync(path);
+		if (pathStat.isSymbolicLink() || !pathStat.isFile() || pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) notOwned();
+		owned = readFileSync(marker, { encoding: 'utf8' }) === PROFILE_MARKER_CONTENT;
 	} catch {
-		notOwned();
+		failed = true;
 	} finally {
-		await marker.close().catch((): void => {});
+		try {
+			closeSync(marker);
+		} catch {
+			failed = true;
+		}
 	}
+	if (failed) notOwned();
+	return owned;
 }
 
 async function isEmptyDirectory(path: string): Promise<boolean> {
@@ -58,6 +70,32 @@ async function isEmptyRustScaffold(paths: ValidatedProfilePaths): Promise<boolea
 	]).then(results => results.every(Boolean));
 }
 
+function createMarker(path: string): void {
+	let marker: number;
+	try {
+		marker = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | O_CLOEXEC, 0o600);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'EEXIST' && existingOwnedMarker(path)) return;
+		notOwned();
+	}
+
+	let failed = false;
+	try {
+		const content = Buffer.from(PROFILE_MARKER_CONTENT, 'utf8');
+		let offset = 0;
+		while (offset < content.length) offset += writeSync(marker, content, offset, content.length - offset);
+		fsyncSync(marker);
+	} catch {
+		failed = true;
+	}
+	try {
+		closeSync(marker);
+	} catch {
+		failed = true;
+	}
+	if (failed) notOwned();
+}
+
 export async function claimProfile(paths: ValidatedProfilePaths): Promise<void> {
 	let safePaths: ValidatedProfilePaths;
 	try {
@@ -67,22 +105,17 @@ export async function claimProfile(paths: ValidatedProfilePaths): Promise<void> 
 		throw profileError('PROFILE_INVALID');
 	}
 
-	if (await existingOwnedMarker(safePaths.marker)) return;
+	const markerPath = join(safePaths.root, '.joplin-lite-profile.json');
+	if (existingOwnedMarker(markerPath)) {
+		await revalidateProfilePath(safePaths);
+		return;
+	}
 	if (!(await isEmptyRustScaffold(safePaths))) notOwned();
 
-	let marker;
-	try {
-		marker = await open(safePaths.marker, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | O_CLOEXEC, 0o600);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === 'EEXIST' && await existingOwnedMarker(safePaths.marker)) return;
-		notOwned();
-	}
-	try {
-		await marker.writeFile(PROFILE_MARKER_CONTENT, 'utf8');
-		await marker.sync();
-	} catch {
-		notOwned();
-	} finally {
-		await marker.close().catch((): void => {});
-	}
+	// Recheck after the asynchronous scaffold read, then keep the final
+	// identity check and O_EXCL open in one synchronous critical section.
+	safePaths = await revalidateProfilePath(safePaths);
+	const finalPaths = revalidateProfilePathSync(safePaths);
+	createMarker(join(finalPaths.root, '.joplin-lite-profile.json'));
+	await revalidateProfilePath(finalPaths);
 }
