@@ -551,6 +551,7 @@ struct SidecarManifest {
     entry_path: String,
     current_dir: String,
     node_version: String,
+    node_sha256: String,
     bun_version: String,
 }
 
@@ -643,6 +644,11 @@ fn release_sidecar_command(bundle: &Path) -> io::Result<SidecarCommand> {
         || manifest.platform != "darwin"
         || manifest.arch != "arm64"
         || manifest.node_version.is_empty()
+        || manifest.node_sha256.len() != 64
+        || !manifest
+            .node_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
         || manifest.bun_version.is_empty()
     {
         return Err(io::Error::new(
@@ -708,7 +714,7 @@ mod release_sidecar_tests {
         fs::write(
             root.join("manifest.json"),
             format!(
-                r#"{{"formatVersion":1,"platform":"darwin","arch":"arm64","nodePath":"{node}","entryPath":"{entry}","currentDir":"{current_dir}","nodeVersion":"test","bunVersion":"test"}}"#
+                r#"{{"formatVersion":1,"platform":"darwin","arch":"arm64","nodePath":"{node}","entryPath":"{entry}","currentDir":"{current_dir}","nodeVersion":"test","nodeSha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","bunVersion":"test"}}"#
             ),
         )
         .unwrap();

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "yarn build:web && yarn workspace @joplin/app-lite-sync build:release"
+  },
+  "bundle": {
+    "active": true,
+    "resources": {
+      "resources/sidecar/": "sidecar/"
+    }
+  }
+}

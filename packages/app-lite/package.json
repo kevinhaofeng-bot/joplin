@@ -11,7 +11,8 @@
     "test-ci": "vitest run",
     "tsc": "tsc --noEmit",
     "dev": "tauri dev",
-    "build:native": "tauri build"
+    "build:native": "tauri build",
+    "build:native:release": "tauri build --config src-tauri/tauri.release.conf.json"
   },
   "dependencies": {
     "@joplin/editor": "~3.7",

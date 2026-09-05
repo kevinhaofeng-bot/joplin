@@ -1,10 +1,21 @@
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { PINNED_NODE_SHA256, PINNED_NODE_VERSION } = require('./fetch-node-runtime.cjs');
 
 function validateRelativeBundlePath(value) {
   if (typeof value !== 'string' || value.length === 0 || path.isAbsolute(value)) return false;
   return !value.split(/[\\/]+/).some((part) => part === '..' || part === '');
+}
+
+function validateMachODependencies(output) {
+  const lines = String(output).split('\n').slice(1).map(line => line.trim()).filter(Boolean);
+  const disallowed = lines.filter(line => {
+    const dependency = line.split(' ')[0];
+    return !(dependency.startsWith('/System/Library/') || dependency.startsWith('/usr/lib/'));
+  });
+  if (disallowed.length) throw new Error(`Node has non-system Mach-O dependencies: ${disallowed.join(', ')}`);
 }
 
 function assertRegularFile(file, label) {
@@ -74,13 +85,25 @@ function main() {
   const repoRoot = path.resolve(sidecarRoot, '../..');
   const appRoot = path.join(repoRoot, 'packages/app-lite');
   const stagingRoot = path.join(appRoot, 'src-tauri/resources/sidecar');
-  const nodeRuntime = process.env.JOPLIN_LITE_NODE_RUNTIME;
-  if (!nodeRuntime) throw new Error('JOPLIN_LITE_NODE_RUNTIME must point to an explicit arm64 Node runtime');
   if (!process.versions.bun) throw new Error('run this script with the pinned Bun runtime');
   const bunRuntime = resolveRegularFile(process.execPath, 'Bun runtime');
+  let nodeRuntime = process.env.JOPLIN_LITE_NODE_RUNTIME;
+  if (!nodeRuntime) {
+    nodeRuntime = path.join(sidecarRoot, '.cache', `node-${PINNED_NODE_VERSION}-darwin-arm64`, 'bin/node');
+    const checksumPath = `${nodeRuntime}.sha256`;
+    if (!fs.existsSync(nodeRuntime) || fs.readFileSync(checksumPath, 'utf8').trim() !== PINNED_NODE_SHA256) {
+      run(bunRuntime, [path.join(__dirname, 'fetch-node-runtime.cjs'), nodeRuntime], { cwd: repoRoot });
+    }
+  }
   const nodeRuntimePath = resolveRegularFile(nodeRuntime, 'Node runtime');
   const nodeFile = run('/usr/bin/file', ['-b', nodeRuntimePath]);
   if (!/Mach-O.*arm64/.test(nodeFile)) throw new Error(`Node runtime is not arm64: ${nodeFile}`);
+  const nodeDependencies = run('/usr/bin/otool', ['-L', nodeRuntimePath]);
+  validateMachODependencies(nodeDependencies);
+  const nodeSha256 = crypto.createHash('sha256').update(fs.readFileSync(nodeRuntimePath)).digest('hex');
+  if (nodeSha256 !== PINNED_NODE_SHA256 || run(nodeRuntimePath, ['--version']) !== PINNED_NODE_VERSION) {
+    throw new Error(`Node runtime must be pinned official ${PINNED_NODE_VERSION}`);
+  }
 
   const manifest = {
     formatVersion: 1,
@@ -89,7 +112,8 @@ function main() {
     nodePath: 'bin/node',
     entryPath: 'sidecar.cjs',
     currentDir: '.',
-    nodeVersion: run(nodeRuntimePath, ['--version']),
+    nodeVersion: PINNED_NODE_VERSION,
+    nodeSha256,
     bunVersion: Bun.version,
   };
   if (!validateRelativeBundlePath(manifest.nodePath) || !validateRelativeBundlePath(manifest.entryPath)) {
@@ -138,6 +162,6 @@ function main() {
   process.stdout.write(`${JSON.stringify({ stagingRoot, manifest, bunRuntime, nodeRuntime })}\n`);
 }
 
-module.exports = { validateRelativeBundlePath };
+module.exports = { validateMachODependencies, validateRelativeBundlePath };
 
 if (require.main === module) main();

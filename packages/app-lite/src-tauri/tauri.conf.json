@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "yarn dev:web",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "yarn build:web && yarn workspace @joplin/app-lite-sync build:release",
+    "beforeBuildCommand": "yarn build:web",
     "frontendDist": "../dist"
   },
   "app": {
@@ -23,9 +23,6 @@
     }
   },
   "bundle": {
-    "active": true,
-    "resources": {
-      "resources/sidecar/": "sidecar/"
-    }
+    "active": false
   }
 }
