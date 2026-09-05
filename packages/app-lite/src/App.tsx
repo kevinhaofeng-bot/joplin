@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ComponentType, type Form
 import { getRuntimeInfo, type RuntimeInfo } from './runtime';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
-	LibraryClientError, libraryApi, type Folder, type LibraryApi, type NoteDetail, type NoteSummary, type Resource, type SearchNote,
+	LibraryClientError, libraryApi, type Folder, type LibraryApi, type NoteDetail, type NoteSummary, type Resource, type SearchNote, type JexImportStatus,
 	type SyncConfig,
 } from './library';
 import RichTextEditor, { type RichTextEditorProps } from './RichTextEditor';
@@ -29,6 +29,9 @@ const safeErrorMessage = (error: unknown, fallback: string) => {
 	if (error instanceof LibraryClientError && error.code === 'SYNC_NETWORK') return '同步网络不可用';
 	if (error instanceof LibraryClientError && error.code === 'SYNC_BUSY') return '同步正在进行';
 	if (error instanceof LibraryClientError && error.code === 'SYNC_FAILED') return '同步失败';
+	if (error instanceof LibraryClientError && error.code === 'IMPORT_BUSY') return '导入正在进行';
+	if (error instanceof LibraryClientError && error.code === 'IMPORT_FAILED') return 'JEX 导入失败';
+	if (error instanceof LibraryClientError && error.code === 'IMPORT_INVALID') return 'JEX 文件无效';
 	return fallback;
 };
 
@@ -59,6 +62,8 @@ export default function App({
 	const [syncPassword, setSyncPassword] = useState('');
 	const [syncState, setSyncState] = useState<'idle'|'saving'|'syncing'|'success'|'failed'>('idle');
 	const syncPollSequence = useRef(0);
+	const jexPollSequence = useRef(0);
+	const [jexStatus, setJexStatus] = useState<JexImportStatus>({ state: 'idle' });
 	const [saveState, setSaveState] = useState<SaveState>('saved');
 	const [errorMessage, setErrorMessage] = useState('');
 	const [busy, setBusy] = useState(false);
@@ -251,6 +256,30 @@ export default function App({
 		} catch (error) { setSyncState('failed'); setErrorMessage(safeErrorMessage(error, '同步失败')); }
 	}, [flushSave, library, selectedFolderId, selectedNoteId, setCurrentDetail]);
 
+	const importJex = useCallback(async () => {
+		if (!library.startJexImport || !library.getJexImportStatus) return;
+		const selected = await open({ multiple: false, directory: false, title: '从 JEX 导入', filters: [{ name: 'Joplin Export', extensions: ['jex'] }] });
+		if (!selected || Array.isArray(selected)) return;
+		const sequence = ++jexPollSequence.current;
+		setErrorMessage('');
+		try {
+			let status = await library.startJexImport({ path: selected });
+			setJexStatus(status);
+			while (status.state === 'running') {
+				await new Promise<void>(resolve => setTimeout(resolve, 800));
+				if (sequence !== jexPollSequence.current) return;
+				status = await library.getJexImportStatus();
+				setJexStatus(status);
+			}
+			if (status.state === 'failed') throw new LibraryClientError(status.code);
+			if (status.state === 'succeeded') {
+				const [loadedFolders, page] = await Promise.all([library.listFolders(), library.listNotes(selectedFolderId ? { parentId: selectedFolderId } : {})]);
+				setFolders(loadedFolders.filter(folder => folder.deletedTime === 0)); setNotes(page.items);
+				setErrorMessage('');
+			}
+		} catch (error) { setErrorMessage(safeErrorMessage(error, 'JEX 导入失败')); }
+	}, [library, selectedFolderId]);
+
 	const chooseResource = useCallback(async (): Promise<Resource | null> => {
 		const selected = await open({ multiple: false, directory: false, title: '添加附件' });
 		if (!selected || Array.isArray(selected)) return null;
@@ -262,7 +291,7 @@ export default function App({
 		try { await library.openResource({ id: resource.id, fileExtension: resource.fileExtension }); } catch (error) { setErrorMessage(safeErrorMessage(error, '无法打开附件')); }
 	}, [library]);
 
-	useEffect(() => () => { syncPollSequence.current++; void flushSave(); }, [flushSave]);
+	useEffect(() => () => { syncPollSequence.current++; jexPollSequence.current++; void flushSave(); }, [flushSave]);
 
 	if (initialization.kind === 'loading') return <main className="initialization-shell">正在打开本地资料库…</main>;
 	if (initialization.kind === 'failed') return <section className="initialization-failure" role="alert"><p>{initialization.message}</p><button type="button" onClick={() => { void bootstrap(true); }}>重试打开资料库</button></section>;
@@ -275,7 +304,7 @@ export default function App({
 				<button type="button" className={`navigation-item ${selectedFolderId === null ? 'is-active' : ''}`} aria-current={selectedFolderId === null ? 'page' : undefined} onClick={() => { void selectFolder(null); }}>全部笔记</button>
 				<div className="folder-navigation"><p className="section-label">笔记本</p>{folders.map(folder => <button type="button" className="navigation-item" key={folder.id} aria-current={selectedFolderId === folder.id ? 'page' : undefined} onClick={() => { void selectFolder(folder.id); }}>{folder.title}</button>)}</div>
 				<div className="sync-panel">
-					<button type="button" className="sync-status" onClick={() => syncConfig.configured ? void runSync() : setSyncFormOpen(previous => !previous)} disabled={syncState === 'saving' || syncState === 'syncing'}>{syncState === 'syncing' ? '同步中…' : syncConfig.configured ? '同步' : '设置同步'}</button>
+					<button type="button" className="sync-status" onClick={() => syncConfig.configured ? void runSync() : setSyncFormOpen(previous => !previous)} disabled={syncState === 'saving' || syncState === 'syncing' || jexStatus.state === 'running'}>{syncState === 'syncing' ? '同步中…' : syncConfig.configured ? '同步' : '设置同步'}</button>
 					{syncConfig.configured ? <button type="button" className="sync-settings" onClick={() => { setSyncUrl(syncConfig.url ?? ''); setSyncUsername(syncConfig.username ?? ''); setSyncPassword(''); setSyncFormOpen(true); }}>设置</button> : null}
 					{syncConfig.configured && syncState === 'success' ? <small>刚刚同步</small> : null}
 					{syncState === 'failed' ? <small role="status">同步失败，可重试</small> : null}
@@ -285,6 +314,9 @@ export default function App({
 						<label>密码<input aria-label="密码" type="password" value={syncPassword} onChange={event => setSyncPassword(event.target.value)} required /></label>
 						<button type="submit" disabled={syncState === 'saving'}>{syncState === 'saving' ? '连接中…' : '连接并保存'}</button>
 					</form> : null}
+					<button type="button" className="sync-settings" onClick={() => { void importJex(); }} disabled={jexStatus.state === 'running'}>{jexStatus.state === 'running' ? '导入中…' : '从 JEX 导入'}</button>
+					{jexStatus.state === 'succeeded' ? <small role="status">已导入 {jexStatus.summary.notes} 篇笔记</small> : null}
+					{jexStatus.state === 'failed' ? <small role="status">JEX 导入失败，可重试</small> : null}
 				</div>
 			</nav>
 			<aside className="note-list" aria-label="笔记列表">

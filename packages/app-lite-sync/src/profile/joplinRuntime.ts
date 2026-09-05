@@ -22,11 +22,17 @@ import { setRSA } from '../../../lib/services/e2ee/ppk/ppk';
 import RSA from '../../../lib/services/e2ee/ppk/RSA.node';
 import ShareService from '../../../lib/services/share/ShareService';
 import SearchEngine from '../../../lib/services/search/SearchEngine';
+import InteropService from '../../../lib/services/interop/InteropService';
+import Folder from '../../../lib/models/Folder';
+import Note from '../../../lib/models/Note';
+import Tag from '../../../lib/models/Tag';
+import Resource from '../../../lib/models/Resource';
 import { reg } from '../../../lib/registry';
 import Logger from '../../../utils/Logger';
 import { registerItemClasses } from '../codec';
 import type { ValidatedProfilePaths } from './pathPolicy';
 import { createSyncSecretStore, syncConfigFromMetadata, syncError, SyncService, type SyncConfig, type SyncConfigInput, type SyncStatus, type SyncSummary, type SyncSecretStore } from './syncService';
+import { JexImportService, type JexImportStatus, type JexImportSummary } from './jexImport';
 
 const joplinVersion: string = require('../../../lib/package.json').version;
 
@@ -39,6 +45,8 @@ export type RuntimeHandle = Readonly<{
 	getSyncStatus?: ()=> Promise<SyncStatus>;
 	startSync?: ()=> Promise<SyncStatus>;
 	syncNow?: ()=> Promise<SyncSummary>;
+	startJexImport?: (path: unknown)=> Promise<JexImportStatus>;
+	getJexImportStatus?: ()=> JexImportStatus;
 }>;
 
 function initializeSettings(paths: ValidatedProfilePaths): void {
@@ -214,6 +222,31 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 				};
 			},
 		});
+		const countItems = async () => {
+			const [folders, notes, tags, resources] = await Promise.all([
+				Folder.count({ where: 'deleted_time = 0' }),
+				Note.count({ where: 'deleted_time = 0' }),
+				Tag.count(),
+				Resource.count(),
+			]);
+			return { folders, notes, tags, resources };
+		};
+		const countImported = async (before: { notes: number; folders: number; tags: number; resources: number }): Promise<JexImportSummary> => {
+			const after = await countItems();
+			return {
+				notes: Math.max(0, after.notes - before.notes),
+				folders: Math.max(0, after.folders - before.folders),
+				tags: Math.max(0, after.tags - before.tags),
+				resources: Math.max(0, after.resources - before.resources),
+			};
+		};
+		const jexImportService = new JexImportService(async path => {
+			const before = await countItems();
+			await InteropService.instance().import({ path, format: 'jex' });
+			await ItemChange.waitForAllSaved();
+			await Setting.saveAll();
+			return countImported(before);
+		});
 
 		const handle: RuntimeHandle = {
 			schemaVersion: database.version(),
@@ -223,6 +256,7 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 			},
 			close: async () => {
 				await syncService.waitForIdle();
+				await jexImportService.waitForIdle();
 				await ItemChange.waitForAllSaved();
 				await Setting.saveAll();
 				await database?.close();
@@ -232,6 +266,8 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 			getSyncStatus: async () => syncService.getSyncStatus(),
 			startSync: async () => syncService.startSync(),
 			syncNow: () => syncService.syncNow(),
+			startJexImport: path => jexImportService.start(path),
+			getJexImportStatus: () => jexImportService.getStatus(),
 		};
 		return handle;
 	} catch {

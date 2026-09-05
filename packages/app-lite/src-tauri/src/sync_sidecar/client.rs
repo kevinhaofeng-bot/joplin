@@ -15,10 +15,11 @@ use crate::profile::ProfilePaths;
 use super::domain::{
     ConfigureJoplinServerParams, CreateFolderParams, CreateNoteParams,
     CreateResourceFromPathParams, CreateResult, CreateTagParams, DeleteResult, EmptyParams,
-    ExpectedUpdatedTimeParams, Folder, GetByIdParams, ListNoteResourcesParams, ListNotesParams,
-    NoteDetail, NotePage, OpenProfile, ProfilePathParams, ProfileStatus, Resource, SearchNotePage,
-    SearchNotesParams, SetNoteTagsParams, SetNoteTagsResult, ShutdownResult, SyncConfig,
-    SyncStatus, SyncSummary, Tag, TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
+    ExpectedUpdatedTimeParams, Folder, GetByIdParams, JexImportStatus, ListNoteResourcesParams,
+    ListNotesParams, NoteDetail, NotePage, OpenProfile, ProfilePathParams, ProfileStatus, Resource,
+    SearchNotePage, SearchNotesParams, SetNoteTagsParams, SetNoteTagsResult, ShutdownResult,
+    StartJexImportParams, SyncConfig, SyncStatus, SyncSummary, Tag, TrashResult,
+    UpdateFolderParams, UpdateNoteParams, UpdateResult,
 };
 use super::profile_lease::ProfileLease;
 use super::protocol::{
@@ -502,6 +503,18 @@ impl SidecarClient {
         params: SearchNotesParams,
     ) -> Result<SearchNotePage, SidecarError> {
         self.request_typed("searchNotes", &params).await
+    }
+
+    pub async fn start_jex_import(
+        &mut self,
+        params: StartJexImportParams,
+    ) -> Result<JexImportStatus, SidecarError> {
+        self.request_typed("startJexImport", &params).await
+    }
+
+    pub async fn get_jex_import_status(&mut self) -> Result<JexImportStatus, SidecarError> {
+        self.request_typed("getJexImportStatus", &EmptyParams {})
+            .await
     }
 
     pub fn state(&self) -> SidecarState {

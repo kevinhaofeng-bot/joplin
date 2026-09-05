@@ -5,6 +5,7 @@ use std::{
 
 pub const EXPECTED_PROFILE_DIRECTORY_NAME: &str = "com.kevinhao.joplin-lite";
 pub const MAX_RESOURCE_BYTES: u64 = 100 * 1024 * 1024;
+pub const MAX_JEX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProfilePathError {
@@ -43,6 +44,33 @@ pub fn validate_resource_file(path: &Path) -> io::Result<std::fs::Metadata> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "resource file rejected",
+        ));
+    }
+    Ok(metadata)
+}
+
+pub fn validate_jex_file(path: &Path) -> io::Result<std::fs::Metadata> {
+    if !path.is_absolute()
+        || path.to_string_lossy().contains('\0')
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("jex"))
+            != Some(true)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "jex file rejected",
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_JEX_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "jex file rejected",
         ));
     }
     Ok(metadata)
@@ -354,6 +382,30 @@ mod tests {
             .set_len(MAX_RESOURCE_BYTES + 1)
             .unwrap();
         assert!(validate_resource_file(&oversized).is_err());
+    }
+
+    #[test]
+    fn jex_input_requires_absolute_regular_non_symlink_file_within_limit() {
+        let temporary_directory = TemporaryDirectory::new();
+        let file = temporary_directory.path().join("export.jex");
+        fs::write(&file, b"fixture").unwrap();
+        assert!(validate_jex_file(&file).is_ok());
+        assert!(validate_jex_file(Path::new("relative.jex")).is_err());
+
+        let link = temporary_directory.path().join("link.jex");
+        symlink(&file, &link).unwrap();
+        assert!(validate_jex_file(&link).is_err());
+
+        let oversized = temporary_directory.path().join("oversized.jex");
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&oversized)
+            .unwrap()
+            .set_len(MAX_JEX_BYTES + 1)
+            .unwrap();
+        assert!(validate_jex_file(&oversized).is_err());
     }
 
     #[test]

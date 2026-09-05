@@ -26,7 +26,7 @@ describe('sidecar command handler', () => {
 		const { handleRequest } = codecHandler();
 
 		await expect(handleRequest(request('hello', {}))).resolves.toMatchObject({
-			response: { ok: true, result: { protocolVersion: 1, joplinVersion: '3.7.0', capabilities: ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'startSync', 'getSyncStatus', 'syncNow', 'searchNotes'] } },
+			response: { ok: true, result: { protocolVersion: 1, joplinVersion: '3.7.0', capabilities: ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'startSync', 'getSyncStatus', 'syncNow', 'searchNotes', 'startJexImport', 'getJexImportStatus'] } },
 			shouldExit: false,
 		});
 	});

@@ -4,6 +4,8 @@ import App from './App';
 import { LibraryClientError, type LibraryApi, type NoteDetail } from './library';
 import type { RichTextEditorProps } from './RichTextEditor';
 
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => '/tmp/export.jex') }));
+
 const folder = {
 	id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', parentId: '', title: '笔记',
 	createdTime: 1, updatedTime: 1, deletedTime: 0,
@@ -145,5 +147,20 @@ describe('App', () => {
 		await screen.findByText(/正文匹配/);
 		fireEvent.keyDown(search, { key: 'Escape' });
 		await waitFor(() => expect(search).toHaveValue(''));
+	});
+
+	it('starts a JEX import from the settings area and shows its safe count', async () => {
+		let statusCalls = 0;
+		const api = makeApi({
+			startJexImport: vi.fn(async () => ({ state: 'running' as const })),
+			getJexImportStatus: vi.fn(async () => {
+				statusCalls++;
+				return statusCalls > 0 ? { state: 'succeeded' as const, summary: { notes: 1, folders: 1, tags: 0, resources: 1 } } : { state: 'running' as const };
+			}),
+		});
+		render(<App loadRuntimeInfo={runtime} library={api} EditorComponent={FakeEditor} />);
+		fireEvent.click(await screen.findByRole('button', { name: '从 JEX 导入' }));
+		await waitFor(() => expect(api.startJexImport).toHaveBeenCalledWith({ path: '/tmp/export.jex' }));
+		await screen.findByText('已导入 1 篇笔记');
 	});
 });

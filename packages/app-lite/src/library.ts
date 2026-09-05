@@ -26,6 +26,11 @@ export type SyncStatus =
 	| { state: 'idle' | 'running' }
 	| { state: 'succeeded'; summary: SyncSummary }
 	| { state: 'failed'; code: 'SYNC_NOT_CONFIGURED' | 'SYNC_AUTH_FAILED' | 'SYNC_NETWORK' | 'SYNC_FAILED' };
+export type JexImportSummary = { notes: number; folders: number; tags: number; resources: number };
+export type JexImportStatus =
+	| { state: 'idle' | 'running' }
+	| { state: 'succeeded'; summary: JexImportSummary }
+	| { state: 'failed'; code: 'IMPORT_INVALID' | 'IMPORT_BUSY' | 'IMPORT_FAILED' };
 
 export interface CreateFolderParams { id?: string; parentId: string; title: string }
 export interface UpdateFolderParams { id: string; expectedUpdatedTime: number; title?: string; parentId?: string }
@@ -56,6 +61,7 @@ const stableMessages: Record<string, string> = {
 	PROFILE_NOT_OPEN: '资料库尚未打开', PROFILE_OPEN_FAILED: '无法打开资料库', STORAGE_ERROR: '无法保存资料库',
 	NOT_FOUND: '项目不存在', VALIDATION_FAILED: '输入内容无效', CONFLICT: '项目已被其他操作修改',
 	SYNC_NOT_CONFIGURED: '尚未配置同步', SYNC_AUTH_FAILED: '同步认证失败', SYNC_NETWORK: '同步网络不可用', SYNC_BUSY: '同步正在进行', SYNC_FAILED: '同步失败',
+	IMPORT_INVALID: 'JEX 文件无效', IMPORT_BUSY: 'JEX 导入正在进行', IMPORT_FAILED: 'JEX 导入失败',
 	SIDECAR_FAILED: '本地资料库操作失败',
 };
 
@@ -175,6 +181,26 @@ function guardSyncStatus(value: unknown): SyncStatus {
 	}
 	return invalid();
 }
+function guardJexImportSummary(value: unknown): JexImportSummary {
+	if (!isRecord(value) || !isTime(value.notes) || !isTime(value.folders) || !isTime(value.tags) || !isTime(value.resources) || !hasExactKeys(value, ['notes', 'folders', 'tags', 'resources'])) return invalid();
+	return value as JexImportSummary;
+}
+function guardJexImportStatus(value: unknown): JexImportStatus {
+	if (!isRecord(value) || typeof value.state !== 'string') return invalid();
+	if (value.state === 'idle' || value.state === 'running') {
+		if (!hasExactKeys(value, ['state'])) return invalid();
+		return value as JexImportStatus;
+	}
+	if (value.state === 'succeeded') {
+		if (!hasExactKeys(value, ['state', 'summary'])) return invalid();
+		return { state: 'succeeded', summary: guardJexImportSummary(value.summary) };
+	}
+	if (value.state === 'failed') {
+		if (!hasExactKeys(value, ['state', 'code']) || !['IMPORT_INVALID', 'IMPORT_BUSY', 'IMPORT_FAILED'].includes(String(value.code))) return invalid();
+		return { state: 'failed', code: value.code as 'IMPORT_INVALID' | 'IMPORT_BUSY' | 'IMPORT_FAILED' };
+	}
+	return invalid();
+}
 function guardPage(value: unknown): NotePage {
 	if (!isRecord(value) || !isPositiveTime(value.page) || typeof value.hasMore !== 'boolean') return invalid();
 	return { items: guardArray(value.items, guardNoteSummary), page: value.page, hasMore: value.hasMore };
@@ -231,6 +257,8 @@ export const configureJoplinServer = (params: ConfigureJoplinServerParams) => ca
 export const startSync = () => call('start_sync', guardSyncStatus);
 export const getSyncStatus = () => call('get_sync_status', guardSyncStatus);
 export const syncNow = () => call('sync_now', guardSyncSummary);
+export const startJexImport = (params: { path: string }) => call('start_jex_import', guardJexImportStatus, params);
+export const getJexImportStatus = () => call('get_jex_import_status', guardJexImportStatus);
 
 export function resourceUrl(resource: Pick<Resource, 'id'|'fileExtension'|'updatedTime'>): string {
 	if (!isId(resource.id) || !/^[A-Za-z0-9]{0,10}$/.test(resource.fileExtension)) return invalid();
@@ -251,11 +279,12 @@ export interface LibraryApi {
 	createResourceFromPath: typeof createResourceFromPath; listNoteResources: typeof listNoteResources;
 	createImageResource: typeof createImageResource; openResource: typeof openResource;
 	getSyncConfig: typeof getSyncConfig; configureJoplinServer: typeof configureJoplinServer; startSync: typeof startSync; getSyncStatus: typeof getSyncStatus; syncNow: typeof syncNow;
+	startJexImport?: typeof startJexImport; getJexImportStatus?: typeof getJexImportStatus;
 }
 
 export const libraryApi: LibraryApi = {
 	openLibrary, retryLibrary, shutdownLibrary, profileStatus, listFolders, createFolder, updateFolder, trashFolder,
 	listTags, createTag, updateTag, deleteTag, listNotes, searchNotes, getNote, createNote, updateNote, trashNote, setNoteTags,
 	createResourceFromPath, listNoteResources, createImageResource, openResource,
-	getSyncConfig, configureJoplinServer, startSync, getSyncStatus, syncNow,
+	getSyncConfig, configureJoplinServer, startSync, getSyncStatus, syncNow, startJexImport, getJexImportStatus,
 };

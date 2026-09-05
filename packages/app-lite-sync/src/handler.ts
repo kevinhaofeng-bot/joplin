@@ -3,6 +3,7 @@ import {
 	failureFrame,
 	profileError,
 	PROFILE_ERROR_MESSAGES,
+	IMPORT_ERROR_MESSAGES,
 	ProtocolError,
 	successFrame,
 	type RequestFrame,
@@ -16,15 +17,16 @@ import { NoteStore, type CreateNoteInput, type SetNoteTagsInput, type UpdateNote
 import { ResourceStore, type CreateResourceInput } from './domain/resourceStore';
 import { SearchStore, type SearchNotesInput } from './domain/searchStore';
 import { exactKeys, validationError } from './domain/validation';
+import { importError } from './profile/jexImport';
 
 const joplinVersion: string = require('../../lib/package.json').version;
-const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'startSync', 'getSyncStatus', 'syncNow', 'searchNotes'] as const;
+const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'startSync', 'getSyncStatus', 'syncNow', 'searchNotes', 'startJexImport', 'getJexImportStatus'] as const;
 const terminalCodes = new Set(['PROFILE_LOCK_REQUIRED', 'PROFILE_OPEN_FAILED', 'STORAGE_ERROR']);
-const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES), 'SYNC_NOT_CONFIGURED', 'SYNC_AUTH_FAILED', 'SYNC_NETWORK', 'SYNC_BUSY', 'SYNC_FAILED']);
+const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES), ...Object.keys(IMPORT_ERROR_MESSAGES)]);
 
 type HandledRequest = { response: ResponseFrame; shouldExit: boolean };
 export type RequestHandler = { handleRequest(request: RequestFrame): Promise<HandledRequest> };
-type SessionLike = Pick<ProfileSession, 'status' | 'open' | 'flush' | 'close' | 'requireOpen'> & Partial<Pick<ProfileSession, 'getSyncConfig' | 'configureJoplinServer' | 'startSync' | 'getSyncStatus' | 'syncNow'>>;
+type SessionLike = Pick<ProfileSession, 'status' | 'open' | 'flush' | 'close' | 'requireOpen'> & Partial<Pick<ProfileSession, 'getSyncConfig' | 'configureJoplinServer' | 'startSync' | 'getSyncStatus' | 'syncNow' | 'startJexImport' | 'getJexImportStatus'>>;
 
 function invalidRequest(): ProtocolError {
 	return new ProtocolError('INVALID_REQUEST', '请求格式无效');
@@ -53,6 +55,7 @@ function fixedError(error: unknown, fallback: string): ProtocolError {
 		if (Object.prototype.hasOwnProperty.call(PROFILE_ERROR_MESSAGES, error.code)) return profileError(error.code as keyof typeof PROFILE_ERROR_MESSAGES);
 		if (error.code === 'INVALID_ITEM') return new ProtocolError('INVALID_ITEM', 'Joplin 项目格式无效');
 		if (error.code.startsWith('SYNC_')) return new ProtocolError(error.code, PROFILE_ERROR_MESSAGES[error.code as keyof typeof PROFILE_ERROR_MESSAGES]);
+		if (Object.prototype.hasOwnProperty.call(IMPORT_ERROR_MESSAGES, error.code)) return new ProtocolError(error.code, IMPORT_ERROR_MESSAGES[error.code as keyof typeof IMPORT_ERROR_MESSAGES]);
 		return new ProtocolError('INVALID_REQUEST', '请求格式无效');
 	}
 	if (fallback === 'INVALID_REQUEST') return new ProtocolError('INVALID_REQUEST', '请求格式无效');
@@ -178,6 +181,16 @@ export function createHandler(session: SessionLike): RequestHandler {
 					requireOpen(session);
 					if (!session.syncNow) throw new ProtocolError('STORAGE_ERROR', 'sync unavailable');
 					return { response: successFrame(request.id, await session.syncNow()), shouldExit: false };
+				case 'startJexImport':
+					if (!isObject(request.params) || !hasOnly(request.params, ['path']) || typeof request.params.path !== 'string') throw importError('IMPORT_INVALID');
+					requireOpen(session);
+					if (!session.startJexImport) throw new ProtocolError('STORAGE_ERROR', 'import unavailable');
+					return { response: successFrame(request.id, await session.startJexImport(request.params.path)), shouldExit: false };
+				case 'getJexImportStatus':
+					if (!hasOnly(request.params, [])) throw importError('IMPORT_INVALID');
+					requireOpen(session);
+					if (!session.getJexImportStatus) throw new ProtocolError('STORAGE_ERROR', 'import unavailable');
+					return { response: successFrame(request.id, await session.getJexImportStatus()), shouldExit: false };
 				case 'searchNotes':
 					if (!isObject(request.params) || !hasAllowed(request.params, ['query'], ['limit'])) throw validationError();
 					requireOpen(session);

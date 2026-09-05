@@ -42,6 +42,9 @@ pub enum SidecarErrorKind {
     SyncNetwork,
     SyncBusy,
     SyncFailed,
+    ImportInvalid,
+    ImportBusy,
+    ImportFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +101,9 @@ fn public_message(kind: SidecarErrorKind) -> &'static str {
         SidecarErrorKind::SyncNetwork => "同步网络不可用",
         SidecarErrorKind::SyncBusy => "同步正在进行",
         SidecarErrorKind::SyncFailed => "同步失败",
+        SidecarErrorKind::ImportInvalid => "JEX 文件无效",
+        SidecarErrorKind::ImportBusy => "JEX 导入正在进行",
+        SidecarErrorKind::ImportFailed => "JEX 导入失败",
     }
 }
 
@@ -235,6 +241,11 @@ pub(crate) fn classify_response_error(response: &ResponseFrame) -> SidecarError 
         }
         Some("SYNC_BUSY") => SidecarError::new(SidecarErrorKind::SyncBusy, "sync busy"),
         Some("SYNC_FAILED") => SidecarError::new(SidecarErrorKind::SyncFailed, "sync failed"),
+        Some("IMPORT_INVALID") => {
+            SidecarError::new(SidecarErrorKind::ImportInvalid, "import invalid")
+        }
+        Some("IMPORT_BUSY") => SidecarError::new(SidecarErrorKind::ImportBusy, "import busy"),
+        Some("IMPORT_FAILED") => SidecarError::new(SidecarErrorKind::ImportFailed, "import failed"),
         Some("PROTOCOL_MISMATCH") => {
             SidecarError::new(SidecarErrorKind::ProtocolMismatch, "protocol mismatch")
         }
@@ -260,5 +271,8 @@ pub(crate) fn is_recoverable_error_code(code: &str) -> bool {
             | "SYNC_NETWORK"
             | "SYNC_BUSY"
             | "SYNC_FAILED"
+            | "IMPORT_INVALID"
+            | "IMPORT_BUSY"
+            | "IMPORT_FAILED"
     )
 }

@@ -68,6 +68,9 @@ mod protocol_tests {
             (SidecarErrorKind::NotFound, "项目不存在"),
             (SidecarErrorKind::ValidationFailed, "输入内容无效"),
             (SidecarErrorKind::Conflict, "项目已被其他操作修改"),
+            (SidecarErrorKind::ImportInvalid, "JEX 文件无效"),
+            (SidecarErrorKind::ImportBusy, "JEX 导入正在进行"),
+            (SidecarErrorKind::ImportFailed, "JEX 导入失败"),
         ] {
             let error = SidecarError::new(kind, secret);
             assert_eq!(error.message(), expected_message);

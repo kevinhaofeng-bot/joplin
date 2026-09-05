@@ -12,7 +12,7 @@ use tempfile::Builder as TempFileBuilder;
 use tokio::sync::Mutex;
 
 use crate::{
-    profile::{ProfilePaths, resource_path, validate_resource_file},
+    profile::{ProfilePaths, resource_path, validate_jex_file, validate_resource_file},
     sync_sidecar::*,
 };
 
@@ -80,6 +80,9 @@ impl From<SidecarError> for LibraryError {
             SidecarErrorKind::SyncNetwork => ("SYNC_NETWORK", error.message()),
             SidecarErrorKind::SyncBusy => ("SYNC_BUSY", error.message()),
             SidecarErrorKind::SyncFailed => ("SYNC_FAILED", error.message()),
+            SidecarErrorKind::ImportInvalid => ("IMPORT_INVALID", error.message()),
+            SidecarErrorKind::ImportBusy => ("IMPORT_BUSY", error.message()),
+            SidecarErrorKind::ImportFailed => ("IMPORT_FAILED", error.message()),
             SidecarErrorKind::SpawnFailed => (SIDECAR_UNAVAILABLE_CODE, "本地兼容组件不可用"),
             _ => (SIDECAR_FAILED_CODE, SIDECAR_FAILED_MESSAGE),
         };
@@ -404,6 +407,23 @@ impl LibraryState {
 
     pub async fn sync_now(&self) -> Result<SyncSummary, LibraryError> {
         self.with_client(|client| Box::pin(client.sync_now())).await
+    }
+
+    pub async fn start_jex_import(
+        &self,
+        params: StartJexImportParams,
+    ) -> Result<JexImportStatus, LibraryError> {
+        validate_jex_file(std::path::Path::new(&params.path)).map_err(|_| LibraryError {
+            code: "IMPORT_INVALID",
+            message: "JEX 文件无效",
+        })?;
+        self.with_client(|client| Box::pin(client.start_jex_import(params)))
+            .await
+    }
+
+    pub async fn get_jex_import_status(&self) -> Result<JexImportStatus, LibraryError> {
+        self.with_client(|client| Box::pin(client.get_jex_import_status()))
+            .await
     }
 
     pub async fn create_image_resource(
@@ -803,6 +823,7 @@ noarg_library_commands! {
     start_sync(start_sync) -> SyncStatus,
     get_sync_status(get_sync_status) -> SyncStatus,
     sync_now(sync_now) -> SyncSummary,
+    get_jex_import_status(get_jex_import_status) -> JexImportStatus,
 }
 
 arg_library_commands! {
@@ -822,6 +843,7 @@ arg_library_commands! {
     create_resource_from_path(create_resource_from_path, CreateResourceFromPathParams) -> Resource,
     list_note_resources(list_note_resources, ListNoteResourcesParams) -> Vec<Resource>,
     configure_joplin_server(configure_joplin_server, ConfigureJoplinServerParams) -> SyncConfig,
+    start_jex_import(start_jex_import, StartJexImportParams) -> JexImportStatus,
 }
 
 #[tauri::command]

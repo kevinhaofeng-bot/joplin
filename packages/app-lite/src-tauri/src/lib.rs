@@ -124,6 +124,8 @@ pub fn run() {
             library::start_sync,
             library::get_sync_status,
             library::sync_now,
+            library::get_jex_import_status,
+            library::start_jex_import,
             library::shutdown_library
         ])
         .run(tauri::generate_context!())

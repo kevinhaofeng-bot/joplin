@@ -2,8 +2,10 @@ import { claimProfile } from './profileMarker';
 import { revalidateProfilePath, validateProfilePath, type ValidatedProfilePaths } from './pathPolicy';
 import { verifyInheritedLease, type InheritedLease } from './inheritedLease';
 import { openJoplinRuntime, type RuntimeHandle } from './joplinRuntime';
-import type { SyncConfig, SyncConfigInput, SyncStatus, SyncSummary } from './syncService';
+import { syncError, type SyncConfig, type SyncConfigInput, type SyncStatus, type SyncSummary } from './syncService';
+import type { JexImportStatus } from './jexImport';
 import { profileError, ProtocolError } from '../protocol';
+import { importError } from './jexImport';
 
 export type ProfileState = 'closed' | 'open';
 export type ProfileStatus = { state: ProfileState; formatVersion: 1 };
@@ -20,6 +22,8 @@ export interface ProfileSession {
 	getSyncStatus(): Promise<SyncStatus>;
 	startSync(): Promise<SyncStatus>;
 	syncNow(): Promise<SyncSummary>;
+	startJexImport(path: unknown): Promise<JexImportStatus>;
+	getJexImportStatus(): Promise<JexImportStatus>;
 }
 
 export type ProfileRuntimeFactory = (paths: ValidatedProfilePaths)=> Promise<RuntimeHandle>;
@@ -158,6 +162,7 @@ export class ProfileSession implements ProfileSession {
 	public async syncNow(): Promise<SyncSummary> {
 		this.requireOpen();
 		if (!this.runtime?.syncNow) throw profileError('STORAGE_ERROR');
+		if (this.runtime.getJexImportStatus?.().state === 'running') throw syncError('SYNC_BUSY');
 		try { return await this.runtime.syncNow(); } catch (error) { throw this.fixedSyncError(error); }
 	}
 
@@ -170,7 +175,25 @@ export class ProfileSession implements ProfileSession {
 	public async startSync(): Promise<SyncStatus> {
 		this.requireOpen();
 		if (!this.runtime?.startSync) throw profileError('STORAGE_ERROR');
+		if (this.runtime.getJexImportStatus?.().state === 'running') throw syncError('SYNC_BUSY');
 		try { return await this.runtime.startSync(); } catch (error) { throw this.fixedSyncError(error); }
+	}
+
+	public async startJexImport(path: unknown): Promise<JexImportStatus> {
+		this.requireOpen();
+		if (!this.runtime?.startJexImport) throw profileError('STORAGE_ERROR');
+		if ((await this.runtime.getSyncStatus?.())?.state === 'running') throw importError('IMPORT_BUSY');
+		try { return await this.runtime.startJexImport(path); } catch (error) {
+			const code = errorCode(error);
+			if (code === 'IMPORT_INVALID' || code === 'IMPORT_BUSY' || code === 'IMPORT_FAILED') throw error;
+			throw profileError('STORAGE_ERROR');
+		}
+	}
+
+	public async getJexImportStatus(): Promise<JexImportStatus> {
+		this.requireOpen();
+		if (!this.runtime?.getJexImportStatus) throw profileError('STORAGE_ERROR');
+		try { return await this.runtime.getJexImportStatus(); } catch { throw profileError('STORAGE_ERROR'); }
 	}
 
 	private async cleanupPartialOpen(): Promise<void> {

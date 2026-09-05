@@ -107,6 +107,48 @@ pub struct ProfilePathParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartJexImportParams {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JexImportSummary {
+    pub notes: u64,
+    pub folders: u64,
+    pub tags: u64,
+    pub resources: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JexImportState {
+    Idle,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum JexImportCode {
+    ImportInvalid,
+    ImportBusy,
+    ImportFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JexImportStatus {
+    pub state: JexImportState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<JexImportSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<JexImportCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListNotesParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -377,7 +419,7 @@ pub struct SearchNotePage {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigureJoplinServerParams, SearchNotesParams, SyncStatus};
+    use super::{ConfigureJoplinServerParams, JexImportStatus, SearchNotesParams, SyncStatus};
 
     #[test]
     fn configure_debug_redacts_password() {
@@ -407,5 +449,11 @@ mod tests {
     fn sync_status_rejects_unknown_error_codes() {
         let value = serde_json::json!({ "state": "failed", "code": "SECRET_ERROR" });
         assert!(serde_json::from_value::<SyncStatus>(value).is_err());
+    }
+
+    #[test]
+    fn jex_status_is_strict_and_safe() {
+        let value = serde_json::json!({ "state": "succeeded", "summary": { "notes": 1, "folders": 1, "tags": 0, "resources": 1 }, "unexpected": true });
+        assert!(serde_json::from_value::<JexImportStatus>(value).is_err());
     }
 }

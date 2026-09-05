@@ -21,6 +21,12 @@ export const PROFILE_ERROR_MESSAGES = {
 	SYNC_FAILED: '同步失败',
 } as const;
 
+export const IMPORT_ERROR_MESSAGES = {
+	IMPORT_INVALID: 'JEX 文件无效',
+	IMPORT_BUSY: 'JEX 导入正在进行',
+	IMPORT_FAILED: 'JEX 导入失败',
+} as const;
+
 export type ProfileErrorCode = keyof typeof PROFILE_ERROR_MESSAGES;
 
 export type RequestFrame = {
