@@ -82,6 +82,18 @@ describe('ProfileSession', () => {
 		expect(lease.close).toHaveBeenCalledTimes(1);
 	});
 
+	test('does not reuse profile A lease to claim a different profile B', async () => {
+		const parentA = await scaffold(true);
+		const parentB = await scaffold();
+		parents.push(parentA, parentB);
+		const { session, lease } = fakes();
+
+		await expect(session.open(join(parentA, PROFILE_DIRECTORY_NAME))).rejects.toMatchObject({ code: 'PROFILE_NOT_OWNED' });
+		await expect(session.open(join(parentB, PROFILE_DIRECTORY_NAME))).rejects.toMatchObject({ code: 'PROFILE_LOCK_REQUIRED' });
+		await expect(access(join(parentB, PROFILE_DIRECTORY_NAME, '.joplin-lite-profile.json'))).rejects.toThrow();
+		expect(lease.close).toHaveBeenCalledTimes(1);
+	});
+
 	test('makes an inherited-lease failure terminal before claiming or opening a database', async () => {
 		const parent = await scaffold();
 		parents.push(parent);

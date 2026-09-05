@@ -32,6 +32,7 @@ export class ProfileSession implements ProfileSession {
 	private terminalError: ProtocolError | undefined;
 	private runtime: RuntimeHandle | undefined;
 	private lease: InheritedLease | undefined;
+	private leaseRoot: string | undefined;
 	private readonly runtimeFactory: ProfileRuntimeFactory;
 	private readonly verifyLease: ProfileLeaseVerifier;
 
@@ -58,11 +59,17 @@ export class ProfileSession implements ProfileSession {
 		if (!this.lease) {
 			try {
 				this.lease = this.verifyLease(paths);
+				this.leaseRoot = paths.root;
 			} catch (error) {
 				const fixed = this.fixedDomainError(error, 'PROFILE_LOCK_REQUIRED');
 				if (fixed.code === 'PROFILE_LOCK_REQUIRED') this.terminalError = fixed;
 				throw fixed;
 			}
+		} else if (this.leaseRoot !== paths.root) {
+			const fixed = profileError('PROFILE_LOCK_REQUIRED');
+			this.terminalError = fixed;
+			await this.cleanupPartialOpen();
+			throw fixed;
 		}
 
 		let runtimeStarted = false;
@@ -115,6 +122,7 @@ export class ProfileSession implements ProfileSession {
 				failed = true;
 			}
 			this.lease = undefined;
+			this.leaseRoot = undefined;
 		}
 		this.state = 'closed';
 		if (failed) {
@@ -137,6 +145,7 @@ export class ProfileSession implements ProfileSession {
 			// The terminal error remains fixed and never includes OS details.
 		}
 		this.lease = undefined;
+		this.leaseRoot = undefined;
 		this.state = 'closed';
 	}
 
