@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PROFILE_DIRECTORY_NAME, revalidateProfilePath, validateProfilePath } from './pathPolicy';
@@ -42,6 +42,11 @@ describe('validateProfilePath', () => {
 		const legacy = join(parent, 'JoPlIn-DeSkToP');
 		await mkdir(legacy);
 		await expectInvalid(await profileRoot(legacy));
+	});
+
+	test('rejects legacy components before resolving dot-dot segments', async () => {
+		const parent = await tempParent();
+		await expectInvalid(join(parent, 'joplin-desktop', '..', PROFILE_DIRECTORY_NAME));
 	});
 
 	test('rejects a canonical parent whose real path contains the legacy component', async () => {
@@ -120,5 +125,57 @@ describe('validateProfilePath', () => {
 		await rm(paths.resources, { recursive: true, force: true });
 		await symlink(paths.logs, paths.resources);
 		await expect(revalidateProfilePath(paths)).rejects.toMatchObject({ code: INVALID, message: '资料库路径无效' });
+	});
+
+	test('rejects a root renamed and recreated at the same path', async () => {
+		const parent = await tempParent();
+		const root = await profileRoot(parent);
+		await Promise.all(['resources', 'indexes', 'logs'].map(name => mkdir(join(root, name))));
+		const paths = await validateProfilePath(root);
+		await rename(root, join(parent, 'old-root'));
+		await mkdir(root);
+		await Promise.all(['resources', 'indexes', 'logs'].map(name => mkdir(join(root, name))));
+		await expect(revalidateProfilePath(paths)).rejects.toMatchObject({ code: INVALID });
+	});
+
+	test('rejects replacement of an existing database file', async () => {
+		const root = await profileRoot();
+		await Promise.all(['resources', 'indexes', 'logs'].map(name => mkdir(join(root, name))));
+		const database = join(root, 'database.sqlite');
+		await writeFile(database, 'first');
+		const paths = await validateProfilePath(root);
+		await rename(database, join(root, 'database.old'));
+		await writeFile(database, 'replacement');
+		await expect(revalidateProfilePath(paths)).rejects.toMatchObject({ code: INVALID });
+	});
+
+	test('records a newly created managed entry, then rejects its disappearance', async () => {
+		const root = await profileRoot();
+		await Promise.all(['resources', 'indexes', 'logs'].map(name => mkdir(join(root, name))));
+		const paths = await validateProfilePath(root);
+		await writeFile(paths.database, 'created after initial validation');
+		await expect(revalidateProfilePath(paths)).resolves.toEqual(paths);
+		await rm(paths.database, { force: true });
+		await expect(revalidateProfilePath(paths)).rejects.toMatchObject({ code: INVALID });
+	});
+
+	test('rejects a canonical parent symlink retargeted to another root', async () => {
+		const parent = await tempParent();
+		const targetA = join(parent, 'target-a');
+		const targetB = join(parent, 'target-b');
+		const link = join(parent, 'profile-parent');
+		await mkdir(targetA);
+		await mkdir(targetB);
+		for (const target of [targetA, targetB]) {
+			const root = join(target, PROFILE_DIRECTORY_NAME);
+			await mkdir(root);
+			await Promise.all(['resources', 'indexes', 'logs'].map(name => mkdir(join(root, name))));
+		}
+		await symlink(targetA, link);
+		const root = join(link, PROFILE_DIRECTORY_NAME);
+		const paths = await validateProfilePath(root);
+		await rename(link, join(parent, 'old-parent-link'));
+		await symlink(targetB, link);
+		await expect(revalidateProfilePath(paths)).rejects.toMatchObject({ code: INVALID });
 	});
 });

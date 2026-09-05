@@ -1,8 +1,8 @@
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { claimProfile, PROFILE_MARKER_CONTENT } from './profileMarker';
-import { PROFILE_DIRECTORY_NAME, type ValidatedProfilePaths } from './pathPolicy';
+import { PROFILE_DIRECTORY_NAME, validateProfilePath, type ValidatedProfilePaths } from './pathPolicy';
 
 const tempParents = new Set<string>();
 
@@ -15,17 +15,7 @@ async function scaffold(options: { marker?: string; unknown?: string; nonEmpty?:
 	if (options.nonEmpty) await writeFile(join(root, 'resources', 'fixture.txt'), 'fixture');
 	if (options.unknown) await writeFile(join(root, options.unknown), 'unknown');
 	if (options.marker !== undefined) await writeFile(join(root, '.joplin-lite-profile.json'), options.marker);
-	return {
-		root,
-		database: join(root, 'database.sqlite'),
-		resources: join(root, 'resources'),
-		indexes: join(root, 'indexes'),
-		logs: join(root, 'logs'),
-		settings: join(root, 'settings.json'),
-		marker: join(root, '.joplin-lite-profile.json'),
-		temp: join(root, 'tmp'),
-		cache: join(root, 'cache'),
-	};
+	return validateProfilePath(root);
 }
 
 const NOT_OWNED = { code: 'PROFILE_NOT_OWNED', message: '资料库不属于 Joplin Lite' };
@@ -77,8 +67,9 @@ describe('claimProfile', () => {
 		tempParents.add(parent);
 		const empty = join(parent, PROFILE_DIRECTORY_NAME);
 		await mkdir(empty);
+		const emptyPaths = await validateProfilePath(empty);
+		await expect(claimProfile(emptyPaths)).rejects.toMatchObject(NOT_OWNED);
 		const paths = await scaffold();
-		await expect(claimProfile({ ...paths, root: empty, marker: join(empty, '.joplin-lite-profile.json') })).rejects.toMatchObject(NOT_OWNED);
 		const missing = join(parent, 'missing', PROFILE_DIRECTORY_NAME);
 		await expect(claimProfile({ ...paths, root: missing, marker: join(missing, '.joplin-lite-profile.json') })).rejects.toMatchObject({ code: 'PROFILE_INVALID', message: '资料库路径无效' });
 	});
@@ -90,6 +81,12 @@ describe('claimProfile', () => {
 		await symlink(target, paths.marker);
 		await expect(claimProfile(paths)).rejects.toMatchObject({ code: 'PROFILE_INVALID', message: '资料库路径无效' });
 		await expect(readFile(target, 'utf8')).resolves.toBe('secret-marker');
+	});
+
+	test('rejects a deterministic half-written marker without overwriting it', async () => {
+		const paths = await scaffold({ marker: '' });
+		await expect(claimProfile(paths)).rejects.toMatchObject(NOT_OWNED);
+		await expect(readFile(paths.marker, 'utf8')).resolves.toBe('');
 	});
 
 	test('racing claims never overwrite the marker', async () => {
@@ -107,5 +104,32 @@ describe('claimProfile', () => {
 		const before = await readdir(paths.root);
 		await expect(claimProfile(paths)).rejects.toMatchObject(NOT_OWNED);
 		expect(await readdir(paths.root)).toEqual(before);
+	});
+
+	test('rejects an old validated object after root replacement and writes no new marker', async () => {
+		const paths = await scaffold();
+		const oldRoot = `${paths.root}.old`;
+		await rename(paths.root, oldRoot);
+		await mkdir(paths.root);
+		for (const name of ['resources', 'indexes', 'logs']) await mkdir(join(paths.root, name));
+		await expect(claimProfile(paths)).rejects.toMatchObject({ code: 'PROFILE_INVALID', message: '资料库路径无效' });
+		await expect(access(join(paths.root, '.joplin-lite-profile.json'))).rejects.toThrow();
+	});
+
+	test('does not trust forged child paths and never writes outside the validated root', async () => {
+		const paths = await scaffold();
+		const outside = join(paths.root, '..', 'outside-marker');
+		const forged = { ...paths, marker: outside } as ValidatedProfilePaths;
+		await expect(claimProfile(forged)).rejects.toMatchObject({ code: 'PROFILE_INVALID' });
+		await expect(access(outside)).rejects.toThrow();
+	});
+
+	test('derives child paths from the root even if a validated object is mutated', async () => {
+		const paths = await scaffold();
+		const outside = join(paths.root, '..', 'mutated-marker');
+		(paths as { marker: string }).marker = outside;
+		await claimProfile(paths);
+		await expect(readFile(join(paths.root, '.joplin-lite-profile.json'), 'utf8')).resolves.toBe(PROFILE_MARKER_CONTENT);
+		await expect(access(outside)).rejects.toThrow();
 	});
 });
