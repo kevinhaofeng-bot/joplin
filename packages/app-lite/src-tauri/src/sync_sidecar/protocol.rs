@@ -219,3 +219,19 @@ pub(crate) fn classify_response_error(response: &ResponseFrame) -> SidecarError 
         _ => SidecarError::new(SidecarErrorKind::InvalidResponse, "sidecar failure"),
     }
 }
+
+pub(crate) fn is_recoverable_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "PROFILE_IN_USE"
+            | "PROFILE_INVALID"
+            | "PROFILE_NOT_OWNED"
+            | "PROFILE_ALREADY_OPEN"
+            | "PROFILE_NOT_OPEN"
+            | "NOT_FOUND"
+            | "VALIDATION_FAILED"
+            | "CONFLICT"
+            | "INVALID_REQUEST"
+            | "INVALID_ITEM"
+    )
+}

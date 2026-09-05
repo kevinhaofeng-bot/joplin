@@ -3,8 +3,11 @@
 use std::{path::PathBuf, time::Duration};
 
 use joplin_lite::profile::ProfilePaths;
-use joplin_lite::sync_sidecar::{SidecarClient, SidecarCommand, SidecarErrorKind, SidecarState};
-use serde_json::json;
+use joplin_lite::sync_sidecar::{
+    CreateFolderParams, CreateNoteParams, CreateTagParams, ExpectedUpdatedTimeParams,
+    GetByIdParams, ListNotesParams, MarkupLanguage, ProfileState, SetNoteTagsParams, SidecarClient,
+    SidecarCommand, SidecarErrorKind, SidecarState, UpdateFolderParams, UpdateNoteParams,
+};
 
 fn command(repo_root: PathBuf) -> SidecarCommand {
     SidecarCommand {
@@ -44,197 +47,181 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
         .expect("supervised profile sidecar");
         assert_eq!(first.state(), SidecarState::Ready);
         assert_eq!(
-            first
-                .request("profileStatus", json!({}))
-                .await
-                .expect("closed status")["state"],
-            "closed"
+            first.profile_status().await.expect("closed status").state,
+            ProfileState::Closed
         );
-        let opened = first
-            .request("openProfile", json!({ "profilePath": root }))
-            .await
-            .expect("open profile");
-        assert_eq!(opened["state"], "open");
-        assert!(opened["schemaVersion"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(
+            first.open_profile().await.expect("open profile").state,
+            ProfileState::Open
+        );
         assert!(root.join(".joplin-lite-profile.json").is_file());
         assert!(paths.database().is_file());
-        assert!(
-            std::fs::metadata(paths.database())
-                .expect("database metadata")
-                .len()
-                > 0
-        );
 
-        let folder_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let child_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let folder_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        let child_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
         let created_folder = first
-            .request(
-                "createFolder",
-                json!({ "id": folder_id, "parentId": "", "title": "/Root" }),
-            )
+            .create_folder(CreateFolderParams {
+                id: Some(folder_id.clone()),
+                parent_id: "".into(),
+                title: "/Root".into(),
+            })
             .await
             .expect("create root folder");
-        assert_eq!(created_folder["item"]["title"], "Root");
-        assert_eq!(
-            first
-                .request(
-                    "createFolder",
-                    json!({ "id": folder_id, "parentId": "", "title": "Root" }),
-                )
+        assert_eq!(created_folder.item.title, "Root");
+        assert!(
+            !first
+                .create_folder(CreateFolderParams {
+                    id: Some(folder_id.clone()),
+                    parent_id: "".into(),
+                    title: "Root".into()
+                })
                 .await
-                .expect("replay root folder")["created"],
-            false
+                .expect("replay root folder")
+                .created
         );
         first
-            .request(
-                "createFolder",
-                json!({ "id": child_id, "parentId": folder_id, "title": "Child" }),
-            )
+            .create_folder(CreateFolderParams {
+                id: Some(child_id.clone()),
+                parent_id: folder_id.clone(),
+                title: "Child".into(),
+            })
             .await
             .expect("create child folder");
-        let root_updated_time = created_folder["item"]["updatedTime"]
-            .as_u64()
-            .expect("root timestamp");
-        let child = first
-            .request(
-                "updateFolder",
-                json!({ "id": child_id, "expectedUpdatedTime": 0, "title": "Child 2" }),
-            )
+        let root_updated_time = created_folder.item.updated_time;
+        let child_conflict = first
+            .update_folder(UpdateFolderParams {
+                id: child_id.clone(),
+                expected_updated_time: 0,
+                title: Some("Child 2".into()),
+                parent_id: None,
+            })
             .await;
-        assert_eq!(child.unwrap_err().kind(), SidecarErrorKind::Conflict);
-        let child = first
-            .request("listFolders", json!({}))
-            .await
-            .expect("list folders");
-        assert_eq!(child.as_array().expect("folder list").len(), 2);
+        assert_eq!(
+            child_conflict.unwrap_err().kind(),
+            SidecarErrorKind::Conflict
+        );
+        assert_eq!(first.list_folders().await.expect("list folders").len(), 2);
         let cycle = first
-            .request(
-                "updateFolder",
-                json!({ "id": folder_id, "expectedUpdatedTime": root_updated_time, "parentId": child_id }),
-            )
+            .update_folder(UpdateFolderParams {
+                id: folder_id.clone(),
+                expected_updated_time: root_updated_time,
+                title: None,
+                parent_id: Some(child_id.clone()),
+            })
             .await;
         assert_eq!(
             cycle.unwrap_err().kind(),
             SidecarErrorKind::ValidationFailed
         );
-        let tag_id = "cccccccccccccccccccccccccccccccc";
-        let second_tag_id = "dddddddddddddddddddddddddddddddd";
+
+        let tag_id = "cccccccccccccccccccccccccccccccc".to_owned();
+        let second_tag_id = "dddddddddddddddddddddddddddddddd".to_owned();
         let tag = first
-            .request(
-                "createTag",
-                json!({ "id": tag_id, "title": "  Cafe\u{0301}  " }),
-            )
+            .create_tag(CreateTagParams {
+                id: Some(tag_id.clone()),
+                title: "  Cafe\u{0301}  ".into(),
+            })
             .await
             .expect("create tag");
-        assert_eq!(tag["item"]["title"], "Café");
-        assert_eq!(tag["item"]["noteCount"], 0);
+        assert_eq!(tag.item.title, "Café");
+        assert_eq!(tag.item.note_count, 0);
         first
-            .request(
-                "createTag",
-                json!({ "id": second_tag_id, "title": "Second" }),
-            )
+            .create_tag(CreateTagParams {
+                id: Some(second_tag_id.clone()),
+                title: "Second".into(),
+            })
             .await
             .expect("create second tag");
 
-        let note_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let note_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned();
         let created_note = first
-            .request(
-                "createNote",
-                json!({ "id": note_id, "parentId": child_id, "title": "Local note", "body": "Hello from the local profile" }),
-            )
+            .create_note(CreateNoteParams {
+                id: Some(note_id.clone()),
+                parent_id: child_id.clone(),
+                title: "Local note".into(),
+                body: "Hello from the local profile".into(),
+                is_todo: None,
+                todo_due: None,
+            })
             .await
             .expect("create note");
-        assert_eq!(created_note["item"]["body"], "Hello from the local profile");
-        assert_eq!(
-            first
-                .request(
-                    "createNote",
-                    json!({ "id": note_id, "parentId": child_id, "title": "Local note", "body": "Hello from the local profile" }),
-                )
+        assert_eq!(created_note.item.body, "Hello from the local profile");
+        assert_eq!(created_note.item.markup_language, MarkupLanguage::Markdown);
+        assert!(
+            !first
+                .create_note(CreateNoteParams {
+                    id: Some(note_id.clone()),
+                    parent_id: child_id.clone(),
+                    title: "Local note".into(),
+                    body: "Hello from the local profile".into(),
+                    is_todo: None,
+                    todo_due: None,
+                })
                 .await
-                .expect("replay note")["created"],
-            false
+                .expect("replay note")
+                .created
         );
         let listed_notes = first
-            .request("listNotes", json!({ "parentId": child_id }))
+            .list_notes(ListNotesParams {
+                parent_id: Some(child_id.clone()),
+                page: None,
+                limit: None,
+            })
             .await
             .expect("list notes");
-        assert!(listed_notes["items"][0].get("body").is_none());
-        assert_eq!(
-            first
-                .request("getNote", json!({ "id": note_id }))
-                .await
-                .expect("get note")["body"],
-            "Hello from the local profile"
-        );
-        let note_updated_time = created_note["item"]["updatedTime"]
-            .as_u64()
-            .expect("note timestamp");
+        assert_eq!(listed_notes.items.len(), 1);
+        let detail = first
+            .get_note(GetByIdParams {
+                id: note_id.clone(),
+            })
+            .await
+            .expect("get note");
+        assert_eq!(detail.body, "Hello from the local profile");
+
         let tagged = first
-            .request(
-                "setNoteTags",
-                json!({ "noteId": note_id, "expectedUpdatedTime": note_updated_time, "tagIds": [second_tag_id, tag_id] }),
-            )
+            .set_note_tags(SetNoteTagsParams {
+                note_id: note_id.clone(),
+                expected_updated_time: created_note.item.updated_time,
+                tag_ids: vec![second_tag_id.clone(), tag_id.clone()],
+            })
             .await
             .expect("set note tags");
-        assert_eq!(tagged["tagIds"], json!([tag_id, second_tag_id]));
+        assert_eq!(tagged.tag_ids, vec![tag_id.clone(), second_tag_id.clone()]);
         let replaced = first
-            .request(
-                "setNoteTags",
-                json!({ "noteId": note_id, "expectedUpdatedTime": tagged["updatedTime"], "tagIds": [second_tag_id] }),
-            )
+            .set_note_tags(SetNoteTagsParams {
+                note_id: note_id.clone(),
+                expected_updated_time: tagged.updated_time,
+                tag_ids: vec![second_tag_id],
+            })
             .await
             .expect("replace note tags");
-        assert_eq!(replaced["tagIds"], json!([second_tag_id]));
         let updated_note = first
-            .request(
-                "updateNote",
-                json!({ "id": note_id, "expectedUpdatedTime": replaced["updatedTime"], "body": "Updated local profile note" }),
-            )
+            .update_note(UpdateNoteParams {
+                id: note_id.clone(),
+                expected_updated_time: replaced.updated_time,
+                title: None,
+                body: Some("Updated local profile note".into()),
+                parent_id: None,
+                is_todo: None,
+                todo_due: None,
+                todo_completed: None,
+            })
             .await
             .expect("update note");
+        assert_eq!(updated_note.item.body, "Updated local profile note");
         let stale_note = first
-            .request(
-                "updateNote",
-                json!({ "id": note_id, "expectedUpdatedTime": replaced["updatedTime"], "title": "stale" }),
-            )
+            .update_note(UpdateNoteParams {
+                id: note_id.clone(),
+                expected_updated_time: replaced.updated_time,
+                title: Some("stale".into()),
+                body: None,
+                parent_id: None,
+                is_todo: None,
+                todo_due: None,
+                todo_completed: None,
+            })
             .await;
         assert_eq!(stale_note.unwrap_err().kind(), SidecarErrorKind::Conflict);
-        first
-            .request(
-                "trashNote",
-                json!({ "id": note_id, "expectedUpdatedTime": updated_note["item"]["updatedTime"] }),
-            )
-            .await
-            .expect("trash note");
-        assert!(
-            first
-                .request("listNotes", json!({ "parentId": child_id }))
-                .await
-                .expect("notes after trash")["items"]
-                .as_array()
-                .expect("note list")
-                .is_empty()
-        );
-
-        first
-            .request(
-                "trashFolder",
-                json!({ "id": folder_id, "expectedUpdatedTime": root_updated_time }),
-            )
-            .await
-            .expect("trash folder");
-        assert_eq!(
-            first
-                .request("listFolders", json!({}))
-                .await
-                .expect("folders after trash")
-                .as_array()
-                .expect("folder list")
-                .len(),
-            0
-        );
-
         first.shutdown().await.expect("first shutdown");
         assert_eq!(first.state(), SidecarState::Stopped);
 
@@ -242,27 +229,71 @@ async fn opens_closes_and_reopens_one_isolated_profile() {
             SidecarClient::start_for_profile(command(repo_root), &paths, Duration::from_secs(10))
                 .await
                 .expect("reopened profile sidecar");
-        let reopened = second
-            .request("openProfile", json!({ "profilePath": root }))
+        assert_eq!(
+            second.open_profile().await.expect("reopen profile").state,
+            ProfileState::Open
+        );
+        assert_eq!(
+            second.list_folders().await.expect("reopened folders").len(),
+            2
+        );
+        assert_eq!(second.list_tags().await.expect("reopened tags").len(), 2);
+        let reopened_detail = second
+            .get_note(GetByIdParams {
+                id: note_id.clone(),
+            })
             .await
-            .expect("reopen profile");
-        assert_eq!(reopened["state"], "open");
-        assert!(
-            second
-                .request("listNotes", json!({}))
-                .await
-                .expect("reopened notes")["items"]
-                .as_array()
-                .expect("note list")
-                .is_empty()
+            .expect("reopened note");
+        assert_eq!(reopened_detail.body, "Updated local profile note");
+        assert_eq!(
+            reopened_detail.tag_ids,
+            vec!["dddddddddddddddddddddddddddddddd"]
         );
         assert_eq!(
             second
-                .request("getNote", json!({ "id": note_id }))
+                .list_notes(ListNotesParams {
+                    parent_id: Some(child_id.clone()),
+                    page: None,
+                    limit: None
+                })
                 .await
-                .unwrap_err()
-                .kind(),
-            SidecarErrorKind::NotFound
+                .expect("reopened notes")
+                .items
+                .len(),
+            1
+        );
+        second
+            .trash_note(ExpectedUpdatedTimeParams {
+                id: note_id.clone(),
+                expected_updated_time: reopened_detail.updated_time,
+            })
+            .await
+            .expect("trash reopened note");
+        assert!(
+            second
+                .list_notes(ListNotesParams {
+                    parent_id: Some(child_id),
+                    page: None,
+                    limit: None
+                })
+                .await
+                .expect("notes after trash")
+                .items
+                .is_empty()
+        );
+        second
+            .trash_folder(ExpectedUpdatedTimeParams {
+                id: folder_id,
+                expected_updated_time: root_updated_time,
+            })
+            .await
+            .expect("trash folder");
+        assert!(
+            second
+                .list_folders()
+                .await
+                .expect("folders after trash")
+                .is_empty()
         );
         second.shutdown().await.expect("second shutdown");
     };

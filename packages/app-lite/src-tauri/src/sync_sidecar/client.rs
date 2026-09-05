@@ -2,6 +2,7 @@ use std::{fmt, io, process::Stdio, time::Duration};
 
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::{
     process::{Child, Command},
@@ -11,11 +12,17 @@ use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 use crate::profile::ProfilePaths;
 
+use super::domain::{
+    CreateFolderParams, CreateNoteParams, CreateResult, CreateTagParams, DeleteResult, EmptyParams,
+    ExpectedUpdatedTimeParams, Folder, GetByIdParams, ListNotesParams, NoteDetail, NotePage,
+    OpenProfile, ProfilePathParams, ProfileStatus, SetNoteTagsParams, SetNoteTagsResult,
+    ShutdownResult, Tag, TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
+};
 use super::profile_lease::ProfileLease;
 use super::protocol::{
     MAX_FRAME_BYTES, ResponseFrame, STARTUP_TIMEOUT, SidecarCommand, SidecarError,
-    SidecarErrorKind, SidecarState, classify_response_error, decode_response, request_frame,
-    validate_hello, validate_response_id,
+    SidecarErrorKind, SidecarState, classify_response_error, decode_response,
+    is_recoverable_error_code, request_frame, validate_hello, validate_response_id,
 };
 
 type SidecarReader = FramedRead<tokio::process::ChildStdout, RawNdjsonCodec>;
@@ -101,6 +108,7 @@ pub struct SidecarClient {
     state: SidecarState,
     request_timeout: Duration,
     next_request: u64,
+    profile_root: Option<std::path::PathBuf>,
 }
 
 impl SidecarClient {
@@ -108,7 +116,7 @@ impl SidecarClient {
         command: SidecarCommand,
         request_timeout: Duration,
     ) -> Result<Self, SidecarError> {
-        Self::start_with_lease(command, request_timeout, None).await
+        Self::start_with_lease(command, request_timeout, None, None).await
     }
 
     #[cfg(target_os = "macos")]
@@ -121,13 +129,20 @@ impl SidecarClient {
             .ensure()
             .map_err(|error| SidecarError::new(SidecarErrorKind::ProfileLockRequired, error))?;
         let lease = ProfileLease::acquire(profile)?;
-        Self::start_with_lease(command, request_timeout, Some(lease)).await
+        Self::start_with_lease(
+            command,
+            request_timeout,
+            Some(lease),
+            Some(profile.root().to_path_buf()),
+        )
+        .await
     }
 
     async fn start_with_lease(
         command: SidecarCommand,
         request_timeout: Duration,
         mut lease: Option<ProfileLease>,
+        profile_root: Option<std::path::PathBuf>,
     ) -> Result<Self, SidecarError> {
         let mut process = Command::new(&command.executable);
         process
@@ -187,6 +202,7 @@ impl SidecarClient {
             state: SidecarState::Starting,
             request_timeout,
             next_request: 2,
+            profile_root,
         };
 
         let handshake = timeout(
@@ -223,7 +239,7 @@ impl SidecarClient {
         Ok(client)
     }
 
-    pub async fn request(&mut self, command: &str, params: Value) -> Result<Value, SidecarError> {
+    async fn request_value(&mut self, command: &str, params: Value) -> Result<Value, SidecarError> {
         if self.state != SidecarState::Ready {
             return Err(SidecarError::new(
                 SidecarErrorKind::InvalidResponse,
@@ -251,7 +267,13 @@ impl SidecarClient {
         }
         if !response.ok {
             let error = classify_response_error(&response);
-            if matches!(
+            if !is_recoverable_error_code(
+                response
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str())
+                    .unwrap_or_default(),
+            ) || matches!(
                 error.kind(),
                 SidecarErrorKind::ProfileLockRequired
                     | SidecarErrorKind::ProfileOpenFailed
@@ -269,6 +291,135 @@ impl SidecarClient {
                 Err(error)
             }
         }
+    }
+
+    async fn request_typed<P, R>(&mut self, command: &str, params: &P) -> Result<R, SidecarError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let params = serde_json::to_value(params)
+            .map_err(|_| SidecarError::new(SidecarErrorKind::Io, "serialize params"))?;
+        let result = self.request_value(command, params).await?;
+        match serde_json::from_value(result) {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                let error = SidecarError::new(SidecarErrorKind::InvalidResponse, "invalid result");
+                self.fail(error.kind()).await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn profile_status(&mut self) -> Result<ProfileStatus, SidecarError> {
+        self.request_typed("profileStatus", &EmptyParams {}).await
+    }
+
+    pub async fn open_profile(&mut self) -> Result<OpenProfile, SidecarError> {
+        let profile_path = match self.profile_root.clone() {
+            Some(path) => path,
+            None => {
+                let error = SidecarError::new(
+                    SidecarErrorKind::ProfileLockRequired,
+                    "profile root unavailable",
+                );
+                self.fail(error.kind()).await;
+                return Err(error);
+            }
+        };
+        self.request_typed(
+            "openProfile",
+            &ProfilePathParams {
+                profile_path: profile_path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+    }
+
+    pub async fn list_folders(&mut self) -> Result<Vec<Folder>, SidecarError> {
+        self.request_typed("listFolders", &EmptyParams {}).await
+    }
+
+    pub async fn create_folder(
+        &mut self,
+        params: CreateFolderParams,
+    ) -> Result<CreateResult<Folder>, SidecarError> {
+        self.request_typed("createFolder", &params).await
+    }
+
+    pub async fn update_folder(
+        &mut self,
+        params: UpdateFolderParams,
+    ) -> Result<UpdateResult<Folder>, SidecarError> {
+        self.request_typed("updateFolder", &params).await
+    }
+
+    pub async fn trash_folder(
+        &mut self,
+        params: ExpectedUpdatedTimeParams,
+    ) -> Result<TrashResult, SidecarError> {
+        self.request_typed("trashFolder", &params).await
+    }
+
+    pub async fn list_tags(&mut self) -> Result<Vec<Tag>, SidecarError> {
+        self.request_typed("listTags", &EmptyParams {}).await
+    }
+
+    pub async fn create_tag(
+        &mut self,
+        params: CreateTagParams,
+    ) -> Result<CreateResult<Tag>, SidecarError> {
+        self.request_typed("createTag", &params).await
+    }
+
+    pub async fn update_tag(
+        &mut self,
+        params: super::domain::UpdateTagParams,
+    ) -> Result<UpdateResult<Tag>, SidecarError> {
+        self.request_typed("updateTag", &params).await
+    }
+
+    pub async fn delete_tag(
+        &mut self,
+        params: ExpectedUpdatedTimeParams,
+    ) -> Result<DeleteResult, SidecarError> {
+        self.request_typed("deleteTag", &params).await
+    }
+
+    pub async fn list_notes(&mut self, params: ListNotesParams) -> Result<NotePage, SidecarError> {
+        self.request_typed("listNotes", &params).await
+    }
+
+    pub async fn get_note(&mut self, params: GetByIdParams) -> Result<NoteDetail, SidecarError> {
+        self.request_typed("getNote", &params).await
+    }
+
+    pub async fn create_note(
+        &mut self,
+        params: CreateNoteParams,
+    ) -> Result<CreateResult<NoteDetail>, SidecarError> {
+        self.request_typed("createNote", &params).await
+    }
+
+    pub async fn update_note(
+        &mut self,
+        params: UpdateNoteParams,
+    ) -> Result<UpdateResult<NoteDetail>, SidecarError> {
+        self.request_typed("updateNote", &params).await
+    }
+
+    pub async fn trash_note(
+        &mut self,
+        params: ExpectedUpdatedTimeParams,
+    ) -> Result<TrashResult, SidecarError> {
+        self.request_typed("trashNote", &params).await
+    }
+
+    pub async fn set_note_tags(
+        &mut self,
+        params: SetNoteTagsParams,
+    ) -> Result<SetNoteTagsResult, SidecarError> {
+        self.request_typed("setNoteTags", &params).await
     }
 
     pub fn state(&self) -> SidecarState {
@@ -301,8 +452,17 @@ impl SidecarClient {
                         SidecarErrorKind::InvalidResponse,
                         "shutdown response",
                     ))
-                } else {
+                } else if response
+                    .result
+                    .and_then(|result| serde_json::from_value::<ShutdownResult>(result).ok())
+                    .is_some_and(|result| result.stopped)
+                {
                     Ok(())
+                } else {
+                    Err(SidecarError::new(
+                        SidecarErrorKind::InvalidResponse,
+                        "shutdown result",
+                    ))
                 }
             }
             Ok(Err(error)) => Err(error),
@@ -313,13 +473,22 @@ impl SidecarClient {
         };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let waited = timeout(remaining, self.child.wait()).await;
+        let mut natural_exit = matches!(&waited, Ok(Ok(status)) if status.success());
         if waited.is_err() || self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill().await;
             let _ = self.child.wait().await;
+            natural_exit = false;
         }
         self.lease.take();
         self.state = SidecarState::Stopped;
-        result
+        if result.is_ok() && !natural_exit {
+            Err(SidecarError::new(
+                SidecarErrorKind::InvalidResponse,
+                "sidecar exit status",
+            ))
+        } else {
+            result
+        }
     }
 
     async fn exchange(
@@ -413,23 +582,33 @@ mod tests {
 
     const ECHO_SCRIPT: &str = r#"
 const rl=require('readline').createInterface({input:process.stdin});
-rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{stopped:true}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
 "#;
 
     const DOMAIN_FAILURE_SCRIPT: &str = r#"
 const rl=require('readline').createInterface({input:process.stdin});
-rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='domain')process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'INVALID_ITEM',message:'secret-domain-detail'}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='domain')process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'INVALID_ITEM',message:'secret-domain-detail'}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{stopped:true}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
+"#;
+
+    const TYPED_CONFLICT_SCRIPT: &str = r#"
+const rl=require('readline').createInterface({input:process.stdin});let failed=false;
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='listFolders'&&!failed){failed=true;process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'CONFLICT',message:'secret-conflict-detail'}})+'\n');}else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{stopped:true}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:[]})+'\n');});
+"#;
+
+    const STORAGE_FAILURE_SCRIPT: &str = r#"
+const rl=require('readline').createInterface({input:process.stdin});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'STORAGE_ERROR',message:'secret-storage-detail'}})+'\n');});
 "#;
 
     const LEASE_SCRIPT: &str = r#"
 const fs=require('fs');
 const rl=require('readline').createInterface({input:process.stdin});
-rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='check'){let open=false;try{fs.fstatSync(198);open=true;}catch{}process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{env:process.env.JOPLIN_LITE_PROFILE_LEASE_FD||null,open}})+'\n');}else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='check'){let open=false;try{fs.fstatSync(198);open=true;}catch{}process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{env:process.env.JOPLIN_LITE_PROFILE_LEASE_FD||null,open}})+'\n');}else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{stopped:true}})+'\n');process.exit(0);}});
 "#;
 
     const PROTOCOL_MISMATCH_FAILURE_SCRIPT: &str = r#"
 const rl=require('readline').createInterface({input:process.stdin});
-rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='mismatch')process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'PROTOCOL_MISMATCH',message:'secret-version-detail'}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='mismatch')process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'PROTOCOL_MISMATCH',message:'secret-version-detail'}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{stopped:true}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
 "#;
 
     #[tokio::test]
@@ -439,7 +618,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
             .expect("sidecar starts");
         assert_eq!(client.state(), SidecarState::Ready);
         let result = client
-            .request("echo", json!({"value":"ok"}))
+            .request_value("echo", json!({"value":"ok"}))
             .await
             .expect("echo");
         assert_eq!(result["value"], "ok");
@@ -454,7 +633,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
                 .await
                 .expect("sidecar starts");
         let error = client
-            .request("domain", json!({"secret":"secret-marker"}))
+            .request_value("domain", json!({"secret":"secret-marker"}))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::InvalidResponse);
@@ -462,29 +641,61 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         assert!(!error.to_string().contains("secret-domain-detail"));
         assert_eq!(client.state(), SidecarState::Ready);
         assert_eq!(
-            client.request("echo", json!({"after":true})).await.unwrap()["after"],
+            client
+                .request_value("echo", json!({"after":true}))
+                .await
+                .unwrap()["after"],
             true
         );
         client.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
-    async fn ordinary_protocol_mismatch_is_redacted_and_keeps_client_ready() {
+    async fn typed_conflict_is_recoverable_and_next_typed_request_succeeds() {
+        let mut client =
+            SidecarClient::start(command(TYPED_CONFLICT_SCRIPT), Duration::from_secs(1))
+                .await
+                .expect("sidecar starts");
+        let error = client.list_folders().await.unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::Conflict);
+        assert_eq!(client.state(), SidecarState::Ready);
+        assert!(
+            client
+                .list_folders()
+                .await
+                .expect("next typed request")
+                .is_empty()
+        );
+        client.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn typed_storage_error_fails_and_reaps_client() {
+        let mut client =
+            SidecarClient::start(command(STORAGE_FAILURE_SCRIPT), Duration::from_secs(1))
+                .await
+                .expect("sidecar starts");
+        let error = client.list_folders().await.unwrap_err();
+        assert_eq!(error.kind(), SidecarErrorKind::StorageError);
+        assert_eq!(client.state(), SidecarState::Failed);
+        assert!(client.child.try_wait().expect("wait status").is_some());
+    }
+
+    #[tokio::test]
+    async fn ordinary_protocol_mismatch_is_redacted_and_fails_client() {
         let mut client = SidecarClient::start(
             command(PROTOCOL_MISMATCH_FAILURE_SCRIPT),
             Duration::from_secs(1),
         )
         .await
         .expect("sidecar starts");
-        let error = client.request("mismatch", json!({})).await.unwrap_err();
+        let error = client
+            .request_value("mismatch", json!({}))
+            .await
+            .unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::ProtocolMismatch);
         assert_eq!(error.to_string(), "兼容协议版本不匹配");
-        assert_eq!(client.state(), SidecarState::Ready);
-        assert_eq!(
-            client.request("echo", json!({"after":true})).await.unwrap()["after"],
-            true
-        );
-        client.shutdown().await.expect("shutdown");
+        assert_eq!(client.state(), SidecarState::Failed);
     }
 
     #[cfg(target_os = "macos")]
@@ -494,7 +705,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
             .await
             .expect("ordinary sidecar starts");
         let ordinary_result = ordinary
-            .request("check", json!({}))
+            .request_value("check", json!({}))
             .await
             .expect("ordinary check");
         assert_eq!(ordinary_result["env"], Value::Null);
@@ -515,7 +726,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
                 .await
                 .expect("profile sidecar starts");
         let profile_result = profile
-            .request("check", json!({}))
+            .request_value("check", json!({}))
             .await
             .expect("profile check");
         assert_eq!(profile_result["env"], "198");
@@ -571,7 +782,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         let mut client = SidecarClient::start(command(script), Duration::from_millis(100))
             .await
             .expect("start");
-        let error = client.request("echo", json!({})).await.unwrap_err();
+        let error = client.request_value("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::Timeout);
         assert_eq!(client.state(), SidecarState::Failed);
     }
@@ -586,7 +797,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello'){process.std
             .await
             .expect("start");
         tokio::time::sleep(Duration::from_millis(80)).await;
-        let error = client.request("echo", json!({})).await.unwrap_err();
+        let error = client.request_value("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::SidecarExited);
         assert_eq!(client.state(), SidecarState::Failed);
     }
@@ -609,7 +820,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         let mut client = SidecarClient::start(command(script), Duration::from_secs(1))
             .await
             .expect("start");
-        let error = client.request("echo", json!({})).await.unwrap_err();
+        let error = client.request_value("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::InvalidResponse);
         assert_eq!(client.state(), SidecarState::Failed);
     }
@@ -623,7 +834,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         let mut client = SidecarClient::start(command(script), Duration::from_secs(1))
             .await
             .expect("start");
-        let error = client.request("echo", json!({})).await.unwrap_err();
+        let error = client.request_value("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::InvalidResponse);
         assert_eq!(error.to_string(), "兼容组件响应无效");
         assert_eq!(client.state(), SidecarState::Failed);
@@ -639,7 +850,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
             .await
             .expect("start");
         let started = std::time::Instant::now();
-        let error = client.request("echo", json!({})).await.unwrap_err();
+        let error = client.request_value("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::FrameTooLarge);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(client.state(), SidecarState::Failed);
@@ -654,14 +865,14 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         let mut client = SidecarClient::start(command(&script), Duration::from_secs(2))
             .await
             .expect("start");
-        let error = client.request("echo", json!({})).await.unwrap_err();
+        let error = client.request_value("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::FrameTooLarge);
         assert_eq!(client.state(), SidecarState::Failed);
     }
 
     fn exact_boundary_script(target_payload_bytes: usize) -> String {
         format!(
-            "const rl=require('readline').createInterface({{input:process.stdin}});const make=(id)=>{{const o={{id,ok:true,result:{{padding:''}}}};const empty=JSON.stringify(o);o.result.padding='x'.repeat({}-Buffer.byteLength(empty));return JSON.stringify(o);}};rl.on('line',line=>{{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({{id:r.id,ok:true,result:{{protocolVersion:1}}}})+'\\n');else if(r.command==='shutdown'){{process.stdout.write(JSON.stringify({{id:r.id,ok:true,result:{{}}}})+'\\n');process.exit(0);}}else process.stdout.write(make(r.id)+'\\n');}});",
+            "const rl=require('readline').createInterface({{input:process.stdin}});const make=(id)=>{{const o={{id,ok:true,result:{{padding:''}}}};const empty=JSON.stringify(o);o.result.padding='x'.repeat({}-Buffer.byteLength(empty));return JSON.stringify(o);}};rl.on('line',line=>{{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({{id:r.id,ok:true,result:{{protocolVersion:1}}}})+'\\n');else if(r.command==='shutdown'){{process.stdout.write(JSON.stringify({{id:r.id,ok:true,result:{{stopped:true}}}})+'\\n');process.exit(0);}}else process.stdout.write(make(r.id)+'\\n');}});",
             target_payload_bytes
         )
     }
@@ -675,7 +886,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         .await
         .expect("start");
         let result = client
-            .request("echo", json!({}))
+            .request_value("echo", json!({}))
             .await
             .expect("boundary response");
         assert!(result["padding"].as_str().expect("padding").len() > MAX_FRAME_BYTES - 100);
@@ -690,7 +901,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         )
         .await
         .expect("start");
-        let error = client.request("echo", json!({})).await.unwrap_err();
+        let error = client.request_value("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::FrameTooLarge);
         assert_eq!(client.state(), SidecarState::Failed);
     }
@@ -704,7 +915,7 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
         let mut client = SidecarClient::start(command(&script), Duration::from_secs(5))
             .await
             .expect("start");
-        let error = client.request("echo", json!({})).await.unwrap_err();
+        let error = client.request_value("echo", json!({})).await.unwrap_err();
         assert_eq!(error.kind(), SidecarErrorKind::FrameTooLarge);
         assert_eq!(client.state(), SidecarState::Failed);
     }

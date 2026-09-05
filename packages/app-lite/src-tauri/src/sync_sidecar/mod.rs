@@ -1,9 +1,11 @@
+pub mod domain;
 pub mod protocol;
 
 mod client;
 mod profile_lease;
 
 pub use client::SidecarClient;
+pub use domain::*;
 pub use protocol::{
     DEFAULT_REQUEST_TIMEOUT, MAX_FRAME_BYTES, PROTOCOL_VERSION, STARTUP_TIMEOUT, SidecarCommand,
     SidecarError, SidecarErrorKind, SidecarState,
