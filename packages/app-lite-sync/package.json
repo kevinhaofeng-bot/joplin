@@ -6,11 +6,12 @@
     "test": "jest --config jest.config.js --runInBand",
     "test-ci": "yarn test",
     "tsc": "tsc --noEmit --project tsconfig.json",
-    "verify:clean": "yarn workspace @joplin/fork-htmlparser2 build && yarn workspace @joplin/utils build && yarn workspace @joplin/lib tsc && yarn test && yarn tsc",
+    "verify:clean": "node scripts/bootstrap-sqlite3.cjs && yarn workspace @joplin/fork-htmlparser2 build && yarn workspace @joplin/utils build && yarn workspace @joplin/lib tsc && yarn test && yarn tsc",
     "start:stdio": "node -r ts-node/register/transpile-only src/main.ts"
   },
   "dependencies": {
-    "@joplin/lib": "~3.7"
+    "@joplin/lib": "~3.7",
+    "sqlite3": "5.1.6"
   },
   "devDependencies": {
     "@types/jest": "29.5.14",

@@ -5,6 +5,8 @@ export const PROFILE_FORMAT_VERSION = 1 as const;
 export const PROFILE_ERROR_MESSAGES = {
 	PROFILE_INVALID: '资料库路径无效',
 	PROFILE_NOT_OWNED: '资料库不属于 Joplin Lite',
+	PROFILE_IN_USE: '资料库正在被使用',
+	PROFILE_LOCK_REQUIRED: '资料库写入租约无效',
 } as const;
 
 export type ProfileErrorCode = keyof typeof PROFILE_ERROR_MESSAGES;

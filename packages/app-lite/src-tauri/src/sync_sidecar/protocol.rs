@@ -26,6 +26,8 @@ pub enum SidecarErrorKind {
     InvalidResponse,
     FrameTooLarge,
     Io,
+    ProfileInUse,
+    ProfileLockRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +68,8 @@ fn public_message(kind: SidecarErrorKind) -> &'static str {
         SidecarErrorKind::InvalidResponse => "兼容组件响应无效",
         SidecarErrorKind::FrameTooLarge => "兼容组件响应过大",
         SidecarErrorKind::Io => "兼容组件通信失败",
+        SidecarErrorKind::ProfileInUse => "资料库正在被使用",
+        SidecarErrorKind::ProfileLockRequired => "资料库写入租约无效",
     }
 }
 
@@ -163,6 +167,13 @@ pub fn validate_hello(response: &ResponseFrame) -> Result<(), SidecarError> {
 
 pub(crate) fn classify_response_error(response: &ResponseFrame) -> SidecarError {
     match response.error.as_ref().map(|error| error.code.as_str()) {
+        Some("PROFILE_IN_USE") => {
+            SidecarError::new(SidecarErrorKind::ProfileInUse, "profile in use")
+        }
+        Some("PROFILE_LOCK_REQUIRED") => SidecarError::new(
+            SidecarErrorKind::ProfileLockRequired,
+            "profile lock required",
+        ),
         Some("PROTOCOL_MISMATCH") => {
             SidecarError::new(SidecarErrorKind::ProtocolMismatch, "protocol mismatch")
         }

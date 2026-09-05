@@ -16,9 +16,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
+libc = "0.2"
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs"] }
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
-
-[dev-dependencies]
-libc = "0.2"

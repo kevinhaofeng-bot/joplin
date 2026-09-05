@@ -1,6 +1,7 @@
 pub mod protocol;
 
 mod client;
+mod profile_lease;
 
 pub use client::SidecarClient;
 pub use protocol::{
@@ -51,6 +52,8 @@ mod protocol_tests {
             (SidecarErrorKind::InvalidResponse, "兼容组件响应无效"),
             (SidecarErrorKind::FrameTooLarge, "兼容组件响应过大"),
             (SidecarErrorKind::Io, "兼容组件通信失败"),
+            (SidecarErrorKind::ProfileInUse, "资料库正在被使用"),
+            (SidecarErrorKind::ProfileLockRequired, "资料库写入租约无效"),
         ] {
             let error = SidecarError::new(kind, secret);
             assert_eq!(error.message(), expected_message);

@@ -9,6 +9,9 @@ use tokio::{
 };
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
+use crate::profile::ProfilePaths;
+
+use super::profile_lease::ProfileLease;
 use super::protocol::{
     MAX_FRAME_BYTES, ResponseFrame, STARTUP_TIMEOUT, SidecarCommand, SidecarError,
     SidecarErrorKind, SidecarState, classify_response_error, decode_response, request_frame,
@@ -92,6 +95,7 @@ impl Encoder<String> for RawNdjsonCodec {
 #[derive(Debug)]
 pub struct SidecarClient {
     child: Child,
+    lease: Option<ProfileLease>,
     reader: SidecarReader,
     writer: SidecarWriter,
     state: SidecarState,
@@ -104,6 +108,27 @@ impl SidecarClient {
         command: SidecarCommand,
         request_timeout: Duration,
     ) -> Result<Self, SidecarError> {
+        Self::start_with_lease(command, request_timeout, None).await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn start_for_profile(
+        command: SidecarCommand,
+        profile: &ProfilePaths,
+        request_timeout: Duration,
+    ) -> Result<Self, SidecarError> {
+        profile
+            .ensure()
+            .map_err(|error| SidecarError::new(SidecarErrorKind::ProfileLockRequired, error))?;
+        let lease = ProfileLease::acquire(profile)?;
+        Self::start_with_lease(command, request_timeout, Some(lease)).await
+    }
+
+    async fn start_with_lease(
+        command: SidecarCommand,
+        request_timeout: Duration,
+        mut lease: Option<ProfileLease>,
+    ) -> Result<Self, SidecarError> {
         let mut process = Command::new(&command.executable);
         process
             .args(&command.args)
@@ -112,19 +137,51 @@ impl SidecarClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if let Some(profile_lease) = lease.as_ref() {
+            let source_fd = profile_lease.raw_fd();
+            process.env("JOPLIN_LITE_PROFILE_LEASE_FD", "198");
+            unsafe {
+                process.pre_exec(move || {
+                    if libc::dup2(source_fd, 198) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(198, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        } else {
+            process.env_remove("JOPLIN_LITE_PROFILE_LEASE_FD");
+        }
         let mut child = process
             .spawn()
             .map_err(|error| SidecarError::new(SidecarErrorKind::SpawnFailed, error))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| SidecarError::new(SidecarErrorKind::Io, "sidecar stdin unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| SidecarError::new(SidecarErrorKind::Io, "sidecar stdout unavailable"))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(SidecarError::new(
+                    SidecarErrorKind::Io,
+                    "sidecar stdin unavailable",
+                ));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(SidecarError::new(
+                    SidecarErrorKind::Io,
+                    "sidecar stdout unavailable",
+                ));
+            }
+        };
         let mut client = Self {
             child,
+            lease: lease.take(),
             reader: FramedRead::new(stdout, RawNdjsonCodec),
             writer: FramedWrite::new(stdin, RawNdjsonCodec),
             state: SidecarState::Starting,
@@ -252,6 +309,7 @@ impl SidecarClient {
             let _ = self.child.kill().await;
             let _ = self.child.wait().await;
         }
+        self.lease.take();
         self.state = SidecarState::Stopped;
         result
     }
@@ -299,6 +357,7 @@ impl SidecarClient {
             let _ = self.child.kill().await;
         }
         let _ = self.child.wait().await;
+        self.lease.take();
     }
 
     fn map_frame_error(&mut self, error: FrameError) -> SidecarError {
@@ -307,6 +366,24 @@ impl SidecarClient {
         } else {
             map_frame_error(error)
         }
+    }
+}
+
+impl Drop for SidecarClient {
+    fn drop(&mut self) {
+        if self.lease.is_none() {
+            return;
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.start_kill();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self.child.try_wait().ok().flatten().is_none()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        self.lease.take();
     }
 }
 
@@ -324,11 +401,17 @@ fn map_frame_error(error: FrameError) -> SidecarError {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use serde_json::json;
 
     use super::*;
+
+    static PROFILE_TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn command(script: &str) -> SidecarCommand {
         SidecarCommand {
@@ -346,6 +429,12 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
     const DOMAIN_FAILURE_SCRIPT: &str = r#"
 const rl=require('readline').createInterface({input:process.stdin});
 rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='domain')process.stdout.write(JSON.stringify({id:r.id,ok:false,error:{code:'INVALID_ITEM',message:'secret-domain-detail'}})+'\n');else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}else process.stdout.write(JSON.stringify({id:r.id,ok:true,result:r.params})+'\n');});
+"#;
+
+    const LEASE_SCRIPT: &str = r#"
+const fs=require('fs');
+const rl=require('readline').createInterface({input:process.stdin});
+rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{protocolVersion:1}})+'\n');else if(r.command==='check'){let open=false;try{fs.fstatSync(198);open=true;}catch{}process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{env:process.env.JOPLIN_LITE_PROFILE_LEASE_FD||null,open}})+'\n');}else if(r.command==='shutdown'){process.stdout.write(JSON.stringify({id:r.id,ok:true,result:{}})+'\n');process.exit(0);}});
 "#;
 
     const PROTOCOL_MISMATCH_FAILURE_SCRIPT: &str = r#"
@@ -406,6 +495,72 @@ rl.on('line',line=>{const r=JSON.parse(line);if(r.command==='hello')process.stdo
             true
         );
         client.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn profile_start_inherits_fd_198_but_ordinary_start_does_not() {
+        let mut ordinary = SidecarClient::start(command(LEASE_SCRIPT), Duration::from_secs(1))
+            .await
+            .expect("ordinary sidecar starts");
+        let ordinary_result = ordinary
+            .request("check", json!({}))
+            .await
+            .expect("ordinary check");
+        assert_eq!(ordinary_result["env"], Value::Null);
+        assert_eq!(ordinary_result["open"], false);
+        ordinary.shutdown().await.expect("ordinary shutdown");
+
+        let parent = std::env::temp_dir().join(format!(
+            "joplin-lite-client-{}-{}",
+            std::process::id(),
+            PROFILE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = parent.join(crate::profile::EXPECTED_PROFILE_DIRECTORY_NAME);
+        std::fs::create_dir_all(&parent).unwrap();
+        let paths = crate::profile::ProfilePaths::try_from_app_data(root).unwrap();
+        paths.ensure().unwrap();
+        let mut profile =
+            SidecarClient::start_for_profile(command(LEASE_SCRIPT), &paths, Duration::from_secs(1))
+                .await
+                .expect("profile sidecar starts");
+        let profile_result = profile
+            .request("check", json!({}))
+            .await
+            .expect("profile check");
+        assert_eq!(profile_result["env"], "198");
+        assert_eq!(profile_result["open"], true);
+        profile.shutdown().await.expect("profile shutdown");
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn profile_lease_blocks_second_start_until_first_reaped() {
+        let parent = std::env::temp_dir().join(format!(
+            "joplin-lite-contention-{}-{}",
+            std::process::id(),
+            PROFILE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = parent.join(crate::profile::EXPECTED_PROFILE_DIRECTORY_NAME);
+        std::fs::create_dir_all(&parent).unwrap();
+        let paths = crate::profile::ProfilePaths::try_from_app_data(root).unwrap();
+        paths.ensure().unwrap();
+        let mut first =
+            SidecarClient::start_for_profile(command(ECHO_SCRIPT), &paths, Duration::from_secs(1))
+                .await
+                .expect("first profile sidecar");
+        let second =
+            SidecarClient::start_for_profile(command(ECHO_SCRIPT), &paths, Duration::from_secs(1))
+                .await;
+        assert_eq!(second.unwrap_err().kind(), SidecarErrorKind::ProfileInUse);
+        first.shutdown().await.expect("first shutdown");
+        let mut third =
+            SidecarClient::start_for_profile(command(ECHO_SCRIPT), &paths, Duration::from_secs(1))
+                .await
+                .expect("reopen profile sidecar");
+        third.shutdown().await.expect("third shutdown");
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[tokio::test]
