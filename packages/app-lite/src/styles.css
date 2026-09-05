@@ -43,6 +43,9 @@ button:disabled { cursor: default; opacity: .52; }
 .sync-form button { min-height: 28px; border: 1px solid var(--teal); border-radius: 3px; color: #fff; background: var(--teal); font-size: 11px; }
 
 .note-list { display: flex; flex-direction: column; background: #f8f6f1; border-right: 1px solid var(--line); }
+.search-box { display: grid; gap: 4px; padding: 12px 18px 4px; }
+.search-box input { width: 100%; min-height: 30px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 4px; color: var(--ink); background: var(--paper); font-size: 12px; }
+.search-box small { color: var(--muted); font-size: 10px; }
 .pane-header { display: flex; align-items: end; justify-content: space-between; gap: 12px; padding: 30px 22px 20px; border-bottom: 1px solid var(--line); }
 .pane-header h2 { margin: 0; color: var(--ink); font-size: 22px; font-weight: 650; letter-spacing: -.04em; }
 .new-note-button { min-height: 34px; padding: 7px 12px; border: 1px solid #1e6064; border-radius: 5px; color: #f8fcfa; background: var(--teal); font-size: 12px; font-weight: 650; }

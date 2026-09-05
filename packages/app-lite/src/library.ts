@@ -13,6 +13,8 @@ export interface NoteSummary {
 }
 export interface NoteDetail extends NoteSummary { body: string; markupLanguage: MarkupLanguage; tagIds: string[] }
 export interface NotePage { items: NoteSummary[]; page: number; hasMore: boolean }
+export interface SearchNote extends NoteSummary { bodyMatch: boolean }
+export interface SearchNotePage { query: string; items: SearchNote[] }
 export interface Resource {
 	id: string; title: string; mime: string; fileExtension: string; size: number;
 	createdTime: number; updatedTime: number; markup: string;
@@ -34,6 +36,7 @@ export interface UpdateNoteParams {
 	isTodo?: boolean; todoDue?: number; todoCompleted?: number;
 }
 export interface SetNoteTagsParams { noteId: string; expectedUpdatedTime: number; tagIds: string[] }
+export interface SearchNotesParams { query: string; limit?: number }
 
 export interface CreateResult<T> { item: T; created: boolean }
 export interface UpdateResult<T> { item: T; changed: boolean }
@@ -156,6 +159,14 @@ function guardPage(value: unknown): NotePage {
 	if (!isRecord(value) || !isPositiveTime(value.page) || typeof value.hasMore !== 'boolean') return invalid();
 	return { items: guardArray(value.items, guardNoteSummary), page: value.page, hasMore: value.hasMore };
 }
+function guardSearchPage(value: unknown): SearchNotePage {
+	if (!isRecord(value) || typeof value.query !== 'string') return invalid();
+	const items = guardArray(value.items, item => {
+		if (!isRecord(item) || typeof item.bodyMatch !== 'boolean') return invalid();
+		return { ...guardNoteSummary(item), bodyMatch: item.bodyMatch };
+	});
+	return { query: value.query, items };
+}
 async function call<T>(command: string, guard: (value: unknown)=> T, params?: unknown): Promise<T> {
 	try {
 		const value = params === undefined ? await invoke<unknown>(command) : await invoke<unknown>(command, { params });
@@ -182,6 +193,7 @@ export const createTag = (params: CreateTagParams) => call('create_tag', value =
 export const updateTag = (params: UpdateTagParams) => call('update_tag', value => guardUpdate(value, guardTag), params);
 export const deleteTag = (params: ExpectedUpdatedTimeParams) => call('delete_tag', guardDelete, params);
 export const listNotes = (params: ListNotesParams = {}) => call('list_notes', guardPage, params);
+export const searchNotes = (params: SearchNotesParams) => call('search_notes', guardSearchPage, params);
 export const getNote = (params: GetByIdParams) => call('get_note', guardNote, params);
 export const createNote = (params: CreateNoteParams) => call('create_note', value => guardCreate(value, guardNote), params);
 export const updateNote = (params: UpdateNoteParams) => call('update_note', value => guardUpdate(value, guardNote), params);
@@ -212,6 +224,7 @@ export interface LibraryApi {
 	updateFolder: typeof updateFolder; trashFolder: typeof trashFolder; listTags: typeof listTags;
 	createTag: typeof createTag; updateTag: typeof updateTag; deleteTag: typeof deleteTag;
 	listNotes: typeof listNotes; getNote: typeof getNote; createNote: typeof createNote;
+	searchNotes: typeof searchNotes;
 	updateNote: typeof updateNote; trashNote: typeof trashNote; setNoteTags: typeof setNoteTags;
 	createResourceFromPath: typeof createResourceFromPath; listNoteResources: typeof listNoteResources;
 	createImageResource: typeof createImageResource; openResource: typeof openResource;
@@ -220,7 +233,7 @@ export interface LibraryApi {
 
 export const libraryApi: LibraryApi = {
 	openLibrary, retryLibrary, shutdownLibrary, profileStatus, listFolders, createFolder, updateFolder, trashFolder,
-	listTags, createTag, updateTag, deleteTag, listNotes, getNote, createNote, updateNote, trashNote, setNoteTags,
+	listTags, createTag, updateTag, deleteTag, listNotes, searchNotes, getNote, createNote, updateNote, trashNote, setNoteTags,
 	createResourceFromPath, listNoteResources, createImageResource, openResource,
 	getSyncConfig, configureJoplinServer, syncNow,
 };

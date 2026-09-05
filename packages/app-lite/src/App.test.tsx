@@ -23,7 +23,7 @@ function makeApi(overrides: Partial<LibraryApi> = {}): LibraryApi {
 		listFolders: vi.fn(async () => []), createFolder: vi.fn(async () => ({ created: true, item: folder })),
 		updateFolder: vi.fn(), trashFolder: vi.fn(), listTags: vi.fn(async () => []),
 		createTag: vi.fn(), updateTag: vi.fn(), deleteTag: vi.fn(),
-		listNotes: vi.fn(async () => ({ items: [], page: 1, hasMore: false })), getNote: vi.fn(async () => note),
+		listNotes: vi.fn(async () => ({ items: [], page: 1, hasMore: false })), searchNotes: vi.fn(async () => ({ query: '', items: [] })), getNote: vi.fn(async () => note),
 		createNote: vi.fn(async () => ({ created: true, item: note })),
 		updateNote: vi.fn(async (params) => ({ changed: true, item: { ...note, ...params, updatedTime: params.expectedUpdatedTime + 1 } })),
 		trashNote: vi.fn(), setNoteTags: vi.fn(), createResourceFromPath: vi.fn(), listNoteResources: vi.fn(async () => []),
@@ -110,5 +110,19 @@ describe('App', () => {
 		await waitFor(() => expect(api.syncNow).toHaveBeenCalledTimes(1));
 		expect(api.listFolders).toHaveBeenCalled();
 		expect(api.listNotes).toHaveBeenCalled();
+	});
+
+	it('debounces note search and Escape restores the regular list', async () => {
+		const api = makeApi({
+			listNotes: vi.fn(async () => ({ items: [note], page: 1, hasMore: false })),
+			searchNotes: vi.fn(async () => ({ query: 'body', items: [{ ...note, bodyMatch: true }] })),
+		});
+		render(<App loadRuntimeInfo={runtime} library={api} EditorComponent={FakeEditor} />);
+		const search = await screen.findByRole('textbox', { name: '搜索笔记' });
+		fireEvent.change(search, { target: { value: 'body' } });
+		await waitFor(() => expect(api.searchNotes).toHaveBeenCalledWith({ query: 'body', limit: 50 }), { timeout: 1000 });
+		await screen.findByText(/正文匹配/);
+		fireEvent.keyDown(search, { key: 'Escape' });
+		await waitFor(() => expect(search).toHaveValue(''));
 	});
 });

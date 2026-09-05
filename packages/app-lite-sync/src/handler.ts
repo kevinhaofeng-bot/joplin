@@ -14,10 +14,11 @@ import { TagStore } from './domain/tagStore';
 import type { CreateTagInput, UpdateTagInput } from './domain/tagStore';
 import { NoteStore, type CreateNoteInput, type SetNoteTagsInput, type UpdateNoteInput } from './domain/noteStore';
 import { ResourceStore, type CreateResourceInput } from './domain/resourceStore';
+import { SearchStore, type SearchNotesInput } from './domain/searchStore';
 import { exactKeys, validationError } from './domain/validation';
 
 const joplinVersion: string = require('../../lib/package.json').version;
-const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'syncNow'] as const;
+const capabilities = ['decodeItem', 'encodeItem', 'shutdown', 'profileStatus', 'openProfile', 'listFolders', 'createFolder', 'updateFolder', 'trashFolder', 'listTags', 'createTag', 'updateTag', 'deleteTag', 'listNotes', 'getNote', 'createNote', 'updateNote', 'trashNote', 'setNoteTags', 'createResourceFromPath', 'listNoteResources', 'getSyncConfig', 'configureJoplinServer', 'syncNow', 'searchNotes'] as const;
 const terminalCodes = new Set(['PROFILE_LOCK_REQUIRED', 'PROFILE_OPEN_FAILED', 'STORAGE_ERROR']);
 const stableCodes = new Set(['INVALID_ITEM', 'INVALID_REQUEST', ...Object.keys(PROFILE_ERROR_MESSAGES), 'SYNC_NOT_CONFIGURED', 'SYNC_AUTH_FAILED', 'SYNC_NETWORK', 'SYNC_BUSY', 'SYNC_FAILED']);
 
@@ -63,6 +64,7 @@ export function createHandler(session: SessionLike): RequestHandler {
 	const tagStore = new TagStore();
 	const noteStore = new NoteStore();
 	const resourceStore = new ResourceStore();
+	const searchStore = new SearchStore();
 	return {
 		handleRequest: async (request: RequestFrame): Promise<HandledRequest> => {
 			try {
@@ -166,6 +168,10 @@ export function createHandler(session: SessionLike): RequestHandler {
 					requireOpen(session);
 					if (!session.syncNow) throw new ProtocolError('STORAGE_ERROR', 'sync unavailable');
 					return { response: successFrame(request.id, await session.syncNow()), shouldExit: false };
+				case 'searchNotes':
+					if (!isObject(request.params) || !hasAllowed(request.params, ['query'], ['limit'])) throw validationError();
+					requireOpen(session);
+					return { response: successFrame(request.id, await searchStore.search(request.params as SearchNotesInput)), shouldExit: false };
 				default:
 					return { response: failureFrame(request.id, 'UNKNOWN_COMMAND', '未知命令'), shouldExit: false };
 				}

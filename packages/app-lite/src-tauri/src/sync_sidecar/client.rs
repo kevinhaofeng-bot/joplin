@@ -16,9 +16,9 @@ use super::domain::{
     ConfigureJoplinServerParams, CreateFolderParams, CreateNoteParams,
     CreateResourceFromPathParams, CreateResult, CreateTagParams, DeleteResult, EmptyParams,
     ExpectedUpdatedTimeParams, Folder, GetByIdParams, ListNoteResourcesParams, ListNotesParams,
-    NoteDetail, NotePage, OpenProfile, ProfilePathParams, ProfileStatus, Resource,
-    SetNoteTagsParams, SetNoteTagsResult, ShutdownResult, SyncConfig, SyncSummary, Tag,
-    TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
+    NoteDetail, NotePage, OpenProfile, ProfilePathParams, ProfileStatus, Resource, SearchNotePage,
+    SearchNotesParams, SetNoteTagsParams, SetNoteTagsResult, ShutdownResult, SyncConfig,
+    SyncSummary, Tag, TrashResult, UpdateFolderParams, UpdateNoteParams, UpdateResult,
 };
 use super::profile_lease::ProfileLease;
 use super::protocol::{
@@ -487,6 +487,13 @@ impl SidecarClient {
     pub async fn sync_now(&mut self) -> Result<SyncSummary, SidecarError> {
         self.request_typed_with_timeout("syncNow", &EmptyParams {}, Duration::from_secs(15 * 60))
             .await
+    }
+
+    pub async fn search_notes(
+        &mut self,
+        params: SearchNotesParams,
+    ) -> Result<SearchNotePage, SidecarError> {
+        self.request_typed("searchNotes", &params).await
     }
 
     pub fn state(&self) -> SidecarState {

@@ -315,9 +315,41 @@ pub struct SyncSummary {
     pub fetched: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchNotesParams {
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchNote {
+    pub id: String,
+    pub parent_id: String,
+    pub title: String,
+    pub is_todo: bool,
+    pub todo_due: u64,
+    pub todo_completed: u64,
+    pub created_time: u64,
+    pub updated_time: u64,
+    pub user_created_time: u64,
+    pub user_updated_time: u64,
+    pub deleted_time: u64,
+    pub body_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchNotePage {
+    pub query: String,
+    pub items: Vec<SearchNote>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ConfigureJoplinServerParams;
+    use super::{ConfigureJoplinServerParams, SearchNotesParams};
 
     #[test]
     fn configure_debug_redacts_password() {
@@ -329,5 +361,11 @@ mod tests {
         let debug = format!("{value:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret-marker"));
+    }
+
+    #[test]
+    fn search_params_reject_unknown_fields() {
+        let value = serde_json::json!({ "query": "body", "unexpected": true });
+        assert!(serde_json::from_value::<SearchNotesParams>(value).is_err());
     }
 }

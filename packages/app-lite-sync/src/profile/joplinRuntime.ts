@@ -22,6 +22,7 @@ import EncryptionService from '../../../lib/services/e2ee/EncryptionService';
 import { setRSA } from '../../../lib/services/e2ee/ppk/ppk';
 import RSA from '../../../lib/services/e2ee/ppk/RSA.node';
 import ShareService from '../../../lib/services/share/ShareService';
+import SearchEngine from '../../../lib/services/search/SearchEngine';
 import { reg } from '../../../lib/registry';
 import Logger from '../../../utils/Logger';
 import { registerItemClasses } from '../codec';
@@ -66,6 +67,7 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 		Logger.initializeGlobalLogger(logger);
 		initLib(logger);
 		BaseService.logger_ = logger;
+		SearchEngine.instance().setLogger(logger);
 
 		registerItemClasses();
 		initializeSettings(paths);
@@ -77,6 +79,7 @@ export async function openJoplinRuntime(paths: ValidatedProfilePaths): Promise<R
 		await database.open({ name: paths.database });
 		BaseModel.setDb(database);
 		reg.setDb(database);
+		SearchEngine.instance().setDb(database);
 		KvStore.instance().setDb(database);
 		setRSA(RSA);
 		const encryptionService = EncryptionService.instance();

@@ -267,6 +267,25 @@ impl LibraryState {
         self.with_client(|client| Box::pin(client.list_notes(params)))
             .await
     }
+    pub async fn search_notes(
+        &self,
+        params: SearchNotesParams,
+    ) -> Result<SearchNotePage, LibraryError> {
+        if params.query.trim().is_empty()
+            || params.query.len() > 256
+            || params.query.contains('\0')
+            || params
+                .limit
+                .is_some_and(|limit| !(1..=100).contains(&limit))
+        {
+            return Err(LibraryError {
+                code: "VALIDATION_FAILED",
+                message: "输入内容无效",
+            });
+        }
+        self.with_client(|client| Box::pin(client.search_notes(params)))
+            .await
+    }
     pub async fn get_note(&self, params: GetByIdParams) -> Result<NoteDetail, LibraryError> {
         self.with_client(|client| Box::pin(client.get_note(params)))
             .await
@@ -568,6 +587,7 @@ arg_library_commands! {
     update_tag(update_tag, UpdateTagParams) -> UpdateResult<Tag>,
     delete_tag(delete_tag, ExpectedUpdatedTimeParams) -> DeleteResult,
     list_notes(list_notes, ListNotesParams) -> NotePage,
+    search_notes(search_notes, SearchNotesParams) -> SearchNotePage,
     get_note(get_note, GetByIdParams) -> NoteDetail,
     create_note(create_note, CreateNoteParams) -> CreateResult<NoteDetail>,
     update_note(update_note, UpdateNoteParams) -> UpdateResult<NoteDetail>,

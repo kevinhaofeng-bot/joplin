@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ComponentType, type Form
 import { getRuntimeInfo, type RuntimeInfo } from './runtime';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
-	LibraryClientError, libraryApi, type Folder, type LibraryApi, type NoteDetail, type NoteSummary, type Resource,
+	LibraryClientError, libraryApi, type Folder, type LibraryApi, type NoteDetail, type NoteSummary, type Resource, type SearchNote,
 	type SyncConfig,
 } from './library';
 import RichTextEditor, { type RichTextEditorProps } from './RichTextEditor';
@@ -43,6 +43,11 @@ export default function App({
 	const [initialization, setInitialization] = useState<Initialization>({ kind: 'loading' });
 	const [folders, setFolders] = useState<Folder[]>([]);
 	const [notes, setNotes] = useState<NoteSummary[]>([]);
+	const [searchQuery, setSearchQuery] = useState('');
+	const [searchResults, setSearchResults] = useState<SearchNote[] | null>(null);
+	const [searching, setSearching] = useState(false);
+	const [searchError, setSearchError] = useState('');
+	const searchSequence = useRef(0);
 	const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
 	const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
 	const [detail, setDetail] = useState<NoteDetail | null>(null);
@@ -93,6 +98,34 @@ export default function App({
 	}, [library, loadRuntimeInfo]);
 
 	useEffect(() => { void bootstrap(); }, [bootstrap]);
+
+	useEffect(() => {
+		if (initialization.kind !== 'ready') return;
+		const query = searchQuery.trim();
+		const requestSequence = ++searchSequence.current;
+		if (!query) {
+			setSearchResults(null);
+			setSearching(false);
+			setSearchError('');
+			void refreshNotes();
+			return;
+		}
+		setSearching(true);
+		setSearchError('');
+		const timer = setTimeout(() => {
+			void library.searchNotes({ query, limit: 50 }).then(result => {
+				if (requestSequence !== searchSequence.current) return;
+				setSearchResults(result.items);
+				setSearching(false);
+			}).catch(() => {
+				if (requestSequence !== searchSequence.current) return;
+				setSearchResults([]);
+				setSearching(false);
+				setSearchError('搜索暂时不可用');
+			});
+		}, 250);
+		return () => clearTimeout(timer);
+	}, [initialization.kind, library, refreshNotes, searchQuery]);
 
 	const enqueueSave = useCallback(() => {
 		if (autoSaveDisabled.current) return;
@@ -223,6 +256,7 @@ export default function App({
 
 	if (initialization.kind === 'loading') return <main className="initialization-shell">正在打开本地资料库…</main>;
 	if (initialization.kind === 'failed') return <section className="initialization-failure" role="alert"><p>{initialization.message}</p><button type="button" onClick={() => { void bootstrap(true); }}>重试打开资料库</button></section>;
+	const visibleNotes: NoteSummary[] = searchResults ?? notes;
 
 	return (
 		<div className="app-shell">
@@ -245,7 +279,8 @@ export default function App({
 			</nav>
 			<aside className="note-list" aria-label="笔记列表">
 				<header className="pane-header"><div><p className="eyebrow">{selectedFolderId ? '笔记本' : '全部笔记'}</p><h2>笔记</h2></div><button type="button" className="new-note-button" onClick={() => { void createNote(); }} disabled={busy}>新建笔记</button></header>
-				<div className="note-rows">{notes.map(item => <button type="button" className={`note-row ${selectedNoteId === item.id ? 'is-selected' : ''}`} key={item.id} aria-label={noteLabel(item)} onClick={() => { void selectNote(item.id); }}><strong>{noteLabel(item)}</strong><time>{formatUpdatedTime(item.updatedTime)}</time></button>)}{notes.length === 0 ? <p className="empty-note-list">这里会放下你正在写的东西。<br />从一页空白开始。</p> : null}</div>
+				<div className="search-box"><label className="sr-only" htmlFor="note-search">搜索笔记</label><input id="note-search" aria-label="搜索笔记" value={searchQuery} onChange={event => setSearchQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') setSearchQuery(''); }} placeholder="搜索笔记" />{searching ? <small>搜索中…</small> : null}{searchError ? <small role="status">{searchError}</small> : null}</div>
+				<div className="note-rows">{visibleNotes.map(item => <button type="button" className={`note-row ${selectedNoteId === item.id ? 'is-selected' : ''}`} key={item.id} aria-label={noteLabel(item)} onClick={() => { void selectNote(item.id); }}><strong>{noteLabel(item)}</strong><time>{formatUpdatedTime(item.updatedTime)}{'bodyMatch' in item && item.bodyMatch ? ' · 正文匹配' : ''}</time></button>)}{visibleNotes.length === 0 ? <p className="empty-note-list">{searchResults ? '没有找到匹配的笔记。' : <>这里会放下你正在写的东西。<br />从一页空白开始。</>}</p> : null}</div>
 			</aside>
 			<main className="editor-pane" aria-label="编辑区">
 				{detail ? <>

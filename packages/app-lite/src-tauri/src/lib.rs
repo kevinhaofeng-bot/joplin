@@ -108,6 +108,7 @@ pub fn run() {
             library::update_tag,
             library::delete_tag,
             library::list_notes,
+            library::search_notes,
             library::get_note,
             library::create_note,
             library::update_note,
