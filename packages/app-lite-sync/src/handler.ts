@@ -1,4 +1,3 @@
-import { decodeItem, encodeItem, registerItemClasses } from './codec';
 import {
 	failureFrame,
 	profileError,
@@ -10,12 +9,12 @@ import {
 	type ResponseFrame,
 } from './protocol';
 import type { ProfileSession } from './profile/profileSession';
-import { FolderStore, type CreateFolderInput, type UpdateFolderInput } from './domain/folderStore';
-import { TagStore } from './domain/tagStore';
+import type { FolderStore, CreateFolderInput, UpdateFolderInput } from './domain/folderStore';
+import type { TagStore } from './domain/tagStore';
 import type { CreateTagInput, UpdateTagInput } from './domain/tagStore';
-import { NoteStore, type CreateNoteInput, type SetNoteTagsInput, type UpdateNoteInput } from './domain/noteStore';
-import { ResourceStore, type CreateResourceInput } from './domain/resourceStore';
-import { SearchStore, type SearchNotesInput } from './domain/searchStore';
+import type { NoteStore, CreateNoteInput, SetNoteTagsInput, UpdateNoteInput } from './domain/noteStore';
+import type { ResourceStore, CreateResourceInput } from './domain/resourceStore';
+import type { SearchStore, SearchNotesInput } from './domain/searchStore';
 import { exactKeys, validationError } from './domain/validation';
 import { importError } from './profile/jexImport';
 
@@ -63,15 +62,54 @@ function fixedError(error: unknown, fallback: string): ProtocolError {
 }
 
 export function createHandler(session: SessionLike): RequestHandler {
-	const folderStore = new FolderStore();
-	const tagStore = new TagStore();
-	const noteStore = new NoteStore();
-	const resourceStore = new ResourceStore();
-	const searchStore = new SearchStore();
+	let codec: typeof import('./codec') | undefined;
+	let folderStore: FolderStore | undefined;
+	let tagStore: TagStore | undefined;
+	let noteStore: NoteStore | undefined;
+	let resourceStore: ResourceStore | undefined;
+	let searchStore: SearchStore | undefined;
+	const loadCodec = async () => {
+		codec ??= await import('./codec');
+		return codec;
+	};
+	const loadFolderStore = async () => {
+		if (!folderStore) {
+			const { FolderStore: Store } = await import('./domain/folderStore');
+			folderStore = new Store();
+		}
+		return folderStore;
+	};
+	const loadTagStore = async () => {
+		if (!tagStore) {
+			const { TagStore: Store } = await import('./domain/tagStore');
+			tagStore = new Store();
+		}
+		return tagStore;
+	};
+	const loadNoteStore = async () => {
+		if (!noteStore) {
+			const { NoteStore: Store } = await import('./domain/noteStore');
+			noteStore = new Store();
+		}
+		return noteStore;
+	};
+	const loadResourceStore = async () => {
+		if (!resourceStore) {
+			const { ResourceStore: Store } = await import('./domain/resourceStore');
+			resourceStore = new Store();
+		}
+		return resourceStore;
+	};
+	const loadSearchStore = async () => {
+		if (!searchStore) {
+			const { SearchStore: Store } = await import('./domain/searchStore');
+			searchStore = new Store();
+		}
+		return searchStore;
+	};
 	return {
 		handleRequest: async (request: RequestFrame): Promise<HandledRequest> => {
 			try {
-				if (!['hello', 'profileStatus', 'openProfile', 'shutdown'].includes(request.command)) registerItemClasses();
 				switch (request.command) {
 				case 'hello':
 					if (!hasOnly(request.params, [])) throw invalidRequest();
@@ -84,74 +122,74 @@ export function createHandler(session: SessionLike): RequestHandler {
 					return { response: successFrame(request.id, await session.open(request.params.profilePath)), shouldExit: false };
 				case 'decodeItem':
 					if (typeof request.params.raw !== 'string') throw invalidRequest();
-					return { response: successFrame(request.id, await decodeItem(request.params.raw)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadCodec()).decodeItem(request.params.raw)), shouldExit: false };
 				case 'encodeItem':
 					if (!isObject(request.params.item)) throw invalidRequest();
-					return { response: successFrame(request.id, await encodeItem(request.params.item)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadCodec()).encodeItem(request.params.item)), shouldExit: false };
 				case 'listFolders':
 					if (!isObject(request.params) || !hasOnly(request.params, [])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await folderStore.list()), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadFolderStore()).list()), shouldExit: false };
 				case 'createFolder':
 					if (!isObject(request.params) || !hasAllowed(request.params, ['parentId', 'title'], ['id'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await folderStore.create(request.params as CreateFolderInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadFolderStore()).create(request.params as CreateFolderInput)), shouldExit: false };
 				case 'updateFolder':
 					if (!isObject(request.params) || !hasAllowed(request.params, ['id', 'expectedUpdatedTime'], ['title', 'parentId'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await folderStore.update(request.params as UpdateFolderInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadFolderStore()).update(request.params as UpdateFolderInput)), shouldExit: false };
 				case 'trashFolder':
 					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await folderStore.trash(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadFolderStore()).trash(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
 				case 'listTags':
 					if (!isObject(request.params) || !hasOnly(request.params, [])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await tagStore.list()), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadTagStore()).list()), shouldExit: false };
 				case 'createTag':
 					if (!isObject(request.params) || !hasAllowed(request.params, ['title'], ['id'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await tagStore.create(request.params as CreateTagInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadTagStore()).create(request.params as CreateTagInput)), shouldExit: false };
 				case 'updateTag':
 					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime', 'title'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await tagStore.update(request.params as UpdateTagInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadTagStore()).update(request.params as UpdateTagInput)), shouldExit: false };
 				case 'deleteTag':
 					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await tagStore.delete(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadTagStore()).delete(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
 				case 'listNotes':
 					if (!isObject(request.params) || !hasAllowed(request.params, [], ['parentId', 'page', 'limit'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await noteStore.list(request.params)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadNoteStore()).list(request.params)), shouldExit: false };
 				case 'getNote':
 					if (!isObject(request.params) || !hasOnly(request.params, ['id'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await noteStore.get(request.params.id)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadNoteStore()).get(request.params.id)), shouldExit: false };
 				case 'createNote':
 					if (!isObject(request.params) || !hasAllowed(request.params, ['parentId', 'title', 'body'], ['id', 'isTodo', 'todoDue'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await noteStore.create(request.params as CreateNoteInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadNoteStore()).create(request.params as CreateNoteInput)), shouldExit: false };
 				case 'updateNote':
 					if (!isObject(request.params) || !hasAllowed(request.params, ['id', 'expectedUpdatedTime'], ['title', 'body', 'parentId', 'isTodo', 'todoDue', 'todoCompleted'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await noteStore.update(request.params as UpdateNoteInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadNoteStore()).update(request.params as UpdateNoteInput)), shouldExit: false };
 				case 'trashNote':
 					if (!isObject(request.params) || !hasOnly(request.params, ['id', 'expectedUpdatedTime'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await noteStore.trash(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadNoteStore()).trash(request.params.id, request.params.expectedUpdatedTime)), shouldExit: false };
 				case 'setNoteTags':
 					if (!isObject(request.params) || !hasOnly(request.params, ['noteId', 'expectedUpdatedTime', 'tagIds'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await noteStore.setNoteTags(request.params as SetNoteTagsInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadNoteStore()).setNoteTags(request.params as SetNoteTagsInput)), shouldExit: false };
 				case 'createResourceFromPath':
 					if (!isObject(request.params) || !hasAllowed(request.params, ['path'], ['title']) || typeof request.params.path !== 'string' || (request.params.title !== undefined && typeof request.params.title !== 'string')) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await resourceStore.createFromPath(request.params as CreateResourceInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadResourceStore()).createFromPath(request.params as CreateResourceInput)), shouldExit: false };
 				case 'listNoteResources':
 					if (!isObject(request.params) || !hasOnly(request.params, ['noteId']) || typeof request.params.noteId !== 'string') throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await resourceStore.listForNote(request.params.noteId)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadResourceStore()).listForNote(request.params.noteId)), shouldExit: false };
 				case 'shutdown':
 					if (!hasOnly(request.params, [])) throw invalidRequest();
 					await session.close();
@@ -194,7 +232,7 @@ export function createHandler(session: SessionLike): RequestHandler {
 				case 'searchNotes':
 					if (!isObject(request.params) || !hasAllowed(request.params, ['query'], ['limit'])) throw validationError();
 					requireOpen(session);
-					return { response: successFrame(request.id, await searchStore.search(request.params as SearchNotesInput)), shouldExit: false };
+					return { response: successFrame(request.id, await (await loadSearchStore()).search(request.params as SearchNotesInput)), shouldExit: false };
 				default:
 					return { response: failureFrame(request.id, 'UNKNOWN_COMMAND', '未知命令'), shouldExit: false };
 				}
