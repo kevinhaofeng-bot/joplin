@@ -26,7 +26,7 @@ packages/app-lite-native/scripts/bundle.sh
 open "packages/app-lite-native/dist/Joplin Lite Native.app"
 ```
 
-## 当前功能（0.3.0 图片附件 MVP）
+## 当前功能（0.3.1 图片附件 MVP）
 
 - 原生笔记列表、实时搜索和软删除：低摩擦地接近 Evernote 的列表使用感
 - 新建笔记、标题与正文编辑、自动保存；标题独立保存，不从正文首行覆盖
@@ -48,10 +48,11 @@ open "packages/app-lite-native/dist/Joplin Lite Native.app"
 - App 包体约 2.4 MB；空资料库稳定后 RSS 约 46–49 MB，载入并编辑笔记后一次复测约 57 MB。
 - 进程没有子进程；release 二进制的动态链接中没有 WebKit 或 JavaScriptCore。
 
-## 0.3.0 图片附件验收
+## 0.3.1 图片附件验收
 
 - PNG/JPEG 图片粘贴、10-MiB 上限、真实编码校验、canonical marker、blob 持久化与重启恢复已覆盖自动化测试和签名临时 profile smoke。
 - Finder JPEG 跨应用拖入、退出重开与附件恢复已完成签名临时 profile 端到端验收。
+- Finder 复制单个本地 PNG/JPEG 文件后，粘贴优先读取原始 file URL 的文件名和字节；Finder 同时提供的图标 PNG/TIFF 预览不会被误存为 `clipboard.png`。无 file URL 的 PNG/TIFF/JPEG 像素剪贴板仍按原路径导入；无效、远程、promised、多文件或超限 file URL 会拒绝且不回退到图标预览。
 
 ## 当前限制
 

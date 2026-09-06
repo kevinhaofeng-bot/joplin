@@ -2067,88 +2067,97 @@ impl AppDelegate {
 
     fn read_pasteboard_image(&self) -> PasteboardImage {
         let pasteboard = NSPasteboard::generalPasteboard();
-        let png_type = unsafe { NSPasteboardTypePNG };
-        let tiff_type = unsafe { NSPasteboardTypeTIFF };
-        let file_url_type = unsafe { NSPasteboardTypeFileURL };
-        if let Some(data) = pasteboard.dataForType(png_type) {
-            return normalize_paste_image(data.to_vec(), "clipboard.png", "image/png");
-        }
-        if let Some(data) = pasteboard.dataForType(tiff_type) {
-            return normalize_tiff(data.to_vec(), "clipboard.png");
-        }
-        let jpeg_type = NSString::from_str("public.jpeg");
-        if let Some(data) = pasteboard.dataForType(&jpeg_type) {
-            return normalize_paste_image(data.to_vec(), "clipboard.jpg", "image/jpeg");
-        }
-        if pasteboard.types().as_ref().is_some_and(|types| {
-            types.iter().any(|item| {
-                let item: &NSString = item.as_ref();
-                item == file_url_type
-            })
-        }) {
-            if pasteboard.types().as_ref().is_some_and(|types| {
-                types.iter().any(|item| {
-                    let item: &NSString = item.as_ref();
-                    is_promised_pasteboard_type(item.to_string().as_str())
-                })
-            }) {
-                return PasteboardImage::Rejected("图片未插入：格式不支持");
-            }
-            let Some(items) = pasteboard.pasteboardItems() else {
-                return PasteboardImage::Rejected("图片未插入：格式不支持");
-            };
-            if items.len() != 1 {
-                return PasteboardImage::Rejected("图片未插入：格式不支持");
-            }
-            let Some(url_text) = pasteboard.stringForType(file_url_type) else {
-                return PasteboardImage::Rejected("图片未插入：格式不支持");
-            };
-            let Some(url) = NSURL::initWithString(NSURL::alloc(), &url_text) else {
-                return PasteboardImage::Rejected("图片未插入：格式不支持");
-            };
-            let host = url.host().map(|host| host.to_string());
-            if !url.isFileURL() || !is_local_file_url_host(host.as_deref()) {
-                return PasteboardImage::Rejected("图片未插入：格式不支持");
-            }
-            let Some(path) = url.path() else {
-                return PasteboardImage::Rejected("图片未插入：格式不支持");
-            };
-            let path = std::path::PathBuf::from(path.to_string());
-            let extension = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(str::to_ascii_lowercase);
-            let mime = match extension.as_deref() {
-                Some("png") => ("image/png", "png"),
-                Some("jpg") | Some("jpeg") => ("image/jpeg", "jpg"),
-                _ => return PasteboardImage::Rejected("图片未插入：格式不支持"),
-            };
-            let title = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("图片")
-                .to_owned();
-            let bytes = match read_regular_image_file(&path) {
-                Ok(bytes) => bytes,
-                Err(PasteFileError::TooLarge) => {
-                    return PasteboardImage::Rejected("图片未插入：超过 10 MB");
-                }
-                Err(PasteFileError::Invalid) => {
-                    return PasteboardImage::Rejected("图片未插入：格式不支持");
-                }
-            };
-            if !valid_image_bytes_for_mime(&bytes, mime.0) {
-                return PasteboardImage::Rejected("图片未插入：格式不支持");
-            }
-            return PasteboardImage::Data {
-                bytes,
-                title,
-                mime: mime.0.to_owned(),
-            };
-        }
-        PasteboardImage::NotImage
+        read_pasteboard_image_from(&pasteboard)
     }
+}
 
+fn read_pasteboard_image_from(pasteboard: &NSPasteboard) -> PasteboardImage {
+    let png_type = unsafe { NSPasteboardTypePNG };
+    let tiff_type = unsafe { NSPasteboardTypeTIFF };
+    let file_url_type = unsafe { NSPasteboardTypeFileURL };
+    if pasteboard.types().as_ref().is_some_and(|types| {
+        types.iter().any(|item| {
+            let item: &NSString = item.as_ref();
+            item == file_url_type
+        })
+    }) {
+        return read_file_url_pasteboard_image(pasteboard);
+    }
+    if let Some(data) = pasteboard.dataForType(png_type) {
+        return normalize_paste_image(data.to_vec(), "clipboard.png", "image/png");
+    }
+    if let Some(data) = pasteboard.dataForType(tiff_type) {
+        return normalize_tiff(data.to_vec(), "clipboard.png");
+    }
+    let jpeg_type = NSString::from_str("public.jpeg");
+    if let Some(data) = pasteboard.dataForType(&jpeg_type) {
+        return normalize_paste_image(data.to_vec(), "clipboard.jpg", "image/jpeg");
+    }
+    PasteboardImage::NotImage
+}
+
+fn read_file_url_pasteboard_image(pasteboard: &NSPasteboard) -> PasteboardImage {
+    let file_url_type = unsafe { NSPasteboardTypeFileURL };
+    if pasteboard.types().as_ref().is_some_and(|types| {
+        types.iter().any(|item| {
+            let item: &NSString = item.as_ref();
+            is_promised_pasteboard_type(item.to_string().as_str())
+        })
+    }) {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    }
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    };
+    if items.len() != 1 {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    }
+    let Some(url_text) = pasteboard.stringForType(file_url_type) else {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    };
+    let Some(url) = NSURL::initWithString(NSURL::alloc(), &url_text) else {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    };
+    let host = url.host().map(|host| host.to_string());
+    if !url.isFileURL() || !is_local_file_url_host(host.as_deref()) {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    }
+    let Some(path) = url.path() else {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    };
+    let path = PathBuf::from(path.to_string());
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let mime = match extension.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        _ => return PasteboardImage::Rejected("图片未插入：格式不支持"),
+    };
+    let title = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("图片")
+        .to_owned();
+    let bytes = match read_regular_image_file(&path) {
+        Ok(bytes) => bytes,
+        Err(PasteFileError::TooLarge) => {
+            return PasteboardImage::Rejected("图片未插入：超过 10 MB");
+        }
+        Err(PasteFileError::Invalid) => return PasteboardImage::Rejected("图片未插入：格式不支持"),
+    };
+    if !valid_image_bytes_for_mime(&bytes, mime) {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    }
+    PasteboardImage::Data {
+        bytes,
+        title,
+        mime: mime.to_owned(),
+    }
+}
+
+impl AppDelegate {
     fn insert_image_data(&self, bytes: &[u8], title: &str, mime: &str) -> bool {
         self.insert_image_data_with_save(bytes, title, mime)
     }
@@ -3142,23 +3151,32 @@ mod tests {
         editor_segments_with_ranges, ensure_notes_database_file, format_decision, format_target,
         image_signature_matches_mime, inline_attachment_with_alt, inline_image_display_size,
         is_local_file_url_host, is_promised_pasteboard_type, load_save_status, paste_route,
-        read_drag_image_file, read_regular_image_file, rtf_load_decision, rtf_save_plan,
-        rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
-        valid_image_bytes_for_mime, validate_canonical_data_dir,
+        read_drag_image_file, read_pasteboard_image_from, read_regular_image_file,
+        rtf_load_decision, rtf_save_plan, rtf_text_matches_body, sanitized_rtf_from_editor,
+        typing_trait_operation, valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
     use joplin_lite_native::core::StoredResource;
     use objc2::{AnyThread, runtime::AnyObject};
     use objc2_app_kit::{
         NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
-        NSBitmapImageFileType, NSBitmapImageRep, NSTextAttachment,
+        NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypeFileURL,
+        NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSTextAttachment,
     };
     use objc2_foundation::{
         NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSSize,
-        NSString,
+        NSString, NSURL,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    const TEST_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
 
     #[test]
     fn editor_projection_preserves_attachment_order_without_binary_rtf() {
@@ -3403,6 +3421,102 @@ mod tests {
             read_drag_image_file(&wrong_extension),
             Err(PasteFileError::Invalid)
         ));
+    }
+
+    #[test]
+    fn file_url_wins_over_finder_icon_previews_on_the_pasteboard() {
+        const ICON_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("original.jpg");
+        let rep = NSBitmapImageRep::initWithData(
+            NSBitmapImageRep::alloc(),
+            &NSData::with_bytes(ICON_PNG),
+        )
+        .unwrap();
+        let empty_keys: [&NSString; 0] = [];
+        let empty_values: [&AnyObject; 0] = [];
+        let properties =
+            NSDictionary::<NSString, AnyObject>::from_slices(&empty_keys, &empty_values);
+        let source_data = unsafe {
+            rep.representationUsingType_properties(NSBitmapImageFileType::JPEG, &properties)
+        }
+        .unwrap();
+        fs::write(&source, source_data.to_vec()).unwrap();
+        let source_bytes = fs::read(&source).unwrap();
+        let icon_tiff = unsafe {
+            rep.representationUsingType_properties(NSBitmapImageFileType::TIFF, &properties)
+        }
+        .unwrap();
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        pasteboard.clearContents();
+        assert!(
+            pasteboard.setData_forType(Some(&NSData::with_bytes(ICON_PNG)), unsafe {
+                NSPasteboardTypePNG
+            },)
+        );
+        assert!(pasteboard.setData_forType(Some(&icon_tiff), unsafe { NSPasteboardTypeTIFF },));
+        let source_url = NSURL::fileURLWithPath(&NSString::from_str(source.to_str().unwrap()));
+        let source_url_string = source_url.absoluteString().unwrap();
+        assert!(
+            pasteboard.setString_forType(&source_url_string, unsafe { NSPasteboardTypeFileURL },)
+        );
+
+        match read_pasteboard_image_from(&pasteboard) {
+            PasteboardImage::Data { bytes, title, mime } => {
+                assert_eq!(bytes, source_bytes);
+                assert_eq!(title, "original.jpg");
+                assert_eq!(mime, "image/jpeg");
+            }
+            PasteboardImage::NotImage => panic!("expected source file, got no image"),
+            PasteboardImage::Rejected(message) => {
+                panic!("expected source file, got rejection: {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_file_url_rejects_without_falling_back_to_icon_pixels() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        pasteboard.clearContents();
+        assert!(
+            pasteboard.setData_forType(Some(&NSData::with_bytes(TEST_PNG)), unsafe {
+                NSPasteboardTypePNG
+            },)
+        );
+        let remote_url = NSString::from_str("file://remote.example/image.png");
+        assert!(pasteboard.setString_forType(&remote_url, unsafe { NSPasteboardTypeFileURL },));
+
+        assert!(matches!(
+            read_pasteboard_image_from(&pasteboard),
+            PasteboardImage::Rejected("图片未插入：格式不支持")
+        ));
+    }
+
+    #[test]
+    fn pixel_png_without_file_url_remains_supported() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        pasteboard.clearContents();
+        assert!(
+            pasteboard.setData_forType(Some(&NSData::with_bytes(TEST_PNG)), unsafe {
+                NSPasteboardTypePNG
+            },)
+        );
+
+        match read_pasteboard_image_from(&pasteboard) {
+            PasteboardImage::Data { bytes, title, mime } => {
+                assert_eq!(bytes, TEST_PNG);
+                assert_eq!(title, "clipboard.png");
+                assert_eq!(mime, "image/png");
+            }
+            PasteboardImage::NotImage => panic!("expected pixel clipboard image"),
+            PasteboardImage::Rejected(message) => panic!("unexpected rejection: {message}"),
+        }
     }
 
     #[test]
