@@ -58,7 +58,7 @@ define_class!(
             list_stack.setEdgeInsets(objc2_foundation::NSEdgeInsets { top: 8.0, left: 8.0, bottom: 8.0, right: 8.0 });
             list_scroll.setDocumentView(Some(&list_stack));
             window.contentView().unwrap().addSubview(&list_scroll);
-            let search_field = NSSearchField::initWithFrame(NSSearchField::alloc(mtm), NSRect::new(NSPoint::new(16.0, 600.0), NSSize::new(280.0, 32.0)));
+            let search_field = NSSearchField::initWithFrame(NSSearchField::alloc(mtm), NSRect::new(NSPoint::new(146.0, 600.0), NSSize::new(150.0, 32.0)));
             search_field.setPlaceholderString(Some(ns_string!("搜索笔记")));
             search_field.setContinuous(true);
             unsafe {
@@ -79,14 +79,14 @@ define_class!(
             }
             let body = NSTextView::initWithFrame(NSTextView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(620.0, 480.0)));
             body.setEditable(true); body.setRichText(true); body.setAllowsUndo(true); body.setFont(Some(&NSFont::systemFontOfSize(17.0)));
-            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), NSRect::new(NSPoint::new(328.0, 48.0), NSSize::new(724.0, 530.0)));
+            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), NSRect::new(NSPoint::new(328.0, 48.0), NSSize::new(724.0, 500.0)));
             scroll.setHasVerticalScroller(true); scroll.setDocumentView(Some(&body));
             window.contentView().unwrap().addSubview(&scroll);
             let button = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("新建笔记"), Some(self), Some(sel!(newNote:)), mtm) };
-            button.setFrame(NSRect::new(NSPoint::new(312.0, 600.0), NSSize::new(140.0, 32.0)));
+            button.setFrame(NSRect::new(NSPoint::new(16.0, 600.0), NSSize::new(118.0, 32.0)));
             window.contentView().unwrap().addSubview(&button);
             let delete_button = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("删除"), Some(self), Some(sel!(deleteNote:)), mtm) };
-            delete_button.setFrame(NSRect::new(NSPoint::new(460.0, 600.0), NSSize::new(100.0, 32.0)));
+            delete_button.setFrame(NSRect::new(NSPoint::new(16.0, 560.0), NSSize::new(118.0, 28.0)));
             window.contentView().unwrap().addSubview(&delete_button);
             let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("主菜单"));
             let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("应用"));
@@ -371,9 +371,19 @@ impl AppDelegate {
             } else {
                 &note.title
             };
+            let summary = note
+                .body
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("暂无正文");
+            let label = format!(
+                "{}\n{}",
+                title,
+                summary.chars().take(32).collect::<String>()
+            );
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    &objc2_foundation::NSString::from_str(title),
+                    &objc2_foundation::NSString::from_str(&label),
                     Some(self),
                     Some(sel!(selectNote:)),
                     self.mtm(),
@@ -381,6 +391,7 @@ impl AppDelegate {
             };
             button.setTag(index as isize);
             button.setAlignment(objc2_app_kit::NSTextAlignment::Left);
+            button.setBordered(false);
             stack.addArrangedSubview(&button);
             self.ivars().note_buttons.borrow_mut().push(button);
         }
