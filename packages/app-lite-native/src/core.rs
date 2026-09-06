@@ -96,18 +96,16 @@ impl NoteRepository {
         let connection = Connection::open_with_flags(&path, flags)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        migrate_schema(&connection)?;
         let resource_store = ResourceStore::new(
             path.parent()
                 .ok_or(CoreError::InvalidDatabasePath)?
                 .to_path_buf(),
         )?;
-        let repository = Self {
+        migrate_schema(&connection)?;
+        Ok(Self {
             connection: Mutex::new(connection),
             resource_store,
-        };
-        repository.rebuild_search_index()?;
-        Ok(repository)
+        })
     }
 
     pub fn create_note(&self, input: CreateNote) -> Result<Note, CoreError> {
@@ -210,18 +208,28 @@ impl NoteRepository {
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT OR IGNORE INTO resource_blobs (sha256, size) VALUES (?1, ?2)",
-            params![blob.sha256, blob.size as i64],
+            "INSERT OR IGNORE INTO resource_blobs
+             (sha256, size, mime, relative_path, created_time) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                blob.sha256,
+                blob.size as i64,
+                input.mime,
+                format!("resources/blobs/{}", blob.sha256),
+                now
+            ],
         )?;
         transaction.execute(
-            "INSERT INTO resources (id, sha256, title, mime, file_extension, created_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO resources
+             (id, sha256, title, mime, file_extension, created_time, size, updated_time, deleted_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
             params![
                 blob.id,
                 blob.sha256,
                 input.title,
                 input.mime,
                 input.file_extension,
+                now,
+                blob.size as i64,
                 now
             ],
         )?;
@@ -244,8 +252,8 @@ impl NoteRepository {
             let connection = self.connection.lock().expect("repository mutex poisoned");
             connection
                 .query_row(
-                    "SELECT r.id, r.sha256, b.size, r.title, r.mime, r.file_extension
-                     FROM resources r JOIN resource_blobs b ON b.sha256 = r.sha256
+                    "SELECT r.id, r.sha256, r.size, r.title, r.mime, r.file_extension
+                     FROM resources r
                      WHERE r.id = ?1",
                     [id],
                     |row| {
@@ -328,8 +336,10 @@ impl NoteRepository {
         transaction.execute("DELETE FROM note_resources WHERE note_id = ?1", [id])?;
         for (position, resource_id) in input.resource_ids.iter().enumerate() {
             transaction.execute(
-                "INSERT INTO note_resources (note_id, resource_id, position) VALUES (?1, ?2, ?3)",
-                params![id, resource_id, position as i64],
+                "INSERT INTO note_resources
+                 (note_id, resource_id, position, is_associated, last_seen_time)
+                 VALUES (?1, ?2, ?3, 1, ?4)",
+                params![id, resource_id, position as i64, timestamp()],
             )?;
         }
         transaction.commit()?;
@@ -399,33 +409,13 @@ impl NoteRepository {
         let fallback_rows = fallback.query_map([query], row_to_note)?;
         Ok(fallback_rows.collect::<Result<Vec<_>, _>>()?)
     }
-
-    fn rebuild_search_index(&self) -> Result<(), CoreError> {
-        let connection = self.connection.lock().expect("repository mutex poisoned");
-        connection.execute("DELETE FROM notes_fts", [])?;
-        let mut statement =
-            connection.prepare("SELECT id, title, body_text FROM notes WHERE deleted_time = 0")?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let values = rows.collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        for (id, title, body_text) in values {
-            connection.execute(
-                "INSERT INTO notes_fts (id, title, body_text) VALUES (?1, ?2, ?3)",
-                params![id, title, body_text],
-            )?;
-        }
-        Ok(())
-    }
 }
 
 fn migrate_schema(connection: &Connection) -> Result<(), CoreError> {
-    connection.execute_batch(
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    let legacy = version < 2;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS notes (
             id TEXT PRIMARY KEY NOT NULL,
@@ -438,50 +428,169 @@ fn migrate_schema(connection: &Connection) -> Result<(), CoreError> {
             updated_time INTEGER NOT NULL,
             deleted_time INTEGER NOT NULL DEFAULT 0
         );
-        ",
-    )?;
-    let columns = connection
-        .prepare("PRAGMA table_info(notes)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|column| column == "body_rtf") {
-        connection.execute(
-            "ALTER TABLE notes ADD COLUMN body_rtf BLOB NOT NULL DEFAULT X''",
-            [],
-        )?;
-    }
-    if !columns.iter().any(|column| column == "body_text") {
-        connection.execute(
-            "ALTER TABLE notes ADD COLUMN body_text TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-    }
-    connection.execute("UPDATE notes SET body_text = body WHERE body_text = ''", [])?;
-    connection.execute_batch(
-        "
         CREATE TABLE IF NOT EXISTS resource_blobs (
             sha256 TEXT PRIMARY KEY NOT NULL,
-            size INTEGER NOT NULL
+            size INTEGER NOT NULL DEFAULT 0,
+            mime TEXT NOT NULL DEFAULT '',
+            relative_path TEXT NOT NULL DEFAULT '',
+            created_time INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS resources (
             id TEXT PRIMARY KEY NOT NULL,
             sha256 TEXT NOT NULL REFERENCES resource_blobs(sha256),
             title TEXT NOT NULL DEFAULT '',
-            mime TEXT NOT NULL,
-            file_extension TEXT NOT NULL,
-            created_time INTEGER NOT NULL
+            mime TEXT NOT NULL DEFAULT '',
+            file_extension TEXT NOT NULL DEFAULT '',
+            created_time INTEGER NOT NULL DEFAULT 0,
+            size INTEGER NOT NULL DEFAULT 0,
+            updated_time INTEGER NOT NULL DEFAULT 0,
+            deleted_time INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS note_resources (
             note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
             resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE RESTRICT,
-            position INTEGER NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            is_associated INTEGER NOT NULL DEFAULT 1,
+            last_seen_time INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (note_id, resource_id)
         );
-        DROP TABLE IF EXISTS notes_fts;
-        CREATE VIRTUAL TABLE notes_fts USING fts5(id UNINDEXED, title, body_text);
-        PRAGMA user_version = 2;
         ",
     )?;
+    ensure_column(
+        &transaction,
+        "notes",
+        "body_rtf",
+        "BLOB NOT NULL DEFAULT X''",
+    )?;
+    ensure_column(
+        &transaction,
+        "notes",
+        "body_text",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &transaction,
+        "resource_blobs",
+        "size",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &transaction,
+        "resource_blobs",
+        "mime",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &transaction,
+        "resource_blobs",
+        "relative_path",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &transaction,
+        "resource_blobs",
+        "created_time",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &transaction,
+        "resources",
+        "size",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &transaction,
+        "resources",
+        "created_time",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &transaction,
+        "resources",
+        "updated_time",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &transaction,
+        "resources",
+        "deleted_time",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &transaction,
+        "note_resources",
+        "is_associated",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        &transaction,
+        "note_resources",
+        "last_seen_time",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    if legacy {
+        transaction.execute("UPDATE notes SET body_text = body WHERE body_text = ''", [])?;
+    }
+    let fts_columns = table_columns(&transaction, "notes_fts")?;
+    let rebuild_fts = legacy
+        || !fts_columns.iter().any(|column| column == "body_text")
+        || fts_columns.iter().any(|column| column == "body");
+    if rebuild_fts {
+        transaction.execute_batch(
+            "DROP TABLE IF EXISTS notes_fts;
+             CREATE VIRTUAL TABLE notes_fts USING fts5(id UNINDEXED, title, body_text);",
+        )?;
+        let mut statement =
+            transaction.prepare("SELECT id, title, body_text FROM notes WHERE deleted_time = 0")?;
+        let values = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (id, title, body_text) in values {
+            transaction.execute(
+                "INSERT INTO notes_fts (id, title, body_text) VALUES (?1, ?2, ?3)",
+                params![id, title, body_text],
+            )?;
+        }
+    }
+    if version < 2 {
+        transaction.execute_batch("PRAGMA user_version = 2;")?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn table_columns(
+    connection: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Result<Vec<String>, CoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn ensure_column(
+    connection: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), CoreError> {
+    if !table_columns(connection, table)?
+        .iter()
+        .any(|name| name == column)
+    {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -652,6 +761,29 @@ mod tests {
                 .body_text,
             "legacy body"
         );
+        let connection = repo.connection.lock().unwrap();
+        for (table, column) in [
+            ("resource_blobs", "mime"),
+            ("resource_blobs", "relative_path"),
+            ("resource_blobs", "created_time"),
+            ("resources", "size"),
+            ("resources", "updated_time"),
+            ("resources", "deleted_time"),
+            ("note_resources", "is_associated"),
+            ("note_resources", "last_seen_time"),
+        ] {
+            let found: i64 = connection
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "missing {table}.{column}");
+        }
+        drop(connection);
         let first = repo
             .import_resource(png_import(TINY_PNG, "first.png"))
             .unwrap();
@@ -692,7 +824,10 @@ mod tests {
     fn search_uses_alt_text_but_not_digest_or_path_text() {
         let temp = tempdir().unwrap();
         let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
-        let id = "0123456789abcdef0123456789abcdef";
+        let resource = repo
+            .import_resource(png_import(TINY_PNG, "screenshot.png"))
+            .unwrap();
+        let id = resource.id.as_str();
         let body = format!("证据\n\n{}", markdown_marker(id, "庭审截图 [1]").unwrap());
         let note = repo
             .create_note(CreateNote {
@@ -704,6 +839,42 @@ mod tests {
             .unwrap();
         assert_eq!(note.body_text, project_search_text(&body));
         assert_eq!(repo.search("庭审截图").unwrap().len(), 1);
-        assert!(repo.search(id).unwrap().is_empty());
+        assert!(repo.search(&resource.sha256).unwrap().is_empty());
+        assert!(
+            repo.search(resource.path.to_string_lossy().as_ref())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_image_projection_survives_reopen_without_digest_search_hits() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("notes.sqlite");
+        let repo = NoteRepository::open(&db).unwrap();
+        let resource = repo
+            .import_resource(png_import(TINY_PNG, "empty-alt.png"))
+            .unwrap();
+        let body = markdown_marker(&resource.id, "").unwrap();
+        let note = repo
+            .create_note(CreateNote {
+                title: "纯图片".into(),
+                body,
+                body_rtf: Vec::new(),
+                is_draft: false,
+            })
+            .unwrap();
+        assert!(note.body_text.is_empty());
+        drop(repo);
+        let reopened = NoteRepository::open(&db).unwrap();
+        assert!(
+            reopened
+                .get_note(&note.id)
+                .unwrap()
+                .unwrap()
+                .body_text
+                .is_empty()
+        );
+        assert!(reopened.search(&resource.sha256).unwrap().is_empty());
     }
 }

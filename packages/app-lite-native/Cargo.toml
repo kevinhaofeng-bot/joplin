@@ -13,6 +13,7 @@ name = "joplin-lite-native"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
