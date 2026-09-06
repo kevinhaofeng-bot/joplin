@@ -4,9 +4,9 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSButton, NSControlTextEditingDelegate, NSEventModifierFlags, NSMenu, NSMenuItem, NSScrollView,
-    NSSearchField, NSStackView, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
-    NSTextViewDelegate, NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate,
+    NSButton, NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSMenu, NSMenuItem,
+    NSScrollView, NSSearchField, NSStackView, NSTextDelegate, NSTextField, NSTextFieldDelegate,
+    NSTextView, NSTextViewDelegate, NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate,
     NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -44,7 +44,8 @@ define_class!(
         fn application_did_finish_launching(&self, notification: &NSNotification) {
             let mtm = self.mtm();
             let application = notification.object().unwrap().downcast::<NSApplication>().unwrap();
-            let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(NSWindow::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(980.0, 680.0)), NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable, NSBackingStoreType::Buffered, false) };
+            let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(NSWindow::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1100.0, 720.0)), NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable, NSBackingStoreType::Buffered, false) };
+            window.setContentMinSize(NSSize::new(860.0, 560.0));
             unsafe { window.setReleasedWhenClosed(false) };
             window.setTitle(ns_string!("Joplin Lite Native"));
             let list_scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), NSRect::new(NSPoint::new(16.0, 32.0), NSSize::new(280.0, 550.0)));
@@ -63,13 +64,15 @@ define_class!(
                 search_field.setAction(Some(sel!(searchNotes:)));
             }
             window.contentView().unwrap().addSubview(&search_field);
-            let title_field = NSTextField::initWithFrame(NSTextField::alloc(mtm), NSRect::new(NSPoint::new(312.0, 550.0), NSSize::new(636.0, 32.0)));
+            let title_field = NSTextField::initWithFrame(NSTextField::alloc(mtm), NSRect::new(NSPoint::new(328.0, 600.0), NSSize::new(724.0, 42.0)));
             title_field.setStringValue(ns_string!(""));
             title_field.setEditable(true);
+            title_field.setBezeled(false); title_field.setDrawsBackground(false);
+            title_field.setFont(Some(&NSFont::systemFontOfSize_weight(28.0, 0.5)));
             window.contentView().unwrap().addSubview(&title_field);
             let body = NSTextView::initWithFrame(NSTextView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(620.0, 480.0)));
-            body.setEditable(true); body.setRichText(true); body.setAllowsUndo(true);
-            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), NSRect::new(NSPoint::new(312.0, 32.0), NSSize::new(636.0, 500.0)));
+            body.setEditable(true); body.setRichText(true); body.setAllowsUndo(true); body.setFont(Some(&NSFont::systemFontOfSize(17.0)));
+            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), NSRect::new(NSPoint::new(328.0, 48.0), NSSize::new(724.0, 530.0)));
             scroll.setHasVerticalScroller(true); scroll.setDocumentView(Some(&body));
             window.contentView().unwrap().addSubview(&scroll);
             let button = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("新建笔记"), Some(self), Some(sel!(newNote:)), mtm) };
