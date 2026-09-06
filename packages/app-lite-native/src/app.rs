@@ -4,14 +4,15 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSButton, NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSMenu, NSMenuItem,
-    NSScrollView, NSSearchField, NSStackView, NSTextDelegate, NSTextField, NSTextFieldDelegate,
-    NSTextView, NSTextViewDelegate, NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSButton, NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSFontAttributeName,
+    NSFontTraitMask, NSMenu, NSMenuItem, NSMutableAttributedStringAppKitAdditions, NSScrollView,
+    NSSearchField, NSStackView, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
+    NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect,
-    NSSize, ns_string,
+    MainThreadMarker, NSData, NSMutableCopying, NSNotification, NSNumber, NSObject,
+    NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, ns_string,
 };
 use std::cell::{OnceCell, RefCell};
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ struct AppDelegateIvars {
     notes: RefCell<Vec<Note>>,
     title_field: OnceCell<Retained<NSTextField>>,
     body_view: OnceCell<Retained<NSTextView>>,
+    loading_guard: RefCell<bool>,
     search_field: OnceCell<Retained<NSSearchField>>,
     list_stack: OnceCell<Retained<NSStackView>>,
     note_buttons: RefCell<Vec<Retained<NSButton>>>,
@@ -70,6 +72,11 @@ define_class!(
             title_field.setBezeled(false); title_field.setDrawsBackground(false);
             title_field.setFont(Some(&NSFont::systemFontOfSize_weight(28.0, 0.5)));
             window.contentView().unwrap().addSubview(&title_field);
+            for (label, action, width, x) in [("B", sel!(toggleBoldText:), 36.0, 328.0), ("I", sel!(toggleItalicText:), 36.0, 368.0), ("U", sel!(toggleUnderlineText:), 36.0, 408.0), ("清除格式", sel!(clearFormatting:), 92.0, 448.0)] {
+                let format_button = unsafe { NSButton::buttonWithTitle_target_action(&objc2_foundation::NSString::from_str(label), Some(self), Some(action), mtm) };
+                format_button.setFrame(NSRect::new(NSPoint::new(x, 560.0), NSSize::new(width, 30.0)));
+                window.contentView().unwrap().addSubview(&format_button);
+            }
             let body = NSTextView::initWithFrame(NSTextView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(620.0, 480.0)));
             body.setEditable(true); body.setRichText(true); body.setAllowsUndo(true); body.setFont(Some(&NSFont::systemFontOfSize(17.0)));
             let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), NSRect::new(NSPoint::new(328.0, 48.0), NSSize::new(724.0, 530.0)));
@@ -123,13 +130,18 @@ define_class!(
             edit_menu_item.setSubmenu(Some(&edit_menu));
             menu.addItem(&edit_menu_item);
             let format_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("格式"));
-            let bold_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("粗体"), Some(sel!(toggleBoldface:)), ns_string!("b")) };
-            let italic_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("斜体"), Some(sel!(toggleItalics:)), ns_string!("i")) };
-            let underline_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("下划线"), Some(sel!(underline:)), ns_string!("u")) };
+            let bold_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("粗体"), Some(sel!(toggleBoldText:)), ns_string!("b")) };
+            let italic_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("斜体"), Some(sel!(toggleItalicText:)), ns_string!("i")) };
+            let underline_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("下划线"), Some(sel!(toggleUnderlineText:)), ns_string!("u")) };
             for item in [&bold_item, &italic_item, &underline_item] {
                 unsafe { item.setTarget(None); }
                 item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
                 format_menu.addItem(item);
+            }
+            unsafe {
+                bold_item.setTarget(Some(self));
+                italic_item.setTarget(Some(self));
+                underline_item.setTarget(Some(self));
             }
             let format_menu_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("格式"), None, ns_string!("")) };
             format_menu_item.setSubmenu(Some(&format_menu));
@@ -140,6 +152,7 @@ define_class!(
             self.ivars().window.set(window).unwrap();
             self.ivars().title_field.set(title_field.clone()).unwrap();
             self.ivars().body_view.set(body.clone()).unwrap();
+            *self.ivars().loading_guard.borrow_mut() = false;
             self.ivars().search_field.set(search_field).unwrap();
             self.ivars().list_stack.set(list_stack).unwrap();
             unsafe { title_field.setDelegate(Some(ProtocolObject::from_ref(self))); }
@@ -173,6 +186,14 @@ define_class!(
     unsafe impl NSTextFieldDelegate for AppDelegate {}
     unsafe impl NSTextViewDelegate for AppDelegate {}
     impl AppDelegate {
+        #[unsafe(method(toggleBoldText:))]
+        fn toggle_bold_text(&self, _sender: &NSObject) { self.apply_format(TextFormat::Bold); }
+        #[unsafe(method(toggleItalicText:))]
+        fn toggle_italic_text(&self, _sender: &NSObject) { self.apply_format(TextFormat::Italic); }
+        #[unsafe(method(toggleUnderlineText:))]
+        fn toggle_underline_text(&self, _sender: &NSObject) { self.apply_format(TextFormat::Underline); }
+        #[unsafe(method(clearFormatting:))]
+        fn clear_formatting(&self, _sender: &NSObject) { self.apply_format(TextFormat::Clear); }
         #[unsafe(method(undoText:))]
         fn undo_text(&self, _sender: &NSObject) {
             if let Some(manager) = self.ivars().body_view.get().and_then(|body| body.undoManager()) && manager.canUndo() {
@@ -216,7 +237,91 @@ define_class!(
 );
 
 impl AppDelegate {
+    fn apply_format(&self, format: TextFormat) {
+        let Some(body) = self.ivars().body_view.get() else {
+            return;
+        };
+        let range = body.selectedRange();
+        if range.length == 0 {
+            self.apply_typing_format(body, format);
+            return;
+        }
+        let Some(storage) = (unsafe { body.textStorage() }) else {
+            return;
+        };
+        let font_key = unsafe { NSFontAttributeName };
+        let underline_key = unsafe { NSUnderlineStyleAttributeName };
+        match format {
+            TextFormat::Bold => storage.applyFontTraits_range(NSFontTraitMask::BoldFontMask, range),
+            TextFormat::Italic => {
+                storage.applyFontTraits_range(NSFontTraitMask::ItalicFontMask, range)
+            }
+            TextFormat::Underline => unsafe {
+                let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
+                storage.addAttribute_value_range(underline_key, &value, range);
+            },
+            TextFormat::Clear => {
+                storage.removeAttribute_range(font_key, range);
+                storage.removeAttribute_range(underline_key, range);
+                let font = NSFont::systemFontOfSize(17.0);
+                unsafe {
+                    storage.addAttribute_value_range(font_key, &font, range);
+                }
+            }
+        }
+        self.save_current_note();
+    }
+
+    fn apply_typing_format(&self, body: &NSTextView, format: TextFormat) {
+        let attributes = body.typingAttributes();
+        let mutable = attributes.mutableCopy();
+        let font_key = unsafe { NSFontAttributeName };
+        let underline_key = unsafe { NSUnderlineStyleAttributeName };
+        match format {
+            TextFormat::Bold | TextFormat::Italic => {
+                let Some(object) = attributes.objectForKey(font_key) else {
+                    return;
+                };
+                let Ok(font) = object.downcast::<NSFont>() else {
+                    return;
+                };
+                let manager = objc2_app_kit::NSFontManager::sharedFontManager(self.mtm());
+                let trait_mask = if format == TextFormat::Bold {
+                    NSFontTraitMask::BoldFontMask
+                } else {
+                    NSFontTraitMask::ItalicFontMask
+                };
+                let inverse = if format == TextFormat::Bold {
+                    NSFontTraitMask::UnboldFontMask
+                } else {
+                    NSFontTraitMask::UnitalicFontMask
+                };
+                let desired = if manager.traitsOfFont(&font).contains(trait_mask) {
+                    inverse
+                } else {
+                    trait_mask
+                };
+                let converted = manager.convertFont_toHaveTrait(&font, desired);
+                mutable.insert(font_key, &converted);
+            }
+            TextFormat::Underline => {
+                let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
+                mutable.insert(underline_key, &value);
+            }
+            TextFormat::Clear => {
+                mutable.removeObjectForKey(font_key);
+                mutable.removeObjectForKey(underline_key);
+                let font = NSFont::systemFontOfSize(17.0);
+                mutable.insert(font_key, &font);
+            }
+        }
+        unsafe {
+            body.setTypingAttributes(&mutable);
+        }
+    }
+
     fn load_note(&self, note: &Note) {
+        *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = Some(note.id.clone());
         self.ivars()
             .title_field
@@ -231,6 +336,7 @@ impl AppDelegate {
         } else {
             body_view.setString(&objc2_foundation::NSString::from_str(&note.body));
         }
+        *self.ivars().loading_guard.borrow_mut() = false;
     }
 
     fn refresh_notes(&self) {
@@ -285,6 +391,9 @@ impl AppDelegate {
     }
 
     fn save_current_note(&self) {
+        if *self.ivars().loading_guard.borrow() {
+            return;
+        }
         let Some(id) = self.ivars().current_note_id.borrow().clone() else {
             return;
         };
@@ -352,6 +461,30 @@ fn autosave_title_state(title: &str, body: &str) -> (String, Option<String>) {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FormatTarget {
+    Selection,
+    Typing,
+}
+
+#[cfg(test)]
+fn format_target(range: NSRange) -> FormatTarget {
+    if range.length == 0 {
+        FormatTarget::Typing
+    } else {
+        FormatTarget::Selection
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum TextFormat {
+    Bold,
+    Italic,
+    Underline,
+    Clear,
+}
+
 pub fn run() {
     let mtm = MainThreadMarker::new().expect("AppKit must run on the main thread");
     let application = NSApplication::sharedApplication(mtm);
@@ -386,6 +519,7 @@ impl AppDelegate {
             notes: RefCell::new(Vec::new()),
             title_field: OnceCell::new(),
             body_view: OnceCell::new(),
+            loading_guard: RefCell::new(false),
             search_field: OnceCell::new(),
             list_stack: OnceCell::new(),
             note_buttons: RefCell::new(Vec::new()),
@@ -396,7 +530,8 @@ impl AppDelegate {
 
 #[cfg(test)]
 mod tests {
-    use super::autosave_title_state;
+    use super::{FormatTarget, autosave_title_state, format_target};
+    use objc2_foundation::NSRange;
 
     #[test]
     fn explicit_title_does_not_rewrite_title_field_during_autosave() {
@@ -404,5 +539,11 @@ mod tests {
             autosave_title_state("我的真实标题", "正文首行"),
             ("我的真实标题".to_string(), None),
         );
+    }
+
+    #[test]
+    fn format_target_distinguishes_selection_from_typing() {
+        assert_eq!(format_target(NSRange::new(4, 3)), FormatTarget::Selection);
+        assert_eq!(format_target(NSRange::new(4, 0)), FormatTarget::Typing);
     }
 }

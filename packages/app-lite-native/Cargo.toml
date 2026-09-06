@@ -23,7 +23,8 @@ objc2 = "0.6.4"
 objc2-foundation = "0.3.2"
 objc2-app-kit = { version = "0.3.2", features = [
     "NSApplication", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSMenu",
-    "NSMenuItem", "NSResponder", "NSScrollView", "NSSearchField", "NSSplitView", "NSStackView",
+    "NSFontManager", "NSMenuItem", "NSResponder", "NSScrollView", "NSSearchField", "NSSplitView", "NSStackView",
+    "NSTextStorage",
     "NSText", "NSTextField", "NSTextView", "NSView", "NSWindow",
 ] }
 
