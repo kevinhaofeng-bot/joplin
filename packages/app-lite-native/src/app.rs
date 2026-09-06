@@ -119,9 +119,11 @@ fn content_layout(width: f64, height: f64) -> ContentLayout {
     };
     let empty_editor = LayoutRect {
         x: body.x,
-        y: body.y + body.height * 0.45,
+        // The empty copy is two lines; keep its optical center at the same
+        // slightly-above-middle position used by the writing canvas.
+        y: body.y + body.height * 0.45 - 22.0,
         width: body.width,
-        height: 32.0,
+        height: 44.0,
     };
 
     ContentLayout {
@@ -1770,6 +1772,10 @@ mod tests {
             assert!(layout.body.y >= 0.0);
             assert!(layout.body.y + layout.body.height <= height);
             assert!(layout.title.x >= layout.sidebar.x + layout.sidebar.width);
+            assert_eq!(layout.empty_editor.height, 44.0);
+            let expected_center = layout.body.y + layout.body.height * 0.45;
+            let actual_center = layout.empty_editor.y + layout.empty_editor.height * 0.5;
+            assert!((actual_center - expected_center).abs() < f64::EPSILON);
         }
         let wide = content_layout(1800.0, 900.0);
         assert_eq!(wide.body.width, 720.0);
