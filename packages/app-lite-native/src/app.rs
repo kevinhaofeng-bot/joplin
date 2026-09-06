@@ -1881,11 +1881,10 @@ impl AppDelegate {
         };
         insert_inline_attachment(body, &inline);
         let saved = save(self);
-        if saved {
+        if finish_image_insert(saved, restore) {
             *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
             true
         } else {
-            restore();
             *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
             false
         }
@@ -2407,6 +2406,18 @@ fn valid_image_bytes_for_mime(bytes: &[u8], mime: &str) -> bool {
     image_signature_matches_mime(bytes, mime) && valid_image_bytes(bytes)
 }
 
+fn finish_image_insert<F>(saved: bool, restore: F) -> bool
+where
+    F: FnOnce(),
+{
+    if saved {
+        true
+    } else {
+        restore();
+        false
+    }
+}
+
 fn is_local_file_url_host(host: Option<&str>) -> bool {
     host.is_none_or(|host| host.is_empty() || host.eq_ignore_ascii_case("localhost"))
 }
@@ -2597,11 +2608,11 @@ mod tests {
         PasteboardImage, RtfLoadDecision, RtfSavePlan, TextFormat,
         attributed_string_has_attachments, choose_data_dir, content_layout, display_note_title,
         editor_save_projection, editor_segments_with_ranges, ensure_notes_database_file,
-        format_decision, format_target, image_signature_matches_mime, inline_attachment_with_alt,
-        is_local_file_url_host, is_promised_pasteboard_type, paste_route, read_drag_image_file,
-        read_regular_image_file, rtf_load_decision, rtf_save_plan, rtf_text_matches_body,
-        sanitized_rtf_from_editor, typing_trait_operation, valid_image_bytes_for_mime,
-        validate_canonical_data_dir,
+        finish_image_insert, format_decision, format_target, image_signature_matches_mime,
+        inline_attachment_with_alt, is_local_file_url_host, is_promised_pasteboard_type,
+        paste_route, read_drag_image_file, read_regular_image_file, rtf_load_decision,
+        rtf_save_plan, rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
+        valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
     use joplin_lite_native::core::StoredResource;
     use objc2::{AnyThread, runtime::AnyObject};
@@ -2898,6 +2909,17 @@ mod tests {
             "com.apple.pasteboard.promised-file-url"
         ));
         assert!(!is_promised_pasteboard_type("public.file-url"));
+    }
+
+    #[test]
+    fn failed_save_restores_the_editor_snapshot_before_reporting_failure() {
+        let mut restored = false;
+        assert!(!finish_image_insert(false, || restored = true));
+        assert!(restored);
+
+        restored = false;
+        assert!(finish_image_insert(true, || restored = true));
+        assert!(!restored);
     }
 
     #[test]
