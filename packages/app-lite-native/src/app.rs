@@ -33,6 +33,7 @@ use objc2_foundation::{
     NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSURL, ns_string,
 };
 use std::cell::{OnceCell, RefCell};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -95,7 +96,11 @@ fn editor_save_projection(
             }
         }
     }
-    let resource_ids = extract_resource_ids(&body);
+    let mut seen_resource_ids = HashSet::new();
+    let resource_ids = extract_resource_ids(&body)
+        .into_iter()
+        .filter(|resource_id| seen_resource_ids.insert(resource_id.clone()))
+        .collect();
     Ok(EditorProjection {
         body_text: project_search_text(&body),
         body,
@@ -334,23 +339,41 @@ fn editor_segments_with_ranges(
         let resource_id = attribute_string(&attributes, &id_key);
         let alt = attribute_string(&attributes, &alt_key).unwrap_or_else(|| "图片".into());
         let has_attachment = unsafe { attributes.objectForKey_unchecked(attachment_key) }.is_some();
-        if let Some(resource_id) = resource_id.filter(|_| text == "\u{fffc}") {
-            if let Ok(marker) = markdown_marker(&resource_id, &alt) {
-                segments.push(EditorSegment::Attachment(AttachmentDescriptor {
-                    resource_id,
-                    alt,
-                }));
-                replacement_ranges.push((effective_range, marker));
+        let marker = resource_id
+            .as_deref()
+            .and_then(|id| markdown_marker(id, &alt).ok());
+        let mut ordinary_text = String::new();
+        let mut unit_location = effective_range.location;
+        for character in text.chars() {
+            let unit_length = character.len_utf16();
+            let unit_range = NSRange::new(unit_location, unit_length);
+            if character == '\u{fffc}' {
+                if let (Some(resource_id), Some(marker)) = (resource_id.as_ref(), marker.as_ref()) {
+                    if !ordinary_text.is_empty() {
+                        segments.push(EditorSegment::Text(std::mem::take(&mut ordinary_text)));
+                    }
+                    segments.push(EditorSegment::Attachment(AttachmentDescriptor {
+                        resource_id: resource_id.clone(),
+                        alt: alt.clone(),
+                    }));
+                    replacement_ranges.push((unit_range, marker.clone()));
+                } else {
+                    if !ordinary_text.is_empty() {
+                        segments.push(EditorSegment::Text(std::mem::take(&mut ordinary_text)));
+                    }
+                    segments.push(EditorSegment::Text("[图片]".into()));
+                    replacement_ranges.push((unit_range, "[图片]".into()));
+                }
             } else {
-                segments.push(EditorSegment::Text("[图片]".into()));
-                replacement_ranges.push((effective_range, "[图片]".into()));
+                ordinary_text.push(character);
             }
-        } else if has_attachment || text.contains('\u{fffc}') {
-            let text = text.replace('\u{fffc}', "[图片]");
-            segments.push(EditorSegment::Text(text.clone()));
-            replacement_ranges.push((effective_range, text));
-        } else {
-            segments.push(EditorSegment::Text(text));
+            unit_location = unit_location.saturating_add(unit_length);
+        }
+        if !ordinary_text.is_empty() {
+            segments.push(EditorSegment::Text(ordinary_text));
+        }
+        if has_attachment && text.is_empty() {
+            segments.push(EditorSegment::Text("[图片]".into()));
         }
         let next = effective_range
             .location
@@ -757,7 +780,7 @@ define_class!(
             body.setEditable(true);
             body.setRichText(true);
             body.setAllowsUndo(true);
-            body.setImportsGraphics(true);
+            body.setImportsGraphics(false);
             body.setUsesFontPanel(false);
             body.setDrawsBackground(false);
             body.setFont(Some(&NSFont::systemFontOfSize(17.0)));
@@ -2333,10 +2356,11 @@ mod tests {
         RtfLoadDecision, RtfSavePlan, TextFormat, attributed_string_has_attachments,
         choose_data_dir, content_layout, display_note_title, editor_save_projection,
         editor_segments_with_ranges, ensure_notes_database_file, format_decision, format_target,
-        paste_route, read_regular_image_file, rtf_load_decision, rtf_save_plan,
-        rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
+        inline_attachment_with_alt, paste_route, read_regular_image_file, rtf_load_decision,
+        rtf_save_plan, rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
         validate_canonical_data_dir,
     };
+    use joplin_lite_native::core::StoredResource;
     use objc2::AnyThread;
     use objc2_app_kit::{
         NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
@@ -2474,26 +2498,34 @@ mod tests {
     #[test]
     fn sanitizer_downgrades_known_and_unknown_attachments_without_rtf_payload() {
         let id = "0123456789abcdef0123456789abcdef";
-        let bytes = NSData::with_bytes(b"not-a-real-image");
-        let known_attachment = NSTextAttachment::initWithData_ofType(
-            NSTextAttachment::alloc(),
-            Some(&bytes),
-            Some(&NSString::from_str("public.png")),
-        );
+        const TINY_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let resource = StoredResource {
+            id: id.into(),
+            sha256: "0".repeat(64),
+            size: TINY_PNG.len(),
+            title: "截图.png".into(),
+            mime: "image/png".into(),
+            file_extension: "png".into(),
+            path: PathBuf::new(),
+            bytes: TINY_PNG.to_vec(),
+        };
+        let known = inline_attachment_with_alt(&resource, "截图.png").unwrap();
+        let bytes = NSData::with_bytes(TINY_PNG);
         let unknown_attachment = NSTextAttachment::initWithData_ofType(
             NSTextAttachment::alloc(),
             Some(&bytes),
             Some(&NSString::from_str("public.png")),
         );
-        let known = NSAttributedString::attributedStringWithAttachment(&known_attachment);
         let unknown = NSAttributedString::attributedStringWithAttachment(&unknown_attachment);
-        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str("前"));
+        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str("前😀"));
         source.appendAttributedString(&known);
-        let id_key = super::resource_id_attribute_key();
-        let id_value = NSString::from_str(id);
-        unsafe {
-            source.addAttribute_value_range(&id_key, &id_value, NSRange::new(1, 1));
-        }
+        source.appendAttributedString(&known);
         source.appendAttributedString(&unknown);
         source.appendAttributedString(&NSAttributedString::initWithString(
             NSAttributedString::alloc(),
@@ -2502,7 +2534,9 @@ mod tests {
         let source_ref: &NSAttributedString = &source;
         let (segments, replacements) = editor_segments_with_ranges(source_ref);
         let projection = editor_save_projection(&segments).unwrap();
-        assert_eq!(projection.body, format!("前![图片](:/{id})[图片]后"));
+        let marker = format!("![截图.png](:/{id})");
+        assert_eq!(projection.body, format!("前😀{marker}{marker}[图片]后"));
+        assert_eq!(projection.resource_ids, vec![id.to_owned()]);
         let rtf = sanitized_rtf_from_editor(source_ref, &replacements, &projection.body).unwrap();
         let parsed = unsafe {
             NSAttributedString::initWithRTF_documentAttributes(
@@ -2517,6 +2551,8 @@ mod tests {
         let rtf_text = String::from_utf8_lossy(&rtf);
         assert!(!rtf_text.contains("\\pict"));
         assert!(!rtf_text.contains("pngblip"));
+        assert!(!rtf_text.contains("jpegblip"));
+        assert!(!rtf.windows(TINY_PNG.len()).any(|window| window == TINY_PNG));
     }
 
     #[test]
