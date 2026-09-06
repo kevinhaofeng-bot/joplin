@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::{extract_resource_ids, markdown_marker, project_search_text};
+    use super::{extract_resource_ids, markdown_marker, marker_spans, project_search_text};
 
     #[test]
     fn marker_round_trip_and_projection_are_joplin_compatible() {
@@ -16,6 +16,18 @@ mod tests {
         assert!(projected.contains("庭审截图 [1]"));
         assert!(!projected.contains("0123456789abcdef"));
         assert!(!projected.contains('\u{fffc}'));
+    }
+
+    #[test]
+    fn marker_spans_skip_broken_prefixes_and_keep_escaped_alt_and_emoji() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let escaped = markdown_marker(id, "a [x\\y]").unwrap();
+        let body = format!("😀![broken\n{escaped}\n![second](:/{id})");
+        let spans = marker_spans(&body);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].alt, "a [x\\y]");
+        assert_eq!(spans[1].alt, "second");
+        assert_eq!(extract_resource_ids(&body), vec![id, id]);
     }
 }
 use thiserror::Error;
@@ -36,40 +48,50 @@ pub fn markdown_marker(resource_id: &str, alt: &str) -> Result<String, BodyError
 }
 
 pub fn extract_resource_ids(body: &str) -> Vec<String> {
-    let mut ids = Vec::new();
+    marker_spans(body)
+        .into_iter()
+        .map(|span| span.resource_id)
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerSpan {
+    pub start: usize,
+    pub end: usize,
+    pub resource_id: String,
+    pub alt: String,
+}
+
+pub fn marker_spans(body: &str) -> Vec<MarkerSpan> {
+    let mut spans = Vec::new();
     let mut offset = 0;
     while offset < body.len() {
         let Some(relative) = body[offset..].find("![") else {
             break;
         };
         let start = offset + relative;
-        if let Some((end, id, _alt)) = parse_marker(body, start) {
-            ids.push(id.to_owned());
+        if let Some((end, id, alt)) = parse_marker(body, start) {
+            spans.push(MarkerSpan {
+                start,
+                end,
+                resource_id: id.to_owned(),
+                alt: unescape_alt(alt),
+            });
             offset = end;
         } else {
             offset = start + 2;
         }
     }
-    ids
+    spans
 }
 
 pub fn project_search_text(body: &str) -> String {
     let mut projected = String::with_capacity(body.len());
     let mut cursor = 0;
-    let mut search_from = 0;
-    while search_from < body.len() {
-        let Some(relative) = body[search_from..].find("![") else {
-            break;
-        };
-        let start = search_from + relative;
-        let Some((end, _id, alt)) = parse_marker(body, start) else {
-            search_from = start + 2;
-            continue;
-        };
-        projected.push_str(&body[cursor..start]);
-        projected.push_str(&unescape_alt(alt));
-        cursor = end;
-        search_from = end;
+    for span in marker_spans(body) {
+        projected.push_str(&body[cursor..span.start]);
+        projected.push_str(&span.alt);
+        cursor = span.end;
     }
     projected.push_str(&body[cursor..]);
     projected
@@ -97,6 +119,9 @@ fn parse_marker(body: &str, start: usize) -> Option<(usize, &str, &str)> {
     let mut escaped = false;
     while index < bytes.len() {
         let byte = bytes[index];
+        if !escaped && byte == b'!' && bytes.get(index + 1) == Some(&b'[') {
+            return None;
+        }
         if escaped {
             escaped = false;
             index += 1;

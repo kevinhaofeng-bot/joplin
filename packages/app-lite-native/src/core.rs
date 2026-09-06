@@ -2,6 +2,7 @@ use crate::body::{BodyError, project_search_text};
 pub use crate::resource_store::ResourceImport;
 use crate::resource_store::{ResourceError, ResourceStore};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -307,14 +308,19 @@ impl NoteRepository {
             )
             .optional()?
             .ok_or(CoreError::InvalidId)?;
+        let mut associated_resource_ids = Vec::new();
+        let mut seen_resource_ids = HashSet::new();
         for resource_id in &input.resource_ids {
+            if !seen_resource_ids.insert(resource_id) {
+                continue;
+            }
             let exists = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM resources WHERE id = ?1)",
                 [resource_id],
                 |row| row.get::<_, i64>(0),
             )?;
-            if exists == 0 {
-                return Err(CoreError::InvalidId);
+            if exists != 0 {
+                associated_resource_ids.push(resource_id.clone());
             }
         }
         note.title = input.title;
@@ -336,7 +342,7 @@ impl NoteRepository {
             ],
         )?;
         transaction.execute("DELETE FROM note_resources WHERE note_id = ?1", [id])?;
-        for (position, resource_id) in input.resource_ids.iter().enumerate() {
+        for (position, resource_id) in associated_resource_ids.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO note_resources
                  (note_id, resource_id, position, is_associated, last_seen_time)
@@ -846,6 +852,94 @@ mod tests {
         assert_eq!(count_rows(&repo, "note_resources"), 1);
         assert!(repo.get_resource(&first.id).unwrap().is_some());
         assert!(repo.get_resource(&second.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn content_update_skips_missing_metadata_but_keeps_existing_association() {
+        let temp = tempdir().unwrap();
+        let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
+        let resource = repo
+            .import_resource(png_import(TINY_PNG, "present.png"))
+            .unwrap();
+        let note = repo
+            .create_note(CreateNote {
+                title: "标题".into(),
+                body: "初始".into(),
+                body_rtf: Vec::new(),
+                is_draft: false,
+            })
+            .unwrap();
+        let missing = "0123456789abcdef0123456789abcdef";
+        let updated = repo
+            .update_note_content(
+                &note.id,
+                NoteContentUpdate {
+                    title: "更新标题".into(),
+                    body: format!("![缺失](:/{missing})\n![存在](:/{})", resource.id),
+                    body_text: "缺失\n存在".into(),
+                    body_rtf: Vec::new(),
+                    resource_ids: vec![missing.into(), resource.id.clone(), missing.into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.title, "更新标题");
+        let connection = repo.connection.lock().unwrap();
+        let associations: Vec<(String, i64)> = connection
+            .prepare(
+                "SELECT resource_id, position FROM note_resources
+                 WHERE note_id = ?1 ORDER BY position",
+            )
+            .unwrap()
+            .query_map([&note.id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(associations, vec![(resource.id, 0)]);
+    }
+
+    #[test]
+    fn content_update_keeps_metadata_for_missing_blob_alongside_normal_resource() {
+        let temp = tempdir().unwrap();
+        let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
+        let missing_blob = repo
+            .import_resource(png_import(TINY_PNG, "missing-blob.png"))
+            .unwrap();
+        let normal = repo
+            .import_resource(png_import(b"other bytes", "normal.png"))
+            .unwrap();
+        std::fs::remove_file(&missing_blob.path).unwrap();
+        let note = repo
+            .create_note(CreateNote {
+                title: "混合资源".into(),
+                body: "初始".into(),
+                body_rtf: Vec::new(),
+                is_draft: false,
+            })
+            .unwrap();
+        repo.update_note_content(
+            &note.id,
+            NoteContentUpdate {
+                title: "混合资源已保存".into(),
+                body: format!(
+                    "{}\n{}",
+                    markdown_marker(&missing_blob.id, "缺 blob").unwrap(),
+                    markdown_marker(&normal.id, "正常").unwrap()
+                ),
+                body_text: "缺 blob\n正常".into(),
+                body_rtf: Vec::new(),
+                resource_ids: vec![missing_blob.id.clone(), normal.id.clone()],
+            },
+        )
+        .unwrap();
+        let connection = repo.connection.lock().unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM note_resources WHERE note_id = ?1",
+                [&note.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]
