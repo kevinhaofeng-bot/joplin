@@ -35,9 +35,9 @@ open "packages/app-lite-native/dist/Joplin Lite Native.app"
 
 新建行为契约是：每次点击“新建笔记”都会创建一条新的草稿笔记，清空搜索条件、切换到该笔记并把焦点放到正文；空白草稿会在下次启动时清理。删除只做软删除，不物理移除历史行。
 
-## 0.1.0 MVP 验收
+## 0.1.1 MVP 验收
 
-- 真实 AppKit 界面验证了按钮新建、`Command-N`、中文标题/正文自动保存、退出重开恢复、搜索和软删除。
+- 真实原生界面验证了新建按钮、`Command-N`、`Command-V` 粘贴、`Command-Z` 撤销和 `Shift-Command-Z` 重做，以及中文标题/正文自动保存、退出重开恢复、搜索和软删除。
 - 干净 release 构建通过 5 项核心集成测试、`cargo fmt --check` 和 `cargo clippy -- -D warnings`。
 - ad-hoc 签名的 `.app` 通过 `codesign --verify --deep --strict`。
 - App 包体约 2.3 MB；空资料库稳定后 RSS 约 46–49 MB，载入并编辑笔记后一次复测约 57 MB。
