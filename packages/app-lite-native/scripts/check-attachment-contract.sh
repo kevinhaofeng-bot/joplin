@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+filter_otool_dependency_rows() {
+  awk '/^[[:space:]]/{print}'
+}
+
+if [[ "${1:-}" == "--filter-otool-dependencies" ]]; then
+  filter_otool_dependency_rows
+  exit 0
+fi
+
 APP_PATH="${1:?app path required}"
 CONTENTS_PATH="$APP_PATH/Contents"
 PLIST="$CONTENTS_PATH/Info.plist"
@@ -51,10 +60,11 @@ while IFS= read -r candidate; do
   if [[ "$kind" != *Mach-O* ]]; then
     continue
   fi
-  # otool's first line is the Mach-O's own path, not a dependency. Only scan
-  # install-name rows so a clean bundle under a directory named WebKit (or
-  # JavaScriptCore/libnode) is not rejected by its absolute path.
-  dependencies="$(otool -L "$candidate" | tail -n +2)"
+  # otool prints one unindented path/architecture header per architecture and
+  # indented install-name rows below it. Scan only those dependency rows so a
+  # clean bundle under a directory named WebKit (or JavaScriptCore/libnode)
+  # is not rejected by its absolute path, including for universal binaries.
+  dependencies="$(otool -L "$candidate" | filter_otool_dependency_rows)"
   if grep -Eiq 'WebKit|JavaScriptCore|libnode' <<<"$dependencies"; then
     echo "forbidden runtime dependency in $candidate" >&2
     exit 1

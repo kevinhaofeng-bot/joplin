@@ -721,10 +721,17 @@ define_class!(
     unsafe impl NSObjectProtocol for AppDelegate {}
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
-        fn application_should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool { true }
+        fn application_should_terminate_after_last_window_closed(
+            &self,
+            _sender: &NSApplication,
+        ) -> bool {
+            true
+        }
 
         #[unsafe(method(applicationSupportsSecureRestorableState:))]
-        fn application_supports_secure_restorable_state(&self, _app: &NSApplication) -> bool { true }
+        fn application_supports_secure_restorable_state(&self, _app: &NSApplication) -> bool {
+            true
+        }
 
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn application_did_finish_launching(&self, notification: &NSNotification) {
@@ -756,7 +763,13 @@ define_class!(
             // while remaining fully dynamic in light and dark appearance.
             let sidebar_background = NSBox::initWithFrame(
                 NSBox::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             sidebar_background.setBoxType(NSBoxType::Custom);
             sidebar_background.setTransparent(false);
@@ -766,14 +779,26 @@ define_class!(
 
             let separator = NSBox::initWithFrame(
                 NSBox::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             separator.setBoxType(NSBoxType::Separator);
             content.addSubview(&separator);
 
             let list_scroll = NSScrollView::initWithFrame(
                 NSScrollView::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             list_scroll.setHasVerticalScroller(true);
             list_scroll.setAutohidesScrollers(true);
@@ -781,7 +806,13 @@ define_class!(
             list_scroll.setDrawsBackground(false);
             let list_stack = NSStackView::initWithFrame(
                 NSStackView::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             list_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
             list_stack.setSpacing(4.0);
@@ -798,7 +829,13 @@ define_class!(
 
             let list_empty_label = NSTextField::initWithFrame(
                 NSTextField::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             list_empty_label.setStringValue(ns_string!("还没有笔记"));
             list_empty_label.setBezeled(false);
@@ -824,7 +861,13 @@ define_class!(
 
             let search_field = NSSearchField::initWithFrame(
                 NSSearchField::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             search_field.setPlaceholderString(Some(ns_string!("搜索笔记")));
             search_field.setContinuous(true);
@@ -837,7 +880,13 @@ define_class!(
 
             let title_field = NSTextField::initWithFrame(
                 NSTextField::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             title_field.setStringValue(ns_string!(""));
             title_field.setPlaceholderString(Some(ns_string!("标题")));
@@ -872,7 +921,13 @@ define_class!(
             let body = BodyTextView::new(
                 mtm,
                 self,
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             let file_url_type = unsafe { NSPasteboardTypeFileURL };
             let drag_types: Retained<NSArray<NSString>> = NSArray::from_slice(&[file_url_type]);
@@ -895,7 +950,13 @@ define_class!(
 
             let body_scroll = NSScrollView::initWithFrame(
                 NSScrollView::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             body_scroll.setHasVerticalScroller(true);
             body_scroll.setAutohidesScrollers(true);
@@ -919,7 +980,13 @@ define_class!(
 
             let save_status = NSTextField::initWithFrame(
                 NSTextField::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             save_status.setStringValue(ns_string!("已保存"));
             save_status.setBezeled(false);
@@ -932,7 +999,13 @@ define_class!(
 
             let editor_empty_label = NSTextField::initWithFrame(
                 NSTextField::alloc(mtm),
-                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+                LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }
+                .ns_rect(),
             );
             editor_empty_label.setStringValue(ns_string!("从一条笔记开始\n点击左上角「新建笔记」"));
             editor_empty_label.setBezeled(false);
@@ -947,7 +1020,10 @@ define_class!(
             content.addSubview(&editor_empty_label);
 
             self.ivars().window.set(window.clone()).unwrap();
-            self.ivars().sidebar_background.set(sidebar_background).unwrap();
+            self.ivars()
+                .sidebar_background
+                .set(sidebar_background)
+                .unwrap();
             self.ivars().sidebar_separator.set(separator).unwrap();
             self.ivars().list_scroll.set(list_scroll).unwrap();
             self.ivars().list_stack.set(list_stack).unwrap();
@@ -960,12 +1036,20 @@ define_class!(
             self.ivars().underline_button.set(underline_button).unwrap();
             self.ivars().clear_button.set(clear_button).unwrap();
             self.ivars().body_scroll.set(body_scroll).unwrap();
-            self.ivars().body_view.set(body.clone().into_super()).unwrap();
+            self.ivars()
+                .body_view
+                .set(body.clone().into_super())
+                .unwrap();
             self.ivars().delete_button.set(delete_button).unwrap();
             self.ivars().save_status.set(save_status).unwrap();
-            self.ivars().editor_empty_label.set(editor_empty_label).unwrap();
+            self.ivars()
+                .editor_empty_label
+                .set(editor_empty_label)
+                .unwrap();
 
-            unsafe { title_field.setDelegate(Some(ProtocolObject::from_ref(self))); }
+            unsafe {
+                title_field.setDelegate(Some(ProtocolObject::from_ref(self)));
+            }
             body.setDelegate(Some(ProtocolObject::from_ref(self)));
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
             self.layout_content(content.frame().size.width, content.frame().size.height);
@@ -1000,9 +1084,15 @@ define_class!(
                     .setString(&NSString::from_str(&body_text.to_string_lossy()));
                 self.save_current_note();
             }
+            if let Some(image_path) = std::env::var_os("JOPLIN_LITE_NATIVE_SMOKE_NATIVE_UNDO") {
+                self.run_native_undo_smoke(Path::new(&image_path));
+            }
             if let Some(query) = std::env::var_os("JOPLIN_LITE_NATIVE_SMOKE_SEARCH") {
                 self.search_notes(&query.to_string_lossy());
-                println!("searchNotes: result count={}", self.ivars().notes.borrow().len());
+                println!(
+                    "searchNotes: result count={}",
+                    self.ivars().notes.borrow().len()
+                );
             }
             if std::env::var_os("JOPLIN_LITE_NATIVE_SMOKE_DELETE_CURRENT").is_some() {
                 let sender = NSObject::new();
@@ -1071,118 +1161,201 @@ define_class!(
     }
     impl AppDelegate {
         #[unsafe(method(toggleBoldText:))]
-        fn toggle_bold_text(&self, _sender: &NSObject) {
-            self.apply_format(TextFormat::Bold);
-        }
+    fn toggle_bold_text(&self, _sender: &NSObject) {
+        self.apply_format(TextFormat::Bold);
+    }
 
-        #[unsafe(method(toggleItalicText:))]
-        fn toggle_italic_text(&self, _sender: &NSObject) {
-            self.apply_format(TextFormat::Italic);
-        }
+    #[unsafe(method(toggleItalicText:))]
+    fn toggle_italic_text(&self, _sender: &NSObject) {
+        self.apply_format(TextFormat::Italic);
+    }
 
-        #[unsafe(method(toggleUnderlineText:))]
-        fn toggle_underline_text(&self, _sender: &NSObject) {
-            self.apply_format(TextFormat::Underline);
-        }
+    #[unsafe(method(toggleUnderlineText:))]
+    fn toggle_underline_text(&self, _sender: &NSObject) {
+        self.apply_format(TextFormat::Underline);
+    }
 
-        #[unsafe(method(clearFormatting:))]
-        fn clear_formatting(&self, _sender: &NSObject) {
-            self.apply_format(TextFormat::Clear);
-        }
+    #[unsafe(method(clearFormatting:))]
+    fn clear_formatting(&self, _sender: &NSObject) {
+        self.apply_format(TextFormat::Clear);
+    }
 
-        #[unsafe(method(paste:))]
-        fn paste(&self, _sender: &NSObject) {
-            self.handle_paste(None);
-        }
+    #[unsafe(method(paste:))]
+    fn paste(&self, _sender: &NSObject) {
+        self.handle_paste(None);
+    }
 
-        #[unsafe(method(undoText:))]
-        fn undo_text(&self, _sender: &NSObject) {
-            if let Some(manager) = self.ivars().body_view.get().and_then(|body| body.undoManager())
-                && manager.canUndo()
-            {
-                manager.undo();
-            }
+    #[unsafe(method(undoText:))]
+    fn undo_text(&self, _sender: &NSObject) {
+        if let Some(manager) = self
+            .ivars()
+            .body_view
+            .get()
+            .and_then(|body| body.undoManager())
+            && manager.canUndo()
+        {
+            manager.undo();
         }
+    }
 
-        #[unsafe(method(redoText:))]
-        fn redo_text(&self, _sender: &NSObject) {
-            if let Some(manager) = self.ivars().body_view.get().and_then(|body| body.undoManager())
-                && manager.canRedo()
-            {
-                manager.redo();
-            }
+    #[unsafe(method(redoText:))]
+    fn redo_text(&self, _sender: &NSObject) {
+        if let Some(manager) = self
+            .ivars()
+            .body_view
+            .get()
+            .and_then(|body| body.undoManager())
+            && manager.canRedo()
+        {
+            manager.redo();
         }
+    }
 
-        #[unsafe(method(newNote:))]
-        fn new_note(&self, _sender: &NSObject) {
-            let note = self.ivars().repository.create_note(CreateNote {
-                title: String::new(),
-                body: String::new(),
-                body_rtf: Vec::new(),
-                is_draft: true,
-            });
-            match note {
-                Ok(note) => {
-                    self.ivars()
-                        .search_field
-                        .get()
-                        .unwrap()
-                        .setStringValue(ns_string!(""));
-                    self.load_note(&note);
-                    self.refresh_notes();
-                    if let Some(window) = self.ivars().window.get() {
-                        window.makeFirstResponder(Some(self.ivars().body_view.get().unwrap()));
-                    }
-                    println!("newNote: action triggered");
+    #[unsafe(method(newNote:))]
+    fn new_note(&self, _sender: &NSObject) {
+        let note = self.ivars().repository.create_note(CreateNote {
+            title: String::new(),
+            body: String::new(),
+            body_rtf: Vec::new(),
+            is_draft: true,
+        });
+        match note {
+            Ok(note) => {
+                self.ivars()
+                    .search_field
+                    .get()
+                    .unwrap()
+                    .setStringValue(ns_string!(""));
+                self.load_note(&note);
+                self.refresh_notes();
+                if let Some(window) = self.ivars().window.get() {
+                    window.makeFirstResponder(Some(self.ivars().body_view.get().unwrap()));
                 }
-                Err(error) => eprintln!("newNote: could not create note: {error}"),
+                println!("newNote: action triggered");
             }
+            Err(error) => eprintln!("newNote: could not create note: {error}"),
         }
+    }
 
-        #[unsafe(method(selectNote:))]
-        fn select_note(&self, sender: &NSButton) {
-            let index = sender.tag();
-            if index < 0 {
-                return;
-            }
-            if let Some(note) = self.ivars().notes.borrow().get(index as usize).cloned() {
-                self.load_note(&note);
-            }
+    #[unsafe(method(selectNote:))]
+    fn select_note(&self, sender: &NSButton) {
+        let index = sender.tag();
+        if index < 0 {
+            return;
         }
+        if let Some(note) = self.ivars().notes.borrow().get(index as usize).cloned() {
+            self.load_note(&note);
+        }
+    }
 
-        #[unsafe(method(searchNotes:))]
-        fn search_notes_action(&self, sender: &NSSearchField) {
-            self.search_notes(&sender.stringValue().to_string());
-        }
+    #[unsafe(method(searchNotes:))]
+    fn search_notes_action(&self, sender: &NSSearchField) {
+        self.search_notes(&sender.stringValue().to_string());
+    }
 
-        #[unsafe(method(deleteNote:))]
-        fn delete_note(&self, _sender: &NSObject) {
-            let Some(id) = self.ivars().current_note_id.borrow_mut().take() else {
-                return;
-            };
-            if let Err(error) = self.ivars().repository.soft_delete(&id) {
-                eprintln!("deleteNote: could not delete note: {error}");
-                *self.ivars().current_note_id.borrow_mut() = Some(id);
-                self.set_save_status("保存失败", true);
-                return;
-            }
-            let query = self
-                .ivars()
-                .search_field
-                .get()
-                .map(|field| field.stringValue().to_string())
-                .unwrap_or_default();
-            self.search_notes(&query);
-            if let Some(note) = self.ivars().notes.borrow().first().cloned() {
-                self.load_note(&note);
-            } else {
-                self.clear_current_note();
-            }
+    #[unsafe(method(deleteNote:))]
+    fn delete_note(&self, _sender: &NSObject) {
+        let Some(id) = self.ivars().current_note_id.borrow_mut().take() else {
+            return;
+        };
+        if let Err(error) = self.ivars().repository.soft_delete(&id) {
+            eprintln!("deleteNote: could not delete note: {error}");
+            *self.ivars().current_note_id.borrow_mut() = Some(id);
+            self.set_save_status("保存失败", true);
+            return;
         }
+        let query = self
+            .ivars()
+            .search_field
+            .get()
+            .map(|field| field.stringValue().to_string())
+            .unwrap_or_default();
+        self.search_notes(&query);
+        if let Some(note) = self.ivars().notes.borrow().first().cloned() {
+            self.load_note(&note);
+        } else {
+            self.clear_current_note();
+        }
+    }
     }
 );
 
 impl AppDelegate {
+    #[allow(deprecated)]
+    fn run_native_undo_smoke(&self, image_path: &Path) {
+        let Ok(bytes) = read_regular_image_file(image_path) else {
+            eprintln!("native undo smoke image could not be read");
+            return;
+        };
+        if !valid_image_bytes_for_mime(&bytes, "image/png") {
+            eprintln!("native undo smoke image is not a PNG");
+            return;
+        }
+        let Some(body) = self.ivars().body_view.get() else {
+            eprintln!("native undo smoke body view unavailable");
+            return;
+        };
+        body.setString(ns_string!("seed"));
+        body.setSelectedRange(NSRange::new(4, 0));
+        unsafe {
+            body.insertText(&NSString::from_str("A") as &AnyObject);
+            body.insertText(&NSString::from_str("B") as &AnyObject);
+        }
+        if let Some(manager) = body.undoManager() {
+            manager.undo();
+        }
+        self.save_current_note();
+
+        let before_string = body.string().to_string();
+        let before_selection = body.selectedRange();
+        let (before_can_undo, before_can_redo) = body
+            .undoManager()
+            .map(|manager| (manager.canUndo(), manager.canRedo()))
+            .unwrap_or((false, false));
+        let smoke_resource = joplin_lite_native::core::StoredResource {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            sha256: "0".repeat(64),
+            size: bytes.len(),
+            title: "smoke.png".into(),
+            mime: "image/png".into(),
+            file_extension: "png".into(),
+            path: PathBuf::new(),
+            bytes: bytes.clone(),
+        };
+        let Some(inline) = inline_attachment(&smoke_resource) else {
+            eprintln!("native undo smoke attachment construction failed");
+            return;
+        };
+        let failed = commit_live_image_insert(body, before_selection, &inline, || false);
+        let after_failure_string = body.string().to_string();
+        let after_failure_selection = body.selectedRange();
+        let (after_failure_can_undo, after_failure_can_redo) = body
+            .undoManager()
+            .map(|manager| (manager.canUndo(), manager.canRedo()))
+            .unwrap_or((false, false));
+        println!(
+            "nativeUndoSmoke failure result={} unchanged={} selection_unchanged={} undo_unchanged={} redo_unchanged={}",
+            failed,
+            before_string == after_failure_string,
+            before_selection == after_failure_selection,
+            before_can_undo == after_failure_can_undo,
+            before_can_redo == after_failure_can_redo,
+        );
+
+        let inserted = self.insert_image_data(&bytes, "smoke.png", "image/png");
+        let inserted_has_attachment = body.string().to_string().contains('\u{fffc}');
+        let sender = NSObject::new();
+        self.undo_text(sel!(undoText:), &sender);
+        let undone_has_attachment = body.string().to_string().contains('\u{fffc}');
+        self.redo_text(sel!(redoText:), &sender);
+        let redone_has_attachment = body.string().to_string().contains('\u{fffc}');
+        let saved = self.save_current_note();
+        println!(
+            "nativeUndoSmoke success inserted={} attachment_after_insert={} attachment_after_cmd_z={} attachment_after_shift_cmd_z={} saved={}",
+            inserted, inserted_has_attachment, undone_has_attachment, redone_has_attachment, saved,
+        );
+    }
+
     fn make_format_button(
         mtm: MainThreadMarker,
         target: &AppDelegate,
@@ -2988,58 +3161,15 @@ mod tests {
     }
 
     #[test]
-    fn persistence_gate_leaves_live_editor_and_undo_history_untouched_on_failure() {
-        let original = ("hello".to_owned(), 2usize, true, true);
-        let mut state = original.clone();
+    fn persistence_gate_skips_live_apply_when_persistence_fails() {
         let mut apply_count = 0;
         assert!(!commit_after_persistence(
             || false,
             || {
                 apply_count += 1;
-                state.0 = "changed".to_owned();
-                state.1 = 5;
-                state.2 = true;
-                state.3 = false;
             },
         ));
         assert_eq!(apply_count, 0);
-        assert_eq!(state, original);
-    }
-
-    #[test]
-    fn persisted_editor_insert_registers_one_native_undo_and_redo() {
-        let mut body = "hello".to_owned();
-        let mut selection = 5usize;
-        let mut can_undo = false;
-        let mut can_redo = true;
-        let mut undo_body = None;
-        assert!(commit_after_persistence(
-            || true,
-            || {
-                undo_body = Some(body.clone());
-                body.insert_str(selection, "[图片]");
-                selection += "[图片]".chars().count();
-                can_undo = true;
-                can_redo = false;
-            },
-        ));
-        assert_eq!(body, "hello[图片]");
-        assert_eq!(selection, 9);
-        assert!(can_undo);
-        assert!(!can_redo);
-        let redo_body = body.clone();
-        body = undo_body.take().unwrap();
-        can_undo = false;
-        can_redo = true;
-        assert_eq!(body, "hello");
-        assert!(!can_undo);
-        assert!(can_redo);
-        body = redo_body;
-        can_undo = true;
-        can_redo = false;
-        assert_eq!(body, "hello[图片]");
-        assert!(can_undo);
-        assert!(!can_redo);
     }
 
     #[test]
