@@ -1,4 +1,4 @@
-# Joplin Lite 0.11.0
+# Joplin Lite 0.10.0
 
 Joplin Lite is a macOS arm64 Tauri/WebKit client with an embedded official
 Node 23.11 sidecar and Joplin 3.7 library. It uses an independent
@@ -79,11 +79,3 @@ yet clean its temporary directory on every failure path, and import is not an
 all-or-nothing transaction. Memory usage remains above the 250 MiB target.
 Release artifacts are not notarized, and a real full-server first upload has
 not yet been performed.
-
-## Memory sampling
-
-On the same macOS arm64 release sidecar and 15-second hello-only workload,
-maximum RSS fell from about 201.1 MiB in 0.10.0 to about 160.3 MiB in 0.11.0
-(about 20.3% lower). Opening an isolated profile measured about 245.4 MiB for
-the sidecar alone. These are sidecar RSS samples, not the complete Tauri app
-total; the 250 MiB total-process target is therefore not claimed as met.

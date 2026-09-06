@@ -1,7 +1,7 @@
 import { claimProfile } from './profileMarker';
 import { revalidateProfilePath, validateProfilePath, type ValidatedProfilePaths } from './pathPolicy';
 import { verifyInheritedLease, type InheritedLease } from './inheritedLease';
-import type { RuntimeHandle } from './joplinRuntime';
+import { openJoplinRuntime, type RuntimeHandle } from './joplinRuntime';
 import { syncError, type SyncConfig, type SyncConfigInput, type SyncStatus, type SyncSummary } from './syncService';
 import type { JexImportStatus } from './jexImport';
 import { profileError, ProtocolError } from '../protocol';
@@ -48,10 +48,7 @@ export class ProfileSession implements ProfileSession {
 	private readonly verifyLease: ProfileLeaseVerifier;
 
 	public constructor(options: SessionOptions = {}) {
-		this.runtimeFactory = options.runtimeFactory ?? (async paths => {
-			const { openJoplinRuntime } = await import('./joplinRuntime');
-			return openJoplinRuntime(paths);
-		});
+		this.runtimeFactory = options.runtimeFactory ?? openJoplinRuntime;
 		this.verifyLease = options.verifyLease ?? verifyInheritedLease;
 	}
 
