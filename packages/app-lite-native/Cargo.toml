@@ -1,0 +1,32 @@
+[package]
+name = "joplin-lite-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "joplin_lite_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "joplin-lite-native"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+dirs = "6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSApplication", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSMenu",
+    "NSMenuItem", "NSResponder", "NSScrollView", "NSSearchField", "NSSplitView", "NSStackView",
+    "NSText", "NSTextField", "NSTextView", "NSView", "NSWindow",
+] }
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
