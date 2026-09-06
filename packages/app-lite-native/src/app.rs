@@ -1423,6 +1423,7 @@ impl AppDelegate {
         insert_inline_attachment(body, &inline);
         body.setSelectedRange(NSRange::new(1, 0));
         let before = first_attachment_bounds(body);
+        let before_line = first_attachment_line_metrics(body);
         let before_selection = body.selectedRange();
         let before_undo = body
             .undoManager()
@@ -1434,6 +1435,7 @@ impl AppDelegate {
             self.layout_content(860.0, 560.0);
         }
         let after = first_attachment_bounds(body);
+        let after_line = first_attachment_line_metrics(body);
         let after_selection = body.selectedRange();
         let after_undo = body
             .undoManager()
@@ -1444,12 +1446,26 @@ impl AppDelegate {
                 < 0.01
         });
         println!(
-            "resizeSmoke before_width={:?} after_width={:?} after_height={:?} width_ok={} height_ok={} aspect_preserved={} selection_unchanged={} undo_unchanged={}",
+            "resizeSmoke before_width={:?} after_width={:?} after_height={:?} before_glyph_height={:?} after_glyph_height={:?} before_line_height={:?} after_line_height={:?} before_used_height={:?} after_used_height={:?} width_ok={} height_ok={} layout_height_ok={} layout_updated={} aspect_preserved={} selection_unchanged={} undo_unchanged={}",
             before.map(|bounds| bounds.size.width),
             after.map(|bounds| bounds.size.width),
             after.map(|bounds| bounds.size.height),
+            before_line.map(|(glyph, _, _)| glyph.size.height),
+            after_line.map(|(glyph, _, _)| glyph.size.height),
+            before_line.map(|(_, line, _)| line.size.height),
+            after_line.map(|(_, line, _)| line.size.height),
+            before_line.map(|(_, _, used)| used.size.height),
+            after_line.map(|(_, _, used)| used.size.height),
             after.is_some_and(|bounds| bounds.size.width <= 520.0),
             after.is_some_and(|bounds| bounds.size.height <= 640.0),
+            after_line.is_some_and(|(glyph, line, used)| {
+                glyph.size.height <= 520.0 && line.size.height <= 520.0 && used.size.height <= 520.0
+            }),
+            before_line.map(|(glyph, line, used)| {
+                (glyph.size.height, line.size.height, used.size.height)
+            }) != after_line.map(|(glyph, line, used)| {
+                (glyph.size.height, line.size.height, used.size.height)
+            }),
             aspect_preserved,
             before_selection == after_selection,
             before_undo == after_undo,
@@ -2837,6 +2853,7 @@ fn resize_inline_attachments(body: &NSTextView) {
     }
     let attachment_key = unsafe { NSAttachmentAttributeName };
     let available_width = text_container_available_width(body);
+    let layout_manager = unsafe { body.layoutManager() };
     let mut location = 0;
     while location < length {
         let mut effective_range = NSRange::new(location, 0);
@@ -2855,6 +2872,16 @@ fn resize_inline_attachments(body: &NSTextView) {
             let size = inline_image_display_size(image.size(), available_width);
             if bounds.size != size {
                 attachment.setBounds(NSRect::new(bounds.origin, size));
+                if let Some(layout_manager) = layout_manager.as_ref() {
+                    let attachment_range = NSRange::new(location, 1);
+                    unsafe {
+                        layout_manager.invalidateLayoutForCharacterRange_actualCharacterRange(
+                            attachment_range,
+                            null_mut(),
+                        );
+                    }
+                    layout_manager.invalidateDisplayForCharacterRange(attachment_range);
+                }
             }
         }
         let next = effective_range.location + effective_range.length;
@@ -2863,6 +2890,56 @@ fn resize_inline_attachments(body: &NSTextView) {
         }
         location = next;
     }
+}
+
+fn first_attachment_line_metrics(body: &NSTextView) -> Option<(NSRect, NSRect, NSRect)> {
+    let storage = unsafe { body.textStorage() }?;
+    let layout_manager = unsafe { body.layoutManager() }?;
+    let container = unsafe { body.textContainer() }?;
+    let length = storage.length();
+    if length == 0 {
+        return None;
+    }
+    let attachment_key = unsafe { NSAttachmentAttributeName };
+    let mut location = 0;
+    while location < length {
+        let mut effective_range = NSRange::new(location, 0);
+        let attributes = unsafe {
+            storage.attributesAtIndex_longestEffectiveRange_inRange(
+                location,
+                &mut effective_range,
+                NSRange::new(0, length),
+            )
+        };
+        if unsafe { attributes.objectForKey_unchecked(attachment_key) }.is_some() {
+            let glyph_range = unsafe {
+                layout_manager.glyphRangeForCharacterRange_actualCharacterRange(
+                    NSRange::new(location, 1),
+                    null_mut(),
+                )
+            };
+            let line_range = NSRange::new(glyph_range.location, glyph_range.length.max(1));
+            let glyph_rect =
+                layout_manager.boundingRectForGlyphRange_inTextContainer(line_range, &container);
+            let line_rect = unsafe {
+                layout_manager
+                    .lineFragmentRectForGlyphAtIndex_effectiveRange(line_range.location, null_mut())
+            };
+            let used_rect = unsafe {
+                layout_manager.lineFragmentUsedRectForGlyphAtIndex_effectiveRange(
+                    line_range.location,
+                    null_mut(),
+                )
+            };
+            return Some((glyph_rect, line_rect, used_rect));
+        }
+        let next = effective_range.location + effective_range.length;
+        if next <= location {
+            break;
+        }
+        location = next;
+    }
+    None
 }
 
 fn first_attachment_bounds(body: &NSTextView) -> Option<NSRect> {
