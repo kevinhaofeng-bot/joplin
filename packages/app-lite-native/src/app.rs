@@ -293,18 +293,11 @@ impl AppDelegate {
             .unwrap_or_default();
         let body_view = self.ivars().body_view.get().unwrap();
         let body = body_view.string().to_string();
-        let display_title = if title.trim().is_empty() {
-            body.lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("")
-                .chars()
-                .take(120)
-                .collect()
-        } else {
-            title
-        };
-        if let Some(field) = self.ivars().title_field.get() {
-            field.setStringValue(&objc2_foundation::NSString::from_str(&display_title));
+        let (display_title, editor_title) = autosave_title_state(&title, &body);
+        if let Some(editor_title) = editor_title
+            && let Some(field) = self.ivars().title_field.get()
+        {
+            field.setStringValue(&objc2_foundation::NSString::from_str(&editor_title));
         }
         let rtf = body_view
             .RTFFromRange(NSRange::new(0, body_view.string().length()))
@@ -337,6 +330,22 @@ impl AppDelegate {
             }
             Err(error) => eprintln!("autosave failed: {error}"),
         }
+    }
+}
+
+fn autosave_title_state(title: &str, body: &str) -> (String, Option<String>) {
+    if title.trim().is_empty() {
+        let display_title = body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        let editor_title = (!display_title.is_empty()).then(|| display_title.clone());
+        (display_title, editor_title)
+    } else {
+        (title.to_string(), None)
     }
 }
 
@@ -379,5 +388,18 @@ impl AppDelegate {
             note_buttons: RefCell::new(Vec::new()),
         });
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::autosave_title_state;
+
+    #[test]
+    fn explicit_title_does_not_rewrite_title_field_during_autosave() {
+        assert_eq!(
+            autosave_title_state("我的真实标题", "正文首行"),
+            ("我的真实标题".to_string(), None),
+        );
     }
 }
