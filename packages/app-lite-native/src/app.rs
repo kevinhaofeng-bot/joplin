@@ -1848,6 +1848,8 @@ impl AppDelegate {
     where
         F: FnOnce(&Self) -> bool,
     {
+        let previous_loading_guard = *self.ivars().loading_guard.borrow();
+        *self.ivars().loading_guard.borrow_mut() = true;
         let restore = || {
             if let Some(storage) = unsafe { body.textStorage() } {
                 let snapshot_ref: &NSAttributedString = &snapshot.attributed;
@@ -1867,16 +1869,16 @@ impl AppDelegate {
                 eprintln!("paste image import failed: {error}");
                 self.set_save_status("图片未插入：格式不支持", true);
                 restore();
+                *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
                 return false;
             }
         };
         let Some(inline) = inline_attachment(&stored) else {
             self.set_save_status("图片未插入：格式不支持", true);
             restore();
+            *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
             return false;
         };
-        let previous_loading_guard = *self.ivars().loading_guard.borrow();
-        *self.ivars().loading_guard.borrow_mut() = true;
         insert_inline_attachment(body, &inline);
         let saved = save(self);
         if saved {
