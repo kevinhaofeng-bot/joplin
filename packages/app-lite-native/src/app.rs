@@ -1,24 +1,31 @@
 use joplin_lite_native::core::{CreateNote, Note, NoteRepository};
 use objc2::rc::Retained;
 use objc2::runtime::{ProtocolObject, Sel};
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+#[allow(deprecated)]
+use objc2_app_kit::NSObliquenessAttributeName;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontTraitMask,
-    NSForegroundColorAttributeName, NSLayoutAttribute, NSLineBreakMode, NSMenu, NSMenuItem,
-    NSMutableAttributedStringAppKitAdditions, NSMutableParagraphStyle, NSScrollView, NSSearchField,
-    NSStackView, NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSAttributedStringAppKitDocumentFormats, NSBackgroundColorAttributeName, NSBackingStoreType,
+    NSBaselineOffsetAttributeName, NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton,
+    NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSFontAttributeName,
+    NSFontTraitMask, NSForegroundColorAttributeName, NSKernAttributeName, NSLayoutAttribute,
+    NSLineBreakMode, NSMenu, NSMenuItem, NSMutableAttributedStringAppKitAdditions,
+    NSMutableParagraphStyle, NSScrollView, NSSearchField, NSShadowAttributeName, NSStackView,
+    NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName, NSStrokeWidthAttributeName,
+    NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
     NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
     NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSData, NSMutableAttributedString, NSMutableCopying, NSNotification,
-    NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, ns_string,
+    MainThreadMarker, NSAttributedString, NSData, NSMutableAttributedString, NSMutableCopying,
+    NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
+    NSString, ns_string,
 };
 use std::cell::{OnceCell, RefCell};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::Arc;
 
@@ -151,6 +158,136 @@ fn format_decision(format: TextFormat, active: bool) -> FormatDecision {
     } else {
         FormatDecision::Add
     }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FontTraitOperation {
+    Have,
+    NotHave,
+    None,
+}
+
+fn typing_trait_operation(format: TextFormat, decision: FormatDecision) -> FontTraitOperation {
+    match (format, decision) {
+        (TextFormat::Bold | TextFormat::Italic, FormatDecision::Add) => FontTraitOperation::Have,
+        (TextFormat::Bold | TextFormat::Italic, FormatDecision::Remove) => {
+            FontTraitOperation::NotHave
+        }
+        _ => FontTraitOperation::None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RtfLoadDecision {
+    ParsedRtf,
+    PlainBodyFallback,
+}
+
+fn rtf_load_decision(parse_succeeded: bool) -> RtfLoadDecision {
+    if parse_succeeded {
+        RtfLoadDecision::ParsedRtf
+    } else {
+        RtfLoadDecision::PlainBodyFallback
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RtfSaveError {
+    ExportUnavailable,
+}
+
+fn rtf_save_payload(payload: Option<Vec<u8>>) -> Result<Vec<u8>, RtfSaveError> {
+    payload.ok_or(RtfSaveError::ExportUnavailable)
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum DataDirError {
+    OverrideMustBeAbsolute,
+    DefaultDirectoryUnavailable,
+    HomeDirectoryUnavailable,
+    CanonicalizationFailed,
+    CreateDirectoryFailed,
+    OfficialJoplinProfile,
+}
+
+fn choose_data_dir(
+    override_path: Option<&Path>,
+    default_path: Option<&Path>,
+) -> Result<PathBuf, DataDirError> {
+    if let Some(path) = override_path {
+        if !path.is_absolute() {
+            return Err(DataDirError::OverrideMustBeAbsolute);
+        }
+        return Ok(path.to_path_buf());
+    }
+    default_path
+        .map(Path::to_path_buf)
+        .ok_or(DataDirError::DefaultDirectoryUnavailable)
+}
+
+fn validate_canonical_data_dir(
+    candidate: &Path,
+    official_profiles: &[PathBuf],
+) -> Result<(), DataDirError> {
+    if official_profiles
+        .iter()
+        .any(|profile| candidate == profile || candidate.starts_with(profile))
+    {
+        return Err(DataDirError::OfficialJoplinProfile);
+    }
+    Ok(())
+}
+
+fn canonicalize_for_comparison(path: &Path) -> Result<PathBuf, DataDirError> {
+    let mut suffix = Vec::<OsString>::new();
+    let mut current = path;
+    loop {
+        match std::fs::canonicalize(current) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(component) = current.file_name() else {
+                    return Err(DataDirError::CanonicalizationFailed);
+                };
+                suffix.push(component.to_os_string());
+                let Some(parent) = current.parent() else {
+                    return Err(DataDirError::CanonicalizationFailed);
+                };
+                current = parent;
+            }
+            Err(_) => return Err(DataDirError::CanonicalizationFailed),
+        }
+    }
+}
+
+fn resolve_native_data_dir(
+    override_path: Option<PathBuf>,
+    default_path: Option<PathBuf>,
+    home_path: Option<PathBuf>,
+) -> Result<PathBuf, DataDirError> {
+    let candidate = choose_data_dir(override_path.as_deref(), default_path.as_deref())?;
+    let home = home_path.ok_or(DataDirError::HomeDirectoryUnavailable)?;
+    let official_profiles = [
+        home.join(".config").join("joplin-desktop"),
+        home.join("Library")
+            .join("Application Support")
+            .join("Joplin")
+            .join("Joplin Desktop"),
+    ];
+    let canonical_official_profiles = official_profiles
+        .iter()
+        .map(|profile| canonicalize_for_comparison(profile))
+        .collect::<Result<Vec<_>, _>>()?;
+    let canonical_candidate = canonicalize_for_comparison(&candidate)?;
+    validate_canonical_data_dir(&canonical_candidate, &canonical_official_profiles)?;
+    std::fs::create_dir_all(&candidate).map_err(|_| DataDirError::CreateDirectoryFailed)?;
+    let canonical_candidate = canonicalize_for_comparison(&candidate)?;
+    validate_canonical_data_dir(&canonical_candidate, &canonical_official_profiles)?;
+    Ok(canonical_candidate)
 }
 
 struct AppDelegateIvars {
@@ -481,7 +618,17 @@ define_class!(
         }
     }
     unsafe impl NSTextFieldDelegate for AppDelegate {}
-    unsafe impl NSTextViewDelegate for AppDelegate {}
+    unsafe impl NSTextViewDelegate for AppDelegate {
+        #[unsafe(method(textViewDidChangeSelection:))]
+        fn text_view_did_change_selection(&self, _notification: &NSNotification) {
+            self.update_formatting_buttons();
+        }
+
+        #[unsafe(method(textViewDidChangeTypingAttributes:))]
+        fn text_view_did_change_typing_attributes(&self, _notification: &NSNotification) {
+            self.update_formatting_buttons();
+        }
+    }
     impl AppDelegate {
         #[unsafe(method(toggleBoldText:))]
         fn toggle_bold_text(&self, _sender: &NSObject) {
@@ -842,6 +989,7 @@ impl AppDelegate {
         }
     }
 
+    #[allow(deprecated)]
     fn apply_format(&self, format: TextFormat) {
         let Some(body) = self.ivars().body_view.get() else {
             return;
@@ -879,8 +1027,21 @@ impl AppDelegate {
                     storage.removeAttribute_range(underline_key, range);
                 }
                 (TextFormat::Clear, FormatDecision::Clear) => unsafe {
-                    storage.removeAttribute_range(font_key, range);
-                    storage.removeAttribute_range(underline_key, range);
+                    for key in [
+                        NSFontAttributeName,
+                        NSForegroundColorAttributeName,
+                        NSBackgroundColorAttributeName,
+                        NSUnderlineStyleAttributeName,
+                        NSStrikethroughStyleAttributeName,
+                        NSObliquenessAttributeName,
+                        NSStrokeColorAttributeName,
+                        NSStrokeWidthAttributeName,
+                        NSShadowAttributeName,
+                        NSKernAttributeName,
+                        NSBaselineOffsetAttributeName,
+                    ] {
+                        storage.removeAttribute_range(key, range);
+                    }
                     let font = NSFont::systemFontOfSize(17.0);
                     storage.addAttribute_value_range(font_key, &font, range);
                 },
@@ -975,6 +1136,7 @@ impl AppDelegate {
         }
     }
 
+    #[allow(deprecated)]
     fn apply_typing_format(&self, body: &NSTextView, format: TextFormat, decision: FormatDecision) {
         let attributes = body.typingAttributes();
         let mutable = attributes.mutableCopy();
@@ -995,15 +1157,12 @@ impl AppDelegate {
                 } else {
                     NSFontTraitMask::ItalicFontMask
                 };
-                let converted = if decision == FormatDecision::Add {
-                    manager.convertFont_toHaveTrait(&font, trait_mask)
-                } else {
-                    let inverse = if format == TextFormat::Bold {
-                        NSFontTraitMask::UnboldFontMask
-                    } else {
-                        NSFontTraitMask::UnitalicFontMask
-                    };
-                    manager.convertFont_toHaveTrait(&font, inverse)
+                let converted = match typing_trait_operation(format, decision) {
+                    FontTraitOperation::Have => manager.convertFont_toHaveTrait(&font, trait_mask),
+                    FontTraitOperation::NotHave => {
+                        manager.convertFont_toNotHaveTrait(&font, trait_mask)
+                    }
+                    FontTraitOperation::None => font.clone(),
                 };
                 mutable.insert(font_key, &converted);
             }
@@ -1015,8 +1174,21 @@ impl AppDelegate {
                 mutable.removeObjectForKey(underline_key);
             }
             (TextFormat::Clear, FormatDecision::Clear) => {
-                mutable.removeObjectForKey(font_key);
-                mutable.removeObjectForKey(underline_key);
+                for key in [
+                    font_key,
+                    unsafe { NSForegroundColorAttributeName },
+                    unsafe { NSBackgroundColorAttributeName },
+                    underline_key,
+                    unsafe { NSStrikethroughStyleAttributeName },
+                    unsafe { NSObliquenessAttributeName },
+                    unsafe { NSStrokeColorAttributeName },
+                    unsafe { NSStrokeWidthAttributeName },
+                    unsafe { NSShadowAttributeName },
+                    unsafe { NSKernAttributeName },
+                    unsafe { NSBaselineOffsetAttributeName },
+                ] {
+                    mutable.removeObjectForKey(key);
+                }
                 let font = NSFont::systemFontOfSize(17.0);
                 mutable.insert(font_key, &font);
             }
@@ -1072,16 +1244,42 @@ impl AppDelegate {
             .unwrap()
             .setStringValue(&NSString::from_str(&note.title));
         let body = self.ivars().body_view.get().unwrap();
-        body.setString(ns_string!(""));
-        if !note.body_rtf.is_empty() {
-            let rtf = NSData::with_bytes(&note.body_rtf);
-            body.replaceCharactersInRange_withRTF(NSRange::new(0, 0), &rtf);
-        } else {
+        let loaded_rtf = if note.body_rtf.is_empty() {
             body.setString(&NSString::from_str(&note.body));
-        }
+            None
+        } else {
+            let rtf = NSData::with_bytes(&note.body_rtf);
+            let parsed = unsafe {
+                NSAttributedString::initWithRTF_documentAttributes(
+                    NSAttributedString::alloc(),
+                    &rtf,
+                    None,
+                )
+            };
+            if let Some(parsed) = parsed {
+                if let Some(storage) = unsafe { body.textStorage() } {
+                    storage.setAttributedString(&parsed);
+                    Some(true)
+                } else {
+                    body.setString(&NSString::from_str(&note.body));
+                    Some(false)
+                }
+            } else {
+                body.setString(&NSString::from_str(&note.body));
+                Some(false)
+            }
+        };
+        let rtf_failed = loaded_rtf
+            .map(rtf_load_decision)
+            .map(|decision| decision == RtfLoadDecision::PlainBodyFallback)
+            .unwrap_or(false);
         body.setSelectedRange(NSRange::new(0, 0));
         *self.ivars().loading_guard.borrow_mut() = false;
-        self.set_save_status("已保存", false);
+        if rtf_failed {
+            self.set_save_status("格式恢复失败，已回退正文", true);
+        } else {
+            self.set_save_status("已保存", false);
+        }
         self.update_editor_visibility();
         self.update_note_selection();
         self.update_formatting_buttons();
@@ -1266,10 +1464,17 @@ impl AppDelegate {
             .unwrap_or_default();
         let body_view = self.ivars().body_view.get().unwrap();
         let body = body_view.string().to_string();
-        let rtf = body_view
-            .RTFFromRange(NSRange::new(0, body_view.string().length()))
-            .map(|data| data.to_vec())
-            .unwrap_or_default();
+        let rtf = match rtf_save_payload(
+            body_view
+                .RTFFromRange(NSRange::new(0, body_view.string().length()))
+                .map(|data| data.to_vec()),
+        ) {
+            Ok(rtf) => rtf,
+            Err(RtfSaveError::ExportUnavailable) => {
+                self.set_save_status("保存失败", true);
+                return;
+            }
+        };
         match self.ivars().repository.update_note(
             &id,
             joplin_lite_native::core::UpdateNote {
@@ -1374,19 +1579,13 @@ pub fn run() {
     let mtm = MainThreadMarker::new().expect("AppKit must run on the main thread");
     let application = NSApplication::sharedApplication(mtm);
     application.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    let mut data_dir = std::env::var_os("JOPLIN_LITE_NATIVE_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("com.kevinhao.joplin-lite-native")
-        });
-    if let Err(error) = std::fs::create_dir_all(&data_dir) {
-        eprintln!("could not create data directory: {error}");
-    }
-    data_dir.push("notes.sqlite");
+    let override_path = std::env::var_os("JOPLIN_LITE_NATIVE_DATA_DIR").map(PathBuf::from);
+    let default_path = dirs::data_dir().map(|path| path.join("com.kevinhao.joplin-lite-native"));
+    let data_dir = resolve_native_data_dir(override_path, default_path, dirs::home_dir())
+        .unwrap_or_else(|error| panic!("could not resolve native data directory: {error:?}"));
+    let data_path = data_dir.join("notes.sqlite");
     let repository =
-        Arc::new(NoteRepository::open(&data_dir).expect("could not open notes database"));
+        Arc::new(NoteRepository::open(&data_path).expect("could not open notes database"));
     if let Err(error) = repository.cleanup_abandoned_drafts() {
         eprintln!("could not clean drafts: {error}");
     }
@@ -1428,10 +1627,15 @@ impl AppDelegate {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentLayout, FormatDecision, FormatTarget, TextFormat, content_layout,
-        display_note_title, format_decision, format_target,
+        ContentLayout, DataDirError, FontTraitOperation, FormatDecision, FormatTarget,
+        RtfLoadDecision, RtfSaveError, TextFormat, choose_data_dir, content_layout,
+        display_note_title, format_decision, format_target, rtf_load_decision, rtf_save_payload,
+        typing_trait_operation, validate_canonical_data_dir,
     };
     use objc2_foundation::NSRange;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
 
     #[test]
     fn content_layout_keeps_editor_regions_disjoint_at_supported_sizes() {
@@ -1480,5 +1684,65 @@ mod tests {
     fn format_target_distinguishes_selection_from_typing() {
         assert_eq!(format_target(NSRange::new(4, 3)), FormatTarget::Selection);
         assert_eq!(format_target(NSRange::new(4, 0)), FormatTarget::Typing);
+    }
+
+    #[test]
+    fn data_directory_override_must_be_absolute_and_default_must_exist() {
+        let default = PathBuf::from("/tmp/joplin-lite-native-default");
+        assert_eq!(
+            choose_data_dir(Some(Path::new("relative-profile")), Some(&default)),
+            Err(DataDirError::OverrideMustBeAbsolute),
+        );
+        assert_eq!(
+            choose_data_dir(None, None),
+            Err(DataDirError::DefaultDirectoryUnavailable),
+        );
+    }
+
+    #[test]
+    fn canonical_data_directory_rejects_official_profile_and_children() {
+        let temp = tempdir().unwrap();
+        let official = temp.path().join("Joplin").join("Joplin Desktop");
+        fs::create_dir_all(&official).unwrap();
+        let alias = temp.path().join("profile-alias");
+        std::os::unix::fs::symlink(&official, &alias).unwrap();
+        let canonical_official = fs::canonicalize(&official).unwrap();
+        let canonical_alias = fs::canonicalize(&alias).unwrap();
+        assert_eq!(
+            validate_canonical_data_dir(
+                &canonical_alias,
+                std::slice::from_ref(&canonical_official),
+            ),
+            Err(DataDirError::OfficialJoplinProfile),
+        );
+        let child = canonical_official.join("native-profile");
+        assert_eq!(
+            validate_canonical_data_dir(&child, &[canonical_official]),
+            Err(DataDirError::OfficialJoplinProfile),
+        );
+    }
+
+    #[test]
+    fn bad_rtf_chooses_plain_body_without_replacing_saved_rtf() {
+        assert_eq!(rtf_load_decision(false), RtfLoadDecision::PlainBodyFallback);
+        assert_eq!(rtf_load_decision(true), RtfLoadDecision::ParsedRtf);
+    }
+
+    #[test]
+    fn missing_rtf_export_fails_without_an_empty_replacement() {
+        assert_eq!(rtf_save_payload(None), Err(RtfSaveError::ExportUnavailable),);
+        assert_eq!(rtf_save_payload(Some(vec![])), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn typing_format_removal_uses_not_have_trait() {
+        assert_eq!(
+            typing_trait_operation(TextFormat::Bold, FormatDecision::Remove),
+            FontTraitOperation::NotHave,
+        );
+        assert_eq!(
+            typing_trait_operation(TextFormat::Italic, FormatDecision::Add),
+            FontTraitOperation::Have,
+        );
     }
 }
