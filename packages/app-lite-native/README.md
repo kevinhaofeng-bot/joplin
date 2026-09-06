@@ -51,7 +51,7 @@ open "packages/app-lite-native/dist/Joplin Lite Native.app"
 ## 0.3.0 图片附件验收
 
 - PNG/JPEG 图片粘贴、10-MiB 上限、真实编码校验、canonical marker、blob 持久化与重启恢复已覆盖自动化测试和签名临时 profile smoke。
-- Finder JPEG 拖入接收链已实现并注册在正文视图；当前 CUA 环境中跨应用拖动尚未稳定完成端到端验收，发布前应人工 Finder 拖入复核。
+- Finder JPEG 跨应用拖入、退出重开与附件恢复已完成签名临时 profile 端到端验收。
 
 ## 当前限制
 

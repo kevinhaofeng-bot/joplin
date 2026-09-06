@@ -296,6 +296,15 @@ fn rtf_load_decision(parse_succeeded: bool) -> RtfLoadDecision {
     }
 }
 
+fn load_save_status(rtf_failed: bool, attachment_failures: usize) -> (&'static str, bool) {
+    match (rtf_failed, attachment_failures > 0) {
+        (true, true) => ("格式恢复失败，部分图片未恢复，已保留引用", true),
+        (true, false) => ("格式恢复失败，已回退正文", true),
+        (false, true) => ("部分图片未恢复，已保留引用", true),
+        (false, false) => ("已保存", false),
+    }
+}
+
 fn rtf_text_matches_body(expanded_text: Option<&str>, canonical_body: &str) -> bool {
     expanded_text == Some(canonical_body)
 }
@@ -1342,6 +1351,25 @@ impl AppDelegate {
             before_can_redo == after_failure_can_redo,
         );
 
+        if bytes.len() > 32 {
+            let truncated = bytes[..32].to_vec();
+            let truncated_result = self.insert_image_data(&truncated, "truncated.png", "image/png");
+            let after_truncated_string = body.string().to_string();
+            let after_truncated_selection = body.selectedRange();
+            let (after_truncated_can_undo, after_truncated_can_redo) = body
+                .undoManager()
+                .map(|manager| (manager.canUndo(), manager.canRedo()))
+                .unwrap_or((false, false));
+            println!(
+                "nativeUndoSmoke truncated result={} unchanged={} selection_unchanged={} undo_unchanged={} redo_unchanged={}",
+                truncated_result,
+                before_string == after_truncated_string,
+                before_selection == after_truncated_selection,
+                before_can_undo == after_truncated_can_undo,
+                before_can_redo == after_truncated_can_redo,
+            );
+        }
+
         let inserted = self.insert_image_data(&bytes, "smoke.png", "image/png");
         let inserted_has_attachment = body.string().to_string().contains('\u{fffc}');
         let sender = NSObject::new();
@@ -2085,7 +2113,11 @@ impl AppDelegate {
                 return false;
             }
         };
-        let Some(inline) = inline_attachment(&stored) else {
+        let Some(inline) = inline_attachment_with_width(
+            &stored,
+            &stored.title,
+            text_container_available_width(body),
+        ) else {
             self.set_save_status("图片未插入：格式不支持", true);
             return false;
         };
@@ -2159,35 +2191,38 @@ impl AppDelegate {
             .map(rtf_load_decision)
             .map(|decision| decision == RtfLoadDecision::PlainBodyFallback)
             .unwrap_or(false);
-        self.render_body_attachments(note);
+        let attachment_failures = self.render_body_attachments(note);
         body.setSelectedRange(NSRange::new(0, 0));
         *self.ivars().loading_guard.borrow_mut() = false;
-        if rtf_failed {
-            self.set_save_status("格式恢复失败，已回退正文", true);
-        } else {
-            self.set_save_status("已保存", false);
-        }
+        let (status, is_error) = load_save_status(rtf_failed, attachment_failures);
+        self.set_save_status(status, is_error);
         self.update_editor_visibility();
         self.update_note_selection();
         self.update_formatting_buttons();
     }
 
-    fn render_body_attachments(&self, note: &Note) {
+    fn render_body_attachments(&self, note: &Note) -> usize {
         let Some(body) = self.ivars().body_view.get() else {
-            return;
+            return 0;
         };
         let Some(storage) = (unsafe { body.textStorage() }) else {
-            return;
+            return 0;
         };
         let mut replacements = Vec::new();
+        let mut failures = 0;
         for (range, resource_id, alt) in canonical_marker_ranges(&note.body) {
             let Ok(resource) = self.ivars().repository.get_resource(&resource_id) else {
+                failures += 1;
                 continue;
             };
             let Some(resource) = resource else {
+                failures += 1;
                 continue;
             };
-            let Some(inline) = inline_attachment_with_alt(&resource, &alt) else {
+            let Some(inline) =
+                inline_attachment_with_width(&resource, &alt, text_container_available_width(body))
+            else {
+                failures += 1;
                 continue;
             };
             replacements.push((range, inline));
@@ -2195,6 +2230,7 @@ impl AppDelegate {
         for (range, inline) in replacements.into_iter().rev() {
             storage.replaceCharactersInRange_withAttributedString(range, inline.as_ref());
         }
+        failures
     }
 
     fn clear_current_note(&self) {
@@ -2614,11 +2650,23 @@ fn normalize_tiff(bytes: Vec<u8>, title: &str) -> PasteboardImage {
 }
 
 fn valid_image_bytes(bytes: &[u8]) -> bool {
+    decoded_image(bytes).is_some()
+}
+
+fn decoded_image(bytes: &[u8]) -> Option<Retained<NSImage>> {
     if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
-        return false;
+        return None;
     }
     let data = NSData::with_bytes(bytes);
-    NSImage::initWithData(NSImage::alloc(), &data).is_some()
+    let image = NSImage::initWithData(NSImage::alloc(), &data)?;
+    if !image.isValid() {
+        return None;
+    }
+    // NSImage may be initialized lazily. Asking AppKit for a concrete TIFF
+    // representation forces the underlying bitmap/image representation to be
+    // decoded before the bytes are admitted to storage or rendering.
+    image.TIFFRepresentation()?;
+    Some(image)
 }
 
 fn image_signature_matches_mime(bytes: &[u8], mime: &str) -> bool {
@@ -2680,8 +2728,34 @@ fn inline_attachment_with_alt(
     resource: &joplin_lite_native::core::StoredResource,
     alt: &str,
 ) -> Option<Retained<NSMutableAttributedString>> {
+    inline_attachment_with_width(resource, alt, 640.0)
+}
+
+fn text_container_available_width(body: &NSTextView) -> f64 {
+    let container_width = unsafe { body.textContainer() }
+        .map(|container| container.containerSize().width)
+        .filter(|width| width.is_finite() && *width > 0.0);
+    container_width.unwrap_or_else(|| {
+        let inset = body.textContainerInset();
+        (body.frame().size.width - inset.width * 2.0).max(1.0)
+    })
+}
+
+fn inline_image_display_size(image_size: NSSize, available_width: f64) -> NSSize {
+    let width = image_size.width.max(1.0);
+    let height = image_size.height.max(1.0);
+    let max_width = available_width.clamp(1.0, 640.0);
+    let scale = (max_width / width).min(1.0);
+    NSSize::new(width * scale, height * scale)
+}
+
+fn inline_attachment_with_width(
+    resource: &joplin_lite_native::core::StoredResource,
+    alt: &str,
+    available_width: f64,
+) -> Option<Retained<NSMutableAttributedString>> {
+    let image = decoded_image(&resource.bytes)?;
     let data = NSData::with_bytes(&resource.bytes);
-    let image = NSImage::initWithData(NSImage::alloc(), &data)?;
     let uti = NSString::from_str(if resource.mime == "image/jpeg" {
         "public.jpeg"
     } else {
@@ -2690,15 +2764,9 @@ fn inline_attachment_with_alt(
     let attachment =
         NSTextAttachment::initWithData_ofType(NSTextAttachment::alloc(), Some(&data), Some(&uti));
     attachment.setImage(Some(&image));
-    let size = image.size();
-    let scale = if size.width > 640.0 || size.height > 640.0 {
-        (640.0 / size.width.max(size.height)).min(1.0)
-    } else {
-        1.0
-    };
     attachment.setBounds(NSRect::new(
         NSPoint::new(0.0, 0.0),
-        NSSize::new(size.width * scale, size.height * scale),
+        inline_image_display_size(image.size(), available_width),
     ));
     let attributed = NSAttributedString::attributedStringWithAttachment(&attachment);
     let mutable = NSMutableAttributedString::from_attributed_nsstring(&attributed);
@@ -2848,10 +2916,11 @@ mod tests {
         attributed_string_has_attachments, candidate_with_attachment, choose_data_dir,
         commit_after_persistence, content_layout, display_note_title, editor_save_projection,
         editor_segments_with_ranges, ensure_notes_database_file, format_decision, format_target,
-        image_signature_matches_mime, inline_attachment_with_alt, is_local_file_url_host,
-        is_promised_pasteboard_type, paste_route, read_drag_image_file, read_regular_image_file,
-        rtf_load_decision, rtf_save_plan, rtf_text_matches_body, sanitized_rtf_from_editor,
-        typing_trait_operation, valid_image_bytes_for_mime, validate_canonical_data_dir,
+        image_signature_matches_mime, inline_attachment_with_alt, inline_image_display_size,
+        is_local_file_url_host, is_promised_pasteboard_type, load_save_status, paste_route,
+        read_drag_image_file, read_regular_image_file, rtf_load_decision, rtf_save_plan,
+        rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
+        valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
     use joplin_lite_native::core::StoredResource;
     use objc2::{AnyThread, runtime::AnyObject};
@@ -2860,7 +2929,8 @@ mod tests {
         NSBitmapImageFileType, NSBitmapImageRep, NSTextAttachment,
     };
     use objc2_foundation::{
-        NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSString,
+        NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSSize,
+        NSString,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2936,6 +3006,16 @@ mod tests {
             wide.body.x + wide.body.width,
             wide.status.x + wide.status.width + 10.0
         );
+    }
+
+    #[test]
+    fn inline_image_display_size_respects_column_and_preserves_aspect_ratio() {
+        let size = inline_image_display_size(NSSize::new(1600.0, 800.0), 530.0);
+        assert_eq!(size, NSSize::new(530.0, 265.0));
+        let small = inline_image_display_size(NSSize::new(320.0, 160.0), 530.0);
+        assert_eq!(small, NSSize::new(320.0, 160.0));
+        let capped = inline_image_display_size(NSSize::new(1600.0, 800.0), 900.0);
+        assert_eq!(capped, NSSize::new(640.0, 320.0));
     }
 
     #[test]
@@ -3133,6 +3213,12 @@ mod tests {
         }
         .unwrap();
         assert!(valid_image_bytes_for_mime(&jpeg.to_vec(), "image/jpeg"));
+        let truncated_png = TINY_PNG[..32].to_vec();
+        let truncated_jpeg = jpeg.to_vec()[..32].to_vec();
+        assert!(image_signature_matches_mime(&truncated_png, "image/png"));
+        assert!(image_signature_matches_mime(&truncated_jpeg, "image/jpeg"));
+        assert!(!valid_image_bytes_for_mime(&truncated_png, "image/png"));
+        assert!(!valid_image_bytes_for_mime(&truncated_jpeg, "image/jpeg"));
         assert!(!valid_image_bytes_for_mime(GIF, "image/png"));
         assert!(!valid_image_bytes_for_mime(TIFF, "image/jpeg"));
     }
@@ -3227,6 +3313,23 @@ mod tests {
     fn bad_rtf_chooses_plain_body_without_replacing_saved_rtf() {
         assert_eq!(rtf_load_decision(false), RtfLoadDecision::PlainBodyFallback);
         assert_eq!(rtf_load_decision(true), RtfLoadDecision::ParsedRtf);
+    }
+
+    #[test]
+    fn load_save_status_keeps_nonfatal_attachment_failures_editable() {
+        assert_eq!(load_save_status(false, 0), ("已保存", false));
+        assert_eq!(
+            load_save_status(false, 2),
+            ("部分图片未恢复，已保留引用", true)
+        );
+        assert_eq!(
+            load_save_status(true, 0),
+            ("格式恢复失败，已回退正文", true)
+        );
+        assert_eq!(
+            load_save_status(true, 2),
+            ("格式恢复失败，部分图片未恢复，已保留引用", true)
+        );
     }
 
     #[test]
