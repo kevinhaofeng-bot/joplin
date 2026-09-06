@@ -210,8 +210,9 @@ fn open_or_create_dir(parent_fd: RawFd, name: &str) -> Result<DirFd, ResourceErr
         )
     };
     if fd >= 0 {
+        let child = DirFd(fd);
         fsync_fd(parent_fd)?;
-        return Ok(DirFd(fd));
+        return Ok(child);
     }
     let first_error = std::io::Error::last_os_error();
     if first_error.kind() != std::io::ErrorKind::NotFound {
@@ -227,8 +228,6 @@ fn open_or_create_dir(parent_fd: RawFd, name: &str) -> Result<DirFd, ResourceErr
         if error.kind() != std::io::ErrorKind::AlreadyExists {
             return Err(error.into());
         }
-    } else {
-        fsync_fd(parent_fd)?;
     }
     let fd = unsafe {
         libc::openat(
@@ -244,7 +243,9 @@ fn open_or_create_dir(parent_fd: RawFd, name: &str) -> Result<DirFd, ResourceErr
             io_error()
         });
     }
-    Ok(DirFd(fd))
+    let child = DirFd(fd);
+    fsync_fd(parent_fd)?;
+    Ok(child)
 }
 
 fn open_blob(dir_fd: RawFd, name: &str) -> Result<Option<File>, ResourceError> {
