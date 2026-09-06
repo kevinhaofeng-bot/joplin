@@ -129,6 +129,8 @@ fn persist_blob(dir_fd: RawFd, bytes: &[u8], sha256: &str) -> Result<(), Resourc
         if hex_digest(&Sha256::digest(&current)) != sha256 {
             return Err(ResourceError::CorruptBlob);
         }
+        existing.sync_all()?;
+        fsync_fd(dir_fd)?;
         return Ok(());
     }
 
@@ -208,6 +210,7 @@ fn open_or_create_dir(parent_fd: RawFd, name: &str) -> Result<DirFd, ResourceErr
         )
     };
     if fd >= 0 {
+        fsync_fd(parent_fd)?;
         return Ok(DirFd(fd));
     }
     let first_error = std::io::Error::last_os_error();
@@ -250,7 +253,7 @@ fn open_blob(dir_fd: RawFd, name: &str) -> Result<Option<File>, ResourceError> {
         libc::openat(
             dir_fd,
             c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -450,5 +453,34 @@ mod tests {
             Sha256::digest(store.read_blob(&blob.sha256).unwrap()),
             Sha256::digest(bytes)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_digest_leaf_is_rejected_without_blocking() {
+        use sha2::{Digest, Sha256};
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().unwrap();
+        let store = ResourceStore::new(dir.path().to_path_buf()).unwrap();
+        let bytes = b"fifo bytes";
+        let digest = super::hex_digest(&Sha256::digest(bytes));
+        let path = dir.path().join("resources").join("blobs").join(&digest);
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            store.put(ResourceImport {
+                bytes,
+                title: "fifo",
+                mime: "image/png",
+                file_extension: "png",
+            }),
+            Err(ResourceError::UnsafePath)
+        ));
+        assert!(matches!(
+            store.read_blob(&digest),
+            Err(ResourceError::UnsafePath)
+        ));
     }
 }

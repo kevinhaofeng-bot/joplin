@@ -102,10 +102,12 @@ impl NoteRepository {
                 .to_path_buf(),
         )?;
         migrate_schema(&connection)?;
-        Ok(Self {
+        let repository = Self {
             connection: Mutex::new(connection),
             resource_store,
-        })
+        };
+        repository.rebuild_search_index()?;
+        Ok(repository)
     }
 
     pub fn create_note(&self, input: CreateNote) -> Result<Note, CoreError> {
@@ -408,6 +410,32 @@ impl NoteRepository {
         )?;
         let fallback_rows = fallback.query_map([query], row_to_note)?;
         Ok(fallback_rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn rebuild_search_index(&self) -> Result<(), CoreError> {
+        let connection = self.connection.lock().expect("repository mutex poisoned");
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute("DELETE FROM notes_fts", [])?;
+        let mut statement =
+            transaction.prepare("SELECT id, title, body_text FROM notes WHERE deleted_time = 0")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (id, title, body_text) in rows {
+            transaction.execute(
+                "INSERT INTO notes_fts (id, title, body_text) VALUES (?1, ?2, ?3)",
+                params![id, title, body_text],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 }
 
@@ -876,5 +904,47 @@ mod tests {
                 .is_empty()
         );
         assert!(reopened.search(&resource.sha256).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reopen_repairs_missing_fts_rows_from_body_text_without_mutating_notes() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("notes.sqlite");
+        let repo = NoteRepository::open(&db).unwrap();
+        let first = repo
+            .create_note(CreateNote {
+                title: "第一笔记".into(),
+                body: "共同关键词 一".into(),
+                body_rtf: Vec::new(),
+                is_draft: false,
+            })
+            .unwrap();
+        let second = repo
+            .create_note(CreateNote {
+                title: "第二笔记".into(),
+                body: "共同关键词 二".into(),
+                body_rtf: Vec::new(),
+                is_draft: false,
+            })
+            .unwrap();
+        let first_body = repo.get_note(&first.id).unwrap().unwrap().body_text;
+        let second_body = repo.get_note(&second.id).unwrap().unwrap().body_text;
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM notes_fts WHERE id = ?1", [&first.id])
+            .unwrap();
+        drop(repo);
+        let reopened = NoteRepository::open(&db).unwrap();
+        let results = reopened.search("共同关键词").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            reopened.get_note(&first.id).unwrap().unwrap().body_text,
+            first_body
+        );
+        assert_eq!(
+            reopened.get_note(&second.id).unwrap().unwrap().body_text,
+            second_body
+        );
     }
 }
