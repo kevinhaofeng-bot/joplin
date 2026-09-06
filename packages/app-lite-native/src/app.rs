@@ -67,6 +67,11 @@ struct EditorProjection {
     resource_ids: Vec<String>,
 }
 
+struct PreparedNoteContent {
+    update: NoteContentUpdate,
+    formatting_fallback: bool,
+}
+
 struct EditorSnapshot {
     attributed: Retained<NSMutableAttributedString>,
     selection: NSRange,
@@ -430,6 +435,51 @@ fn sanitized_rtf_from_editor(
         return None;
     }
     Some(data.to_vec())
+}
+
+fn prepare_note_content_from_editor(
+    source: &NSAttributedString,
+    title: String,
+) -> Result<PreparedNoteContent, EditorCodecError> {
+    let (segments, attachment_ranges) = editor_segments_with_ranges(source);
+    let projection = editor_save_projection(&segments)?;
+    let save_plan = rtf_save_plan(sanitized_rtf_from_editor(
+        source,
+        &attachment_ranges,
+        &projection.body,
+    ));
+    let formatting_fallback = matches!(save_plan, RtfSavePlan::PlainTextFallback);
+    let body_rtf = match save_plan {
+        RtfSavePlan::Rich(rtf) => rtf,
+        RtfSavePlan::PlainTextFallback => Vec::new(),
+    };
+    Ok(PreparedNoteContent {
+        update: NoteContentUpdate {
+            title,
+            body: projection.body,
+            body_text: projection.body_text,
+            body_rtf,
+            resource_ids: projection.resource_ids,
+        },
+        formatting_fallback,
+    })
+}
+
+fn candidate_with_attachment(
+    source: &NSAttributedString,
+    insertion_range: NSRange,
+    inline: &NSMutableAttributedString,
+) -> Option<Retained<NSMutableAttributedString>> {
+    let source_length = source.string().length();
+    let end = insertion_range
+        .location
+        .checked_add(insertion_range.length)?;
+    if end > source_length {
+        return None;
+    }
+    let candidate = source.mutableCopy();
+    candidate.replaceCharactersInRange_withAttributedString(insertion_range, inline);
+    Some(candidate)
 }
 
 fn canonical_marker_ranges(body: &str) -> Vec<(NSRange, String, String)> {
@@ -1712,10 +1762,14 @@ impl AppDelegate {
         };
         let point = body.convertPoint_fromView(sender.draggingLocation(), None);
         let character_index = body.characterIndexForInsertionAtPoint(point);
-        body.setSelectedRange(NSRange::new(character_index, 0));
-        self.insert_image_data_from_snapshot(&bytes, &title, &mime, body, snapshot, |this| {
-            this.save_current_note_unchecked()
-        })
+        self.insert_image_data_from_snapshot(
+            &bytes,
+            &title,
+            &mime,
+            body,
+            snapshot,
+            NSRange::new(character_index, 0),
+        )
     }
 
     fn read_pasteboard_image(&self) -> PasteboardImage {
@@ -1803,15 +1857,10 @@ impl AppDelegate {
     }
 
     fn insert_image_data(&self, bytes: &[u8], title: &str, mime: &str) -> bool {
-        self.insert_image_data_with_save(bytes, title, mime, |this| {
-            this.save_current_note_unchecked()
-        })
+        self.insert_image_data_with_save(bytes, title, mime)
     }
 
-    fn insert_image_data_with_save<F>(&self, bytes: &[u8], title: &str, mime: &str, save: F) -> bool
-    where
-        F: FnOnce(&Self) -> bool,
-    {
+    fn insert_image_data_with_save(&self, bytes: &[u8], title: &str, mime: &str) -> bool {
         if bytes.len() > MAX_IMAGE_BYTES {
             self.set_save_status("图片未插入：超过 10 MB", true);
             return false;
@@ -1833,29 +1882,21 @@ impl AppDelegate {
             attributed,
             selection: body.selectedRange(),
         };
-        self.insert_image_data_from_snapshot(bytes, title, mime, body, snapshot, save)
+        let insertion_range = snapshot.selection;
+        self.insert_image_data_from_snapshot(bytes, title, mime, body, snapshot, insertion_range)
     }
 
-    fn insert_image_data_from_snapshot<F>(
+    fn insert_image_data_from_snapshot(
         &self,
         bytes: &[u8],
         title: &str,
         mime: &str,
         body: &NSTextView,
         snapshot: EditorSnapshot,
-        save: F,
-    ) -> bool
-    where
-        F: FnOnce(&Self) -> bool,
-    {
-        let previous_loading_guard = *self.ivars().loading_guard.borrow();
-        *self.ivars().loading_guard.borrow_mut() = true;
-        let restore = || {
-            if let Some(storage) = unsafe { body.textStorage() } {
-                let snapshot_ref: &NSAttributedString = &snapshot.attributed;
-                storage.setAttributedString(snapshot_ref);
-            }
-            body.setSelectedRange(snapshot.selection);
+        insertion_range: NSRange,
+    ) -> bool {
+        let Some(note_id) = self.ivars().current_note_id.borrow().clone() else {
+            return false;
         };
         let extension = if mime == "image/png" { "png" } else { "jpg" };
         let stored = match self.ivars().repository.import_resource(ResourceImport {
@@ -1868,26 +1909,39 @@ impl AppDelegate {
             Err(error) => {
                 eprintln!("paste image import failed: {error}");
                 self.set_save_status("图片未插入：格式不支持", true);
-                restore();
-                *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
                 return false;
             }
         };
         let Some(inline) = inline_attachment(&stored) else {
             self.set_save_status("图片未插入：格式不支持", true);
-            restore();
-            *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
             return false;
         };
-        insert_inline_attachment(body, &inline);
-        let saved = save(self);
-        if finish_image_insert(saved, restore) {
-            *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
-            true
-        } else {
-            *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
-            false
-        }
+        let source: &NSAttributedString = &snapshot.attributed;
+        let Some(candidate) = candidate_with_attachment(source, insertion_range, &inline) else {
+            self.set_save_status("图片未插入：格式不支持", true);
+            return false;
+        };
+        let title = self
+            .ivars()
+            .title_field
+            .get()
+            .map(|field| field.stringValue().to_string())
+            .unwrap_or_default();
+        let prepared = match prepare_note_content_from_editor(&candidate, title) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                eprintln!("editor projection failed: {error}");
+                self.set_save_status("保存失败", true);
+                return false;
+            }
+        };
+        let previous_loading_guard = *self.ivars().loading_guard.borrow();
+        *self.ivars().loading_guard.borrow_mut() = true;
+        let inserted = commit_live_image_insert(body, insertion_range, &inline, || {
+            self.persist_note_content(&note_id, prepared)
+        });
+        *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
+        inserted
     }
 
     fn load_note(&self, note: &Note) {
@@ -2178,47 +2232,47 @@ impl AppDelegate {
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
         let body_view = self.ivars().body_view.get().unwrap();
-        let (segments, attachment_ranges) = (unsafe { body_view.textStorage() })
-            .map(|storage| {
-                let source: &NSAttributedString = &storage;
-                editor_segments_with_ranges(source)
-            })
-            .unwrap_or_else(|| {
-                (
-                    vec![EditorSegment::Text(body_view.string().to_string())],
-                    Vec::new(),
-                )
-            });
-        let projection = match editor_save_projection(&segments) {
-            Ok(projection) => projection,
-            Err(error) => {
-                eprintln!("editor projection failed: {error}");
-                self.set_save_status("保存失败", true);
-                return false;
+        let prepared = if let Some(storage) = unsafe { body_view.textStorage() } {
+            let source: &NSAttributedString = &storage;
+            match prepare_note_content_from_editor(source, title) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    eprintln!("editor projection failed: {error}");
+                    self.set_save_status("保存失败", true);
+                    return false;
+                }
+            }
+        } else {
+            let projection = match editor_save_projection(&[EditorSegment::Text(
+                body_view.string().to_string(),
+            )]) {
+                Ok(projection) => projection,
+                Err(error) => {
+                    eprintln!("editor projection failed: {error}");
+                    self.set_save_status("保存失败", true);
+                    return false;
+                }
+            };
+            PreparedNoteContent {
+                update: NoteContentUpdate {
+                    title,
+                    body: projection.body,
+                    body_text: projection.body_text,
+                    body_rtf: Vec::new(),
+                    resource_ids: projection.resource_ids,
+                },
+                formatting_fallback: true,
             }
         };
-        let body = projection.body.clone();
-        let save_plan = rtf_save_plan((unsafe { body_view.textStorage() }).and_then(|storage| {
-            let source: &NSAttributedString = &storage;
-            sanitized_rtf_from_editor(source, &attachment_ranges, &projection.body)
-        }));
-        let formatting_fallback = matches!(save_plan, RtfSavePlan::PlainTextFallback);
-        let rtf = match save_plan {
-            RtfSavePlan::Rich(rtf) => rtf,
-            // Clearing the stored RTF is intentional: keeping stale rich text
-            // would make a restart restore an older body than the plain text.
-            RtfSavePlan::PlainTextFallback => Vec::new(),
-        };
-        match self.ivars().repository.update_note_content(
-            &id,
-            NoteContentUpdate {
-                title,
-                body,
-                body_text: projection.body_text,
-                body_rtf: rtf,
-                resource_ids: projection.resource_ids,
-            },
-        ) {
+        self.persist_note_content(&id, prepared)
+    }
+
+    fn persist_note_content(&self, id: &str, prepared: PreparedNoteContent) -> bool {
+        let PreparedNoteContent {
+            update,
+            formatting_fallback,
+        } = prepared;
+        match self.ivars().repository.update_note_content(id, update) {
             Ok(updated) => {
                 let index = self
                     .ivars()
@@ -2406,18 +2460,6 @@ fn valid_image_bytes_for_mime(bytes: &[u8], mime: &str) -> bool {
     image_signature_matches_mime(bytes, mime) && valid_image_bytes(bytes)
 }
 
-fn finish_image_insert<F>(saved: bool, restore: F) -> bool
-where
-    F: FnOnce(),
-{
-    if saved {
-        true
-    } else {
-        restore();
-        false
-    }
-}
-
 fn is_local_file_url_host(host: Option<&str>) -> bool {
     host.is_none_or(|host| host.is_empty() || host.eq_ignore_ascii_case("localhost"))
 }
@@ -2430,6 +2472,30 @@ fn inline_attachment(
     resource: &joplin_lite_native::core::StoredResource,
 ) -> Option<Retained<NSMutableAttributedString>> {
     inline_attachment_with_alt(resource, &resource.title)
+}
+
+fn commit_after_persistence<P, A>(persist: P, apply: A) -> bool
+where
+    P: FnOnce() -> bool,
+    A: FnOnce(),
+{
+    if !persist() {
+        return false;
+    }
+    apply();
+    true
+}
+
+fn commit_live_image_insert(
+    body: &NSTextView,
+    insertion_range: NSRange,
+    inline: &NSMutableAttributedString,
+    persist: impl FnOnce() -> bool,
+) -> bool {
+    commit_after_persistence(persist, || {
+        body.setSelectedRange(insertion_range);
+        insert_inline_attachment(body, inline);
+    })
 }
 
 #[allow(deprecated)]
@@ -2606,13 +2672,13 @@ mod tests {
         AttachmentDescriptor, ContentLayout, DataDirError, DataFileError, EditorSegment,
         FontTraitOperation, FormatDecision, FormatTarget, PasteFileError, PasteRoute,
         PasteboardImage, RtfLoadDecision, RtfSavePlan, TextFormat,
-        attributed_string_has_attachments, choose_data_dir, content_layout, display_note_title,
-        editor_save_projection, editor_segments_with_ranges, ensure_notes_database_file,
-        finish_image_insert, format_decision, format_target, image_signature_matches_mime,
-        inline_attachment_with_alt, is_local_file_url_host, is_promised_pasteboard_type,
-        paste_route, read_drag_image_file, read_regular_image_file, rtf_load_decision,
-        rtf_save_plan, rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
-        valid_image_bytes_for_mime, validate_canonical_data_dir,
+        attributed_string_has_attachments, candidate_with_attachment, choose_data_dir,
+        commit_after_persistence, content_layout, display_note_title, editor_save_projection,
+        editor_segments_with_ranges, ensure_notes_database_file, format_decision, format_target,
+        image_signature_matches_mime, inline_attachment_with_alt, is_local_file_url_host,
+        is_promised_pasteboard_type, paste_route, read_drag_image_file, read_regular_image_file,
+        rtf_load_decision, rtf_save_plan, rtf_text_matches_body, sanitized_rtf_from_editor,
+        typing_trait_operation, valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
     use joplin_lite_native::core::StoredResource;
     use objc2::{AnyThread, runtime::AnyObject};
@@ -2912,14 +2978,68 @@ mod tests {
     }
 
     #[test]
-    fn failed_save_restores_the_editor_snapshot_before_reporting_failure() {
-        let mut restored = false;
-        assert!(!finish_image_insert(false, || restored = true));
-        assert!(restored);
+    fn image_candidate_is_built_off_view_without_mutating_source() {
+        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str("hello"));
+        let inline = NSMutableAttributedString::from_nsstring(&NSString::from_str("[图片]"));
+        let source_ref: &NSAttributedString = &source;
+        let candidate = candidate_with_attachment(source_ref, NSRange::new(1, 1), &inline).unwrap();
+        assert_eq!(source.string().to_string(), "hello");
+        assert_eq!(candidate.string().to_string(), "h[图片]llo");
+    }
 
-        restored = false;
-        assert!(finish_image_insert(true, || restored = true));
-        assert!(!restored);
+    #[test]
+    fn persistence_gate_leaves_live_editor_and_undo_history_untouched_on_failure() {
+        let original = ("hello".to_owned(), 2usize, true, true);
+        let mut state = original.clone();
+        let mut apply_count = 0;
+        assert!(!commit_after_persistence(
+            || false,
+            || {
+                apply_count += 1;
+                state.0 = "changed".to_owned();
+                state.1 = 5;
+                state.2 = true;
+                state.3 = false;
+            },
+        ));
+        assert_eq!(apply_count, 0);
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn persisted_editor_insert_registers_one_native_undo_and_redo() {
+        let mut body = "hello".to_owned();
+        let mut selection = 5usize;
+        let mut can_undo = false;
+        let mut can_redo = true;
+        let mut undo_body = None;
+        assert!(commit_after_persistence(
+            || true,
+            || {
+                undo_body = Some(body.clone());
+                body.insert_str(selection, "[图片]");
+                selection += "[图片]".chars().count();
+                can_undo = true;
+                can_redo = false;
+            },
+        ));
+        assert_eq!(body, "hello[图片]");
+        assert_eq!(selection, 9);
+        assert!(can_undo);
+        assert!(!can_redo);
+        let redo_body = body.clone();
+        body = undo_body.take().unwrap();
+        can_undo = false;
+        can_redo = true;
+        assert_eq!(body, "hello");
+        assert!(!can_undo);
+        assert!(can_redo);
+        body = redo_body;
+        can_undo = true;
+        can_redo = false;
+        assert_eq!(body, "hello[图片]");
+        assert!(can_undo);
+        assert!(!can_redo);
     }
 
     #[test]

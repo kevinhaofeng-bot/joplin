@@ -51,7 +51,10 @@ while IFS= read -r candidate; do
   if [[ "$kind" != *Mach-O* ]]; then
     continue
   fi
-  dependencies="$(otool -L "$candidate")"
+  # otool's first line is the Mach-O's own path, not a dependency. Only scan
+  # install-name rows so a clean bundle under a directory named WebKit (or
+  # JavaScriptCore/libnode) is not rejected by its absolute path.
+  dependencies="$(otool -L "$candidate" | tail -n +2)"
   if grep -Eiq 'WebKit|JavaScriptCore|libnode' <<<"$dependencies"; then
     echo "forbidden runtime dependency in $candidate" >&2
     exit 1
