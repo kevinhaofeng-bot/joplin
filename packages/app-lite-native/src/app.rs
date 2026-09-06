@@ -1096,6 +1096,9 @@ define_class!(
             if let Some(image_path) = std::env::var_os("JOPLIN_LITE_NATIVE_SMOKE_NATIVE_UNDO") {
                 self.run_native_undo_smoke(Path::new(&image_path));
             }
+            if let Some(image_path) = std::env::var_os("JOPLIN_LITE_NATIVE_SMOKE_RESIZE") {
+                self.run_resize_smoke(Path::new(&image_path));
+            }
             if let Some(query) = std::env::var_os("JOPLIN_LITE_NATIVE_SMOKE_SEARCH") {
                 self.search_notes(&query.to_string_lossy());
                 println!(
@@ -1384,6 +1387,75 @@ impl AppDelegate {
         );
     }
 
+    #[allow(deprecated)]
+    fn run_resize_smoke(&self, image_path: &Path) {
+        let Ok(bytes) = read_regular_image_file(image_path) else {
+            eprintln!("resize smoke image could not be read");
+            return;
+        };
+        if !valid_image_bytes_for_mime(&bytes, "image/png") {
+            eprintln!("resize smoke image is not a PNG");
+            return;
+        }
+        let Some(body) = self.ivars().body_view.get() else {
+            eprintln!("resize smoke body view unavailable");
+            return;
+        };
+        let resource = joplin_lite_native::core::StoredResource {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            sha256: "0".repeat(64),
+            size: bytes.len(),
+            title: "resize.png".into(),
+            mime: "image/png".into(),
+            file_extension: "png".into(),
+            path: PathBuf::new(),
+            bytes,
+        };
+        let Some(inline) = inline_attachment(&resource) else {
+            eprintln!("resize smoke attachment construction failed");
+            return;
+        };
+        let previous_loading_guard = *self.ivars().loading_guard.borrow();
+        *self.ivars().loading_guard.borrow_mut() = true;
+        body.setString(ns_string!(""));
+        self.layout_content(1400.0, 720.0);
+        body.setSelectedRange(NSRange::new(0, 0));
+        insert_inline_attachment(body, &inline);
+        body.setSelectedRange(NSRange::new(1, 0));
+        let before = first_attachment_bounds(body);
+        let before_selection = body.selectedRange();
+        let before_undo = body
+            .undoManager()
+            .map(|manager| (manager.canUndo(), manager.canRedo()));
+        if let Some(window) = self.ivars().window.get() {
+            window.setContentSize(NSSize::new(860.0, 560.0));
+            window.displayIfNeeded();
+        } else {
+            self.layout_content(860.0, 560.0);
+        }
+        let after = first_attachment_bounds(body);
+        let after_selection = body.selectedRange();
+        let after_undo = body
+            .undoManager()
+            .map(|manager| (manager.canUndo(), manager.canRedo()));
+        *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
+        let aspect_preserved = before.zip(after).is_some_and(|(before, after)| {
+            (before.size.width * after.size.height - after.size.width * before.size.height).abs()
+                < 0.01
+        });
+        println!(
+            "resizeSmoke before_width={:?} after_width={:?} after_height={:?} width_ok={} height_ok={} aspect_preserved={} selection_unchanged={} undo_unchanged={}",
+            before.map(|bounds| bounds.size.width),
+            after.map(|bounds| bounds.size.width),
+            after.map(|bounds| bounds.size.height),
+            after.is_some_and(|bounds| bounds.size.width <= 520.0),
+            after.is_some_and(|bounds| bounds.size.height <= 640.0),
+            aspect_preserved,
+            before_selection == after_selection,
+            before_undo == after_undo,
+        );
+    }
+
     fn make_format_button(
         mtm: MainThreadMarker,
         target: &AppDelegate,
@@ -1635,6 +1707,10 @@ impl AppDelegate {
             ));
             body.setMinSize(NSSize::new(layout.body.width, layout.body.height));
             body.setMaxSize(NSSize::new(layout.body.width, f64::MAX));
+            let previous_loading_guard = *self.ivars().loading_guard.borrow();
+            *self.ivars().loading_guard.borrow_mut() = true;
+            resize_inline_attachments(body);
+            *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
         }
         if let Some(button) = self.ivars().delete_button.get() {
             button.setFrame(layout.delete.ns_rect());
@@ -2733,7 +2809,9 @@ fn inline_attachment_with_alt(
 
 fn text_container_available_width(body: &NSTextView) -> f64 {
     let container_width = unsafe { body.textContainer() }
-        .map(|container| container.containerSize().width)
+        .map(|container| {
+            (container.containerSize().width - container.lineFragmentPadding() * 2.0).max(1.0)
+        })
         .filter(|width| width.is_finite() && *width > 0.0);
     container_width.unwrap_or_else(|| {
         let inset = body.textContainerInset();
@@ -2745,8 +2823,77 @@ fn inline_image_display_size(image_size: NSSize, available_width: f64) -> NSSize
     let width = image_size.width.max(1.0);
     let height = image_size.height.max(1.0);
     let max_width = available_width.clamp(1.0, 640.0);
-    let scale = (max_width / width).min(1.0);
+    let scale = (max_width / width).min(640.0 / height).min(1.0);
     NSSize::new(width * scale, height * scale)
+}
+
+fn resize_inline_attachments(body: &NSTextView) {
+    let Some(storage) = (unsafe { body.textStorage() }) else {
+        return;
+    };
+    let length = storage.length();
+    if length == 0 {
+        return;
+    }
+    let attachment_key = unsafe { NSAttachmentAttributeName };
+    let available_width = text_container_available_width(body);
+    let mut location = 0;
+    while location < length {
+        let mut effective_range = NSRange::new(location, 0);
+        let attributes = unsafe {
+            storage.attributesAtIndex_longestEffectiveRange_inRange(
+                location,
+                &mut effective_range,
+                NSRange::new(0, length),
+            )
+        };
+        if let Some(value) = unsafe { attributes.objectForKey_unchecked(attachment_key) }
+            && let Some(attachment) = value.downcast_ref::<NSTextAttachment>()
+            && let Some(image) = attachment.image()
+        {
+            let bounds = attachment.bounds();
+            let size = inline_image_display_size(image.size(), available_width);
+            if bounds.size != size {
+                attachment.setBounds(NSRect::new(bounds.origin, size));
+            }
+        }
+        let next = effective_range.location + effective_range.length;
+        if next <= location {
+            break;
+        }
+        location = next;
+    }
+}
+
+fn first_attachment_bounds(body: &NSTextView) -> Option<NSRect> {
+    let storage = unsafe { body.textStorage() }?;
+    let length = storage.length();
+    if length == 0 {
+        return None;
+    }
+    let attachment_key = unsafe { NSAttachmentAttributeName };
+    let mut location = 0;
+    while location < length {
+        let mut effective_range = NSRange::new(location, 0);
+        let attributes = unsafe {
+            storage.attributesAtIndex_longestEffectiveRange_inRange(
+                location,
+                &mut effective_range,
+                NSRange::new(0, length),
+            )
+        };
+        if let Some(value) = unsafe { attributes.objectForKey_unchecked(attachment_key) }
+            && let Some(attachment) = value.downcast_ref::<NSTextAttachment>()
+        {
+            return Some(attachment.bounds());
+        }
+        let next = effective_range.location + effective_range.length;
+        if next <= location {
+            break;
+        }
+        location = next;
+    }
+    None
 }
 
 fn inline_attachment_with_width(
@@ -3016,6 +3163,8 @@ mod tests {
         assert_eq!(small, NSSize::new(320.0, 160.0));
         let capped = inline_image_display_size(NSSize::new(1600.0, 800.0), 900.0);
         assert_eq!(capped, NSSize::new(640.0, 320.0));
+        let tall = inline_image_display_size(NSSize::new(320.0, 1600.0), 900.0);
+        assert_eq!(tall, NSSize::new(128.0, 640.0));
     }
 
     #[test]
