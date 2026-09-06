@@ -13,9 +13,9 @@ use objc2_app_kit::{
     NSFontTraitMask, NSForegroundColorAttributeName, NSKernAttributeName, NSLayoutAttribute,
     NSLineBreakMode, NSMenu, NSMenuItem, NSMutableAttributedStringAppKitAdditions,
     NSMutableParagraphStyle, NSScrollView, NSSearchField, NSShadowAttributeName, NSStackView,
-    NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName, NSStrokeWidthAttributeName,
-    NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
-    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
+    NSStackViewDistribution, NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName,
+    NSStrokeWidthAttributeName, NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate,
+    NSTextView, NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
     NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -67,7 +67,10 @@ fn content_layout(width: f64, height: f64) -> ContentLayout {
     let sidebar_width = (width * 0.30).clamp(258.0, 280.0);
     let right_width = width - sidebar_width;
     let margin = if right_width >= 700.0 { 48.0 } else { 36.0 };
-    let editor_width = (right_width - margin * 2.0).max(400.0);
+    // Byword-like reading measure: keep long lines comfortable on wide
+    // windows, while still filling the available space at the MVP minimum.
+    let editor_width = (right_width - margin * 2.0).clamp(400.0, 720.0);
+    let editor_x = sidebar_width + (right_width - editor_width) / 2.0;
     let toolbar_y = height - 132.0;
     let body_y = 28.0;
     let body_height = (toolbar_y - body_y - 16.0).max(220.0);
@@ -85,31 +88,31 @@ fn content_layout(width: f64, height: f64) -> ContentLayout {
         height: (height - 116.0).max(240.0),
     };
     let title = LayoutRect {
-        x: sidebar_width + margin,
+        x: editor_x,
         y: height - 84.0,
         width: (editor_width - 84.0).max(260.0),
         height: 42.0,
     };
     let toolbar = LayoutRect {
-        x: sidebar_width + margin,
+        x: editor_x,
         y: toolbar_y,
         width: editor_width,
         height: 30.0,
     };
     let body = LayoutRect {
-        x: sidebar_width + margin,
+        x: editor_x,
         y: body_y,
         width: editor_width,
         height: body_height,
     };
     let delete = LayoutRect {
-        x: width - margin - 62.0,
+        x: editor_x + editor_width - 62.0,
         y: height - 60.0,
         width: 62.0,
         height: 26.0,
     };
     let status = LayoutRect {
-        x: width - margin - 164.0,
+        x: editor_x + editor_width - 164.0,
         y: toolbar_y + 5.0,
         width: 154.0,
         height: 20.0,
@@ -339,6 +342,7 @@ struct AppDelegateIvars {
     current_note_id: RefCell<Option<String>>,
     notes: RefCell<Vec<Note>>,
     loading_guard: RefCell<bool>,
+    sidebar_background: OnceCell<Retained<NSBox>>,
     sidebar_separator: OnceCell<Retained<NSBox>>,
     list_scroll: OnceCell<Retained<NSScrollView>>,
     list_stack: OnceCell<Retained<NSStackView>>,
@@ -356,6 +360,7 @@ struct AppDelegateIvars {
     save_status: OnceCell<Retained<NSTextField>>,
     editor_empty_label: OnceCell<Retained<NSTextField>>,
     note_buttons: RefCell<Vec<Retained<NSButton>>>,
+    note_rows: RefCell<Vec<Retained<NSBox>>>,
 }
 
 define_class!(
@@ -397,6 +402,18 @@ define_class!(
 
             let content = window.contentView().expect("window content view");
 
+            // A softly tinted reading-list rail keeps the writing canvas calm
+            // while remaining fully dynamic in light and dark appearance.
+            let sidebar_background = NSBox::initWithFrame(
+                NSBox::alloc(mtm),
+                LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
+            );
+            sidebar_background.setBoxType(NSBoxType::Custom);
+            sidebar_background.setTransparent(false);
+            sidebar_background.setFillColor(&NSColor::underPageBackgroundColor());
+            sidebar_background.setBorderWidth(0.0);
+            content.addSubview(&sidebar_background);
+
             let separator = NSBox::initWithFrame(
                 NSBox::alloc(mtm),
                 LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
@@ -417,7 +434,8 @@ define_class!(
                 LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
             );
             list_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-            list_stack.setSpacing(0.0);
+            list_stack.setSpacing(4.0);
+            list_stack.setDistribution(NSStackViewDistribution::GravityAreas);
             list_stack.setAlignment(NSLayoutAttribute::Width);
             list_stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
                 top: 10.0,
@@ -450,6 +468,8 @@ define_class!(
                 )
             };
             new_button.setBezelStyle(NSBezelStyle::Push);
+            new_button.setBezelColor(Some(&NSColor::controlAccentColor()));
+            new_button.setContentTintColor(Some(&NSColor::whiteColor()));
             content.addSubview(&new_button);
 
             let search_field = NSSearchField::initWithFrame(
@@ -458,6 +478,7 @@ define_class!(
             );
             search_field.setPlaceholderString(Some(ns_string!("搜索笔记")));
             search_field.setContinuous(true);
+            search_field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
             unsafe {
                 search_field.setTarget(Some(self));
                 search_field.setAction(Some(sel!(searchNotes:)));
@@ -475,6 +496,8 @@ define_class!(
             title_field.setDrawsBackground(false);
             title_field.setFont(Some(&NSFont::systemFontOfSize_weight(28.0, 0.5)));
             title_field.setTextColor(Some(&NSColor::labelColor()));
+            title_field.setMaximumNumberOfLines(1);
+            title_field.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             content.addSubview(&title_field);
 
             let bold_button = Self::make_format_button(mtm, self, "B", sel!(toggleBoldText:));
@@ -490,6 +513,7 @@ define_class!(
                 )
             };
             clear_button.setBezelStyle(NSBezelStyle::Toolbar);
+            clear_button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
             content.addSubview(&bold_button);
             content.addSubview(&italic_button);
             content.addSubview(&underline_button);
@@ -536,6 +560,7 @@ define_class!(
             };
             delete_button.setBordered(false);
             delete_button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+            delete_button.setHasDestructiveAction(true);
             content.addSubview(&delete_button);
 
             let save_status = NSTextField::initWithFrame(
@@ -555,16 +580,20 @@ define_class!(
                 NSTextField::alloc(mtm),
                 LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
             );
-            editor_empty_label.setStringValue(ns_string!("新建一条笔记开始记录"));
+            editor_empty_label.setStringValue(ns_string!("从一条笔记开始\n点击左上角「新建笔记」"));
             editor_empty_label.setBezeled(false);
             editor_empty_label.setDrawsBackground(false);
             editor_empty_label.setEditable(false);
             editor_empty_label.setAlignment(NSTextAlignment::Center);
-            editor_empty_label.setFont(Some(&NSFont::systemFontOfSize(17.0)));
+            editor_empty_label.setUsesSingleLineMode(false);
+            editor_empty_label.setMaximumNumberOfLines(2);
+            editor_empty_label.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+            editor_empty_label.setFont(Some(&NSFont::systemFontOfSize(16.0)));
             editor_empty_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
             content.addSubview(&editor_empty_label);
 
             self.ivars().window.set(window.clone()).unwrap();
+            self.ivars().sidebar_background.set(sidebar_background).unwrap();
             self.ivars().sidebar_separator.set(separator).unwrap();
             self.ivars().list_scroll.set(list_scroll).unwrap();
             self.ivars().list_stack.set(list_stack).unwrap();
@@ -952,20 +981,32 @@ impl AppDelegate {
                 NSSize::new(1.0, layout.sidebar.height),
             ));
         }
+        if let Some(background) = self.ivars().sidebar_background.get() {
+            background.setFrame(layout.sidebar.ns_rect());
+        }
         if let Some(list_scroll) = self.ivars().list_scroll.get() {
             list_scroll.setFrame(layout.list.ns_rect());
         }
         if let Some(list_stack) = self.ivars().list_stack.get() {
+            // Keep the document view at least as tall as the viewport, then
+            // position each row explicitly at the top of the reading rail.
             let stack_height =
-                (self.ivars().notes.borrow().len() as f64 * 58.0 + 24.0).max(layout.list.height);
+                (self.ivars().notes.borrow().len() as f64 * 64.0 + 24.0).max(layout.list.height);
             list_stack.setFrame(NSRect::new(
                 NSPoint::new(0.0, 0.0),
                 NSSize::new(layout.list.width, stack_height),
             ));
+            let row_width = (layout.list.width - 24.0).max(180.0);
+            for (index, row) in self.ivars().note_rows.borrow().iter().enumerate() {
+                row.setFrame(NSRect::new(
+                    NSPoint::new(12.0, stack_height - 12.0 - ((index + 1) as f64 * 64.0)),
+                    NSSize::new(row_width, 60.0),
+                ));
+            }
             for button in self.ivars().note_buttons.borrow().iter() {
                 button.setFrame(NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new((layout.list.width - 24.0).max(180.0), 56.0),
+                    NSPoint::new(8.0, 0.0),
+                    NSSize::new((row_width - 16.0).max(164.0), 60.0),
                 ));
             }
         }
@@ -977,16 +1018,16 @@ impl AppDelegate {
         }
         if let Some(button) = self.ivars().new_button.get() {
             button.setFrame(NSRect::new(
-                NSPoint::new(16.0, height - 58.0),
-                NSSize::new(112.0, 32.0),
+                NSPoint::new(16.0, height - 56.0),
+                NSSize::new(108.0, 30.0),
             ));
         }
         if let Some(search) = self.ivars().search_field.get() {
-            let x = 136.0;
+            let x = 132.0;
             let search_width = (layout.sidebar.width - x - 14.0).max(108.0);
             search.setFrame(NSRect::new(
-                NSPoint::new(x, height - 58.0),
-                NSSize::new(search_width, 32.0),
+                NSPoint::new(x, height - 56.0),
+                NSSize::new(search_width, 30.0),
             ));
         }
         if let Some(title) = self.ivars().title_field.get() {
@@ -1411,8 +1452,10 @@ impl AppDelegate {
             return;
         };
         for button in self.ivars().note_buttons.borrow_mut().drain(..) {
-            stack.removeArrangedSubview(&button);
             button.removeFromSuperview();
+        }
+        for row in self.ivars().note_rows.borrow_mut().drain(..) {
+            row.removeFromSuperview();
         }
         *self.ivars().notes.borrow_mut() = notes;
         let selected_id = self.ivars().current_note_id.borrow().clone();
@@ -1426,6 +1469,20 @@ impl AppDelegate {
                     self.mtm(),
                 )
             };
+            let row = NSBox::initWithFrame(
+                NSBox::alloc(self.mtm()),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(220.0, 60.0)),
+            );
+            row.setBoxType(NSBoxType::Custom);
+            row.setTransparent(false);
+            row.setBorderWidth(0.0);
+            row.setCornerRadius(8.0);
+            let row_color = if selected {
+                NSColor::selectedContentBackgroundColor()
+            } else {
+                NSColor::clearColor()
+            };
+            row.setFillColor(&row_color);
             button.setTag(index as isize);
             button.setBordered(false);
             button.setButtonType(NSButtonType::PushOnPushOff);
@@ -1445,11 +1502,13 @@ impl AppDelegate {
             button.setContentTintColor(Some(&color));
             set_note_button_title(&button, note, selected);
             button.setFrame(NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(220.0, 56.0),
+                NSPoint::new(8.0, 0.0),
+                NSSize::new(204.0, 60.0),
             ));
-            stack.addArrangedSubview(&button);
+            row.addSubview(&button);
+            stack.addSubview(&row);
             self.ivars().note_buttons.borrow_mut().push(button);
+            self.ivars().note_rows.borrow_mut().push(row);
         }
         let is_empty = self.ivars().notes.borrow().is_empty();
         if let Some(label) = self.ivars().list_empty_label.get() {
@@ -1486,6 +1545,14 @@ impl AppDelegate {
                 NSColor::labelColor()
             };
             button.setContentTintColor(Some(&color));
+            if let Some(row) = self.ivars().note_rows.borrow().get(index) {
+                let row_color = if selected {
+                    NSColor::selectedContentBackgroundColor()
+                } else {
+                    NSColor::clearColor()
+                };
+                row.setFillColor(&row_color);
+            }
             if let Some(note) = self.ivars().notes.borrow().get(index) {
                 set_note_button_title(button, note, selected);
             }
@@ -1568,11 +1635,15 @@ fn set_note_button_title(button: &NSButton, note: &Note, selected: bool) {
     let title_font = NSFont::systemFontOfSize_weight(15.0, if selected { 0.3 } else { 0.0 });
     let summary_font = NSFont::systemFontOfSize(12.0);
     let title_color = if selected {
-        NSColor::controlAccentColor()
+        NSColor::whiteColor()
     } else {
         NSColor::labelColor()
     };
-    let summary_color = NSColor::secondaryLabelColor();
+    let summary_color = if selected {
+        NSColor::whiteColor()
+    } else {
+        NSColor::secondaryLabelColor()
+    };
     let title_length = NSString::from_str(&title).length();
     let full_length = NSString::from_str(&label).length();
     unsafe {
@@ -1652,6 +1723,7 @@ impl AppDelegate {
             current_note_id: RefCell::new(None),
             notes: RefCell::new(Vec::new()),
             loading_guard: RefCell::new(false),
+            sidebar_background: OnceCell::new(),
             sidebar_separator: OnceCell::new(),
             list_scroll: OnceCell::new(),
             list_stack: OnceCell::new(),
@@ -1669,6 +1741,7 @@ impl AppDelegate {
             save_status: OnceCell::new(),
             editor_empty_label: OnceCell::new(),
             note_buttons: RefCell::new(Vec::new()),
+            note_rows: RefCell::new(Vec::new()),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -1698,6 +1771,16 @@ mod tests {
             assert!(layout.body.y + layout.body.height <= height);
             assert!(layout.title.x >= layout.sidebar.x + layout.sidebar.width);
         }
+        let wide = content_layout(1800.0, 900.0);
+        assert_eq!(wide.body.width, 720.0);
+        assert_eq!(
+            wide.body.x + wide.body.width,
+            wide.delete.x + wide.delete.width
+        );
+        assert_eq!(
+            wide.body.x + wide.body.width,
+            wide.status.x + wide.status.width + 10.0
+        );
     }
 
     #[test]
