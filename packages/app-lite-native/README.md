@@ -26,7 +26,7 @@ packages/app-lite-native/scripts/bundle.sh
 open "packages/app-lite-native/dist/Joplin Lite Native.app"
 ```
 
-## 当前功能（0.2.0 MVP）
+## 当前功能（0.3.0 图片附件 MVP）
 
 - 原生笔记列表、实时搜索和软删除：低摩擦地接近 Evernote 的列表使用感
 - 新建笔记、标题与正文编辑、自动保存；标题独立保存，不从正文首行覆盖
@@ -35,7 +35,7 @@ open "packages/app-lite-native/dist/Joplin Lite Native.app"
 - SQLite 本地存储及基础全文搜索
 - 图片附件 MVP：正文视图支持 PNG/JPEG/TIFF 粘贴；Finder 拖入支持普通本地 PNG/JPEG
 - 图片单文件上限为 10 MiB；拖入仅接受真实本地 regular file（拒绝目录、符号链接、FIFO、远程 URL、promised file 和非图片）
-- 图片 blob 保存在 profile 的 `resources/<sha256 前缀>/<sha256>.<扩展名>`，正文使用规范 marker：`![alt](:/<32 位 resource id>)`
+- 图片 blob 保存在 `<profile>/resources/blobs/<sha256>`，正文使用规范 marker：`![alt](:/<32 位 resource id>)`
 - 数据目录和 `notes.sqlite` 的符号链接防护；RTF 导出失败时优先保存正文，避免丢失最新文字
 
 新建行为契约是：每次点击“新建笔记”都会创建一条新的草稿笔记，清空搜索条件、切换到该笔记并把焦点放到正文；空白草稿会在下次启动时清理。删除只做软删除，不物理移除历史行。
@@ -47,6 +47,11 @@ open "packages/app-lite-native/dist/Joplin Lite Native.app"
 - ad-hoc 签名的 `.app` 通过 `codesign --verify --deep --strict`。
 - App 包体约 2.4 MB；空资料库稳定后 RSS 约 46–49 MB，载入并编辑笔记后一次复测约 57 MB。
 - 进程没有子进程；release 二进制的动态链接中没有 WebKit 或 JavaScriptCore。
+
+## 0.3.0 图片附件验收
+
+- PNG/JPEG 图片粘贴、10-MiB 上限、真实编码校验、canonical marker、blob 持久化与重启恢复已覆盖自动化测试和签名临时 profile smoke。
+- Finder JPEG 拖入接收链已实现并注册在正文视图；当前 CUA 环境中跨应用拖动尚未稳定完成端到端验收，发布前应人工 Finder 拖入复核。
 
 ## 当前限制
 

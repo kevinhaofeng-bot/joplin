@@ -10,6 +10,8 @@ use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 #[allow(deprecated)]
 use objc2_app_kit::NSObliquenessAttributeName;
+#[allow(deprecated)]
+use objc2_app_kit::NSShadowAttributeName;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAttachmentAttributeName,
     NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
@@ -21,12 +23,12 @@ use objc2_app_kit::{
     NSForegroundColorAttributeName, NSImage, NSKernAttributeName, NSLayoutAttribute,
     NSLineBreakMode, NSMenu, NSMenuItem, NSMutableAttributedStringAppKitAdditions,
     NSMutableParagraphStyle, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
-    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSShadowAttributeName,
-    NSStackView, NSStackViewDistribution, NSStrikethroughStyleAttributeName,
-    NSStrokeColorAttributeName, NSStrokeWidthAttributeName, NSTextAlignment, NSTextAttachment,
-    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSTextViewDelegate,
-    NSUnderlineStyle, NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSStackView,
+    NSStackViewDistribution, NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName,
+    NSStrokeWidthAttributeName, NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField,
+    NSTextFieldDelegate, NSTextView, NSTextViewDelegate, NSUnderlineStyle,
+    NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
@@ -63,6 +65,11 @@ struct EditorProjection {
     body: String,
     body_text: String,
     resource_ids: Vec<String>,
+}
+
+struct EditorSnapshot {
+    attributed: Retained<NSMutableAttributedString>,
+    selection: NSRange,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -1693,10 +1700,22 @@ impl AppDelegate {
         else {
             return false;
         };
+        let Some(attributed) = (unsafe { body.textStorage() }).map(|storage| {
+            let source: &NSAttributedString = &storage;
+            source.mutableCopy()
+        }) else {
+            return false;
+        };
+        let snapshot = EditorSnapshot {
+            attributed,
+            selection: body.selectedRange(),
+        };
         let point = body.convertPoint_fromView(sender.draggingLocation(), None);
         let character_index = body.characterIndexForInsertionAtPoint(point);
         body.setSelectedRange(NSRange::new(character_index, 0));
-        self.insert_image_data(&bytes, &title, &mime)
+        self.insert_image_data_from_snapshot(&bytes, &title, &mime, body, snapshot, |this| {
+            this.save_current_note_unchecked()
+        })
     }
 
     fn read_pasteboard_image(&self) -> PasteboardImage {
@@ -1720,6 +1739,14 @@ impl AppDelegate {
                 item == file_url_type
             })
         }) {
+            if pasteboard.types().as_ref().is_some_and(|types| {
+                types.iter().any(|item| {
+                    let item: &NSString = item.as_ref();
+                    is_promised_pasteboard_type(item.to_string().as_str())
+                })
+            }) {
+                return PasteboardImage::Rejected("图片未插入：格式不支持");
+            }
             let Some(items) = pasteboard.pasteboardItems() else {
                 return PasteboardImage::Rejected("图片未插入：格式不支持");
             };
@@ -1732,7 +1759,8 @@ impl AppDelegate {
             let Some(url) = NSURL::initWithString(NSURL::alloc(), &url_text) else {
                 return PasteboardImage::Rejected("图片未插入：格式不支持");
             };
-            if !url.isFileURL() {
+            let host = url.host().map(|host| host.to_string());
+            if !url.isFileURL() || !is_local_file_url_host(host.as_deref()) {
                 return PasteboardImage::Rejected("图片未插入：格式不支持");
             }
             let Some(path) = url.path() else {
@@ -1762,7 +1790,7 @@ impl AppDelegate {
                     return PasteboardImage::Rejected("图片未插入：格式不支持");
                 }
             };
-            if !valid_image_bytes(&bytes) {
+            if !valid_image_bytes_for_mime(&bytes, mime.0) {
                 return PasteboardImage::Rejected("图片未插入：格式不支持");
             }
             return PasteboardImage::Data {
@@ -1775,14 +1803,58 @@ impl AppDelegate {
     }
 
     fn insert_image_data(&self, bytes: &[u8], title: &str, mime: &str) -> bool {
+        self.insert_image_data_with_save(bytes, title, mime, |this| {
+            this.save_current_note_unchecked()
+        })
+    }
+
+    fn insert_image_data_with_save<F>(&self, bytes: &[u8], title: &str, mime: &str, save: F) -> bool
+    where
+        F: FnOnce(&Self) -> bool,
+    {
         if bytes.len() > MAX_IMAGE_BYTES {
             self.set_save_status("图片未插入：超过 10 MB", true);
             return false;
         }
-        if !matches!(mime, "image/png" | "image/jpeg") || !valid_image_bytes(bytes) {
+        if !matches!(mime, "image/png" | "image/jpeg") || !valid_image_bytes_for_mime(bytes, mime) {
             self.set_save_status("图片未插入：格式不支持", true);
             return false;
         }
+        let Some(body) = self.ivars().body_view.get() else {
+            return false;
+        };
+        let Some(attributed) = (unsafe { body.textStorage() }).map(|storage| {
+            let source: &NSAttributedString = &storage;
+            source.mutableCopy()
+        }) else {
+            return false;
+        };
+        let snapshot = EditorSnapshot {
+            attributed,
+            selection: body.selectedRange(),
+        };
+        self.insert_image_data_from_snapshot(bytes, title, mime, body, snapshot, save)
+    }
+
+    fn insert_image_data_from_snapshot<F>(
+        &self,
+        bytes: &[u8],
+        title: &str,
+        mime: &str,
+        body: &NSTextView,
+        snapshot: EditorSnapshot,
+        save: F,
+    ) -> bool
+    where
+        F: FnOnce(&Self) -> bool,
+    {
+        let restore = || {
+            if let Some(storage) = unsafe { body.textStorage() } {
+                let snapshot_ref: &NSAttributedString = &snapshot.attributed;
+                storage.setAttributedString(snapshot_ref);
+            }
+            body.setSelectedRange(snapshot.selection);
+        };
         let extension = if mime == "image/png" { "png" } else { "jpg" };
         let stored = match self.ivars().repository.import_resource(ResourceImport {
             bytes,
@@ -1794,18 +1866,27 @@ impl AppDelegate {
             Err(error) => {
                 eprintln!("paste image import failed: {error}");
                 self.set_save_status("图片未插入：格式不支持", true);
+                restore();
                 return false;
             }
         };
-        let Some(body) = self.ivars().body_view.get() else {
-            return false;
-        };
         let Some(inline) = inline_attachment(&stored) else {
             self.set_save_status("图片未插入：格式不支持", true);
+            restore();
             return false;
         };
+        let previous_loading_guard = *self.ivars().loading_guard.borrow();
+        *self.ivars().loading_guard.borrow_mut() = true;
         insert_inline_attachment(body, &inline);
-        self.save_current_note()
+        let saved = save(self);
+        if saved {
+            *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
+            true
+        } else {
+            restore();
+            *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
+            false
+        }
     }
 
     fn load_note(&self, note: &Note) {
@@ -2082,6 +2163,10 @@ impl AppDelegate {
         if *self.ivars().loading_guard.borrow() {
             return false;
         }
+        self.save_current_note_unchecked()
+    }
+
+    fn save_current_note_unchecked(&self) -> bool {
         let Some(id) = self.ivars().current_note_id.borrow().clone() else {
             return false;
         };
@@ -2203,7 +2288,7 @@ fn read_drag_image_file(path: &Path) -> Result<PasteboardImage, PasteFileError> 
         _ => return Err(PasteFileError::Invalid),
     };
     let bytes = read_regular_image_file(path)?;
-    if !valid_image_bytes(&bytes) {
+    if !valid_image_bytes_for_mime(&bytes, mime) {
         return Err(PasteFileError::Invalid);
     }
     let title = path
@@ -2223,6 +2308,12 @@ fn read_drag_pasteboard(pasteboard: &NSPasteboard) -> Result<PasteboardImage, Pa
     let Some(types) = pasteboard.types() else {
         return Err(PasteFileError::Invalid);
     };
+    if types.iter().any(|item| {
+        let item: &NSString = item.as_ref();
+        is_promised_pasteboard_type(item.to_string().as_str())
+    }) {
+        return Err(PasteFileError::Invalid);
+    }
     if !types.iter().any(|item| {
         let item: &NSString = item.as_ref();
         item == file_url_type
@@ -2241,7 +2332,8 @@ fn read_drag_pasteboard(pasteboard: &NSPasteboard) -> Result<PasteboardImage, Pa
     let Some(url) = NSURL::initWithString(NSURL::alloc(), &url_text) else {
         return Err(PasteFileError::Invalid);
     };
-    if !url.isFileURL() {
+    let host = url.host().map(|host| host.to_string());
+    if !url.isFileURL() || !is_local_file_url_host(host.as_deref()) {
         return Err(PasteFileError::Invalid);
     }
     let Some(path) = url.path() else {
@@ -2263,7 +2355,7 @@ enum PasteboardImage {
 fn normalize_paste_image(bytes: Vec<u8>, title: &str, mime: &str) -> PasteboardImage {
     if bytes.len() > MAX_IMAGE_BYTES {
         PasteboardImage::Rejected("图片未插入：超过 10 MB")
-    } else if valid_image_bytes(&bytes) {
+    } else if valid_image_bytes_for_mime(&bytes, mime) {
         PasteboardImage::Data {
             bytes,
             title: title.to_owned(),
@@ -2299,6 +2391,26 @@ fn valid_image_bytes(bytes: &[u8]) -> bool {
     }
     let data = NSData::with_bytes(bytes);
     NSImage::initWithData(NSImage::alloc(), &data).is_some()
+}
+
+fn image_signature_matches_mime(bytes: &[u8], mime: &str) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
+        _ => false,
+    }
+}
+
+fn valid_image_bytes_for_mime(bytes: &[u8], mime: &str) -> bool {
+    image_signature_matches_mime(bytes, mime) && valid_image_bytes(bytes)
+}
+
+fn is_local_file_url_host(host: Option<&str>) -> bool {
+    host.is_none_or(|host| host.is_empty() || host.eq_ignore_ascii_case("localhost"))
+}
+
+fn is_promised_pasteboard_type(type_name: &str) -> bool {
+    type_name.to_ascii_lowercase().contains("promise")
 }
 
 fn inline_attachment(
@@ -2483,19 +2595,20 @@ mod tests {
         PasteboardImage, RtfLoadDecision, RtfSavePlan, TextFormat,
         attributed_string_has_attachments, choose_data_dir, content_layout, display_note_title,
         editor_save_projection, editor_segments_with_ranges, ensure_notes_database_file,
-        format_decision, format_target, inline_attachment_with_alt, paste_route,
-        read_drag_image_file, read_regular_image_file, rtf_load_decision, rtf_save_plan,
-        rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
+        format_decision, format_target, image_signature_matches_mime, inline_attachment_with_alt,
+        is_local_file_url_host, is_promised_pasteboard_type, paste_route, read_drag_image_file,
+        read_regular_image_file, rtf_load_decision, rtf_save_plan, rtf_text_matches_body,
+        sanitized_rtf_from_editor, typing_trait_operation, valid_image_bytes_for_mime,
         validate_canonical_data_dir,
     };
     use joplin_lite_native::core::StoredResource;
-    use objc2::AnyThread;
+    use objc2::{AnyThread, runtime::AnyObject};
     use objc2_app_kit::{
         NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
-        NSTextAttachment,
+        NSBitmapImageFileType, NSBitmapImageRep, NSTextAttachment,
     };
     use objc2_foundation::{
-        NSAttributedString, NSData, NSMutableAttributedString, NSRange, NSString,
+        NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSString,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2732,6 +2845,57 @@ mod tests {
             read_drag_image_file(&wrong_extension),
             Err(PasteFileError::Invalid)
         ));
+    }
+
+    #[test]
+    fn image_signatures_match_only_the_declared_png_or_jpeg_mime() {
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+        const JPEG: &[u8] = b"\xff\xd8\xff\xe0";
+        const GIF: &[u8] = b"GIF89a";
+        const TIFF: &[u8] = b"II*\0";
+        assert!(image_signature_matches_mime(PNG, "image/png"));
+        assert!(image_signature_matches_mime(JPEG, "image/jpeg"));
+        assert!(!image_signature_matches_mime(PNG, "image/jpeg"));
+        assert!(!image_signature_matches_mime(JPEG, "image/png"));
+        assert!(!image_signature_matches_mime(GIF, "image/png"));
+        assert!(!image_signature_matches_mime(TIFF, "image/jpeg"));
+
+        const TINY_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let rep = NSBitmapImageRep::initWithData(
+            NSBitmapImageRep::alloc(),
+            &NSData::with_bytes(TINY_PNG),
+        )
+        .unwrap();
+        let empty_keys: [&NSString; 0] = [];
+        let empty_values: [&AnyObject; 0] = [];
+        let properties =
+            NSDictionary::<NSString, AnyObject>::from_slices(&empty_keys, &empty_values);
+        let jpeg = unsafe {
+            rep.representationUsingType_properties(NSBitmapImageFileType::JPEG, &properties)
+        }
+        .unwrap();
+        assert!(valid_image_bytes_for_mime(&jpeg.to_vec(), "image/jpeg"));
+        assert!(!valid_image_bytes_for_mime(GIF, "image/png"));
+        assert!(!valid_image_bytes_for_mime(TIFF, "image/jpeg"));
+    }
+
+    #[test]
+    fn drag_url_and_promise_guards_reject_remote_and_promised_payloads() {
+        assert!(is_local_file_url_host(None));
+        assert!(is_local_file_url_host(Some("")));
+        assert!(is_local_file_url_host(Some("localhost")));
+        assert!(!is_local_file_url_host(Some("remote.example")));
+        assert!(is_promised_pasteboard_type("NSFilesPromisePboardType"));
+        assert!(is_promised_pasteboard_type(
+            "com.apple.pasteboard.promised-file-url"
+        ));
+        assert!(!is_promised_pasteboard_type("public.file-url"));
     }
 
     #[test]
