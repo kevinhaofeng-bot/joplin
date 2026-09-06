@@ -94,7 +94,7 @@ define_class!(
             file_menu_item.setSubmenu(Some(&file_menu)); menu.addItem(&file_menu_item);
             let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("编辑"));
             let undo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("撤销"), Some(sel!(undoText:)), ns_string!("z")) };
-            let redo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("重做"), Some(sel!(redoText:)), ns_string!("Z")) };
+            let redo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("重做"), Some(sel!(redoText:)), ns_string!("z")) };
             let cut_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("剪切"), Some(sel!(cut:)), ns_string!("x")) };
             let copy_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("拷贝"), Some(sel!(copy:)), ns_string!("c")) };
             let paste_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("粘贴"), Some(sel!(paste:)), ns_string!("v")) };
