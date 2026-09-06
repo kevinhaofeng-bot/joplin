@@ -24,11 +24,12 @@ dirs = "6"
 objc2 = "0.6.4"
 objc2-foundation = "0.3.2"
 objc2-app-kit = { version = "0.3.2", features = [
-    "NSApplication", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSMenu",
+    "NSApplication", "NSBitmapImageRep", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSMenu",
     "NSFontManager", "NSMenuItem", "NSResponder", "NSScrollView", "NSSearchField", "NSSplitView", "NSStackView",
     "NSBox", "NSLayoutConstraint", "NSParagraphStyle", "NSAttributedString",
     "NSTextStorage",
-    "NSText", "NSTextField", "NSTextView", "NSView", "NSWindow",
+    "NSText", "NSTextAttachment", "NSTextField", "NSTextView", "NSView", "NSWindow",
+    "NSPasteboard", "NSPasteboardItem",
 ] }
 
 [dev-dependencies]

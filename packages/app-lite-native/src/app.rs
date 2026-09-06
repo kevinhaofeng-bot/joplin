@@ -1,27 +1,34 @@
-use joplin_lite_native::core::{CreateNote, Note, NoteRepository};
+use joplin_lite_native::body::{extract_resource_ids, markdown_marker, project_search_text};
+use joplin_lite_native::core::{
+    CreateNote, Note, NoteContentUpdate, NoteRepository, ResourceImport,
+};
+use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
-use objc2::runtime::{ProtocolObject, Sel};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 #[allow(deprecated)]
 use objc2_app_kit::NSObliquenessAttributeName;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSAttributedStringAppKitDocumentFormats, NSBackgroundColorAttributeName, NSBackingStoreType,
-    NSBaselineOffsetAttributeName, NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton,
-    NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAttachmentAttributeName,
+    NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
+    NSBackgroundColorAttributeName, NSBackingStoreType, NSBaselineOffsetAttributeName,
+    NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep, NSBorderType, NSBox, NSBoxType,
+    NSButton, NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSFontAttributeName,
-    NSFontTraitMask, NSForegroundColorAttributeName, NSKernAttributeName, NSLayoutAttribute,
-    NSLineBreakMode, NSMenu, NSMenuItem, NSMutableAttributedStringAppKitAdditions,
-    NSMutableParagraphStyle, NSScrollView, NSSearchField, NSShadowAttributeName, NSStackView,
-    NSStackViewDistribution, NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName,
-    NSStrokeWidthAttributeName, NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate,
+    NSFontTraitMask, NSForegroundColorAttributeName, NSImage, NSKernAttributeName,
+    NSLayoutAttribute, NSLineBreakMode, NSMenu, NSMenuItem,
+    NSMutableAttributedStringAppKitAdditions, NSMutableParagraphStyle, NSPasteboard,
+    NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSScrollView,
+    NSSearchField, NSShadowAttributeName, NSStackView, NSStackViewDistribution,
+    NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName, NSStrokeWidthAttributeName,
+    NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField, NSTextFieldDelegate,
     NSTextView, NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
     NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSAttributedString, NSData, NSMutableAttributedString, NSMutableCopying,
-    NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
-    NSString, ns_string,
+    MainThreadMarker, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
+    NSMutableAttributedString, NSMutableCopying, NSNotification, NSNumber, NSObject,
+    NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSURL, ns_string,
 };
 use std::cell::{OnceCell, RefCell};
 use std::ffi::OsString;
@@ -29,6 +36,62 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::Arc;
+
+const RESOURCE_ID_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-id";
+const RESOURCE_ALT_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-alt";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachmentDescriptor {
+    resource_id: String,
+    alt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditorSegment {
+    Text(String),
+    Attachment(AttachmentDescriptor),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorProjection {
+    body: String,
+    body_text: String,
+    resource_ids: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+enum EditorCodecError {
+    #[error("invalid attachment marker: {0}")]
+    Body(#[from] joplin_lite_native::body::BodyError),
+}
+
+fn editor_save_projection(
+    segments: &[EditorSegment],
+) -> Result<EditorProjection, EditorCodecError> {
+    let mut body = String::new();
+    for segment in segments {
+        match segment {
+            EditorSegment::Text(text) => body.push_str(&text.replace('\u{fffc}', "[图片]")),
+            EditorSegment::Attachment(attachment) => {
+                body.push_str(&markdown_marker(&attachment.resource_id, &attachment.alt)?);
+            }
+        }
+    }
+    let resource_ids = extract_resource_ids(&body);
+    Ok(EditorProjection {
+        body_text: project_search_text(&body),
+        body,
+        resource_ids,
+    })
+}
+
+fn resource_id_attribute_key() -> Retained<NSAttributedStringKey> {
+    NSString::from_str(RESOURCE_ID_ATTRIBUTE)
+}
+
+fn resource_alt_attribute_key() -> Retained<NSAttributedStringKey> {
+    NSString::from_str(RESOURCE_ALT_ATTRIBUTE)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LayoutRect {
@@ -208,6 +271,147 @@ fn rtf_save_plan(payload: Option<Vec<u8>>) -> RtfSavePlan {
         Some(payload) => RtfSavePlan::Rich(payload),
         None => RtfSavePlan::PlainTextFallback,
     }
+}
+
+fn string_for_range(source: &NSAttributedString, range: NSRange) -> String {
+    source
+        .attributedSubstringFromRange(range)
+        .string()
+        .to_string()
+}
+
+fn attribute_string(
+    attributes: &NSDictionary<NSAttributedStringKey, AnyObject>,
+    key: &NSAttributedStringKey,
+) -> Option<String> {
+    unsafe { attributes.objectForKey_unchecked(key) }
+        .and_then(|value| value.downcast_ref::<NSString>())
+        .map(ToString::to_string)
+}
+
+fn editor_segments_with_ranges(
+    source: &NSAttributedString,
+) -> (Vec<EditorSegment>, Vec<(NSRange, String)>) {
+    let length = source.string().length();
+    let mut location = 0;
+    let mut segments = Vec::new();
+    let mut attachment_ranges = Vec::new();
+    let id_key = resource_id_attribute_key();
+    let alt_key = resource_alt_attribute_key();
+    while location < length {
+        let mut effective_range = NSRange::new(location, 0);
+        let attributes = unsafe {
+            source.attributesAtIndex_longestEffectiveRange_inRange(
+                location,
+                &mut effective_range,
+                NSRange::new(0, length),
+            )
+        };
+        let text = string_for_range(source, effective_range);
+        let resource_id = attribute_string(&attributes, &id_key);
+        let alt = attribute_string(&attributes, &alt_key).unwrap_or_else(|| "图片".into());
+        if let Some(resource_id) = resource_id.filter(|_| text == "\u{fffc}") {
+            if let Ok(marker) = markdown_marker(&resource_id, &alt) {
+                segments.push(EditorSegment::Attachment(AttachmentDescriptor {
+                    resource_id,
+                    alt,
+                }));
+                attachment_ranges.push((effective_range, marker));
+            } else {
+                segments.push(EditorSegment::Text("[图片]".into()));
+            }
+        } else {
+            segments.push(EditorSegment::Text(text));
+        }
+        let next = effective_range
+            .location
+            .saturating_add(effective_range.length);
+        if next <= location {
+            break;
+        }
+        location = next;
+    }
+    (segments, attachment_ranges)
+}
+
+fn sanitized_rtf_from_editor(
+    source: &NSAttributedString,
+    attachment_ranges: &[(NSRange, String)],
+) -> Option<Vec<u8>> {
+    let mutable = source.mutableCopy();
+    for (range, marker) in attachment_ranges.iter().rev() {
+        let marker = NSString::from_str(marker);
+        mutable.replaceCharactersInRange_withString(*range, &marker);
+        let marker_range = NSRange::new(range.location, marker.length());
+        let attachment_key = unsafe { NSAttachmentAttributeName };
+        mutable.removeAttribute_range(attachment_key, marker_range);
+        mutable.removeAttribute_range(&resource_id_attribute_key(), marker_range);
+        mutable.removeAttribute_range(&resource_alt_attribute_key(), marker_range);
+    }
+    let empty_keys: [&NSString; 0] = [];
+    let empty_values: [&AnyObject; 0] = [];
+    let document_attributes =
+        NSDictionary::<NSString, AnyObject>::from_slices(&empty_keys, &empty_values);
+    let immutable: &NSAttributedString = &mutable;
+    unsafe {
+        immutable
+            .RTFFromRange_documentAttributes(
+                NSRange::new(0, immutable.string().length()),
+                &document_attributes,
+            )
+            .map(|data| data.to_vec())
+    }
+}
+
+fn canonical_marker_ranges(body: &str) -> Vec<(NSRange, String, String)> {
+    let mut output = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = body[search_from..].find("![") {
+        let start = search_from + relative;
+        let Some(close_alt) = body[start + 2..].find("](:/") else {
+            search_from = start + 2;
+            continue;
+        };
+        let id_start = start + 2 + close_alt + 4;
+        let Some(id) = body.get(id_start..id_start.saturating_add(32)) else {
+            break;
+        };
+        let end = id_start.saturating_add(32);
+        if body.get(end..end.saturating_add(1)) != Some(")") {
+            search_from = start + 2;
+            continue;
+        }
+        let marker_end = end + 1;
+        let alt_raw = &body[start + 2..start + 2 + close_alt];
+        let alt = unescape_marker_alt(alt_raw);
+        if markdown_marker(id, &alt).ok().as_deref() == body.get(start..marker_end) {
+            let location = body[..start].encode_utf16().count();
+            let length = body[start..marker_end].encode_utf16().count();
+            output.push((NSRange::new(location, length), id.to_owned(), alt));
+        }
+        search_from = marker_end;
+    }
+    output
+}
+
+fn unescape_marker_alt(alt: &str) -> String {
+    let mut output = String::with_capacity(alt.len());
+    let mut chars = alt.chars();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            match chars.next() {
+                Some(next @ ('\\' | '[' | ']')) => output.push(next),
+                Some(next) => {
+                    output.push('\\');
+                    output.push(next);
+                }
+                None => output.push('\\'),
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -528,7 +732,7 @@ define_class!(
             body.setEditable(true);
             body.setRichText(true);
             body.setAllowsUndo(true);
-            body.setImportsGraphics(false);
+            body.setImportsGraphics(true);
             body.setUsesFontPanel(false);
             body.setDrawsBackground(false);
             body.setFont(Some(&NSFont::systemFontOfSize(17.0)));
@@ -693,6 +897,20 @@ define_class!(
     }
     unsafe impl NSTextFieldDelegate for AppDelegate {}
     unsafe impl NSTextViewDelegate for AppDelegate {
+        #[unsafe(method(textView:doCommandBySelector:))]
+        unsafe fn text_view_do_command_by_selector(
+            &self,
+            _text_view: &NSTextView,
+            command_selector: Sel,
+        ) -> bool {
+            if command_selector == sel!(paste:) {
+                self.handle_paste(None);
+                true
+            } else {
+                false
+            }
+        }
+
         #[unsafe(method(textViewDidChangeSelection:))]
         fn text_view_did_change_selection(&self, _notification: &NSNotification) {
             self.update_formatting_buttons();
@@ -722,6 +940,11 @@ define_class!(
         #[unsafe(method(clearFormatting:))]
         fn clear_formatting(&self, _sender: &NSObject) {
             self.apply_format(TextFormat::Clear);
+        }
+
+        #[unsafe(method(paste:))]
+        fn paste(&self, _sender: &NSObject) {
+            self.handle_paste(None);
         }
 
         #[unsafe(method(undoText:))]
@@ -926,7 +1149,7 @@ impl AppDelegate {
                 )
             };
             unsafe {
-                item.setTarget(None);
+                item.setTarget(if key == "v" { Some(target) } else { None });
             }
             item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
             edit_menu.addItem(&item);
@@ -1321,6 +1544,124 @@ impl AppDelegate {
         }
     }
 
+    fn handle_paste(&self, _sender: Option<&NSObject>) {
+        let Some(body) = self.ivars().body_view.get() else {
+            return;
+        };
+        match self.read_pasteboard_image() {
+            PasteboardImage::NotImage => unsafe { body.paste(None) },
+            PasteboardImage::Rejected(message) => self.set_save_status(message, true),
+            PasteboardImage::Data { bytes, title, mime } => {
+                let _ = self.insert_image_data(&bytes, &title, &mime);
+            }
+        }
+    }
+
+    fn read_pasteboard_image(&self) -> PasteboardImage {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let png_type = unsafe { NSPasteboardTypePNG };
+        let tiff_type = unsafe { NSPasteboardTypeTIFF };
+        let file_url_type = unsafe { NSPasteboardTypeFileURL };
+        if let Some(data) = pasteboard.dataForType(png_type) {
+            return normalize_paste_image(data.to_vec(), "clipboard.png", "image/png");
+        }
+        if let Some(data) = pasteboard.dataForType(tiff_type) {
+            return normalize_tiff(data.to_vec(), "clipboard.png");
+        }
+        let jpeg_type = NSString::from_str("public.jpeg");
+        if let Some(data) = pasteboard.dataForType(&jpeg_type) {
+            return normalize_paste_image(data.to_vec(), "clipboard.jpg", "image/jpeg");
+        }
+        if pasteboard.types().as_ref().is_some_and(|types| {
+            types.iter().any(|item| {
+                let item: &NSString = item.as_ref();
+                item == file_url_type
+            })
+        }) {
+            let Some(items) = pasteboard.pasteboardItems() else {
+                return PasteboardImage::Rejected("图片未插入：格式不支持");
+            };
+            if items.len() != 1 {
+                return PasteboardImage::Rejected("图片未插入：格式不支持");
+            }
+            let Some(url_text) = pasteboard.stringForType(file_url_type) else {
+                return PasteboardImage::Rejected("图片未插入：格式不支持");
+            };
+            let Some(url) = NSURL::initWithString(NSURL::alloc(), &url_text) else {
+                return PasteboardImage::Rejected("图片未插入：格式不支持");
+            };
+            let Some(path) = url.path() else {
+                return PasteboardImage::Rejected("图片未插入：格式不支持");
+            };
+            let path = std::path::PathBuf::from(path.to_string());
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase);
+            let mime = match extension.as_deref() {
+                Some("png") => ("image/png", "png"),
+                Some("jpg") | Some("jpeg") => ("image/jpeg", "jpg"),
+                _ => return PasteboardImage::Rejected("图片未插入：格式不支持"),
+            };
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => return PasteboardImage::Rejected("图片未插入：格式不支持"),
+            };
+            let title = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("图片")
+                .to_owned();
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return PasteboardImage::Rejected("图片未插入：超过 10 MB");
+            }
+            if !valid_image_bytes(&bytes) {
+                return PasteboardImage::Rejected("图片未插入：格式不支持");
+            }
+            return PasteboardImage::Data {
+                bytes,
+                title,
+                mime: mime.0.to_owned(),
+            };
+        }
+        PasteboardImage::NotImage
+    }
+
+    fn insert_image_data(&self, bytes: &[u8], title: &str, mime: &str) -> bool {
+        if bytes.len() > MAX_IMAGE_BYTES {
+            self.set_save_status("图片未插入：超过 10 MB", true);
+            return false;
+        }
+        if !matches!(mime, "image/png" | "image/jpeg") || !valid_image_bytes(bytes) {
+            self.set_save_status("图片未插入：格式不支持", true);
+            return false;
+        }
+        let extension = if mime == "image/png" { "png" } else { "jpg" };
+        let stored = match self.ivars().repository.import_resource(ResourceImport {
+            bytes,
+            title,
+            mime,
+            file_extension: extension,
+        }) {
+            Ok(stored) => stored,
+            Err(error) => {
+                eprintln!("paste image import failed: {error}");
+                self.set_save_status("图片未插入：格式不支持", true);
+                return false;
+            }
+        };
+        let Some(body) = self.ivars().body_view.get() else {
+            return false;
+        };
+        let Some(inline) = inline_attachment(&stored) else {
+            self.set_save_status("图片未插入：格式不支持", true);
+            return false;
+        };
+        insert_inline_attachment(body, &inline);
+        self.save_current_note();
+        true
+    }
+
     fn load_note(&self, note: &Note) {
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = Some(note.id.clone());
@@ -1359,6 +1700,9 @@ impl AppDelegate {
             .map(rtf_load_decision)
             .map(|decision| decision == RtfLoadDecision::PlainBodyFallback)
             .unwrap_or(false);
+        if !rtf_failed {
+            self.render_body_attachments(note);
+        }
         body.setSelectedRange(NSRange::new(0, 0));
         *self.ivars().loading_guard.borrow_mut() = false;
         if rtf_failed {
@@ -1369,6 +1713,31 @@ impl AppDelegate {
         self.update_editor_visibility();
         self.update_note_selection();
         self.update_formatting_buttons();
+    }
+
+    fn render_body_attachments(&self, note: &Note) {
+        let Some(body) = self.ivars().body_view.get() else {
+            return;
+        };
+        let Some(storage) = (unsafe { body.textStorage() }) else {
+            return;
+        };
+        let mut replacements = Vec::new();
+        for (range, resource_id, alt) in canonical_marker_ranges(&note.body) {
+            let Ok(resource) = self.ivars().repository.get_resource(&resource_id) else {
+                continue;
+            };
+            let Some(resource) = resource else {
+                continue;
+            };
+            let Some(inline) = inline_attachment_with_alt(&resource, &alt) else {
+                continue;
+            };
+            replacements.push((range, inline));
+        }
+        for (range, inline) in replacements.into_iter().rev() {
+            storage.replaceCharactersInRange_withAttributedString(range, inline.as_ref());
+        }
     }
 
     fn clear_current_note(&self) {
@@ -1575,12 +1944,30 @@ impl AppDelegate {
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
         let body_view = self.ivars().body_view.get().unwrap();
-        let body = body_view.string().to_string();
-        let save_plan = rtf_save_plan(
-            body_view
-                .RTFFromRange(NSRange::new(0, body_view.string().length()))
-                .map(|data| data.to_vec()),
-        );
+        let (segments, attachment_ranges) = (unsafe { body_view.textStorage() })
+            .map(|storage| {
+                let source: &NSAttributedString = &storage;
+                editor_segments_with_ranges(source)
+            })
+            .unwrap_or_else(|| {
+                (
+                    vec![EditorSegment::Text(body_view.string().to_string())],
+                    Vec::new(),
+                )
+            });
+        let projection = match editor_save_projection(&segments) {
+            Ok(projection) => projection,
+            Err(error) => {
+                eprintln!("editor projection failed: {error}");
+                self.set_save_status("保存失败", true);
+                return;
+            }
+        };
+        let body = projection.body;
+        let save_plan = rtf_save_plan((unsafe { body_view.textStorage() }).and_then(|storage| {
+            let source: &NSAttributedString = &storage;
+            sanitized_rtf_from_editor(source, &attachment_ranges)
+        }));
         let formatting_fallback = matches!(save_plan, RtfSavePlan::PlainTextFallback);
         let rtf = match save_plan {
             RtfSavePlan::Rich(rtf) => rtf,
@@ -1588,12 +1975,14 @@ impl AppDelegate {
             // would make a restart restore an older body than the plain text.
             RtfSavePlan::PlainTextFallback => Vec::new(),
         };
-        match self.ivars().repository.update_note(
+        match self.ivars().repository.update_note_content(
             &id,
-            joplin_lite_native::core::UpdateNote {
-                title: Some(title),
-                body: Some(body),
-                body_rtf: Some(rtf),
+            NoteContentUpdate {
+                title,
+                body,
+                body_text: projection.body_text,
+                body_rtf: rtf,
+                resource_ids: projection.resource_ids,
             },
         ) {
             Ok(updated) => {
@@ -1621,6 +2010,105 @@ impl AppDelegate {
             }
         }
     }
+}
+
+enum PasteboardImage {
+    NotImage,
+    Rejected(&'static str),
+    Data {
+        bytes: Vec<u8>,
+        title: String,
+        mime: String,
+    },
+}
+
+fn normalize_paste_image(bytes: Vec<u8>, title: &str, mime: &str) -> PasteboardImage {
+    if bytes.len() > MAX_IMAGE_BYTES {
+        PasteboardImage::Rejected("图片未插入：超过 10 MB")
+    } else if valid_image_bytes(&bytes) {
+        PasteboardImage::Data {
+            bytes,
+            title: title.to_owned(),
+            mime: mime.to_owned(),
+        }
+    } else {
+        PasteboardImage::Rejected("图片未插入：格式不支持")
+    }
+}
+
+fn normalize_tiff(bytes: Vec<u8>, title: &str) -> PasteboardImage {
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return PasteboardImage::Rejected("图片未插入：超过 10 MB");
+    }
+    let data = NSData::with_bytes(&bytes);
+    let Some(rep) = NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), &data) else {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    };
+    let empty_keys: [&NSString; 0] = [];
+    let empty_values: [&AnyObject; 0] = [];
+    let properties = NSDictionary::<NSString, AnyObject>::from_slices(&empty_keys, &empty_values);
+    let Some(png) = (unsafe {
+        rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
+    }) else {
+        return PasteboardImage::Rejected("图片未插入：格式不支持");
+    };
+    normalize_paste_image(png.to_vec(), title, "image/png")
+}
+
+fn valid_image_bytes(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        return false;
+    }
+    let data = NSData::with_bytes(bytes);
+    NSImage::initWithData(NSImage::alloc(), &data).is_some()
+}
+
+fn inline_attachment(
+    resource: &joplin_lite_native::core::StoredResource,
+) -> Option<Retained<NSMutableAttributedString>> {
+    inline_attachment_with_alt(resource, &resource.title)
+}
+
+#[allow(deprecated)]
+fn insert_inline_attachment(body: &NSTextView, inline: &NSMutableAttributedString) {
+    unsafe { body.insertText(inline as &AnyObject) };
+}
+
+fn inline_attachment_with_alt(
+    resource: &joplin_lite_native::core::StoredResource,
+    alt: &str,
+) -> Option<Retained<NSMutableAttributedString>> {
+    let data = NSData::with_bytes(&resource.bytes);
+    let image = NSImage::initWithData(NSImage::alloc(), &data)?;
+    let uti = NSString::from_str(if resource.mime == "image/jpeg" {
+        "public.jpeg"
+    } else {
+        "public.png"
+    });
+    let attachment =
+        NSTextAttachment::initWithData_ofType(NSTextAttachment::alloc(), Some(&data), Some(&uti));
+    attachment.setImage(Some(&image));
+    let size = image.size();
+    let scale = if size.width > 640.0 || size.height > 640.0 {
+        (640.0 / size.width.max(size.height)).min(1.0)
+    } else {
+        1.0
+    };
+    attachment.setBounds(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(size.width * scale, size.height * scale),
+    ));
+    let attributed = NSAttributedString::attributedStringWithAttachment(&attachment);
+    let mutable = NSMutableAttributedString::from_attributed_nsstring(&attributed);
+    let id = NSString::from_str(&resource.id);
+    let alt = NSString::from_str(alt);
+    let id_key = resource_id_attribute_key();
+    let alt_key = resource_alt_attribute_key();
+    unsafe {
+        mutable.addAttribute_value_range(&id_key, &id, NSRange::new(0, 1));
+        mutable.addAttribute_value_range(&alt_key, &alt, NSRange::new(0, 1));
+    }
+    Some(mutable)
 }
 
 fn set_note_button_title(button: &NSButton, note: &Note, selected: bool) {
@@ -1752,15 +2240,61 @@ impl AppDelegate {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentLayout, DataDirError, DataFileError, FontTraitOperation, FormatDecision,
-        FormatTarget, RtfLoadDecision, RtfSavePlan, TextFormat, choose_data_dir, content_layout,
-        display_note_title, ensure_notes_database_file, format_decision, format_target,
-        rtf_load_decision, rtf_save_plan, typing_trait_operation, validate_canonical_data_dir,
+        AttachmentDescriptor, ContentLayout, DataDirError, DataFileError, EditorSegment,
+        FontTraitOperation, FormatDecision, FormatTarget, RtfLoadDecision, RtfSavePlan, TextFormat,
+        choose_data_dir, content_layout, display_note_title, editor_save_projection,
+        ensure_notes_database_file, format_decision, format_target, rtf_load_decision,
+        rtf_save_plan, typing_trait_operation, validate_canonical_data_dir,
     };
     use objc2_foundation::NSRange;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[test]
+    fn editor_projection_preserves_attachment_order_without_binary_rtf() {
+        let projection = editor_save_projection(&[
+            EditorSegment::Text("前文\n".into()),
+            EditorSegment::Attachment(AttachmentDescriptor {
+                resource_id: "0123456789abcdef0123456789abcdef".into(),
+                alt: "截图.png".into(),
+            }),
+            EditorSegment::Text("\n后文".into()),
+        ])
+        .unwrap();
+        assert_eq!(
+            projection.body,
+            "前文\n![截图.png](:/0123456789abcdef0123456789abcdef)\n后文"
+        );
+        assert_eq!(
+            projection.resource_ids,
+            vec!["0123456789abcdef0123456789abcdef"]
+        );
+        assert!(projection.body_text.contains("截图.png"));
+        assert!(!projection.body.contains('\u{fffc}'));
+    }
+
+    #[test]
+    fn editor_projection_rejects_invalid_resource_ids() {
+        let error = editor_save_projection(&[EditorSegment::Attachment(AttachmentDescriptor {
+            resource_id: "not-a-resource".into(),
+            alt: "图片".into(),
+        })])
+        .unwrap_err();
+        assert!(matches!(error, super::EditorCodecError::Body(_)));
+    }
+
+    #[test]
+    fn editor_projection_keeps_missing_marker_text_and_association() {
+        let body = "前文\n![损坏图](:/0123456789abcdef0123456789abcdef)\n后文";
+        let projection = editor_save_projection(&[EditorSegment::Text(body.into())]).unwrap();
+        assert_eq!(projection.body, body);
+        assert_eq!(
+            projection.resource_ids,
+            vec!["0123456789abcdef0123456789abcdef"]
+        );
+        assert!(projection.body_text.contains("损坏图"));
+    }
 
     #[test]
     fn content_layout_keeps_editor_regions_disjoint_at_supported_sizes() {
