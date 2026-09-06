@@ -35,6 +35,14 @@ open "packages/app-lite-native/dist/Joplin Lite Native.app"
 
 新建行为契约是：每次点击“新建笔记”都会创建一条新的草稿笔记，清空搜索条件、切换到该笔记并把焦点放到正文；空白草稿会在下次启动时清理。删除只做软删除，不物理移除历史行。
 
+## 0.1.0 MVP 验收
+
+- 真实 AppKit 界面验证了按钮新建、`Command-N`、中文标题/正文自动保存、退出重开恢复、搜索和软删除。
+- 干净 release 构建通过 5 项核心集成测试、`cargo fmt --check` 和 `cargo clippy -- -D warnings`。
+- ad-hoc 签名的 `.app` 通过 `codesign --verify --deep --strict`。
+- App 包体约 2.3 MB；空资料库稳定后 RSS 约 46–49 MB，载入并编辑笔记后一次复测约 57 MB。
+- 进程没有子进程；release 二进制的动态链接中没有 WebKit 或 JavaScriptCore。
+
 ## 当前限制
 
 这是基础列表 UI 的本地 MVP：尚无 Joplin Server 同步、JEX 导入导出、附件、笔记本/标签管理、加密或高级编辑功能。当前客户端不能替代完整 Joplin 桌面端。
