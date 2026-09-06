@@ -33,6 +33,9 @@ open "packages/app-lite-native/dist/Joplin Lite Native.app"
 - RTF 所见即所得正文：B、I、U、清除样式，选区格式和重启恢复
 - Byword 式 720pt 舒适写作画布、动态浅色/深色系统颜色和完整空态引导
 - SQLite 本地存储及基础全文搜索
+- 图片附件 MVP：正文视图支持 PNG/JPEG/TIFF 粘贴；Finder 拖入支持普通本地 PNG/JPEG
+- 图片单文件上限为 10 MiB；拖入仅接受真实本地 regular file（拒绝目录、符号链接、FIFO、远程 URL、promised file 和非图片）
+- 图片 blob 保存在 profile 的 `resources/<sha256 前缀>/<sha256>.<扩展名>`，正文使用规范 marker：`![alt](:/<32 位 resource id>)`
 - 数据目录和 `notes.sqlite` 的符号链接防护；RTF 导出失败时优先保存正文，避免丢失最新文字
 
 新建行为契约是：每次点击“新建笔记”都会创建一条新的草稿笔记，清空搜索条件、切换到该笔记并把焦点放到正文；空白草稿会在下次启动时清理。删除只做软删除，不物理移除历史行。
@@ -47,4 +50,4 @@ open "packages/app-lite-native/dist/Joplin Lite Native.app"
 
 ## 当前限制
 
-这是聚焦写作体验的本地 MVP：尚无 Joplin Server 同步、JEX 导入导出、附件、笔记本/标签管理、加密或更高级编辑功能。当前客户端不能替代完整 Joplin 桌面端。
+这是聚焦写作体验的本地 MVP：尚无 Joplin Server 同步、JEX 导入导出、笔记本/标签管理、加密或更高级编辑功能。附件导入目前只覆盖上述 PNG/JPEG/TIFF 粘贴与 PNG/JPEG Finder 拖入；不支持 GIF、SVG、HEIC、PDF、目录或远程资源。当前客户端不能替代完整 Joplin 桌面端。

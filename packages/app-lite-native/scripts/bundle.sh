@@ -50,4 +50,5 @@ if [[ -e "$FINAL_PATH" ]]; then
   rm -rf -- "$FINAL_PATH"
 fi
 mv -- "$BUNDLE_PATH" "$FINAL_PATH"
+bash "$SCRIPT_DIR/check-attachment-contract.sh" "$FINAL_PATH"
 printf 'Created signed app: %s\n' "$FINAL_PATH"

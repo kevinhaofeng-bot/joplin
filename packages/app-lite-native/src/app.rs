@@ -16,19 +16,20 @@ use objc2_app_kit::{
     NSBackgroundColorAttributeName, NSBackingStoreType, NSBaselineOffsetAttributeName,
     NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep, NSBorderType, NSBox, NSBoxType,
     NSButton, NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSFontAttributeName,
-    NSFontTraitMask, NSForegroundColorAttributeName, NSImage, NSKernAttributeName,
-    NSLayoutAttribute, NSLineBreakMode, NSMenu, NSMenuItem,
-    NSMutableAttributedStringAppKitAdditions, NSMutableParagraphStyle, NSPasteboard,
-    NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder, NSScrollView,
-    NSSearchField, NSShadowAttributeName, NSStackView, NSStackViewDistribution,
-    NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName, NSStrokeWidthAttributeName,
-    NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField, NSTextFieldDelegate,
-    NSTextView, NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
-    NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination, NSDraggingInfo,
+    NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontTraitMask,
+    NSForegroundColorAttributeName, NSImage, NSKernAttributeName, NSLayoutAttribute,
+    NSLineBreakMode, NSMenu, NSMenuItem, NSMutableAttributedStringAppKitAdditions,
+    NSMutableParagraphStyle, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
+    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSShadowAttributeName,
+    NSStackView, NSStackViewDistribution, NSStrikethroughStyleAttributeName,
+    NSStrokeColorAttributeName, NSStrokeWidthAttributeName, NSTextAlignment, NSTextAttachment,
+    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSTextViewDelegate,
+    NSUnderlineStyle, NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
+    MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
     NSMutableAttributedString, NSMutableCopying, NSNotification, NSNumber, NSObject,
     NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSURL, ns_string,
 };
@@ -39,7 +40,7 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::ptr::null_mut;
+use std::ptr::{NonNull, null_mut};
 use std::sync::Arc;
 
 const RESOURCE_ID_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-id";
@@ -590,6 +591,44 @@ fn resolve_native_data_dir(
     Ok(canonical_candidate)
 }
 
+struct BodyTextViewIvars {
+    owner: NonNull<AppDelegate>,
+}
+
+define_class!(
+    #[unsafe(super = NSTextView)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = BodyTextViewIvars]
+    struct BodyTextView;
+    unsafe impl NSObjectProtocol for BodyTextView {}
+    unsafe impl NSDraggingDestination for BodyTextView {
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            let owner = unsafe { self.ivars().owner.as_ref() };
+            if owner.accept_drag(sender) {
+                NSDragOperation::Copy
+            } else {
+                NSDragOperation::None
+            }
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            let owner = unsafe { self.ivars().owner.as_ref() };
+            owner.perform_drag(self, sender)
+        }
+    }
+);
+
+impl BodyTextView {
+    fn new(mtm: MainThreadMarker, owner: &AppDelegate, frame: NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(BodyTextViewIvars {
+            owner: NonNull::from(owner),
+        });
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     repository: Arc<NoteRepository>,
@@ -773,10 +812,14 @@ define_class!(
             content.addSubview(&underline_button);
             content.addSubview(&clear_button);
 
-            let body = NSTextView::initWithFrame(
-                NSTextView::alloc(mtm),
+            let body = BodyTextView::new(
+                mtm,
+                self,
                 LayoutRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }.ns_rect(),
             );
+            let file_url_type = unsafe { NSPasteboardTypeFileURL };
+            let drag_types: Retained<NSArray<NSString>> = NSArray::from_slice(&[file_url_type]);
+            body.registerForDraggedTypes(&drag_types);
             body.setEditable(true);
             body.setRichText(true);
             body.setAllowsUndo(true);
@@ -860,7 +903,7 @@ define_class!(
             self.ivars().underline_button.set(underline_button).unwrap();
             self.ivars().clear_button.set(clear_button).unwrap();
             self.ivars().body_scroll.set(body_scroll).unwrap();
-            self.ivars().body_view.set(body.clone()).unwrap();
+            self.ivars().body_view.set(body.clone().into_super()).unwrap();
             self.ivars().delete_button.set(delete_button).unwrap();
             self.ivars().save_status.set(save_status).unwrap();
             self.ivars().editor_empty_label.set(editor_empty_label).unwrap();
@@ -1632,6 +1675,30 @@ impl AppDelegate {
         }
     }
 
+    fn accept_drag(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+        self.ivars().current_note_id.borrow().is_some()
+            && read_drag_pasteboard(&sender.draggingPasteboard()).is_ok()
+    }
+
+    fn perform_drag(
+        &self,
+        body: &BodyTextView,
+        sender: &ProtocolObject<dyn NSDraggingInfo>,
+    ) -> bool {
+        if self.ivars().current_note_id.borrow().is_none() {
+            return false;
+        }
+        let Ok(PasteboardImage::Data { bytes, title, mime }) =
+            read_drag_pasteboard(&sender.draggingPasteboard())
+        else {
+            return false;
+        };
+        let point = body.convertPoint_fromView(sender.draggingLocation(), None);
+        let character_index = body.characterIndexForInsertionAtPoint(point);
+        body.setSelectedRange(NSRange::new(character_index, 0));
+        self.insert_image_data(&bytes, &title, &mime)
+    }
+
     fn read_pasteboard_image(&self) -> PasteboardImage {
         let pasteboard = NSPasteboard::generalPasteboard();
         let png_type = unsafe { NSPasteboardTypePNG };
@@ -1738,8 +1805,7 @@ impl AppDelegate {
             return false;
         };
         insert_inline_attachment(body, &inline);
-        self.save_current_note();
-        true
+        self.save_current_note()
     }
 
     fn load_note(&self, note: &Note) {
@@ -2012,12 +2078,12 @@ impl AppDelegate {
         }
     }
 
-    fn save_current_note(&self) {
+    fn save_current_note(&self) -> bool {
         if *self.ivars().loading_guard.borrow() {
-            return;
+            return false;
         }
         let Some(id) = self.ivars().current_note_id.borrow().clone() else {
-            return;
+            return false;
         };
         let title = self
             .ivars()
@@ -2042,7 +2108,7 @@ impl AppDelegate {
             Err(error) => {
                 eprintln!("editor projection failed: {error}");
                 self.set_save_status("保存失败", true);
-                return;
+                return false;
             }
         };
         let body = projection.body.clone();
@@ -2085,10 +2151,12 @@ impl AppDelegate {
                 } else {
                     self.set_save_status("已保存", false);
                 }
+                true
             }
             Err(error) => {
                 eprintln!("autosave failed: {error}");
                 self.set_save_status("保存失败", true);
+                false
             }
         }
     }
@@ -2121,6 +2189,65 @@ fn read_regular_image_file(path: &Path) -> Result<Vec<u8>, PasteFileError> {
         return Err(PasteFileError::TooLarge);
     }
     Ok(bytes)
+}
+
+fn read_drag_image_file(path: &Path) -> Result<PasteboardImage, PasteFileError> {
+    let mime = match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        _ => return Err(PasteFileError::Invalid),
+    };
+    let bytes = read_regular_image_file(path)?;
+    if !valid_image_bytes(&bytes) {
+        return Err(PasteFileError::Invalid);
+    }
+    let title = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("图片")
+        .to_owned();
+    Ok(PasteboardImage::Data {
+        bytes,
+        title,
+        mime: mime.to_owned(),
+    })
+}
+
+fn read_drag_pasteboard(pasteboard: &NSPasteboard) -> Result<PasteboardImage, PasteFileError> {
+    let file_url_type = unsafe { NSPasteboardTypeFileURL };
+    let Some(types) = pasteboard.types() else {
+        return Err(PasteFileError::Invalid);
+    };
+    if !types.iter().any(|item| {
+        let item: &NSString = item.as_ref();
+        item == file_url_type
+    }) {
+        return Err(PasteFileError::Invalid);
+    }
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Err(PasteFileError::Invalid);
+    };
+    if items.len() != 1 {
+        return Err(PasteFileError::Invalid);
+    }
+    let Some(url_text) = pasteboard.stringForType(file_url_type) else {
+        return Err(PasteFileError::Invalid);
+    };
+    let Some(url) = NSURL::initWithString(NSURL::alloc(), &url_text) else {
+        return Err(PasteFileError::Invalid);
+    };
+    if !url.isFileURL() {
+        return Err(PasteFileError::Invalid);
+    }
+    let Some(path) = url.path() else {
+        return Err(PasteFileError::Invalid);
+    };
+    read_drag_image_file(Path::new(path.to_string().as_str()))
 }
 
 enum PasteboardImage {
@@ -2353,11 +2480,12 @@ mod tests {
     use super::{
         AttachmentDescriptor, ContentLayout, DataDirError, DataFileError, EditorSegment,
         FontTraitOperation, FormatDecision, FormatTarget, PasteFileError, PasteRoute,
-        RtfLoadDecision, RtfSavePlan, TextFormat, attributed_string_has_attachments,
-        choose_data_dir, content_layout, display_note_title, editor_save_projection,
-        editor_segments_with_ranges, ensure_notes_database_file, format_decision, format_target,
-        inline_attachment_with_alt, paste_route, read_regular_image_file, rtf_load_decision,
-        rtf_save_plan, rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
+        PasteboardImage, RtfLoadDecision, RtfSavePlan, TextFormat,
+        attributed_string_has_attachments, choose_data_dir, content_layout, display_note_title,
+        editor_save_projection, editor_segments_with_ranges, ensure_notes_database_file,
+        format_decision, format_target, inline_attachment_with_alt, paste_route,
+        read_drag_image_file, read_regular_image_file, rtf_load_decision, rtf_save_plan,
+        rtf_text_matches_body, sanitized_rtf_from_editor, typing_trait_operation,
         validate_canonical_data_dir,
     };
     use joplin_lite_native::core::StoredResource;
@@ -2579,6 +2707,31 @@ mod tests {
         let fifo_c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert_eq!(read_regular_image_file(&fifo), Err(PasteFileError::Invalid));
+    }
+
+    #[test]
+    fn drag_file_reader_accepts_only_local_png_or_jpeg_images() {
+        const TINY_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let temp = tempdir().unwrap();
+        let png = temp.path().join("drop.png");
+        fs::write(&png, TINY_PNG).unwrap();
+        assert!(matches!(
+            read_drag_image_file(&png),
+            Ok(PasteboardImage::Data { mime, .. }) if mime == "image/png"
+        ));
+
+        let wrong_extension = temp.path().join("drop.tiff");
+        fs::write(&wrong_extension, TINY_PNG).unwrap();
+        assert!(matches!(
+            read_drag_image_file(&wrong_extension),
+            Err(PasteFileError::Invalid)
+        ));
     }
 
     #[test]
