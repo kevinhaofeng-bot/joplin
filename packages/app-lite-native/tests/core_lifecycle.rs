@@ -131,3 +131,51 @@ fn rich_text_payload_survives_restart() {
         expected_rtf
     );
 }
+
+#[test]
+fn plain_text_fallback_clears_stale_rich_text_before_restart() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("notes.sqlite");
+    let repo = NoteRepository::open(&path).unwrap();
+    let created = repo
+        .create_note(CreateNote {
+            title: "旧标题".into(),
+            body: "旧正文".into(),
+            body_rtf: b"{\\rtf1\\b old body}".to_vec(),
+            is_draft: false,
+        })
+        .unwrap();
+
+    let updated = repo
+        .update_note(
+            &created.id,
+            UpdateNote {
+                title: Some("最新标题".into()),
+                body: Some("最新纯文本正文".into()),
+                body_rtf: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.title, "最新标题");
+    assert_eq!(updated.body, "最新纯文本正文");
+    assert!(updated.body_rtf.is_empty());
+    drop(repo);
+
+    let reopened = NoteRepository::open(&path).unwrap();
+    let reopened_note = reopened.get_note(&created.id).unwrap().unwrap();
+    assert_eq!(reopened_note.title, "最新标题");
+    assert_eq!(reopened_note.body, "最新纯文本正文");
+    assert!(reopened_note.body_rtf.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_refuses_to_open_a_database_symlink() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target.sqlite");
+    let link = dir.path().join("notes.sqlite");
+    std::fs::write(&target, b"not a database").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert!(NoteRepository::open(&link).is_err());
+}

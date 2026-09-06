@@ -25,6 +25,7 @@ use objc2_foundation::{
 };
 use std::cell::{OnceCell, RefCell};
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -191,13 +192,52 @@ fn rtf_load_decision(parse_succeeded: bool) -> RtfLoadDecision {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum RtfSaveError {
-    ExportUnavailable,
+#[derive(Debug, PartialEq, Eq)]
+enum RtfSavePlan {
+    Rich(Vec<u8>),
+    PlainTextFallback,
 }
 
-fn rtf_save_payload(payload: Option<Vec<u8>>) -> Result<Vec<u8>, RtfSaveError> {
-    payload.ok_or(RtfSaveError::ExportUnavailable)
+fn rtf_save_plan(payload: Option<Vec<u8>>) -> RtfSavePlan {
+    match payload {
+        Some(payload) => RtfSavePlan::Rich(payload),
+        None => RtfSavePlan::PlainTextFallback,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum DataFileError {
+    Symlink,
+    NotRegularFile,
+    MetadataFailed,
+    CreateFailed,
+}
+
+/// Validate the database inode without following links, creating a new file
+/// atomically when it does not exist yet.
+fn ensure_notes_database_file(path: &Path) -> Result<(), DataFileError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(DataFileError::Symlink);
+            }
+            if !file_type.is_file() {
+                return Err(DataFileError::NotRegularFile);
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_notes_database_file(path)
+                }
+                Err(_) => Err(DataFileError::CreateFailed),
+            }
+        }
+        Err(_) => Err(DataFileError::MetadataFailed),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -273,6 +313,9 @@ fn resolve_native_data_dir(
     let home = home_path.ok_or(DataDirError::HomeDirectoryUnavailable)?;
     let official_profiles = [
         home.join(".config").join("joplin-desktop"),
+        home.join("Library")
+            .join("Application Support")
+            .join("Joplin"),
         home.join("Library")
             .join("Application Support")
             .join("Joplin")
@@ -1464,16 +1507,17 @@ impl AppDelegate {
             .unwrap_or_default();
         let body_view = self.ivars().body_view.get().unwrap();
         let body = body_view.string().to_string();
-        let rtf = match rtf_save_payload(
+        let save_plan = rtf_save_plan(
             body_view
                 .RTFFromRange(NSRange::new(0, body_view.string().length()))
                 .map(|data| data.to_vec()),
-        ) {
-            Ok(rtf) => rtf,
-            Err(RtfSaveError::ExportUnavailable) => {
-                self.set_save_status("保存失败", true);
-                return;
-            }
+        );
+        let formatting_fallback = matches!(save_plan, RtfSavePlan::PlainTextFallback);
+        let rtf = match save_plan {
+            RtfSavePlan::Rich(rtf) => rtf,
+            // Clearing the stored RTF is intentional: keeping stale rich text
+            // would make a restart restore an older body than the plain text.
+            RtfSavePlan::PlainTextFallback => Vec::new(),
         };
         match self.ivars().repository.update_note(
             &id,
@@ -1496,7 +1540,11 @@ impl AppDelegate {
                         set_note_button_title(button, &updated, true);
                     }
                 }
-                self.set_save_status("已保存", false);
+                if formatting_fallback {
+                    self.set_save_status("正文已保存，格式未保存", true);
+                } else {
+                    self.set_save_status("已保存", false);
+                }
             }
             Err(error) => {
                 eprintln!("autosave failed: {error}");
@@ -1584,6 +1632,8 @@ pub fn run() {
     let data_dir = resolve_native_data_dir(override_path, default_path, dirs::home_dir())
         .unwrap_or_else(|error| panic!("could not resolve native data directory: {error:?}"));
     let data_path = data_dir.join("notes.sqlite");
+    ensure_notes_database_file(&data_path)
+        .unwrap_or_else(|error| panic!("could not validate notes database file: {error:?}"));
     let repository =
         Arc::new(NoteRepository::open(&data_path).expect("could not open notes database"));
     if let Err(error) = repository.cleanup_abandoned_drafts() {
@@ -1627,10 +1677,10 @@ impl AppDelegate {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentLayout, DataDirError, FontTraitOperation, FormatDecision, FormatTarget,
-        RtfLoadDecision, RtfSaveError, TextFormat, choose_data_dir, content_layout,
-        display_note_title, format_decision, format_target, rtf_load_decision, rtf_save_payload,
-        typing_trait_operation, validate_canonical_data_dir,
+        ContentLayout, DataDirError, DataFileError, FontTraitOperation, FormatDecision,
+        FormatTarget, RtfLoadDecision, RtfSavePlan, TextFormat, choose_data_dir, content_layout,
+        display_note_title, ensure_notes_database_file, format_decision, format_target,
+        rtf_load_decision, rtf_save_plan, typing_trait_operation, validate_canonical_data_dir,
     };
     use objc2_foundation::NSRange;
     use std::fs;
@@ -1720,6 +1770,21 @@ mod tests {
             validate_canonical_data_dir(&child, &[canonical_official]),
             Err(DataDirError::OfficialJoplinProfile),
         );
+
+        let mac_joplin_root = temp
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("Joplin");
+        fs::create_dir_all(mac_joplin_root.join("Joplin Desktop")).unwrap();
+        let canonical_mac_root = fs::canonicalize(&mac_joplin_root).unwrap();
+        assert_eq!(
+            validate_canonical_data_dir(
+                &canonical_mac_root.join("native-profile"),
+                std::slice::from_ref(&canonical_mac_root),
+            ),
+            Err(DataDirError::OfficialJoplinProfile),
+        );
     }
 
     #[test]
@@ -1729,9 +1794,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_rtf_export_fails_without_an_empty_replacement() {
-        assert_eq!(rtf_save_payload(None), Err(RtfSaveError::ExportUnavailable),);
-        assert_eq!(rtf_save_payload(Some(vec![])), Ok(Vec::new()));
+    fn missing_rtf_export_chooses_plain_text_without_stale_rich_text() {
+        assert_eq!(rtf_save_plan(None), RtfSavePlan::PlainTextFallback);
+        assert_eq!(
+            rtf_save_plan(Some(vec![1, 2])),
+            RtfSavePlan::Rich(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn notes_database_rejects_a_real_symlink() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("target.sqlite");
+        fs::write(&target, b"not a database").unwrap();
+        let link = temp.path().join("notes.sqlite");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            ensure_notes_database_file(&link),
+            Err(DataFileError::Symlink)
+        );
+    }
+
+    #[test]
+    fn notes_database_missing_file_is_exclusively_created() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notes.sqlite");
+        ensure_notes_database_file(&path).unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(ensure_notes_database_file(&path), Ok(()));
     }
 
     #[test]

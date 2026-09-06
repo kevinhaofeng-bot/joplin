@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +13,8 @@ pub enum CoreError {
     Storage(#[from] rusqlite::Error),
     #[error("invalid note id")]
     InvalidId,
+    #[error("invalid database path")]
+    InvalidDatabasePath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +51,23 @@ pub struct NoteRepository {
 
 impl NoteRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoreError> {
-        let connection = Connection::open(path)?;
+        let input_path = path.as_ref();
+        ensure_database_inode(input_path)?;
+        // NOFOLLOW also checks parent components on macOS. Canonicalize only
+        // the parent, never the database leaf, so a concurrent leaf swap is
+        // still rejected by SQLite rather than followed here.
+        let parent = input_path.parent().ok_or(CoreError::InvalidDatabasePath)?;
+        let file_name = input_path
+            .file_name()
+            .ok_or(CoreError::InvalidDatabasePath)?;
+        let path = std::fs::canonicalize(parent)
+            .map_err(|_| CoreError::InvalidDatabasePath)?
+            .join(file_name);
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let connection = Connection::open_with_flags(path, flags)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(
@@ -264,6 +282,32 @@ impl NoteRepository {
             )?;
         }
         Ok(())
+    }
+}
+
+fn ensure_database_inode(path: &Path) -> Result<(), CoreError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(CoreError::InvalidDatabasePath);
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_database_inode(path)
+                }
+                Err(_) => Err(CoreError::InvalidDatabasePath),
+            }
+        }
+        Err(_) => Err(CoreError::InvalidDatabasePath),
     }
 }
 
