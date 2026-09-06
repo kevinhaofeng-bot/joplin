@@ -4,9 +4,10 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSButton, NSControlTextEditingDelegate, NSMenu, NSMenuItem, NSScrollView, NSSearchField,
-    NSStackView, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSTextViewDelegate,
-    NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSButton, NSControlTextEditingDelegate, NSEventModifierFlags, NSMenu, NSMenuItem, NSScrollView,
+    NSSearchField, NSStackView, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSTextViewDelegate, NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect,
@@ -35,6 +36,10 @@ define_class!(
     struct AppDelegate;
     unsafe impl NSObjectProtocol for AppDelegate {}
     unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
+        fn application_should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool { true }
+        #[unsafe(method(applicationSupportsSecureRestorableState:))]
+        fn application_supports_secure_restorable_state(&self, _app: &NSApplication) -> bool { true }
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn application_did_finish_launching(&self, notification: &NSNotification) {
             let mtm = self.mtm();
@@ -74,13 +79,57 @@ define_class!(
             delete_button.setFrame(NSRect::new(NSPoint::new(460.0, 600.0), NSSize::new(100.0, 32.0)));
             window.contentView().unwrap().addSubview(&delete_button);
             let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("主菜单"));
+            let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("应用"));
+            let quit_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("退出"), Some(sel!(terminate:)), ns_string!("q")) };
+            unsafe { quit_item.setTarget(None); }
+            quit_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+            app_menu.addItem(&quit_item);
+            let app_menu_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("应用"), None, ns_string!("")) };
+            app_menu_item.setSubmenu(Some(&app_menu));
+            menu.addItem(&app_menu_item);
             let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("文件"));
             let new_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("新建笔记"), Some(sel!(newNote:)), ns_string!("n")) };
             unsafe { new_item.setTarget(Some(self)); file_menu.addItem(&new_item); }
             let file_menu_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("文件"), None, ns_string!("")) };
             file_menu_item.setSubmenu(Some(&file_menu)); menu.addItem(&file_menu_item);
+            let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("编辑"));
+            let undo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("撤销"), Some(sel!(undo:)), ns_string!("z")) };
+            let redo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("重做"), Some(sel!(redo:)), ns_string!("z")) };
+            let cut_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("剪切"), Some(sel!(cut:)), ns_string!("x")) };
+            let copy_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("拷贝"), Some(sel!(copy:)), ns_string!("c")) };
+            let paste_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("粘贴"), Some(sel!(paste:)), ns_string!("v")) };
+            let select_all_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("全选"), Some(sel!(selectAll:)), ns_string!("a")) };
+            for item in [&undo_item, &redo_item, &cut_item, &copy_item, &paste_item, &select_all_item] {
+                unsafe { item.setTarget(None); }
+                item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+            }
+            redo_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+            edit_menu.addItem(&undo_item);
+            edit_menu.addItem(&redo_item);
+            edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+            edit_menu.addItem(&cut_item);
+            edit_menu.addItem(&copy_item);
+            edit_menu.addItem(&paste_item);
+            edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+            edit_menu.addItem(&select_all_item);
+            let edit_menu_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("编辑"), None, ns_string!("")) };
+            edit_menu_item.setSubmenu(Some(&edit_menu));
+            menu.addItem(&edit_menu_item);
+            let format_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("格式"));
+            let bold_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("粗体"), Some(sel!(toggleBoldface:)), ns_string!("b")) };
+            let italic_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("斜体"), Some(sel!(toggleItalics:)), ns_string!("i")) };
+            let underline_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("下划线"), Some(sel!(underline:)), ns_string!("u")) };
+            for item in [&bold_item, &italic_item, &underline_item] {
+                unsafe { item.setTarget(None); }
+                item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+                format_menu.addItem(item);
+            }
+            let format_menu_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("格式"), None, ns_string!("")) };
+            format_menu_item.setSubmenu(Some(&format_menu));
+            menu.addItem(&format_menu_item);
             application.setMainMenu(Some(&menu));
             window.center(); window.makeKeyAndOrderFront(None);
+            window.setDelegate(Some(ProtocolObject::from_ref(self)));
             self.ivars().window.set(window).unwrap();
             self.ivars().title_field.set(title_field.clone()).unwrap();
             self.ivars().body_view.set(body.clone()).unwrap();
