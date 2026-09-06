@@ -93,8 +93,8 @@ define_class!(
             let file_menu_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("文件"), None, ns_string!("")) };
             file_menu_item.setSubmenu(Some(&file_menu)); menu.addItem(&file_menu_item);
             let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("编辑"));
-            let undo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("撤销"), Some(sel!(undo:)), ns_string!("z")) };
-            let redo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("重做"), Some(sel!(redo:)), ns_string!("z")) };
+            let undo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("撤销"), Some(sel!(undoText:)), ns_string!("z")) };
+            let redo_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("重做"), Some(sel!(redoText:)), ns_string!("Z")) };
             let cut_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("剪切"), Some(sel!(cut:)), ns_string!("x")) };
             let copy_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("拷贝"), Some(sel!(copy:)), ns_string!("c")) };
             let paste_item = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), ns_string!("粘贴"), Some(sel!(paste:)), ns_string!("v")) };
@@ -102,6 +102,10 @@ define_class!(
             for item in [&undo_item, &redo_item, &cut_item, &copy_item, &paste_item, &select_all_item] {
                 unsafe { item.setTarget(None); }
                 item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+            }
+            unsafe {
+                undo_item.setTarget(Some(self));
+                redo_item.setTarget(Some(self));
             }
             redo_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
             edit_menu.addItem(&undo_item);
@@ -166,6 +170,18 @@ define_class!(
     unsafe impl NSTextFieldDelegate for AppDelegate {}
     unsafe impl NSTextViewDelegate for AppDelegate {}
     impl AppDelegate {
+        #[unsafe(method(undoText:))]
+        fn undo_text(&self, _sender: &NSObject) {
+            if let Some(manager) = self.ivars().body_view.get().and_then(|body| body.undoManager()) && manager.canUndo() {
+                manager.undo();
+            }
+        }
+        #[unsafe(method(redoText:))]
+        fn redo_text(&self, _sender: &NSObject) {
+            if let Some(manager) = self.ivars().body_view.get().and_then(|body| body.undoManager()) && manager.canRedo() {
+                manager.redo();
+            }
+        }
         #[unsafe(method(newNote:))]
         fn new_note(&self, _sender: &NSObject) {
             let note = self.ivars().repository.create_note(CreateNote { title: String::new(), body: String::new(), body_rtf: Vec::new(), is_draft: true });
