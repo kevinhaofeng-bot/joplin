@@ -2,8 +2,9 @@ use crate::note_preview::NotePreview;
 
 use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send, rc::Retained};
 use objc2_app_kit::{
-    NSBox, NSBoxType, NSCollectionView, NSCollectionViewFlowLayout, NSCollectionViewItem, NSColor,
-    NSFont, NSImage, NSImageScaling, NSImageView, NSLineBreakMode, NSTextAlignment, NSTextField,
+    NSAutoresizingMaskOptions, NSBox, NSBoxType, NSCollectionView, NSCollectionViewFlowLayout,
+    NSCollectionViewItem, NSColor, NSFont, NSImage, NSImageScaling, NSImageView, NSLineBreakMode,
+    NSTextAlignment, NSTextField,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -302,14 +303,24 @@ pub fn configure_note_card(
     metrics: BrowserMetrics,
     mtm: MainThreadMarker,
 ) {
-    let card = match item.view().downcast::<NoteCardView>() {
-        Ok(card) => card,
-        Err(_) => {
+    let root = item.view();
+    let card = root
+        .subviews()
+        .iter()
+        .find_map(|view| view.downcast::<NoteCardView>().ok())
+        .unwrap_or_else(|| {
             let card = NoteCardView::new(mtm, metrics);
-            item.setView(&card);
+            card.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            card.setFrame(root.bounds());
+            root.addSubview(&card);
             card
-        }
-    };
+        });
+    // The collection item root remains owned by NSCollectionViewFlowLayout;
+    // this typed child follows its bounds as the reusable item is laid out.
+    card.setFrame(root.bounds());
     card.configure(preview, image, selected, metrics);
 }
 
