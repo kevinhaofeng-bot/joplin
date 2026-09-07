@@ -8,9 +8,9 @@ use joplin_lite_native::html_body::{
     serialize_html,
 };
 use joplin_lite_native::native_editor::{
-    EmptyBlockCarrier, InlineCommand, NativeEditorSession, RenderedDocument,
-    apply_committed_text_delta, apply_inline_command, delete_image_anchor, document_from_session,
-    insert_image_anchor, render_session, session_from_document,
+    EmptyBlockCarrier, InlineCommand, NativeEditorSession, RenderedAttachment, RenderedDocument,
+    apply_committed_text_delta, apply_inline_command, delete_image_anchor_if_identity,
+    document_from_session, insert_image_anchor, render_session, session_from_document,
 };
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
@@ -188,6 +188,50 @@ fn exact_empty_block_carrier(
         .find(|carrier| carrier.addressable_offset == selection.location)
 }
 
+fn adjust_projection_attachments(
+    attachments: &mut Vec<RenderedAttachment>,
+    range: NSRange,
+    replacement_length: usize,
+    removed_resource_id: Option<&str>,
+) -> bool {
+    let Some(end) = range.location.checked_add(range.length) else {
+        return false;
+    };
+    if let Some(resource_id) = removed_resource_id
+        && !attachments.iter().any(|attachment| {
+            attachment.addressable_offset >= range.location
+                && attachment.addressable_offset < end
+                && attachment.resource_id == resource_id
+        })
+    {
+        return false;
+    }
+    let mut removed = false;
+    attachments.retain(|attachment| {
+        if attachment.addressable_offset >= range.location && attachment.addressable_offset < end {
+            let matches_identity =
+                removed_resource_id.is_none_or(|resource_id| resource_id == attachment.resource_id);
+            if matches_identity {
+                removed = true;
+                return false;
+            }
+            return true;
+        }
+        true
+    });
+    let delta = replacement_length as isize - range.length as isize;
+    for attachment in attachments.iter_mut() {
+        if attachment.addressable_offset >= end {
+            let shifted = attachment.addressable_offset as isize + delta;
+            if shifted < 0 {
+                return false;
+            }
+            attachment.addressable_offset = shifted as usize;
+        }
+    }
+    removed_resource_id.is_none() || removed
+}
+
 fn resource_id_attribute_key() -> Retained<NSAttributedStringKey> {
     NSString::from_str(RESOURCE_ID_ATTRIBUTE)
 }
@@ -214,6 +258,39 @@ fn attribute_string(
     unsafe { attributes.objectForKey_unchecked(key) }
         .and_then(|value| value.downcast_ref::<NSString>())
         .map(ToString::to_string)
+}
+
+#[allow(deprecated)]
+fn projection_attachments_from_storage(body: &NSTextView) -> Vec<RenderedAttachment> {
+    let Some(storage) = (unsafe { body.textStorage() }) else {
+        return Vec::new();
+    };
+    let length = storage.length();
+    let key = resource_id_attribute_key();
+    let mut result = Vec::new();
+    let mut location = 0usize;
+    while location < length {
+        let mut effective_range = NSRange::new(location, 0);
+        let attributes = unsafe {
+            storage.attributesAtIndex_longestEffectiveRange_inRange(
+                location,
+                &mut effective_range,
+                NSRange::new(0, length),
+            )
+        };
+        if let Some(resource_id) = attribute_string(&attributes, &key) {
+            result.push(RenderedAttachment {
+                addressable_offset: location,
+                resource_id,
+            });
+        }
+        let next = effective_range.location + effective_range.length;
+        if next <= location {
+            break;
+        }
+        location = next;
+    }
+    result
 }
 
 fn missing_resource_placeholder_text(alt: &str) -> String {
@@ -956,6 +1033,8 @@ struct AppDelegateIvars {
     notes: RefCell<Vec<Note>>,
     loading_guard: RefCell<bool>,
     editor_session: RefCell<Option<NativeEditorSession>>,
+    projection_attachments: RefCell<Vec<RenderedAttachment>>,
+    projection_empty_carriers: RefCell<Vec<EmptyBlockCarrier>>,
     sidebar_background: OnceCell<Retained<NSBox>>,
     sidebar_separator: OnceCell<Retained<NSBox>>,
     list_scroll: OnceCell<Retained<NSScrollView>>,
@@ -1434,6 +1513,7 @@ define_class!(
 
         #[unsafe(method(textViewDidChangeSelection:))]
         fn text_view_did_change_selection(&self, _notification: &NSNotification) {
+            self.reapply_empty_carrier_for_selection();
             self.update_formatting_buttons();
         }
 
@@ -1574,6 +1654,9 @@ impl AppDelegate {
         if let Some(storage) = unsafe { body.textStorage() } {
             storage.setAttributedString(&rendered.attributed);
         }
+        *self.ivars().projection_attachments.borrow_mut() = rendered.attachments.clone();
+        *self.ivars().projection_empty_carriers.borrow_mut() =
+            rendered.empty_block_carriers.clone();
         let max_length = rendered.attributed.string().length();
         let location = selection.location.min(max_length);
         let length = selection.length.min(max_length.saturating_sub(location));
@@ -1660,6 +1743,57 @@ impl AppDelegate {
             .unwrap_or((false, false))
     }
 
+    fn reapply_empty_carrier_for_selection(&self) {
+        let Some(body) = self.ivars().body_view.get() else {
+            return;
+        };
+        let selection = body.selectedRange();
+        if selection.length != 0 {
+            return;
+        }
+        let carrier = self
+            .ivars()
+            .projection_empty_carriers
+            .borrow()
+            .iter()
+            .find(|carrier| carrier.addressable_offset == selection.location)
+            .cloned();
+        if let Some(carrier) = carrier {
+            body.setDefaultParagraphStyle(Some(&carrier.paragraph));
+            let typing = body.typingAttributes();
+            let mutable = typing.mutableCopy();
+            unsafe {
+                mutable.insert(NSParagraphStyleAttributeName, &carrier.paragraph);
+                body.setTypingAttributes(&mutable);
+            }
+            return;
+        }
+
+        let Some(storage) = (unsafe { body.textStorage() }) else {
+            return;
+        };
+        let length = storage.length();
+        if length == 0 {
+            return;
+        }
+        let source: &NSAttributedString = &storage;
+        let probe = selection.location.min(length - 1);
+        let Some(paragraph) = (unsafe {
+            source
+                .attribute_atIndex_effectiveRange(NSParagraphStyleAttributeName, probe, null_mut())
+                .and_then(|value| value.downcast::<NSParagraphStyle>().ok())
+        }) else {
+            return;
+        };
+        body.setDefaultParagraphStyle(Some(&paragraph));
+        let typing = body.typingAttributes();
+        let mutable = typing.mutableCopy();
+        unsafe {
+            mutable.insert(NSParagraphStyleAttributeName, &paragraph);
+            body.setTypingAttributes(&mutable);
+        }
+    }
+
     #[allow(deprecated)]
     fn sync_editor_session_from_view(&self) -> EditorSessionSyncResult {
         if *self.ivars().loading_guard.borrow() {
@@ -1686,7 +1820,30 @@ impl AppDelegate {
                     let Some((range, replacement)) = editor_text_delta(&old_text, &new_text) else {
                         return EditorSessionSyncResult::Rejected;
                     };
-                    if !replacement.is_empty() || delete_image_anchor(session, range).is_err() {
+                    if !replacement.is_empty() {
+                        return EditorSessionSyncResult::Rejected;
+                    }
+                    let expected_resource_id = self
+                        .ivars()
+                        .projection_attachments
+                        .borrow()
+                        .iter()
+                        .find(|attachment| attachment.addressable_offset == range.location)
+                        .map(|attachment| attachment.resource_id.clone());
+                    let Some(expected_resource_id) = expected_resource_id else {
+                        return EditorSessionSyncResult::Rejected;
+                    };
+                    if delete_image_anchor_if_identity(session, range, Some(&expected_resource_id))
+                        .is_err()
+                    {
+                        return EditorSessionSyncResult::Rejected;
+                    }
+                    if !adjust_projection_attachments(
+                        &mut self.ivars().projection_attachments.borrow_mut(),
+                        range,
+                        0,
+                        Some(&expected_resource_id),
+                    ) {
                         return EditorSessionSyncResult::Rejected;
                     }
                     return EditorSessionSyncResult::Applied;
@@ -1695,7 +1852,14 @@ impl AppDelegate {
                     let Some((range, replacement)) = editor_text_delta(&old_text, &new_text) else {
                         return EditorSessionSyncResult::Rejected;
                     };
-                    if apply_committed_text_delta(session, range, &replacement).is_ok() {
+                    if apply_committed_text_delta(session, range, &replacement).is_ok()
+                        && adjust_projection_attachments(
+                            &mut self.ivars().projection_attachments.borrow_mut(),
+                            range,
+                            NSString::from_str(&replacement).length(),
+                            None,
+                        )
+                    {
                         return EditorSessionSyncResult::Applied;
                     }
                     // A live delta that cannot be applied semantically is
@@ -2701,6 +2865,10 @@ impl AppDelegate {
         if !inserted && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut() {
             let _ = session.undo();
         }
+        if inserted {
+            *self.ivars().projection_attachments.borrow_mut() =
+                projection_attachments_from_storage(body);
+        }
         inserted
     }
 
@@ -2738,12 +2906,16 @@ impl AppDelegate {
                 Err(error) => {
                     eprintln!("native editor load failed: {error}");
                     *self.ivars().editor_session.borrow_mut() = None;
+                    self.ivars().projection_attachments.borrow_mut().clear();
+                    self.ivars().projection_empty_carriers.borrow_mut().clear();
                     body.setString(ns_string!("正文无法读取"));
                     ("正文无法读取", true)
                 }
             },
             Err(_) => {
                 *self.ivars().editor_session.borrow_mut() = None;
+                self.ivars().projection_attachments.borrow_mut().clear();
+                self.ivars().projection_empty_carriers.borrow_mut().clear();
                 body.setString(ns_string!("正文无法读取"));
                 ("正文无法读取", true)
             }
@@ -2759,6 +2931,8 @@ impl AppDelegate {
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = None;
         *self.ivars().editor_session.borrow_mut() = None;
+        self.ivars().projection_attachments.borrow_mut().clear();
+        self.ivars().projection_empty_carriers.borrow_mut().clear();
         self.ivars()
             .title_field
             .get()
@@ -3524,6 +3698,8 @@ impl AppDelegate {
             notes: RefCell::new(Vec::new()),
             loading_guard: RefCell::new(false),
             editor_session: RefCell::new(None),
+            projection_attachments: RefCell::new(Vec::new()),
+            projection_empty_carriers: RefCell::new(Vec::new()),
             sidebar_background: OnceCell::new(),
             sidebar_separator: OnceCell::new(),
             list_scroll: OnceCell::new(),
@@ -3656,6 +3832,10 @@ mod tests {
             super::classify_editor_text_change("ab", "a\u{fffc}b"),
             super::EditorTextSyncDecision::Reject
         );
+        assert_eq!(
+            super::editor_text_delta("😀x", "前😀x"),
+            Some((NSRange::new(0, 0), "前".into()))
+        );
     }
 
     #[test]
@@ -3667,6 +3847,7 @@ mod tests {
                 addressable_offset: 0,
                 paragraph: NSMutableParagraphStyle::new(),
             }],
+            attachments: Vec::new(),
         };
         assert!(super::exact_empty_block_carrier(&rendered, NSRange::new(0, 0)).is_some());
         assert!(super::exact_empty_block_carrier(&rendered, NSRange::new(0, 1)).is_none());
@@ -3684,6 +3865,57 @@ mod tests {
         assert!(!super::should_persist_after_editor_sync(
             super::EditorSessionSyncResult::Rejected
         ));
+    }
+
+    #[test]
+    fn projection_attachment_mapping_keeps_adjacent_identity_after_deletion() {
+        let mut attachments = vec![
+            super::RenderedAttachment {
+                addressable_offset: 0,
+                resource_id: "image-a".into(),
+            },
+            super::RenderedAttachment {
+                addressable_offset: 1,
+                resource_id: "image-b".into(),
+            },
+        ];
+        assert!(super::adjust_projection_attachments(
+            &mut attachments,
+            NSRange::new(0, 1),
+            0,
+            Some("image-a")
+        ));
+        assert_eq!(
+            attachments,
+            vec![super::RenderedAttachment {
+                addressable_offset: 0,
+                resource_id: "image-b".into(),
+            }]
+        );
+
+        let mut reverse = vec![
+            super::RenderedAttachment {
+                addressable_offset: 0,
+                resource_id: "image-a".into(),
+            },
+            super::RenderedAttachment {
+                addressable_offset: 1,
+                resource_id: "image-b".into(),
+            },
+        ];
+        assert!(super::adjust_projection_attachments(
+            &mut reverse,
+            NSRange::new(1, 1),
+            0,
+            Some("image-b")
+        ));
+        assert_eq!(
+            reverse,
+            vec![super::RenderedAttachment {
+                addressable_offset: 0,
+                resource_id: "image-a".into(),
+            }]
+        );
     }
 
     #[test]

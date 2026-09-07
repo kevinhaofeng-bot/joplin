@@ -91,6 +91,7 @@ pub struct NativeEditorSession {
     highlighted_ranges: Vec<(usize, usize)>,
     highlight_undo: Vec<Vec<(usize, usize)>>,
     highlight_redo: Vec<Vec<(usize, usize)>>,
+    command_model_mutated: bool,
 }
 
 const MAX_EDITOR_UNDO_ENTRIES: usize = 200;
@@ -144,22 +145,38 @@ impl NativeEditorSession {
         Ok(())
     }
 
-    fn begin_command(&mut self) -> TextCursor {
+    fn begin_command(&mut self) -> (TextCursor, Vec<(usize, usize)>) {
         self.text.break_undo_merge();
         let cursor = self.text.cursor_at(0);
         cursor.begin_edit_block();
+        self.command_model_mutated = false;
+        (cursor, self.highlighted_ranges.clone())
+    }
+
+    fn finish_command(&mut self, cursor: TextCursor, previous: Vec<(usize, usize)>) {
+        cursor.end_edit_block();
+        self.text.break_undo_merge();
         if self.highlight_undo.len() >= MAX_EDITOR_UNDO_ENTRIES {
             self.highlight_undo.remove(0);
         }
-        self.highlight_undo.push(self.highlighted_ranges.clone());
+        self.highlight_undo.push(previous);
         self.highlight_redo.clear();
-        cursor
+        self.command_model_mutated = false;
+        self.revision = self.revision.wrapping_add(1);
     }
 
-    fn finish_command(&mut self, cursor: TextCursor) {
+    fn cancel_command(&mut self, cursor: TextCursor, previous: Vec<(usize, usize)>) {
         cursor.end_edit_block();
         self.text.break_undo_merge();
-        self.revision = self.revision.wrapping_add(1);
+        if self.command_model_mutated {
+            // All production closures mark each successful model mutation.
+            // Undoing the just-closed edit block rolls back a partial command
+            // without touching the preceding user history entry.
+            let _ = self.text.undo();
+            self.text.break_undo_merge();
+        }
+        self.highlighted_ranges = previous;
+        self.command_model_mutated = false;
     }
 
     fn is_highlighted(&self, position: usize) -> bool {
@@ -169,29 +186,61 @@ impl NativeEditorSession {
     }
 }
 
+struct EditOutcome<T> {
+    value: T,
+    changed: bool,
+}
+
+fn changed<T>(value: T) -> EditOutcome<T> {
+    EditOutcome {
+        value,
+        changed: true,
+    }
+}
+
 fn run_edit_command<T, F>(
     session: &mut NativeEditorSession,
     action: F,
 ) -> Result<T, EditorCodecError>
 where
-    F: FnOnce(&mut NativeEditorSession) -> Result<T, EditorCodecError>,
+    F: FnOnce(&mut NativeEditorSession) -> Result<EditOutcome<T>, EditorCodecError>,
 {
-    let command_cursor = session.begin_command();
+    let (command_cursor, previous_highlights) = session.begin_command();
     let result = action(session);
-    session.finish_command(command_cursor);
-    result
+    match result {
+        Ok(outcome) if outcome.changed => {
+            session.finish_command(command_cursor, previous_highlights);
+            Ok(outcome.value)
+        }
+        Ok(outcome) => {
+            session.cancel_command(command_cursor, previous_highlights);
+            Ok(outcome.value)
+        }
+        Err(error) => {
+            session.cancel_command(command_cursor, previous_highlights);
+            Err(error)
+        }
+    }
 }
 
 pub struct RenderedDocument {
     pub attributed: Retained<NSMutableAttributedString>,
     pub missing_resources: usize,
     pub empty_block_carriers: Vec<EmptyBlockCarrier>,
+    pub attachments: Vec<RenderedAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedAttachment {
+    pub addressable_offset: usize,
+    pub resource_id: String,
 }
 
 /// Projection metadata for a semantic block with no addressable characters.
 /// TextKit cannot attach a paragraph attribute to a zero-length range, so the
 /// renderer keeps the native paragraph/list carrier beside the attributed
 /// string. It is display-only and is never decoded back into the model.
+#[derive(Clone)]
 pub struct EmptyBlockCarrier {
     pub addressable_offset: usize,
     pub paragraph: Retained<NSMutableParagraphStyle>,
@@ -390,6 +439,7 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
         highlighted_ranges: highlight_ranges(&blocks),
         highlight_undo: Vec::new(),
         highlight_redo: Vec::new(),
+        command_model_mutated: false,
     })
 }
 
@@ -448,18 +498,9 @@ fn apply_list_item_style(cursor: &TextCursor, block: &Block) -> Result<(), Edito
             })
             .map_err(model_error)?;
     }
-    // The list operation owns the list; explicitly set the indent afterwards
-    // so nested list items remain distinguishable in the live model.
-    let indent = match block {
-        Block::List { items, .. } => items[0].style.indent,
-        _ => 0,
-    };
-    cursor
-        .set_current_list_format(&text_document::ListFormat {
-            indent: Some(indent),
-            ..Default::default()
-        })
-        .map_err(model_error)?;
+    // ListFormat belongs to the whole native list.  Per-item nesting lives on
+    // each block's BlockFormat, which keeps adjacent items independently
+    // round-trippable without mutating one shared list for every item.
     Ok(())
 }
 
@@ -547,10 +588,9 @@ pub fn document_from_session(session: &NativeEditorSession) -> Result<Document, 
         let style = BlockStyle {
             alignment: html_alignment(snapshot.block_format.alignment),
             indent: snapshot
-                .list_info
-                .as_ref()
-                .map(|info| info.indent)
-                .or(snapshot.block_format.indent)
+                .block_format
+                .indent
+                .or(snapshot.list_info.as_ref().map(|info| info.indent))
                 .unwrap_or(0)
                 .min(8),
         };
@@ -640,8 +680,14 @@ fn utf16_range(text: &str, range: NSRange) -> Result<(usize, usize), EditorCodec
     let mut start_scalar = None;
     let mut end_scalar = None;
     let mut offset = 0usize;
+    // Zero is a valid boundary for both insertion and replacement, including
+    // a non-empty document.  Seed both ends before scanning so NSRange(0, 0)
+    // does not depend on seeing a character after the boundary.
     if range.location == 0 {
         start_scalar = Some(0);
+    }
+    if end == 0 {
+        end_scalar = Some(0);
     }
     for (scalar, character) in text.chars().enumerate() {
         if offset == range.location {
@@ -732,6 +778,44 @@ fn clear_highlight_range(session: &mut NativeEditorSession, start: usize, end: u
     session.highlighted_ranges = result;
 }
 
+fn selection_needs_clear(session: &NativeEditorSession, start: usize, end: usize) -> bool {
+    if (start..end).any(|position| session.is_highlighted(position)) {
+        return true;
+    }
+    for element in session.text.flow() {
+        let FlowElement::Block(block) = element else {
+            continue;
+        };
+        let snapshot = block.snapshot();
+        for fragment in snapshot.fragments {
+            let FragmentContent::Text {
+                offset,
+                length,
+                format,
+                ..
+            } = fragment
+            else {
+                continue;
+            };
+            let from = snapshot.position + offset;
+            let to = from + length;
+            if from >= end || to <= start {
+                continue;
+            }
+            if format.font_bold == Some(true)
+                || format.font_italic == Some(true)
+                || format.font_underline == Some(true)
+                || format.font_strikeout == Some(true)
+                || format.anchor_href.is_some()
+                || format.background_color.is_some_and(|color| color.alpha > 0)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn apply_committed_text_delta(
     session: &mut NativeEditorSession,
     range: NSRange,
@@ -740,19 +824,27 @@ pub fn apply_committed_text_delta(
     if replacement.contains('\0') {
         return Err(EditorCodecError::InvalidReplacement);
     }
+    if replacement.contains('\u{fffc}') {
+        return Err(EditorCodecError::Unsupported);
+    }
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, range)?;
+    let current: String = text.chars().skip(start).take(end - start).collect();
+    if current == replacement {
+        return Ok(());
+    }
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
         cursor.insert_text(replacement).map_err(model_error)?;
+        session.command_model_mutated = true;
         adjust_highlight_ranges(
             &mut session.highlighted_ranges,
             start,
             end,
             replacement.chars().count(),
         );
-        Ok(())
+        Ok(changed(()))
     })
 }
 
@@ -775,11 +867,12 @@ pub fn insert_image_anchor(
         cursor
             .insert_image(resource_id, alt, width.max(1), height.max(1))
             .map_err(model_error)?;
+        session.command_model_mutated = true;
         adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 1);
         session
             .image_dimensions
             .insert(resource_id.to_owned(), (width.max(1), height.max(1)));
-        Ok(())
+        Ok(changed(()))
     })
 }
 
@@ -790,21 +883,53 @@ pub fn delete_image_anchor(
     session: &mut NativeEditorSession,
     selection: NSRange,
 ) -> Result<(), EditorCodecError> {
+    delete_image_anchor_if_identity(session, selection, None)
+}
+
+pub fn delete_image_anchor_if_identity(
+    session: &mut NativeEditorSession,
+    selection: NSRange,
+    expected_resource_id: Option<&str>,
+) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
     if end != start + 1 || text.chars().nth(start) != Some('\u{fffc}') {
+        return Err(EditorCodecError::Unsupported);
+    }
+    if let Some(expected_resource_id) = expected_resource_id
+        && image_resource_id_at(session, start).as_deref() != Some(expected_resource_id)
+    {
         return Err(EditorCodecError::Unsupported);
     }
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
         let deleted = cursor.remove_selected_text().map_err(model_error)?;
+        session.command_model_mutated = true;
         if deleted != "\u{fffc}" {
             return Err(EditorCodecError::Unsupported);
         }
         adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 0);
-        Ok(())
+        session.command_model_mutated = true;
+        Ok(changed(()))
     })
+}
+
+fn image_resource_id_at(session: &NativeEditorSession, position: usize) -> Option<String> {
+    for element in session.text.flow() {
+        let FlowElement::Block(block) = element else {
+            continue;
+        };
+        let snapshot = block.snapshot();
+        for fragment in snapshot.fragments {
+            if let FragmentContent::Image { name, offset, .. } = fragment
+                && snapshot.position + offset == position
+            {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 pub fn apply_link(
@@ -833,7 +958,8 @@ pub fn apply_link(
             },
         };
         cursor.merge_char_format(&format).map_err(model_error)?;
-        Ok(())
+        session.command_model_mutated = true;
+        Ok(changed(()))
     })
 }
 
@@ -859,8 +985,13 @@ pub fn apply_inline_command(
                     }),
                     ..Default::default()
                 })
-                .map_err(model_error)
+                .map_err(model_error)?;
+            session.command_model_mutated = true;
+            Ok(changed(()))
         });
+    }
+    if matches!(command, InlineCommand::Clear) && !selection_needs_clear(session, start, end) {
+        return Ok(());
     }
     let active = query_inline_state(session, selection, command)? == SelectionState::Active;
     run_edit_command(session, |session| {
@@ -897,7 +1028,9 @@ pub fn apply_inline_command(
                 ..Default::default()
             },
         };
-        cursor.merge_char_format(&format).map_err(model_error)
+        cursor.merge_char_format(&format).map_err(model_error)?;
+        session.command_model_mutated = true;
+        Ok(changed(()))
     })
 }
 
@@ -920,6 +1053,7 @@ pub fn apply_block_command(
                         ..Default::default()
                     })
                     .map_err(model_error)?;
+                session.command_model_mutated = true;
                 remove_lists_in_selection(session, start, end)?;
             }
             BlockCommand::Heading(level) => {
@@ -934,6 +1068,7 @@ pub fn apply_block_command(
                         ..Default::default()
                     })
                     .map_err(model_error)?;
+                session.command_model_mutated = true;
             }
             BlockCommand::UnorderedList | BlockCommand::OrderedList | BlockCommand::Checklist => {
                 let style = match command {
@@ -941,6 +1076,7 @@ pub fn apply_block_command(
                     _ => ListStyle::Disc,
                 };
                 cursor.create_list(style).map_err(model_error)?;
+                session.command_model_mutated = true;
                 if matches!(command, BlockCommand::Checklist) {
                     cursor
                         .set_block_format(&BlockFormat {
@@ -948,10 +1084,11 @@ pub fn apply_block_command(
                             ..Default::default()
                         })
                         .map_err(model_error)?;
+                    session.command_model_mutated = true;
                 }
             }
         }
-        Ok(())
+        Ok(changed(()))
     })
 }
 
@@ -990,6 +1127,9 @@ pub fn apply_paragraph_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    if paragraph_command_is_noop(session, start, end, command) {
+        return Ok(());
+    }
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
@@ -999,52 +1139,68 @@ pub fn apply_paragraph_command(
                 ..Default::default()
             }),
             ParagraphCommand::IncreaseIndent => {
-                if cursor.current_list().is_some() {
-                    let current = cursor
-                        .current_list()
-                        .and_then(|list| list.format().indent)
-                        .unwrap_or(0);
-                    cursor.set_current_list_format(&text_document::ListFormat {
-                        indent: Some(current.saturating_add(1).min(8)),
-                        ..Default::default()
-                    })
-                } else {
-                    let current = cursor
-                        .block_format()
-                        .map_err(model_error)?
-                        .indent
-                        .unwrap_or(0);
-                    cursor.set_block_format(&BlockFormat {
-                        indent: Some(current.saturating_add(1).min(8)),
-                        ..Default::default()
-                    })
-                }
+                let current = cursor
+                    .block_format()
+                    .map_err(model_error)?
+                    .indent
+                    .unwrap_or(0);
+                cursor.set_block_format(&BlockFormat {
+                    indent: Some(current.saturating_add(1).min(8)),
+                    ..Default::default()
+                })
             }
             ParagraphCommand::DecreaseIndent => {
-                if cursor.current_list().is_some() {
-                    let current = cursor
-                        .current_list()
-                        .and_then(|list| list.format().indent)
-                        .unwrap_or(0);
-                    cursor.set_current_list_format(&text_document::ListFormat {
-                        indent: Some(current.saturating_sub(1)),
-                        ..Default::default()
-                    })
-                } else {
-                    let current = cursor
-                        .block_format()
-                        .map_err(model_error)?
-                        .indent
-                        .unwrap_or(0);
-                    cursor.set_block_format(&BlockFormat {
-                        indent: Some(current.saturating_sub(1)),
-                        ..Default::default()
-                    })
-                }
+                let current = cursor
+                    .block_format()
+                    .map_err(model_error)?
+                    .indent
+                    .unwrap_or(0);
+                cursor.set_block_format(&BlockFormat {
+                    indent: Some(current.saturating_sub(1)),
+                    ..Default::default()
+                })
             }
         }
-        .map_err(model_error)
+        .map_err(model_error)?;
+        session.command_model_mutated = true;
+        Ok(changed(()))
     })
+}
+
+fn paragraph_command_is_noop(
+    session: &NativeEditorSession,
+    start: usize,
+    end: usize,
+    command: ParagraphCommand,
+) -> bool {
+    let mut found = false;
+    for element in session.text.flow() {
+        let FlowElement::Block(block) = element else {
+            continue;
+        };
+        let snapshot = block.snapshot();
+        let overlaps = if start == end {
+            snapshot.position <= start && start <= snapshot.position + snapshot.length
+        } else {
+            snapshot.position < end && snapshot.position + snapshot.length > start
+        };
+        if !overlaps {
+            continue;
+        }
+        found = true;
+        let indent = snapshot.block_format.indent.unwrap_or(0);
+        let matches = match command {
+            ParagraphCommand::Align(alignment) => {
+                html_alignment(snapshot.block_format.alignment) == alignment
+            }
+            ParagraphCommand::IncreaseIndent => indent >= 8,
+            ParagraphCommand::DecreaseIndent => indent == 0,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    found
 }
 
 pub fn toggle_checklist_at_utf16_location(
@@ -1066,13 +1222,15 @@ pub fn toggle_checklist_at_utf16_location(
         Some(MarkerType::Unchecked) => MarkerType::Checked,
         _ => return false,
     };
-    run_edit_command(session, |_session| {
+    run_edit_command(session, |session| {
         cursor
             .set_block_format(&BlockFormat {
                 marker: Some(marker),
                 ..Default::default()
             })
-            .map_err(model_error)
+            .map_err(model_error)?;
+        session.command_model_mutated = true;
+        Ok(changed(()))
     })
     .is_ok()
 }
@@ -1360,6 +1518,7 @@ where
     let mut previous_paragraph: Option<Retained<NSMutableParagraphStyle>> = None;
     let mut pending_empty_block: Option<(usize, Retained<NSMutableParagraphStyle>)> = None;
     let mut empty_block_carriers = Vec::new();
+    let mut attachments = Vec::new();
     for element in session.text.flow() {
         let FlowElement::Block(block) = element else {
             continue;
@@ -1432,6 +1591,10 @@ where
                     height: image_height,
                     ..
                 } => {
+                    attachments.push(RenderedAttachment {
+                        addressable_offset: output.string().length(),
+                        resource_id: name.clone(),
+                    });
                     let resource = load(&name);
                     if resource.is_none() {
                         missing_resources += 1;
@@ -1471,6 +1634,7 @@ where
         attributed: output,
         missing_resources,
         empty_block_carriers,
+        attachments,
     }
 }
 
@@ -1603,6 +1767,146 @@ mod tests {
         assert_eq!(session.text.to_addressable_text().unwrap(), "A猫B");
         apply_committed_text_delta(&mut session, NSRange::new(3, 0), "!").unwrap();
         assert_eq!(session.text.to_addressable_text().unwrap(), "A猫B!");
+    }
+
+    #[test]
+    fn utf16_zero_offset_accepts_text_and_image_insertions() {
+        let mut text_session =
+            session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "😀x".into(),
+                    marks: Default::default(),
+                }],
+            }]))
+            .unwrap();
+        apply_committed_text_delta(&mut text_session, NSRange::new(0, 0), "前").unwrap();
+        assert_eq!(text_session.text.to_addressable_text().unwrap(), "前😀x");
+
+        let mut image_session =
+            session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "x".into(),
+                    marks: Default::default(),
+                }],
+            }]))
+            .unwrap();
+        insert_image_anchor(
+            &mut image_session,
+            NSRange::new(0, 0),
+            "image-at-zero",
+            "图",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            image_session.text.to_addressable_text().unwrap(),
+            "\u{fffc}x"
+        );
+    }
+
+    #[test]
+    fn no_op_and_failed_commands_do_not_consume_history_or_revision() {
+        let mut session = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "abc".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+
+        apply_inline_command(&mut session, NSRange::new(0, 3), InlineCommand::Highlight).unwrap();
+        apply_inline_command(&mut session, NSRange::new(0, 3), InlineCommand::Clear).unwrap();
+        let revision_after_clear = session.revision();
+        apply_inline_command(&mut session, NSRange::new(0, 3), InlineCommand::Clear).unwrap();
+        assert_eq!(session.revision(), revision_after_clear);
+        session.undo().unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(0, 3), InlineCommand::Highlight).unwrap(),
+            SelectionState::Active
+        );
+
+        let revision = session.revision();
+        let can_undo = session.can_undo();
+        let failure: Result<(), EditorCodecError> =
+            run_edit_command(&mut session, |_session| Err(EditorCodecError::Unsupported));
+        assert_eq!(failure, Err(EditorCodecError::Unsupported));
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.can_undo(), can_undo);
+
+        let before_text = session.text.to_addressable_text().unwrap();
+        let partial: Result<(), EditorCodecError> = run_edit_command(&mut session, |session| {
+            let cursor = session.text.cursor_at(0);
+            cursor.insert_text("x").map_err(model_error)?;
+            session.command_model_mutated = true;
+            Err(EditorCodecError::Unsupported)
+        });
+        assert_eq!(partial, Err(EditorCodecError::Unsupported));
+        assert_eq!(session.text.to_addressable_text().unwrap(), before_text);
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.can_undo(), can_undo);
+    }
+
+    #[test]
+    fn empty_text_delta_is_not_a_visible_command() {
+        let mut session = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "abc".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        apply_inline_command(&mut session, NSRange::new(0, 3), InlineCommand::Highlight).unwrap();
+        let revision = session.revision();
+        apply_committed_text_delta(&mut session, NSRange::new(0, 0), "").unwrap();
+        assert_eq!(session.revision(), revision);
+        session.undo().unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(0, 3), InlineCommand::Highlight).unwrap(),
+            SelectionState::Inactive
+        );
+    }
+
+    #[test]
+    fn list_item_indents_round_trip_independently() {
+        let document = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Ordered,
+            items: vec![
+                ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "one".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                ListItem {
+                    checked: None,
+                    style: BlockStyle {
+                        indent: 2,
+                        ..Default::default()
+                    },
+                    inlines: vec![Inline::Text {
+                        text: "nested".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "two".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+            ],
+        }]);
+        let session = session_from_document(&document).unwrap();
+        assert_eq!(document_from_session(&session).unwrap(), document);
     }
 
     #[test]
@@ -2082,5 +2386,64 @@ mod tests {
                     Inline::Image { resource_id, .. } if resource_id == "res-1"
                 )))
         ));
+    }
+
+    #[test]
+    fn adjacent_image_deletion_uses_resource_identity_and_undo() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![
+                Inline::Image {
+                    resource_id: "image-a".into(),
+                    alt: "A".into(),
+                },
+                Inline::Image {
+                    resource_id: "image-b".into(),
+                    alt: "B".into(),
+                },
+            ],
+        }]);
+        let mut first = session_from_document(&document).unwrap();
+        assert_eq!(
+            delete_image_anchor_if_identity(&mut first, NSRange::new(0, 1), Some("image-b")),
+            Err(EditorCodecError::Unsupported)
+        );
+        delete_image_anchor_if_identity(&mut first, NSRange::new(0, 1), Some("image-a")).unwrap();
+        assert_eq!(
+            image_ids(&document_from_session(&first).unwrap()),
+            vec!["image-b".to_string()]
+        );
+        first.undo().unwrap();
+        assert_eq!(
+            image_ids(&document_from_session(&first).unwrap()),
+            vec!["image-a".to_string(), "image-b".to_string()]
+        );
+
+        let mut second = session_from_document(&document).unwrap();
+        delete_image_anchor_if_identity(&mut second, NSRange::new(1, 1), Some("image-b")).unwrap();
+        assert_eq!(
+            image_ids(&document_from_session(&second).unwrap()),
+            vec!["image-a".to_string()]
+        );
+        second.undo().unwrap();
+        assert_eq!(
+            image_ids(&document_from_session(&second).unwrap()),
+            vec!["image-a".to_string(), "image-b".to_string()]
+        );
+    }
+
+    fn image_ids(document: &Document) -> Vec<String> {
+        document
+            .blocks
+            .iter()
+            .flat_map(|block| match block {
+                Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => inlines,
+                Block::List { items, .. } => &items[0].inlines,
+            })
+            .filter_map(|inline| match inline {
+                Inline::Image { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }

@@ -250,3 +250,88 @@ passed
 - Paragraph alignment/indent commands keep block format semantics, while list
   indent changes use `ListFormat`; increase/decrease survives
   `document_from_session` and session reload.
+
+## Fix 1 third-round review: RED/GREEN evidence (2026-09-07)
+
+### RED: four independent blockers reproduced before the fixes
+
+The new focused regressions were added and run against the inherited product
+implementation before changing the corresponding production paths:
+
+```text
+cargo test --manifest-path packages/app-lite-native/Cargo.toml --lib \
+  utf16_zero_offset_accepts_text_and_image_insertions
+FAILED: NSRange(0, 0) on a non-empty document returned InvalidUtf16Range
+
+cargo test --manifest-path packages/app-lite-native/Cargo.toml --lib \
+  no_op_and_failed_commands_do_not_consume_history_or_revision
+FAILED: the second Clear incremented revision (left 3, expected 2), so one
+        no-op command consumed a visible history step
+
+cargo test --manifest-path packages/app-lite-native/Cargo.toml --lib \
+  empty_text_delta_is_not_a_visible_command
+FAILED: the zero-length insertion at offset zero returned InvalidUtf16Range
+
+cargo test --manifest-path packages/app-lite-native/Cargo.toml --lib \
+  list_item_indents_round_trip_independently
+FAILED: the second ordered item returned indent 0 instead of canonical indent 2
+```
+
+The adjacent-image RED condition is the range-only ambiguity: deleting either
+image from the same old/new U+FFFC strings produces only a one-character
+`NSRange`, with no resource identity. The regression therefore asserts the new
+projection identity map for both deletion directions, rejects an identity
+mismatch before mutating the session, and checks undo restoration. The
+terminal empty-list carrier regression is exercised through the production
+selection-refresh path, not by adding a canonical placeholder character.
+
+### GREEN: focused and locked gates
+
+```text
+cargo test --manifest-path packages/app-lite-native/Cargo.toml --lib
+80 passed; 0 failed
+
+cargo test --manifest-path packages/app-lite-native/Cargo.toml --bin joplin-lite-native
+36 passed; 0 failed
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml --all-targets
+80 library + 36 app + 7 lifecycle tests passed; 0 failed
+
+cargo clippy --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --all-targets -- -D warnings
+passed
+
+cargo fmt --manifest-path packages/app-lite-native/Cargo.toml -- --check
+passed
+
+git diff --check
+passed
+```
+
+### Third-round design and scope
+
+- The live model still has exactly one incremental history owner: the
+  `TextDocument` undo manager with a 200-entry limit. `run_edit_command` now
+  stages the sidecar pre-state and only commits it, clears redo, and increments
+  revision after a changed command succeeds. No-op deltas/Clear and bounded
+  paragraph no-ops return before history creation. Failed commands restore the
+  sidecar; a marked partial model edit is rolled back through the just-closed
+  TextDocument edit block. No full-document snapshot stack was introduced.
+- `utf16_range` seeds both endpoints at offset zero and scans only exact UTF-16
+  boundaries, so insertion before ordinary text, emoji, or an image sentinel
+  applies while a mid-surrogate boundary still rejects. Live replacement text
+  containing U+FFFC remains rejected; image removal has its own semantic path.
+- Per-item list nesting is stored in each item's `BlockFormat.indent`; the
+  shared `ListFormat` is no longer rewritten once per item. Consecutive items
+  retain one native list identity and ordered numbering, while
+  `document_from_session` prefers the item block indent and round-trips mixed
+  list/checklist/nesting semantics.
+- Renderer output now carries each attachment's addressable UTF-16 offset and
+  resource ID. AppKit live sync uses that stable projection map plus the actual
+  edit range to delete exactly A or B from adjacent anchors, updates offsets for
+  ordinary text deltas, and keeps inserted-image mappings synchronized from
+  storage. Unknown/mismatched identity fails closed before semantic mutation.
+- Empty terminal/solo blocks remain zero-character projections. Their native
+  paragraph carrier is stored by the shared load/refresh install helper and is
+  reapplied when a collapsed selection moves onto the exact carrier offset;
+  canonical text, model history, and SQLite never receive a fake character.
