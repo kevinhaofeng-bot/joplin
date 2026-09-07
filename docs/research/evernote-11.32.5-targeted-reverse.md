@@ -106,6 +106,16 @@ Native ruling: retain the existing Rust command catalogue, replace one-character
 
 Native ruling: keep the current Rust `NotePreview` projection, `NSCollectionView` reuse and visible-only thumbnail decoding. Tune the visual card toward this compact information hierarchy: stable metadata/footer geometry, 13 pt title/snippet scale, restrained selected outline and fixed cropped thumbnail slot. Avoid turning the note browser into a gallery of oversized images; the image supports recognition while title, snippet and recency remain primary.
 
+### Offline search and relevance
+
+- The current local schema does not treat search as a scan of serialized note documents. It materializes separate FTS5 indexes for note metadata/title, extracted note content and attachment search text. The attachment index is fed by a plain searchable-text table rather than by filenames or binary payloads alone.
+- A free-text term is queried across those independent sources and the matching note IDs are combined. In relevance mode each source supplies an SQLite `bm25(...)` score; if the same note matches more than one source, the scores are summed before the final sort. Lower BM25 score is the stronger match.
+- The normal query sanitizer doubles embedded quotes, wraps a term as an FTS phrase and appends `*` for prefix matching unless the user explicitly entered an exact quoted term. This provides type-ahead-friendly prefix results without concatenating raw FTS syntax.
+- The query parser also has field operators for title, created/updated time, notebook, tag and attachment filename/MIME. Those operators demonstrate a layered query model, but they are not all MVP requirements for a personal lightweight client.
+- The shipped final schema uses ordinary FTS5 tokenization for the search indexes. A historical suggestion migration used trigram tokenization for title/notebook/tag suggestions, but a later tokenizer migration rebuilt the note indexes; the historical trigram choice must not be mistaken for the current general-search contract.
+
+Native ruling: keep SQLite FTS5 and the readable `body_text` projection, but stop sorting every successful search only by recency. The MVP ranking should merge safe FTS prefix matches with literal substring matches needed for CJK, de-duplicate by note ID, and rank exact title, title prefix and title substring above body-only matches, with BM25 and recency as deterministic tie-breakers. Search results and note-card previews must use the same ordering. Attachment alt/caption text already present in `body_text` remains searchable; OCR and field-operator syntax are separate product increments, not excuses to delay useful relevance now.
+
 ## Explicitly excluded Evernote scope
 
 AI editing, collaboration, calendar integration, tasks, meeting recording, transcription, templates, advertising/promotions, rich web cards, PDF/spreadsheet viewers, arbitrary fonts/colors and other expansion features are not product requirements. Their presence in the bundle is evidence of Evernote's current size, not a backlog for Joplin Lite Native.
