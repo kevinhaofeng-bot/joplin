@@ -975,6 +975,25 @@ fn toggle_focus_visibility(
     }
 }
 
+fn search_focus_visibility(
+    current: ShellVisibility,
+    restore: Option<ShellVisibility>,
+) -> (ShellVisibility, Option<ShellVisibility>) {
+    match current {
+        ShellVisibility::Focus => (
+            match restore {
+                Some(visible @ (ShellVisibility::Default | ShellVisibility::BrowserCollapsed)) => {
+                    visible
+                }
+                _ => ShellVisibility::Default,
+            },
+            None,
+        ),
+        ShellVisibility::BrowserOnly => (ShellVisibility::Default, None),
+        _ => (current, restore),
+    }
+}
+
 fn toggle_browser_visibility(current: ShellVisibility) -> ShellVisibility {
     match current {
         ShellVisibility::Default => ShellVisibility::BrowserCollapsed,
@@ -3584,6 +3603,35 @@ define_class!(
         self.search_notes(&sender.stringValue().to_string());
     }
 
+    #[unsafe(method(focusSearch:))]
+    fn focus_search(&self, _sender: &NSObject) {
+        let current = *self.ivars().shell_visibility.borrow();
+        let restore = *self.ivars().focus_restore_visibility.borrow();
+        let (visibility, restore) = search_focus_visibility(current, restore);
+        if visibility != current || restore != *self.ivars().focus_restore_visibility.borrow() {
+            *self.ivars().shell_visibility.borrow_mut() = visibility;
+            *self.ivars().focus_restore_visibility.borrow_mut() = restore;
+            if let Some(content) = self
+                .ivars()
+                .window
+                .get()
+                .and_then(|window| window.contentView())
+            {
+                let frame = content.frame();
+                self.layout_content(frame.size.width, frame.size.height);
+            }
+        }
+        let Some(search) = self.ivars().search_field.get() else {
+            return;
+        };
+        let Some(window) = self.ivars().window.get() else {
+            return;
+        };
+        if window.makeFirstResponder(Some(search)) {
+            unsafe { search.selectText(None) };
+        }
+    }
+
     #[unsafe(method(deleteNote:))]
     fn delete_note(&self, _sender: &NSObject) {
         if self.ivars().current_note_id.borrow().is_some() && !self.save_current_note() {
@@ -4476,6 +4524,19 @@ impl AppDelegate {
         }
         new_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
         file_menu.addItem(&new_item);
+        let search_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("搜索笔记"),
+                Some(sel!(focusSearch:)),
+                ns_string!("k"),
+            )
+        };
+        unsafe {
+            search_item.setTarget(Some(target));
+        }
+        search_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        file_menu.addItem(&search_item);
         let file_menu_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -7539,6 +7600,55 @@ mod tests {
             super::toggle_browser_visibility(super::ShellVisibility::Focus),
             super::ShellVisibility::BrowserOnly
         );
+    }
+
+    #[test]
+    fn red_search_focus_visibility_restores_a_navigation_shell() {
+        let cases = [
+            (
+                super::ShellVisibility::Default,
+                None,
+                super::ShellVisibility::Default,
+                None,
+            ),
+            (
+                super::ShellVisibility::BrowserCollapsed,
+                None,
+                super::ShellVisibility::BrowserCollapsed,
+                None,
+            ),
+            (
+                super::ShellVisibility::Focus,
+                Some(super::ShellVisibility::Default),
+                super::ShellVisibility::Default,
+                None,
+            ),
+            (
+                super::ShellVisibility::Focus,
+                Some(super::ShellVisibility::BrowserCollapsed),
+                super::ShellVisibility::BrowserCollapsed,
+                None,
+            ),
+            (
+                super::ShellVisibility::Focus,
+                None,
+                super::ShellVisibility::Default,
+                None,
+            ),
+            (
+                super::ShellVisibility::BrowserOnly,
+                Some(super::ShellVisibility::BrowserCollapsed),
+                super::ShellVisibility::Default,
+                None,
+            ),
+        ];
+        for (current, restore, expected_visibility, expected_restore) in cases {
+            assert_eq!(
+                super::search_focus_visibility(current, restore),
+                (expected_visibility, expected_restore),
+                "current={current:?} restore={restore:?}"
+            );
+        }
     }
 
     #[test]
