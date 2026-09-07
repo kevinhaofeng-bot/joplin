@@ -412,13 +412,19 @@ impl TreeSink for DomSink {
         let Some(parent) = Self::parent(sibling) else {
             return;
         };
+        let new_node = match new_node {
+            NodeOrText::AppendNode(node) => {
+                Self::detach(&node);
+                NodeOrText::AppendNode(node)
+            }
+            NodeOrText::AppendText(text) => NodeOrText::AppendText(text),
+        };
         let mut children = parent.children.borrow_mut();
         let Some(index) = children.iter().position(|child| Rc::ptr_eq(child, sibling)) else {
             return;
         };
         match new_node {
             NodeOrText::AppendNode(node) => {
-                Self::detach(&node);
                 Self::set_parent(&parent, &node);
                 children.insert(index, node);
             }
@@ -863,5 +869,73 @@ mod tests {
             parse_html("&nbsp;").map(|doc| search_text(&doc)).unwrap(),
             " "
         );
+    }
+
+    #[test]
+    fn preformatted_whitespace_is_downgraded_to_the_same_canonical_model() {
+        let document = parse_html("<pre>  first\n  second</pre>").unwrap();
+        assert_eq!(
+            document,
+            Document::from_blocks(vec![Block::Paragraph(vec![
+                Inline::Text {
+                    text: "  first".into(),
+                    marks: Marks::default(),
+                },
+                Inline::SoftBreak,
+                Inline::Text {
+                    text: "  second".into(),
+                    marks: Marks::default(),
+                },
+            ])])
+        );
+        assert_eq!(
+            serialize_html(&document),
+            "<p>&nbsp;&nbsp;first<br>&nbsp;&nbsp;second</p>"
+        );
+    }
+
+    #[test]
+    fn html5_adoption_agency_preserves_nested_marks_without_panicking() {
+        let document = parse_html("<p><strong><em>x</strong>y</em>z</p>").unwrap();
+        assert_eq!(
+            document,
+            Document::from_blocks(vec![Block::Paragraph(vec![
+                Inline::Text {
+                    text: "x".into(),
+                    marks: Marks {
+                        bold: true,
+                        italic: true,
+                        ..Marks::default()
+                    },
+                },
+                Inline::Text {
+                    text: "y".into(),
+                    marks: Marks {
+                        italic: true,
+                        ..Marks::default()
+                    },
+                },
+                Inline::Text {
+                    text: "z".into(),
+                    marks: Marks::default(),
+                },
+            ])])
+        );
+    }
+
+    #[test]
+    fn tree_sink_can_move_an_existing_sibling_without_borrow_panics() {
+        let sink = DomSink::default();
+        let parent = DomSink::node(DomData::Document);
+        let sibling = DomSink::node(DomData::Text(RefCell::new("sibling".into())));
+        let moved = DomSink::node(DomData::Text(RefCell::new("moved".into())));
+        DomSink::append_node(&parent, sibling.clone());
+        DomSink::append_node(&parent, moved.clone());
+
+        sink.append_before_sibling(&sibling, NodeOrText::AppendNode(moved.clone()));
+
+        let children = parent.children.borrow();
+        assert!(Rc::ptr_eq(&children[0], &moved));
+        assert!(Rc::ptr_eq(&children[1], &sibling));
     }
 }
