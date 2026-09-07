@@ -189,7 +189,7 @@ pub fn serialize_html(document: &Document) -> String {
                     serialize_style_attributes(&item.style, &mut output);
                     output.push('>');
                     if item.inlines.is_empty() {
-                        output.push_str("<br>");
+                        output.push_str("<br data-joplin-lite-empty-item=\"true\">");
                     } else if item.inlines.len() == 1
                         && matches!(item.inlines[0], Inline::SoftBreak)
                     {
@@ -962,6 +962,7 @@ fn project_dom(root: &DomHandle) -> Document {
             } => projection.finish_block(blocks_before, kind, style),
             ProjectionFrame::FinishList => projection.finish_list(),
             ProjectionFrame::FinishListItem => projection.finish_list_item(),
+            ProjectionFrame::FinishListBlock => projection.finish_list_block(),
             ProjectionFrame::Visit {
                 node,
                 marks,
@@ -1026,6 +1027,7 @@ fn project_dom(root: &DomHandle) -> Document {
                         if !projection.list_contexts.is_empty() {
                             projection.begin_list_block();
                             projection.ensure_current();
+                            pending.push(ProjectionFrame::FinishListBlock);
                             for child in children.into_iter().rev() {
                                 pending.push(ProjectionFrame::Visit {
                                     node: child,
@@ -1059,8 +1061,14 @@ fn project_dom(root: &DomHandle) -> Document {
                         )
                     {
                         if !projection.list_contexts.is_empty() {
-                            projection.begin_list_block();
+                            let is_list_block = matches!(tag.as_str(), "p" | "pre" | "blockquote");
+                            if is_list_block {
+                                projection.begin_list_block();
+                            }
                             projection.ensure_current();
+                            if is_list_block {
+                                pending.push(ProjectionFrame::FinishListBlock);
+                            }
                             let child_preformatted = preformatted || tag == "pre";
                             for child in children.into_iter().rev() {
                                 pending.push(ProjectionFrame::Visit {
@@ -1091,13 +1099,20 @@ fn project_dom(root: &DomHandle) -> Document {
                         continue;
                     }
                     if tag == "br" {
-                        if attribute(&attrs.borrow(), "data-joplin-lite-soft-break").as_deref()
+                        if attribute(&attrs.borrow(), "data-joplin-lite-empty-item").as_deref()
                             == Some("true")
                         {
-                            projection.mark_explicit_softbreak();
+                            projection.mark_empty_item_placeholder();
+                        } else {
+                            if attribute(&attrs.borrow(), "data-joplin-lite-soft-break").as_deref()
+                                == Some("true")
+                            {
+                                projection.mark_explicit_softbreak();
+                            }
+                            projection.ensure_current().push(Inline::SoftBreak);
+                            projection.flow_has_visible = true;
+                            projection.current_item_has_content = true;
                         }
-                        projection.ensure_current().push(Inline::SoftBreak);
-                        projection.flow_has_visible = true;
                         continue;
                     }
                     if tag == "img" {
@@ -1162,6 +1177,7 @@ enum ProjectionFrame {
     },
     FinishList,
     FinishListItem,
+    FinishListBlock,
 }
 
 #[derive(Clone, Default)]
@@ -1354,14 +1370,6 @@ impl Projection {
             return;
         };
         let inlines = normalize_inlines(inlines);
-        let inlines = if inlines.len() == 1
-            && matches!(inlines[0], Inline::SoftBreak)
-            && !self.explicit_softbreak
-        {
-            Vec::new()
-        } else {
-            inlines
-        };
         context.items.push(ListItem {
             checked: context.pending_checked,
             style: context.pending_style,
@@ -1372,6 +1380,12 @@ impl Projection {
         self.flow_has_visible = false;
         self.explicit_softbreak = false;
         self.current_item_has_content = false;
+    }
+
+    fn finish_list_block(&mut self) {
+        if self.current.is_some() {
+            self.finish_list_item();
+        }
     }
 
     fn finish_list(&mut self) {
@@ -1423,6 +1437,10 @@ impl Projection {
 
     fn mark_explicit_softbreak(&mut self) {
         self.explicit_softbreak = true;
+    }
+
+    fn mark_empty_item_placeholder(&mut self) {
+        self.ensure_current();
     }
 
     fn text(&mut self, text: &str, marks: &ProjectionMarks, preformatted: bool) {
@@ -1773,6 +1791,43 @@ mod tests {
     }
 
     #[test]
+    fn list_block_end_separates_following_inline_content() {
+        let document = parse_html("<ul><li><p>one</p>two</li></ul>").unwrap();
+        assert_eq!(search_text(&document), "one\ntwo");
+        let Block::List { items, .. } = &document.blocks[0] else {
+            panic!("expected list");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            serialize_html(&document),
+            "<ul><li>one</li><li>two</li></ul>"
+        );
+
+        let empty_child = parse_html("<ul><li><p></p><h2>two</h2></li></ul>").unwrap();
+        assert_eq!(search_text(&empty_child), "\ntwo");
+        assert_eq!(
+            serialize_html(&empty_child),
+            "<ul><li><br data-joplin-lite-empty-item=\"true\"></li><li>two</li></ul>"
+        );
+    }
+
+    #[test]
+    fn softbreaks_before_blocks_and_nested_lists_are_not_dropped() {
+        let explicit = parse_html(
+            "<ul><li><br data-joplin-lite-soft-break=\"true\"><ol><li>inner</li></ol></li></ul>",
+        )
+        .unwrap();
+        assert_eq!(search_text(&explicit), "\n\ninner");
+
+        let consecutive = parse_html("<ul><li><br><br><p>two</p></li></ul>").unwrap();
+        assert_eq!(search_text(&consecutive), "\n\n\ntwo");
+        assert_eq!(
+            serialize_html(&consecutive),
+            "<ul><li><br><br></li><li>two</li></ul>"
+        );
+    }
+
+    #[test]
     fn nested_list_after_item_keeps_outer_style_and_check_state() {
         let document = parse_html(
             "<ul data-type=\"checklist\"><li data-checked=\"true\" data-align=\"right\" data-indent=\"2\">outer<ol><li>inner</li></ol>after</li></ul>",
@@ -2022,7 +2077,10 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
             },
         ]);
         let html = serialize_html(&document);
-        assert_eq!(html, "<h1><br></h1><ul><li><br></li></ul>");
+        assert_eq!(
+            html,
+            "<h1><br></h1><ul><li><br data-joplin-lite-empty-item=\"true\"></li></ul>"
+        );
         assert_eq!(parse_html(&html).unwrap(), document);
 
         let empty_list = Document::from_blocks(vec![Block::List {
