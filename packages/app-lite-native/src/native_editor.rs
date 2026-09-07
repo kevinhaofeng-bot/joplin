@@ -92,8 +92,15 @@ pub struct NativeEditorSession {
     highlight_undo: Vec<Vec<(usize, usize)>>,
     highlight_redo: Vec<Vec<(usize, usize)>>,
     typing_format: TextFormat,
-    typing_undo: Vec<TextFormat>,
-    typing_redo: Vec<TextFormat>,
+    typing_override: Option<(usize, TextFormat)>,
+    typing_undo: Vec<TypingState>,
+    typing_redo: Vec<TypingState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypingState {
+    format: TextFormat,
+    override_at: Option<(usize, TextFormat)>,
 }
 
 const MAX_EDITOR_UNDO_ENTRIES: usize = 200;
@@ -134,8 +141,8 @@ impl NativeEditorSession {
             self.highlighted_ranges = previous;
         }
         if let Some(previous) = self.typing_undo.pop() {
-            self.typing_redo.push(self.typing_format.clone());
-            self.typing_format = previous;
+            self.typing_redo.push(self.typing_state());
+            self.restore_typing_state(previous);
         }
         self.revision = self.revision.wrapping_add(1);
         Ok(())
@@ -148,29 +155,25 @@ impl NativeEditorSession {
             self.highlighted_ranges = next;
         }
         if let Some(next) = self.typing_redo.pop() {
-            self.typing_undo.push(self.typing_format.clone());
-            self.typing_format = next;
+            self.typing_undo.push(self.typing_state());
+            self.restore_typing_state(next);
         }
         self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
-    fn begin_command(&mut self) -> (TextCursor, Vec<(usize, usize)>, TextFormat) {
+    fn begin_command(&mut self) -> (TextCursor, Vec<(usize, usize)>, TypingState) {
         self.text.break_undo_merge();
         let cursor = self.text.cursor_at(0);
         cursor.begin_edit_block();
-        (
-            cursor,
-            self.highlighted_ranges.clone(),
-            self.typing_format.clone(),
-        )
+        (cursor, self.highlighted_ranges.clone(), self.typing_state())
     }
 
     fn finish_command(
         &mut self,
         cursor: TextCursor,
         previous: Vec<(usize, usize)>,
-        previous_typing: TextFormat,
+        previous_typing: TypingState,
     ) {
         cursor.end_edit_block();
         self.text.break_undo_merge();
@@ -191,6 +194,103 @@ impl NativeEditorSession {
         self.highlighted_ranges
             .iter()
             .any(|(start, end)| *start <= position && position < *end)
+    }
+
+    fn typing_state(&self) -> TypingState {
+        TypingState {
+            format: self.typing_format.clone(),
+            override_at: self.typing_override.clone(),
+        }
+    }
+
+    fn restore_typing_state(&mut self, state: TypingState) {
+        self.typing_format = state.format;
+        self.typing_override = state.override_at;
+    }
+
+    fn inherited_typing_format(&self, position: usize) -> TextFormat {
+        for element in self.text.flow() {
+            let FlowElement::Block(block) = element else {
+                continue;
+            };
+            let snapshot = block.snapshot();
+            if position < snapshot.position || position > snapshot.position + snapshot.length {
+                continue;
+            }
+            let local = position.saturating_sub(snapshot.position);
+            let candidate = if local == 0 {
+                snapshot
+                    .fragments
+                    .iter()
+                    .find_map(|fragment| match fragment {
+                        FragmentContent::Text {
+                            offset: 0, format, ..
+                        }
+                        | FragmentContent::Image {
+                            offset: 0, format, ..
+                        }
+                        | FragmentContent::FootnoteReference {
+                            offset: 0, format, ..
+                        } => Some(format.clone()),
+                        _ => None,
+                    })
+            } else {
+                snapshot
+                    .fragments
+                    .iter()
+                    .find_map(|fragment| match fragment {
+                        FragmentContent::Text {
+                            offset,
+                            length,
+                            format,
+                            ..
+                        } if *offset < local && local <= offset + length => Some(format.clone()),
+                        FragmentContent::Image { offset, format, .. }
+                            if *offset < local && local <= offset + 1 =>
+                        {
+                            Some(format.clone())
+                        }
+                        FragmentContent::FootnoteReference { offset, format, .. }
+                            if *offset < local && local <= offset + 1 =>
+                        {
+                            Some(format.clone())
+                        }
+                        _ => None,
+                    })
+            };
+            return candidate.unwrap_or_default();
+        }
+        TextFormat::default()
+    }
+
+    fn effective_typing_format(&self, position: usize) -> TextFormat {
+        self.typing_override
+            .as_ref()
+            .filter(|(override_at, _)| *override_at == position)
+            .map(|(_, format)| format.clone())
+            .unwrap_or_else(|| self.inherited_typing_format(position))
+    }
+
+    pub fn sync_caret_context(&mut self, selection: NSRange) {
+        let Ok(text) = self.text.to_addressable_text() else {
+            return;
+        };
+        let Ok((start, end)) = utf16_range(&text, selection) else {
+            return;
+        };
+        if start != end {
+            self.typing_override = None;
+            self.typing_format = TextFormat::default();
+            return;
+        }
+        if self
+            .typing_override
+            .as_ref()
+            .is_some_and(|(override_at, _)| *override_at != start)
+        {
+            self.typing_override = None;
+        }
+        self.typing_format = self.effective_typing_format(start);
     }
 }
 
@@ -432,6 +532,7 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
         highlight_undo: Vec::new(),
         highlight_redo: Vec::new(),
         typing_format: TextFormat::default(),
+        typing_override: None,
         typing_undo: Vec::new(),
         typing_redo: Vec::new(),
     })
@@ -827,7 +928,7 @@ pub fn apply_committed_text_delta(
     if current == replacement {
         return Ok(());
     }
-    let typing_format = session.typing_format.clone();
+    let typing_format = session.effective_typing_format(start);
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
@@ -1209,11 +1310,13 @@ pub fn apply_inline_command(
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
     if start == end {
-        let next = toggled_typing_format(&session.typing_format, command);
+        let current = session.effective_typing_format(start);
+        let next = toggled_typing_format(&current, command);
         run_edit_command(session, |session| {
             let cursor = session.text.cursor_at(start);
             must_apply(cursor.merge_char_format(&next), "set typing format");
-            session.typing_format = next;
+            session.typing_format = next.clone();
+            session.typing_override = Some((start, next));
         });
         return Ok(());
     }
@@ -1498,13 +1601,13 @@ pub fn query_inline_state(
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
     if start == end {
+        let format = session.effective_typing_format(start);
         let active = match command {
-            InlineCommand::Bold => session.typing_format.font_bold == Some(true),
-            InlineCommand::Italic => session.typing_format.font_italic == Some(true),
-            InlineCommand::Underline => session.typing_format.font_underline == Some(true),
-            InlineCommand::Strikethrough => session.typing_format.font_strikeout == Some(true),
-            InlineCommand::Highlight => session
-                .typing_format
+            InlineCommand::Bold => format.font_bold == Some(true),
+            InlineCommand::Italic => format.font_italic == Some(true),
+            InlineCommand::Underline => format.font_underline == Some(true),
+            InlineCommand::Strikethrough => format.font_strikeout == Some(true),
+            InlineCommand::Highlight => format
                 .background_color
                 .as_ref()
                 .is_some_and(|color| color.alpha != 0),
@@ -2517,6 +2620,68 @@ mod tests {
         ));
         let reloaded = session_from_document(&persisted).unwrap();
         assert_eq!(document_from_session(&reloaded).unwrap(), persisted);
+    }
+
+    #[test]
+    fn collapsed_caret_context_follows_semantic_boundaries_and_overrides() {
+        let bold = Marks {
+            bold: true,
+            ..Default::default()
+        };
+        let document = Document::from_blocks(vec![
+            Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "😀bold".into(),
+                    marks: bold,
+                }],
+            },
+            Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "plain".into(),
+                    marks: Marks::default(),
+                }],
+            },
+        ]);
+        let mut session = session_from_document(&document).unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(0, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Active
+        );
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(2, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Active
+        );
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(7, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Inactive
+        );
+        apply_inline_command(&mut session, NSRange::new(7, 0), InlineCommand::Bold).unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(7, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Active
+        );
+        apply_committed_text_delta(&mut session, NSRange::new(7, 0), "X").unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(13, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Inactive
+        );
+        session.undo().unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(7, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Active
+        );
+        session.undo().unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(7, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Inactive
+        );
+        session.redo().unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(7, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Active
+        );
     }
 
     #[test]

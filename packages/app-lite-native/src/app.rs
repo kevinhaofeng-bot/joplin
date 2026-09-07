@@ -30,10 +30,10 @@ use objc2_app_kit::{
     NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle,
     NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
     NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSStackView,
-    NSStackViewDistribution, NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField,
-    NSTextFieldDelegate, NSTextInputClient, NSTextView, NSTextViewDelegate, NSUnderlineStyle,
-    NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSStackViewDistribution, NSText, NSTextAlignment, NSTextAttachment, NSTextDelegate,
+    NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextView, NSTextViewDelegate,
+    NSUnderlineStyle, NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
@@ -48,6 +48,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null_mut};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESOURCE_ID_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-id";
 const RESOURCE_ALT_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-alt";
@@ -830,6 +831,30 @@ enum ShellVisibility {
     Default,
     BrowserCollapsed,
     Focus,
+    BrowserOnly,
+}
+
+fn toggle_focus_visibility(
+    current: ShellVisibility,
+    restore: Option<ShellVisibility>,
+) -> (ShellVisibility, Option<ShellVisibility>) {
+    match current {
+        ShellVisibility::Focus => (restore.unwrap_or(ShellVisibility::Default), None),
+        ShellVisibility::BrowserOnly => (
+            ShellVisibility::Focus,
+            restore.or(Some(ShellVisibility::Default)),
+        ),
+        _ => (ShellVisibility::Focus, Some(current)),
+    }
+}
+
+fn toggle_browser_visibility(current: ShellVisibility) -> ShellVisibility {
+    match current {
+        ShellVisibility::Default => ShellVisibility::BrowserCollapsed,
+        ShellVisibility::BrowserCollapsed => ShellVisibility::Default,
+        ShellVisibility::Focus => ShellVisibility::BrowserOnly,
+        ShellVisibility::BrowserOnly => ShellVisibility::Focus,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -853,12 +878,13 @@ fn shell_layout(width: f64, height: f64, visibility: ShellVisibility) -> ShellLa
     let width = width.max(1.0);
     let height = height.max(1.0);
     let navigation_width = match visibility {
-        ShellVisibility::Focus => 0.0,
+        ShellVisibility::Focus | ShellVisibility::BrowserOnly => 0.0,
         _ => 192.0,
     };
     let browser_width = match visibility {
         ShellVisibility::Default => 384.0,
         ShellVisibility::BrowserCollapsed | ShellVisibility::Focus => 0.0,
+        ShellVisibility::BrowserOnly => 384.0,
     };
     let editor = LayoutRect {
         x: navigation_width + browser_width,
@@ -891,7 +917,7 @@ fn shell_layout(width: f64, height: f64, visibility: ShellVisibility) -> ShellLa
     let breadcrumb = LayoutRect {
         x: content_x,
         y: sheet.top() - 42.0,
-        width: content_width,
+        width: (content_width - 140.0).max(0.0),
         height: 18.0,
     };
     let title = LayoutRect {
@@ -902,13 +928,13 @@ fn shell_layout(width: f64, height: f64, visibility: ShellVisibility) -> ShellLa
     };
     let updated = LayoutRect {
         x: content_x,
-        y: title.y - 20.0,
+        y: title.y - 24.0,
         width: content_width,
         height: 14.0,
     };
     let toolbar = LayoutRect {
         x: content_x,
-        y: title.y - 42.0,
+        y: title.y - 58.0,
         width: content_width,
         height: 30.0,
     };
@@ -983,12 +1009,25 @@ enum EditorActionGroup {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorActionKind {
+    Momentary,
+    Toggle,
+    Popup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorActionDescriptor {
     action: EditorAction,
     label: &'static str,
     group: EditorActionGroup,
     fixed: bool,
     wide_only: bool,
+}
+
+impl EditorActionDescriptor {
+    fn kind(self) -> EditorActionKind {
+        editor_action_kind(self.action)
+    }
 }
 
 const EDITOR_ACTION_CATALOGUE: &[EditorActionDescriptor] = &[
@@ -1138,6 +1177,30 @@ fn editor_action_catalogue() -> &'static [EditorActionDescriptor] {
     EDITOR_ACTION_CATALOGUE
 }
 
+fn editor_action_kind(action: EditorAction) -> EditorActionKind {
+    match action {
+        EditorAction::Bold
+        | EditorAction::Italic
+        | EditorAction::Underline
+        | EditorAction::Highlight
+        | EditorAction::BulletList
+        | EditorAction::OrderedList
+        | EditorAction::Checklist
+        | EditorAction::Strikethrough => EditorActionKind::Toggle,
+        EditorAction::BlockStyle | EditorAction::Link => EditorActionKind::Popup,
+        EditorAction::InsertImage
+        | EditorAction::Undo
+        | EditorAction::Redo
+        | EditorAction::More
+        | EditorAction::AlignLeft
+        | EditorAction::AlignCenter
+        | EditorAction::AlignRight
+        | EditorAction::IncreaseIndent
+        | EditorAction::DecreaseIndent
+        | EditorAction::Clear => EditorActionKind::Momentary,
+    }
+}
+
 fn toolbar_actions_for_width(width: f64) -> Vec<EditorAction> {
     EDITOR_ACTION_CATALOGUE
         .iter()
@@ -1188,6 +1251,29 @@ fn action_group(action: EditorAction) -> EditorActionGroup {
         .unwrap_or(EditorActionGroup::More)
 }
 
+fn block_style_label(session: &NativeEditorSession, selection: NSRange) -> &'static str {
+    for (command, label) in [
+        (
+            BlockCommand::Heading(joplin_lite_native::html_body::HeadingLevel::One),
+            "H1",
+        ),
+        (
+            BlockCommand::Heading(joplin_lite_native::html_body::HeadingLevel::Two),
+            "H2",
+        ),
+        (
+            BlockCommand::Heading(joplin_lite_native::html_body::HeadingLevel::Three),
+            "H3",
+        ),
+        (BlockCommand::Paragraph, "正文"),
+    ] {
+        if query_block_state(session, selection, command).ok() == Some(SelectionState::Active) {
+            return label;
+        }
+    }
+    "混合"
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AutosaveDecision {
     Stale,
@@ -1202,13 +1288,16 @@ enum AutosaveDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutosaveState {
     note_id: Option<String>,
+    epoch: u64,
     persisted_title: String,
     persisted_html: String,
     pending_title: String,
     pending_html: String,
     generation: u64,
     scheduled_generation: Option<u64>,
+    scheduled_epoch: Option<u64>,
     retry_generation: Option<u64>,
+    retry_epoch: Option<u64>,
     retry_attempt: u8,
     dirty: bool,
 }
@@ -1220,13 +1309,16 @@ impl AutosaveState {
     fn loaded(note_id: &str, title: &str, html: &str) -> Self {
         Self {
             note_id: Some(note_id.to_owned()),
+            epoch: 1,
             persisted_title: title.to_owned(),
             persisted_html: html.to_owned(),
             pending_title: title.to_owned(),
             pending_html: html.to_owned(),
             generation: 0,
             scheduled_generation: None,
+            scheduled_epoch: None,
             retry_generation: None,
+            retry_epoch: None,
             retry_attempt: 0,
             dirty: false,
         }
@@ -1235,20 +1327,31 @@ impl AutosaveState {
     fn empty() -> Self {
         Self {
             note_id: None,
+            epoch: 0,
             persisted_title: String::new(),
             persisted_html: String::new(),
             pending_title: String::new(),
             pending_html: String::new(),
             generation: 0,
             scheduled_generation: None,
+            scheduled_epoch: None,
             retry_generation: None,
+            retry_epoch: None,
             retry_attempt: 0,
             dirty: false,
         }
     }
 
     fn reset(&mut self, note_id: &str, title: &str, html: &str) {
+        let epoch = self.epoch.saturating_add(1);
         *self = Self::loaded(note_id, title, html);
+        self.epoch = epoch;
+    }
+
+    fn clear(&mut self) {
+        let epoch = self.epoch.saturating_add(1);
+        *self = Self::empty();
+        self.epoch = epoch;
     }
 
     fn mark_dirty(&mut self, note_id: &str, title: &str, html: &str) -> Option<u64> {
@@ -1261,7 +1364,9 @@ impl AutosaveState {
             self.pending_html = html.to_owned();
             self.dirty = false;
             self.scheduled_generation = None;
+            self.scheduled_epoch = None;
             self.retry_generation = None;
+            self.retry_epoch = None;
             self.retry_attempt = 0;
             return None;
         }
@@ -1272,14 +1377,27 @@ impl AutosaveState {
         self.pending_title = title.to_owned();
         self.pending_html = html.to_owned();
         self.scheduled_generation = Some(self.generation);
+        self.scheduled_epoch = Some(self.epoch);
         self.retry_generation = None;
+        self.retry_epoch = None;
         self.retry_attempt = 0;
         self.dirty = true;
         Some(self.generation)
     }
 
+    #[cfg(test)]
     fn timer_decision(&self, note_id: &str, generation: u64) -> AutosaveDecision {
+        self.timer_decision_with_epoch(note_id, self.epoch, generation)
+    }
+
+    fn timer_decision_with_epoch(
+        &self,
+        note_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> AutosaveDecision {
         if self.note_id.as_deref() != Some(note_id)
+            || self.scheduled_epoch != Some(epoch)
             || self.scheduled_generation != Some(generation)
             || !self.dirty
         {
@@ -1313,46 +1431,79 @@ impl AutosaveState {
         self.persisted_title = self.pending_title.clone();
         self.persisted_html = self.pending_html.clone();
         self.scheduled_generation = None;
+        self.scheduled_epoch = None;
         self.retry_generation = None;
+        self.retry_epoch = None;
         self.retry_attempt = 0;
         self.dirty = false;
     }
 
+    #[cfg(test)]
     fn mark_failed(&mut self, generation: u64) -> Option<f64> {
-        if generation == self.generation {
+        self.mark_failed_with_epoch(self.epoch, generation)
+    }
+
+    fn mark_failed_with_epoch(&mut self, epoch: u64, generation: u64) -> Option<f64> {
+        if epoch == self.epoch && generation == self.generation {
             if self.retry_attempt >= AUTOSAVE_MAX_RETRIES {
                 self.scheduled_generation = None;
+                self.scheduled_epoch = None;
                 self.retry_generation = None;
+                self.retry_epoch = None;
                 self.dirty = true;
                 return None;
             }
             self.scheduled_generation = None;
+            self.scheduled_epoch = None;
             self.retry_generation = Some(generation);
+            self.retry_epoch = Some(epoch);
             self.retry_attempt = self.retry_attempt.saturating_add(1);
             self.dirty = true;
-            return self.retry_delay(generation);
+            return self.retry_delay_with_epoch(epoch, generation);
         }
         None
     }
 
+    #[cfg(test)]
     fn retry_delay(&self, generation: u64) -> Option<f64> {
-        if self.retry_generation != Some(generation) || !self.dirty {
+        self.retry_delay_with_epoch(self.epoch, generation)
+    }
+
+    fn retry_delay_with_epoch(&self, epoch: u64, generation: u64) -> Option<f64> {
+        if self.retry_epoch != Some(epoch)
+            || self.retry_generation != Some(generation)
+            || !self.dirty
+        {
             return None;
         }
         let exponent = self.retry_attempt.saturating_sub(1) as i32;
         Some((AUTOSAVE_BASE_DELAY_SECONDS * 2_f64.powi(exponent)).min(4.8))
     }
 
+    #[cfg(test)]
     fn mark_retry_scheduled(&mut self, generation: u64) {
-        if self.retry_generation == Some(generation) && self.dirty {
+        self.mark_retry_scheduled_with_epoch(self.epoch, generation);
+    }
+
+    fn mark_retry_scheduled_with_epoch(&mut self, epoch: u64, generation: u64) {
+        if self.retry_epoch == Some(epoch)
+            && self.retry_generation == Some(generation)
+            && self.dirty
+        {
             self.retry_generation = None;
+            self.retry_epoch = None;
             self.scheduled_generation = Some(generation);
+            self.scheduled_epoch = Some(epoch);
         }
     }
 
     fn is_dirty(&self) -> bool {
         self.dirty
     }
+}
+
+fn should_defer_persistence(body_marked: bool, title_marked: bool, loading: bool) -> bool {
+    loading || body_marked || title_marked
 }
 
 fn display_note_title(title: &str, body: &str) -> String {
@@ -1377,6 +1528,26 @@ fn note_list_summary(note: &Note) -> String {
         .map(|line| line.trim().chars().take(52).collect::<String>())
         .filter(|line| !line.is_empty())
         .unwrap_or_else(|| "暂无正文".to_string())
+}
+
+fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn format_updated_time(updated_time: i64, now: i64) -> String {
+    let elapsed = now.saturating_sub(updated_time);
+    if elapsed < 60_000 {
+        "刚刚".into()
+    } else if elapsed < 3_600_000 {
+        format!("{}分钟前", elapsed / 60_000)
+    } else if elapsed < 86_400_000 {
+        "今天".into()
+    } else {
+        format!("{}天前", elapsed / 86_400_000)
+    }
 }
 
 #[cfg(test)]
@@ -1734,7 +1905,9 @@ struct AppDelegateIvars {
     loading_guard: RefCell<bool>,
     autosave: RefCell<AutosaveState>,
     shell_visibility: RefCell<ShellVisibility>,
+    focus_restore_visibility: RefCell<Option<ShellVisibility>>,
     last_body_selection: RefCell<NSRange>,
+    selection_sync_guard: RefCell<bool>,
     editor_session: RefCell<Option<NativeEditorSession>>,
     projection_attachments: RefCell<Vec<RenderedAttachment>>,
     projection_empty_carriers: RefCell<Vec<EmptyBlockCarrier>>,
@@ -1860,8 +2033,9 @@ define_class!(
             );
             editor_background.setBoxType(NSBoxType::Custom);
             editor_background.setTransparent(false);
-            editor_background.setFillColor(&NSColor::underPageBackgroundColor());
-            editor_background.setBorderWidth(0.0);
+            editor_background.setFillColor(&NSColor::textBackgroundColor());
+            editor_background.setBorderColor(&NSColor::separatorColor());
+            editor_background.setBorderWidth(1.0);
             content.addSubview(&editor_background);
 
             let separator = NSBox::initWithFrame(
@@ -2031,6 +2205,7 @@ define_class!(
             breadcrumb_label.setEditable(false);
             breadcrumb_label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
             breadcrumb_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            breadcrumb_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             content.addSubview(&breadcrumb_label);
 
             let updated_label = NSTextField::initWithFrame(
@@ -2043,6 +2218,7 @@ define_class!(
             updated_label.setEditable(false);
             updated_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             updated_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            updated_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             content.addSubview(&updated_label);
 
             let focus_button = unsafe {
@@ -2379,7 +2555,14 @@ define_class!(
         #[unsafe(method(textViewDidChangeSelection:))]
         fn text_view_did_change_selection(&self, _notification: &NSNotification) {
             if let Some(body) = self.ivars().body_view.get() {
-                *self.ivars().last_body_selection.borrow_mut() = body.selectedRange();
+                let selection = body.selectedRange();
+                *self.ivars().last_body_selection.borrow_mut() = selection;
+                if !*self.ivars().selection_sync_guard.borrow()
+                    && !*self.ivars().loading_guard.borrow()
+                    && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
+                {
+                    session.sync_caret_context(selection);
+                }
             }
             self.reapply_empty_carrier_for_selection();
             self.update_formatting_buttons();
@@ -2397,10 +2580,16 @@ define_class!(
                 return;
             };
             let token_string = token.to_string();
-            let Some((token_note_id, generation)) = token_string
+            let Some((token_note_id, token_epoch, generation)) = token_string
                 .split_once('\u{1f}')
-                .and_then(|(note_id, generation)| {
-                    generation.parse::<u64>().ok().map(|generation| (note_id, generation))
+                .and_then(|(note_id, token)| {
+                    token.split_once('\u{1f}').and_then(|(epoch, generation)| {
+                        Some((
+                            note_id,
+                            epoch.parse::<u64>().ok()?,
+                            generation.parse::<u64>().ok()?,
+                        ))
+                    })
                 })
             else {
                 return;
@@ -2411,11 +2600,21 @@ define_class!(
             if token_note_id != note_id {
                 return;
             }
+            if should_defer_persistence(
+                self.ivars()
+                    .body_view
+                    .get()
+                    .is_some_and(|body| body.hasMarkedText()),
+                self.title_field_has_marked_text(),
+                *self.ivars().loading_guard.borrow(),
+            ) {
+                return;
+            }
             let decision = self
                 .ivars()
                 .autosave
                 .borrow()
-                .timer_decision(&note_id, generation);
+                .timer_decision_with_epoch(&note_id, token_epoch, generation);
             match decision {
                 AutosaveDecision::Stale => {}
                 AutosaveDecision::Noop => {
@@ -2492,7 +2691,11 @@ define_class!(
 
         #[unsafe(method(showBlockStyle:))]
         fn show_block_style(&self, sender: &NSButton) {
+            if self.ivars().current_note_id.borrow().is_none() {
+                return;
+            }
             let menu = NSMenu::initWithTitle(NSMenu::alloc(self.mtm()), ns_string!("块样式"));
+            let selection = self.command_selection().unwrap_or(NSRange::new(0, 0));
             for (title, action) in [
                 ("正文", sel!(setParagraphStyle:)),
                 ("标题 1", sel!(setHeadingOne:)),
@@ -2508,6 +2711,33 @@ define_class!(
                     )
                 };
                 unsafe { item.setTarget(Some(self)) };
+                let state = self
+                    .ivars()
+                    .editor_session
+                    .borrow()
+                    .as_ref()
+                    .and_then(|session| {
+                        let command = match title {
+                            "正文" => BlockCommand::Paragraph,
+                            "标题 1" => BlockCommand::Heading(
+                                joplin_lite_native::html_body::HeadingLevel::One,
+                            ),
+                            "标题 2" => BlockCommand::Heading(
+                                joplin_lite_native::html_body::HeadingLevel::Two,
+                            ),
+                            _ => BlockCommand::Heading(
+                                joplin_lite_native::html_body::HeadingLevel::Three,
+                            ),
+                        };
+                        query_block_state(session, selection, command).ok()
+                    })
+                    .unwrap_or(SelectionState::Inactive);
+                item.setState(match state {
+                    SelectionState::Active => NSControlStateValueOn,
+                    SelectionState::Mixed => NSControlStateValueMixed,
+                    SelectionState::Inactive => NSControlStateValueOff,
+                });
+                item.setEnabled(self.toolbar_action_enabled(EditorAction::BlockStyle));
                 menu.addItem(&item);
             }
             menu.popUpMenuPositioningItem_atLocation_inView(
@@ -2608,6 +2838,7 @@ define_class!(
                     )
                 };
                 unsafe { item.setTarget(Some(self)) };
+                item.setEnabled(self.toolbar_action_enabled(descriptor.action));
                 menu.addItem(&item);
             }
             menu.popUpMenuPositioningItem_atLocation_inView(
@@ -2619,21 +2850,18 @@ define_class!(
 
         #[unsafe(method(toggleFocusMode:))]
         fn toggle_focus_mode(&self, _sender: &NSObject) {
-            let next = match *self.ivars().shell_visibility.borrow() {
-                ShellVisibility::Focus => ShellVisibility::Default,
-                _ => ShellVisibility::Focus,
-            };
+            let current = *self.ivars().shell_visibility.borrow();
+            let restore = *self.ivars().focus_restore_visibility.borrow();
+            let (next, next_restore) = toggle_focus_visibility(current, restore);
             *self.ivars().shell_visibility.borrow_mut() = next;
+            *self.ivars().focus_restore_visibility.borrow_mut() = next_restore;
             self.relayout_window();
         }
 
         #[unsafe(method(toggleBrowser:))]
         fn toggle_browser(&self, _sender: &NSObject) {
-            let next = match *self.ivars().shell_visibility.borrow() {
-                ShellVisibility::BrowserCollapsed => ShellVisibility::Default,
-                ShellVisibility::Default => ShellVisibility::BrowserCollapsed,
-                ShellVisibility::Focus => ShellVisibility::Default,
-            };
+            let current = *self.ivars().shell_visibility.borrow();
+            let next = toggle_browser_visibility(current);
             *self.ivars().shell_visibility.borrow_mut() = next;
             self.relayout_window();
         }
@@ -2813,6 +3041,13 @@ define_class!(
 );
 
 impl AppDelegate {
+    fn set_selected_range_programmatically(&self, body: &NSTextView, selection: NSRange) {
+        let previous = *self.ivars().selection_sync_guard.borrow();
+        *self.ivars().selection_sync_guard.borrow_mut() = true;
+        body.setSelectedRange(selection);
+        *self.ivars().selection_sync_guard.borrow_mut() = previous;
+    }
+
     fn relayout_window(&self) {
         let Some(content) = self
             .ivars()
@@ -2865,7 +3100,12 @@ impl AppDelegate {
                     mtm,
                 )
             };
-            button.setButtonType(NSButtonType::PushOnPushOff);
+            button.setButtonType(match descriptor.kind() {
+                EditorActionKind::Toggle => NSButtonType::PushOnPushOff,
+                EditorActionKind::Momentary | EditorActionKind::Popup => {
+                    NSButtonType::MomentaryPushIn
+                }
+            });
             button.setBezelStyle(NSBezelStyle::Toolbar);
             button.setBordered(false);
             button.setToolTip(Some(&NSString::from_str(descriptor.label)));
@@ -3039,7 +3279,7 @@ impl AppDelegate {
                 }
             }
         }
-        body.setSelectedRange(NSRange::new(location, length));
+        self.set_selected_range_programmatically(body, NSRange::new(location, length));
     }
 
     fn refresh_body_from_session(&self) {
@@ -3575,6 +3815,8 @@ impl AppDelegate {
             background.setFrame(shell.sheet.ns_rect());
             background.setHidden(shell.editor.width == 0.0);
             background.setCornerRadius(12.0);
+            background.setFillColor(&NSColor::textBackgroundColor());
+            background.setBorderColor(&NSColor::separatorColor());
             background.setBorderWidth(1.0);
         }
         if let Some(list_scroll) = self.ivars().list_scroll.get() {
@@ -3693,7 +3935,22 @@ impl AppDelegate {
                 NSPoint::new(x, shell.toolbar.y),
                 NSSize::new(28.0, shell.toolbar.height),
             ));
-            button.setTitle(&NSString::from_str(compact_toolbar_label(*action)));
+            let title = if *action == EditorAction::BlockStyle {
+                self.ivars()
+                    .editor_session
+                    .borrow()
+                    .as_ref()
+                    .map(|session| {
+                        block_style_label(
+                            session,
+                            self.command_selection().unwrap_or(NSRange::new(0, 0)),
+                        )
+                    })
+                    .unwrap_or(compact_toolbar_label(*action))
+            } else {
+                compact_toolbar_label(*action)
+            };
+            button.setTitle(&NSString::from_str(title));
             button.setToolTip(Some(&NSString::from_str(
                 editor_action_catalogue()
                     .iter()
@@ -3747,12 +4004,49 @@ impl AppDelegate {
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
-        body.setSelectedRange(selection);
+        self.set_selected_range_programmatically(body, selection);
         *self.ivars().last_body_selection.borrow_mut() = selection;
         if let Some(window) = self.ivars().window.get() {
             window.makeFirstResponder(Some(body));
         }
         self.update_formatting_buttons();
+    }
+
+    fn toolbar_action_enabled(&self, action: EditorAction) -> bool {
+        if self.ivars().current_note_id.borrow().is_none() {
+            return false;
+        }
+        match action {
+            EditorAction::Undo => self
+                .ivars()
+                .editor_session
+                .borrow()
+                .as_ref()
+                .is_some_and(NativeEditorSession::can_undo),
+            EditorAction::Redo => self
+                .ivars()
+                .editor_session
+                .borrow()
+                .as_ref()
+                .is_some_and(NativeEditorSession::can_redo),
+            EditorAction::More => self
+                .ivars()
+                .window
+                .get()
+                .and_then(|window| window.contentView())
+                .map(|content| {
+                    let width = shell_layout(
+                        content.frame().size.width,
+                        content.frame().size.height,
+                        *self.ivars().shell_visibility.borrow(),
+                    )
+                    .toolbar
+                    .width;
+                    !toolbar_overflow_actions_for_width(width).is_empty()
+                })
+                .unwrap_or(true),
+            _ => true,
+        }
     }
 
     fn apply_inline_command(&self, command: InlineCommand) {
@@ -3945,6 +4239,9 @@ impl AppDelegate {
         let (can_undo, can_redo) = session
             .map(|session| (session.can_undo(), session.can_redo()))
             .unwrap_or((false, false));
+        let block_label = session
+            .map(|session| block_style_label(session, selection))
+            .unwrap_or("正文");
         for (action, button) in self.ivars().toolbar_buttons.borrow().iter() {
             let state = match action {
                 EditorAction::Bold => state_for_inline(InlineCommand::Bold),
@@ -3966,6 +4263,9 @@ impl AppDelegate {
                     _ => true,
                 };
             button.setEnabled(enabled);
+            if *action == EditorAction::BlockStyle {
+                button.setTitle(&NSString::from_str(block_label));
+            }
             if !has_note {
                 button.setHidden(true);
             }
@@ -4266,10 +4566,13 @@ impl AppDelegate {
             }
         };
         let previous_loading_guard = *self.ivars().loading_guard.borrow();
+        let previous_selection_guard = *self.ivars().selection_sync_guard.borrow();
         *self.ivars().loading_guard.borrow_mut() = true;
+        *self.ivars().selection_sync_guard.borrow_mut() = true;
         let inserted = commit_live_image_insert(body, insertion_range, &inline, || {
             self.persist_note_content(&note_id, prepared)
         });
+        *self.ivars().selection_sync_guard.borrow_mut() = previous_selection_guard;
         *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
         if !inserted && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut() {
             let _ = session.undo();
@@ -4313,7 +4616,10 @@ impl AppDelegate {
             .updated_label
             .get()
             .unwrap()
-            .setStringValue(&NSString::from_str(&format!("更新 {}", note.updated_time)));
+            .setStringValue(&NSString::from_str(&format!(
+                "更新 {}",
+                format_updated_time(note.updated_time, current_time_millis())
+            )));
         let body = self.ivars().body_view.get().unwrap();
         let (status, is_error) = match parse_html(&note.body) {
             Ok(document) => match session_from_document(&document) {
@@ -4365,7 +4671,7 @@ impl AppDelegate {
         self.clear_pending_editor_intent();
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = None;
-        *self.ivars().autosave.borrow_mut() = AutosaveState::empty();
+        self.ivars().autosave.borrow_mut().clear();
         *self.ivars().editor_session.borrow_mut() = None;
         self.ivars().projection_attachments.borrow_mut().clear();
         self.ivars().projection_empty_carriers.borrow_mut().clear();
@@ -4585,16 +4891,28 @@ impl AppDelegate {
         if self.ivars().current_note_id.borrow().is_none() {
             return true;
         }
-        if *self.ivars().loading_guard.borrow()
-            || self
-                .ivars()
-                .body_view
-                .get()
-                .is_some_and(|body| body.hasMarkedText())
-        {
+        let body_marked = self
+            .ivars()
+            .body_view
+            .get()
+            .is_some_and(|body| body.hasMarkedText());
+        if should_defer_persistence(
+            body_marked,
+            self.title_field_has_marked_text(),
+            *self.ivars().loading_guard.borrow(),
+        ) {
             return false;
         }
         self.save_current_note_unchecked()
+    }
+
+    fn title_field_has_marked_text(&self) -> bool {
+        self.ivars()
+            .title_field
+            .get()
+            .and_then(|field| field.currentEditor())
+            .and_then(|editor: Retained<NSText>| editor.downcast::<NSTextView>().ok())
+            .is_some_and(|editor| editor.hasMarkedText())
     }
 
     fn prepared_current_note_content(&self) -> Option<PreparedNoteContent> {
@@ -4615,12 +4933,12 @@ impl AppDelegate {
         })
     }
 
-    fn schedule_autosave_after(&self, note_id: &str, generation: u64, delay: f64) {
+    fn schedule_autosave_after(&self, note_id: &str, epoch: u64, generation: u64, delay: f64) {
         self.ivars()
             .autosave
             .borrow_mut()
-            .mark_retry_scheduled(generation);
-        let token = NSString::from_str(&format!("{note_id}\u{1f}{generation}"));
+            .mark_retry_scheduled_with_epoch(epoch, generation);
+        let token = NSString::from_str(&format!("{note_id}\u{1f}{epoch}\u{1f}{generation}"));
         unsafe {
             let _: () = msg_send![
                 self,
@@ -4631,18 +4949,21 @@ impl AppDelegate {
         }
     }
 
-    fn schedule_autosave(&self, note_id: &str, generation: u64) {
-        self.schedule_autosave_after(note_id, generation, 0.3);
+    fn schedule_autosave(&self, note_id: &str, epoch: u64, generation: u64) {
+        self.schedule_autosave_after(note_id, epoch, generation, 0.3);
     }
 
     fn mark_current_note_dirty(&self) {
-        if *self.ivars().loading_guard.borrow()
-            || self
-                .ivars()
-                .body_view
-                .get()
-                .is_some_and(|body| body.hasMarkedText())
-        {
+        let body_marked = self
+            .ivars()
+            .body_view
+            .get()
+            .is_some_and(|body| body.hasMarkedText());
+        if should_defer_persistence(
+            body_marked,
+            self.title_field_has_marked_text(),
+            *self.ivars().loading_guard.borrow(),
+        ) {
             return;
         }
         let Some(id) = self.ivars().current_note_id.borrow().clone() else {
@@ -4659,7 +4980,8 @@ impl AppDelegate {
         );
         if let Some(generation) = generation {
             self.set_save_status("未保存", false);
-            self.schedule_autosave(&id, generation);
+            let epoch = self.ivars().autosave.borrow().epoch;
+            self.schedule_autosave(&id, epoch, generation);
         }
     }
 
@@ -4714,6 +5036,14 @@ impl AppDelegate {
                         set_note_button_title(button, &updated, true);
                     }
                 }
+                if self.ivars().current_note_id.borrow().as_deref() == Some(id)
+                    && let Some(label) = self.ivars().updated_label.get()
+                {
+                    label.setStringValue(&NSString::from_str(&format!(
+                        "更新 {}",
+                        format_updated_time(updated.updated_time, current_time_millis())
+                    )));
+                }
                 self.set_save_status("已保存", false);
                 if let Some(generation) = generation {
                     self.ivars().autosave.borrow_mut().mark_saved(generation);
@@ -4722,10 +5052,16 @@ impl AppDelegate {
             }
             Err(error) => {
                 eprintln!("autosave failed: {error}");
-                if let Some(generation) = generation
-                    && let Some(delay) = self.ivars().autosave.borrow_mut().mark_failed(generation)
-                {
-                    self.schedule_autosave_after(id, generation, delay);
+                if let Some(generation) = generation {
+                    let epoch = self.ivars().autosave.borrow().epoch;
+                    let delay = self
+                        .ivars()
+                        .autosave
+                        .borrow_mut()
+                        .mark_failed_with_epoch(epoch, generation);
+                    if let Some(delay) = delay {
+                        self.schedule_autosave_after(id, epoch, generation, delay);
+                    }
                 }
                 self.set_save_status("保存失败", true);
                 false
@@ -5242,7 +5578,9 @@ impl AppDelegate {
             loading_guard: RefCell::new(false),
             autosave: RefCell::new(AutosaveState::empty()),
             shell_visibility: RefCell::new(ShellVisibility::Default),
+            focus_restore_visibility: RefCell::new(None),
             last_body_selection: RefCell::new(NSRange::new(0, 0)),
+            selection_sync_guard: RefCell::new(false),
             editor_session: RefCell::new(None),
             projection_attachments: RefCell::new(Vec::new()),
             projection_empty_carriers: RefCell::new(Vec::new()),
@@ -6057,6 +6395,78 @@ mod tests {
         }
         assert_eq!(state.mark_failed(1), None);
         assert_eq!(state.retry_generation, None);
+    }
+
+    #[test]
+    fn red_autosave_rejects_an_old_same_note_token_after_an_aba_switch() {
+        let mut state = super::AutosaveState::loaded("note-a", "标题", "<p>旧</p>");
+        assert_eq!(state.mark_dirty("note-a", "标题", "<p>A1</p>"), Some(1));
+        let old_epoch = state.epoch;
+        state.reset("note-b", "标题", "<p>B</p>");
+        state.reset("note-a", "标题", "<p>A1</p>");
+        assert_eq!(state.mark_dirty("note-a", "标题", "<p>A2</p>"), Some(1));
+        assert_eq!(
+            state.timer_decision_with_epoch("note-a", old_epoch, 1),
+            super::AutosaveDecision::Stale
+        );
+    }
+
+    #[test]
+    fn red_toolbar_descriptors_distinguish_toggle_popup_and_momentary_actions() {
+        assert_eq!(
+            super::editor_action_kind(super::EditorAction::Bold),
+            super::EditorActionKind::Toggle
+        );
+        assert_eq!(
+            super::editor_action_kind(super::EditorAction::BlockStyle),
+            super::EditorActionKind::Popup
+        );
+        assert_eq!(
+            super::editor_action_kind(super::EditorAction::Undo),
+            super::EditorActionKind::Momentary
+        );
+    }
+
+    #[test]
+    fn red_title_field_marked_text_defers_persistence() {
+        assert!(super::should_defer_persistence(false, true, false));
+        assert!(super::should_defer_persistence(true, false, false));
+        assert!(!super::should_defer_persistence(false, false, false));
+    }
+
+    #[test]
+    fn red_updated_time_is_short_and_regions_do_not_overlap() {
+        let now = 1_700_000_000_000_i64;
+        assert_eq!(super::format_updated_time(now, now), "刚刚");
+        assert_eq!(
+            super::format_updated_time(now - 3 * 60 * 1000, now),
+            "3分钟前"
+        );
+        let layout = super::shell_layout(1380.0, 820.0, super::ShellVisibility::Default);
+        assert!(layout.updated.y >= layout.toolbar.top());
+        let focus_button = super::LayoutRect {
+            x: layout.sheet.right() - 66.0,
+            y: layout.sheet.top() - 42.0,
+            width: 58.0,
+            height: 24.0,
+        };
+        assert!(layout.breadcrumb.right() <= focus_button.x);
+    }
+
+    #[test]
+    fn red_focus_visibility_restores_prior_browser_state_without_opening_both() {
+        let (focus, restore) =
+            super::toggle_focus_visibility(super::ShellVisibility::BrowserCollapsed, None);
+        assert_eq!(focus, super::ShellVisibility::Focus);
+        assert_eq!(restore, Some(super::ShellVisibility::BrowserCollapsed));
+        assert_eq!(
+            super::toggle_focus_visibility(focus, restore).0,
+            super::ShellVisibility::BrowserCollapsed
+        );
+        assert_eq!(
+            super::toggle_browser_visibility(super::ShellVisibility::Focus),
+            super::ShellVisibility::BrowserOnly
+        );
     }
 
     #[test]
