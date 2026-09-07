@@ -3,4 +3,7 @@ pub mod core;
 pub mod html_body;
 #[cfg(target_os = "macos")]
 pub mod native_editor;
+#[cfg(target_os = "macos")]
+pub mod native_note_browser;
+pub mod note_preview;
 pub mod resource_store;

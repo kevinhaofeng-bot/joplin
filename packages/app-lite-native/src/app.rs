@@ -17,6 +17,11 @@ use joplin_lite_native::native_editor::{
     query_clear_state, query_inline_state, query_link_selection, query_paragraph_command_state,
     render_session, session_from_document,
 };
+use joplin_lite_native::native_note_browser::{
+    ThumbnailCache, ThumbnailKey, configure_note_card, make_note_collection_view,
+    selected_index_for_id,
+};
+use joplin_lite_native::note_preview::{NotePreview, preview_from_note};
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
@@ -26,24 +31,25 @@ use objc2_app_kit::{
     NSApplicationTerminateReply, NSAttachmentAttributeName,
     NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
     NSBackingStoreType, NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep, NSBorderType, NSBox,
-    NSBoxType, NSButton, NSButtonType, NSColor, NSControlStateValueMixed, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination,
-    NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSImage, NSLayoutAttribute, NSLineBreakMode, NSMenu,
-    NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle,
-    NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
-    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSStackView,
-    NSStackViewDistribution, NSText, NSTextAlignment, NSTextAttachment, NSTextDelegate,
+    NSBoxType, NSButton, NSButtonType, NSCollectionView, NSCollectionViewDataSource,
+    NSCollectionViewDelegate, NSCollectionViewFlowLayout, NSCollectionViewItem, NSColor,
+    NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination, NSDraggingInfo,
+    NSEventModifierFlags, NSFont, NSFontAttributeName, NSImage,
+    NSIndexPathNSCollectionViewAdditions, NSLineBreakMode, NSMenu, NSMenuItem, NSModalResponseOK,
+    NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle, NSParagraphStyleAttributeName,
+    NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder,
+    NSScrollView, NSSearchField, NSText, NSTextAlignment, NSTextAttachment, NSTextDelegate,
     NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextView, NSTextViewDelegate,
-    NSUnderlineStyle, NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
-    NSMutableAttributedString, NSMutableCopying, NSNotification, NSNumber, NSObject,
-    NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSURL, ns_string,
+    NSIndexPath, NSMutableAttributedString, NSMutableCopying, NSNotification, NSNumber, NSObject,
+    NSObjectProtocol, NSPoint, NSRange, NSRect, NSSet, NSSize, NSString, NSURL, ns_string,
 };
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -1741,6 +1747,7 @@ fn should_defer_persistence(body_marked: bool, title_marked: bool, loading: bool
     loading || body_marked || title_marked
 }
 
+#[cfg(test)]
 fn display_note_title(title: &str, body: &str) -> String {
     if !title.trim().is_empty() {
         return title.trim().chars().take(120).collect();
@@ -1752,10 +1759,12 @@ fn display_note_title(title: &str, body: &str) -> String {
         .unwrap_or_else(|| "无标题笔记".to_string())
 }
 
+#[cfg(test)]
 fn note_list_title(note: &Note) -> String {
     display_note_title(&note.title, &note.body_text)
 }
 
+#[cfg(test)]
 fn note_list_summary(note: &Note) -> String {
     note.body_text
         .lines()
@@ -2137,12 +2146,16 @@ struct AppDelegateIvars {
     repository: Arc<NoteRepository>,
     current_note_id: RefCell<Option<String>>,
     notes: RefCell<Vec<Note>>,
+    note_previews: RefCell<Vec<NotePreview>>,
+    thumbnail_cache: RefCell<ThumbnailCache<Retained<NSImage>>>,
+    thumbnail_decode_count: Cell<usize>,
     loading_guard: RefCell<bool>,
     autosave: RefCell<AutosaveState>,
     shell_visibility: RefCell<ShellVisibility>,
     focus_restore_visibility: RefCell<Option<ShellVisibility>>,
     last_body_selection: RefCell<NSRange>,
     selection_sync_guard: RefCell<bool>,
+    collection_selection_guard: Cell<bool>,
     editor_session: RefCell<Option<NativeEditorSession>>,
     projection_attachments: RefCell<Vec<RenderedAttachment>>,
     projection_empty_carriers: RefCell<Vec<EmptyBlockCarrier>>,
@@ -2153,8 +2166,8 @@ struct AppDelegateIvars {
     browser_background: OnceCell<Retained<NSBox>>,
     editor_background: OnceCell<Retained<NSBox>>,
     sidebar_separator: OnceCell<Retained<NSBox>>,
-    list_scroll: OnceCell<Retained<NSScrollView>>,
-    list_stack: OnceCell<Retained<NSStackView>>,
+    browser_scroll: OnceCell<Retained<NSScrollView>>,
+    note_collection: OnceCell<Retained<NSCollectionView>>,
     browser_title: OnceCell<Retained<NSTextField>>,
     browser_count: OnceCell<Retained<NSTextField>>,
     breadcrumb_label: OnceCell<Retained<NSTextField>>,
@@ -2172,8 +2185,6 @@ struct AppDelegateIvars {
     save_status: OnceCell<Retained<NSTextField>>,
     editor_empty_label: OnceCell<Retained<NSTextField>>,
     toolbar_buttons: RefCell<Vec<(EditorAction, Retained<NSButton>)>>,
-    note_buttons: RefCell<Vec<Retained<NSButton>>>,
-    note_rows: RefCell<Vec<Retained<NSBox>>>,
 }
 
 define_class!(
@@ -2286,7 +2297,7 @@ define_class!(
             separator.setBoxType(NSBoxType::Separator);
             content.addSubview(&separator);
 
-            let list_scroll = NSScrollView::initWithFrame(
+            let browser_scroll = NSScrollView::initWithFrame(
                 NSScrollView::alloc(mtm),
                 LayoutRect {
                     x: 0.0,
@@ -2296,12 +2307,12 @@ define_class!(
                 }
                 .ns_rect(),
             );
-            list_scroll.setHasVerticalScroller(true);
-            list_scroll.setAutohidesScrollers(true);
-            list_scroll.setBorderType(NSBorderType::NoBorder);
-            list_scroll.setDrawsBackground(false);
-            let list_stack = NSStackView::initWithFrame(
-                NSStackView::alloc(mtm),
+            browser_scroll.setHasVerticalScroller(true);
+            browser_scroll.setAutohidesScrollers(true);
+            browser_scroll.setBorderType(NSBorderType::NoBorder);
+            browser_scroll.setDrawsBackground(false);
+            let note_collection = make_note_collection_view(
+                mtm,
                 LayoutRect {
                     x: 0.0,
                     y: 0.0,
@@ -2310,18 +2321,8 @@ define_class!(
                 }
                 .ns_rect(),
             );
-            list_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-            list_stack.setSpacing(4.0);
-            list_stack.setDistribution(NSStackViewDistribution::GravityAreas);
-            list_stack.setAlignment(NSLayoutAttribute::Width);
-            list_stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
-                top: 10.0,
-                left: 12.0,
-                bottom: 10.0,
-                right: 12.0,
-            });
-            list_scroll.setDocumentView(Some(&list_stack));
-            content.addSubview(&list_scroll);
+            browser_scroll.setDocumentView(Some(&note_collection));
+            content.addSubview(&browser_scroll);
 
             let browser_title = NSTextField::initWithFrame(
                 NSTextField::alloc(mtm),
@@ -2602,8 +2603,10 @@ define_class!(
                 .set(editor_background)
                 .unwrap();
             self.ivars().sidebar_separator.set(separator).unwrap();
-            self.ivars().list_scroll.set(list_scroll).unwrap();
-            self.ivars().list_stack.set(list_stack).unwrap();
+            self.ivars().browser_scroll.set(browser_scroll).unwrap();
+            note_collection.setDataSource(Some(ProtocolObject::from_ref(self)));
+            note_collection.setDelegate(Some(ProtocolObject::from_ref(self)));
+            self.ivars().note_collection.set(note_collection).unwrap();
             self.ivars().browser_title.set(browser_title).unwrap();
             self.ivars().browser_count.set(browser_count).unwrap();
             self.ivars().breadcrumb_label.set(breadcrumb_label).unwrap();
@@ -2771,6 +2774,67 @@ define_class!(
         }
     }
     unsafe impl NSTextFieldDelegate for AppDelegate {}
+    #[allow(non_snake_case)]
+    unsafe impl NSCollectionViewDataSource for AppDelegate {
+        #[unsafe(method(collectionView:numberOfItemsInSection:))]
+        fn collectionView_numberOfItemsInSection(
+            &self,
+            _collection_view: &NSCollectionView,
+            _section: isize,
+        ) -> isize {
+            self.ivars().note_previews.borrow().len() as isize
+        }
+
+        #[unsafe(method_id(collectionView:itemForRepresentedObjectAtIndexPath:))]
+        fn collectionView_itemForRepresentedObjectAtIndexPath(
+            &self,
+            collection_view: &NSCollectionView,
+            index_path: &NSIndexPath,
+        ) -> Retained<NSCollectionViewItem> {
+            let identifier = NSString::from_str(
+                joplin_lite_native::native_note_browser::NOTE_CARD_IDENTIFIER,
+            );
+            let item = collection_view.makeItemWithIdentifier_forIndexPath(&identifier, index_path);
+            let index = index_path.item() as usize;
+            if let Some(preview) = self.ivars().note_previews.borrow().get(index).cloned() {
+                let selected = self
+                    .ivars()
+                    .current_note_id
+                    .borrow()
+                    .as_deref()
+                    == Some(preview.note_id.as_str());
+                let image = self.thumbnail_for_preview(&preview);
+                configure_note_card(
+                    &item,
+                    &preview,
+                    image.as_deref(),
+                    selected,
+                    joplin_lite_native::native_note_browser::browser_metrics(
+                        collection_view.frame().size.width,
+                    ),
+                    self.mtm(),
+                );
+            }
+            item
+        }
+    }
+    #[allow(non_snake_case)]
+    unsafe impl NSCollectionViewDelegate for AppDelegate {
+        #[unsafe(method(collectionView:didSelectItemsAtIndexPaths:))]
+        fn collectionView_didSelectItemsAtIndexPaths(
+            &self,
+            _collection_view: &NSCollectionView,
+            index_paths: &NSSet<NSIndexPath>,
+        ) {
+            if self.ivars().collection_selection_guard.get() {
+                return;
+            }
+            let Some(index_path) = (unsafe { index_paths.anyObject_unchecked() }) else {
+                return;
+            };
+            self.select_note_index(index_path.item() as usize);
+        }
+    }
     unsafe impl NSTextViewDelegate for AppDelegate {
         #[unsafe(method(textView:shouldChangeTextInRange:replacementString:))]
         fn text_view_should_change_text_in_range_replacement_string(
@@ -3262,15 +3326,7 @@ define_class!(
         if index < 0 {
             return;
         }
-        if let Some(note) = self.ivars().notes.borrow().get(index as usize).cloned() {
-            if self.ivars().current_note_id.borrow().as_deref() == Some(note.id.as_str()) {
-                return;
-            }
-            if !self.save_current_note() {
-                return;
-            }
-            self.load_note(&note);
-        }
+        self.select_note_index(index as usize);
     }
 
     #[unsafe(method(searchNotes:))]
@@ -3309,6 +3365,79 @@ define_class!(
 );
 
 impl AppDelegate {
+    fn thumbnail_for_preview(&self, preview: &NotePreview) -> Option<Retained<NSImage>> {
+        let resource_id = preview.first_image_id.as_deref()?;
+        let key = ThumbnailKey {
+            resource_id: resource_id.to_owned(),
+            target_size: 112,
+        };
+        if let Some(image) = self.ivars().thumbnail_cache.borrow_mut().get(&key) {
+            return Some(image);
+        }
+        let resource = self
+            .ivars()
+            .repository
+            .get_resource(resource_id)
+            .ok()
+            .flatten()?;
+        if !matches!(resource.mime.as_str(), "image/png" | "image/jpeg")
+            || !image_signature_matches_mime(&resource.bytes, &resource.mime)
+        {
+            return None;
+        }
+        let image = decoded_thumbnail(&resource.bytes, 112.0)?;
+        self.ivars()
+            .thumbnail_decode_count
+            .set(self.ivars().thumbnail_decode_count.get().saturating_add(1));
+        self.ivars()
+            .thumbnail_cache
+            .borrow_mut()
+            .insert(key, image.clone());
+        Some(image)
+    }
+
+    fn select_note_index(&self, index: usize) {
+        let Some(note) = self.ivars().notes.borrow().get(index).cloned() else {
+            return;
+        };
+        if self.ivars().current_note_id.borrow().as_deref() == Some(note.id.as_str()) {
+            return;
+        }
+        let ids = self
+            .ivars()
+            .notes
+            .borrow()
+            .iter()
+            .map(|note| note.id.clone())
+            .collect::<Vec<_>>();
+        let previous_index =
+            selected_index_for_id(&ids, self.ivars().current_note_id.borrow().as_deref());
+        if !self.save_current_note() {
+            return;
+        }
+        self.load_note(&note);
+        self.update_note_selection();
+        self.reload_collection_items(previous_index, Some(index));
+    }
+
+    fn reload_collection_items(&self, previous_index: Option<usize>, next_index: Option<usize>) {
+        let Some(collection) = self.ivars().note_collection.get() else {
+            return;
+        };
+        let paths = [previous_index, next_index]
+            .into_iter()
+            .flatten()
+            .filter(|index| *index < self.ivars().note_previews.borrow().len())
+            .map(|index| NSIndexPath::indexPathForItem_inSection(index as isize, 0))
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return;
+        }
+        let refs = paths.iter().map(|path| &**path).collect::<Vec<_>>();
+        let index_paths = NSSet::from_slice(&refs);
+        collection.reloadItemsAtIndexPaths(&index_paths);
+    }
+
     fn set_selected_range_programmatically(&self, body: &NSTextView, selection: NSRange) {
         let previous = *self.ivars().selection_sync_guard.borrow();
         *self.ivars().selection_sync_guard.borrow_mut() = true;
@@ -4087,9 +4216,9 @@ impl AppDelegate {
             background.setBorderColor(&NSColor::separatorColor());
             background.setBorderWidth(1.0);
         }
-        if let Some(list_scroll) = self.ivars().list_scroll.get() {
-            list_scroll.setFrame(list.ns_rect());
-            list_scroll.setHidden(shell.browser.width == 0.0);
+        if let Some(browser_scroll) = self.ivars().browser_scroll.get() {
+            browser_scroll.setFrame(list.ns_rect());
+            browser_scroll.setHidden(shell.browser.width == 0.0);
         }
         if let Some(title) = self.ivars().browser_title.get() {
             title.setFrame(NSRect::new(
@@ -4108,28 +4237,23 @@ impl AppDelegate {
             ));
             count.setHidden(shell.browser.width == 0.0);
         }
-        if let Some(list_stack) = self.ivars().list_stack.get() {
-            // Keep the document view at least as tall as the viewport, then
-            // position each row explicitly at the top of the reading rail.
-            let stack_height =
-                (self.ivars().notes.borrow().len() as f64 * 64.0 + 24.0).max(list.height);
-            list_stack.setFrame(NSRect::new(
+        if let Some(collection) = self.ivars().note_collection.get() {
+            let row_count = self.ivars().note_previews.borrow().len().div_ceil(2);
+            let metrics = joplin_lite_native::native_note_browser::browser_metrics(list.width);
+            if let Some(layout) = collection
+                .collectionViewLayout()
+                .and_then(|layout| layout.downcast::<NSCollectionViewFlowLayout>().ok())
+            {
+                layout.setItemSize(NSSize::new(metrics.card_width, metrics.card_height));
+                layout.invalidateLayout();
+            }
+            let content_height =
+                (row_count as f64 * (metrics.card_height + 8.0) + 16.0).max(list.height);
+            collection.setFrame(NSRect::new(
                 NSPoint::new(0.0, 0.0),
-                NSSize::new(list.width, stack_height),
+                NSSize::new(list.width, content_height),
             ));
-            let row_width = (list.width - 24.0).max(180.0);
-            for (index, row) in self.ivars().note_rows.borrow().iter().enumerate() {
-                row.setFrame(NSRect::new(
-                    NSPoint::new(12.0, stack_height - 12.0 - ((index + 1) as f64 * 64.0)),
-                    NSSize::new(row_width, 60.0),
-                ));
-            }
-            for button in self.ivars().note_buttons.borrow().iter() {
-                button.setFrame(NSRect::new(
-                    NSPoint::new(8.0, 0.0),
-                    NSSize::new((row_width - 16.0).max(164.0), 60.0),
-                ));
-            }
+            self.refresh_visible_note_cards(collection, metrics);
         }
         if let Some(label) = self.ivars().list_empty_label.get() {
             label.setFrame(NSRect::new(
@@ -4256,6 +4380,33 @@ impl AppDelegate {
             label.setFrame(shell.empty_editor.ns_rect());
         }
         self.update_formatting_buttons();
+    }
+
+    fn refresh_visible_note_cards(
+        &self,
+        collection: &NSCollectionView,
+        metrics: joplin_lite_native::native_note_browser::BrowserMetrics,
+    ) {
+        for item in collection.visibleItems().iter() {
+            let Some(index_path) = collection.indexPathForItem(&item) else {
+                continue;
+            };
+            let index = index_path.item() as usize;
+            let Some(preview) = self.ivars().note_previews.borrow().get(index).cloned() else {
+                continue;
+            };
+            let selected =
+                self.ivars().current_note_id.borrow().as_deref() == Some(preview.note_id.as_str());
+            let image = self.thumbnail_for_preview(&preview);
+            configure_note_card(
+                &item,
+                &preview,
+                image.as_deref(),
+                selected,
+                metrics,
+                self.mtm(),
+            );
+        }
     }
 
     fn command_selection(&self) -> Option<NSRange> {
@@ -4984,68 +5135,17 @@ impl AppDelegate {
     }
 
     fn replace_note_list(&self, notes: Vec<Note>) {
-        let Some(stack) = self.ivars().list_stack.get() else {
+        let Some(collection) = self.ivars().note_collection.get() else {
             return;
         };
-        for button in self.ivars().note_buttons.borrow_mut().drain(..) {
-            button.removeFromSuperview();
-        }
-        for row in self.ivars().note_rows.borrow_mut().drain(..) {
-            row.removeFromSuperview();
-        }
+        let now = current_time_millis();
+        let previews = notes
+            .iter()
+            .map(|note| preview_from_note(note, now))
+            .collect::<Vec<_>>();
         *self.ivars().notes.borrow_mut() = notes;
-        let selected_id = self.ivars().current_note_id.borrow().clone();
-        for (index, note) in self.ivars().notes.borrow().iter().enumerate() {
-            let selected = selected_id.as_deref() == Some(note.id.as_str());
-            let button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    ns_string!(""),
-                    Some(self),
-                    Some(sel!(selectNote:)),
-                    self.mtm(),
-                )
-            };
-            let row = NSBox::initWithFrame(
-                NSBox::alloc(self.mtm()),
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(220.0, 60.0)),
-            );
-            row.setBoxType(NSBoxType::Custom);
-            row.setTransparent(false);
-            row.setBorderWidth(0.0);
-            row.setCornerRadius(8.0);
-            let row_color = if selected {
-                NSColor::selectedContentBackgroundColor()
-            } else {
-                NSColor::clearColor()
-            };
-            row.setFillColor(&row_color);
-            button.setTag(index as isize);
-            button.setBordered(false);
-            button.setButtonType(NSButtonType::PushOnPushOff);
-            button.setUsesSingleLineMode(false);
-            button.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-            button.setAlignment(NSTextAlignment::Left);
-            button.setState(if selected {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
-            let color = if selected {
-                NSColor::controlAccentColor()
-            } else {
-                NSColor::labelColor()
-            };
-            button.setContentTintColor(Some(&color));
-            set_note_button_title(&button, note, selected);
-            button.setFrame(NSRect::new(
-                NSPoint::new(8.0, 0.0),
-                NSSize::new(204.0, 60.0),
-            ));
-            row.addSubview(&button);
-            stack.addSubview(&row);
-            self.ivars().note_buttons.borrow_mut().push(button);
-            self.ivars().note_rows.borrow_mut().push(row);
-        }
+        *self.ivars().note_previews.borrow_mut() = previews;
+        collection.reloadData();
         let is_empty = self.ivars().notes.borrow().is_empty();
         if let Some(label) = self.ivars().list_empty_label.get() {
             label.setHidden(!is_empty);
@@ -5058,41 +5158,34 @@ impl AppDelegate {
             .map(|content| (content.frame().size.width, content.frame().size.height))
             .unwrap_or((1100.0, 720.0));
         self.layout_content(width, height);
+        self.update_note_selection();
     }
 
     fn update_note_selection(&self) {
-        let selected_id = self.ivars().current_note_id.borrow().clone();
-        for (index, button) in self.ivars().note_buttons.borrow().iter().enumerate() {
-            let selected = self
-                .ivars()
-                .notes
-                .borrow()
-                .get(index)
-                .map(|note| selected_id.as_deref() == Some(note.id.as_str()))
-                .unwrap_or(false);
-            button.setState(if selected {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
-            let color = if selected {
-                NSColor::controlAccentColor()
-            } else {
-                NSColor::labelColor()
-            };
-            button.setContentTintColor(Some(&color));
-            if let Some(row) = self.ivars().note_rows.borrow().get(index) {
-                let row_color = if selected {
-                    NSColor::selectedContentBackgroundColor()
-                } else {
-                    NSColor::clearColor()
-                };
-                row.setFillColor(&row_color);
-            }
-            if let Some(note) = self.ivars().notes.borrow().get(index) {
-                set_note_button_title(button, note, selected);
-            }
+        let Some(collection) = self.ivars().note_collection.get() else {
+            return;
+        };
+        let was_guarded = self.ivars().collection_selection_guard.replace(true);
+        unsafe {
+            collection.deselectAll(None);
         }
+        let ids = self
+            .ivars()
+            .notes
+            .borrow()
+            .iter()
+            .map(|note| note.id.clone())
+            .collect::<Vec<_>>();
+        let selected_id = self.ivars().current_note_id.borrow().clone();
+        if let Some(index) = selected_index_for_id(&ids, selected_id.as_deref()) {
+            let path = NSIndexPath::indexPathForItem_inSection(index as isize, 0);
+            let paths = NSSet::from_slice(&[&*path]);
+            collection.selectItemsAtIndexPaths_scrollPosition(
+                &paths,
+                objc2_app_kit::NSCollectionViewScrollPosition::None,
+            );
+        }
+        self.ivars().collection_selection_guard.set(was_guarded);
     }
 
     #[allow(deprecated)]
@@ -5272,8 +5365,13 @@ impl AppDelegate {
                     .position(|note| note.id == updated.id);
                 if let Some(index) = index {
                     self.ivars().notes.borrow_mut()[index] = updated.clone();
-                    if let Some(button) = self.ivars().note_buttons.borrow().get(index) {
-                        set_note_button_title(button, &updated, true);
+                    if let Some(preview) = self.ivars().note_previews.borrow_mut().get_mut(index) {
+                        *preview = preview_from_note(&updated, current_time_millis());
+                    }
+                    if let Some(collection) = self.ivars().note_collection.get() {
+                        let path = NSIndexPath::indexPathForItem_inSection(index as isize, 0);
+                        let paths = NSSet::from_slice(&[&*path]);
+                        collection.reloadItemsAtIndexPaths(&paths);
                     }
                 }
                 if self.ivars().current_note_id.borrow().as_deref() == Some(id)
@@ -5466,6 +5564,34 @@ fn decoded_image(bytes: &[u8]) -> Option<Retained<NSImage>> {
     // decoded before the bytes are admitted to storage or rendering.
     image.TIFFRepresentation()?;
     Some(image)
+}
+
+#[allow(deprecated)]
+fn decoded_thumbnail(bytes: &[u8], target: f64) -> Option<Retained<NSImage>> {
+    let source = decoded_image(bytes)?;
+    let draw_size = thumbnail_dimensions(source.size(), target)?;
+    let thumbnail = NSImage::initWithSize(NSImage::alloc(), NSSize::new(target, target));
+    thumbnail.lockFocus();
+    source.drawInRect(NSRect::new(
+        NSPoint::new(
+            (target - draw_size.width) / 2.0,
+            (target - draw_size.height) / 2.0,
+        ),
+        draw_size,
+    ));
+    thumbnail.unlockFocus();
+    Some(thumbnail)
+}
+
+fn thumbnail_dimensions(source_size: NSSize, target: f64) -> Option<NSSize> {
+    if source_size.width <= 0.0 || source_size.height <= 0.0 || target <= 0.0 {
+        return None;
+    }
+    let scale = (target / source_size.width).min(target / source_size.height);
+    Some(NSSize::new(
+        source_size.width * scale,
+        source_size.height * scale,
+    ))
 }
 
 fn image_signature_matches_mime(bytes: &[u8], mime: &str) -> bool {
@@ -5716,49 +5842,6 @@ fn inline_attachment_with_width(
     Some(mutable)
 }
 
-fn set_note_button_title(button: &NSButton, note: &Note, selected: bool) {
-    let title = note_list_title(note);
-    let summary = note_list_summary(note);
-    let label = format!("{title}\n{summary}");
-    let attributed = NSMutableAttributedString::from_nsstring(&NSString::from_str(&label));
-    let title_font = NSFont::systemFontOfSize_weight(15.0, if selected { 0.3 } else { 0.0 });
-    let summary_font = NSFont::systemFontOfSize(12.0);
-    let title_color = if selected {
-        NSColor::whiteColor()
-    } else {
-        NSColor::labelColor()
-    };
-    let summary_color = if selected {
-        NSColor::whiteColor()
-    } else {
-        NSColor::secondaryLabelColor()
-    };
-    let title_length = NSString::from_str(&title).length();
-    let full_length = NSString::from_str(&label).length();
-    unsafe {
-        attributed.addAttribute_value_range(
-            NSFontAttributeName,
-            &title_font,
-            NSRange::new(0, title_length),
-        );
-        attributed.addAttribute_value_range(
-            NSForegroundColorAttributeName,
-            &title_color,
-            NSRange::new(0, title_length),
-        );
-        if full_length > title_length + 1 {
-            let summary_range = NSRange::new(title_length + 1, full_length - title_length - 1);
-            attributed.addAttribute_value_range(NSFontAttributeName, &summary_font, summary_range);
-            attributed.addAttribute_value_range(
-                NSForegroundColorAttributeName,
-                &summary_color,
-                summary_range,
-            );
-        }
-    }
-    button.setAttributedTitle(attributed.as_ref());
-}
-
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum TextFormat {
     Bold,
@@ -5815,12 +5898,16 @@ impl AppDelegate {
             repository,
             current_note_id: RefCell::new(None),
             notes: RefCell::new(Vec::new()),
+            note_previews: RefCell::new(Vec::new()),
+            thumbnail_cache: RefCell::new(ThumbnailCache::new(32)),
+            thumbnail_decode_count: Cell::new(0),
             loading_guard: RefCell::new(false),
             autosave: RefCell::new(AutosaveState::empty()),
             shell_visibility: RefCell::new(ShellVisibility::Default),
             focus_restore_visibility: RefCell::new(None),
             last_body_selection: RefCell::new(NSRange::new(0, 0)),
             selection_sync_guard: RefCell::new(false),
+            collection_selection_guard: Cell::new(false),
             editor_session: RefCell::new(None),
             projection_attachments: RefCell::new(Vec::new()),
             projection_empty_carriers: RefCell::new(Vec::new()),
@@ -5831,8 +5918,8 @@ impl AppDelegate {
             browser_background: OnceCell::new(),
             editor_background: OnceCell::new(),
             sidebar_separator: OnceCell::new(),
-            list_scroll: OnceCell::new(),
-            list_stack: OnceCell::new(),
+            browser_scroll: OnceCell::new(),
+            note_collection: OnceCell::new(),
             browser_title: OnceCell::new(),
             browser_count: OnceCell::new(),
             breadcrumb_label: OnceCell::new(),
@@ -5850,8 +5937,6 @@ impl AppDelegate {
             save_status: OnceCell::new(),
             editor_empty_label: OnceCell::new(),
             toolbar_buttons: RefCell::new(Vec::new()),
-            note_buttons: RefCell::new(Vec::new()),
-            note_rows: RefCell::new(Vec::new()),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -5868,7 +5953,8 @@ mod tests {
         is_local_file_url_host, is_promised_pasteboard_type, legacy_migration_recovery_message,
         note_list_summary, note_list_title, paste_route, read_drag_image_file,
         read_pasteboard_image_from, read_regular_image_file, render_document_to_attributed_string,
-        typing_trait_operation, valid_image_bytes_for_mime, validate_canonical_data_dir,
+        thumbnail_dimensions, typing_trait_operation, valid_image_bytes_for_mime,
+        validate_canonical_data_dir,
     };
     use joplin_lite_native::core::{LegacyNoteForHtmlMigration, NoteRepository, StoredResource};
     use joplin_lite_native::html_body::{Block, Document, Inline, Marks, serialize_html};
@@ -7066,6 +7152,15 @@ mod tests {
         assert!(!valid_image_bytes_for_mime(&truncated_jpeg, "image/jpeg"));
         assert!(!valid_image_bytes_for_mime(GIF, "image/png"));
         assert!(!valid_image_bytes_for_mime(TIFF, "image/jpeg"));
+    }
+
+    #[test]
+    fn thumbnail_dimensions_are_bounded_and_preserve_aspect_ratio() {
+        let size = thumbnail_dimensions(NSSize::new(4000.0, 2000.0), 112.0).unwrap();
+        assert_eq!(size.width, 112.0);
+        assert_eq!(size.height, 56.0);
+        assert!(size.width <= 112.0 && size.height <= 112.0);
+        assert!(thumbnail_dimensions(NSSize::new(0.0, 1.0), 112.0).is_none());
     }
 
     #[test]
