@@ -10,6 +10,28 @@ if [[ "${1:-}" == "--filter-otool-dependencies" ]]; then
   exit 0
 fi
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+EXPECTED_VERSION="0.4.0"
+SOURCE_SCAN="$(mktemp "${TMPDIR:-/tmp}/joplin-lite-source.XXXXXX")"
+cleanup_source_scan() { rm -f -- "$SOURCE_SCAN"; }
+trap cleanup_source_scan EXIT
+for source in "$PACKAGE_DIR"/src/app.rs "$PACKAGE_DIR"/src/core.rs; do
+  awk '/^mod tests[[:space:]]*\{/{exit} {print}' "$source" >>"$SOURCE_SCAN"
+done
+
+if rg -n 'RTFFromRange|RtfLoadDecision|RtfSavePlan|sanitized_rtf_from_editor|rtf_save_plan|rtf_load_decision|rtf_text_matches_body|editor_save_projection|editor_segments_with_ranges' "$SOURCE_SCAN"; then
+  echo "obsolete normal-runtime RTF save/load path is present" >&2
+  exit 1
+fi
+if rg -n 'body_rtf[[:space:]]*=' "$SOURCE_SCAN" | rg -v "body_rtf[[:space:]]*=[[:space:]]*X''"; then
+  echo "normal runtime must only write an empty legacy body_rtf column" >&2
+  exit 1
+fi
+LEGACY_DECODER_COUNT="$(rg -o 'NSAttributedString::initWithRTF_documentAttributes' "$PACKAGE_DIR/src/app.rs" | wc -l | tr -d ' ')"
+test "$LEGACY_DECODER_COUNT" = "1"
+rg -q 'fn decode_legacy_rtf_for_html_migration' "$PACKAGE_DIR/src/app.rs"
+
 APP_PATH="${1:?app path required}"
 CONTENTS_PATH="$APP_PATH/Contents"
 PLIST="$CONTENTS_PATH/Info.plist"
@@ -17,7 +39,10 @@ PLIST="$CONTENTS_PATH/Info.plist"
 test -d "$APP_PATH"
 test -f "$PLIST"
 test -f "$CONTENTS_PATH/Resources/AppIcon.icns"
+test -s "$CONTENTS_PATH/Resources/AppIcon.icns"
 test "$(plutil -extract CFBundleIconFile raw -o - "$PLIST")" = "AppIcon"
+test "$(plutil -extract CFBundleShortVersionString raw -o - "$PLIST")" = "$EXPECTED_VERSION"
+test "$(plutil -extract CFBundleVersion raw -o - "$PLIST")" = "$EXPECTED_VERSION"
 
 EXECUTABLE_NAME="$(plutil -extract CFBundleExecutable raw -o - "$PLIST")"
 test -n "$EXECUTABLE_NAME"
@@ -25,6 +50,14 @@ EXECUTABLE_PATH="$CONTENTS_PATH/MacOS/$EXECUTABLE_NAME"
 test -f "$EXECUTABLE_PATH"
 if [[ -L "$EXECUTABLE_PATH" ]]; then
   echo "bundle executable must not be a symlink" >&2
+  exit 1
+fi
+if [[ -d "$CONTENTS_PATH/Helpers" ]] && find "$CONTENTS_PATH/Helpers" -type f -print -quit | grep -q .; then
+  echo "child helper executables are forbidden" >&2
+  exit 1
+fi
+if find "$CONTENTS_PATH/MacOS" -type f ! -name "$EXECUTABLE_NAME" -print -quit | grep -q .; then
+  echo "bundle must contain only its main executable" >&2
   exit 1
 fi
 EXECUTABLE_KIND="$(file -b "$EXECUTABLE_PATH")"
