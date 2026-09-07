@@ -16,7 +16,7 @@ Evernote 是业务与界面的主要原型，Byword 只补充长文写作区的�
 
 ## 选择
 
-采用纯 AppKit 增量改造：`NSCollectionView` 虚拟化卡片、`NSTextView` 原生编辑、Rust Document 模型和 SQLite 中的规范 HTML。拒绝 WKWebView/ProseMirror 路线，因为它重新引入 WebKit 内存与焦点/剪贴板边界；也不在本轮重写成 SwiftUI/TextKit 2，因为会扩大风险且不增加用户价值。
+采用纯 AppKit 增量改造：`NSCollectionView` 虚拟化卡片、`NSTextView` 原生编辑、Rust `text-document` 编辑会话、应用自有 canonical `Document` 和 SQLite 中的规范 HTML。拒绝 WKWebView/ProseMirror 路线，因为它重新引入 WebKit 内存与焦点/剪贴板边界；也不在本轮重写成 SwiftUI/TextKit 2，因为会扩大风险且不增加用户价值。
 
 ## 从 Evernote 实现中实际采用的机制
 
@@ -45,7 +45,17 @@ Element 的 Matrix Rich Text Editor 是本轮进一步检查的 Rust 富文本�
 
 本轮不把 `wysiwyg` crate 直接作为运行时依赖，也不复制其源码。上游 README 明示项目仍处早期、次版本可能破坏 API 且可能出现崩溃；当前版本面向 Matrix 消息编辑器，没有笔记所需的图片资源节点、标题层级、清单状态、块对齐和高亮语义，直接接入会与本项目已经定义的 canonical HTML `Document` 形成第二套事实源。它采用 AGPLv3/商业双许可，虽然本项目同属开源路线，算法参考仍以 clean-room 行为对照和自行实现为界，避免无意引入额外来源义务。若未来上游稳定并补齐笔记语义，可重新评估替换内部范围变换层，而不是替换 AppKit 输入/排版层或 SQLite 正文模型。
 
-因此编辑器组合固定为：AppKit `NSTextView`/TextKit 负责系统级输入、IME、选区、拼写、无障碍和排版；Rust `Document` 负责持久语义；`html5ever` 负责 HTML5 解析；SQLite/FTS5 负责事务与索引；Matrix RTE、Lapce/Floem 和 Evernote 只提供经过验证的算法与产品机制参考。选择现成组件的标准是减少产品风险，而不是追求依赖数量。
+## Teksilo 与 text-document 取舍
+
+`teksilo-preview-ui` 只是 Teksilo 控件目录的三栏预览器，不是应用 GUI 底座。完整 Teksilo 确实提供纯 Rust retained tree、AccessKit、winit/wgpu 和现成 `RichTextEditor`，但当前版本仍为 0.9.x，官方明确声明 0.x 会有破坏性变化，生产部署也主要限于作者自己的应用。它的 40 多个 crate、自绘输入/渲染链和 JetBrains Int UI 默认风格都不是当前 macOS 单人笔记 MVP 的必要成本，因此本轮不迁移 AppKit 外壳，也不依赖 `teksilo-preview-ui` 或 `teksilo-widgets`。
+
+采用其已经独立稳定到 1.x 的 MPL-2.0 `text-document` 作为**瞬时富文本编辑模型**。它提供 Rope 文本、块/列表/图片锚点、格式区间、cursor mutation、查找替换、复合 undo/redo 与增量事件，能替换本项目原计划自行编写的大部分范围变换和历史算法。应用自有 canonical `Document` 仍是持久化边界；`text-document::TextDocument` 只存在于打开笔记的编辑会话内，不能成为第二种磁盘正文格式。
+
+实测门禁已经确认：中文、emoji、链接格式、查找、undo/redo 以及 `jln-resource://sha256/...` 外部图片引用可正常导入并往返；但 `text-document` 1.12.1 的全量 HTML exporter 会把内部已有 indent 的嵌套列表序列化成同级 `<li>`。因此禁止用 `TextDocument::to_html()` 直接写 `notes.body`，也禁止把图片资源 bytes/base64 放入其 resource table。Task 2 必须实现显式双向 adapter：canonical `Document` ↔ `TextDocument` flow/format snapshot；保存仍统一走现有白名单 serializer。嵌套层级、清单 marker、对齐、缩进和图片资源 id 均由 adapter 显式映射并做等价往返测试。
+
+AppKit `NSTextView`/TextKit 继续负责系统级输入、IME marked text、选区、拼写、无障碍和排版；活动 `TextDocument` 负责已提交文字与语义命令。IME 组合态只停留在 TextKit 投影中，composition commit 后再以最小 UTF-16 delta 转换为 Unicode scalar range 写入 `TextDocument`；格式命令直接作用于 `TextCursor`，再增量刷新 AppKit 投影。AppKit 自身不再作为持久语义来源，两个 undo 栈不得同时接管同一次编辑。
+
+因此编辑器组合固定为：AppKit `NSTextView`/TextKit 负责原生交互；`text-document` 负责活动编辑事务；应用自有 Rust `Document` + `html5ever` 负责安全、确定的持久语义与 HTML；SQLite/FTS5 负责事务与索引；Teksilo RichTextEditor、Matrix RTE、Lapce/Floem 和 Evernote 提供实现与行为参考。选择现成组件的标准是减少产品风险，而不是追求依赖数量。
 
 ## Iced、Slint、Loro 与 cosmic-text 取舍
 

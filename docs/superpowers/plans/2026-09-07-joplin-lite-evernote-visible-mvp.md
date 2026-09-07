@@ -4,17 +4,17 @@
 
 **Goal:** Build a recognizably Evernote-style, fully native macOS note browser and WYSIWYG editor without reintroducing WebKit, live RTF, or unrelated Evernote features.
 
-**Architecture:** Extend the pure Rust HTML Document model first, then project it through a focused AppKit editor codec. Replace the eager stack of note buttons with a reusable `NSCollectionView` card browser; let `app.rs` coordinate a three-region shell, responsive toolbar, focus mode, delayed autosave and existing persistence/image services.
+**Architecture:** Keep the pure Rust HTML `Document` as the canonical storage boundary, use `text-document` as the active rich-editing transaction model, and project it through a focused AppKit adapter. Replace the eager stack of note buttons with a reusable `NSCollectionView` card browser; let `app.rs` coordinate a three-region shell, responsive toolbar, focus mode, delayed autosave and existing persistence/image services.
 
-**Tech Stack:** Rust 2024, rusqlite/SQLite FTS5, html5ever, objc2 0.6, objc2-app-kit 0.3, AppKit `NSTextView`/`NSCollectionView`, Bash release contracts.
+**Tech Stack:** Rust 2024, rusqlite/SQLite FTS5, html5ever, text-document 1.12.1, objc2 0.6, objc2-app-kit 0.3, AppKit `NSTextView`/`NSCollectionView`, Bash release contracts.
 
 **Spec:** `docs/superpowers/specs/2026-09-07-joplin-lite-visible-mvp-design.md`
 
 **Evernote implementation evidence:** The installed Evernote 11.32.5 bundle exposes source maps for `@evernote/common-editor` 183.272.12. Its relevant core is a semantic ProseMirror document, transaction-based command/query APIs, separate DOM/ENML parsers and serializers, resource nodes keyed by stable identity, immediate `contentChanged` plus a debounced settled notification, explicit flush, context-change de-thrashing, computed centered note width, and viewport-bounded work. Tasks 2–4 must translate those mechanisms into native AppKit rather than imitate only the pixels.
 
-**Existing editor-core evidence:** Element's Matrix Rich Text Editor is the concrete Rust rich-text algorithm reference for Task 2. Compare its UTF-16 range mapping, cross-node formatting/link mutations, nested-list enter/exit/indent behavior, action-state queries and undo snapshots. Do not add the upstream crate as a runtime dependency or copy its source in this MVP: upstream declares an early, breaking API; its Matrix-composer schema lacks note images, headings, checklists, alignment and highlight; and it would duplicate this project's canonical `Document`. Lapce/Floem remains the reference for revision/pristine and projection-only phantom content, not the persistent rich-note model.
+**Existing editor-core evidence:** Pin the independent MPL-2.0 `text-document` 1.12.1 crate as the active editor transaction model; its Rope, cursor mutations, block/list/image model, find/replace, undo/redo and change events replace hand-written range/history algorithms. Its HTML exporter is not a persistence boundary: the verified 1.12.1 exporter flattens nested list indent, so canonical saves must traverse flow/format snapshots into this project's `Document` and use the existing serializer. Element's Matrix Rich Text Editor remains a behavioral reference for UTF-16 and list edge cases; Lapce/Floem remains a reference for revision/pristine and projection-only auxiliary content.
 
-**Rust stack ruling:** Keep AppKit/TextKit for this macOS MVP; Iced/Slint do not currently provide the required native rich-editing surface, and cosmic-text is a layout engine rather than a replacement for system IME/accessibility/spellcheck/attachment editing. Select Loro for the follow-on native sync phase, behind the canonical `Document` transaction boundary. Do not add Loro to Tasks 1–5 or make its binary snapshot/oplog the only note body. SQLite canonical HTML/FTS remains readable materialized state; Joplin Server remains an undisturbed migration/recovery rail until a separate Loro multi-replica and NAS-resource gate passes.
+**Rust stack ruling:** Keep AppKit/TextKit for this macOS MVP; `teksilo-preview-ui` is only a previewer and full Teksilo 0.9.x would replace the proven macOS input chain with a pre-1.0 winit/wgpu stack. Reuse its stable lower layer `text-document`, but keep canonical HTML ownership in this project. Select Loro for the follow-on native sync phase, behind the canonical `Document` transaction boundary. Do not add Loro to Tasks 1–5 or make its binary snapshot/oplog the only note body. SQLite canonical HTML/FTS remains readable materialized state; Joplin Server remains an undisturbed migration/recovery rail until a separate Loro multi-replica and NAS-resource gate passes.
 
 ## Global Constraints
 
@@ -25,7 +25,7 @@
 - Normal runtime keeps readable canonical HTML and derived FTS even after Loro sync is introduced; a CRDT snapshot/oplog may never be the only copy of note content.
 - Do not show AI, task, calendar, reminder, template, sharing, collaboration or plugin controls.
 - Every visible formatting/insert command works; future commands stay absent.
-- Editor commands mutate semantic attributes in one undo transaction and expose query state for toolbar refresh; UI controls must not directly mutate fonts as the source of truth.
+- Editor commands mutate the active `text-document::TextDocument` in one undo transaction and expose query state for toolbar refresh; UI controls must not directly mutate fonts as the source of truth.
 - Save only when canonical HTML differs from the last persisted HTML. Dirty status changes immediately; coalescing may delay the write, never the status.
 - Preserve title persistence, Command-N, undo/redo, Finder/bitmap paste, drag/drop, resource safety, search, soft delete and migration backup.
 - Never access an official Joplin profile from normal product code.
@@ -34,7 +34,7 @@
 ## File map
 
 - `src/html_body.rs`: platform-neutral document types, safe parsing, deterministic HTML, search/resource projections.
-- `src/native_editor.rs`: macOS attributed-string codec, semantic attributes, list/checklist projection and formatting helpers.
+- `src/native_editor.rs`: `text-document` ↔ canonical `Document` adapter, UTF-16 bridge, AppKit projection and editor session.
 - `src/note_preview.rs`: preview title, snippet, first image and card metric projection.
 - `src/native_note_browser.rs`: reusable `NSCollectionViewItem` card views and flow layout.
 - `src/app.rs`: window/app delegate, three-region shell, commands, selection and delayed-save orchestration.
@@ -82,7 +82,7 @@ Links accept only absolute `https://`, `http://` and `mailto:` URLs. Indent clam
 
 ---
 
-### Task 2: Build the native editor codec
+### Task 2: Build the native editor session and AppKit adapter
 
 **Files:**
 - Create: `packages/app-lite-native/src/native_editor.rs`
@@ -90,7 +90,7 @@ Links accept only absolute `https://`, `http://` and `mailto:` URLs. Indent clam
 - Modify: `packages/app-lite-native/Cargo.toml`
 - Test: inline AppKit tests in `native_editor.rs`
 
-**Consumes:** Task 1 Document types.
+**Consumes:** Task 1 canonical `Document` types. Pin `text-document = "=1.12.1"`; do not add the full Teksilo framework.
 
 **Produces:**
 
@@ -98,19 +98,26 @@ Links accept only absolute `https://`, `http://` and `mailto:` URLs. Indent clam
 pub enum BlockCommand { Paragraph, Heading(HeadingLevel), UnorderedList, OrderedList, Checklist }
 pub enum InlineCommand { Bold, Italic, Underline, Strikethrough, Highlight, Clear }
 pub enum ParagraphCommand { Align(Alignment), IncreaseIndent, DecreaseIndent }
+pub struct NativeEditorSession { /* active text_document::TextDocument + revision */ }
 pub struct RenderedDocument { pub attributed: Retained<NSMutableAttributedString>, pub missing_resources: usize }
-pub fn document_from_editor(source: &NSAttributedString) -> Result<Document, EditorCodecError>;
-pub fn render_document<F>(document: &Document, load: F, width: f64) -> RenderedDocument where F: FnMut(&str) -> Option<StoredResource>;
+pub fn session_from_document(document: &Document) -> Result<NativeEditorSession, EditorCodecError>;
+pub fn document_from_session(session: &NativeEditorSession) -> Result<Document, EditorCodecError>;
+pub fn render_session<F>(session: &NativeEditorSession, load: F, width: f64) -> RenderedDocument where F: FnMut(&str) -> Option<StoredResource>;
+pub fn apply_committed_text_delta(session: &mut NativeEditorSession, range: NSRange, replacement: &str) -> Result<(), EditorCodecError>;
+pub fn apply_link(session: &mut NativeEditorSession, selection: NSRange, url: Option<&str>) -> Result<(), EditorCodecError>;
+pub fn toggle_checklist_at_utf16_location(session: &mut NativeEditorSession, location: usize) -> bool;
 ```
 
-- [ ] **Step 1: Move existing codec and tests without behavior changes.** Keep the legacy RTF decoder in `app.rs`, calling the same new codec; do not duplicate it.
-- [ ] **Step 2: Add RED round-trip tests.** Cover H1/H2/H3, bullet/ordered/checklist, strike/highlight/link, alignment/indent, emoji UTF-16 ranges, empty blocks and images.
-- [ ] **Step 2a: Port behavioral edge cases, not source.** Add independently written cases equivalent to Matrix RTE's cross-node partial-link selection, empty list-item exit, nested-list remnants, action-state transitions and one-command-one-history behavior.
-- [ ] **Step 3: Implement semantic attributes.** Define app-owned attributes for block/list/checklist/alignment/indent and tagged projection prefixes. Render native 11/13/17/22/30 pt roles and strip projection prefixes on save.
-- [ ] **Step 4: Implement mutations and query state.** Block commands operate on full paragraphs; inline commands on exact UTF-16 ranges. Applying the active list kind again returns to paragraphs. Clear removes inline semantics but never attachments/block type. Expose mixed/active state so the toolbar refreshes only when selection context changes.
-- [ ] **Step 5: Implement Return behavior.** Return continues a nonempty list item; Return on an empty item exits the list. Checklist prefix is `☐`/`☑` and remains toggleable without entering canonical text.
-- [ ] **Step 6: Preserve undo boundaries.** One visible command creates one text-storage edit/undo group; `app.rs` saves once afterward.
-- [ ] **Step 7: Run gates and commit.** Run fmt/full tests/Clippy/diff-check; commit `Add native semantic editor`.
+- [ ] **Step 0: Prove the dependency boundary before integration.** Add focused tests showing Chinese/emoji scalar↔UTF-16 conversion, external `jln-resource://sha256/...` image identity, nested list indent and checklist markers. Add a regression proving why `TextDocument::to_html()` is forbidden for persistence: 1.12.1 flattens nested lists even though flow snapshots retain indent. No product save path may call it.
+- [ ] **Step 1: Move the existing AppKit codec without behavior changes.** Keep the legacy RTF decoder isolated in `app.rs`; do not duplicate or generalize it. The last known working title/image/paste path remains available until the new session passes all gates.
+- [ ] **Step 2: Implement explicit canonical adapters.** Map Task 1 blocks/inlines/resources to `text-document` flow/format structures and back without routing through HTML. Cover H1/H2/H3, bullet/ordered/checklist, nested indent, strike/highlight/link, alignment, empty blocks and images. Image nodes store only the existing resource URI/id and dimensions; never insert resource bytes/base64 into `TextDocument`.
+- [ ] **Step 3: Implement the AppKit projection.** Render native 11/13/17/22/30 pt roles, paragraph styles, attachments and tagged projection-only list/checklist prefixes. TextKit marked text remains ephemeral; only committed composition deltas enter the active model. Missing-image labels and `☐`/`☑` never enter canonical text.
+- [ ] **Step 4: Implement the UTF-16 delta bridge.** Convert AppKit `NSRange` to Unicode scalar positions with checked boundaries; apply committed insertion/deletion through `TextCursor`, then incrementally refresh the affected projection. Reject ranges splitting a surrogate pair. Add Chinese, emoji, combining-mark and cross-block tests.
+- [ ] **Step 5: Implement mutations and query state through `TextCursor`.** Block commands operate on full blocks; inline commands on exact converted ranges. Applying the active list kind again returns to paragraphs. Clear removes inline semantics but never attachments/block type. Expose inactive/active/mixed states and refresh the toolbar only when context changes.
+- [ ] **Step 6: Implement Return/list behavior and one undo owner.** Return continues a nonempty list item; Return on an empty item exits the list. Group one visible command in one `text-document` composite edit. Disable or bridge the competing AppKit undo registration so one edit never appears in two stacks; Command-Z and toolbar undo must exercise the same model history.
+- [ ] **Step 7: Close the Task 1 write-back gate atomically.** Until `document_from_session` and AppKit projection pass all semantic round-trips, title changes/autosave may not overwrite a body with the temporary paragraph-only codec. Switch load/edit/save together in one commit and retain a safe refusal path for unsupported sessions.
+- [ ] **Step 8: Port behavioral edge cases, not source.** Add independently written cases equivalent to Matrix RTE's partial-link selection, empty-list exit, nested remnants and action-state transitions, plus `text-document`-specific nested-list export and dual-undo regressions.
+- [ ] **Step 9: Run gates and commit.** Run fmt/full tests/Clippy/diff-check; commit `Add native semantic editor session`.
 
 ---
 
