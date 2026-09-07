@@ -41,7 +41,62 @@ impl Document {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
-    Paragraph(Vec<Inline>),
+    Paragraph {
+        style: BlockStyle,
+        inlines: Vec<Inline>,
+    },
+    Heading {
+        level: HeadingLevel,
+        style: BlockStyle,
+        inlines: Vec<Inline>,
+    },
+    List {
+        kind: ListKind,
+        items: Vec<ListItem>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadingLevel {
+    One,
+    Two,
+    Three,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockStyle {
+    pub alignment: Alignment,
+    pub indent: u8,
+}
+
+impl Default for BlockStyle {
+    fn default() -> Self {
+        Self {
+            alignment: Alignment::Left,
+            indent: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    Unordered,
+    Ordered,
+    Checklist,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListItem {
+    pub checked: Option<bool>,
+    pub style: BlockStyle,
+    pub inlines: Vec<Inline>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -49,6 +104,9 @@ pub struct Marks {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub strikethrough: bool,
+    pub highlight: bool,
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,20 +146,95 @@ pub fn serialize_html(document: &Document) -> String {
     let mut output = String::new();
     for block in &document.blocks {
         match block {
-            Block::Paragraph(inlines) => {
-                output.push_str("<p>");
-                if inlines.is_empty() {
-                    output.push_str("<br>");
-                } else if inlines.len() == 1 && matches!(inlines[0], Inline::SoftBreak) {
-                    output.push_str("<br data-joplin-lite-soft-break=\"true\">");
-                } else {
-                    serialize_inlines(inlines, &mut output);
+            Block::Paragraph { style, inlines } => {
+                serialize_block("p", style, inlines, &mut output)
+            }
+            Block::Heading {
+                level,
+                style,
+                inlines,
+            } => {
+                let tag = match level {
+                    HeadingLevel::One => "h1",
+                    HeadingLevel::Two => "h2",
+                    HeadingLevel::Three => "h3",
+                };
+                serialize_block(tag, style, inlines, &mut output);
+            }
+            Block::List { kind, items } => {
+                let (tag, checklist) = match kind {
+                    ListKind::Unordered => ("ul", false),
+                    ListKind::Ordered => ("ol", false),
+                    ListKind::Checklist => ("ul", true),
+                };
+                output.push('<');
+                output.push_str(tag);
+                if checklist {
+                    output.push_str(" data-type=\"checklist\"");
                 }
-                output.push_str("</p>");
+                output.push('>');
+                for item in items {
+                    output.push_str("<li");
+                    if checklist {
+                        output.push_str(" data-checked=\"");
+                        output.push_str(if item.checked == Some(true) {
+                            "true"
+                        } else {
+                            "false"
+                        });
+                        output.push('"');
+                    }
+                    serialize_style_attributes(&item.style, &mut output);
+                    output.push('>');
+                    if item.inlines.is_empty() {
+                        output.push_str("<br>");
+                    } else if item.inlines.len() == 1
+                        && matches!(item.inlines[0], Inline::SoftBreak)
+                    {
+                        output.push_str("<br data-joplin-lite-soft-break=\"true\">");
+                    } else {
+                        serialize_inlines(&item.inlines, &mut output);
+                    }
+                    output.push_str("</li>");
+                }
+                output.push_str("</");
+                output.push_str(tag);
+                output.push('>');
             }
         }
     }
     output
+}
+
+fn serialize_block(tag: &str, style: &BlockStyle, inlines: &[Inline], output: &mut String) {
+    output.push('<');
+    output.push_str(tag);
+    serialize_style_attributes(style, output);
+    output.push('>');
+    if inlines.is_empty() {
+        output.push_str("<br>");
+    } else if inlines.len() == 1 && matches!(inlines[0], Inline::SoftBreak) {
+        output.push_str("<br data-joplin-lite-soft-break=\"true\">");
+    } else {
+        serialize_inlines(inlines, output);
+    }
+    output.push_str("</");
+    output.push_str(tag);
+    output.push('>');
+}
+
+fn serialize_style_attributes(style: &BlockStyle, output: &mut String) {
+    match style.alignment {
+        Alignment::Center => output.push_str(" data-align=\"center\""),
+        Alignment::Right => output.push_str(" data-align=\"right\""),
+        Alignment::Left => {}
+    }
+    let indent = style.indent.min(8);
+    if indent > 0 {
+        output.push_str(" data-indent=\"");
+        output.push_str(&indent.to_string());
+        output.push('"');
+    }
 }
 
 pub fn search_text(document: &Document) -> String {
@@ -111,13 +244,15 @@ pub fn search_text(document: &Document) -> String {
             output.push('\n');
         }
         match block {
-            Block::Paragraph(inlines) => {
-                for inline in inlines {
-                    match inline {
-                        Inline::Text { text, .. } => output.push_str(text),
-                        Inline::SoftBreak => output.push('\n'),
-                        Inline::Image { alt, .. } => output.push_str(alt),
+            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => {
+                append_search_inlines(inlines, &mut output);
+            }
+            Block::List { items, .. } => {
+                for (item_index, item) in items.iter().enumerate() {
+                    if item_index > 0 {
+                        output.push('\n');
                     }
+                    append_search_inlines(&item.inlines, &mut output);
                 }
             }
         }
@@ -125,13 +260,35 @@ pub fn search_text(document: &Document) -> String {
     output
 }
 
+fn append_search_inlines(inlines: &[Inline], output: &mut String) {
+    for inline in inlines {
+        match inline {
+            Inline::Text { text, .. } => output.push_str(text),
+            Inline::SoftBreak => output.push('\n'),
+            Inline::Image { alt, .. } => output.push_str(alt),
+        }
+    }
+}
+
 pub fn resource_ids(document: &Document) -> Vec<String> {
     document
         .blocks
         .iter()
         .flat_map(|block| match block {
-            Block::Paragraph(inlines) => inlines
+            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => inlines
                 .iter()
+                .filter_map(|inline| match inline {
+                    Inline::Image { resource_id, .. }
+                        if crate::body::validate_resource_id(resource_id).is_ok() =>
+                    {
+                        Some(resource_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            Block::List { items, .. } => items
+                .iter()
+                .flat_map(|item| item.inlines.iter())
                 .filter_map(|inline| match inline {
                     Inline::Image { resource_id, .. }
                         if crate::body::validate_resource_id(resource_id).is_ok() =>
@@ -147,11 +304,15 @@ pub fn resource_ids(document: &Document) -> Vec<String> {
 
 fn block_is_empty(block: &Block) -> bool {
     match block {
-        Block::Paragraph(inlines) => inlines.iter().all(|inline| match inline {
+        Block::Paragraph { inlines, .. } => inlines.iter().all(|inline| match inline {
             Inline::Text { text, .. } => text.is_empty(),
             Inline::SoftBreak => false,
             Inline::Image { .. } => false,
         }),
+        // Headings and lists are semantic blocks even when they have no
+        // visible text. They must retain a reversible placeholder instead of
+        // disappearing as an all-empty document.
+        Block::Heading { .. } | Block::List { .. } => false,
     }
 }
 
@@ -159,9 +320,56 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
     blocks
         .into_iter()
         .map(|block| match block {
-            Block::Paragraph(inlines) => Block::Paragraph(normalize_inlines(inlines)),
+            Block::Paragraph { style, inlines } => Block::Paragraph {
+                style: normalize_style(style),
+                inlines: normalize_inlines(inlines),
+            },
+            Block::Heading {
+                level,
+                style,
+                inlines,
+            } => Block::Heading {
+                level,
+                style: normalize_style(style),
+                inlines: normalize_inlines(inlines),
+            },
+            Block::List { kind, items } => Block::List {
+                kind,
+                items: items
+                    .into_iter()
+                    .map(|item| ListItem {
+                        checked: if kind == ListKind::Checklist {
+                            Some(item.checked.unwrap_or(false))
+                        } else {
+                            None
+                        },
+                        style: normalize_style(item.style),
+                        inlines: normalize_inlines(item.inlines),
+                    })
+                    .collect(),
+            },
         })
-        .collect()
+        .fold(Vec::new(), |mut normalized, block| {
+            if let (
+                Some(Block::List {
+                    kind: previous_kind,
+                    items: previous_items,
+                }),
+                Block::List { kind, items },
+            ) = (normalized.last_mut(), &block)
+                && previous_kind == kind
+            {
+                previous_items.extend(items.clone());
+            } else {
+                normalized.push(block);
+            }
+            normalized
+        })
+}
+
+fn normalize_style(mut style: BlockStyle) -> BlockStyle {
+    style.indent = style.indent.min(8);
+    style
 }
 
 fn normalize_inlines(inlines: Vec<Inline>) -> Vec<Inline> {
@@ -209,19 +417,31 @@ fn append_normalized_text(inlines: &mut Vec<Inline>, text: &str, marks: &Marks) 
     if text.is_empty() {
         return;
     }
+    let marks = normalize_marks(marks);
     if let Some(Inline::Text {
         text: previous,
         marks: previous_marks,
     }) = inlines.last_mut()
-        && previous_marks == marks
+        && *previous_marks == marks
     {
         previous.push_str(text);
         return;
     }
     inlines.push(Inline::Text {
         text: text.to_owned(),
-        marks: marks.clone(),
+        marks,
     });
+}
+
+fn normalize_marks(marks: &Marks) -> Marks {
+    Marks {
+        bold: marks.bold,
+        italic: marks.italic,
+        underline: marks.underline,
+        strikethrough: marks.strikethrough,
+        highlight: marks.highlight,
+        link: marks.link.clone().filter(|value| valid_link(value)),
+    }
 }
 
 fn serialize_inlines(inlines: &[Inline], output: &mut String) {
@@ -251,6 +471,17 @@ fn serialize_text(
     index: usize,
     output: &mut String,
 ) {
+    if let Some(link) = marks.link.as_deref() {
+        output.push_str("<a href=\"");
+        escape_attribute(link, output);
+        output.push_str("\">");
+    }
+    if marks.highlight {
+        output.push_str("<mark>");
+    }
+    if marks.strikethrough {
+        output.push_str("<del>");
+    }
     if marks.bold {
         output.push_str("<strong>");
     }
@@ -269,6 +500,15 @@ fn serialize_text(
     }
     if marks.bold {
         output.push_str("</strong>");
+    }
+    if marks.strikethrough {
+        output.push_str("</del>");
+    }
+    if marks.highlight {
+        output.push_str("</mark>");
+    }
+    if marks.link.is_some() {
+        output.push_str("</a>");
     }
 }
 
@@ -710,9 +950,13 @@ fn project_dom(root: &DomHandle) -> Document {
 
     while let Some(frame) = pending.pop() {
         match frame {
-            ProjectionFrame::FinishBlock { blocks_before } => {
-                projection.finish_block(blocks_before);
-            }
+            ProjectionFrame::FinishBlock {
+                blocks_before,
+                kind,
+                style,
+            } => projection.finish_block(blocks_before, kind, style),
+            ProjectionFrame::FinishList => projection.finish_list(),
+            ProjectionFrame::FinishListItem => projection.finish_list_item(),
             ProjectionFrame::Visit {
                 node,
                 marks,
@@ -727,6 +971,70 @@ fn project_dom(root: &DomHandle) -> Document {
                         continue;
                     }
                     let children = node.children.borrow().clone();
+                    if tag == "ul" || tag == "ol" {
+                        let kind = if tag == "ol" {
+                            ListKind::Ordered
+                        } else if attribute(&attrs.borrow(), "data-type").as_deref()
+                            == Some("checklist")
+                        {
+                            ListKind::Checklist
+                        } else {
+                            ListKind::Unordered
+                        };
+                        projection.begin_list(kind);
+                        pending.push(ProjectionFrame::FinishList);
+                        for child in children.into_iter().rev() {
+                            pending.push(ProjectionFrame::Visit {
+                                node: child,
+                                marks: marks.clone(),
+                                preformatted,
+                            });
+                        }
+                        continue;
+                    }
+                    if tag == "li" && projection.current_list.is_some() {
+                        let style = block_style(&attrs.borrow(), 0);
+                        let checked = if projection
+                            .current_list
+                            .as_ref()
+                            .is_some_and(|list| list.kind == ListKind::Checklist)
+                        {
+                            Some(
+                                attribute(&attrs.borrow(), "data-checked").as_deref()
+                                    == Some("true"),
+                            )
+                        } else {
+                            None
+                        };
+                        projection.begin_list_item(style, checked);
+                        pending.push(ProjectionFrame::FinishListItem);
+                        for child in children.into_iter().rev() {
+                            pending.push(ProjectionFrame::Visit {
+                                node: child,
+                                marks: marks.clone(),
+                                preformatted,
+                            });
+                        }
+                        continue;
+                    }
+                    if let Some(level) = heading_level(&tag) {
+                        let blocks_before = projection.document.blocks.len();
+                        let style = block_style(&attrs.borrow(), 0);
+                        projection.begin_block(BlockKind::Heading(level), style);
+                        pending.push(ProjectionFrame::FinishBlock {
+                            blocks_before,
+                            kind: BlockKind::Heading(level),
+                            style,
+                        });
+                        for child in children.into_iter().rev() {
+                            pending.push(ProjectionFrame::Visit {
+                                node: child,
+                                marks: marks.clone(),
+                                preformatted,
+                            });
+                        }
+                        continue;
+                    }
                     if is_block_element(&tag)
                         || matches!(
                             tag.as_str(),
@@ -734,8 +1042,14 @@ fn project_dom(root: &DomHandle) -> Document {
                         )
                     {
                         let blocks_before = projection.document.blocks.len();
-                        projection.begin_block();
-                        pending.push(ProjectionFrame::FinishBlock { blocks_before });
+                        let style =
+                            block_style(&attrs.borrow(), if tag == "blockquote" { 1 } else { 0 });
+                        projection.begin_block(BlockKind::Paragraph, style);
+                        pending.push(ProjectionFrame::FinishBlock {
+                            blocks_before,
+                            kind: BlockKind::Paragraph,
+                            style,
+                        });
                         let child_preformatted = preformatted || tag == "pre";
                         for child in children.into_iter().rev() {
                             pending.push(ProjectionFrame::Visit {
@@ -764,6 +1078,16 @@ fn project_dom(root: &DomHandle) -> Document {
                         bold: marks.bold || matches!(tag.as_str(), "strong" | "b"),
                         italic: marks.italic || matches!(tag.as_str(), "em" | "i"),
                         underline: marks.underline || tag == "u",
+                        strikethrough: marks.strikethrough
+                            || matches!(tag.as_str(), "del" | "s" | "strike"),
+                        highlight: marks.highlight || tag == "mark",
+                        link: if marks.link.is_some() {
+                            marks.link.clone()
+                        } else if tag == "a" {
+                            attribute(&attrs.borrow(), "href").filter(|value| valid_link(value))
+                        } else {
+                            None
+                        },
                     };
                     for child in children.into_iter().rev() {
                         pending.push(ProjectionFrame::Visit {
@@ -801,13 +1125,34 @@ enum ProjectionFrame {
     },
     FinishBlock {
         blocks_before: usize,
+        kind: BlockKind,
+        style: BlockStyle,
     },
+    FinishList,
+    FinishListItem,
+}
+
+#[derive(Clone, Copy, Default)]
+enum BlockKind {
+    #[default]
+    Paragraph,
+    Heading(HeadingLevel),
+}
+
+struct WorkingList {
+    kind: ListKind,
+    items: Vec<ListItem>,
 }
 
 #[derive(Default)]
 struct Projection {
     document: Document,
     current: Option<Vec<Inline>>,
+    current_style: BlockStyle,
+    current_kind: BlockKind,
+    current_list: Option<WorkingList>,
+    current_item_style: BlockStyle,
+    current_item_checked: Option<bool>,
     explicit_softbreak: bool,
     pending_space: bool,
     pending_marks: Option<Marks>,
@@ -816,6 +1161,9 @@ struct Projection {
 
 impl Projection {
     fn finish(mut self) -> Document {
+        if self.current_list.is_some() {
+            self.finish_list();
+        }
         self.flush();
         Document::from_blocks(self.document.blocks)
     }
@@ -831,37 +1179,113 @@ impl Projection {
         if let Some(inlines) = self.current.take()
             && !inlines.is_empty()
         {
-            self.document.blocks.push(Block::Paragraph(inlines));
+            self.document.blocks.push(Block::Paragraph {
+                style: self.current_style,
+                inlines,
+            });
         }
     }
 
-    fn begin_block(&mut self) {
+    fn begin_block(&mut self, kind: BlockKind, style: BlockStyle) {
         self.flush();
         self.current = Some(Vec::new());
+        self.current_kind = kind;
+        self.current_style = style;
         self.explicit_softbreak = false;
     }
 
-    fn finish_block(&mut self, blocks_before: usize) {
+    fn finish_block(&mut self, blocks_before: usize, kind: BlockKind, style: BlockStyle) {
         let Some(inlines) = self.current.take() else {
             self.explicit_softbreak = false;
             self.pending_space = false;
             self.pending_marks = None;
             self.flow_has_visible = false;
             if self.document.blocks.len() == blocks_before {
-                self.document.blocks.push(Block::Paragraph(Vec::new()));
+                self.push_block(kind, style, Vec::new());
             }
             return;
         };
         let inlines = normalize_inlines(inlines);
         if inlines.len() == 1 && matches!(inlines[0], Inline::SoftBreak) && !self.explicit_softbreak
         {
-            self.document.blocks.push(Block::Paragraph(Vec::new()));
+            self.push_block(kind, style, Vec::new());
         } else if !inlines.is_empty() {
-            self.document.blocks.push(Block::Paragraph(inlines));
+            self.push_block(kind, style, inlines);
         } else if self.document.blocks.len() == blocks_before {
-            self.document.blocks.push(Block::Paragraph(Vec::new()));
+            self.push_block(kind, style, Vec::new());
         }
         self.explicit_softbreak = false;
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
+    }
+
+    fn push_block(&mut self, kind: BlockKind, style: BlockStyle, inlines: Vec<Inline>) {
+        self.document.blocks.push(match kind {
+            BlockKind::Paragraph => Block::Paragraph { style, inlines },
+            BlockKind::Heading(level) => Block::Heading {
+                level,
+                style,
+                inlines,
+            },
+        });
+    }
+
+    fn begin_list(&mut self, kind: ListKind) {
+        self.flush();
+        self.current_list = Some(WorkingList {
+            kind,
+            items: Vec::new(),
+        });
+        self.current = None;
+    }
+
+    fn begin_list_item(&mut self, style: BlockStyle, checked: Option<bool>) {
+        self.current = Some(Vec::new());
+        self.current_item_style = style;
+        self.current_item_checked = checked;
+        self.explicit_softbreak = false;
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
+    }
+
+    fn finish_list_item(&mut self) {
+        let Some(mut list) = self.current_list.take() else {
+            return;
+        };
+        let inlines = normalize_inlines(self.current.take().unwrap_or_default());
+        let inlines = if inlines.len() == 1
+            && matches!(inlines[0], Inline::SoftBreak)
+            && !self.explicit_softbreak
+        {
+            Vec::new()
+        } else {
+            inlines
+        };
+        list.items.push(ListItem {
+            checked: self.current_item_checked,
+            style: self.current_item_style,
+            inlines,
+        });
+        self.current_list = Some(list);
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
+        self.explicit_softbreak = false;
+    }
+
+    fn finish_list(&mut self) {
+        if self.current.is_some() {
+            self.finish_list_item();
+        }
+        if let Some(list) = self.current_list.take() {
+            self.document.blocks.push(Block::List {
+                kind: list.kind,
+                items: list.items,
+            });
+        }
+        self.current = None;
         self.pending_space = false;
         self.pending_marks = None;
         self.flow_has_visible = false;
@@ -963,6 +1387,39 @@ fn attribute(attrs: &[Attribute], name: &str) -> Option<String> {
         .map(|attribute| attribute.value.to_string())
 }
 
+fn valid_link(value: &str) -> bool {
+    if value.chars().any(char::is_control) {
+        return false;
+    }
+    ["http://", "https://", "mailto:"].iter().any(|prefix| {
+        value
+            .get(..prefix.len())
+            .is_some_and(|head| value.len() > prefix.len() && head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+fn block_style(attrs: &[Attribute], default_indent: u8) -> BlockStyle {
+    let alignment = match attribute(attrs, "data-align").as_deref() {
+        Some("center") => Alignment::Center,
+        Some("right") => Alignment::Right,
+        _ => Alignment::Left,
+    };
+    let indent = attribute(attrs, "data-indent")
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(default_indent)
+        .min(8);
+    BlockStyle { alignment, indent }
+}
+
+fn heading_level(tag: &str) -> Option<HeadingLevel> {
+    match tag {
+        "h1" => Some(HeadingLevel::One),
+        "h2" => Some(HeadingLevel::Two),
+        "h3" => Some(HeadingLevel::Three),
+        _ => None,
+    }
+}
+
 fn is_block_element(name: &str) -> bool {
     matches!(name, "p" | "h1" | "h2" | "h3" | "li" | "pre" | "blockquote")
 }
@@ -978,9 +1435,80 @@ mod tests {
 
     const RESOURCE_ID: &str = "0123456789abcdef0123456789abcdef";
 
+    fn paragraph(inlines: Vec<Inline>) -> Block {
+        Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines,
+        }
+    }
+
+    #[test]
+    fn semantic_blocks_and_marks_have_canonical_html() {
+        let document = Document::from_blocks(vec![
+            Block::Heading {
+                level: HeadingLevel::Two,
+                style: BlockStyle {
+                    alignment: Alignment::Center,
+                    indent: 2,
+                },
+                inlines: vec![Inline::Text {
+                    text: "标题".into(),
+                    marks: Marks {
+                        strikethrough: true,
+                        highlight: true,
+                        link: Some("https://example.com/a".into()),
+                        ..Marks::default()
+                    },
+                }],
+            },
+            Block::List {
+                kind: ListKind::Checklist,
+                items: vec![
+                    ListItem {
+                        checked: Some(false),
+                        style: BlockStyle::default(),
+                        inlines: vec![Inline::Text {
+                            text: "待办".into(),
+                            marks: Marks::default(),
+                        }],
+                    },
+                    ListItem {
+                        checked: Some(true),
+                        style: BlockStyle::default(),
+                        inlines: vec![Inline::Text {
+                            text: "完成".into(),
+                            marks: Marks::default(),
+                        }],
+                    },
+                ],
+            },
+        ]);
+        let html = serialize_html(&document);
+        assert_eq!(
+            html,
+            "<h2 data-align=\"center\" data-indent=\"2\"><a href=\"https://example.com/a\"><mark><del>标题</del></mark></a></h2><ul data-type=\"checklist\"><li data-checked=\"false\">待办</li><li data-checked=\"true\">完成</li></ul>"
+        );
+        assert_eq!(serialize_html(&parse_html(&html).unwrap()), html);
+        assert_eq!(search_text(&parse_html(&html).unwrap()), "标题\n待办\n完成");
+    }
+
+    #[test]
+    fn unsafe_links_and_css_are_visible_or_discarded() {
+        let document = parse_html(
+            r#"<p style="color:red" onclick="alert(1)"><a href="javascript:alert(1)">危险</a><a href="mailto:a@example.com">安全</a><a href="http://safe
+bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
+        )
+        .unwrap();
+        assert_eq!(search_text(&document), "危险安全控制字符相对路径");
+        assert_eq!(
+            serialize_html(&document),
+            "<p>危险<a href=\"mailto:a@example.com\">安全</a>控制字符相对路径</p>"
+        );
+    }
+
     #[test]
     fn escapes_unicode_text_and_preserves_significant_whitespace() {
-        let document = Document::from_blocks(vec![Block::Paragraph(vec![Inline::Text {
+        let document = Document::from_blocks(vec![paragraph(vec![Inline::Text {
             text: "  中文 😀 & < > \" '  ".into(),
             marks: Marks::default(),
         }])]);
@@ -995,13 +1523,14 @@ mod tests {
     #[test]
     fn paragraphs_marks_breaks_and_images_round_trip_in_order() {
         let document = Document::from_blocks(vec![
-            Block::Paragraph(vec![
+            paragraph(vec![
                 Inline::Text {
                     text: "前".into(),
                     marks: Marks {
                         bold: true,
                         italic: false,
                         underline: false,
+                        ..Marks::default()
                     },
                 },
                 Inline::SoftBreak,
@@ -1015,10 +1544,11 @@ mod tests {
                         bold: false,
                         italic: true,
                         underline: true,
+                        ..Marks::default()
                     },
                 },
             ]),
-            Block::Paragraph(Vec::new()),
+            paragraph(Vec::new()),
         ]);
         let html = serialize_html(&document);
         assert_eq!(
@@ -1030,12 +1560,13 @@ mod tests {
 
     #[test]
     fn identical_documents_have_identical_html_bytes() {
-        let document = Document::from_blocks(vec![Block::Paragraph(vec![Inline::Text {
+        let document = Document::from_blocks(vec![paragraph(vec![Inline::Text {
             text: "稳定输出".into(),
             marks: Marks {
                 bold: true,
                 italic: true,
                 underline: true,
+                ..Marks::default()
             },
         }])]);
         assert_eq!(serialize_html(&document), serialize_html(&document));
@@ -1054,7 +1585,7 @@ mod tests {
         assert_eq!(resource_ids(&document), vec![RESOURCE_ID]);
         assert_eq!(
             document,
-            Document::from_blocks(vec![Block::Paragraph(vec![
+            Document::from_blocks(vec![paragraph(vec![
                 Inline::Image {
                     resource_id: RESOURCE_ID.into(),
                     alt: "ok".into(),
@@ -1095,9 +1626,76 @@ mod tests {
         assert_eq!(serialize_html(&Document::default()), "");
         assert_eq!(serialize_html(&Document::from_blocks(vec![])), "");
         assert_eq!(
-            serialize_html(&Document::from_blocks(vec![Block::Paragraph(vec![])])),
+            serialize_html(&Document::from_blocks(vec![paragraph(vec![])])),
             ""
         );
+    }
+
+    #[test]
+    fn empty_semantic_blocks_and_items_remain_reversible() {
+        let document = Document::from_blocks(vec![
+            Block::Heading {
+                level: HeadingLevel::One,
+                style: BlockStyle::default(),
+                inlines: Vec::new(),
+            },
+            Block::List {
+                kind: ListKind::Unordered,
+                items: vec![ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: Vec::new(),
+                }],
+            },
+        ]);
+        let html = serialize_html(&document);
+        assert_eq!(html, "<h1><br></h1><ul><li><br></li></ul>");
+        assert_eq!(parse_html(&html).unwrap(), document);
+
+        let empty_list = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Ordered,
+            items: Vec::new(),
+        }]);
+        assert_eq!(serialize_html(&empty_list), "<ol></ol>");
+        assert_eq!(parse_html("<ol></ol>").unwrap(), empty_list);
+    }
+
+    #[test]
+    fn all_list_kinds_and_item_styles_have_stable_projection() {
+        let document = Document::from_blocks(vec![
+            Block::List {
+                kind: ListKind::Unordered,
+                items: vec![ListItem {
+                    checked: Some(true),
+                    style: BlockStyle {
+                        alignment: Alignment::Right,
+                        indent: 9,
+                    },
+                    inlines: vec![Inline::Text {
+                        text: "bullet".into(),
+                        marks: Marks::default(),
+                    }],
+                }],
+            },
+            Block::List {
+                kind: ListKind::Ordered,
+                items: vec![ListItem {
+                    checked: Some(false),
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "number".into(),
+                        marks: Marks::default(),
+                    }],
+                }],
+            },
+        ]);
+        let html = serialize_html(&document);
+        assert_eq!(
+            html,
+            "<ul><li data-align=\"right\" data-indent=\"8\">bullet</li></ul><ol><li>number</li></ol>"
+        );
+        assert_eq!(serialize_html(&parse_html(&html).unwrap()), html);
+        assert_eq!(search_text(&parse_html(&html).unwrap()), "bullet\nnumber");
     }
 
     #[test]
@@ -1119,7 +1717,7 @@ mod tests {
         assert_eq!(search_text(&script), "beforeafter");
         assert_eq!(
             script.blocks,
-            vec![Block::Paragraph(vec![Inline::Text {
+            vec![paragraph(vec![Inline::Text {
                 text: "beforeafter".into(),
                 marks: Marks {
                     bold: true,
@@ -1140,8 +1738,8 @@ mod tests {
         assert_eq!(
             document,
             Document::from_blocks(vec![
-                Block::Paragraph(Vec::new()),
-                Block::Paragraph(vec![Inline::Text {
+                paragraph(Vec::new()),
+                paragraph(vec![Inline::Text {
                     text: "text".into(),
                     marks: Marks::default(),
                 }]),
@@ -1153,12 +1751,12 @@ mod tests {
         assert_eq!(nested.blocks.len(), 2);
         assert!(matches!(
             nested.blocks[0],
-            Block::Paragraph(ref inlines)
+            Block::Paragraph { ref inlines, .. }
                 if matches!(&inlines[0], Inline::Text { marks, .. } if marks.bold)
         ));
         assert!(matches!(
             nested.blocks[1],
-            Block::Paragraph(ref inlines)
+            Block::Paragraph { ref inlines, .. }
                 if matches!(&inlines[0], Inline::Text { text, marks } if text == "two" && marks.bold)
                     && matches!(&inlines[1], Inline::Text { text, marks } if text == "three" && !marks.bold)
         ));
@@ -1169,7 +1767,7 @@ mod tests {
         let document = parse_html("<p>&nbsp;a\tb\r\nc&nbsp;</p>").unwrap();
         assert_eq!(
             document,
-            Document::from_blocks(vec![Block::Paragraph(vec![
+            Document::from_blocks(vec![paragraph(vec![
                 Inline::Text {
                     text: "\u{00a0}a    b".into(),
                     marks: Marks::default(),
@@ -1196,7 +1794,7 @@ mod tests {
         let document = parse_html("<pre>  first\n  second</pre>").unwrap();
         assert_eq!(
             document,
-            Document::from_blocks(vec![Block::Paragraph(vec![
+            Document::from_blocks(vec![paragraph(vec![
                 Inline::Text {
                     text: "  first".into(),
                     marks: Marks::default(),
@@ -1216,7 +1814,7 @@ mod tests {
 
     #[test]
     fn ordinary_spaces_remain_natural_breaks_across_mark_runs() {
-        let document = Document::from_blocks(vec![Block::Paragraph(vec![
+        let document = Document::from_blocks(vec![paragraph(vec![
             Inline::Text {
                 text: "one ".into(),
                 marks: Marks::default(),
@@ -1238,7 +1836,7 @@ mod tests {
             "<p>one <strong>two</strong> three</p>"
         );
 
-        let repeated = Document::from_blocks(vec![Block::Paragraph(vec![
+        let repeated = Document::from_blocks(vec![paragraph(vec![
             Inline::Text {
                 text: "a ".into(),
                 marks: Marks::default(),
@@ -1301,7 +1899,7 @@ mod tests {
 
     #[test]
     fn public_text_boundaries_normalize_tabs_newlines_and_adjacent_runs() {
-        let document = Document::from_blocks(vec![Block::Paragraph(vec![
+        let document = Document::from_blocks(vec![paragraph(vec![
             Inline::Text {
                 text: "a\tb".into(),
                 marks: Marks::default(),
@@ -1317,7 +1915,7 @@ mod tests {
         ])]);
         assert_eq!(
             document,
-            Document::from_blocks(vec![Block::Paragraph(vec![
+            Document::from_blocks(vec![paragraph(vec![
                 Inline::Text {
                     text: "a    bc".into(),
                     marks: Marks::default(),
@@ -1334,12 +1932,12 @@ mod tests {
     #[test]
     fn empty_paragraphs_have_a_visible_reversible_placeholder() {
         let document = Document::from_blocks(vec![
-            Block::Paragraph(vec![Inline::Text {
+            paragraph(vec![Inline::Text {
                 text: "first".into(),
                 marks: Marks::default(),
             }]),
-            Block::Paragraph(Vec::new()),
-            Block::Paragraph(vec![Inline::Text {
+            paragraph(Vec::new()),
+            paragraph(vec![Inline::Text {
                 text: "last".into(),
                 marks: Marks::default(),
             }]),
@@ -1349,8 +1947,8 @@ mod tests {
         assert_eq!(parse_html(&html).unwrap(), document);
         assert_eq!(
             serialize_html(&Document::from_blocks(vec![
-                Block::Paragraph(Vec::new()),
-                Block::Paragraph(Vec::new()),
+                paragraph(Vec::new()),
+                paragraph(Vec::new()),
             ])),
             ""
         );
@@ -1399,7 +1997,7 @@ mod tests {
         let document = parse_html("<p><strong><em>x</strong>y</em>z</p>").unwrap();
         assert_eq!(
             document,
-            Document::from_blocks(vec![Block::Paragraph(vec![
+            Document::from_blocks(vec![paragraph(vec![
                 Inline::Text {
                     text: "x".into(),
                     marks: Marks {

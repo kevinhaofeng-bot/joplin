@@ -160,6 +160,9 @@ fn marks_from_attributes(attributes: &NSDictionary<NSAttributedStringKey, AnyObj
         bold: font_traits.0,
         italic: font_traits.1,
         underline,
+        strikethrough: false,
+        highlight: false,
+        link: None,
     }
 }
 
@@ -248,7 +251,13 @@ fn document_from_attributed_string(
         location = next;
     }
     Ok(Document::from_blocks(
-        blocks.into_iter().map(Block::Paragraph).collect(),
+        blocks
+            .into_iter()
+            .map(|inlines| Block::Paragraph {
+                style: Default::default(),
+                inlines,
+            })
+            .collect(),
     ))
 }
 
@@ -296,7 +305,14 @@ where
     let output = NSMutableAttributedString::from_nsstring(ns_string!(""));
     let mut attachment_failures = 0;
     for (block_index, block) in document.blocks.iter().enumerate() {
-        let Block::Paragraph(inlines) = block;
+        let inlines: Vec<&Inline> = match block {
+            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => {
+                inlines.iter().collect()
+            }
+            Block::List { items, .. } => {
+                items.iter().flat_map(|item| item.inlines.iter()).collect()
+            }
+        };
         for inline in inlines {
             match inline {
                 Inline::Text { text, marks } => {
@@ -2668,10 +2684,13 @@ impl AppDelegate {
                 }
             }
         } else {
-            let document = Document::from_blocks(vec![Block::Paragraph(vec![Inline::Text {
-                text: body_view.string().to_string(),
-                marks: Marks::default(),
-            }])]);
+            let document = Document::from_blocks(vec![Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: body_view.string().to_string(),
+                    marks: Marks::default(),
+                }],
+            }]);
             PreparedNoteContent {
                 update: NoteContentUpdate {
                     title,
@@ -3274,6 +3293,13 @@ mod tests {
         0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
 
+    fn paragraph(inlines: Vec<Inline>) -> Block {
+        Block::Paragraph {
+            style: Default::default(),
+            inlines,
+        }
+    }
+
     #[test]
     fn attributed_document_codec_preserves_cjk_emoji_marks_and_paragraphs() {
         let source = NSMutableAttributedString::from_nsstring(&NSString::from_str(
@@ -3435,14 +3461,14 @@ mod tests {
         assert_eq!(serialize_html(&document), "<p>前[图片]后</p>");
         assert!(matches!(
             document.blocks[0],
-            Block::Paragraph(ref inlines)
+            Block::Paragraph { ref inlines, .. }
                 if inlines.iter().any(|inline| matches!(inline, Inline::Text { text, .. } if text.contains("[图片]")))
         ));
     }
 
     #[test]
     fn html_document_codec_preserves_known_image_position_and_alt() {
-        let document = Document::from_blocks(vec![Block::Paragraph(vec![
+        let document = Document::from_blocks(vec![paragraph(vec![
             Inline::Text {
                 text: "前".into(),
                 marks: Marks {
@@ -3485,7 +3511,7 @@ mod tests {
 
     #[test]
     fn missing_image_placeholder_preserves_reference_on_editor_round_trip() {
-        let document = Document::from_blocks(vec![Block::Paragraph(vec![
+        let document = Document::from_blocks(vec![paragraph(vec![
             Inline::Text {
                 text: "前".into(),
                 marks: Marks::default(),
