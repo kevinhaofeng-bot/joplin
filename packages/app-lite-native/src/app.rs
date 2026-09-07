@@ -3504,15 +3504,6 @@ define_class!(
         }
     }
 
-    #[unsafe(method(selectNote:))]
-    fn select_note(&self, sender: &NSButton) {
-        let index = sender.tag();
-        if index < 0 {
-            return;
-        }
-        self.select_note_index(index as usize);
-    }
-
     #[unsafe(method(searchNotes:))]
     fn search_notes_action(&self, sender: &NSSearchField) {
         self.search_notes(&sender.stringValue().to_string());

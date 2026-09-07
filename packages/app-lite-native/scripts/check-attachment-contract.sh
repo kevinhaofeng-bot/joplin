@@ -12,18 +12,49 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-EXPECTED_VERSION="0.4.0"
+EXPECTED_VERSION="0.6.0"
 SOURCE_SCAN="$(mktemp "${TMPDIR:-/tmp}/joplin-lite-source.XXXXXX")"
-cleanup_source_scan() { rm -f -- "$SOURCE_SCAN"; }
-trap cleanup_source_scan EXIT
-for source in "$PACKAGE_DIR"/src/app.rs "$PACKAGE_DIR"/src/core.rs; do
-  awk '/^mod tests[[:space:]]*\{/{exit} {print}' "$source" >>"$SOURCE_SCAN"
+MACHO_LIST=""
+cleanup() {
+  [[ -z "$MACHO_LIST" ]] || rm -f -- "$MACHO_LIST"
+  rm -f -- "$SOURCE_SCAN"
+}
+trap cleanup EXIT
+while IFS= read -r source; do
+  # Keep the contract focused on production code. Test modules are appended
+  # after the production implementation in each source file.
+  awk '/^mod tests[[:space:]]*\{/{exit} {print}' \
+    "$source" >>"$SOURCE_SCAN"
+done < <(find "$PACKAGE_DIR/src" -type f -name '*.rs' -print | sort)
+
+for production_marker in 'define_class!' 'ThumbnailRuntime' 'enum EditorAction'; do
+  if ! rg -q --fixed-strings "$production_marker" "$SOURCE_SCAN"; then
+    echo "production source scan is incomplete; missing marker: $production_marker" >&2
+    exit 1
+  fi
 done
 
 if rg -n 'RTFFromRange|RtfLoadDecision|RtfSavePlan|sanitized_rtf_from_editor|rtf_save_plan|rtf_load_decision|rtf_text_matches_body|editor_save_projection|editor_segments_with_ranges' "$SOURCE_SCAN"; then
   echo "obsolete normal-runtime RTF save/load path is present" >&2
   exit 1
 fi
+if rg -n -i 'tauri|electron|node\.js|wkwebview|webkit|javascriptcore|nsstackview|note_rows|note_buttons|list_stack|tag.?index|selectNote:' "$SOURCE_SCAN"; then
+  echo "forbidden runtime, eager note-row, or legacy tag-index path is present" >&2
+  exit 1
+fi
+if rg -n '"[^"\n]*(AI|分享|协作|字体族|任意颜色|font family|font-family|color picker)[^"\n]*"' "$SOURCE_SCAN"; then
+  echo "unsupported toolbar action label is present" >&2
+  exit 1
+fi
+for label in '插入图片' '撤销' '重做' '正文/标题' '粗体' '斜体' '下划线' '高亮' \
+  '项目符号' '编号列表' '清单' '链接' '左对齐' '居中' '右对齐' \
+  '增加缩进' '减少缩进' '删除线' '清除格式' '更多'; do
+  if ! rg -q --fixed-strings "label: \"$label\"" "$SOURCE_SCAN" \
+    && ! rg -q --fixed-strings "\"$label\"" "$SOURCE_SCAN"; then
+    echo "toolbar catalogue is missing label: $label" >&2
+    exit 1
+  fi
+done
 if rg -n 'body_rtf[[:space:]]*=' "$SOURCE_SCAN" | rg -v "body_rtf[[:space:]]*=[[:space:]]*X''"; then
   echo "normal runtime must only write an empty legacy body_rtf column" >&2
   exit 1
@@ -40,9 +71,13 @@ test -d "$APP_PATH"
 test -f "$PLIST"
 test -f "$CONTENTS_PATH/Resources/AppIcon.icns"
 test -s "$CONTENTS_PATH/Resources/AppIcon.icns"
+PACKAGE_VERSION="$(awk -F'"' '$1 ~ /^[[:space:]]*version[[:space:]]*=/ { print $2; exit }' "$PACKAGE_DIR/Cargo.toml")"
+test "$PACKAGE_VERSION" = "$EXPECTED_VERSION"
 test "$(plutil -extract CFBundleIconFile raw -o - "$PLIST")" = "AppIcon"
 test "$(plutil -extract CFBundleShortVersionString raw -o - "$PLIST")" = "$EXPECTED_VERSION"
 test "$(plutil -extract CFBundleVersion raw -o - "$PLIST")" = "$EXPECTED_VERSION"
+BUNDLE_IDENTIFIER="$(plutil -extract CFBundleIdentifier raw -o - "$PLIST")"
+test -n "$BUNDLE_IDENTIFIER"
 
 EXECUTABLE_NAME="$(plutil -extract CFBundleExecutable raw -o - "$PLIST")"
 test -n "$EXECUTABLE_NAME"
@@ -52,8 +87,12 @@ if [[ -L "$EXECUTABLE_PATH" ]]; then
   echo "bundle executable must not be a symlink" >&2
   exit 1
 fi
-if [[ -d "$CONTENTS_PATH/Helpers" ]] && find "$CONTENTS_PATH/Helpers" -type f -print -quit | grep -q .; then
+if [[ -d "$CONTENTS_PATH/Helpers" ]]; then
   echo "child helper executables are forbidden" >&2
+  exit 1
+fi
+if find "$CONTENTS_PATH" \( -type d -name '*.framework' -o -path "$CONTENTS_PATH/Frameworks" \) -print -quit | grep -q .; then
+  echo "embedded frameworks are forbidden; use system frameworks only" >&2
   exit 1
 fi
 if find "$CONTENTS_PATH/MacOS" -type f ! -name "$EXECUTABLE_NAME" -print -quit | grep -q .; then
@@ -84,8 +123,6 @@ if find "$APP_PATH" \( \
 fi
 
 MACHO_LIST="$(mktemp "${TMPDIR:-/tmp}/joplin-lite-macho.XXXXXX")"
-cleanup() { rm -f -- "$MACHO_LIST"; }
-trap cleanup EXIT
 find "$APP_PATH" -type f -print >"$MACHO_LIST"
 while IFS= read -r candidate; do
   [[ -n "$candidate" ]] || continue
@@ -105,3 +142,5 @@ while IFS= read -r candidate; do
 done <"$MACHO_LIST"
 
 codesign --verify --deep --strict "$APP_PATH"
+SIGNED_IDENTIFIER="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1 | sed -n 's/^Identifier=//p' | head -n 1)"
+test "$SIGNED_IDENTIFIER" = "$BUNDLE_IDENTIFIER"
