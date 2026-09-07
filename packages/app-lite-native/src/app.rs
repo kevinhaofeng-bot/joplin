@@ -1113,7 +1113,10 @@ define_class!(
             body.registerForDraggedTypes(&drag_types);
             body.setEditable(true);
             body.setRichText(true);
-            body.setAllowsUndo(true);
+            // NativeEditorSession owns the only undo history.  NSTextView is
+            // deliberately kept as a projection so it cannot create a
+            // second, divergent undo stack for the same edit.
+            body.setAllowsUndo(false);
             body.setImportsGraphics(false);
             body.setUsesFontPanel(false);
             body.setDrawsBackground(false);
@@ -1370,27 +1373,29 @@ define_class!(
 
     #[unsafe(method(undoText:))]
     fn undo_text(&self, _sender: &NSObject) {
-        if let Some(manager) = self
+        let changed = self
             .ivars()
-            .body_view
-            .get()
-            .and_then(|body| body.undoManager())
-            && manager.canUndo()
-        {
-            manager.undo();
+            .editor_session
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|session| session.can_undo() && session.undo().is_ok());
+        if changed {
+            self.refresh_body_from_session();
+            self.save_current_note();
         }
     }
 
     #[unsafe(method(redoText:))]
     fn redo_text(&self, _sender: &NSObject) {
-        if let Some(manager) = self
+        let changed = self
             .ivars()
-            .body_view
-            .get()
-            .and_then(|body| body.undoManager())
-            && manager.canRedo()
-        {
-            manager.redo();
+            .editor_session
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|session| session.can_redo() && session.redo().is_ok());
+        if changed {
+            self.refresh_body_from_session();
+            self.save_current_note();
         }
     }
 
@@ -1463,6 +1468,48 @@ define_class!(
 );
 
 impl AppDelegate {
+    fn refresh_body_from_session(&self) {
+        let Some(document) = self
+            .ivars()
+            .editor_session
+            .borrow()
+            .as_ref()
+            .and_then(|session| document_from_session(session).ok())
+        else {
+            return;
+        };
+        let Some(body) = self.ivars().body_view.get() else {
+            return;
+        };
+        let (rendered, failures) = render_note_document(
+            &document,
+            &self.ivars().repository,
+            text_container_available_width(body),
+        );
+        let previous_loading_guard = *self.ivars().loading_guard.borrow();
+        *self.ivars().loading_guard.borrow_mut() = true;
+        if let Some(storage) = unsafe { body.textStorage() } {
+            storage.setAttributedString(&rendered);
+        }
+        body.setSelectedRange(NSRange::new(0, 0));
+        *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
+        if failures == 0 {
+            self.set_save_status("已保存", false);
+        } else {
+            self.set_save_status("部分图片未恢复，已保留引用", true);
+        }
+        self.update_formatting_buttons();
+    }
+
+    fn native_undo_state(&self) -> (bool, bool) {
+        self.ivars()
+            .editor_session
+            .borrow()
+            .as_ref()
+            .map(|session| (session.can_undo(), session.can_redo()))
+            .unwrap_or((false, false))
+    }
+
     fn sync_editor_session_from_view(&self) {
         if *self.ivars().loading_guard.borrow() {
             return;
@@ -1543,17 +1590,13 @@ impl AppDelegate {
             body.insertText(&NSString::from_str("A") as &AnyObject);
             body.insertText(&NSString::from_str("B") as &AnyObject);
         }
-        if let Some(manager) = body.undoManager() {
-            manager.undo();
-        }
+        let sender = NSObject::new();
+        self.undo_text(sel!(undoText:), &sender);
         self.save_current_note();
 
         let before_string = body.string().to_string();
         let before_selection = body.selectedRange();
-        let (before_can_undo, before_can_redo) = body
-            .undoManager()
-            .map(|manager| (manager.canUndo(), manager.canRedo()))
-            .unwrap_or((false, false));
+        let (before_can_undo, before_can_redo) = self.native_undo_state();
         let smoke_resource = joplin_lite_native::core::StoredResource {
             id: "0123456789abcdef0123456789abcdef".into(),
             sha256: "0".repeat(64),
@@ -1571,10 +1614,7 @@ impl AppDelegate {
         let failed = commit_live_image_insert(body, before_selection, &inline, || false);
         let after_failure_string = body.string().to_string();
         let after_failure_selection = body.selectedRange();
-        let (after_failure_can_undo, after_failure_can_redo) = body
-            .undoManager()
-            .map(|manager| (manager.canUndo(), manager.canRedo()))
-            .unwrap_or((false, false));
+        let (after_failure_can_undo, after_failure_can_redo) = self.native_undo_state();
         println!(
             "nativeUndoSmoke failure result={} unchanged={} selection_unchanged={} undo_unchanged={} redo_unchanged={}",
             failed,
@@ -1589,10 +1629,7 @@ impl AppDelegate {
             let truncated_result = self.insert_image_data(&truncated, "truncated.png", "image/png");
             let after_truncated_string = body.string().to_string();
             let after_truncated_selection = body.selectedRange();
-            let (after_truncated_can_undo, after_truncated_can_redo) = body
-                .undoManager()
-                .map(|manager| (manager.canUndo(), manager.canRedo()))
-                .unwrap_or((false, false));
+            let (after_truncated_can_undo, after_truncated_can_redo) = self.native_undo_state();
             println!(
                 "nativeUndoSmoke truncated result={} unchanged={} selection_unchanged={} undo_unchanged={} redo_unchanged={}",
                 truncated_result,
@@ -1655,9 +1692,7 @@ impl AppDelegate {
         let before = first_attachment_bounds(body);
         let before_line = first_attachment_line_metrics(body);
         let before_selection = body.selectedRange();
-        let before_undo = body
-            .undoManager()
-            .map(|manager| (manager.canUndo(), manager.canRedo()));
+        let before_undo = Some(self.native_undo_state());
         if let Some(window) = self.ivars().window.get() {
             window.setContentSize(NSSize::new(860.0, 560.0));
             window.displayIfNeeded();
@@ -1667,9 +1702,7 @@ impl AppDelegate {
         let after = first_attachment_bounds(body);
         let after_line = first_attachment_line_metrics(body);
         let after_selection = body.selectedRange();
-        let after_undo = body
-            .undoManager()
-            .map(|manager| (manager.canUndo(), manager.canRedo()));
+        let after_undo = Some(self.native_undo_state());
         *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
         let aspect_preserved = before.zip(after).is_some_and(|(before, after)| {
             (before.size.width * after.size.height - after.size.width * before.size.height).abs()

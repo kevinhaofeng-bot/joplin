@@ -113,6 +113,10 @@ impl NativeEditorSession {
         self.text.can_undo()
     }
 
+    pub fn can_redo(&self) -> bool {
+        self.text.can_redo()
+    }
+
     pub fn undo(&mut self) -> Result<(), EditorCodecError> {
         self.text.undo().map_err(model_error)?;
         self.revision = self.revision.wrapping_add(1);
