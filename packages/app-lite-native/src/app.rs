@@ -32,19 +32,19 @@ use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationTerminateReply, NSAttachmentAttributeName,
     NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
-    NSBackingStoreType, NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep, NSBorderType, NSBox,
-    NSBoxType, NSButton, NSButtonType, NSCellImagePosition, NSCollectionView,
-    NSCollectionViewDataSource, NSCollectionViewDelegate, NSCollectionViewFlowLayout,
-    NSCollectionViewItem, NSColor, NSControlStateValueMixed, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination,
-    NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName, NSImage,
-    NSIndexPathNSCollectionViewAdditions, NSLineBreakMode, NSMenu, NSMenuItem, NSModalResponseOK,
-    NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle, NSParagraphStyleAttributeName,
-    NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder,
-    NSScrollView, NSSearchField, NSText, NSTextAlignment, NSTextAttachment, NSTextDelegate,
-    NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextStorage, NSTextView,
-    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSBackgroundColorAttributeName, NSBackingStoreType, NSBezelStyle, NSBitmapImageFileType,
+    NSBitmapImageRep, NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSCellImagePosition,
+    NSCollectionView, NSCollectionViewDataSource, NSCollectionViewDelegate,
+    NSCollectionViewFlowLayout, NSCollectionViewItem, NSColor, NSControlStateValueMixed,
+    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation,
+    NSDraggingDestination, NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName,
+    NSImage, NSIndexPathNSCollectionViewAdditions, NSLayoutManager, NSLineBreakMode, NSMenu,
+    NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle,
+    NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
+    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSText, NSTextAlignment,
+    NSTextAttachment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextInputClient,
+    NSTextStorage, NSTextView, NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
+    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
@@ -2946,6 +2946,7 @@ define_class!(
                     loading_guard,
                 );
             }
+            self.refresh_search_highlights(body, false);
             self.update_formatting_buttons();
             if should_persist_after_editor_sync(sync_result) {
                 if matches!(sync_result, EditorSessionSyncResult::Applied) {
@@ -4060,6 +4061,23 @@ impl AppDelegate {
             }
         }
         self.set_selected_range_programmatically(body, NSRange::new(location, length));
+        self.refresh_search_highlights(body, false);
+    }
+
+    fn refresh_search_highlights(&self, body: &NSTextView, scroll_to_first: bool) {
+        let Some(layout_manager) = (unsafe { body.layoutManager() }) else {
+            return;
+        };
+        let query = if self.ivars().current_note_id.borrow().is_some() {
+            self.ivars().note_filter_query.borrow().clone()
+        } else {
+            String::new()
+        };
+        let text = body.string().to_string();
+        let ranges = apply_search_highlights(&layout_manager, &text, &query);
+        if scroll_to_first && let Some(range) = ranges.first() {
+            body.scrollRangeToVisible(*range);
+        }
     }
 
     fn refresh_body_from_session(&self) {
@@ -5402,6 +5420,7 @@ impl AppDelegate {
             }
         };
         *self.ivars().loading_guard.borrow_mut() = false;
+        self.refresh_search_highlights(body, true);
         self.set_save_status(status, is_error);
         self.update_editor_visibility();
         self.update_note_selection();
@@ -5432,6 +5451,7 @@ impl AppDelegate {
             .unwrap()
             .setString(ns_string!(""));
         *self.ivars().loading_guard.borrow_mut() = false;
+        self.refresh_search_highlights(self.ivars().body_view.get().unwrap(), false);
         self.update_editor_visibility();
         self.update_note_selection();
     }
@@ -5518,6 +5538,9 @@ impl AppDelegate {
         *self.ivars().note_filter_query.borrow_mut() = query.to_owned();
         if let Ok(items) = self.note_list_items(query) {
             self.replace_note_list(items);
+        }
+        if let Some(body) = self.ivars().body_view.get() {
+            self.refresh_search_highlights(body, false);
         }
     }
 
@@ -6036,6 +6059,111 @@ fn text_container_available_width(body: &NSTextView) -> f64 {
     })
 }
 
+fn search_match_ranges(text: &str, query: &str) -> Vec<NSRange> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed.contains('\u{fffc}') {
+        return Vec::new();
+    }
+
+    let mut terms = Vec::<Vec<char>>::new();
+    for candidate in std::iter::once(trimmed).chain(trimmed.split_whitespace()) {
+        if candidate.is_empty() || candidate.contains('\u{fffc}') {
+            continue;
+        }
+        let folded = candidate.chars().map(ascii_fold_char).collect::<Vec<_>>();
+        if folded.is_empty() || terms.iter().any(|term| term == &folded) {
+            continue;
+        }
+        terms.push(folded);
+    }
+    if terms.is_empty() {
+        return Vec::new();
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let utf16_offsets = chars
+        .iter()
+        .scan(0usize, |offset, character| {
+            let start = *offset;
+            *offset += character.len_utf16();
+            Some(start)
+        })
+        .chain(std::iter::once(
+            chars.iter().map(|character| character.len_utf16()).sum(),
+        ))
+        .collect::<Vec<_>>();
+
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\u{fffc}' {
+            index += 1;
+            continue;
+        }
+        let matched = terms.iter().find_map(|term| {
+            if index + term.len() > chars.len()
+                || chars[index..index + term.len()].contains(&'\u{fffc}')
+            {
+                return None;
+            }
+            let matches = chars[index..index + term.len()]
+                .iter()
+                .map(|character| ascii_fold_char(*character))
+                .eq(term.iter().copied());
+            matches.then_some(term.len())
+        });
+        if let Some(length) = matched {
+            ranges.push(NSRange::new(
+                utf16_offsets[index],
+                utf16_offsets[index + length] - utf16_offsets[index],
+            ));
+            index += length;
+        } else {
+            index += 1;
+        }
+    }
+    ranges
+}
+
+fn ascii_fold_char(character: char) -> char {
+    character.to_ascii_lowercase()
+}
+
+fn clear_search_highlights(layout_manager: &NSLayoutManager, text_length: usize) {
+    if text_length == 0 {
+        return;
+    }
+    unsafe {
+        layout_manager.removeTemporaryAttribute_forCharacterRange(
+            NSBackgroundColorAttributeName,
+            NSRange::new(0, text_length),
+        );
+    }
+}
+
+fn apply_search_highlights(
+    layout_manager: &NSLayoutManager,
+    text: &str,
+    query: &str,
+) -> Vec<NSRange> {
+    let ranges = search_match_ranges(text, query);
+    clear_search_highlights(layout_manager, text.encode_utf16().count());
+    if ranges.is_empty() {
+        return ranges;
+    }
+    let color = NSColor::systemYellowColor().colorWithAlphaComponent(0.32);
+    for range in &ranges {
+        unsafe {
+            layout_manager.addTemporaryAttribute_value_forCharacterRange(
+                NSBackgroundColorAttributeName,
+                &color,
+                *range,
+            );
+        }
+    }
+    ranges
+}
+
 fn inline_image_display_size(image_size: NSSize, available_width: f64) -> NSSize {
     let width = image_size.width.max(1.0);
     let height = image_size.height.max(1.0);
@@ -6362,11 +6490,11 @@ mod tests {
     use joplin_lite_native::html_body::{Block, Document, Inline, Marks, serialize_html};
     use objc2::{AnyThread, runtime::AnyObject};
     use objc2_app_kit::{
-        NSAttachmentAttributeName, NSAttributedStringAttachmentConveniences, NSBitmapImageFileType,
-        NSBitmapImageRep, NSFontAttributeName, NSLayoutManager, NSMutableParagraphStyle,
-        NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF,
-        NSTextAttachment, NSTextContainer, NSTextStorage, NSUnderlineStyle,
-        NSUnderlineStyleAttributeName,
+        NSAttachmentAttributeName, NSAttributedStringAttachmentConveniences,
+        NSBackgroundColorAttributeName, NSBitmapImageFileType, NSBitmapImageRep,
+        NSFontAttributeName, NSLayoutManager, NSMutableParagraphStyle, NSPasteboard,
+        NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSTextAttachment,
+        NSTextContainer, NSTextStorage, NSUnderlineStyle, NSUnderlineStyleAttributeName,
     };
     use objc2_foundation::{
         NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSSize,
@@ -7411,6 +7539,82 @@ mod tests {
             super::toggle_browser_visibility(super::ShellVisibility::Focus),
             super::ShellVisibility::BrowserOnly
         );
+    }
+
+    #[test]
+    fn search_match_ranges_cover_utf16_casefold_terms_and_attachments() {
+        let ranges = super::search_match_ranges("😀复盘 \u{fffc}同步 复盘", "复盘 同步");
+        assert_eq!(
+            ranges,
+            vec![NSRange::new(2, 2), NSRange::new(6, 2), NSRange::new(9, 2)]
+        );
+
+        let ascii = super::search_match_ranges("Alpha ALPHA alpha", "alpha");
+        assert_eq!(
+            ascii,
+            vec![NSRange::new(0, 5), NSRange::new(6, 5), NSRange::new(12, 5)]
+        );
+
+        assert!(super::search_match_ranges("😀\u{fffc}图片", "\u{fffc}").is_empty());
+        assert!(super::search_match_ranges("正文", "   ").is_empty());
+        assert_eq!(
+            super::search_match_ranges("aaaa", "aa"),
+            vec![NSRange::new(0, 2), NSRange::new(2, 2)]
+        );
+    }
+
+    #[test]
+    fn search_highlight_uses_temporary_layout_attributes_only() {
+        let storage = NSTextStorage::new();
+        let layout = NSLayoutManager::new();
+        let container = NSTextContainer::initWithContainerSize(
+            NSTextContainer::alloc(),
+            NSSize::new(640.0, 200.0),
+        );
+        storage.addLayoutManager(&layout);
+        layout.addTextContainer(&container);
+        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str("Alpha"));
+        storage.setAttributedString(&source);
+        layout.ensureLayoutForTextContainer(&container);
+
+        let ranges = super::apply_search_highlights(&layout, "Alpha", "alpha");
+        assert_eq!(ranges, vec![NSRange::new(0, 5)]);
+        let mut effective_range = NSRange::new(0, 0);
+        assert!(
+            unsafe {
+                storage.attribute_atIndex_effectiveRange(
+                    NSBackgroundColorAttributeName,
+                    0,
+                    &mut effective_range,
+                )
+            }
+            .is_none()
+        );
+        assert!(
+            unsafe {
+                layout.temporaryAttribute_atCharacterIndex_effectiveRange(
+                    NSBackgroundColorAttributeName,
+                    0,
+                    &mut effective_range,
+                )
+            }
+            .is_some()
+        );
+
+        super::clear_search_highlights(&layout, storage.length());
+        assert!(
+            unsafe {
+                layout.temporaryAttribute_atCharacterIndex_effectiveRange(
+                    NSBackgroundColorAttributeName,
+                    0,
+                    &mut effective_range,
+                )
+            }
+            .is_none()
+        );
+        let source: &NSAttributedString = &storage;
+        let document = super::document_from_attributed_string(source).unwrap();
+        assert_eq!(super::serialize_html(&document), "<p>Alpha</p>");
     }
 
     #[test]
