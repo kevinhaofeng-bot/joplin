@@ -487,26 +487,19 @@ impl NoteRepository {
             return self.list_notes();
         }
         let connection = self.connection.lock().expect("repository mutex poisoned");
-        let mut statement = connection.prepare(
-            "SELECT n.id, n.title, n.body, n.body_text, n.markup_language, n.is_draft, n.created_time,
-                    n.updated_time, n.deleted_time
-             FROM notes_fts f JOIN notes n ON n.id = f.id
-             WHERE notes_fts MATCH ?1 AND n.deleted_time = 0
-             ORDER BY n.updated_time DESC, n.id ASC",
+        let mut statement = connection.prepare(&search_query_sql(
+            "n.id, n.title, n.body, n.body_text, n.markup_language, n.is_draft,
+             n.created_time, n.updated_time, n.deleted_time",
+        ))?;
+        let rows = statement.query_map(
+            params![
+                sanitize_fts_query(query),
+                sanitize_fts_query_for_column(query, "title"),
+                query
+            ],
+            row_to_note,
         )?;
-        let rows = statement
-            .query_map([sanitize_fts_query(query)], row_to_note)?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-        let mut fallback = connection.prepare(
-            "SELECT id, title, body, body_text, markup_language, is_draft, created_time, updated_time, deleted_time
-             FROM notes WHERE deleted_time = 0 AND (instr(title, ?1) > 0 OR instr(body_text, ?1) > 0)
-             ORDER BY updated_time DESC, id ASC",
-        )?;
-        let fallback_rows = fallback.query_map([query], row_to_note)?;
-        Ok(fallback_rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn search_note_previews(&self, query: &str) -> Result<Vec<NoteListItem>, CoreError> {
@@ -515,38 +508,24 @@ impl NoteRepository {
             return self.list_note_previews();
         }
         let connection = self.connection.lock().expect("repository mutex poisoned");
-        let select =
-            "SELECT n.id, substr(n.title, 1, 120), substr(n.body_text, 1, 96), n.updated_time,
-                    (SELECT nr.resource_id
-                     FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
-                     WHERE nr.note_id = n.id AND nr.is_associated = 1
-                       AND r.deleted_time = 0
-                       AND r.mime IN ('image/png', 'image/jpeg')
-                     ORDER BY nr.position ASC, nr.resource_id ASC LIMIT 1)
-             FROM notes_fts f JOIN notes n ON n.id = f.id
-             WHERE notes_fts MATCH ?1 AND n.deleted_time = 0
-             ORDER BY n.updated_time DESC, n.id ASC";
-        let mut statement = connection.prepare(select)?;
-        let rows = statement
-            .query_map([sanitize_fts_query(query)], row_to_note_list_item)?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-        let mut fallback = connection.prepare(
-            "SELECT n.id, substr(n.title, 1, 120), substr(n.body_text, 1, 96), n.updated_time,
-                    (SELECT nr.resource_id
-                     FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
-                     WHERE nr.note_id = n.id AND nr.is_associated = 1
-                       AND r.deleted_time = 0
-                       AND r.mime IN ('image/png', 'image/jpeg')
-                     ORDER BY nr.position ASC, nr.resource_id ASC LIMIT 1)
-             FROM notes n WHERE n.deleted_time = 0
-               AND (instr(n.title, ?1) > 0 OR instr(n.body_text, ?1) > 0)
-             ORDER BY n.updated_time DESC, n.id ASC",
+        let mut statement = connection.prepare(&search_query_sql(
+            "n.id, substr(n.title, 1, 120), substr(n.body_text, 1, 96), n.updated_time,
+             (SELECT nr.resource_id
+              FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
+              WHERE nr.note_id = n.id AND nr.is_associated = 1
+                AND r.deleted_time = 0
+                AND r.mime IN ('image/png', 'image/jpeg')
+              ORDER BY nr.position ASC, nr.resource_id ASC LIMIT 1)",
+        ))?;
+        let rows = statement.query_map(
+            params![
+                sanitize_fts_query(query),
+                sanitize_fts_query_for_column(query, "title"),
+                query
+            ],
+            row_to_note_list_item,
         )?;
-        let fallback_rows = fallback.query_map([query], row_to_note_list_item)?;
-        Ok(fallback_rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     fn rebuild_search_index(&self) -> Result<(), CoreError> {
@@ -1389,6 +1368,63 @@ fn validate_id(id: &str) -> Result<(), CoreError> {
     }
 }
 
+/// Build the shared ranked search query used by both full-note and lightweight
+/// preview projections. FTS5 supplies prefix candidates and bm25 scores while
+/// the literal branch catches substrings (especially CJK) that the tokenizer
+/// cannot address. The two candidate sources are deliberately UNIONed rather
+/// than used as a fallback, so one source cannot hide relevant results from
+/// the other.
+fn search_query_sql(projection: &str) -> String {
+    format!(
+        "WITH fts_hits AS (
+             SELECT notes_fts.id, bm25(notes_fts) AS bm25_score
+             FROM notes_fts JOIN notes n ON n.id = notes_fts.id
+             WHERE notes_fts MATCH ?1 AND n.deleted_time = 0
+         ),
+         title_hits AS (
+             SELECT notes_fts.id
+             FROM notes_fts JOIN notes n ON n.id = notes_fts.id
+             WHERE notes_fts MATCH ?2 AND n.deleted_time = 0
+         ),
+         literal_hits AS (
+             SELECT n.id
+             FROM notes n
+             WHERE n.deleted_time = 0
+               AND (instr(lower(n.title), lower(?3)) > 0
+                    OR instr(lower(n.body_text), lower(?3)) > 0)
+         ),
+         candidate_ids AS (
+             SELECT id FROM fts_hits
+             UNION
+             SELECT id FROM literal_hits
+         ),
+         ranked AS (
+             SELECT c.id,
+                    CASE
+                        WHEN lower(n.title) = lower(?3) THEN 0
+                        WHEN instr(lower(n.title), lower(?3)) = 1 THEN 1
+                        WHEN instr(lower(n.title), lower(?3)) > 0
+                             OR EXISTS (SELECT 1 FROM title_hits t WHERE t.id = c.id)
+                            THEN 2
+                        ELSE 3
+                    END AS rank_tier,
+                    MIN(f.bm25_score) AS bm25_score,
+                    MAX(n.updated_time) AS updated_time
+             FROM candidate_ids c
+             JOIN notes n ON n.id = c.id AND n.deleted_time = 0
+             LEFT JOIN fts_hits f ON f.id = c.id
+             GROUP BY c.id
+         )
+         SELECT {projection}
+         FROM ranked JOIN notes n ON n.id = ranked.id
+         ORDER BY ranked.rank_tier ASC,
+                  CASE WHEN ranked.bm25_score IS NULL THEN 1 ELSE 0 END ASC,
+                  ranked.bm25_score ASC,
+                  ranked.updated_time DESC,
+                  ranked.id ASC"
+    )
+}
+
 pub(crate) fn new_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1406,9 +1442,21 @@ fn timestamp() -> i64 {
 }
 
 fn sanitize_fts_query(query: &str) -> String {
+    sanitize_fts_query_for_column(query, "")
+}
+
+fn sanitize_fts_query_for_column(query: &str, column: &str) -> String {
     query
         .split_whitespace()
-        .map(|term| format!("\"{}\"", term.replace('"', "")))
+        .map(|term| {
+            let escaped = term.replace('"', "\"\"");
+            let phrase = format!("\"{escaped}\"*");
+            if column.is_empty() {
+                phrase
+            } else {
+                format!("{column} : {phrase}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -1698,6 +1746,162 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn search_unions_fts_prefix_and_literal_chinese_substring_candidates() {
+        let temp = tempdir().unwrap();
+        let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
+        let fts = repo
+            .create_note(CreateNote {
+                title: "人工智能入门".into(),
+                body: "tokenized body".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        let literal = repo
+            .create_note(CreateNote {
+                title: "超级人工智能".into(),
+                body: "literal substring".into(),
+                is_draft: false,
+            })
+            .unwrap();
+
+        let ids = repo
+            .search("人工")
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&fts.id));
+        assert!(ids.contains(&literal.id));
+        assert_eq!(
+            ids,
+            repo.search_note_previews("人工")
+                .unwrap()
+                .into_iter()
+                .map(|preview| preview.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn search_ranks_exact_title_before_prefix_substring_and_body() {
+        let temp = tempdir().unwrap();
+        let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
+        let exact = repo
+            .create_note(CreateNote {
+                title: "目标".into(),
+                body: "ordinary body".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        let prefix = repo
+            .create_note(CreateNote {
+                title: "目标 前缀".into(),
+                body: "ordinary body".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        let substring = repo
+            .create_note(CreateNote {
+                title: "前目标后".into(),
+                body: "ordinary body".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        let body = repo
+            .create_note(CreateNote {
+                title: "普通标题".into(),
+                body: "正文里的目标".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        repo.update_note(
+            &body.id,
+            UpdateNote {
+                body: Some("更新后的正文目标".into()),
+                ..UpdateNote::default()
+            },
+        )
+        .unwrap();
+
+        let ids = repo
+            .search("目标")
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![exact.id, prefix.id, substring.id, body.id]);
+
+        let ascii = repo
+            .create_note(CreateNote {
+                title: "Target".into(),
+                body: "ordinary body".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        assert_eq!(
+            repo.search("target")
+                .unwrap()
+                .into_iter()
+                .map(|note| note.id)
+                .collect::<Vec<_>>(),
+            vec![ascii.id]
+        );
+    }
+
+    #[test]
+    fn search_escapes_quotes_and_punctuation_without_fts_errors() {
+        let temp = tempdir().unwrap();
+        let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
+        let note = repo
+            .create_note(CreateNote {
+                title: "引号 \"测试\"".into(),
+                body: "方括号 [安全]".into(),
+                is_draft: false,
+            })
+            .unwrap();
+
+        for (query, should_match) in [
+            ("\"", true),
+            ("\"测试\"", true),
+            ("[安全]", true),
+            ("field:value", false),
+            ("*", false),
+            ("-", false),
+            ("OR", false),
+            ("foo\"bar", false),
+        ] {
+            let results = repo.search(query).unwrap();
+            let preview_results = repo.search_note_previews(query).unwrap();
+            assert_eq!(
+                results.iter().map(|item| &item.id).collect::<Vec<_>>(),
+                preview_results
+                    .iter()
+                    .map(|item| &item.id)
+                    .collect::<Vec<_>>()
+            );
+            if should_match {
+                assert!(results.iter().any(|item| item.id == note.id));
+            }
+        }
+    }
+
+    #[test]
+    fn search_excludes_soft_deleted_notes_from_both_projections() {
+        let temp = tempdir().unwrap();
+        let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
+        let note = repo
+            .create_note(CreateNote {
+                title: "待删除目标".into(),
+                body: "body".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        repo.soft_delete(&note.id).unwrap();
+        assert!(repo.search("目标").unwrap().is_empty());
+        assert!(repo.search_note_previews("目标").unwrap().is_empty());
     }
 
     #[test]
