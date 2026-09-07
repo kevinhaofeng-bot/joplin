@@ -7,6 +7,10 @@ use joplin_lite_native::html_body::{
     Block, Document, HtmlBodyError, Inline, Marks, parse_html, resource_ids, search_text,
     serialize_html,
 };
+use joplin_lite_native::native_editor::{
+    InlineCommand, NativeEditorSession, apply_committed_text_delta, apply_inline_command,
+    document_from_session, insert_image_anchor, session_from_document,
+};
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
@@ -29,7 +33,7 @@ use objc2_app_kit::{
     NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSStackView,
     NSStackViewDistribution, NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName,
     NSStrokeWidthAttributeName, NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField,
-    NSTextFieldDelegate, NSTextView, NSTextViewDelegate, NSUnderlineStyle,
+    NSTextFieldDelegate, NSTextInputClient, NSTextView, NSTextViewDelegate, NSUnderlineStyle,
     NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate,
     NSWindowStyleMask,
 };
@@ -551,19 +555,6 @@ fn typing_trait_operation(format: TextFormat, decision: FormatDecision) -> FontT
     }
 }
 
-fn prepare_note_content_from_editor(
-    source: &NSAttributedString,
-    title: String,
-) -> Result<PreparedNoteContent, EditorCodecError> {
-    let document = document_from_attributed_string(source)?;
-    Ok(PreparedNoteContent {
-        update: NoteContentUpdate {
-            title,
-            body: serialize_html(&document),
-        },
-    })
-}
-
 fn candidate_with_attachment(
     source: &NSAttributedString,
     insertion_range: NSRange,
@@ -879,6 +870,7 @@ struct AppDelegateIvars {
     current_note_id: RefCell<Option<String>>,
     notes: RefCell<Vec<Note>>,
     loading_guard: RefCell<bool>,
+    editor_session: RefCell<Option<NativeEditorSession>>,
     sidebar_background: OnceCell<Retained<NSBox>>,
     sidebar_separator: OnceCell<Retained<NSBox>>,
     list_scroll: OnceCell<Retained<NSScrollView>>,
@@ -1320,6 +1312,7 @@ define_class!(
     unsafe impl NSTextDelegate for AppDelegate {
         #[unsafe(method(textDidChange:))]
         fn text_did_change(&self, _notification: &NSNotification) {
+            self.sync_editor_session_from_view();
             self.save_current_note();
         }
     }
@@ -1470,6 +1463,66 @@ define_class!(
 );
 
 impl AppDelegate {
+    fn sync_editor_session_from_view(&self) {
+        if *self.ivars().loading_guard.borrow() {
+            return;
+        }
+        let Some(body) = self.ivars().body_view.get() else {
+            return;
+        };
+        let Some(storage) = (unsafe { body.textStorage() }) else {
+            return;
+        };
+        let source: &NSAttributedString = &storage;
+        let new_text = source.string().to_string();
+        if let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
+            && let Ok(old_text) = session.text_document().to_addressable_text()
+            && old_text != new_text
+        {
+            let old_chars: Vec<char> = old_text.chars().collect();
+            let new_chars: Vec<char> = new_text.chars().collect();
+            let mut prefix = 0usize;
+            while prefix < old_chars.len()
+                && prefix < new_chars.len()
+                && old_chars[prefix] == new_chars[prefix]
+            {
+                prefix += 1;
+            }
+            let mut suffix = 0usize;
+            while suffix < old_chars.len().saturating_sub(prefix)
+                && suffix < new_chars.len().saturating_sub(prefix)
+                && old_chars[old_chars.len() - suffix - 1]
+                    == new_chars[new_chars.len() - suffix - 1]
+            {
+                suffix += 1;
+            }
+            let replacement: String = new_chars[prefix..new_chars.len() - suffix].iter().collect();
+            let location = old_chars[..prefix]
+                .iter()
+                .map(|character| character.len_utf16())
+                .sum();
+            let length = old_chars[prefix..old_chars.len() - suffix]
+                .iter()
+                .map(|character| character.len_utf16())
+                .sum();
+            if !replacement.contains('\u{fffc}')
+                && apply_committed_text_delta(session, NSRange::new(location, length), &replacement)
+                    .is_ok()
+            {
+                return;
+            }
+        }
+        // A projection-only edit (for example an attachment import) has no
+        // text delta. Rebuild only as a guarded compatibility fallback; the
+        // normal typing path above keeps the live semantic model and its list
+        // / heading / image anchors intact.
+        if let Ok(document) = document_from_attributed_string(source)
+            && let Ok(session) = session_from_document(&document)
+        {
+            *self.ivars().editor_session.borrow_mut() = Some(session);
+        }
+    }
+
     #[allow(deprecated)]
     fn run_native_undo_smoke(&self, image_path: &Path) {
         let Ok(bytes) = read_regular_image_file(image_path) else {
@@ -1921,7 +1974,23 @@ impl AppDelegate {
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
+        if body.hasMarkedText() {
+            return;
+        }
         let range = body.selectedRange();
+        if range.length > 0 {
+            let command = match format {
+                TextFormat::Bold => Some(InlineCommand::Bold),
+                TextFormat::Italic => Some(InlineCommand::Italic),
+                TextFormat::Underline => Some(InlineCommand::Underline),
+                TextFormat::Clear => Some(InlineCommand::Clear),
+            };
+            if let Some(command) = command
+                && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
+            {
+                let _ = apply_inline_command(session, range, command);
+            }
+        }
         let active = if range.length == 0 {
             self.typing_style_active(body, format)
         } else {
@@ -2400,22 +2469,42 @@ impl AppDelegate {
             return false;
         };
         let source: &NSAttributedString = &snapshot.attributed;
-        let Some(candidate) = candidate_with_attachment(source, insertion_range, &inline) else {
+        if candidate_with_attachment(source, insertion_range, &inline).is_none() {
             self.set_save_status("图片未插入：格式不支持", true);
             return false;
-        };
+        }
         let title = self
             .ivars()
             .title_field
             .get()
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
-        let prepared = match prepare_note_content_from_editor(&candidate, title) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                eprintln!("editor projection failed: {error}");
-                self.set_save_status("保存失败", true);
+        let prepared = {
+            let mut session_guard = self.ivars().editor_session.borrow_mut();
+            let Some(session) = session_guard.as_mut() else {
+                self.set_save_status("编辑器状态不可用，未覆盖正文", true);
                 return false;
+            };
+            if let Err(error) =
+                insert_image_anchor(session, insertion_range, &stored.id, &stored.title, 1, 1)
+            {
+                eprintln!("native image anchor failed: {error}");
+                self.set_save_status("图片未插入：编辑器状态不可用", true);
+                return false;
+            }
+            match document_from_session(session) {
+                Ok(document) => PreparedNoteContent {
+                    update: NoteContentUpdate {
+                        title,
+                        body: serialize_html(&document),
+                    },
+                },
+                Err(error) => {
+                    let _ = session.undo();
+                    eprintln!("native editor projection failed: {error}");
+                    self.set_save_status("保存失败", true);
+                    return false;
+                }
             }
         };
         let previous_loading_guard = *self.ivars().loading_guard.borrow();
@@ -2424,6 +2513,9 @@ impl AppDelegate {
             self.persist_note_content(&note_id, prepared)
         });
         *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
+        if !inserted && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut() {
+            let _ = session.undo();
+        }
         inserted
     }
 
@@ -2438,6 +2530,7 @@ impl AppDelegate {
         let body = self.ivars().body_view.get().unwrap();
         let (status, is_error) = match parse_html(&note.body) {
             Ok(document) => {
+                let session = session_from_document(&document).ok();
                 let (rendered, failures) = render_note_document(
                     &document,
                     &self.ivars().repository,
@@ -2446,6 +2539,7 @@ impl AppDelegate {
                 if let Some(storage) = unsafe { body.textStorage() } {
                     storage.setAttributedString(&rendered);
                 }
+                *self.ivars().editor_session.borrow_mut() = session;
                 if failures == 0 {
                     ("已保存", false)
                 } else {
@@ -2453,6 +2547,7 @@ impl AppDelegate {
                 }
             }
             Err(_) => {
+                *self.ivars().editor_session.borrow_mut() = None;
                 body.setString(ns_string!("正文无法读取"));
                 ("正文无法读取", true)
             }
@@ -2468,6 +2563,7 @@ impl AppDelegate {
     fn clear_current_note(&self) {
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = None;
+        *self.ivars().editor_session.borrow_mut() = None;
         self.ivars()
             .title_field
             .get()
@@ -2672,30 +2768,24 @@ impl AppDelegate {
             .get()
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
-        let body_view = self.ivars().body_view.get().unwrap();
-        let prepared = if let Some(storage) = unsafe { body_view.textStorage() } {
-            let source: &NSAttributedString = &storage;
-            match prepare_note_content_from_editor(source, title) {
-                Ok(prepared) => prepared,
+        let prepared = {
+            let session_guard = self.ivars().editor_session.borrow();
+            let Some(session) = session_guard.as_ref() else {
+                self.set_save_status("编辑器状态不可用，未覆盖正文", true);
+                return false;
+            };
+            match document_from_session(session) {
+                Ok(document) => PreparedNoteContent {
+                    update: NoteContentUpdate {
+                        title,
+                        body: serialize_html(&document),
+                    },
+                },
                 Err(error) => {
-                    eprintln!("editor projection failed: {error}");
+                    eprintln!("native editor projection failed: {error}");
                     self.set_save_status("保存失败", true);
                     return false;
                 }
-            }
-        } else {
-            let document = Document::from_blocks(vec![Block::Paragraph {
-                style: Default::default(),
-                inlines: vec![Inline::Text {
-                    text: body_view.string().to_string(),
-                    marks: Marks::default(),
-                }],
-            }]);
-            PreparedNoteContent {
-                update: NoteContentUpdate {
-                    title,
-                    body: serialize_html(&document),
-                },
             }
         };
         self.persist_note_content(&id, prepared)
@@ -3231,6 +3321,7 @@ impl AppDelegate {
             current_note_id: RefCell::new(None),
             notes: RefCell::new(Vec::new()),
             loading_guard: RefCell::new(false),
+            editor_session: RefCell::new(None),
             sidebar_background: OnceCell::new(),
             sidebar_separator: OnceCell::new(),
             list_scroll: OnceCell::new(),

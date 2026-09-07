@@ -20,6 +20,7 @@ sha2 = "0.10"
 thiserror = "2"
 dirs = "6"
 html5ever = "0.38"
+text-document = "=1.12.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
