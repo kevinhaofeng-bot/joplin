@@ -117,6 +117,15 @@ Native ruling: retain the existing Rust command catalogue, replace one-character
 
 Native ruling: keep the current Rust `NotePreview` projection, `NSCollectionView` reuse and visible-only thumbnail decoding. Tune the visual card toward this compact information hierarchy: stable metadata/footer geometry, 13 pt title/snippet scale, restrained selected outline and fixed cropped thumbnail slot. Search may derive a query-specific display snippet from the already-materialized `body_text`, but that presentation field must remain separate from durable content and require no canonical-HTML parsing. Avoid turning the note browser into a gallery of oversized images; the image supports recognition while title, snippet and recency remain primary.
 
+### Untitled state and title/snippet separation
+
+- Evernote stores `label`, `snippet` and `isUntitled` as separate note fields. Its list query projects the stored label and snippet independently; the renderer does not promote the first body line into the title slot and then repeat the same text as the snippet.
+- New-note creation supplies a localized untitled label and explicitly marks the new note as untitled. This display state is independent from editor focus: the default cursor can still enter the body immediately.
+- The snippet is materialized in the local note row and returned by the lightweight list query. A historical cached-field table was later removed when snippet became an ordinary note field, confirming that the useful mechanism is a cheap independent projection, not reparsing the rich document for every card.
+- Thumbnail identity is likewise independent metadata (`selectedThumbnailHash` plus resource-version invalidation), so title, snippet and image can update or cache without coupling their display fallbacks.
+
+Native ruling: retain an actually empty stored title until the user types one, but render `无标题笔记` in the title slot as presentation state. Keep the body-derived text only in the snippet slot; do not promote it into both fields. New-note body focus, autosave and canonical HTML remain unchanged. The current `body_text` projection already provides a cheap local snippet, so this improvement requires no new format, no canonical-HTML parse and no persisted fake title. A later schema version may materialize an independently invalidated snippet if profiling shows the current bounded projection is insufficient.
+
 ### Offline search and relevance
 
 - The current local schema does not treat search as a scan of serialized note documents. It materializes separate FTS5 indexes for note metadata/title, extracted note content and attachment search text. The attachment index is fed by a plain searchable-text table rather than by filenames or binary payloads alone.
