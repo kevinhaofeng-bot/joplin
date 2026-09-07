@@ -9,36 +9,31 @@ use joplin_lite_native::html_body::{
 };
 use joplin_lite_native::native_editor::{
     BlockCommand, EmptyBlockCarrier, InlineCommand, NativeEditorSession, ParagraphCommand,
-    RenderedAttachment, RenderedDocument, apply_block_command, apply_committed_text_delta,
-    apply_inline_command, apply_link, apply_paragraph_command, delete_image_anchor_if_identity,
-    document_from_session, insert_image_anchor, render_session, session_from_document,
+    RenderedAttachment, RenderedDocument, SelectionState, apply_block_command,
+    apply_committed_text_delta, apply_inline_command, apply_link, apply_paragraph_command,
+    delete_image_anchor_if_identity, document_from_session, insert_image_anchor, query_block_state,
+    query_inline_state, render_session, session_from_document,
 };
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
-#[allow(deprecated)]
-use objc2_app_kit::NSObliquenessAttributeName;
-#[allow(deprecated)]
-use objc2_app_kit::NSShadowAttributeName;
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSAttachmentAttributeName, NSAttributedStringAppKitDocumentFormats,
-    NSAttributedStringAttachmentConveniences, NSBackgroundColorAttributeName, NSBackingStoreType,
-    NSBaselineOffsetAttributeName, NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep,
-    NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
+    NSApplicationTerminateReply, NSAttachmentAttributeName,
+    NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
+    NSBackingStoreType, NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep, NSBorderType, NSBox,
+    NSBoxType, NSButton, NSButtonType, NSColor, NSControlStateValueMixed, NSControlStateValueOff,
     NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination,
-    NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontTraitMask,
-    NSForegroundColorAttributeName, NSImage, NSKernAttributeName, NSLayoutAttribute,
-    NSLineBreakMode, NSMenu, NSMenuItem, NSModalResponseOK,
-    NSMutableAttributedStringAppKitAdditions, NSMutableParagraphStyle, NSOpenPanel,
-    NSParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeFileURL,
-    NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField,
-    NSStackView, NSStackViewDistribution, NSStrikethroughStyleAttributeName,
-    NSStrokeColorAttributeName, NSStrokeWidthAttributeName, NSTextAlignment, NSTextAttachment,
-    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextView,
-    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSImage, NSLayoutAttribute, NSLineBreakMode, NSMenu,
+    NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle,
+    NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
+    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSStackView,
+    NSStackViewDistribution, NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField,
+    NSTextFieldDelegate, NSTextInputClient, NSTextView, NSTextViewDelegate, NSUnderlineStyle,
+    NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
@@ -845,6 +840,7 @@ struct ShellLayout {
     sheet: LayoutRect,
     breadcrumb: LayoutRect,
     title: LayoutRect,
+    updated: LayoutRect,
     toolbar: LayoutRect,
     body: LayoutRect,
     status: LayoutRect,
@@ -904,6 +900,12 @@ fn shell_layout(width: f64, height: f64, visibility: ShellVisibility) -> ShellLa
         width: content_width,
         height: 34.0,
     };
+    let updated = LayoutRect {
+        x: content_x,
+        y: title.y - 20.0,
+        width: content_width,
+        height: 14.0,
+    };
     let toolbar = LayoutRect {
         x: content_x,
         y: title.y - 42.0,
@@ -936,6 +938,7 @@ fn shell_layout(width: f64, height: f64, visibility: ShellVisibility) -> ShellLa
         sheet,
         breadcrumb,
         title,
+        updated,
         toolbar,
         body,
         status,
@@ -1138,9 +1141,51 @@ fn editor_action_catalogue() -> &'static [EditorActionDescriptor] {
 fn toolbar_actions_for_width(width: f64) -> Vec<EditorAction> {
     EDITOR_ACTION_CATALOGUE
         .iter()
-        .filter(|descriptor| descriptor.fixed || (descriptor.wide_only && width >= 820.0))
+        .filter(|descriptor| descriptor.fixed || (descriptor.wide_only && width >= 680.0))
         .map(|descriptor| descriptor.action)
         .collect()
+}
+
+fn toolbar_overflow_actions_for_width(width: f64) -> Vec<EditorAction> {
+    let visible = toolbar_actions_for_width(width);
+    EDITOR_ACTION_CATALOGUE
+        .iter()
+        .filter(|descriptor| !descriptor.fixed && !visible.contains(&descriptor.action))
+        .map(|descriptor| descriptor.action)
+        .collect()
+}
+
+fn compact_toolbar_label(action: EditorAction) -> &'static str {
+    match action {
+        EditorAction::InsertImage => "图",
+        EditorAction::Undo => "撤",
+        EditorAction::Redo => "重",
+        EditorAction::BlockStyle => "正文",
+        EditorAction::Bold => "B",
+        EditorAction::Italic => "I",
+        EditorAction::Underline => "U",
+        EditorAction::Highlight => "高亮",
+        EditorAction::BulletList => "•",
+        EditorAction::OrderedList => "1.",
+        EditorAction::Checklist => "☑",
+        EditorAction::More => "…",
+        EditorAction::Link => "链",
+        EditorAction::AlignLeft => "左",
+        EditorAction::AlignCenter => "中",
+        EditorAction::AlignRight => "右",
+        EditorAction::IncreaseIndent => ">",
+        EditorAction::DecreaseIndent => "<",
+        EditorAction::Strikethrough => "删",
+        EditorAction::Clear => "清",
+    }
+}
+
+fn action_group(action: EditorAction) -> EditorActionGroup {
+    EDITOR_ACTION_CATALOGUE
+        .iter()
+        .find(|descriptor| descriptor.action == action)
+        .map(|descriptor| descriptor.group)
+        .unwrap_or(EditorActionGroup::More)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1163,8 +1208,13 @@ struct AutosaveState {
     pending_html: String,
     generation: u64,
     scheduled_generation: Option<u64>,
+    retry_generation: Option<u64>,
+    retry_attempt: u8,
     dirty: bool,
 }
+
+const AUTOSAVE_MAX_RETRIES: u8 = 5;
+const AUTOSAVE_BASE_DELAY_SECONDS: f64 = 0.3;
 
 impl AutosaveState {
     fn loaded(note_id: &str, title: &str, html: &str) -> Self {
@@ -1176,12 +1226,25 @@ impl AutosaveState {
             pending_html: html.to_owned(),
             generation: 0,
             scheduled_generation: None,
+            retry_generation: None,
+            retry_attempt: 0,
             dirty: false,
         }
     }
 
     fn empty() -> Self {
-        Self::loaded("", "", "")
+        Self {
+            note_id: None,
+            persisted_title: String::new(),
+            persisted_html: String::new(),
+            pending_title: String::new(),
+            pending_html: String::new(),
+            generation: 0,
+            scheduled_generation: None,
+            retry_generation: None,
+            retry_attempt: 0,
+            dirty: false,
+        }
     }
 
     fn reset(&mut self, note_id: &str, title: &str, html: &str) {
@@ -1198,6 +1261,8 @@ impl AutosaveState {
             self.pending_html = html.to_owned();
             self.dirty = false;
             self.scheduled_generation = None;
+            self.retry_generation = None;
+            self.retry_attempt = 0;
             return None;
         }
         if self.dirty && self.pending_title == title && self.pending_html == html {
@@ -1207,6 +1272,8 @@ impl AutosaveState {
         self.pending_title = title.to_owned();
         self.pending_html = html.to_owned();
         self.scheduled_generation = Some(self.generation);
+        self.retry_generation = None;
+        self.retry_attempt = 0;
         self.dirty = true;
         Some(self.generation)
     }
@@ -1246,13 +1313,40 @@ impl AutosaveState {
         self.persisted_title = self.pending_title.clone();
         self.persisted_html = self.pending_html.clone();
         self.scheduled_generation = None;
+        self.retry_generation = None;
+        self.retry_attempt = 0;
         self.dirty = false;
     }
 
-    fn mark_failed(&mut self, generation: u64) {
+    fn mark_failed(&mut self, generation: u64) -> Option<f64> {
         if generation == self.generation {
-            self.scheduled_generation = Some(generation);
+            if self.retry_attempt >= AUTOSAVE_MAX_RETRIES {
+                self.scheduled_generation = None;
+                self.retry_generation = None;
+                self.dirty = true;
+                return None;
+            }
+            self.scheduled_generation = None;
+            self.retry_generation = Some(generation);
+            self.retry_attempt = self.retry_attempt.saturating_add(1);
             self.dirty = true;
+            return self.retry_delay(generation);
+        }
+        None
+    }
+
+    fn retry_delay(&self, generation: u64) -> Option<f64> {
+        if self.retry_generation != Some(generation) || !self.dirty {
+            return None;
+        }
+        let exponent = self.retry_attempt.saturating_sub(1) as i32;
+        Some((AUTOSAVE_BASE_DELAY_SECONDS * 2_f64.powi(exponent)).min(4.8))
+    }
+
+    fn mark_retry_scheduled(&mut self, generation: u64) {
+        if self.retry_generation == Some(generation) && self.dirty {
+            self.retry_generation = None;
+            self.scheduled_generation = Some(generation);
         }
     }
 
@@ -1285,6 +1379,7 @@ fn note_list_summary(note: &Note) -> String {
         .unwrap_or_else(|| "暂无正文".to_string())
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum FormatDecision {
     Add,
@@ -1292,6 +1387,7 @@ enum FormatDecision {
     Clear,
 }
 
+#[cfg(test)]
 fn format_decision(format: TextFormat, active: bool) -> FormatDecision {
     if format == TextFormat::Clear {
         FormatDecision::Clear
@@ -1302,6 +1398,7 @@ fn format_decision(format: TextFormat, active: bool) -> FormatDecision {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum FontTraitOperation {
     Have,
@@ -1309,6 +1406,7 @@ enum FontTraitOperation {
     None,
 }
 
+#[cfg(test)]
 fn typing_trait_operation(format: TextFormat, decision: FormatDecision) -> FontTraitOperation {
     match (format, decision) {
         (TextFormat::Bold | TextFormat::Italic, FormatDecision::Add) => FontTraitOperation::Have,
@@ -1651,6 +1749,8 @@ struct AppDelegateIvars {
     list_stack: OnceCell<Retained<NSStackView>>,
     browser_title: OnceCell<Retained<NSTextField>>,
     browser_count: OnceCell<Retained<NSTextField>>,
+    breadcrumb_label: OnceCell<Retained<NSTextField>>,
+    updated_label: OnceCell<Retained<NSTextField>>,
     list_empty_label: OnceCell<Retained<NSTextField>>,
     library_label: OnceCell<Retained<NSTextField>>,
     new_button: OnceCell<Retained<NSButton>>,
@@ -1658,16 +1758,12 @@ struct AppDelegateIvars {
     title_field: OnceCell<Retained<NSTextField>>,
     focus_button: OnceCell<Retained<NSButton>>,
     browser_toggle_button: OnceCell<Retained<NSButton>>,
-    bold_button: OnceCell<Retained<NSButton>>,
-    italic_button: OnceCell<Retained<NSButton>>,
-    underline_button: OnceCell<Retained<NSButton>>,
-    clear_button: OnceCell<Retained<NSButton>>,
     body_scroll: OnceCell<Retained<NSScrollView>>,
     body_view: OnceCell<Retained<NSTextView>>,
     delete_button: OnceCell<Retained<NSButton>>,
     save_status: OnceCell<Retained<NSTextField>>,
     editor_empty_label: OnceCell<Retained<NSTextField>>,
-    toolbar_buttons: RefCell<Vec<Retained<NSButton>>>,
+    toolbar_buttons: RefCell<Vec<(EditorAction, Retained<NSButton>)>>,
     note_buttons: RefCell<Vec<Retained<NSButton>>>,
     note_rows: RefCell<Vec<Retained<NSBox>>>,
 }
@@ -1679,6 +1775,18 @@ define_class!(
     struct AppDelegate;
     unsafe impl NSObjectProtocol for AppDelegate {}
     unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn application_should_terminate(
+            &self,
+            _sender: &NSApplication,
+        ) -> NSApplicationTerminateReply {
+            if self.save_current_note() {
+                NSApplicationTerminateReply::TerminateNow
+            } else {
+                NSApplicationTerminateReply::TerminateCancel
+            }
+        }
+
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn application_should_terminate_after_last_window_closed(
             &self,
@@ -1913,9 +2021,33 @@ define_class!(
             title_field.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             content.addSubview(&title_field);
 
+            let breadcrumb_label = NSTextField::initWithFrame(
+                NSTextField::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+            );
+            breadcrumb_label.setStringValue(ns_string!("本地资料库 · 笔记"));
+            breadcrumb_label.setBezeled(false);
+            breadcrumb_label.setDrawsBackground(false);
+            breadcrumb_label.setEditable(false);
+            breadcrumb_label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+            breadcrumb_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            content.addSubview(&breadcrumb_label);
+
+            let updated_label = NSTextField::initWithFrame(
+                NSTextField::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+            );
+            updated_label.setStringValue(ns_string!(""));
+            updated_label.setBezeled(false);
+            updated_label.setDrawsBackground(false);
+            updated_label.setEditable(false);
+            updated_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            updated_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            content.addSubview(&updated_label);
+
             let focus_button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    ns_string!("专注"),
+                    ns_string!("↙↗"),
                     Some(self),
                     Some(sel!(toggleFocusMode:)),
                     mtm,
@@ -1923,12 +2055,12 @@ define_class!(
             };
             focus_button.setBezelStyle(NSBezelStyle::Toolbar);
             focus_button.setBordered(false);
-            focus_button.setToolTip(Some(ns_string!("切换专注模式")));
+            focus_button.setToolTip(Some(ns_string!("展开或收起导航与浏览（专注模式）")));
             content.addSubview(&focus_button);
 
             let browser_toggle_button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    ns_string!("浏览"),
+                    ns_string!("↗"),
                     Some(self),
                     Some(sel!(toggleBrowser:)),
                     mtm,
@@ -1938,21 +2070,6 @@ define_class!(
             browser_toggle_button.setBordered(false);
             browser_toggle_button.setToolTip(Some(ns_string!("显示或隐藏笔记浏览栏")));
             content.addSubview(&browser_toggle_button);
-
-            let bold_button = Self::make_format_button(mtm, self, "B", sel!(toggleBoldText:));
-            let italic_button = Self::make_format_button(mtm, self, "I", sel!(toggleItalicText:));
-            let underline_button =
-                Self::make_format_button(mtm, self, "U", sel!(toggleUnderlineText:));
-            let clear_button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    ns_string!("清除格式"),
-                    Some(self),
-                    Some(sel!(clearFormatting:)),
-                    mtm,
-                )
-            };
-            clear_button.setBezelStyle(NSBezelStyle::Toolbar);
-            clear_button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
 
             let body = BodyTextView::new(
                 mtm,
@@ -2078,6 +2195,8 @@ define_class!(
             self.ivars().list_stack.set(list_stack).unwrap();
             self.ivars().browser_title.set(browser_title).unwrap();
             self.ivars().browser_count.set(browser_count).unwrap();
+            self.ivars().breadcrumb_label.set(breadcrumb_label).unwrap();
+            self.ivars().updated_label.set(updated_label).unwrap();
             self.ivars().library_label.set(library_label).unwrap();
             self.ivars().list_empty_label.set(list_empty_label).unwrap();
             self.ivars().new_button.set(new_button).unwrap();
@@ -2088,10 +2207,6 @@ define_class!(
                 .browser_toggle_button
                 .set(browser_toggle_button)
                 .unwrap();
-            self.ivars().bold_button.set(bold_button).unwrap();
-            self.ivars().italic_button.set(italic_button).unwrap();
-            self.ivars().underline_button.set(underline_button).unwrap();
-            self.ivars().clear_button.set(clear_button).unwrap();
             self.ivars().body_scroll.set(body_scroll).unwrap();
             self.ivars()
                 .body_view
@@ -2316,8 +2431,6 @@ define_class!(
                     );
                     if ok {
                         self.ivars().autosave.borrow_mut().mark_saved(generation);
-                    } else {
-                        self.ivars().autosave.borrow_mut().mark_failed(generation);
                     }
                 }
             }
@@ -2452,11 +2565,37 @@ define_class!(
 
         #[unsafe(method(showMore:))]
         fn show_more(&self, sender: &NSButton) {
+            if self.ivars().current_note_id.borrow().is_none() {
+                return;
+            }
             let menu = NSMenu::initWithTitle(NSMenu::alloc(self.mtm()), ns_string!("更多"));
-            for descriptor in editor_action_catalogue()
-                .iter()
-                .filter(|descriptor| !descriptor.fixed)
-            {
+            let toolbar_width = self
+                .ivars()
+                .window
+                .get()
+                .and_then(|window| window.contentView())
+                .map(|content| {
+                    shell_layout(
+                        content.frame().size.width,
+                        content.frame().size.height,
+                        *self.ivars().shell_visibility.borrow(),
+                    )
+                    .toolbar
+                    .width
+                })
+                .unwrap_or(0.0);
+            let mut previous_group = None;
+            for action in toolbar_overflow_actions_for_width(toolbar_width) {
+                let Some(descriptor) = editor_action_catalogue()
+                    .iter()
+                    .find(|descriptor| descriptor.action == action)
+                else {
+                    continue;
+                };
+                if previous_group.is_some_and(|group| group != descriptor.group) {
+                    menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
+                }
+                previous_group = Some(descriptor.group);
                 let Some(action) = Self::toolbar_selector(descriptor.action) else {
                     continue;
                 };
@@ -2713,29 +2852,29 @@ impl AppDelegate {
     }
 
     fn install_toolbar_buttons(mtm: MainThreadMarker, target: &AppDelegate, content: &NSView) {
-        for action in toolbar_actions_for_width(0.0) {
-            let Some(descriptor) = editor_action_catalogue()
-                .iter()
-                .find(|descriptor| descriptor.action == action)
-            else {
-                continue;
-            };
+        for descriptor in editor_action_catalogue() {
+            let action = descriptor.action;
             let Some(selector) = Self::toolbar_selector(action) else {
                 continue;
             };
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str(descriptor.label),
+                    &NSString::from_str(compact_toolbar_label(action)),
                     Some(target),
                     Some(selector),
                     mtm,
                 )
             };
+            button.setButtonType(NSButtonType::PushOnPushOff);
             button.setBezelStyle(NSBezelStyle::Toolbar);
             button.setBordered(false);
             button.setToolTip(Some(&NSString::from_str(descriptor.label)));
             content.addSubview(&button);
-            target.ivars().toolbar_buttons.borrow_mut().push(button);
+            target
+                .ivars()
+                .toolbar_buttons
+                .borrow_mut()
+                .push((action, button));
         }
     }
 
@@ -3260,25 +3399,6 @@ impl AppDelegate {
         );
     }
 
-    fn make_format_button(
-        mtm: MainThreadMarker,
-        target: &AppDelegate,
-        title: &str,
-        action: Sel,
-    ) -> Retained<NSButton> {
-        let button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(title),
-                Some(target),
-                Some(action),
-                mtm,
-            )
-        };
-        button.setButtonType(NSButtonType::PushOnPushOff);
-        button.setBezelStyle(NSBezelStyle::Toolbar);
-        button
-    }
-
     fn install_menu(application: &NSApplication, target: &AppDelegate, mtm: MainThreadMarker) {
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("主菜单"));
         let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("应用"));
@@ -3518,21 +3638,29 @@ impl AppDelegate {
         if let Some(button) = self.ivars().new_button.get() {
             button.setFrame(NSRect::new(
                 NSPoint::new(16.0, height - 96.0),
-                NSSize::new(108.0, 30.0),
+                NSSize::new((shell.navigation.width - 32.0).max(0.0), 30.0),
             ));
             button.setHidden(shell.navigation.width == 0.0);
         }
         if let Some(search) = self.ivars().search_field.get() {
-            let x = 132.0;
-            let search_width = (shell.navigation.width - x - 14.0).max(108.0);
+            let x = 16.0;
+            let search_width = (shell.navigation.width - 32.0).max(0.0);
             search.setFrame(NSRect::new(
-                NSPoint::new(x, height - 96.0),
+                NSPoint::new(x, height - 136.0),
                 NSSize::new(search_width, 30.0),
             ));
             search.setHidden(shell.navigation.width == 0.0);
         }
         if let Some(title) = self.ivars().title_field.get() {
             title.setFrame(shell.title.ns_rect());
+        }
+        if let Some(breadcrumb) = self.ivars().breadcrumb_label.get() {
+            breadcrumb.setFrame(shell.breadcrumb.ns_rect());
+            breadcrumb.setHidden(shell.editor.width == 0.0);
+        }
+        if let Some(updated) = self.ivars().updated_label.get() {
+            updated.setFrame(shell.updated.ns_rect());
+            updated.setHidden(shell.editor.width == 0.0);
         }
         if let Some(button) = self.ivars().focus_button.get() {
             button.setFrame(NSRect::new(
@@ -3546,31 +3674,34 @@ impl AppDelegate {
                 NSSize::new(58.0, 24.0),
             ));
         }
-        for (button, x) in [
-            (self.ivars().bold_button.get(), shell.toolbar.x),
-            (self.ivars().italic_button.get(), shell.toolbar.x + 38.0),
-            (self.ivars().underline_button.get(), shell.toolbar.x + 76.0),
-        ] {
-            if let Some(button) = button {
-                button.setFrame(NSRect::new(
-                    NSPoint::new(x, shell.toolbar.y),
-                    NSSize::new(34.0, shell.toolbar.height),
-                ));
-            }
-        }
-        if let Some(button) = self.ivars().clear_button.get() {
-            button.setFrame(NSRect::new(
-                NSPoint::new(shell.toolbar.x + 114.0, shell.toolbar.y),
-                NSSize::new(78.0, shell.toolbar.height),
-            ));
-        }
-        for (index, button) in self.ivars().toolbar_buttons.borrow().iter().enumerate() {
-            let x = shell.toolbar.x + (index as f64 * 54.0);
+        let visible_actions = toolbar_actions_for_width(shell.toolbar.width);
+        let narrow = shell.toolbar.width < 680.0;
+        for (action, button) in self.ivars().toolbar_buttons.borrow().iter() {
+            let Some(visible_index) = visible_actions.iter().position(|item| item == action) else {
+                button.setHidden(true);
+                continue;
+            };
+            let group_gaps = visible_actions
+                .iter()
+                .take(visible_index)
+                .zip(visible_actions.iter().skip(1))
+                .filter(|(previous, next)| action_group(**previous) != action_group(**next))
+                .count() as f64
+                * 4.0;
+            let x = shell.toolbar.x + (visible_index as f64 * 32.0) + group_gaps;
             button.setFrame(NSRect::new(
                 NSPoint::new(x, shell.toolbar.y),
-                NSSize::new(50.0, shell.toolbar.height),
+                NSSize::new(28.0, shell.toolbar.height),
             ));
-            button.setHidden(x + 50.0 > shell.toolbar.right());
+            button.setTitle(&NSString::from_str(compact_toolbar_label(*action)));
+            button.setToolTip(Some(&NSString::from_str(
+                editor_action_catalogue()
+                    .iter()
+                    .find(|descriptor| descriptor.action == *action)
+                    .map(|descriptor| descriptor.label)
+                    .unwrap_or(compact_toolbar_label(*action)),
+            )));
+            button.setHidden(narrow && x + 28.0 > shell.toolbar.right());
         }
         if let Some(scroll) = self.ivars().body_scroll.get() {
             scroll.setFrame(shell.body.ns_rect());
@@ -3729,7 +3860,7 @@ impl AppDelegate {
 
     #[allow(deprecated)]
     fn apply_format(&self, format: TextFormat) {
-        if self.ivars().current_note_id.borrow().is_some() && !self.save_current_note() {
+        if self.ivars().current_note_id.borrow().is_none() || !self.save_current_note() {
             return;
         }
         let Some(body) = self.ivars().body_view.get() else {
@@ -3738,267 +3869,110 @@ impl AppDelegate {
         if body.hasMarkedText() {
             return;
         }
-        let range = body.selectedRange();
-        let mut semantic_changed = false;
-        if range.length > 0 {
-            let command = match format {
-                TextFormat::Bold => Some(InlineCommand::Bold),
-                TextFormat::Italic => Some(InlineCommand::Italic),
-                TextFormat::Underline => Some(InlineCommand::Underline),
-                TextFormat::Clear => Some(InlineCommand::Clear),
-            };
-            if let Some(command) = command
-                && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
-            {
-                semantic_changed = apply_inline_command(session, range, command).is_ok();
-            }
-        }
-        if range.length > 0 && semantic_changed {
+        let Some(range) = self.command_selection() else {
+            return;
+        };
+        let command = match format {
+            TextFormat::Bold => InlineCommand::Bold,
+            TextFormat::Italic => InlineCommand::Italic,
+            TextFormat::Underline => InlineCommand::Underline,
+            TextFormat::Clear => InlineCommand::Clear,
+        };
+        let before_revision = self
+            .ivars()
+            .editor_session
+            .borrow()
+            .as_ref()
+            .map(NativeEditorSession::revision)
+            .unwrap_or_default();
+        let applied = self
+            .ivars()
+            .editor_session
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|session| apply_inline_command(session, range, command).is_ok());
+        let after_revision = self
+            .ivars()
+            .editor_session
+            .borrow()
+            .as_ref()
+            .map(NativeEditorSession::revision)
+            .unwrap_or(before_revision);
+        if applied && after_revision != before_revision {
             self.refresh_body_from_session();
-            body.setSelectedRange(range);
-            if let Some(window) = self.ivars().window.get() {
-                window.makeFirstResponder(Some(body));
-            }
+            self.restore_command_selection(range);
             self.update_formatting_buttons();
             self.save_current_note();
-            return;
-        }
-        let active = if range.length == 0 {
-            self.typing_style_active(body, format)
-        } else {
-            self.selection_style_active(body, range, format)
-        };
-        let decision = format_decision(format, active);
-        let font_key = unsafe { NSFontAttributeName };
-        let underline_key = unsafe { NSUnderlineStyleAttributeName };
-        if range.length == 0 {
-            self.apply_typing_format(body, format, decision);
-        } else if let Some(storage) = unsafe { body.textStorage() } {
-            match (format, decision) {
-                (TextFormat::Bold, FormatDecision::Add) => {
-                    storage.applyFontTraits_range(NSFontTraitMask::BoldFontMask, range);
-                }
-                (TextFormat::Bold, FormatDecision::Remove) => {
-                    storage.applyFontTraits_range(NSFontTraitMask::UnboldFontMask, range);
-                }
-                (TextFormat::Italic, FormatDecision::Add) => {
-                    storage.applyFontTraits_range(NSFontTraitMask::ItalicFontMask, range);
-                }
-                (TextFormat::Italic, FormatDecision::Remove) => {
-                    storage.applyFontTraits_range(NSFontTraitMask::UnitalicFontMask, range);
-                }
-                (TextFormat::Underline, FormatDecision::Add) => unsafe {
-                    let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
-                    storage.addAttribute_value_range(underline_key, &value, range);
-                },
-                (TextFormat::Underline, FormatDecision::Remove) => {
-                    storage.removeAttribute_range(underline_key, range);
-                }
-                (TextFormat::Clear, FormatDecision::Clear) => unsafe {
-                    for key in [
-                        NSFontAttributeName,
-                        NSForegroundColorAttributeName,
-                        NSBackgroundColorAttributeName,
-                        NSUnderlineStyleAttributeName,
-                        NSStrikethroughStyleAttributeName,
-                        NSObliquenessAttributeName,
-                        NSStrokeColorAttributeName,
-                        NSStrokeWidthAttributeName,
-                        NSShadowAttributeName,
-                        NSKernAttributeName,
-                        NSBaselineOffsetAttributeName,
-                    ] {
-                        storage.removeAttribute_range(key, range);
-                    }
-                    let font = NSFont::systemFontOfSize(17.0);
-                    storage.addAttribute_value_range(font_key, &font, range);
-                },
-                (TextFormat::Clear, FormatDecision::Add | FormatDecision::Remove) => {}
-                (_, FormatDecision::Clear) => {}
-            }
-        }
-        body.setSelectedRange(range);
-        if let Some(window) = self.ivars().window.get() {
-            window.makeFirstResponder(Some(body));
-        }
-        self.update_formatting_buttons();
-        self.save_current_note();
-    }
-
-    fn selection_style_active(
-        &self,
-        body: &NSTextView,
-        range: NSRange,
-        format: TextFormat,
-    ) -> bool {
-        if format == TextFormat::Clear || range.length == 0 {
-            return false;
-        }
-        let Some(storage) = (unsafe { body.textStorage() }) else {
-            return false;
-        };
-        let font_key = unsafe { NSFontAttributeName };
-        let underline_key = unsafe { NSUnderlineStyleAttributeName };
-        let manager = objc2_app_kit::NSFontManager::sharedFontManager(self.mtm());
-        for index in range.location..range.location + range.length {
-            let active = match format {
-                TextFormat::Bold | TextFormat::Italic => unsafe {
-                    storage
-                        .attribute_atIndex_effectiveRange(font_key, index, null_mut())
-                        .and_then(|value| value.downcast::<NSFont>().ok())
-                        .map(|font| {
-                            let trait_mask = if format == TextFormat::Bold {
-                                NSFontTraitMask::BoldFontMask
-                            } else {
-                                NSFontTraitMask::ItalicFontMask
-                            };
-                            manager.traitsOfFont(&font).contains(trait_mask)
-                        })
-                        .unwrap_or(false)
-                },
-                TextFormat::Underline => unsafe {
-                    storage
-                        .attribute_atIndex_effectiveRange(underline_key, index, null_mut())
-                        .and_then(|value| value.downcast::<NSNumber>().ok())
-                        .map(|number| number.intValue() != 0)
-                        .unwrap_or(false)
-                },
-                TextFormat::Clear => false,
-            };
-            if !active {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn typing_style_active(&self, body: &NSTextView, format: TextFormat) -> bool {
-        let attributes = body.typingAttributes();
-        match format {
-            TextFormat::Bold | TextFormat::Italic => {
-                let font_key = unsafe { NSFontAttributeName };
-                let trait_mask = if format == TextFormat::Bold {
-                    NSFontTraitMask::BoldFontMask
-                } else {
-                    NSFontTraitMask::ItalicFontMask
-                };
-                attributes
-                    .objectForKey(font_key)
-                    .and_then(|value| value.downcast::<NSFont>().ok())
-                    .map(|font| {
-                        objc2_app_kit::NSFontManager::sharedFontManager(self.mtm())
-                            .traitsOfFont(&font)
-                            .contains(trait_mask)
-                    })
-                    .unwrap_or(false)
-            }
-            TextFormat::Underline => {
-                let key = unsafe { NSUnderlineStyleAttributeName };
-                attributes
-                    .objectForKey(key)
-                    .and_then(|value| value.downcast::<NSNumber>().ok())
-                    .map(|number| number.intValue() != 0)
-                    .unwrap_or(false)
-            }
-            TextFormat::Clear => false,
-        }
-    }
-
-    #[allow(deprecated)]
-    fn apply_typing_format(&self, body: &NSTextView, format: TextFormat, decision: FormatDecision) {
-        let attributes = body.typingAttributes();
-        let mutable = attributes.mutableCopy();
-        let font_key = unsafe { NSFontAttributeName };
-        let underline_key = unsafe { NSUnderlineStyleAttributeName };
-        match (format, decision) {
-            (TextFormat::Bold, FormatDecision::Add)
-            | (TextFormat::Bold, FormatDecision::Remove)
-            | (TextFormat::Italic, FormatDecision::Add)
-            | (TextFormat::Italic, FormatDecision::Remove) => {
-                let font = attributes
-                    .objectForKey(font_key)
-                    .and_then(|value| value.downcast::<NSFont>().ok())
-                    .unwrap_or_else(|| NSFont::systemFontOfSize(17.0));
-                let manager = objc2_app_kit::NSFontManager::sharedFontManager(self.mtm());
-                let trait_mask = if format == TextFormat::Bold {
-                    NSFontTraitMask::BoldFontMask
-                } else {
-                    NSFontTraitMask::ItalicFontMask
-                };
-                let converted = match typing_trait_operation(format, decision) {
-                    FontTraitOperation::Have => manager.convertFont_toHaveTrait(&font, trait_mask),
-                    FontTraitOperation::NotHave => {
-                        manager.convertFont_toNotHaveTrait(&font, trait_mask)
-                    }
-                    FontTraitOperation::None => font.clone(),
-                };
-                mutable.insert(font_key, &converted);
-            }
-            (TextFormat::Underline, FormatDecision::Add) => {
-                let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
-                mutable.insert(underline_key, &value);
-            }
-            (TextFormat::Underline, FormatDecision::Remove) => {
-                mutable.removeObjectForKey(underline_key);
-            }
-            (TextFormat::Clear, FormatDecision::Clear) => {
-                for key in [
-                    font_key,
-                    unsafe { NSForegroundColorAttributeName },
-                    unsafe { NSBackgroundColorAttributeName },
-                    underline_key,
-                    unsafe { NSStrikethroughStyleAttributeName },
-                    unsafe { NSObliquenessAttributeName },
-                    unsafe { NSStrokeColorAttributeName },
-                    unsafe { NSStrokeWidthAttributeName },
-                    unsafe { NSShadowAttributeName },
-                    unsafe { NSKernAttributeName },
-                    unsafe { NSBaselineOffsetAttributeName },
-                ] {
-                    mutable.removeObjectForKey(key);
-                }
-                let font = NSFont::systemFontOfSize(17.0);
-                mutable.insert(font_key, &font);
-            }
-            (TextFormat::Clear, FormatDecision::Add | FormatDecision::Remove) => {}
-            (_, FormatDecision::Clear) => {}
-        }
-        unsafe {
-            body.setTypingAttributes(&mutable);
         }
     }
 
     fn update_formatting_buttons(&self) {
-        let Some(body) = self.ivars().body_view.get() else {
-            return;
+        let has_note = self.ivars().current_note_id.borrow().is_some();
+        let toolbar_width = self
+            .ivars()
+            .window
+            .get()
+            .and_then(|window| window.contentView())
+            .map(|content| {
+                shell_layout(
+                    content.frame().size.width,
+                    content.frame().size.height,
+                    *self.ivars().shell_visibility.borrow(),
+                )
+                .toolbar
+                .width
+            })
+            .unwrap_or(0.0);
+        let has_overflow = !toolbar_overflow_actions_for_width(toolbar_width).is_empty();
+        let selection = self
+            .ivars()
+            .body_view
+            .get()
+            .map(|body| body.selectedRange())
+            .unwrap_or(NSRange::new(0, 0));
+        let session_guard = self.ivars().editor_session.borrow();
+        let session = session_guard.as_ref();
+        let state_for_inline = |command| {
+            session
+                .and_then(|session| query_inline_state(session, selection, command).ok())
+                .unwrap_or(SelectionState::Inactive)
         };
-        let range = body.selectedRange();
-        let active = |format| {
-            if range.length == 0 {
-                self.typing_style_active(body, format)
-            } else {
-                self.selection_style_active(body, range, format)
+        let state_for_block = |command| {
+            session
+                .and_then(|session| query_block_state(session, selection, command).ok())
+                .unwrap_or(SelectionState::Inactive)
+        };
+        let (can_undo, can_redo) = session
+            .map(|session| (session.can_undo(), session.can_redo()))
+            .unwrap_or((false, false));
+        for (action, button) in self.ivars().toolbar_buttons.borrow().iter() {
+            let state = match action {
+                EditorAction::Bold => state_for_inline(InlineCommand::Bold),
+                EditorAction::Italic => state_for_inline(InlineCommand::Italic),
+                EditorAction::Underline => state_for_inline(InlineCommand::Underline),
+                EditorAction::Highlight => state_for_inline(InlineCommand::Highlight),
+                EditorAction::Strikethrough => state_for_inline(InlineCommand::Strikethrough),
+                EditorAction::BulletList => state_for_block(BlockCommand::UnorderedList),
+                EditorAction::OrderedList => state_for_block(BlockCommand::OrderedList),
+                EditorAction::Checklist => state_for_block(BlockCommand::Checklist),
+                EditorAction::BlockStyle => state_for_block(BlockCommand::Paragraph),
+                _ => SelectionState::Inactive,
+            };
+            let enabled = has_note
+                && match action {
+                    EditorAction::Undo => can_undo,
+                    EditorAction::Redo => can_redo,
+                    EditorAction::More => has_overflow,
+                    _ => true,
+                };
+            button.setEnabled(enabled);
+            if !has_note {
+                button.setHidden(true);
             }
-        };
-        if let Some(button) = self.ivars().bold_button.get() {
-            button.setState(if active(TextFormat::Bold) {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
-        }
-        if let Some(button) = self.ivars().italic_button.get() {
-            button.setState(if active(TextFormat::Italic) {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
-        }
-        if let Some(button) = self.ivars().underline_button.get() {
-            button.setState(if active(TextFormat::Underline) {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
+            button.setState(match state {
+                SelectionState::Active => NSControlStateValueOn,
+                SelectionState::Mixed => NSControlStateValueMixed,
+                SelectionState::Inactive => NSControlStateValueOff,
             });
         }
     }
@@ -4053,7 +4027,10 @@ impl AppDelegate {
         body: &BodyTextView,
         sender: &ProtocolObject<dyn NSDraggingInfo>,
     ) -> bool {
-        if self.ivars().current_note_id.borrow().is_none() {
+        let has_note = self.ivars().current_note_id.borrow().is_some();
+        let has_marked_text = body.hasMarkedText();
+        let flush_succeeded = self.save_current_note();
+        if !image_insert_gate(has_note, has_marked_text, flush_succeeded) {
             return false;
         }
         let Ok(PasteboardImage::Data { bytes, title, mime }) =
@@ -4181,7 +4158,13 @@ impl AppDelegate {
     }
 
     fn insert_image_data_with_save(&self, bytes: &[u8], title: &str, mime: &str) -> bool {
-        if self.ivars().current_note_id.borrow().is_some() && !self.save_current_note() {
+        let Some(body) = self.ivars().body_view.get() else {
+            return false;
+        };
+        let has_note = self.ivars().current_note_id.borrow().is_some();
+        let has_marked_text = body.hasMarkedText();
+        let flush_succeeded = self.save_current_note();
+        if !image_insert_gate(has_note, has_marked_text, flush_succeeded) {
             return false;
         }
         if bytes.len() > MAX_IMAGE_BYTES {
@@ -4192,9 +4175,6 @@ impl AppDelegate {
             self.set_save_status("图片未插入：格式不支持", true);
             return false;
         }
-        let Some(body) = self.ivars().body_view.get() else {
-            return false;
-        };
         let Some(attributed) = (unsafe { body.textStorage() }).map(|storage| {
             let source: &NSAttributedString = &storage;
             source.mutableCopy()
@@ -4218,6 +4198,9 @@ impl AppDelegate {
         snapshot: EditorSnapshot,
         insertion_range: NSRange,
     ) -> bool {
+        if body.hasMarkedText() || !self.save_current_note() {
+            return false;
+        }
         let Some(note_id) = self.ivars().current_note_id.borrow().clone() else {
             return false;
         };
@@ -4326,6 +4309,11 @@ impl AppDelegate {
             .get()
             .unwrap()
             .setStringValue(&NSString::from_str(&note.title));
+        self.ivars()
+            .updated_label
+            .get()
+            .unwrap()
+            .setStringValue(&NSString::from_str(&format!("更新 {}", note.updated_time)));
         let body = self.ivars().body_view.get().unwrap();
         let (status, is_error) = match parse_html(&note.body) {
             Ok(document) => match session_from_document(&document) {
@@ -4387,6 +4375,11 @@ impl AppDelegate {
             .unwrap()
             .setStringValue(ns_string!(""));
         self.ivars()
+            .updated_label
+            .get()
+            .unwrap()
+            .setStringValue(ns_string!(""));
+        self.ivars()
             .body_view
             .get()
             .unwrap()
@@ -4401,17 +4394,31 @@ impl AppDelegate {
         if let Some(view) = self.ivars().title_field.get() {
             view.setHidden(!has_note);
         }
-        if let Some(view) = self.ivars().bold_button.get() {
+        if let Some(view) = self.ivars().breadcrumb_label.get() {
             view.setHidden(!has_note);
         }
-        if let Some(view) = self.ivars().italic_button.get() {
+        if let Some(view) = self.ivars().updated_label.get() {
             view.setHidden(!has_note);
         }
-        if let Some(view) = self.ivars().underline_button.get() {
-            view.setHidden(!has_note);
-        }
-        if let Some(view) = self.ivars().clear_button.get() {
-            view.setHidden(!has_note);
+        let visible_actions = self
+            .ivars()
+            .window
+            .get()
+            .and_then(|window| window.contentView())
+            .map(|content| {
+                shell_layout(
+                    content.frame().size.width,
+                    content.frame().size.height,
+                    *self.ivars().shell_visibility.borrow(),
+                )
+                .toolbar
+                .width
+            })
+            .map(toolbar_actions_for_width)
+            .unwrap_or_else(|| toolbar_actions_for_width(0.0));
+        for (action, button) in self.ivars().toolbar_buttons.borrow().iter() {
+            button.setHidden(!has_note || !visible_actions.contains(action));
+            button.setEnabled(has_note);
         }
         if let Some(view) = self.ivars().body_scroll.get() {
             view.setHidden(!has_note);
@@ -4575,6 +4582,9 @@ impl AppDelegate {
 
     #[allow(deprecated)]
     fn save_current_note(&self) -> bool {
+        if self.ivars().current_note_id.borrow().is_none() {
+            return true;
+        }
         if *self.ivars().loading_guard.borrow()
             || self
                 .ivars()
@@ -4605,16 +4615,24 @@ impl AppDelegate {
         })
     }
 
-    fn schedule_autosave(&self, note_id: &str, generation: u64) {
+    fn schedule_autosave_after(&self, note_id: &str, generation: u64, delay: f64) {
+        self.ivars()
+            .autosave
+            .borrow_mut()
+            .mark_retry_scheduled(generation);
         let token = NSString::from_str(&format!("{note_id}\u{1f}{generation}"));
         unsafe {
             let _: () = msg_send![
                 self,
                 performSelector: sel!(runAutosave:),
                 withObject: &*token,
-                afterDelay: 0.3_f64
+                afterDelay: delay
             ];
         }
+    }
+
+    fn schedule_autosave(&self, note_id: &str, generation: u64) {
+        self.schedule_autosave_after(note_id, generation, 0.3);
     }
 
     fn mark_current_note_dirty(&self) {
@@ -4647,7 +4665,7 @@ impl AppDelegate {
 
     fn save_current_note_unchecked(&self) -> bool {
         let Some(id) = self.ivars().current_note_id.borrow().clone() else {
-            return false;
+            return true;
         };
         let Some(prepared) = self.prepared_current_note_content() else {
             self.set_save_status("编辑器状态不可用，未覆盖正文", true);
@@ -4669,8 +4687,6 @@ impl AppDelegate {
                 let ok = self.persist_note_content(&id, prepared);
                 if ok {
                     self.ivars().autosave.borrow_mut().mark_saved(generation);
-                } else {
-                    self.ivars().autosave.borrow_mut().mark_failed(generation);
                 }
                 ok
             }
@@ -4706,8 +4722,10 @@ impl AppDelegate {
             }
             Err(error) => {
                 eprintln!("autosave failed: {error}");
-                if let Some(generation) = generation {
-                    self.ivars().autosave.borrow_mut().mark_failed(generation);
+                if let Some(generation) = generation
+                    && let Some(delay) = self.ivars().autosave.borrow_mut().mark_failed(generation)
+                {
+                    self.schedule_autosave_after(id, generation, delay);
                 }
                 self.set_save_status("保存失败", true);
                 false
@@ -4910,6 +4928,10 @@ where
     }
     apply();
     true
+}
+
+fn image_insert_gate(has_note: bool, has_marked_text: bool, flush_succeeded: bool) -> bool {
+    has_note && !has_marked_text && flush_succeeded
 }
 
 fn commit_live_image_insert(
@@ -5235,6 +5257,8 @@ impl AppDelegate {
             list_stack: OnceCell::new(),
             browser_title: OnceCell::new(),
             browser_count: OnceCell::new(),
+            breadcrumb_label: OnceCell::new(),
+            updated_label: OnceCell::new(),
             list_empty_label: OnceCell::new(),
             library_label: OnceCell::new(),
             new_button: OnceCell::new(),
@@ -5242,10 +5266,6 @@ impl AppDelegate {
             title_field: OnceCell::new(),
             focus_button: OnceCell::new(),
             browser_toggle_button: OnceCell::new(),
-            bold_button: OnceCell::new(),
-            italic_button: OnceCell::new(),
-            underline_button: OnceCell::new(),
-            clear_button: OnceCell::new(),
             body_scroll: OnceCell::new(),
             body_view: OnceCell::new(),
             delete_button: OnceCell::new(),
@@ -5993,6 +6013,62 @@ mod tests {
     }
 
     #[test]
+    fn red_compact_toolbar_keeps_every_fixed_action_and_more_reachable() {
+        let actions = super::toolbar_actions_for_width(412.0);
+        assert_eq!(actions.len(), 12);
+        assert_eq!(actions.last(), Some(&super::EditorAction::More));
+        let group_gaps = 4.0 * 4.0;
+        assert!((actions.len() as f64 * 32.0) + group_gaps <= 412.0);
+    }
+
+    #[test]
+    fn red_navigation_controls_stay_inside_the_192_point_rail() {
+        let layout = super::shell_layout(1100.0, 700.0, super::ShellVisibility::Default);
+        let new_note = super::LayoutRect {
+            x: 16.0,
+            y: 0.0,
+            width: 160.0,
+            height: 30.0,
+        };
+        let search = super::LayoutRect {
+            x: 16.0,
+            y: 0.0,
+            width: 160.0,
+            height: 30.0,
+        };
+        assert!(new_note.right() <= layout.navigation.right());
+        assert!(search.right() <= layout.navigation.right());
+    }
+
+    #[test]
+    fn red_empty_autosave_state_represents_no_current_note() {
+        assert!(super::AutosaveState::empty().note_id.is_none());
+    }
+
+    #[test]
+    fn red_failed_autosave_waits_before_retrying_the_same_generation() {
+        let mut state = super::AutosaveState::loaded("note-a", "标题", "<p>旧</p>");
+        assert_eq!(state.mark_dirty("note-a", "标题", "<p>新</p>"), Some(1));
+        state.mark_failed(1);
+        assert_eq!(state.scheduled_generation, None);
+        for _ in 1..super::AUTOSAVE_MAX_RETRIES {
+            state.mark_retry_scheduled(1);
+            state.mark_failed(1);
+        }
+        assert_eq!(state.mark_failed(1), None);
+        assert_eq!(state.retry_generation, None);
+    }
+
+    #[test]
+    fn red_breadcrumb_and_title_share_the_writing_measure() {
+        let layout = super::shell_layout(1380.0, 820.0, super::ShellVisibility::Default);
+        assert!(layout.breadcrumb.width > 0.0);
+        assert_eq!(layout.breadcrumb.x, layout.body.x);
+        assert_eq!(layout.title.x, layout.body.x);
+        assert!(layout.title.y < layout.breadcrumb.y);
+    }
+
+    #[test]
     fn red_autosave_coalesces_bursts_and_rejects_stale_tokens() {
         let mut state = super::AutosaveState::loaded("note-a", "标题", "<p>旧</p>");
         assert_eq!(state.mark_dirty("note-a", "标题", "<p>一</p>"), Some(1));
@@ -6031,8 +6107,14 @@ mod tests {
                 html: "<p>正文</p>".into()
             }
         );
-        state.mark_failed(1);
+        assert_eq!(state.mark_failed(1), Some(0.3));
         assert!(state.is_dirty());
+        assert_eq!(state.retry_delay(1), Some(0.3));
+        assert_eq!(
+            state.timer_decision("note-a", 1),
+            super::AutosaveDecision::Stale
+        );
+        state.mark_retry_scheduled(1);
         assert_eq!(
             state.timer_decision("note-a", 1),
             super::AutosaveDecision::Persist {
@@ -6369,6 +6451,14 @@ mod tests {
             },
         ));
         assert_eq!(apply_count, 0);
+    }
+
+    #[test]
+    fn red_drag_image_uses_the_same_flush_and_ime_gate_as_open_image() {
+        assert!(super::image_insert_gate(true, false, true));
+        assert!(!super::image_insert_gate(true, true, true));
+        assert!(!super::image_insert_gate(true, false, false));
+        assert!(!super::image_insert_gate(false, false, true));
     }
 
     #[test]
