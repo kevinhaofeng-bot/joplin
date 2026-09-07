@@ -935,23 +935,63 @@ fn is_formatting_whitespace(text: &str) -> bool {
 }
 
 fn has_inline_sibling_context(node: &DomHandle) -> bool {
-    let Some(parent) = DomSink::parent(node) else {
-        return false;
-    };
-    let children = parent.children.borrow();
-    let Some(index) = children.iter().position(|child| Rc::ptr_eq(child, node)) else {
-        return false;
-    };
-    let Some(previous) = index
-        .checked_sub(1)
-        .and_then(|position| children.get(position))
-    else {
-        return false;
-    };
-    let Some(next) = children.get(index + 1) else {
-        return false;
-    };
-    is_visible_inline_node(previous) && is_visible_inline_node(next)
+    let mut cursor = node.clone();
+    loop {
+        let Some(parent) = DomSink::parent(&cursor) else {
+            return false;
+        };
+        let children = parent.children.borrow();
+        let Some(index) = children.iter().position(|child| Rc::ptr_eq(child, &cursor)) else {
+            return false;
+        };
+        let previous = visible_sibling(&children, index, -1);
+        let next = visible_sibling(&children, index, 1);
+        if let (Some(previous), Some(next)) = (previous, next) {
+            return is_visible_inline_node(previous) && is_visible_inline_node(next);
+        }
+        if !is_inline_container(&parent) {
+            return false;
+        }
+        cursor = parent.clone();
+    }
+}
+
+fn visible_sibling(children: &[DomHandle], index: usize, direction: isize) -> Option<&DomHandle> {
+    let mut position = index as isize + direction;
+    while position >= 0 && (position as usize) < children.len() {
+        let node = &children[position as usize];
+        match &node.data {
+            DomData::Comment(_) | DomData::ProcessingInstruction { .. } => {
+                position += direction;
+            }
+            _ => return Some(node),
+        }
+    }
+    None
+}
+
+fn is_inline_container(node: &DomHandle) -> bool {
+    match &node.data {
+        DomData::Element { name, .. } => {
+            let tag = name.local.to_string().to_ascii_lowercase();
+            !is_block_element(&tag)
+                && !matches!(
+                    tag.as_str(),
+                    "div"
+                        | "section"
+                        | "article"
+                        | "header"
+                        | "footer"
+                        | "script"
+                        | "style"
+                        | "head"
+                        | "title"
+                        | "br"
+                        | "img"
+                )
+        }
+        _ => false,
+    }
 }
 
 fn is_visible_inline_node(node: &DomHandle) -> bool {
@@ -1261,6 +1301,24 @@ mod tests {
             },
         ])]);
         assert_eq!(serialize_html(&repeated), "<p>a&nbsp;<em>&nbsp;</em>b</p>");
+    }
+
+    #[test]
+    fn root_inline_whitespace_survives_wrappers_and_comments() {
+        assert_eq!(
+            search_text(&parse_html("<strong>one</strong><span> </span><em>two</em>").unwrap()),
+            "one two"
+        );
+        assert_eq!(
+            search_text(&parse_html("<strong>one</strong><!-- comment --> <em>two</em>").unwrap()),
+            "one two"
+        );
+    }
+
+    #[test]
+    fn block_indentation_whitespace_is_not_promoted_to_content() {
+        let document = parse_html("<p>one</p>\n  <div>two</div>\n  <p>three</p>").unwrap();
+        assert_eq!(search_text(&document), "one\ntwo\nthree");
     }
 
     #[test]
