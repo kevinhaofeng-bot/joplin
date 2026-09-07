@@ -3,7 +3,10 @@ use crate::html_body::{HtmlBodyError, parse_html, resource_ids, search_text, ser
 pub use crate::resource_store::ResourceImport;
 use crate::resource_store::{ResourceError, ResourceStore};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::path::PathBuf;
@@ -18,26 +21,39 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
-static FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+#[derive(Default)]
+struct BackupTestHooks {
+    fail_after_destination_open: HashSet<PathBuf>,
+    publish_race_targets: HashSet<PathBuf>,
+    replace_partial_before_cleanup: HashSet<PathBuf>,
+    aba_swap_targets: HashSet<PathBuf>,
+    partial_paths: HashMap<PathBuf, PathBuf>,
+}
 
 #[cfg(test)]
-static PAUSE_AFTER_MIGRATION_BACKUP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static BACKUP_TEST_HOOKS: std::sync::OnceLock<Mutex<BackupTestHooks>> = std::sync::OnceLock::new();
+
 #[cfg(test)]
-static MIGRATION_BACKUP_PAUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+#[derive(Default)]
+struct MigrationTestHooks {
+    pause_after_backup: HashSet<PathBuf>,
+    backup_paused: HashSet<PathBuf>,
+    release_backup: HashSet<PathBuf>,
+}
+
 #[cfg(test)]
-static RELEASE_MIGRATION_BACKUP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static BACKUP_PUBLISH_RACE_TARGET: std::sync::OnceLock<Mutex<Option<PathBuf>>> =
+static MIGRATION_TEST_HOOKS: std::sync::OnceLock<Mutex<MigrationTestHooks>> =
     std::sync::OnceLock::new();
+
 #[cfg(test)]
-static REPLACE_PARTIAL_BEFORE_CLEANUP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+fn backup_test_hooks() -> &'static Mutex<BackupTestHooks> {
+    BACKUP_TEST_HOOKS.get_or_init(|| Mutex::new(BackupTestHooks::default()))
+}
+
 #[cfg(test)]
-static LAST_PARTIAL_PATH: std::sync::OnceLock<Mutex<Option<PathBuf>>> = std::sync::OnceLock::new();
+fn migration_test_hooks() -> &'static Mutex<MigrationTestHooks> {
+    MIGRATION_TEST_HOOKS.get_or_init(|| Mutex::new(MigrationTestHooks::default()))
+}
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -601,20 +617,31 @@ impl NoteRepository {
             ".{target_name}.html-migration-{}.partial",
             new_id()
         ));
-        let partial = OwnedPartial::claim(partial_path)?;
+        let partial = OwnedPartial::claim(partial_path, target)?;
         let result = (|| {
             if !partial.still_owned() {
                 return Err(CoreError::BackupFailure);
             }
-            let mut destination = Connection::open_with_flags(
+            #[cfg(test)]
+            let aba_stash = prepare_aba_swap(&partial.path, target)?;
+            let destination_result = Connection::open_with_flags(
                 &partial.path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )?;
+            );
+            #[cfg(test)]
+            if let Some(stash) = aba_stash {
+                restore_aba_swap(&partial.path, &stash)?;
+            }
+            let mut destination = destination_result?;
+            ensure_destination_has_not_moved(&destination)?;
             if !partial.still_owned() {
                 return Err(CoreError::BackupFailure);
             }
             #[cfg(test)]
-            if FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN.swap(false, Ordering::Relaxed) {
+            if consume_backup_hook(
+                |hooks| hooks.fail_after_destination_open.remove(target),
+                target,
+            ) {
                 return Err(CoreError::BackupFailure);
             }
             let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
@@ -625,10 +652,10 @@ impl NoteRepository {
             if integrity != "ok" {
                 return Err(CoreError::BackupFailure);
             }
+            ensure_destination_has_not_moved(&destination)?;
             if !partial.still_owned() {
                 return Err(CoreError::BackupFailure);
             }
-            drop(destination);
             partial
                 .file
                 .sync_all()
@@ -637,15 +664,10 @@ impl NoteRepository {
                 return Err(CoreError::BackupFailure);
             }
             #[cfg(test)]
-            if let Some(race_target) = BACKUP_PUBLISH_RACE_TARGET
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .expect("backup race mutex poisoned")
-                .take()
-            {
-                std::fs::write(race_target, b"foreign final")
-                    .map_err(|_| CoreError::BackupFailure)?;
+            if consume_backup_hook(|hooks| hooks.publish_race_targets.remove(target), target) {
+                std::fs::write(target, b"foreign final").map_err(|_| CoreError::BackupFailure)?;
             }
+            ensure_destination_has_not_moved(&destination)?;
             std::fs::hard_link(&partial.path, target).map_err(|_| CoreError::BackupFailure)?;
             Ok(())
         })();
@@ -660,12 +682,28 @@ impl NoteRepository {
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let backup = self.backup_before_html_migration_locked(&connection)?;
         #[cfg(test)]
-        if PAUSE_AFTER_MIGRATION_BACKUP.load(Ordering::Acquire) {
-            MIGRATION_BACKUP_PAUSED.store(true, Ordering::Release);
-            while !RELEASE_MIGRATION_BACKUP.load(Ordering::Acquire) {
+        if consume_migration_hook(
+            |hooks| hooks.pause_after_backup.remove(&self.database_path),
+            &self.database_path,
+        ) {
+            migration_test_hooks()
+                .lock()
+                .expect("migration hooks mutex poisoned")
+                .backup_paused
+                .insert(self.database_path.clone());
+            while !migration_test_hooks()
+                .lock()
+                .expect("migration hooks mutex poisoned")
+                .release_backup
+                .contains(&self.database_path)
+            {
                 std::thread::yield_now();
             }
-            MIGRATION_BACKUP_PAUSED.store(false, Ordering::Release);
+            let mut hooks = migration_test_hooks()
+                .lock()
+                .expect("migration hooks mutex poisoned");
+            hooks.backup_paused.remove(&self.database_path);
+            hooks.release_backup.remove(&self.database_path);
         }
         let transaction = connection.unchecked_transaction()?;
         let expected = {
@@ -756,14 +794,84 @@ fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
     }
 }
 
+fn ensure_destination_has_not_moved(destination: &Connection) -> Result<(), CoreError> {
+    let database_name = CString::new("main").expect("static database name has no nul bytes");
+    let mut has_moved: std::os::raw::c_int = 0;
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            destination.handle(),
+            database_name.as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut has_moved as *mut std::os::raw::c_int).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK || has_moved != 0 {
+        return Err(CoreError::BackupFailure);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn consume_backup_hook<F>(consume: F, _target: &Path) -> bool
+where
+    F: FnOnce(&mut BackupTestHooks) -> bool,
+{
+    consume(
+        &mut backup_test_hooks()
+            .lock()
+            .expect("backup hooks mutex poisoned"),
+    )
+}
+
+#[cfg(test)]
+fn consume_migration_hook<F>(consume: F, _database: &Path) -> bool
+where
+    F: FnOnce(&mut MigrationTestHooks) -> bool,
+{
+    consume(
+        &mut migration_test_hooks()
+            .lock()
+            .expect("migration hooks mutex poisoned"),
+    )
+}
+
+#[cfg(test)]
+fn prepare_aba_swap(path: &Path, target: &Path) -> Result<Option<PathBuf>, CoreError> {
+    let enabled = consume_backup_hook(|hooks| hooks.aba_swap_targets.remove(target), target);
+    if !enabled {
+        return Ok(None);
+    }
+    let stash = path.with_file_name(format!(
+        ".{}.aba-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(CoreError::BackupFailure)?,
+        new_id()
+    ));
+    std::fs::rename(path, &stash).map_err(|_| CoreError::BackupFailure)?;
+    if std::fs::write(path, b"foreign partial").is_err() {
+        let _ = std::fs::rename(&stash, path);
+        return Err(CoreError::BackupFailure);
+    }
+    Ok(Some(stash))
+}
+
+#[cfg(test)]
+fn restore_aba_swap(path: &Path, stash: &Path) -> Result<(), CoreError> {
+    std::fs::remove_file(path).map_err(|_| CoreError::BackupFailure)?;
+    std::fs::rename(stash, path).map_err(|_| CoreError::BackupFailure)
+}
+
 struct OwnedPartial {
     path: PathBuf,
     file: File,
     identity: FileIdentity,
+    #[cfg(test)]
+    target: PathBuf,
 }
 
 impl OwnedPartial {
-    fn claim(path: PathBuf) -> Result<Self, CoreError> {
+    fn claim(path: PathBuf, _target: &Path) -> Result<Self, CoreError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -773,16 +881,17 @@ impl OwnedPartial {
             .map_err(|_| CoreError::InvalidBackupTarget)?;
         let identity = file_identity(&file.metadata().map_err(|_| CoreError::BackupFailure)?);
         #[cfg(test)]
-        {
-            *LAST_PARTIAL_PATH
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .expect("partial path mutex poisoned") = Some(path.clone());
-        }
+        backup_test_hooks()
+            .lock()
+            .expect("backup hooks mutex poisoned")
+            .partial_paths
+            .insert(_target.to_path_buf(), path.clone());
         Ok(Self {
             path,
             file,
             identity,
+            #[cfg(test)]
+            target: _target.to_path_buf(),
         })
     }
 
@@ -802,7 +911,10 @@ impl OwnedPartial {
 
     fn cleanup(&self) {
         #[cfg(test)]
-        if REPLACE_PARTIAL_BEFORE_CLEANUP.swap(false, Ordering::AcqRel) {
+        if consume_backup_hook(
+            |hooks| hooks.replace_partial_before_cleanup.remove(&self.target),
+            &self.target,
+        ) {
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::write(&self.path, b"foreign partial");
         }
@@ -810,6 +922,16 @@ impl OwnedPartial {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+#[cfg(test)]
+fn partial_path_for_target(target: &Path) -> Option<PathBuf> {
+    backup_test_hooks()
+        .lock()
+        .expect("backup hooks mutex poisoned")
+        .partial_paths
+        .get(target)
+        .cloned()
 }
 
 fn canonicalize_html(body: &str) -> Result<CanonicalBody, CoreError> {
@@ -1227,16 +1349,13 @@ fn sanitize_fts_query(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKUP_PUBLISH_RACE_TARGET, CoreError, CreateNote, FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN,
-        HtmlNoteConversion, LAST_PARTIAL_PATH, MIGRATION_BACKUP_PAUSED, NoteContentUpdate,
-        NoteRepository, PAUSE_AFTER_MIGRATION_BACKUP, RELEASE_MIGRATION_BACKUP,
-        REPLACE_PARTIAL_BEFORE_CLEANUP, UpdateNote,
+        CoreError, CreateNote, HtmlNoteConversion, NoteContentUpdate, NoteRepository, UpdateNote,
+        backup_test_hooks, migration_test_hooks, partial_path_for_target,
     };
     use crate::html_body::{parse_html, search_text};
     use crate::resource_store::ResourceImport;
     use rusqlite::Connection;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::sync::mpsc::channel;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -1919,8 +2038,12 @@ mod tests {
                 [&note.id],
             )
             .unwrap();
-        PAUSE_AFTER_MIGRATION_BACKUP.store(true, Ordering::Release);
-        RELEASE_MIGRATION_BACKUP.store(false, Ordering::Release);
+        let database_path = repo.database_path.clone();
+        migration_test_hooks()
+            .lock()
+            .unwrap()
+            .pause_after_backup
+            .insert(database_path.clone());
         let migration_repo = Arc::clone(&repo);
         let migration_id = note.id.clone();
         let source_updated_time = note.updated_time;
@@ -1934,12 +2057,23 @@ mod tests {
             }])
         });
         for _ in 0..200 {
-            if MIGRATION_BACKUP_PAUSED.load(Ordering::Acquire) {
+            if migration_test_hooks()
+                .lock()
+                .unwrap()
+                .backup_paused
+                .contains(&database_path)
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(MIGRATION_BACKUP_PAUSED.load(Ordering::Acquire));
+        assert!(
+            migration_test_hooks()
+                .lock()
+                .unwrap()
+                .backup_paused
+                .contains(&database_path)
+        );
         let (started_sender, started_receiver) = channel();
         let update_repo = Arc::clone(&repo);
         let update_id = note.id.clone();
@@ -1955,7 +2089,11 @@ mod tests {
         });
         started_receiver.recv().unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        RELEASE_MIGRATION_BACKUP.store(true, Ordering::Release);
+        migration_test_hooks()
+            .lock()
+            .unwrap()
+            .release_backup
+            .insert(database_path.clone());
         assert!(migration.join().unwrap().unwrap().exists());
         assert_eq!(repo.get_note(&note.id).unwrap().unwrap().body, "<p>new</p>");
         assert_eq!(update.join().unwrap().unwrap().title, "after migration");
@@ -1963,8 +2101,10 @@ mod tests {
             repo.get_note(&note.id).unwrap().unwrap().title,
             "after migration"
         );
-        PAUSE_AFTER_MIGRATION_BACKUP.store(false, Ordering::Release);
-        MIGRATION_BACKUP_PAUSED.store(false, Ordering::Release);
+        let mut hooks = migration_test_hooks().lock().unwrap();
+        hooks.pause_after_backup.remove(&database_path);
+        hooks.backup_paused.remove(&database_path);
+        hooks.release_backup.remove(&database_path);
     }
 
     #[cfg(unix)]
@@ -1993,10 +2133,11 @@ mod tests {
             Err(CoreError::InvalidBackupTarget)
         ));
         let race = profile.join("race.sqlite");
-        *BACKUP_PUBLISH_RACE_TARGET
-            .get_or_init(|| std::sync::Mutex::new(None))
+        backup_test_hooks()
             .lock()
-            .unwrap() = Some(race.clone());
+            .unwrap()
+            .publish_race_targets
+            .insert(race.clone());
         assert!(matches!(
             repo.backup_before_html_migration_to(&race),
             Err(CoreError::BackupFailure)
@@ -2004,33 +2145,53 @@ mod tests {
         assert_eq!(std::fs::read(&race).unwrap(), b"foreign final");
 
         let failed = profile.join("failed.sqlite");
-        FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN.store(true, Ordering::Relaxed);
+        backup_test_hooks()
+            .lock()
+            .unwrap()
+            .fail_after_destination_open
+            .insert(failed.clone());
         assert!(matches!(
             repo.backup_before_html_migration_to(&failed),
             Err(CoreError::BackupFailure)
         ));
         assert!(!failed.exists());
-        let partial = LAST_PARTIAL_PATH
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap();
+        let partial = partial_path_for_target(&failed).unwrap();
         assert!(!partial.exists());
 
         let replaced = profile.join("replaced.sqlite");
-        FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN.store(true, Ordering::Relaxed);
-        REPLACE_PARTIAL_BEFORE_CLEANUP.store(true, Ordering::Relaxed);
+        let mut hooks = backup_test_hooks().lock().unwrap();
+        hooks.fail_after_destination_open.insert(replaced.clone());
+        hooks
+            .replace_partial_before_cleanup
+            .insert(replaced.clone());
+        drop(hooks);
         assert!(matches!(
             repo.backup_before_html_migration_to(&replaced),
             Err(CoreError::BackupFailure)
         ));
-        let foreign_partial = LAST_PARTIAL_PATH
-            .get_or_init(|| std::sync::Mutex::new(None))
+        let foreign_partial = partial_path_for_target(&replaced).unwrap();
+        assert_eq!(std::fs::read(foreign_partial).unwrap(), b"foreign partial");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_fails_closed_when_partial_path_is_swapped_during_sqlite_open() {
+        let temp = tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let repo = NoteRepository::open(profile.join("notes.sqlite")).unwrap();
+        let target = profile.join("aba.sqlite");
+        backup_test_hooks()
             .lock()
             .unwrap()
-            .clone()
-            .unwrap();
-        assert_eq!(std::fs::read(foreign_partial).unwrap(), b"foreign partial");
+            .aba_swap_targets
+            .insert(target.clone());
+
+        assert!(matches!(
+            repo.backup_before_html_migration_to(&target),
+            Err(CoreError::BackupFailure)
+        ));
+        assert!(!target.exists());
+        assert!(!partial_path_for_target(&target).unwrap().exists());
     }
 }
