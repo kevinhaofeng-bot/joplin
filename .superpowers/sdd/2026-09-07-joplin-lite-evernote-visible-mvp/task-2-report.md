@@ -421,3 +421,68 @@ The earlier third-round note that a failed partial model edit is rolled back by
 `TextDocument::undo()` is superseded by this round: the production contract is
 validate-then-apply, and the cancellation path deliberately does not mutate
 either undo or redo history.
+
+## Fix 1 fifth-round review: RED/GREEN evidence (2026-09-07)
+
+### RED: final independent blockers
+
+Focused regressions were added before their production fixes:
+
+```text
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --bin joplin-lite-native composition_accumulator
+RED: the three AppKit marked callbacks could not be accumulated; the helper
+     did not exist and the old capture path cleared marked-text state
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --bin joplin-lite-native production_pending_decision
+RED: multi-attachment/sentinel preflight and all A/A/B identity positions had
+     no production decision helper
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --lib active_list_commands_toggle_back_to_paragraph_and_undo_redo
+RED: applying an already-active list command did not exit to paragraph
+```
+
+### GREEN: final gates
+
+```text
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml --all-targets
+85 library + 42 app + 7 lifecycle tests passed; 0 failed
+
+cargo clippy --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --all-targets -- -D warnings
+passed
+
+cargo fmt --manifest-path packages/app-lite-native/Cargo.toml -- --check
+passed
+
+git diff --check 41acd1683..HEAD
+passed
+```
+
+### Fifth-round design
+
+- Marked AppKit callbacks now form a pure composition accumulator. It retains
+  the original semantic range while validating each successive old view,
+  current marked range, and baseline-plus-latest replacement. Intermediate
+  marked `textDidChange` events neither clear the transaction nor save; final
+  unmarked text commits one semantic delta. Emoji-adjacent selection and
+  cancellation back to baseline are covered.
+- Direct `shouldChange` capture preflights UTF-16 boundaries, stale baselines,
+  NUL/FFFC replacement, multi-attachment edits, and duplicate pending intents;
+  unsupported edits return `false` before AppKit mutates the view. If an
+  accepted edit becomes stale or semantically unapplyable, the delegate
+  restores the authoritative rendered session under the loading guard, clears
+  pending state, clamps the caret, and reports an unsaved error.
+- List commands query each selected block's actual list kind. Repeating the
+  active unordered, ordered, or checklist command removes the list as one
+  undoable command; changing kind applies the requested kind and clears checked
+  markers unless checklist remains active. Undo/redo round-trips cover all
+  three active toggles.
+- `run_edit_command` now accepts only an infallible edit closure. Every public
+  command validates ranges, formats, and discovery before opening the edit
+  block; lower-level Result failures after mutation use the explicit fail-stop
+  `must_apply` path, never an ordinary recoverable error or `undo()` abort.
+  Paragraph list removal no longer swallows errors, and no full-document
+  snapshot history is introduced.

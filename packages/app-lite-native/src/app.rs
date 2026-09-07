@@ -82,6 +82,25 @@ enum PendingIntentDecision {
     Reject,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingEditorComposition {
+    baseline_view_text: String,
+    baseline_semantic_text: String,
+    baseline_range: NSRange,
+    current_view_text: String,
+    current_marked_range: NSRange,
+    replacement: String,
+    covered_attachments: Vec<RenderedAttachment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingIntentRejection {
+    StaleBaseline,
+    InvalidUtf16,
+    InvalidReplacement,
+    AmbiguousAttachment,
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 enum EditorCodecError {
     #[error("HTML document error: {0}")]
@@ -130,6 +149,10 @@ fn should_persist_after_editor_sync(result: EditorSessionSyncResult) -> bool {
         result,
         EditorSessionSyncResult::Noop | EditorSessionSyncResult::Applied
     )
+}
+
+fn should_restore_after_editor_sync(result: EditorSessionSyncResult) -> bool {
+    matches!(result, EditorSessionSyncResult::Rejected)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -275,6 +298,133 @@ fn decide_pending_editor_intent(
             replacement: intent.replacement.clone(),
         }
     }
+}
+
+fn preflight_pending_editor_intent(
+    intent: &PendingEditorIntent,
+) -> Result<(), PendingIntentRejection> {
+    if intent.old_view_text != intent.old_semantic_text {
+        return Err(PendingIntentRejection::StaleBaseline);
+    }
+    if intent
+        .replacement
+        .chars()
+        .any(|character| character == '\0' || character == '\u{fffc}')
+    {
+        return Err(PendingIntentRejection::InvalidReplacement);
+    }
+    let Some((start, end)) = utf16_scalar_range(&intent.old_view_text, intent.range) else {
+        return Err(PendingIntentRejection::InvalidUtf16);
+    };
+    let old_slice: String = intent
+        .old_view_text
+        .chars()
+        .skip(start)
+        .take(end - start)
+        .collect();
+    if old_slice.contains('\u{fffc}')
+        && (old_slice != "\u{fffc}"
+            || !intent.replacement.is_empty()
+            || intent.covered_attachments.len() != 1)
+    {
+        return Err(PendingIntentRejection::AmbiguousAttachment);
+    }
+    Ok(())
+}
+
+fn accumulate_marked_editor_intent(
+    current: Option<PendingEditorComposition>,
+    old_view_text: &str,
+    old_semantic_text: &str,
+    range: NSRange,
+    replacement: &str,
+    marked_range: NSRange,
+    covered_attachments: Vec<RenderedAttachment>,
+) -> Result<PendingEditorComposition, PendingIntentRejection> {
+    if replacement
+        .chars()
+        .any(|character| character == '\0' || character == '\u{fffc}')
+    {
+        return Err(PendingIntentRejection::InvalidReplacement);
+    }
+    match current {
+        None => {
+            let intent = PendingEditorIntent {
+                range,
+                replacement: replacement.to_owned(),
+                old_view_text: old_view_text.to_owned(),
+                old_semantic_text: old_semantic_text.to_owned(),
+                covered_attachments,
+            };
+            preflight_pending_editor_intent(&intent)?;
+            if marked_range != range {
+                return Err(PendingIntentRejection::InvalidUtf16);
+            }
+            let Some(current_view_text) =
+                apply_utf16_intent_to_text(old_view_text, range, replacement)
+            else {
+                return Err(PendingIntentRejection::InvalidUtf16);
+            };
+            Ok(PendingEditorComposition {
+                baseline_view_text: old_view_text.to_owned(),
+                baseline_semantic_text: old_semantic_text.to_owned(),
+                baseline_range: range,
+                current_view_text,
+                current_marked_range: NSRange::new(
+                    range.location,
+                    NSString::from_str(replacement).length(),
+                ),
+                replacement: replacement.to_owned(),
+                covered_attachments: intent.covered_attachments,
+            })
+        }
+        Some(mut current) => {
+            if old_view_text != current.current_view_text
+                || old_semantic_text != current.baseline_semantic_text
+                || range != current.current_marked_range
+                || marked_range != range
+            {
+                return Err(PendingIntentRejection::StaleBaseline);
+            }
+            let Some(current_view_text) =
+                apply_utf16_intent_to_text(old_view_text, range, replacement)
+            else {
+                return Err(PendingIntentRejection::InvalidUtf16);
+            };
+            let Some(expected_view_text) = apply_utf16_intent_to_text(
+                &current.baseline_view_text,
+                current.baseline_range,
+                replacement,
+            ) else {
+                return Err(PendingIntentRejection::InvalidUtf16);
+            };
+            if current_view_text != expected_view_text {
+                return Err(PendingIntentRejection::StaleBaseline);
+            }
+            current.current_view_text = current_view_text;
+            current.current_marked_range =
+                NSRange::new(range.location, NSString::from_str(replacement).length());
+            current.replacement = replacement.to_owned();
+            Ok(current)
+        }
+    }
+}
+
+fn finish_marked_editor_intent(
+    composition: &PendingEditorComposition,
+    new_view_text: &str,
+) -> PendingIntentDecision {
+    if new_view_text != composition.current_view_text {
+        return PendingIntentDecision::Reject;
+    }
+    let intent = PendingEditorIntent {
+        range: composition.baseline_range,
+        replacement: composition.replacement.clone(),
+        old_view_text: composition.baseline_view_text.clone(),
+        old_semantic_text: composition.baseline_semantic_text.clone(),
+        covered_attachments: composition.covered_attachments.clone(),
+    };
+    decide_pending_editor_intent(&intent, new_view_text)
 }
 
 fn exact_empty_block_carrier(
@@ -1138,6 +1288,7 @@ struct AppDelegateIvars {
     projection_attachments: RefCell<Vec<RenderedAttachment>>,
     projection_empty_carriers: RefCell<Vec<EmptyBlockCarrier>>,
     pending_editor_intents: RefCell<Vec<PendingEditorIntent>>,
+    pending_editor_composition: RefCell<Option<PendingEditorComposition>>,
     pending_editor_intent_invalid: RefCell<bool>,
     sidebar_background: OnceCell<Retained<NSBox>>,
     sidebar_separator: OnceCell<Retained<NSBox>>,
@@ -1593,13 +1744,24 @@ define_class!(
                 return;
             }
             if body.hasMarkedText() {
-                self.clear_pending_editor_intent();
+                let current_text = body.string().to_string();
+                let composition_valid = self
+                    .ivars()
+                    .pending_editor_composition
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|composition| composition.current_view_text == current_text);
+                if !composition_valid {
+                    self.restore_body_from_session_after_rejected_edit();
+                    self.set_save_status("正文变更未保存，请重试", true);
+                }
                 return;
             }
             let sync_result = self.sync_editor_session_from_view();
             if should_persist_after_editor_sync(sync_result) {
                 self.save_current_note();
-            } else {
+            } else if should_restore_after_editor_sync(sync_result) {
+                self.restore_body_from_session_after_rejected_edit();
                 self.set_save_status("正文变更未保存，请重试", true);
             }
         }
@@ -1617,8 +1779,7 @@ define_class!(
                 text_view,
                 affected_char_range,
                 replacement_string,
-            );
-            true
+            )
         }
 
         #[unsafe(method(textView:doCommandBySelector:))]
@@ -1771,6 +1932,7 @@ define_class!(
 impl AppDelegate {
     fn clear_pending_editor_intent(&self) {
         self.ivars().pending_editor_intents.borrow_mut().clear();
+        *self.ivars().pending_editor_composition.borrow_mut() = None;
         *self.ivars().pending_editor_intent_invalid.borrow_mut() = false;
     }
 
@@ -1779,18 +1941,14 @@ impl AppDelegate {
         body: &NSTextView,
         range: NSRange,
         replacement: Option<&NSString>,
-    ) {
+    ) -> bool {
         if *self.ivars().loading_guard.borrow() {
             self.clear_pending_editor_intent();
-            return;
-        }
-        if body.hasMarkedText() {
-            self.clear_pending_editor_intent();
-            return;
+            return false;
         }
         let Some(storage) = (unsafe { body.textStorage() }) else {
-            *self.ivars().pending_editor_intent_invalid.borrow_mut() = true;
-            return;
+            self.clear_pending_editor_intent();
+            return false;
         };
         let source: &NSAttributedString = &storage;
         let old_view_text = source.string().to_string();
@@ -1801,8 +1959,8 @@ impl AppDelegate {
             .as_ref()
             .and_then(|session| session.text_document().to_addressable_text().ok());
         let Some(old_semantic_text) = old_semantic_text else {
-            *self.ivars().pending_editor_intent_invalid.borrow_mut() = true;
-            return;
+            self.clear_pending_editor_intent();
+            return false;
         };
         let end = range.location.saturating_add(range.length);
         let covered_attachments = self
@@ -1816,16 +1974,55 @@ impl AppDelegate {
             })
             .cloned()
             .collect();
-        self.ivars()
-            .pending_editor_intents
-            .borrow_mut()
-            .push(PendingEditorIntent {
+        let replacement = replacement.map(ToString::to_string).unwrap_or_default();
+        let marked_range = if body.hasMarkedText() {
+            Some(body.markedRange())
+        } else {
+            None
+        };
+        if marked_range.is_some() || self.ivars().pending_editor_composition.borrow().is_some() {
+            let composition = self.ivars().pending_editor_composition.borrow().clone();
+            let next = accumulate_marked_editor_intent(
+                composition,
+                &old_view_text,
+                &old_semantic_text,
                 range,
-                replacement: replacement.map(ToString::to_string).unwrap_or_default(),
+                &replacement,
+                marked_range.unwrap_or(range),
+                covered_attachments,
+            );
+            match next {
+                Ok(next) => {
+                    *self.ivars().pending_editor_composition.borrow_mut() = Some(next);
+                    true
+                }
+                Err(_) => {
+                    self.clear_pending_editor_intent();
+                    false
+                }
+            }
+        } else {
+            if !self.ivars().pending_editor_intents.borrow().is_empty() {
+                self.clear_pending_editor_intent();
+                return false;
+            }
+            let intent = PendingEditorIntent {
+                range,
+                replacement,
                 old_view_text,
                 old_semantic_text,
                 covered_attachments,
-            });
+            };
+            if preflight_pending_editor_intent(&intent).is_err() {
+                self.clear_pending_editor_intent();
+                return false;
+            }
+            self.ivars()
+                .pending_editor_intents
+                .borrow_mut()
+                .push(intent);
+            true
+        }
     }
 
     fn take_pending_editor_intent(&self) -> (Option<PendingEditorIntent>, bool) {
@@ -1932,6 +2129,11 @@ impl AppDelegate {
         self.update_formatting_buttons();
     }
 
+    fn restore_body_from_session_after_rejected_edit(&self) {
+        self.refresh_body_from_session();
+        self.clear_pending_editor_intent();
+    }
+
     fn native_undo_state(&self) -> (bool, bool) {
         self.ivars()
             .editor_session
@@ -2012,17 +2214,29 @@ impl AppDelegate {
         };
         let source: &NSAttributedString = &storage;
         let new_text = source.string().to_string();
-        let (pending, invalid) = self.take_pending_editor_intent();
-        let Some(intent) = pending else {
+        let composition = self.ivars().pending_editor_composition.borrow().clone();
+        let (decision, invalid) = if let Some(composition) = composition {
+            self.clear_pending_editor_intent();
+            (finish_marked_editor_intent(&composition, &new_text), false)
+        } else {
+            let (pending, invalid) = self.take_pending_editor_intent();
+            let Some(intent) = pending else {
+                // A live change is accepted only when AppKit gave us exactly one
+                // pre-mutation intent. The old/new string diff remains a legacy
+                // test and migration helper, never a live writeback path.
+                return EditorSessionSyncResult::Rejected;
+            };
+            if invalid {
+                return EditorSessionSyncResult::Rejected;
+            }
+            (decide_pending_editor_intent(&intent, &new_text), false)
+        };
+        if invalid {
             // A live change is accepted only when AppKit gave us exactly one
             // pre-mutation intent. The old/new string diff remains a legacy
             // test and migration helper, never a live writeback path.
             return EditorSessionSyncResult::Rejected;
-        };
-        if invalid {
-            return EditorSessionSyncResult::Rejected;
         }
-        let decision = decide_pending_editor_intent(&intent, &new_text);
         let mut next_attachments = self.ivars().projection_attachments.borrow().clone();
         let result = match decision {
             PendingIntentDecision::Noop => return EditorSessionSyncResult::Noop,
@@ -3899,6 +4113,7 @@ impl AppDelegate {
             projection_attachments: RefCell::new(Vec::new()),
             projection_empty_carriers: RefCell::new(Vec::new()),
             pending_editor_intents: RefCell::new(Vec::new()),
+            pending_editor_composition: RefCell::new(None),
             pending_editor_intent_invalid: RefCell::new(false),
             sidebar_background: OnceCell::new(),
             sidebar_separator: OnceCell::new(),
@@ -4099,6 +4314,184 @@ mod tests {
     }
 
     #[test]
+    fn composition_accumulator_replays_real_ime_trace_and_commits_once() {
+        let mut composition = None;
+        composition = Some(
+            super::accumulate_marked_editor_intent(
+                composition,
+                "A",
+                "A",
+                NSRange::new(1, 0),
+                "n",
+                NSRange::new(1, 0),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(composition.as_ref().unwrap().current_view_text, "An");
+        composition = Some(
+            super::accumulate_marked_editor_intent(
+                composition,
+                "An",
+                "A",
+                NSRange::new(1, 1),
+                "ni",
+                NSRange::new(1, 1),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(composition.as_ref().unwrap().current_view_text, "Ani");
+        composition = Some(
+            super::accumulate_marked_editor_intent(
+                composition,
+                "Ani",
+                "A",
+                NSRange::new(1, 2),
+                "你",
+                NSRange::new(1, 2),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(composition.as_ref().unwrap().current_view_text, "A你");
+        assert_eq!(
+            super::finish_marked_editor_intent(composition.as_ref().unwrap(), "A你"),
+            super::PendingIntentDecision::ApplyText {
+                range: NSRange::new(1, 0),
+                replacement: "你".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn composition_accumulator_handles_emoji_selection_and_cancel() {
+        let composition = super::accumulate_marked_editor_intent(
+            None,
+            "😀A",
+            "😀A",
+            NSRange::new(2, 1),
+            "n",
+            NSRange::new(2, 1),
+            Vec::new(),
+        )
+        .unwrap();
+        let composition = super::accumulate_marked_editor_intent(
+            Some(composition),
+            "😀n",
+            "😀A",
+            NSRange::new(2, 1),
+            "你",
+            NSRange::new(2, 1),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::finish_marked_editor_intent(&composition, "😀你"),
+            super::PendingIntentDecision::ApplyText {
+                range: NSRange::new(2, 1),
+                replacement: "你".into(),
+            }
+        );
+
+        let cancelled = super::accumulate_marked_editor_intent(
+            None,
+            "A",
+            "A",
+            NSRange::new(1, 0),
+            "n",
+            NSRange::new(1, 0),
+            Vec::new(),
+        )
+        .unwrap();
+        let cancelled = super::accumulate_marked_editor_intent(
+            Some(cancelled),
+            "An",
+            "A",
+            NSRange::new(1, 1),
+            "",
+            NSRange::new(1, 1),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::finish_marked_editor_intent(&cancelled, "A"),
+            super::PendingIntentDecision::Noop
+        );
+        assert!(
+            super::accumulate_marked_editor_intent(
+                Some(cancelled),
+                "stale",
+                "A",
+                NSRange::new(1, 0),
+                "你",
+                NSRange::new(1, 0),
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_pending_decision_rejects_multi_attachment_delete_and_all_aaa_positions() {
+        let attachments = |count: usize| {
+            (0..count)
+                .map(|index| super::RenderedAttachment {
+                    addressable_offset: index,
+                    resource_id: format!("image-{index}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let multi = super::PendingEditorIntent {
+            range: NSRange::new(0, 2),
+            replacement: String::new(),
+            old_view_text: "\u{fffc}\u{fffc}".into(),
+            old_semantic_text: "\u{fffc}\u{fffc}".into(),
+            covered_attachments: attachments(2),
+        };
+        assert_eq!(
+            super::preflight_pending_editor_intent(&multi),
+            Err(super::PendingIntentRejection::AmbiguousAttachment)
+        );
+        let stale = super::PendingEditorIntent {
+            old_view_text: "old".into(),
+            old_semantic_text: "new".into(),
+            range: NSRange::new(0, 0),
+            replacement: "x".into(),
+            covered_attachments: Vec::new(),
+        };
+        assert_eq!(
+            super::preflight_pending_editor_intent(&stale),
+            Err(super::PendingIntentRejection::StaleBaseline)
+        );
+
+        for (location, id) in [(0, "image-a"), (1, "image-a2"), (2, "image-b")] {
+            let intent = super::PendingEditorIntent {
+                range: NSRange::new(location, 1),
+                replacement: String::new(),
+                old_view_text: "\u{fffc}\u{fffc}\u{fffc}".into(),
+                old_semantic_text: "\u{fffc}\u{fffc}\u{fffc}".into(),
+                covered_attachments: vec![super::RenderedAttachment {
+                    addressable_offset: location,
+                    resource_id: id.into(),
+                }],
+            };
+            assert_eq!(super::preflight_pending_editor_intent(&intent), Ok(()));
+            let new_view = super::apply_utf16_intent_to_text(
+                "\u{fffc}\u{fffc}\u{fffc}",
+                NSRange::new(location, 1),
+                "",
+            )
+            .unwrap();
+            assert!(matches!(
+                super::decide_pending_editor_intent(&intent, &new_view),
+                super::PendingIntentDecision::DeleteImage { resource_id, .. }
+                    if resource_id == id
+            ));
+        }
+    }
+
+    #[test]
     fn empty_carrier_install_decision_requires_collapsed_exact_caret() {
         let rendered = super::RenderedDocument {
             attributed: NSMutableAttributedString::from_nsstring(&NSString::from_str("")),
@@ -4124,6 +4517,12 @@ mod tests {
         ));
         assert!(!super::should_persist_after_editor_sync(
             super::EditorSessionSyncResult::Rejected
+        ));
+        assert!(super::should_restore_after_editor_sync(
+            super::EditorSessionSyncResult::Rejected
+        ));
+        assert!(!super::should_restore_after_editor_sync(
+            super::EditorSessionSyncResult::Applied
         ));
     }
 

@@ -162,12 +162,6 @@ impl NativeEditorSession {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    fn cancel_command(&mut self, cursor: TextCursor, previous: Vec<(usize, usize)>) {
-        cursor.end_edit_block();
-        self.text.break_undo_merge();
-        self.highlighted_ranges = previous;
-    }
-
     fn is_highlighted(&self, position: usize) -> bool {
         self.highlighted_ranges
             .iter()
@@ -175,40 +169,24 @@ impl NativeEditorSession {
     }
 }
 
-struct EditOutcome<T> {
-    value: T,
-    changed: bool,
-}
-
-fn changed<T>(value: T) -> EditOutcome<T> {
-    EditOutcome {
-        value,
-        changed: true,
-    }
-}
-
-fn run_edit_command<T, F>(
-    session: &mut NativeEditorSession,
-    action: F,
-) -> Result<T, EditorCodecError>
+fn run_edit_command<T, F>(session: &mut NativeEditorSession, action: F) -> T
 where
-    F: FnOnce(&mut NativeEditorSession) -> Result<EditOutcome<T>, EditorCodecError>,
+    F: FnOnce(&mut NativeEditorSession) -> T,
 {
+    // All validation and fallible discovery happens before this point. The
+    // edit block therefore accepts only an infallible action; an unexpected
+    // text-document failure is handled by `must_apply`, which fail-stops
+    // rather than returning an ordinary error after partial mutation.
     let (command_cursor, previous_highlights) = session.begin_command();
-    let result = action(session);
+    let value = action(session);
+    session.finish_command(command_cursor, previous_highlights);
+    value
+}
+
+fn must_apply<T>(result: Result<T, impl std::fmt::Display>, operation: &str) -> T {
     match result {
-        Ok(outcome) if outcome.changed => {
-            session.finish_command(command_cursor, previous_highlights);
-            Ok(outcome.value)
-        }
-        Ok(outcome) => {
-            session.cancel_command(command_cursor, previous_highlights);
-            Ok(outcome.value)
-        }
-        Err(error) => {
-            session.cancel_command(command_cursor, previous_highlights);
-            Err(error)
-        }
+        Ok(value) => value,
+        Err(error) => panic!("unexpected atomic editor failure in {operation}: {error}"),
     }
 }
 
@@ -824,15 +802,15 @@ pub fn apply_committed_text_delta(
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
-        cursor.insert_text(replacement).map_err(model_error)?;
+        must_apply(cursor.insert_text(replacement), "insert committed text");
         adjust_highlight_ranges(
             &mut session.highlighted_ranges,
             start,
             end,
             replacement.chars().count(),
         );
-        Ok(changed(()))
-    })
+    });
+    Ok(())
 }
 
 /// Insert a resource-backed object anchor. Pixel data stays in ResourceStore;
@@ -851,15 +829,16 @@ pub fn insert_image_anchor(
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
-        cursor
-            .insert_image(resource_id, alt, width.max(1), height.max(1))
-            .map_err(model_error)?;
+        must_apply(
+            cursor.insert_image(resource_id, alt, width.max(1), height.max(1)),
+            "insert image anchor",
+        );
         adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 1);
         session
             .image_dimensions
             .insert(resource_id.to_owned(), (width.max(1), height.max(1)));
-        Ok(changed(()))
-    })
+    });
+    Ok(())
 }
 
 fn link_command_is_noop(
@@ -929,13 +908,11 @@ pub fn delete_image_anchor_if_identity(
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
-        let deleted = cursor.remove_selected_text().map_err(model_error)?;
-        if deleted != "\u{fffc}" {
-            return Err(EditorCodecError::Unsupported);
-        }
+        let deleted = must_apply(cursor.remove_selected_text(), "delete image anchor");
+        debug_assert_eq!(deleted, "\u{fffc}");
         adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 0);
-        Ok(changed(()))
-    })
+    });
+    Ok(())
 }
 
 fn image_resource_id_at(session: &NativeEditorSession, position: usize) -> Option<String> {
@@ -983,9 +960,9 @@ pub fn apply_link(
                 ..Default::default()
             },
         };
-        cursor.merge_char_format(&format).map_err(model_error)?;
-        Ok(changed(()))
-    })
+        must_apply(cursor.merge_char_format(&format), "apply link");
+    });
+    Ok(())
 }
 
 fn block_command_is_noop(
@@ -1044,6 +1021,54 @@ fn block_command_is_noop(
     found
 }
 
+fn actual_list_command(snapshot: &text_document::BlockSnapshot) -> Option<BlockCommand> {
+    let list = snapshot.list_info.as_ref()?;
+    Some(match list.style {
+        ListStyle::Decimal => BlockCommand::OrderedList,
+        _ if matches!(
+            snapshot.block_format.marker,
+            Some(MarkerType::Checked | MarkerType::Unchecked)
+        ) =>
+        {
+            BlockCommand::Checklist
+        }
+        _ => BlockCommand::UnorderedList,
+    })
+}
+
+fn list_command_is_active(
+    session: &NativeEditorSession,
+    start: usize,
+    end: usize,
+    command: BlockCommand,
+) -> bool {
+    if !matches!(
+        command,
+        BlockCommand::UnorderedList | BlockCommand::OrderedList | BlockCommand::Checklist
+    ) {
+        return false;
+    }
+    let mut found = false;
+    for element in session.text.flow() {
+        let FlowElement::Block(block) = element else {
+            continue;
+        };
+        let snapshot = block.snapshot();
+        let overlaps = if start == end {
+            snapshot.position <= start && start <= snapshot.position + snapshot.length
+        } else {
+            snapshot.position < end && snapshot.position + snapshot.length > start
+        };
+        if overlaps {
+            found = true;
+            if actual_list_command(&snapshot) != Some(command) {
+                return false;
+            }
+        }
+    }
+    found
+}
+
 pub fn apply_inline_command(
     session: &mut NativeEditorSession,
     selection: NSRange,
@@ -1053,22 +1078,23 @@ pub fn apply_inline_command(
     let (start, end) = utf16_range(&text, selection)?;
     if matches!(command, InlineCommand::Highlight) {
         let active = query_inline_state(session, selection, command)? == SelectionState::Active;
-        return run_edit_command(session, |session| {
+        run_edit_command(session, |session| {
             toggle_highlight_range(session, start, end);
             let cursor = session.text.cursor_at(start);
             cursor.set_position(end, MoveMode::KeepAnchor);
-            cursor
-                .merge_char_format(&TextFormat {
+            must_apply(
+                cursor.merge_char_format(&TextFormat {
                     background_color: Some(if active {
                         text_document::Color::rgba(0, 0, 0, 0)
                     } else {
                         text_document::Color::rgb(255, 235, 130)
                     }),
                     ..Default::default()
-                })
-                .map_err(model_error)?;
-            Ok(changed(()))
+                }),
+                "toggle highlight",
+            );
         });
+        return Ok(());
     }
     if matches!(command, InlineCommand::Clear) && !selection_needs_clear(session, start, end) {
         return Ok(());
@@ -1108,9 +1134,9 @@ pub fn apply_inline_command(
                 ..Default::default()
             },
         };
-        cursor.merge_char_format(&format).map_err(model_error)?;
-        Ok(changed(()))
-    })
+        must_apply(cursor.merge_char_format(&format), "apply inline format");
+    });
+    Ok(())
 }
 
 pub fn apply_block_command(
@@ -1120,7 +1146,8 @@ pub fn apply_block_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
-    if block_command_is_noop(session, start, end, command) {
+    let toggle_active = list_command_is_active(session, start, end, command);
+    if !toggle_active && block_command_is_noop(session, start, end, command) {
         return Ok(());
     }
     run_edit_command(session, |session| {
@@ -1128,14 +1155,15 @@ pub fn apply_block_command(
         cursor.set_position(end, MoveMode::KeepAnchor);
         match command {
             BlockCommand::Paragraph => {
-                cursor
-                    .set_block_format(&BlockFormat {
+                must_apply(
+                    cursor.set_block_format(&BlockFormat {
                         heading_level: Some(0),
                         marker: Some(MarkerType::NoMarker),
                         ..Default::default()
-                    })
-                    .map_err(model_error)?;
-                remove_lists_in_selection(session, start, end)?;
+                    }),
+                    "set paragraph format",
+                );
+                remove_lists_in_selection(session, start, end);
             }
             BlockCommand::Heading(level) => {
                 let heading_level = match level {
@@ -1143,38 +1171,43 @@ pub fn apply_block_command(
                     HeadingLevel::Two => 2,
                     HeadingLevel::Three => 3,
                 };
-                cursor
-                    .set_block_format(&BlockFormat {
+                must_apply(
+                    cursor.set_block_format(&BlockFormat {
                         heading_level: Some(heading_level),
                         ..Default::default()
-                    })
-                    .map_err(model_error)?;
+                    }),
+                    "set heading format",
+                );
             }
             BlockCommand::UnorderedList | BlockCommand::OrderedList | BlockCommand::Checklist => {
-                let style = match command {
-                    BlockCommand::OrderedList => ListStyle::Decimal,
-                    _ => ListStyle::Disc,
-                };
-                cursor.create_list(style).map_err(model_error)?;
-                if matches!(command, BlockCommand::Checklist) {
-                    cursor
-                        .set_block_format(&BlockFormat {
-                            marker: Some(MarkerType::Unchecked),
+                if toggle_active {
+                    remove_lists_in_selection(session, start, end);
+                } else {
+                    let style = match command {
+                        BlockCommand::OrderedList => ListStyle::Decimal,
+                        _ => ListStyle::Disc,
+                    };
+                    must_apply(cursor.create_list(style), "create list");
+                    let marker = if matches!(command, BlockCommand::Checklist) {
+                        MarkerType::Unchecked
+                    } else {
+                        MarkerType::NoMarker
+                    };
+                    must_apply(
+                        cursor.set_block_format(&BlockFormat {
+                            marker: Some(marker),
                             ..Default::default()
-                        })
-                        .map_err(model_error)?;
+                        }),
+                        "set list marker",
+                    );
                 }
             }
         }
-        Ok(changed(()))
-    })
+    });
+    Ok(())
 }
 
-fn remove_lists_in_selection(
-    session: &NativeEditorSession,
-    start: usize,
-    end: usize,
-) -> Result<(), EditorCodecError> {
+fn remove_lists_in_selection(session: &NativeEditorSession, start: usize, end: usize) {
     let mut positions = Vec::new();
     for element in session.text.flow() {
         let FlowElement::Block(block) = element else {
@@ -1190,12 +1223,18 @@ fn remove_lists_in_selection(
     }
     for position in positions {
         let cursor = session.text.cursor_at(position);
-        cursor
-            .remove_current_block_from_list()
-            .map_err(model_error)
-            .ok();
+        must_apply(
+            cursor.remove_current_block_from_list(),
+            "remove block from list",
+        );
+        must_apply(
+            cursor.set_block_format(&BlockFormat {
+                marker: Some(MarkerType::NoMarker),
+                ..Default::default()
+            }),
+            "clear list marker",
+        );
     }
-    Ok(())
 }
 
 pub fn apply_paragraph_command(
@@ -1208,40 +1247,39 @@ pub fn apply_paragraph_command(
     if paragraph_command_is_noop(session, start, end, command) {
         return Ok(());
     }
+    let requested_format = match command {
+        ParagraphCommand::Align(alignment) => BlockFormat {
+            alignment: Some(td_alignment(alignment)),
+            ..Default::default()
+        },
+        ParagraphCommand::IncreaseIndent | ParagraphCommand::DecreaseIndent => {
+            let cursor = session.text.cursor_at(start);
+            cursor.set_position(end, MoveMode::KeepAnchor);
+            let current = cursor
+                .block_format()
+                .map_err(model_error)?
+                .indent
+                .unwrap_or(0);
+            let indent = match command {
+                ParagraphCommand::IncreaseIndent => current.saturating_add(1).min(8),
+                ParagraphCommand::DecreaseIndent => current.saturating_sub(1),
+                ParagraphCommand::Align(_) => unreachable!(),
+            };
+            BlockFormat {
+                indent: Some(indent),
+                ..Default::default()
+            }
+        }
+    };
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
-        match command {
-            ParagraphCommand::Align(alignment) => cursor.set_block_format(&BlockFormat {
-                alignment: Some(td_alignment(alignment)),
-                ..Default::default()
-            }),
-            ParagraphCommand::IncreaseIndent => {
-                let current = cursor
-                    .block_format()
-                    .map_err(model_error)?
-                    .indent
-                    .unwrap_or(0);
-                cursor.set_block_format(&BlockFormat {
-                    indent: Some(current.saturating_add(1).min(8)),
-                    ..Default::default()
-                })
-            }
-            ParagraphCommand::DecreaseIndent => {
-                let current = cursor
-                    .block_format()
-                    .map_err(model_error)?
-                    .indent
-                    .unwrap_or(0);
-                cursor.set_block_format(&BlockFormat {
-                    indent: Some(current.saturating_sub(1)),
-                    ..Default::default()
-                })
-            }
-        }
-        .map_err(model_error)?;
-        Ok(changed(()))
-    })
+        must_apply(
+            cursor.set_block_format(&requested_format),
+            "set paragraph format",
+        );
+    });
+    Ok(())
 }
 
 fn paragraph_command_is_noop(
@@ -1300,15 +1338,15 @@ pub fn toggle_checklist_at_utf16_location(
         _ => return false,
     };
     run_edit_command(session, |_session| {
-        cursor
-            .set_block_format(&BlockFormat {
+        must_apply(
+            cursor.set_block_format(&BlockFormat {
                 marker: Some(marker),
                 ..Default::default()
-            })
-            .map_err(model_error)?;
-        Ok(changed(()))
-    })
-    .is_ok()
+            }),
+            "toggle checklist marker",
+        );
+    });
+    true
 }
 
 pub fn query_inline_state(
@@ -1907,21 +1945,25 @@ mod tests {
 
         let revision = session.revision();
         let can_undo = session.can_undo();
-        let failure: Result<(), EditorCodecError> =
-            run_edit_command(&mut session, |_session| Err(EditorCodecError::Unsupported));
+        let can_redo = session.can_redo();
+        let failure = apply_link(
+            &mut session,
+            NSRange::new(0, 3),
+            Some("javascript:alert(1)"),
+        );
         assert_eq!(failure, Err(EditorCodecError::Unsupported));
         assert_eq!(session.revision(), revision);
         assert_eq!(session.can_undo(), can_undo);
+        assert_eq!(session.can_redo(), can_redo);
 
         let before_text = session.text.to_addressable_text().unwrap();
-        let partial: Result<(), EditorCodecError> = run_edit_command(&mut session, |session| {
-            let _ = session;
-            Err(EditorCodecError::Unsupported)
-        });
-        assert_eq!(partial, Err(EditorCodecError::Unsupported));
+        let partial =
+            apply_block_command(&mut session, NSRange::new(99, 1), BlockCommand::Checklist);
+        assert_eq!(partial, Err(EditorCodecError::InvalidUtf16Range));
         assert_eq!(session.text.to_addressable_text().unwrap(), before_text);
         assert_eq!(session.revision(), revision);
         assert_eq!(session.can_undo(), can_undo);
+        assert_eq!(session.can_redo(), can_redo);
     }
 
     #[test]
@@ -1941,11 +1983,8 @@ mod tests {
         let revision = session.revision();
         let can_undo = session.can_undo();
         let can_redo = session.can_redo();
-        let partial: Result<(), EditorCodecError> = run_edit_command(&mut session, |session| {
-            let _ = session;
-            Err(EditorCodecError::Unsupported)
-        });
-        assert_eq!(partial, Err(EditorCodecError::Unsupported));
+        let partial = apply_committed_text_delta(&mut session, NSRange::new(99, 0), "x");
+        assert_eq!(partial, Err(EditorCodecError::InvalidUtf16Range));
         assert_eq!(session.text.to_addressable_text().unwrap(), before);
         assert_eq!(session.revision(), revision);
         assert_eq!(session.can_undo(), can_undo);
@@ -2134,6 +2173,71 @@ mod tests {
         }]);
         let session = session_from_document(&document).unwrap();
         assert_eq!(document_from_session(&session).unwrap(), document);
+    }
+
+    #[test]
+    fn active_list_commands_toggle_back_to_paragraph_and_undo_redo() {
+        for (kind, command) in [
+            (ListKind::Unordered, BlockCommand::UnorderedList),
+            (ListKind::Ordered, BlockCommand::OrderedList),
+            (ListKind::Checklist, BlockCommand::Checklist),
+        ] {
+            let document = Document::from_blocks(vec![Block::List {
+                kind,
+                items: vec![ListItem {
+                    checked: (kind == ListKind::Checklist).then_some(true),
+                    style: Default::default(),
+                    inlines: vec![Inline::Text {
+                        text: "item".into(),
+                        marks: Default::default(),
+                    }],
+                }],
+            }]);
+            let mut session = session_from_document(&document).unwrap();
+            apply_block_command(&mut session, NSRange::new(0, 4), command).unwrap();
+            assert!(matches!(
+                document_from_session(&session).unwrap().blocks.as_slice(),
+                [Block::Paragraph { .. }]
+            ));
+            assert!(session.can_undo());
+            session.undo().unwrap();
+            assert_eq!(document_from_session(&session).unwrap(), document);
+            assert!(session.can_redo());
+            session.redo().unwrap();
+            assert!(matches!(
+                document_from_session(&session).unwrap().blocks.as_slice(),
+                [Block::Paragraph { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn switching_checklist_to_unordered_clears_checked_marker() {
+        let document = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Checklist,
+            items: vec![ListItem {
+                checked: Some(true),
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "item".into(),
+                    marks: Default::default(),
+                }],
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        apply_block_command(
+            &mut session,
+            NSRange::new(0, 4),
+            BlockCommand::UnorderedList,
+        )
+        .unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [Block::List {
+                kind: ListKind::Unordered,
+                items,
+            }] if items[0].checked.is_none()
+        ));
     }
 
     #[test]
