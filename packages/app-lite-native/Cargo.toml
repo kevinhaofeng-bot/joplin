@@ -25,7 +25,7 @@ html5ever = "0.38"
 objc2 = "0.6.4"
 objc2-foundation = "0.3.2"
 objc2-app-kit = { version = "0.3.2", features = [
-    "NSApplication", "NSBitmapImageRep", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSMenu",
+    "NSAlert", "NSApplication", "NSBitmapImageRep", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSMenu",
     "NSFontManager", "NSMenuItem", "NSResponder", "NSScrollView", "NSSearchField", "NSSplitView", "NSStackView",
     "NSBox", "NSLayoutConstraint", "NSParagraphStyle", "NSAttributedString",
     "NSTextStorage",

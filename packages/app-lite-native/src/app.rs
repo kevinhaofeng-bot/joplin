@@ -1,8 +1,11 @@
-use joplin_lite_native::body::{
-    extract_resource_ids, markdown_marker, marker_spans, project_search_text,
-};
+use joplin_lite_native::body::{markdown_marker, marker_spans};
 use joplin_lite_native::core::{
-    CreateNote, Note, NoteContentUpdate, NoteRepository, ResourceImport,
+    CreateNote, HtmlNoteConversion, LegacyNoteForHtmlMigration, Note, NoteContentUpdate,
+    NoteRepository, ResourceImport,
+};
+use joplin_lite_native::html_body::{
+    Block, Document, HtmlBodyError, Inline, Marks, parse_html, resource_ids, search_text,
+    serialize_html,
 };
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
@@ -13,13 +16,13 @@ use objc2_app_kit::NSObliquenessAttributeName;
 #[allow(deprecated)]
 use objc2_app_kit::NSShadowAttributeName;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAttachmentAttributeName,
-    NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
-    NSBackgroundColorAttributeName, NSBackingStoreType, NSBaselineOffsetAttributeName,
-    NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep, NSBorderType, NSBox, NSBoxType,
-    NSButton, NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination, NSDraggingInfo,
-    NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontTraitMask,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSAttachmentAttributeName, NSAttributedStringAppKitDocumentFormats,
+    NSAttributedStringAttachmentConveniences, NSBackgroundColorAttributeName, NSBackingStoreType,
+    NSBaselineOffsetAttributeName, NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep,
+    NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination,
+    NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontTraitMask,
     NSForegroundColorAttributeName, NSImage, NSKernAttributeName, NSLayoutAttribute,
     NSLineBreakMode, NSMenu, NSMenuItem, NSMutableAttributedStringAppKitAdditions,
     NSMutableParagraphStyle, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
@@ -36,7 +39,7 @@ use objc2_foundation::{
     NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSURL, ns_string,
 };
 use std::cell::{OnceCell, RefCell};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -48,28 +51,8 @@ use std::sync::Arc;
 const RESOURCE_ID_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-id";
 const RESOURCE_ALT_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-alt";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AttachmentDescriptor {
-    resource_id: String,
-    alt: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EditorSegment {
-    Text(String),
-    Attachment(AttachmentDescriptor),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EditorProjection {
-    body: String,
-    body_text: String,
-    resource_ids: Vec<String>,
-}
-
 struct PreparedNoteContent {
     update: NoteContentUpdate,
-    formatting_fallback: bool,
 }
 
 struct EditorSnapshot {
@@ -79,6 +62,8 @@ struct EditorSnapshot {
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 enum EditorCodecError {
+    #[error("HTML document error: {0}")]
+    Html(#[from] HtmlBodyError),
     #[error("invalid attachment marker: {0}")]
     Body(#[from] joplin_lite_native::body::BodyError),
 }
@@ -97,36 +82,228 @@ fn paste_route(body_is_first_responder: bool, has_current_note: bool) -> PasteRo
     }
 }
 
-fn editor_save_projection(
-    segments: &[EditorSegment],
-) -> Result<EditorProjection, EditorCodecError> {
-    let mut body = String::new();
-    for segment in segments {
-        match segment {
-            EditorSegment::Text(text) => body.push_str(&text.replace('\u{fffc}', "[图片]")),
-            EditorSegment::Attachment(attachment) => {
-                body.push_str(&markdown_marker(&attachment.resource_id, &attachment.alt)?);
-            }
-        }
-    }
-    let mut seen_resource_ids = HashSet::new();
-    let resource_ids = extract_resource_ids(&body)
-        .into_iter()
-        .filter(|resource_id| seen_resource_ids.insert(resource_id.clone()))
-        .collect();
-    Ok(EditorProjection {
-        body_text: project_search_text(&body),
-        body,
-        resource_ids,
-    })
-}
-
 fn resource_id_attribute_key() -> Retained<NSAttributedStringKey> {
     NSString::from_str(RESOURCE_ID_ATTRIBUTE)
 }
 
 fn resource_alt_attribute_key() -> Retained<NSAttributedStringKey> {
     NSString::from_str(RESOURCE_ALT_ATTRIBUTE)
+}
+
+fn string_for_range(source: &NSAttributedString, range: NSRange) -> String {
+    source
+        .attributedSubstringFromRange(range)
+        .string()
+        .to_string()
+}
+
+fn attribute_string(
+    attributes: &NSDictionary<NSAttributedStringKey, AnyObject>,
+    key: &NSAttributedStringKey,
+) -> Option<String> {
+    unsafe { attributes.objectForKey_unchecked(key) }
+        .and_then(|value| value.downcast_ref::<NSString>())
+        .map(ToString::to_string)
+}
+
+fn marks_from_attributes(attributes: &NSDictionary<NSAttributedStringKey, AnyObject>) -> Marks {
+    let font_key = unsafe { NSFontAttributeName };
+    let underline_key = unsafe { NSUnderlineStyleAttributeName };
+    let font_traits = unsafe { attributes.objectForKey_unchecked(font_key) }
+        .and_then(|value| value.downcast_ref::<NSFont>())
+        .map(|font| {
+            let marker = font.fontDescriptor().symbolicTraits();
+            (
+                marker.contains(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitBold),
+                marker.contains(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitItalic),
+            )
+        })
+        .unwrap_or((false, false));
+    let underline = unsafe { attributes.objectForKey_unchecked(underline_key) }
+        .and_then(|value| value.downcast_ref::<NSNumber>())
+        .is_some_and(|value| value.intValue() != 0);
+    Marks {
+        bold: font_traits.0,
+        italic: font_traits.1,
+        underline,
+    }
+}
+
+fn append_document_text(inlines: &mut Vec<Inline>, text: &str, marks: &Marks) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(Inline::Text {
+        text: previous,
+        marks: previous_marks,
+    }) = inlines.last_mut()
+        && previous_marks == marks
+    {
+        previous.push_str(text);
+    } else {
+        inlines.push(Inline::Text {
+            text: text.to_owned(),
+            marks: marks.clone(),
+        });
+    }
+}
+
+fn document_from_attributed_string(
+    source: &NSAttributedString,
+) -> Result<Document, EditorCodecError> {
+    let length = source.string().length();
+    let mut blocks = vec![Vec::new()];
+    let mut location = 0;
+    let id_key = resource_id_attribute_key();
+    let alt_key = resource_alt_attribute_key();
+    let attachment_key = unsafe { NSAttachmentAttributeName };
+    while location < length {
+        let mut effective_range = NSRange::new(location, 0);
+        let attributes = unsafe {
+            source.attributesAtIndex_longestEffectiveRange_inRange(
+                location,
+                &mut effective_range,
+                NSRange::new(0, length),
+            )
+        };
+        let text = string_for_range(source, effective_range).replace("\r\n", "\n");
+        let marks = marks_from_attributes(&attributes);
+        let resource_id = attribute_string(&attributes, &id_key);
+        let alt = attribute_string(&attributes, &alt_key).unwrap_or_else(|| "图片".into());
+        let has_attachment = unsafe { attributes.objectForKey_unchecked(attachment_key) }.is_some();
+        for character in text.chars() {
+            match character {
+                '\n' | '\r' => blocks.push(Vec::new()),
+                '\u{2028}' | '\u{000b}' => blocks
+                    .last_mut()
+                    .expect("document always has a block")
+                    .push(Inline::SoftBreak),
+                '\u{fffc}' if has_attachment => {
+                    let inlines = blocks.last_mut().expect("document always has a block");
+                    if let Some(resource_id) = resource_id.as_ref()
+                        && markdown_marker(resource_id, "").is_ok()
+                    {
+                        inlines.push(Inline::Image {
+                            resource_id: resource_id.to_string(),
+                            alt: alt.clone(),
+                        });
+                    } else {
+                        append_document_text(inlines, "[图片]", &marks);
+                    }
+                }
+                _ => append_document_text(
+                    blocks.last_mut().expect("document always has a block"),
+                    &character.to_string(),
+                    &marks,
+                ),
+            }
+        }
+        let next = effective_range
+            .location
+            .saturating_add(effective_range.length);
+        if next <= location {
+            break;
+        }
+        location = next;
+    }
+    Ok(Document::from_blocks(
+        blocks.into_iter().map(Block::Paragraph).collect(),
+    ))
+}
+
+fn attributed_text_with_marks(text: &str, marks: &Marks) -> Retained<NSMutableAttributedString> {
+    let attributed = NSMutableAttributedString::from_nsstring(&NSString::from_str(text));
+    if text.is_empty() {
+        return attributed;
+    }
+    let range = NSRange::new(0, NSString::from_str(text).length());
+    let mut font = NSFont::systemFontOfSize(17.0);
+    if marks.bold || marks.italic {
+        let descriptor = font.fontDescriptor();
+        let mut traits = descriptor.symbolicTraits();
+        if marks.bold {
+            traits.insert(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitBold);
+        }
+        if marks.italic {
+            traits.insert(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitItalic);
+        }
+        if let Some(converted) = NSFont::fontWithDescriptor_size(
+            &descriptor.fontDescriptorWithSymbolicTraits(traits),
+            17.0,
+        ) {
+            font = converted;
+        }
+    }
+    unsafe {
+        attributed.addAttribute_value_range(NSFontAttributeName, &font, range);
+        if marks.underline {
+            let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
+            attributed.addAttribute_value_range(NSUnderlineStyleAttributeName, &value, range);
+        }
+    }
+    attributed
+}
+
+fn render_document_to_attributed_string<F>(
+    document: &Document,
+    mut resource_loader: F,
+    available_width: f64,
+) -> (Retained<NSMutableAttributedString>, usize)
+where
+    F: FnMut(&str) -> Option<joplin_lite_native::core::StoredResource>,
+{
+    let output = NSMutableAttributedString::from_nsstring(ns_string!(""));
+    let mut attachment_failures = 0;
+    for (block_index, block) in document.blocks.iter().enumerate() {
+        let Block::Paragraph(inlines) = block;
+        for inline in inlines {
+            match inline {
+                Inline::Text { text, marks } => {
+                    output.appendAttributedString(&attributed_text_with_marks(text, marks));
+                }
+                Inline::SoftBreak => output.appendAttributedString(&attributed_text_with_marks(
+                    "\u{2028}",
+                    &Marks::default(),
+                )),
+                Inline::Image { resource_id, alt } => {
+                    let inline = resource_loader(resource_id).and_then(|resource| {
+                        inline_attachment_with_width(&resource, alt, available_width)
+                    });
+                    if let Some(inline) = inline {
+                        output.appendAttributedString(&inline);
+                    } else {
+                        attachment_failures += 1;
+                        output.appendAttributedString(&attributed_text_with_marks(
+                            if alt.is_empty() { "[图片]" } else { alt },
+                            &Marks::default(),
+                        ));
+                    }
+                }
+            }
+        }
+        if block_index + 1 < document.blocks.len() {
+            output.appendAttributedString(&attributed_text_with_marks("\n", &Marks::default()));
+        }
+    }
+    (output, attachment_failures)
+}
+
+fn render_note_document(
+    document: &Document,
+    repository: &NoteRepository,
+    available_width: f64,
+) -> (Retained<NSMutableAttributedString>, usize) {
+    let mut resources = HashMap::new();
+    for resource_id in resource_ids(document) {
+        if let Ok(Some(resource)) = repository.get_resource(&resource_id) {
+            resources.insert(resource_id, resource);
+        }
+    }
+    render_document_to_attributed_string(
+        document,
+        |resource_id| resources.get(resource_id).cloned(),
+        available_width,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -282,190 +459,16 @@ fn typing_trait_operation(format: TextFormat, decision: FormatDecision) -> FontT
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum RtfLoadDecision {
-    ParsedRtf,
-    PlainBodyFallback,
-}
-
-fn rtf_load_decision(parse_succeeded: bool) -> RtfLoadDecision {
-    if parse_succeeded {
-        RtfLoadDecision::ParsedRtf
-    } else {
-        RtfLoadDecision::PlainBodyFallback
-    }
-}
-
-fn load_save_status(rtf_failed: bool, attachment_failures: usize) -> (&'static str, bool) {
-    match (rtf_failed, attachment_failures > 0) {
-        (true, true) => ("格式恢复失败，部分图片未恢复，已保留引用", true),
-        (true, false) => ("格式恢复失败，已回退正文", true),
-        (false, true) => ("部分图片未恢复，已保留引用", true),
-        (false, false) => ("已保存", false),
-    }
-}
-
-fn rtf_text_matches_body(expanded_text: Option<&str>, canonical_body: &str) -> bool {
-    expanded_text == Some(canonical_body)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum RtfSavePlan {
-    Rich(Vec<u8>),
-    PlainTextFallback,
-}
-
-fn rtf_save_plan(payload: Option<Vec<u8>>) -> RtfSavePlan {
-    match payload {
-        Some(payload) => RtfSavePlan::Rich(payload),
-        None => RtfSavePlan::PlainTextFallback,
-    }
-}
-
-fn string_for_range(source: &NSAttributedString, range: NSRange) -> String {
-    source
-        .attributedSubstringFromRange(range)
-        .string()
-        .to_string()
-}
-
-fn attribute_string(
-    attributes: &NSDictionary<NSAttributedStringKey, AnyObject>,
-    key: &NSAttributedStringKey,
-) -> Option<String> {
-    unsafe { attributes.objectForKey_unchecked(key) }
-        .and_then(|value| value.downcast_ref::<NSString>())
-        .map(ToString::to_string)
-}
-
-fn editor_segments_with_ranges(
-    source: &NSAttributedString,
-) -> (Vec<EditorSegment>, Vec<(NSRange, String)>) {
-    let length = source.string().length();
-    let mut location = 0;
-    let mut segments = Vec::new();
-    let mut replacement_ranges = Vec::new();
-    let id_key = resource_id_attribute_key();
-    let alt_key = resource_alt_attribute_key();
-    let attachment_key = unsafe { NSAttachmentAttributeName };
-    while location < length {
-        let mut effective_range = NSRange::new(location, 0);
-        let attributes = unsafe {
-            source.attributesAtIndex_longestEffectiveRange_inRange(
-                location,
-                &mut effective_range,
-                NSRange::new(0, length),
-            )
-        };
-        let text = string_for_range(source, effective_range);
-        let resource_id = attribute_string(&attributes, &id_key);
-        let alt = attribute_string(&attributes, &alt_key).unwrap_or_else(|| "图片".into());
-        let has_attachment = unsafe { attributes.objectForKey_unchecked(attachment_key) }.is_some();
-        let marker = resource_id
-            .as_deref()
-            .and_then(|id| markdown_marker(id, &alt).ok());
-        let mut ordinary_text = String::new();
-        let mut unit_location = effective_range.location;
-        for character in text.chars() {
-            let unit_length = character.len_utf16();
-            let unit_range = NSRange::new(unit_location, unit_length);
-            if character == '\u{fffc}' {
-                if let (Some(resource_id), Some(marker)) = (resource_id.as_ref(), marker.as_ref()) {
-                    if !ordinary_text.is_empty() {
-                        segments.push(EditorSegment::Text(std::mem::take(&mut ordinary_text)));
-                    }
-                    segments.push(EditorSegment::Attachment(AttachmentDescriptor {
-                        resource_id: resource_id.clone(),
-                        alt: alt.clone(),
-                    }));
-                    replacement_ranges.push((unit_range, marker.clone()));
-                } else {
-                    if !ordinary_text.is_empty() {
-                        segments.push(EditorSegment::Text(std::mem::take(&mut ordinary_text)));
-                    }
-                    segments.push(EditorSegment::Text("[图片]".into()));
-                    replacement_ranges.push((unit_range, "[图片]".into()));
-                }
-            } else {
-                ordinary_text.push(character);
-            }
-            unit_location = unit_location.saturating_add(unit_length);
-        }
-        if !ordinary_text.is_empty() {
-            segments.push(EditorSegment::Text(ordinary_text));
-        }
-        if has_attachment && text.is_empty() {
-            segments.push(EditorSegment::Text("[图片]".into()));
-        }
-        let next = effective_range
-            .location
-            .saturating_add(effective_range.length);
-        if next <= location {
-            break;
-        }
-        location = next;
-    }
-    (segments, replacement_ranges)
-}
-
-fn sanitized_rtf_from_editor(
-    source: &NSAttributedString,
-    replacement_ranges: &[(NSRange, String)],
-    canonical_body: &str,
-) -> Option<Vec<u8>> {
-    let mutable = source.mutableCopy();
-    for (range, replacement) in replacement_ranges.iter().rev() {
-        mutable.replaceCharactersInRange_withString(*range, &NSString::from_str(replacement));
-    }
-    let full_range = NSRange::new(0, mutable.string().length());
-    let attachment_key = unsafe { NSAttachmentAttributeName };
-    mutable.removeAttribute_range(attachment_key, full_range);
-    mutable.removeAttribute_range(&resource_id_attribute_key(), full_range);
-    mutable.removeAttribute_range(&resource_alt_attribute_key(), full_range);
-    let empty_keys: [&NSString; 0] = [];
-    let empty_values: [&AnyObject; 0] = [];
-    let document_attributes =
-        NSDictionary::<NSString, AnyObject>::from_slices(&empty_keys, &empty_values);
-    let immutable: &NSAttributedString = &mutable;
-    let data = unsafe {
-        immutable.RTFFromRange_documentAttributes(
-            NSRange::new(0, immutable.string().length()),
-            &document_attributes,
-        )?
-    };
-    let parsed = unsafe {
-        NSAttributedString::initWithRTF_documentAttributes(
-            NSAttributedString::alloc(),
-            &data,
-            None,
-        )?
-    };
-    if parsed.string().to_string() != canonical_body || attributed_string_has_attachments(&parsed) {
-        return None;
-    }
-    Some(data.to_vec())
-}
-
 fn prepare_note_content_from_editor(
     source: &NSAttributedString,
     title: String,
 ) -> Result<PreparedNoteContent, EditorCodecError> {
-    let (segments, attachment_ranges) = editor_segments_with_ranges(source);
-    let projection = editor_save_projection(&segments)?;
-    let save_plan = rtf_save_plan(sanitized_rtf_from_editor(
-        source,
-        &attachment_ranges,
-        &projection.body,
-    ));
-    let formatting_fallback = matches!(save_plan, RtfSavePlan::PlainTextFallback);
+    let document = document_from_attributed_string(source)?;
     Ok(PreparedNoteContent {
         update: NoteContentUpdate {
             title,
-            body: projection.body,
-            body_text: projection.body_text,
-            resource_ids: projection.resource_ids,
+            body: serialize_html(&document),
         },
-        formatting_fallback,
     })
 }
 
@@ -495,33 +498,6 @@ fn canonical_marker_ranges(body: &str) -> Vec<(NSRange, String, String)> {
             (NSRange::new(location, length), span.resource_id, span.alt)
         })
         .collect()
-}
-
-fn attributed_string_has_attachments(source: &NSAttributedString) -> bool {
-    let length = source.string().length();
-    let attachment_key = unsafe { NSAttachmentAttributeName };
-    let mut location = 0;
-    while location < length {
-        let mut effective_range = NSRange::new(location, 0);
-        let attributes = unsafe {
-            source.attributesAtIndex_longestEffectiveRange_inRange(
-                location,
-                &mut effective_range,
-                NSRange::new(0, length),
-            )
-        };
-        if unsafe { attributes.objectForKey_unchecked(attachment_key) }.is_some() {
-            return true;
-        }
-        let next = effective_range
-            .location
-            .saturating_add(effective_range.length);
-        if next <= location {
-            break;
-        }
-        location = next;
-    }
-    false
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -595,6 +571,115 @@ fn validate_canonical_data_dir(
         return Err(DataDirError::OfficialJoplinProfile);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyMigrationFailure {
+    note_id: String,
+    reason: String,
+}
+
+fn decode_legacy_rtf_for_html_migration(
+    legacy: &LegacyNoteForHtmlMigration,
+) -> Result<Retained<NSMutableAttributedString>, LegacyMigrationFailure> {
+    if legacy.body_rtf.is_empty() {
+        return Ok(NSMutableAttributedString::from_nsstring(
+            &NSString::from_str(&legacy.body),
+        ));
+    }
+    let rtf = NSData::with_bytes(&legacy.body_rtf);
+    let parsed = unsafe {
+        NSAttributedString::initWithRTF_documentAttributes(NSAttributedString::alloc(), &rtf, None)
+    }
+    .ok_or_else(|| LegacyMigrationFailure {
+        note_id: legacy.id.clone(),
+        reason: "RTF 解码失败".into(),
+    })?;
+    if parsed.string().to_string() != legacy.body {
+        return Err(LegacyMigrationFailure {
+            note_id: legacy.id.clone(),
+            reason: "RTF 正文与旧正文不一致".into(),
+        });
+    }
+    Ok(NSMutableAttributedString::from_attributed_nsstring(&parsed))
+}
+
+fn migrate_legacy_note_to_conversion(
+    repository: &NoteRepository,
+    legacy: &LegacyNoteForHtmlMigration,
+) -> Result<HtmlNoteConversion, LegacyMigrationFailure> {
+    let attributed = decode_legacy_rtf_for_html_migration(legacy)?;
+    for (range, resource_id, alt) in canonical_marker_ranges(&legacy.body).into_iter().rev() {
+        let resource = repository
+            .get_resource(&resource_id)
+            .map_err(|_| LegacyMigrationFailure {
+                note_id: legacy.id.clone(),
+                reason: "读取图片资源失败".into(),
+            })?
+            .ok_or_else(|| LegacyMigrationFailure {
+                note_id: legacy.id.clone(),
+                reason: "图片资源不存在".into(),
+            })?;
+        let inline =
+            inline_attachment_with_alt(&resource, &alt).ok_or_else(|| LegacyMigrationFailure {
+                note_id: legacy.id.clone(),
+                reason: "图片资源无法解码".into(),
+            })?;
+        attributed.replaceCharactersInRange_withAttributedString(range, inline.as_ref());
+    }
+    let source: &NSAttributedString = &attributed;
+    let document = document_from_attributed_string(source).map_err(|_| LegacyMigrationFailure {
+        note_id: legacy.id.clone(),
+        reason: "正文无法转换为 HTML".into(),
+    })?;
+    Ok(HtmlNoteConversion {
+        id: legacy.id.clone(),
+        source_updated_time: legacy.updated_time,
+        body: serialize_html(&document),
+        body_text: search_text(&document),
+        resource_ids: resource_ids(&document),
+    })
+}
+
+fn migrate_legacy_notes_before_window(
+    repository: &NoteRepository,
+) -> Result<(), LegacyMigrationFailure> {
+    let legacy_notes = repository
+        .list_legacy_notes_for_html_migration()
+        .map_err(|_| LegacyMigrationFailure {
+            note_id: "<database>".into(),
+            reason: "读取旧笔记失败".into(),
+        })?;
+    if legacy_notes.is_empty() {
+        return Ok(());
+    }
+    let conversions = legacy_notes
+        .iter()
+        .map(|legacy| migrate_legacy_note_to_conversion(repository, legacy))
+        .collect::<Result<Vec<_>, _>>()?;
+    repository
+        .apply_html_migration(conversions)
+        .map(|_| ())
+        .map_err(|_| LegacyMigrationFailure {
+            note_id: "<database>".into(),
+            reason: "原子迁移失败，数据库保持旧格式".into(),
+        })
+}
+
+fn show_legacy_migration_failure(
+    mtm: MainThreadMarker,
+    failure: &LegacyMigrationFailure,
+    profile: &Path,
+) {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(ns_string!("笔记迁移未完成"));
+    alert.setInformativeText(&NSString::from_str(&format!(
+        "笔记 {}：{}\n备份位置：{}\n请先保留当前数据，再修复后重试。",
+        failure.note_id,
+        failure.reason,
+        profile.display()
+    )));
+    let _ = alert.runModal();
 }
 
 fn canonicalize_for_comparison(path: &Path) -> Result<PathBuf, DataDirError> {
@@ -2253,79 +2338,33 @@ impl AppDelegate {
             .unwrap()
             .setStringValue(&NSString::from_str(&note.title));
         let body = self.ivars().body_view.get().unwrap();
-        let loaded_rtf = if note.body_rtf.is_empty() {
-            body.setString(&NSString::from_str(&note.body));
-            None
-        } else {
-            let rtf = NSData::with_bytes(&note.body_rtf);
-            let parsed = unsafe {
-                NSAttributedString::initWithRTF_documentAttributes(
-                    NSAttributedString::alloc(),
-                    &rtf,
-                    None,
-                )
-            };
-            if let Some(parsed) = parsed.filter(|parsed| {
-                let expanded = parsed.string().to_string();
-                rtf_text_matches_body(Some(&expanded), &note.body)
-                    && !attributed_string_has_attachments(parsed)
-            }) {
+        let (status, is_error) = match parse_html(&note.body) {
+            Ok(document) => {
+                let (rendered, failures) = render_note_document(
+                    &document,
+                    &self.ivars().repository,
+                    text_container_available_width(body),
+                );
                 if let Some(storage) = unsafe { body.textStorage() } {
-                    storage.setAttributedString(&parsed);
-                    Some(true)
-                } else {
-                    body.setString(&NSString::from_str(&note.body));
-                    Some(false)
+                    storage.setAttributedString(&rendered);
                 }
-            } else {
-                body.setString(&NSString::from_str(&note.body));
-                Some(false)
+                if failures == 0 {
+                    ("已保存", false)
+                } else {
+                    ("部分图片未恢复，已保留引用", true)
+                }
+            }
+            Err(_) => {
+                body.setString(ns_string!("正文无法读取"));
+                ("正文无法读取", true)
             }
         };
-        let rtf_failed = loaded_rtf
-            .map(rtf_load_decision)
-            .map(|decision| decision == RtfLoadDecision::PlainBodyFallback)
-            .unwrap_or(false);
-        let attachment_failures = self.render_body_attachments(note);
         body.setSelectedRange(NSRange::new(0, 0));
         *self.ivars().loading_guard.borrow_mut() = false;
-        let (status, is_error) = load_save_status(rtf_failed, attachment_failures);
         self.set_save_status(status, is_error);
         self.update_editor_visibility();
         self.update_note_selection();
         self.update_formatting_buttons();
-    }
-
-    fn render_body_attachments(&self, note: &Note) -> usize {
-        let Some(body) = self.ivars().body_view.get() else {
-            return 0;
-        };
-        let Some(storage) = (unsafe { body.textStorage() }) else {
-            return 0;
-        };
-        let mut replacements = Vec::new();
-        let mut failures = 0;
-        for (range, resource_id, alt) in canonical_marker_ranges(&note.body) {
-            let Ok(resource) = self.ivars().repository.get_resource(&resource_id) else {
-                failures += 1;
-                continue;
-            };
-            let Some(resource) = resource else {
-                failures += 1;
-                continue;
-            };
-            let Some(inline) =
-                inline_attachment_with_width(&resource, &alt, text_container_available_width(body))
-            else {
-                failures += 1;
-                continue;
-            };
-            replacements.push((range, inline));
-        }
-        for (range, inline) in replacements.into_iter().rev() {
-            storage.replaceCharactersInRange_withAttributedString(range, inline.as_ref());
-        }
-        failures
     }
 
     fn clear_current_note(&self) {
@@ -2547,34 +2586,22 @@ impl AppDelegate {
                 }
             }
         } else {
-            let projection = match editor_save_projection(&[EditorSegment::Text(
-                body_view.string().to_string(),
-            )]) {
-                Ok(projection) => projection,
-                Err(error) => {
-                    eprintln!("editor projection failed: {error}");
-                    self.set_save_status("保存失败", true);
-                    return false;
-                }
-            };
+            let document = Document::from_blocks(vec![Block::Paragraph(vec![Inline::Text {
+                text: body_view.string().to_string(),
+                marks: Marks::default(),
+            }])]);
             PreparedNoteContent {
                 update: NoteContentUpdate {
                     title,
-                    body: projection.body,
-                    body_text: projection.body_text,
-                    resource_ids: projection.resource_ids,
+                    body: serialize_html(&document),
                 },
-                formatting_fallback: true,
             }
         };
         self.persist_note_content(&id, prepared)
     }
 
     fn persist_note_content(&self, id: &str, prepared: PreparedNoteContent) -> bool {
-        let PreparedNoteContent {
-            update,
-            formatting_fallback,
-        } = prepared;
+        let PreparedNoteContent { update } = prepared;
         match self.ivars().repository.update_note_content(id, update) {
             Ok(updated) => {
                 let index = self
@@ -2589,11 +2616,7 @@ impl AppDelegate {
                         set_note_button_title(button, &updated, true);
                     }
                 }
-                if formatting_fallback {
-                    self.set_save_status("正文已保存，格式未保存", true);
-                } else {
-                    self.set_save_status("已保存", false);
-                }
+                self.set_save_status("已保存", false);
                 true
             }
             Err(error) => {
@@ -3093,6 +3116,10 @@ pub fn run() {
         .unwrap_or_else(|error| panic!("could not validate notes database file: {error:?}"));
     let repository =
         Arc::new(NoteRepository::open(&data_path).expect("could not open notes database"));
+    if let Err(failure) = migrate_legacy_notes_before_window(&repository) {
+        show_legacy_migration_failure(mtm, &failure, &data_dir);
+        return;
+    }
     if let Err(error) = repository.cleanup_abandoned_drafts() {
         eprintln!("could not clean drafts: {error}");
     }
@@ -3136,24 +3163,22 @@ impl AppDelegate {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachmentDescriptor, ContentLayout, DataDirError, DataFileError, EditorSegment,
-        FontTraitOperation, FormatDecision, FormatTarget, PasteFileError, PasteRoute,
-        PasteboardImage, RtfLoadDecision, RtfSavePlan, TextFormat,
-        attributed_string_has_attachments, candidate_with_attachment, choose_data_dir,
-        commit_after_persistence, content_layout, display_note_title, editor_save_projection,
-        editor_segments_with_ranges, ensure_notes_database_file, format_decision, format_target,
-        image_signature_matches_mime, inline_attachment_with_alt, inline_image_display_size,
-        is_local_file_url_host, is_promised_pasteboard_type, load_save_status, paste_route,
-        read_drag_image_file, read_pasteboard_image_from, read_regular_image_file,
-        rtf_load_decision, rtf_save_plan, rtf_text_matches_body, sanitized_rtf_from_editor,
+        ContentLayout, DataDirError, DataFileError, FontTraitOperation, FormatDecision,
+        FormatTarget, PasteFileError, PasteRoute, PasteboardImage, TextFormat,
+        candidate_with_attachment, choose_data_dir, commit_after_persistence, content_layout,
+        display_note_title, document_from_attributed_string, ensure_notes_database_file,
+        format_decision, format_target, image_signature_matches_mime, inline_image_display_size,
+        is_local_file_url_host, is_promised_pasteboard_type, paste_route, read_drag_image_file,
+        read_pasteboard_image_from, read_regular_image_file, render_document_to_attributed_string,
         typing_trait_operation, valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
-    use joplin_lite_native::core::StoredResource;
+    use joplin_lite_native::core::{LegacyNoteForHtmlMigration, NoteRepository, StoredResource};
+    use joplin_lite_native::html_body::{Block, Document, Inline, Marks, serialize_html};
     use objc2::{AnyThread, runtime::AnyObject};
     use objc2_app_kit::{
-        NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
-        NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypeFileURL,
-        NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSTextAttachment,
+        NSAttributedStringAttachmentConveniences, NSBitmapImageFileType, NSBitmapImageRep,
+        NSFontAttributeName, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
+        NSPasteboardTypeTIFF, NSTextAttachment, NSUnderlineStyle, NSUnderlineStyleAttributeName,
     };
     use objc2_foundation::{
         NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSSize,
@@ -3172,48 +3197,191 @@ mod tests {
     ];
 
     #[test]
-    fn editor_projection_preserves_attachment_order_without_binary_rtf() {
-        let projection = editor_save_projection(&[
-            EditorSegment::Text("前文\n".into()),
-            EditorSegment::Attachment(AttachmentDescriptor {
+    fn attributed_document_codec_preserves_cjk_emoji_marks_and_paragraphs() {
+        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str(
+            "中文😀\u{2028}第二段\n第三段",
+        ));
+        let bold_font = objc2_app_kit::NSFont::boldSystemFontOfSize(17.0);
+        let underline = objc2_foundation::NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
+        unsafe {
+            source.addAttribute_value_range(
+                NSFontAttributeName,
+                &bold_font,
+                NSRange::new(0, NSString::from_str("中文😀").length()),
+            );
+            source.addAttribute_value_range(
+                NSUnderlineStyleAttributeName,
+                &underline,
+                NSRange::new(0, 2),
+            );
+        }
+        let source_ref: &NSAttributedString = &source;
+        let document = document_from_attributed_string(source_ref).unwrap();
+        assert_eq!(
+            serialize_html(&document),
+            "<p><strong><u>中文</u></strong><strong>😀</strong><br>第二段</p><p>第三段</p>"
+        );
+        let rendered = render_document_to_attributed_string(&document, |_| None, 640.0).0;
+        assert_eq!(
+            rendered.string().to_string(),
+            "中文😀\u{2028}第二段\n第三段"
+        );
+    }
+
+    #[test]
+    fn attributed_document_codec_normalizes_crlf_without_extra_paragraph() {
+        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str("前\r\n后"));
+        let source_ref: &NSAttributedString = &source;
+        let document = document_from_attributed_string(source_ref).unwrap();
+        assert_eq!(serialize_html(&document), "<p>前</p><p>后</p>");
+    }
+
+    #[test]
+    fn legacy_migration_decoder_accepts_empty_rtf_as_old_body() {
+        let legacy = LegacyNoteForHtmlMigration {
+            id: "legacy-empty".into(),
+            title: "旧笔记".into(),
+            body: "旧正文😀".into(),
+            body_rtf: Vec::new(),
+            is_draft: false,
+            created_time: 1,
+            updated_time: 2,
+            deleted_time: 0,
+        };
+        let decoded = super::decode_legacy_rtf_for_html_migration(&legacy).unwrap();
+        assert_eq!(decoded.string().to_string(), legacy.body);
+    }
+
+    #[test]
+    fn legacy_migration_decoder_rejects_rtf_visible_body_mismatch() {
+        let legacy = LegacyNoteForHtmlMigration {
+            id: "legacy-mismatch".into(),
+            title: "旧笔记".into(),
+            body: "数据库正文".into(),
+            body_rtf: br"{\rtf1\ansi decoded}".to_vec(),
+            is_draft: false,
+            created_time: 1,
+            updated_time: 2,
+            deleted_time: 0,
+        };
+        let error = super::decode_legacy_rtf_for_html_migration(&legacy).unwrap_err();
+        assert_eq!(error.note_id, "legacy-mismatch");
+        assert_eq!(error.reason, "RTF 正文与旧正文不一致");
+    }
+
+    #[test]
+    fn legacy_marker_migration_overlays_resources_before_html_conversion() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("notes.sqlite");
+        let repository = NoteRepository::open(&database).unwrap();
+        let resource = repository
+            .import_resource(joplin_lite_native::core::ResourceImport {
+                bytes: TEST_PNG,
+                title: "截图.png",
+                mime: "image/png",
+                file_extension: "png",
+            })
+            .unwrap();
+        let note = repository
+            .create_note(joplin_lite_native::core::CreateNote {
+                title: "旧标题".into(),
+                body: "占位".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        let marker_body = format!("前文\n![截图.png](:/{})\n后文", resource.id);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE notes SET body = ?1, body_text = ?1, body_rtf = X'', markup_language = 1 WHERE id = ?2",
+                rusqlite::params![marker_body, note.id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let legacy = repository
+            .list_legacy_notes_for_html_migration()
+            .unwrap()
+            .pop()
+            .unwrap();
+        let conversion = super::migrate_legacy_note_to_conversion(&repository, &legacy).unwrap();
+        assert_eq!(conversion.body_text, "前文\n截图.png\n后文");
+        assert_eq!(conversion.resource_ids, vec![resource.id.clone()]);
+        assert!(
+            conversion
+                .body
+                .contains(&format!("src=\":/{}\"", resource.id))
+        );
+        assert!(!conversion.body.contains("[截图.png]"));
+    }
+
+    #[test]
+    fn attributed_document_codec_downgrades_unknown_attachments_without_payload() {
+        let bytes = NSData::with_bytes(TEST_PNG);
+        let attachment = NSTextAttachment::initWithData_ofType(
+            NSTextAttachment::alloc(),
+            Some(&bytes),
+            Some(&NSString::from_str("public.png")),
+        );
+        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str("前"));
+        source.appendAttributedString(&NSAttributedString::attributedStringWithAttachment(
+            &attachment,
+        ));
+        source.appendAttributedString(&NSAttributedString::initWithString(
+            NSAttributedString::alloc(),
+            &NSString::from_str("后"),
+        ));
+        let source_ref: &NSAttributedString = &source;
+        let document = document_from_attributed_string(source_ref).unwrap();
+        assert_eq!(serialize_html(&document), "<p>前[图片]后</p>");
+        assert!(matches!(
+            document.blocks[0],
+            Block::Paragraph(ref inlines)
+                if inlines.iter().any(|inline| matches!(inline, Inline::Text { text, .. } if text.contains("[图片]")))
+        ));
+    }
+
+    #[test]
+    fn html_document_codec_preserves_known_image_position_and_alt() {
+        let document = Document::from_blocks(vec![Block::Paragraph(vec![
+            Inline::Text {
+                text: "前".into(),
+                marks: Marks {
+                    bold: true,
+                    ..Marks::default()
+                },
+            },
+            Inline::Image {
                 resource_id: "0123456789abcdef0123456789abcdef".into(),
-                alt: "截图.png".into(),
-            }),
-            EditorSegment::Text("\n后文".into()),
-        ])
-        .unwrap();
-        assert_eq!(
-            projection.body,
-            "前文\n![截图.png](:/0123456789abcdef0123456789abcdef)\n后文"
-        );
-        assert_eq!(
-            projection.resource_ids,
-            vec!["0123456789abcdef0123456789abcdef"]
-        );
-        assert!(projection.body_text.contains("截图.png"));
-        assert!(!projection.body.contains('\u{fffc}'));
-    }
-
-    #[test]
-    fn editor_projection_rejects_invalid_resource_ids() {
-        let error = editor_save_projection(&[EditorSegment::Attachment(AttachmentDescriptor {
-            resource_id: "not-a-resource".into(),
-            alt: "图片".into(),
-        })])
-        .unwrap_err();
-        assert!(matches!(error, super::EditorCodecError::Body(_)));
-    }
-
-    #[test]
-    fn editor_projection_keeps_missing_marker_text_and_association() {
-        let body = "前文\n![损坏图](:/0123456789abcdef0123456789abcdef)\n后文";
-        let projection = editor_save_projection(&[EditorSegment::Text(body.into())]).unwrap();
-        assert_eq!(projection.body, body);
-        assert_eq!(
-            projection.resource_ids,
-            vec!["0123456789abcdef0123456789abcdef"]
-        );
-        assert!(projection.body_text.contains("损坏图"));
+                alt: "截图".into(),
+            },
+            Inline::Text {
+                text: "后".into(),
+                marks: Marks::default(),
+            },
+        ])]);
+        let rendered = render_document_to_attributed_string(
+            &document,
+            |resource_id| {
+                assert_eq!(resource_id, "0123456789abcdef0123456789abcdef");
+                Some(StoredResource {
+                    id: resource_id.into(),
+                    sha256: "0".repeat(64),
+                    size: TEST_PNG.len(),
+                    title: "截图".into(),
+                    mime: "image/png".into(),
+                    file_extension: "png".into(),
+                    path: PathBuf::new(),
+                    bytes: TEST_PNG.to_vec(),
+                })
+            },
+            640.0,
+        )
+        .0;
+        assert_eq!(rendered.string().to_string(), "前\u{fffc}后");
+        let source_ref: &NSAttributedString = &rendered;
+        let round_trip = document_from_attributed_string(source_ref).unwrap();
+        assert_eq!(serialize_html(&round_trip), serialize_html(&document));
     }
 
     #[test]
@@ -3296,73 +3464,6 @@ mod tests {
         assert_eq!(paste_route(true, true), PasteRoute::BodyImporter);
         assert_eq!(paste_route(false, true), PasteRoute::NativeResponder);
         assert_eq!(paste_route(true, false), PasteRoute::NativeResponder);
-    }
-
-    #[test]
-    fn rtf_cache_requires_exact_expanded_body_text() {
-        assert!(rtf_text_matches_body(Some("前文😀"), "前文😀"));
-        assert!(!rtf_text_matches_body(Some("前文"), "前文😀"));
-        assert!(!rtf_text_matches_body(None, "前文"));
-    }
-
-    #[test]
-    fn sanitizer_downgrades_known_and_unknown_attachments_without_rtf_payload() {
-        let id = "0123456789abcdef0123456789abcdef";
-        const TINY_PNG: &[u8] = &[
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
-            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66,
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-        ];
-        let resource = StoredResource {
-            id: id.into(),
-            sha256: "0".repeat(64),
-            size: TINY_PNG.len(),
-            title: "截图.png".into(),
-            mime: "image/png".into(),
-            file_extension: "png".into(),
-            path: PathBuf::new(),
-            bytes: TINY_PNG.to_vec(),
-        };
-        let known = inline_attachment_with_alt(&resource, "截图.png").unwrap();
-        let bytes = NSData::with_bytes(TINY_PNG);
-        let unknown_attachment = NSTextAttachment::initWithData_ofType(
-            NSTextAttachment::alloc(),
-            Some(&bytes),
-            Some(&NSString::from_str("public.png")),
-        );
-        let unknown = NSAttributedString::attributedStringWithAttachment(&unknown_attachment);
-        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str("前😀"));
-        source.appendAttributedString(&known);
-        source.appendAttributedString(&known);
-        source.appendAttributedString(&unknown);
-        source.appendAttributedString(&NSAttributedString::initWithString(
-            NSAttributedString::alloc(),
-            &NSString::from_str("后"),
-        ));
-        let source_ref: &NSAttributedString = &source;
-        let (segments, replacements) = editor_segments_with_ranges(source_ref);
-        let projection = editor_save_projection(&segments).unwrap();
-        let marker = format!("![截图.png](:/{id})");
-        assert_eq!(projection.body, format!("前😀{marker}{marker}[图片]后"));
-        assert_eq!(projection.resource_ids, vec![id.to_owned()]);
-        let rtf = sanitized_rtf_from_editor(source_ref, &replacements, &projection.body).unwrap();
-        let parsed = unsafe {
-            NSAttributedString::initWithRTF_documentAttributes(
-                NSAttributedString::alloc(),
-                &NSData::with_bytes(&rtf),
-                None,
-            )
-        }
-        .unwrap();
-        assert_eq!(parsed.string().to_string(), projection.body);
-        assert!(!attributed_string_has_attachments(&parsed));
-        let rtf_text = String::from_utf8_lossy(&rtf);
-        assert!(!rtf_text.contains("\\pict"));
-        assert!(!rtf_text.contains("pngblip"));
-        assert!(!rtf_text.contains("jpegblip"));
-        assert!(!rtf.windows(TINY_PNG.len()).any(|window| window == TINY_PNG));
     }
 
     #[test]
@@ -3639,38 +3740,6 @@ mod tests {
                 std::slice::from_ref(&canonical_mac_root),
             ),
             Err(DataDirError::OfficialJoplinProfile),
-        );
-    }
-
-    #[test]
-    fn bad_rtf_chooses_plain_body_without_replacing_saved_rtf() {
-        assert_eq!(rtf_load_decision(false), RtfLoadDecision::PlainBodyFallback);
-        assert_eq!(rtf_load_decision(true), RtfLoadDecision::ParsedRtf);
-    }
-
-    #[test]
-    fn load_save_status_keeps_nonfatal_attachment_failures_editable() {
-        assert_eq!(load_save_status(false, 0), ("已保存", false));
-        assert_eq!(
-            load_save_status(false, 2),
-            ("部分图片未恢复，已保留引用", true)
-        );
-        assert_eq!(
-            load_save_status(true, 0),
-            ("格式恢复失败，已回退正文", true)
-        );
-        assert_eq!(
-            load_save_status(true, 2),
-            ("格式恢复失败，部分图片未恢复，已保留引用", true)
-        );
-    }
-
-    #[test]
-    fn missing_rtf_export_chooses_plain_text_without_stale_rich_text() {
-        assert_eq!(rtf_save_plan(None), RtfSavePlan::PlainTextFallback);
-        assert_eq!(
-            rtf_save_plan(Some(vec![1, 2])),
-            RtfSavePlan::Rich(vec![1, 2])
         );
     }
 

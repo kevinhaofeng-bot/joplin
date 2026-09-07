@@ -85,9 +85,6 @@ pub struct Note {
     pub title: String,
     pub body: String,
     pub body_text: String,
-    /// Transitional read-only copy of the legacy RTF column. Normal APIs
-    /// never accept or write this value; Task 3 removes the last reader.
-    pub body_rtf: Vec<u8>,
     pub markup_language: i64,
     pub is_draft: bool,
     pub created_time: i64,
@@ -112,11 +109,6 @@ pub struct UpdateNote {
 pub struct NoteContentUpdate {
     pub title: String,
     pub body: String,
-    /// Transitional derived inputs retained for the AppKit call site. The
-    /// repository ignores them and derives both projections from canonical
-    /// HTML; Task 3 removes these fields from the editor adapter.
-    pub body_text: String,
-    pub resource_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,7 +210,6 @@ impl NoteRepository {
             title: input.title,
             body: canonical.body,
             body_text: canonical.body_text,
-            body_rtf: Vec::new(),
             markup_language: 2,
             is_draft: input.is_draft,
             created_time: now,
@@ -232,7 +223,7 @@ impl NoteRepository {
         let connection = self.connection.lock().expect("repository mutex poisoned");
         connection
             .query_row(
-                "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
+                "SELECT id, title, body, body_text, markup_language, is_draft, created_time, updated_time, deleted_time
                  FROM notes WHERE id = ?1 AND deleted_time = 0",
                 [id],
                 row_to_note,
@@ -244,7 +235,7 @@ impl NoteRepository {
     pub fn list_notes(&self) -> Result<Vec<Note>, CoreError> {
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
+            "SELECT id, title, body, body_text, markup_language, is_draft, created_time, updated_time, deleted_time
              FROM notes WHERE deleted_time = 0 ORDER BY updated_time DESC, id ASC",
         )?;
         let rows = statement.query_map([], row_to_note)?;
@@ -257,7 +248,7 @@ impl NoteRepository {
         let transaction = connection.unchecked_transaction()?;
         let current = transaction
             .query_row(
-                "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
+                "SELECT id, title, body, body_text, markup_language, is_draft, created_time, updated_time, deleted_time
                  FROM notes WHERE id = ?1 AND deleted_time = 0",
                 [id],
                 row_to_note,
@@ -279,7 +270,6 @@ impl NoteRepository {
             note.body_text = canonical.body_text;
             resource_ids = canonical.resource_ids;
         }
-        note.body_rtf.clear();
         note.markup_language = 2;
         note.updated_time = timestamp().max(note.updated_time + 1);
         transaction.execute(
@@ -393,7 +383,7 @@ impl NoteRepository {
         let transaction = connection.unchecked_transaction()?;
         let mut note = transaction
             .query_row(
-                "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
+                "SELECT id, title, body, body_text, markup_language, is_draft, created_time, updated_time, deleted_time
                  FROM notes WHERE id = ?1 AND deleted_time = 0",
                 [id],
                 row_to_note,
@@ -407,7 +397,6 @@ impl NoteRepository {
         note.title = input.title;
         note.body = canonical.body;
         note.body_text = canonical.body_text;
-        note.body_rtf.clear();
         note.markup_language = 2;
         note.is_draft = false;
         note.updated_time = timestamp().max(note.updated_time + 1);
@@ -470,7 +459,7 @@ impl NoteRepository {
         }
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT n.id, n.title, n.body, n.body_text, n.body_rtf, n.markup_language, n.is_draft, n.created_time,
+            "SELECT n.id, n.title, n.body, n.body_text, n.markup_language, n.is_draft, n.created_time,
                     n.updated_time, n.deleted_time
              FROM notes_fts f JOIN notes n ON n.id = f.id
              WHERE notes_fts MATCH ?1 AND n.deleted_time = 0
@@ -483,7 +472,7 @@ impl NoteRepository {
             return Ok(rows);
         }
         let mut fallback = connection.prepare(
-            "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
+            "SELECT id, title, body, body_text, markup_language, is_draft, created_time, updated_time, deleted_time
              FROM notes WHERE deleted_time = 0 AND (instr(title, ?1) > 0 OR instr(body_text, ?1) > 0)
              ORDER BY updated_time DESC, id ASC",
         )?;
@@ -1285,12 +1274,11 @@ fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
         title: row.get(1)?,
         body: row.get(2)?,
         body_text: row.get(3)?,
-        body_rtf: row.get(4)?,
-        markup_language: row.get(5)?,
-        is_draft: row.get::<_, i64>(6)? != 0,
-        created_time: row.get(7)?,
-        updated_time: row.get(8)?,
-        deleted_time: row.get(9)?,
+        markup_language: row.get(4)?,
+        is_draft: row.get::<_, i64>(5)? != 0,
+        created_time: row.get(6)?,
+        updated_time: row.get(7)?,
+        deleted_time: row.get(8)?,
     })
 }
 
@@ -1470,8 +1458,6 @@ mod tests {
                 NoteContentUpdate {
                     title: "updated".into(),
                     body: format!("<p><img src=\":/{}\" alt=\"first\"></p>", first.id),
-                    body_text: "first".into(),
-                    resource_ids: vec![first.id.clone()],
                 },
             )
             .unwrap();
@@ -1482,8 +1468,6 @@ mod tests {
             NoteContentUpdate {
                 title: "updated again".into(),
                 body: format!("<p><img src=\":/{}\" alt=\"second\"></p>", second.id),
-                body_text: "second".into(),
-                resource_ids: vec![second.id.clone()],
             },
         )
         .unwrap();
@@ -1516,8 +1500,6 @@ mod tests {
                         "<p><img src=\":/{missing}\" alt=\"缺失\"><img src=\":/{}\" alt=\"存在\"></p>",
                         resource.id
                     ),
-                    body_text: "缺失\n存在".into(),
-                    resource_ids: vec![missing.into(), resource.id.clone(), missing.into()],
                 },
             )
             .unwrap();
@@ -1562,8 +1544,6 @@ mod tests {
                     "<p><img src=\":/{}\" alt=\"缺 blob\"><img src=\":/{}\" alt=\"正常\"></p>",
                     missing_blob.id, normal.id
                 ),
-                body_text: "缺 blob\n正常".into(),
-                resource_ids: vec![missing_blob.id.clone(), normal.id.clone()],
             },
         )
         .unwrap();
@@ -1689,7 +1669,6 @@ mod tests {
         assert_eq!(note.markup_language, 2);
         assert_eq!(note.body, "<p><strong>正文</strong> 😀</p>");
         assert_eq!(note.body_text, "正文 😀");
-        assert!(note.body_rtf.is_empty());
         let connection = Connection::open(&db).unwrap();
         assert_eq!(
             connection
@@ -1803,8 +1782,6 @@ mod tests {
                 NoteContentUpdate {
                     title: "不应写入".into(),
                     body: "<p>new</p>".into(),
-                    body_text: "new".into(),
-                    resource_ids: Vec::new(),
                 }
             ),
             Err(CoreError::MigrationRequired)
@@ -1898,7 +1875,6 @@ mod tests {
         assert_eq!(migrated.markup_language, 2);
         assert_eq!(migrated.body, first_body);
         assert_eq!(migrated.body_text, "迁移 第一图第一图第二图");
-        assert!(migrated.body_rtf.is_empty());
         assert_eq!(repo.search("第一图").unwrap().len(), 1);
         let connection = repo.connection.lock().unwrap();
         let associations: Vec<String> = connection
@@ -1983,7 +1959,6 @@ mod tests {
         let unchanged = repo.get_note(&note.id).unwrap().unwrap();
         assert_eq!(unchanged.body, "old");
         assert_eq!(unchanged.markup_language, 1);
-        assert_eq!(unchanged.body_rtf, b"rtf".to_vec());
         repo.connection
             .lock()
             .unwrap()

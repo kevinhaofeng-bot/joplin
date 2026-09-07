@@ -32,7 +32,6 @@ fn note_lifecycle_survives_restart_and_supports_fts() {
     assert_eq!(note.title, "更新后的标题");
     assert_eq!(note.body, "<p>持久化后的正文</p>");
     assert_eq!(note.markup_language, 2);
-    assert!(note.body_rtf.is_empty());
     reopened.soft_delete(&id).unwrap();
     assert!(reopened.get_note(&id).unwrap().is_none());
 }
@@ -120,14 +119,16 @@ fn normal_writes_leave_legacy_rtf_empty() {
     drop(repo);
 
     let reopened = NoteRepository::open(&path).unwrap();
-    assert!(
-        reopened
-            .get_note(&created.id)
-            .unwrap()
-            .unwrap()
-            .body_rtf
-            .is_empty()
-    );
+    let body_rtf: Vec<u8> = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT body_rtf FROM notes WHERE id = ?1",
+            [&created.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(body_rtf.is_empty());
+    assert!(reopened.get_note(&created.id).unwrap().is_some());
 }
 
 #[test]
@@ -154,14 +155,12 @@ fn plain_text_fallback_clears_stale_rich_text_before_restart() {
         .unwrap();
     assert_eq!(updated.title, "最新标题");
     assert_eq!(updated.body, "<p>最新纯文本正文</p>");
-    assert!(updated.body_rtf.is_empty());
     drop(repo);
 
     let reopened = NoteRepository::open(&path).unwrap();
     let reopened_note = reopened.get_note(&created.id).unwrap().unwrap();
     assert_eq!(reopened_note.title, "最新标题");
     assert_eq!(reopened_note.body, "<p>最新纯文本正文</p>");
-    assert!(reopened_note.body_rtf.is_empty());
 }
 
 #[cfg(unix)]
