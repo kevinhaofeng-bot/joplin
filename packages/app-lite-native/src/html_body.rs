@@ -22,6 +22,7 @@ pub enum HtmlBodyError {
 const MAX_DOM_DEPTH: usize = 4096;
 const MAX_DOM_NODES: usize = 1_000_000;
 const MAX_LINK_LENGTH: usize = 8 * 1024;
+const MAX_RETAINED_LINK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Document {
@@ -996,11 +997,11 @@ fn project_dom(root: &DomHandle) -> Document {
                         }
                         continue;
                     }
-                    if tag == "li" && projection.current_list.is_some() {
+                    if tag == "li" && !projection.list_contexts.is_empty() {
                         let style = block_style(&attrs.borrow(), 0);
                         let checked = if projection
-                            .current_list
-                            .as_ref()
+                            .list_contexts
+                            .last()
                             .is_some_and(|list| list.kind == ListKind::Checklist)
                         {
                             Some(
@@ -1022,7 +1023,8 @@ fn project_dom(root: &DomHandle) -> Document {
                         continue;
                     }
                     if let Some(level) = heading_level(&tag) {
-                        if projection.current_list.is_some() {
+                        if !projection.list_contexts.is_empty() {
+                            projection.begin_list_block();
                             projection.ensure_current();
                             for child in children.into_iter().rev() {
                                 pending.push(ProjectionFrame::Visit {
@@ -1056,7 +1058,8 @@ fn project_dom(root: &DomHandle) -> Document {
                             "div" | "section" | "article" | "header" | "footer"
                         )
                     {
-                        if projection.current_list.is_some() {
+                        if !projection.list_contexts.is_empty() {
+                            projection.begin_list_block();
                             projection.ensure_current();
                             let child_preformatted = preformatted || tag == "pre";
                             for child in children.into_iter().rev() {
@@ -1171,19 +1174,6 @@ struct ProjectionMarks {
     link: Option<Rc<str>>,
 }
 
-impl ProjectionMarks {
-    fn to_public(&self) -> Marks {
-        Marks {
-            bold: self.bold,
-            italic: self.italic,
-            underline: self.underline,
-            strikethrough: self.strikethrough,
-            highlight: self.highlight,
-            link: self.link.as_ref().map(|link| link.to_string()),
-        }
-    }
-}
-
 fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
     public.bold == projected.bold
         && public.italic == projected.italic
@@ -1200,9 +1190,12 @@ enum BlockKind {
     Heading(HeadingLevel),
 }
 
-struct WorkingList {
+struct ListContext {
     kind: ListKind,
     items: Vec<ListItem>,
+    pending_style: BlockStyle,
+    pending_checked: Option<bool>,
+    split_from_nested: bool,
 }
 
 #[derive(Default)]
@@ -1211,10 +1204,9 @@ struct Projection {
     current: Option<Vec<Inline>>,
     current_style: BlockStyle,
     current_kind: BlockKind,
-    current_list: Option<WorkingList>,
-    list_stack: Vec<ListKind>,
-    current_item_style: BlockStyle,
-    current_item_checked: Option<bool>,
+    list_contexts: Vec<ListContext>,
+    current_item_has_content: bool,
+    retained_link_bytes: usize,
     explicit_softbreak: bool,
     pending_space: bool,
     pending_marks: Option<ProjectionMarks>,
@@ -1223,7 +1215,7 @@ struct Projection {
 
 impl Projection {
     fn finish(mut self) -> Document {
-        while self.current_list.is_some() {
+        while !self.list_contexts.is_empty() {
             self.finish_list();
         }
         self.flush();
@@ -1231,17 +1223,20 @@ impl Projection {
     }
 
     fn ensure_current(&mut self) -> &mut Vec<Inline> {
-        if self.current.is_none()
-            && let Some(kind) = self.current_list.as_ref().map(|list| list.kind)
-        {
-            let checked = (kind == ListKind::Checklist).then_some(false);
-            self.begin_list_item(BlockStyle::default(), checked);
+        if self.current.is_none() {
+            let pending = self
+                .list_contexts
+                .last()
+                .map(|context| (context.pending_style, context.pending_checked));
+            if let Some((style, checked)) = pending {
+                self.begin_list_item(style, checked);
+            }
         }
         self.current.get_or_insert_with(Vec::new)
     }
 
     fn flush(&mut self) {
-        if self.current_list.is_some() {
+        if !self.list_contexts.is_empty() {
             return;
         }
         self.pending_space = false;
@@ -1303,26 +1298,33 @@ impl Projection {
     }
 
     fn begin_list(&mut self, kind: ListKind) {
-        if let Some(parent_kind) = self.current_list.as_ref().map(|list| list.kind) {
-            if self.current.is_some() {
-                self.finish_list_item();
-            }
+        if !self.list_contexts.is_empty() {
+            self.finish_item_before_nested_list();
             self.flush_list_segment();
-            self.list_stack.push(parent_kind);
         } else {
             self.flush();
         }
-        self.current_list = Some(WorkingList {
+        self.list_contexts.push(ListContext {
             kind,
             items: Vec::new(),
+            pending_style: BlockStyle::default(),
+            pending_checked: (kind == ListKind::Checklist).then_some(false),
+            split_from_nested: false,
         });
         self.current = None;
+        self.current_item_has_content = false;
     }
 
     fn begin_list_item(&mut self, style: BlockStyle, checked: Option<bool>) {
+        if self.current.is_some() {
+            self.finish_list_item();
+        }
+        if let Some(context) = self.list_contexts.last_mut() {
+            context.pending_style = style;
+            context.pending_checked = checked;
+        }
         self.current = Some(Vec::new());
-        self.current_item_style = style;
-        self.current_item_checked = checked;
+        self.current_item_has_content = false;
         self.explicit_softbreak = false;
         self.pending_space = false;
         self.pending_marks = None;
@@ -1330,20 +1332,28 @@ impl Projection {
     }
 
     fn flush_list_segment(&mut self) {
-        if let Some(list) = self.current_list.take() {
-            self.document.blocks.push(Block::List {
-                kind: list.kind,
-                items: list.items,
-            });
+        if let Some(context) = self.list_contexts.last_mut() {
+            context.split_from_nested = true;
+            let items = std::mem::take(&mut context.items);
+            if !items.is_empty() {
+                self.document.blocks.push(Block::List {
+                    kind: context.kind,
+                    items,
+                });
+            }
         }
         self.current = None;
+        self.current_item_has_content = false;
     }
 
     fn finish_list_item(&mut self) {
-        let Some(mut list) = self.current_list.take() else {
+        let Some(inlines) = self.current.take() else {
             return;
         };
-        let inlines = normalize_inlines(self.current.take().unwrap_or_default());
+        let Some(context) = self.list_contexts.last_mut() else {
+            return;
+        };
+        let inlines = normalize_inlines(inlines);
         let inlines = if inlines.len() == 1
             && matches!(inlines[0], Inline::SoftBreak)
             && !self.explicit_softbreak
@@ -1352,38 +1362,63 @@ impl Projection {
         } else {
             inlines
         };
-        list.items.push(ListItem {
-            checked: self.current_item_checked,
-            style: self.current_item_style,
+        context.items.push(ListItem {
+            checked: context.pending_checked,
+            style: context.pending_style,
             inlines,
         });
-        self.current_list = Some(list);
         self.pending_space = false;
         self.pending_marks = None;
         self.flow_has_visible = false;
         self.explicit_softbreak = false;
+        self.current_item_has_content = false;
     }
 
     fn finish_list(&mut self) {
         if self.current.is_some() {
             self.finish_list_item();
         }
-        if let Some(list) = self.current_list.take() {
+        if let Some(context) = self.list_contexts.pop()
+            && (!context.items.is_empty() || !context.split_from_nested)
+        {
             self.document.blocks.push(Block::List {
-                kind: list.kind,
-                items: list.items,
-            });
-        }
-        if let Some(parent_kind) = self.list_stack.pop() {
-            self.current_list = Some(WorkingList {
-                kind: parent_kind,
-                items: Vec::new(),
+                kind: context.kind,
+                items: context.items,
             });
         }
         self.current = None;
+        self.current_item_has_content = false;
         self.pending_space = false;
         self.pending_marks = None;
         self.flow_has_visible = false;
+    }
+
+    fn finish_item_before_nested_list(&mut self) {
+        if !self.current_item_has_content {
+            self.current = None;
+            self.pending_space = false;
+            self.pending_marks = None;
+            self.flow_has_visible = false;
+            self.explicit_softbreak = false;
+            self.current_item_has_content = false;
+        } else {
+            self.finish_list_item();
+        }
+    }
+
+    fn begin_list_block(&mut self) {
+        if self.current.is_some() {
+            if self.current_item_has_content {
+                self.finish_list_item();
+            } else {
+                self.current = None;
+                self.pending_space = false;
+                self.pending_marks = None;
+                self.flow_has_visible = false;
+                self.explicit_softbreak = false;
+                self.current_item_has_content = false;
+            }
+        }
     }
 
     fn mark_explicit_softbreak(&mut self) {
@@ -1418,6 +1453,7 @@ impl Projection {
             if pieces.peek().is_some() {
                 self.ensure_current().push(Inline::SoftBreak);
                 self.flow_has_visible = true;
+                self.current_item_has_content = true;
             }
         }
     }
@@ -1434,21 +1470,46 @@ impl Projection {
     }
 
     fn push_text(&mut self, text: &str, marks: &ProjectionMarks) {
-        let inlines = self.ensure_current();
         if let Some(Inline::Text {
             text: previous,
             marks: previous_marks,
-        }) = inlines.last_mut()
+        }) = self.current.as_mut().and_then(|inlines| inlines.last_mut())
             && projection_marks_match(previous_marks, marks)
         {
             previous.push_str(text);
-            return;
+        } else {
+            let public_marks = self.materialize_marks(marks);
+            self.ensure_current().push(Inline::Text {
+                text: text.to_owned(),
+                marks: public_marks,
+            });
         }
-        inlines.push(Inline::Text {
-            text: text.to_owned(),
-            marks: marks.to_public(),
-        });
         self.flow_has_visible = true;
+        self.current_item_has_content = true;
+    }
+
+    fn materialize_marks(&mut self, projected: &ProjectionMarks) -> Marks {
+        let link = projected.link.as_ref().and_then(|link| {
+            let length = link.len();
+            let within_budget = self
+                .retained_link_bytes
+                .checked_add(length)
+                .is_some_and(|total| total <= MAX_RETAINED_LINK_BYTES);
+            if within_budget {
+                self.retained_link_bytes += length;
+                Some(link.to_string())
+            } else {
+                None
+            }
+        });
+        Marks {
+            bold: projected.bold,
+            italic: projected.italic,
+            underline: projected.underline,
+            strikethrough: projected.strikethrough,
+            highlight: projected.highlight,
+            link,
+        }
     }
 
     fn image(&mut self, attrs: &[Attribute], marks: &ProjectionMarks) {
@@ -1472,6 +1533,7 @@ impl Projection {
             alt,
         });
         self.flow_has_visible = true;
+        self.current_item_has_content = true;
     }
 }
 
@@ -1577,6 +1639,7 @@ mod tests {
     use super::*;
 
     const RESOURCE_ID: &str = "0123456789abcdef0123456789abcdef";
+    const SECOND_RESOURCE_ID: &str = "fedcba9876543210fedcba9876543210";
 
     fn paragraph(inlines: Vec<Inline>) -> Block {
         Block::Paragraph {
@@ -1644,7 +1707,7 @@ mod tests {
 
         assert_eq!(
             search_text(&document),
-            "keep\nouterouter-image\ninner-beforeinner-afterinner-image\nouter-after"
+            "keep\nouterouter-image\ninner-before\ninner-afterinner-image\nouter-after"
         );
         assert_eq!(
             resource_ids(&document),
@@ -1670,6 +1733,69 @@ mod tests {
     }
 
     #[test]
+    fn nested_list_without_outer_after_does_not_create_an_empty_item() {
+        let document = parse_html("<ul><li>outer<ol><li>inner</li></ol></li></ul>").unwrap();
+        assert_eq!(search_text(&document), "outer\ninner");
+        assert!(matches!(
+            document.blocks.as_slice(),
+            [
+                Block::List {
+                    items,
+                    ..
+                },
+                Block::List {
+                    items: inner_items,
+                    ..
+                }
+            ] if items.len() == 1 && inner_items.len() == 1
+        ));
+        assert_eq!(
+            serialize_html(&document),
+            "<ul><li>outer</li></ul><ol><li>inner</li></ol>"
+        );
+    }
+
+    #[test]
+    fn nested_list_resource_order_preserves_a_b_a_occurrences() {
+        let document = parse_html(&format!(
+            "<ul><li>before<img src=\":/{RESOURCE_ID}\" alt=\"a\"><ol><li>inner<img src=\":/{SECOND_RESOURCE_ID}\" alt=\"b\"></li></ol>after<img src=\":/{RESOURCE_ID}\" alt=\"a-again\"></li></ul>"
+        ))
+        .unwrap();
+        assert_eq!(
+            resource_ids(&document),
+            vec![
+                RESOURCE_ID.to_owned(),
+                SECOND_RESOURCE_ID.to_owned(),
+                RESOURCE_ID.to_owned()
+            ]
+        );
+        assert_eq!(search_text(&document), "beforea\ninnerb\naftera-again");
+    }
+
+    #[test]
+    fn nested_list_after_item_keeps_outer_style_and_check_state() {
+        let document = parse_html(
+            "<ul data-type=\"checklist\"><li data-checked=\"true\" data-align=\"right\" data-indent=\"2\">outer<ol><li>inner</li></ol>after</li></ul>",
+        )
+        .unwrap();
+        let Block::List { items, .. } = &document.blocks[0] else {
+            panic!("expected outer list segment");
+        };
+        let Block::List {
+            items: after_items, ..
+        } = &document.blocks[2]
+        else {
+            panic!("expected resumed outer list segment");
+        };
+        assert_eq!(items[0].checked, Some(true));
+        assert_eq!(items[0].style.indent, 2);
+        assert_eq!(items[0].style.alignment, Alignment::Right);
+        assert_eq!(after_items[0].checked, Some(true));
+        assert_eq!(after_items[0].style, items[0].style);
+        assert_eq!(search_text(&document), "outer\ninner\nafter");
+    }
+
+    #[test]
     fn long_links_are_bounded_before_marks_are_projected_to_children() {
         let href = format!(
             "https://example.com/{}",
@@ -1682,6 +1808,22 @@ mod tests {
         let document = parse_html(&html).unwrap();
         assert_eq!(search_text(&document), "x".repeat(1_000));
         assert!(!serialize_html(&document).contains("<a href="));
+    }
+
+    #[test]
+    fn retained_link_budget_prevents_per_run_href_amplification() {
+        let href = format!(
+            "https://example.com/{}",
+            "x".repeat(MAX_LINK_LENGTH.saturating_sub(20))
+        );
+        let html = format!(
+            "<p><a href=\"{href}\">{}</a></p>",
+            "<b>x</b><i>x</i>".repeat(1_000)
+        );
+        let document = parse_html(&html).unwrap();
+        let canonical = serialize_html(&document);
+        assert_eq!(search_text(&document), "xx".repeat(1_000));
+        assert!(canonical.matches(" href=\"").count() < 32);
     }
 
     #[test]
