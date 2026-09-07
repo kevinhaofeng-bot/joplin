@@ -33,6 +33,14 @@ Native ruling: Task 3 uses immediate dirty state, a 300 ms coalesced SQLite save
 
 Native ruling: keep creation local-first and recoverable: flush the current note, create an empty draft row with a stable ID, clear search, select/load the new row and focus the body so typing starts immediately. The visible `无标题笔记` string remains a card/title placeholder only; it must never overwrite an empty stored title or a title the user entered. Title and body focus remain independently controllable so a future preference can switch the first cursor target without changing creation or persistence semantics. Clipboard-image and attachment creation must continue through the same resource transaction rather than a special binary note-body format.
 
+### Keyboard-first capture and search
+
+- Evernote exposes ordinary note creation as `Cmd-N` and ordinary search as `Cmd-K` in its shared keyboard-command catalogue. These are product-level commands, not shortcuts wired only to whichever widget currently owns focus.
+- The live macOS UI repeats `⌘K` inside the persistent search field, making the path discoverable while keeping it one keystroke away during editing.
+- Global search, note-local find and AI search are separate commands in the catalogue. Ordinary search therefore does not overload editor Find or require an expanded feature surface.
+
+Native ruling: retain the existing `Cmd-N` create-first path and add a native `Cmd-K` application command that focuses the persistent note search field and selects its current query for immediate replacement. Keep `Cmd-F` available to the focused AppKit text system for in-note find behavior; do not conflate it with library search. The shortcut must reuse the same `searchNotes:` action and filtering state as mouse input, with no parallel search implementation.
+
 ### Composition safety
 
 - Evernote's controlled text input tracks composition start/end and does not overwrite the DOM value while composition is active.
