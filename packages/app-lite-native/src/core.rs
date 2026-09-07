@@ -4,6 +4,7 @@ pub use crate::resource_store::ResourceImport;
 use crate::resource_store::{ResourceError, ResourceStore};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -11,10 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
-static FAIL_NEXT_BACKUP_AFTER_CREATE: std::sync::atomic::AtomicBool =
+static FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
@@ -26,6 +30,14 @@ static MIGRATION_BACKUP_PAUSED: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 static RELEASE_MIGRATION_BACKUP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static BACKUP_PUBLISH_RACE_TARGET: std::sync::OnceLock<Mutex<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+static REPLACE_PARTIAL_BEFORE_CLEANUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static LAST_PARTIAL_PATH: std::sync::OnceLock<Mutex<Option<PathBuf>>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -581,36 +593,63 @@ impl NoteRepository {
         {
             return Err(CoreError::InvalidBackupTarget);
         }
+        let target_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(CoreError::InvalidBackupTarget)?;
+        let partial_path = profile.join(format!(
+            ".{target_name}.html-migration-{}.partial",
+            new_id()
+        ));
+        let partial = OwnedPartial::claim(partial_path)?;
         let result = (|| {
-            #[cfg(test)]
-            if FAIL_NEXT_BACKUP_AFTER_CREATE.swap(false, Ordering::Relaxed) {
+            if !partial.still_owned() {
                 return Err(CoreError::BackupFailure);
             }
-            let destination_flags = OpenFlags::from_bits_retain(
-                (OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | OpenFlags::SQLITE_OPEN_CREATE
-                    | OpenFlags::SQLITE_OPEN_NOFOLLOW)
-                    .bits()
-                    | rusqlite::ffi::SQLITE_OPEN_EXCLUSIVE,
-            );
-            let mut destination = Connection::open_with_flags(target, destination_flags)?;
+            let mut destination = Connection::open_with_flags(
+                &partial.path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            if !partial.still_owned() {
+                return Err(CoreError::BackupFailure);
+            }
+            #[cfg(test)]
+            if FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN.swap(false, Ordering::Relaxed) {
+                return Err(CoreError::BackupFailure);
+            }
             let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
             backup.run_to_completion(64, std::time::Duration::from_millis(0), None)?;
             drop(backup);
-            drop(destination);
-            let integrity = Connection::open_with_flags(
-                target,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )?
-            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+            let integrity = destination
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
             if integrity != "ok" {
                 return Err(CoreError::BackupFailure);
             }
+            if !partial.still_owned() {
+                return Err(CoreError::BackupFailure);
+            }
+            drop(destination);
+            partial
+                .file
+                .sync_all()
+                .map_err(|_| CoreError::BackupFailure)?;
+            if !partial.still_owned() {
+                return Err(CoreError::BackupFailure);
+            }
+            #[cfg(test)]
+            if let Some(race_target) = BACKUP_PUBLISH_RACE_TARGET
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("backup race mutex poisoned")
+                .take()
+            {
+                std::fs::write(race_target, b"foreign final")
+                    .map_err(|_| CoreError::BackupFailure)?;
+            }
+            std::fs::hard_link(&partial.path, target).map_err(|_| CoreError::BackupFailure)?;
             Ok(())
         })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(target);
-        }
+        partial.cleanup();
         result
     }
 
@@ -692,6 +731,85 @@ struct CanonicalBody {
     body: String,
     body_text: String,
     resource_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    #[cfg(unix)]
+    {
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        FileIdentity {
+            device: metadata.len(),
+            inode: metadata.len(),
+        }
+    }
+}
+
+struct OwnedPartial {
+    path: PathBuf,
+    file: File,
+    identity: FileIdentity,
+}
+
+impl OwnedPartial {
+    fn claim(path: PathBuf) -> Result<Self, CoreError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options
+            .open(&path)
+            .map_err(|_| CoreError::InvalidBackupTarget)?;
+        let identity = file_identity(&file.metadata().map_err(|_| CoreError::BackupFailure)?);
+        #[cfg(test)]
+        {
+            *LAST_PARTIAL_PATH
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("partial path mutex poisoned") = Some(path.clone());
+        }
+        Ok(Self {
+            path,
+            file,
+            identity,
+        })
+    }
+
+    fn still_owned(&self) -> bool {
+        let Ok(handle_identity) = self
+            .file
+            .metadata()
+            .map(|metadata| file_identity(&metadata))
+        else {
+            return false;
+        };
+        let Ok(path_metadata) = std::fs::symlink_metadata(&self.path) else {
+            return false;
+        };
+        handle_identity == self.identity && file_identity(&path_metadata) == self.identity
+    }
+
+    fn cleanup(&self) {
+        #[cfg(test)]
+        if REPLACE_PARTIAL_BEFORE_CLEANUP.swap(false, Ordering::AcqRel) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::write(&self.path, b"foreign partial");
+        }
+        if self.still_owned() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn canonicalize_html(body: &str) -> Result<CanonicalBody, CoreError> {
@@ -1109,9 +1227,10 @@ fn sanitize_fts_query(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreError, CreateNote, FAIL_NEXT_BACKUP_AFTER_CREATE, HtmlNoteConversion,
-        MIGRATION_BACKUP_PAUSED, NoteContentUpdate, NoteRepository, PAUSE_AFTER_MIGRATION_BACKUP,
-        RELEASE_MIGRATION_BACKUP, UpdateNote,
+        BACKUP_PUBLISH_RACE_TARGET, CoreError, CreateNote, FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN,
+        HtmlNoteConversion, LAST_PARTIAL_PATH, MIGRATION_BACKUP_PAUSED, NoteContentUpdate,
+        NoteRepository, PAUSE_AFTER_MIGRATION_BACKUP, RELEASE_MIGRATION_BACKUP,
+        REPLACE_PARTIAL_BEFORE_CLEANUP, UpdateNote,
     };
     use crate::html_body::{parse_html, search_text};
     use crate::resource_store::ResourceImport;
@@ -1873,12 +1992,45 @@ mod tests {
             repo.backup_before_html_migration_to(&outside),
             Err(CoreError::InvalidBackupTarget)
         ));
+        let race = profile.join("race.sqlite");
+        *BACKUP_PUBLISH_RACE_TARGET
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some(race.clone());
+        assert!(matches!(
+            repo.backup_before_html_migration_to(&race),
+            Err(CoreError::BackupFailure)
+        ));
+        assert_eq!(std::fs::read(&race).unwrap(), b"foreign final");
+
         let failed = profile.join("failed.sqlite");
-        FAIL_NEXT_BACKUP_AFTER_CREATE.store(true, Ordering::Relaxed);
+        FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN.store(true, Ordering::Relaxed);
         assert!(matches!(
             repo.backup_before_html_migration_to(&failed),
             Err(CoreError::BackupFailure)
         ));
         assert!(!failed.exists());
+        let partial = LAST_PARTIAL_PATH
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(!partial.exists());
+
+        let replaced = profile.join("replaced.sqlite");
+        FAIL_NEXT_BACKUP_AFTER_DESTINATION_OPEN.store(true, Ordering::Relaxed);
+        REPLACE_PARTIAL_BEFORE_CLEANUP.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            repo.backup_before_html_migration_to(&replaced),
+            Err(CoreError::BackupFailure)
+        ));
+        let foreign_partial = LAST_PARTIAL_PATH
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(std::fs::read(foreign_partial).unwrap(), b"foreign partial");
     }
 }
