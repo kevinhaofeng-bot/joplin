@@ -1307,6 +1307,10 @@ fn semantic_action_presentation(
         }
         EditorAction::InsertImage | EditorAction::More => {}
     }
+    // Boundary-specific branches may derive an enabled state from an
+    // inactive query.  A live semantic session remains the common
+    // prerequisite for every catalogue action.
+    presentation.enabled = presentation.enabled && session.is_some();
     presentation
 }
 
@@ -2754,6 +2758,7 @@ define_class!(
                     loading_guard,
                 );
             }
+            self.update_formatting_buttons();
             if should_persist_after_editor_sync(sync_result) {
                 if matches!(sync_result, EditorSessionSyncResult::Applied) {
                     self.mark_current_note_dirty();
@@ -7343,6 +7348,50 @@ mod tests {
             !super::semantic_action_presentation(super::EditorAction::More, true, None, selection,)
                 .enabled
         );
+    }
+
+    #[test]
+    fn red_every_catalogue_action_requires_a_live_session() {
+        let selection = NSRange::new(0, 0);
+        for descriptor in super::editor_action_catalogue() {
+            let presentation =
+                super::semantic_action_presentation(descriptor.action, true, None, selection);
+            assert!(
+                !presentation.enabled,
+                "{} must be disabled without a live semantic session",
+                descriptor.label
+            );
+        }
+    }
+
+    #[test]
+    fn red_editor_commit_refreshes_post_commit_semantic_presentation() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "x".into(),
+                marks: Default::default(),
+            }],
+        }]);
+        let mut session = super::session_from_document(&document).unwrap();
+        super::apply_inline_command(&mut session, NSRange::new(0, 0), super::InlineCommand::Bold)
+            .unwrap();
+        super::apply_committed_text_delta(&mut session, NSRange::new(0, 0), "A").unwrap();
+        super::sync_caret_after_editor_event(
+            &mut session,
+            super::EditorSessionSyncResult::Applied,
+            NSRange::new(1, 0),
+            false,
+            false,
+        );
+        let presentation = super::semantic_action_presentation(
+            super::EditorAction::Bold,
+            true,
+            Some(&session),
+            NSRange::new(1, 0),
+        );
+        assert_eq!(presentation.state, super::SelectionState::Active);
+        assert!(presentation.enabled);
     }
 
     #[test]

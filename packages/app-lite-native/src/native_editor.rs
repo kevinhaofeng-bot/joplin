@@ -1031,7 +1031,6 @@ fn link_command_is_noop(
     if start == end {
         return false;
     }
-    let mut found = false;
     for element in session.text.flow() {
         let FlowElement::Block(block) = element else {
             continue;
@@ -1039,26 +1038,31 @@ fn link_command_is_noop(
         let snapshot = block.snapshot();
         for fragment in snapshot.fragments {
             let FragmentContent::Text {
+                text,
                 offset,
-                length,
                 format,
                 ..
             } = fragment
             else {
                 continue;
             };
-            let from = snapshot.position + offset;
-            let to = from + length;
-            if from >= end || to <= start {
-                continue;
-            }
-            found = true;
-            if format.anchor_href.as_deref() != url {
-                return false;
+            for (index, character) in text.chars().enumerate() {
+                if matches!(character, '\u{2028}' | '\u{000b}' | '\r') {
+                    continue;
+                }
+                let position = snapshot.position + offset + index;
+                if position < start || position >= end {
+                    continue;
+                }
+                if format.anchor_href.as_deref() != url {
+                    return false;
+                }
             }
         }
     }
-    found
+    // A range containing only a non-persistent soft-break carrier has no
+    // linkable text and therefore must not create an undo entry.
+    true
 }
 
 /// Remove exactly one resource-backed object anchor. Live text synchronization
@@ -1771,18 +1775,22 @@ pub fn query_link_selection(
         let snapshot = block.snapshot();
         for fragment in snapshot.fragments {
             let FragmentContent::Text {
+                text,
                 offset,
-                length,
                 format,
                 ..
             } = fragment
             else {
                 continue;
             };
-            let from = snapshot.position + offset;
-            let to = from + length;
-            if from < end && to > start {
-                links.push(format.anchor_href);
+            for (index, character) in text.chars().enumerate() {
+                if matches!(character, '\u{2028}' | '\u{000b}' | '\r') {
+                    continue;
+                }
+                let position = snapshot.position + offset + index;
+                if position >= start && position < end {
+                    links.push(format.anchor_href.clone());
+                }
             }
         }
     }
@@ -2692,6 +2700,46 @@ mod tests {
             SelectionState::Inactive
         );
         assert_eq!(session.text.to_addressable_text().unwrap(), "abc");
+    }
+
+    #[test]
+    fn red_soft_break_is_not_linkable_and_linking_it_is_a_noop() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![
+                Inline::Text {
+                    text: "a".into(),
+                    marks: Marks::default(),
+                },
+                Inline::SoftBreak,
+                Inline::Text {
+                    text: "b".into(),
+                    marks: Marks::default(),
+                },
+            ],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        assert_eq!(
+            query_link_selection(&session, NSRange::new(1, 1)).unwrap(),
+            LinkSelectionState {
+                state: SelectionState::Inactive,
+                has_linkable_text: false,
+            }
+        );
+        let revision = session.revision();
+        let can_undo = session.can_undo();
+        apply_link(
+            &mut session,
+            NSRange::new(1, 1),
+            Some("https://example.com"),
+        )
+        .unwrap();
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.can_undo(), can_undo);
+
+        let mixed = query_link_selection(&session, NSRange::new(0, 3)).unwrap();
+        assert!(mixed.has_linkable_text);
+        assert_eq!(mixed.state, SelectionState::Inactive);
     }
 
     #[test]
