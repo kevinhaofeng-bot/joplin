@@ -37,6 +37,19 @@ Joplin Lite 的价值不是“顺手写一点文字”，而是用更轻、更�
 
 结论：Evernote 值得借鉴的是结构化编辑、稳定的本地事实源、搜索权重和低摩擦工作流；不值得复制的是浏览器运行时和不断扩张的功能面。
 
+### 2.3 Obsidian 只作为格式与可移植性参照
+
+Obsidian 的正文事实源是普通 `.md` 文件；默认 Live Preview 在行内显示排版结果，仅在光标进入时显出多数 Markdown 标记。它的附件也是资料库中的普通文件，粘贴或拖入后在正文位置嵌入。
+
+Joplin Lite 借鉴的是它清楚、有限、容易迁移的语义格式，不照搬它的存储和产品形态：
+
+- 日常编辑继续使用真正的 AppKit 所见即所得，不提供默认 Markdown 源码模式；
+- 内部事实源继续是可读语义 HTML，而不是把富文本反复降级为 Markdown；
+- 支持 Markdown 导入/导出，使文本和附件可以离开应用继续使用；
+- 不引入 Vault 文件夹工作流、插件系统、知识图谱、Canvas、YAML 属性面板或 Dataview 一类扩展。
+
+格式能力按笔记实际需要收敛为：三级标题、粗体、斜体、下划线、删除线、荧光标记、链接、项目符号/编号/勾选列表、引用、行内代码/代码块、分隔线、图片和文件附件。复杂表格、公式、脚注、Callout 和任意 HTML/CSS 不进入首个替代版本。
+
 ### 2.2 只保留与笔记本质相关的行为
 
 根据当前官方帮助和本地可见结构，Joplin Lite 只借鉴以下核心行为：
@@ -57,7 +70,7 @@ Joplin Lite 的价值不是“顺手写一点文字”，而是用更轻、更�
 ### 3.1 私人可替代 MVP 必须具备
 
 1. 新建、标题、正文、自动保存、软删除、退出重开恢复；
-2. 默认所见即所得，支持段落、三级标题、粗体、斜体、下划线、列表、引用、代码、链接；
+2. 默认所见即所得，支持段落、三级标题、粗体、斜体、下划线、删除线、荧光标记、列表、勾选项、引用、代码、链接和分隔线；
 3. 图片粘贴和拖入可在光标处显示，普通文件可作为附件块插入；
 4. 最少的笔记本和标签管理；
 5. 标题优先的中文全文搜索，以及附件/OCR 文本入口；
@@ -101,7 +114,7 @@ Joplin Lite 的价值不是“顺手写一点文字”，而是用更轻、更�
 首批白名单为：
 
 - 块：`p`、`h1`、`h2`、`h3`、`ul`、`ol`、`li`、`blockquote`、`pre`、`hr`；
-- 行内：`strong`、`em`、`u`、`s`、`code`、`a`、`br`、`img`；
+- 行内：`strong`、`em`、`u`、`s`、`mark`、`code`、`a`、`br`、`img`；
 - 属性：链接的 `href`，图片的 `src`/`alt`，以及少量由我们定义且可移除的 `data-joplin-lite-*` 属性。
 
 不把字体家族、任意字号、任意颜色和复杂 CSS 作为首批语义。粘贴进来的富文本先规范化；未知标签保留其可见文本，危险 URL、脚本、事件属性和远程内嵌内容全部丢弃。应用不会执行 HTML。
@@ -182,6 +195,7 @@ HTML fragment
 - `+` 只列核心插入项：图片、文件、分隔线、引用、代码块；
 - 所见即所得是唯一默认编辑方式，不要求用户理解 Markdown；
 - 图片可在光标处与文本前后排列，选中图片后再提供对齐、宽度和删除，不常驻复杂面板。
+- Obsidian 式输入捷径可以作为加速器，例如行首 `# `、`- `、`1. `、`- [ ] ` 自动转为对应结构；转换完成后不要求用户继续面对 Markdown 标记。
 
 ## 7. 搜索
 
@@ -231,6 +245,7 @@ HTML fragment
 - 三栏/窄窗自适应结构；
 - Evernote 式标题、摘要、时间和低干扰格式工具；
 - 三级标题、列表、引用、代码、链接；
+- 删除线、荧光标记、勾选列表、分隔线和核心 Markdown 导入/导出；
 - 标题优先中文搜索和可解释命中摘要；
 - 最少的笔记本、标签和废纸篓入口。
 
@@ -267,3 +282,6 @@ HTML fragment
 - Evernote Export as ENEX or HTML: https://help.evernote.com/hc/en-us/articles/209005557-Export-Notes-and-Notebooks-as-ENEX-or-HTML
 - Joplin Rich Text editor and HTML note behavior: https://joplinapp.org/help/apps/rich_text_editor/
 - Joplin import/export, including ENEX as HTML: https://joplinapp.org/help/apps/import_export/
+- Obsidian Views and editing mode: https://obsidian.md/help/edit-and-read
+- Obsidian Basic formatting syntax: https://obsidian.md/help/syntax
+- Obsidian Attachments and embeds: https://obsidian.md/help/attachments
