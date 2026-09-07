@@ -21,6 +21,7 @@ pub enum HtmlBodyError {
 // only the in-memory tree we are willing to project is bounded.
 const MAX_DOM_DEPTH: usize = 4096;
 const MAX_DOM_NODES: usize = 1_000_000;
+const MAX_LINK_LENGTH: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Document {
@@ -304,11 +305,14 @@ pub fn resource_ids(document: &Document) -> Vec<String> {
 
 fn block_is_empty(block: &Block) -> bool {
     match block {
-        Block::Paragraph { inlines, .. } => inlines.iter().all(|inline| match inline {
-            Inline::Text { text, .. } => text.is_empty(),
-            Inline::SoftBreak => false,
-            Inline::Image { .. } => false,
-        }),
+        Block::Paragraph { style, inlines } if *style == BlockStyle::default() => {
+            inlines.iter().all(|inline| match inline {
+                Inline::Text { text, .. } => text.is_empty(),
+                Inline::SoftBreak => false,
+                Inline::Image { .. } => false,
+            })
+        }
+        Block::Paragraph { .. } => false,
         // Headings and lists are semantic blocks even when they have no
         // visible text. They must retain a reversible placeholder instead of
         // disappearing as an all-empty document.
@@ -480,7 +484,7 @@ fn serialize_text(
         output.push_str("<mark>");
     }
     if marks.strikethrough {
-        output.push_str("<del>");
+        output.push_str("<s>");
     }
     if marks.bold {
         output.push_str("<strong>");
@@ -502,7 +506,7 @@ fn serialize_text(
         output.push_str("</strong>");
     }
     if marks.strikethrough {
-        output.push_str("</del>");
+        output.push_str("</s>");
     }
     if marks.highlight {
         output.push_str("</mark>");
@@ -944,7 +948,7 @@ fn project_dom(root: &DomHandle) -> Document {
     let mut projection = Projection::default();
     let mut pending = vec![ProjectionFrame::Visit {
         node: root.clone(),
-        marks: Marks::default(),
+        marks: ProjectionMarks::default(),
         preformatted: false,
     }];
 
@@ -1018,6 +1022,17 @@ fn project_dom(root: &DomHandle) -> Document {
                         continue;
                     }
                     if let Some(level) = heading_level(&tag) {
+                        if projection.current_list.is_some() {
+                            projection.ensure_current();
+                            for child in children.into_iter().rev() {
+                                pending.push(ProjectionFrame::Visit {
+                                    node: child,
+                                    marks: marks.clone(),
+                                    preformatted,
+                                });
+                            }
+                            continue;
+                        }
                         let blocks_before = projection.document.blocks.len();
                         let style = block_style(&attrs.borrow(), 0);
                         projection.begin_block(BlockKind::Heading(level), style);
@@ -1041,6 +1056,18 @@ fn project_dom(root: &DomHandle) -> Document {
                             "div" | "section" | "article" | "header" | "footer"
                         )
                     {
+                        if projection.current_list.is_some() {
+                            projection.ensure_current();
+                            let child_preformatted = preformatted || tag == "pre";
+                            for child in children.into_iter().rev() {
+                                pending.push(ProjectionFrame::Visit {
+                                    node: child,
+                                    marks: marks.clone(),
+                                    preformatted: child_preformatted,
+                                });
+                            }
+                            continue;
+                        }
                         let blocks_before = projection.document.blocks.len();
                         let style =
                             block_style(&attrs.borrow(), if tag == "blockquote" { 1 } else { 0 });
@@ -1074,7 +1101,7 @@ fn project_dom(root: &DomHandle) -> Document {
                         projection.image(&attrs.borrow(), &marks);
                         continue;
                     }
-                    let next_marks = Marks {
+                    let next_marks = ProjectionMarks {
                         bold: marks.bold || matches!(tag.as_str(), "strong" | "b"),
                         italic: marks.italic || matches!(tag.as_str(), "em" | "i"),
                         underline: marks.underline || tag == "u",
@@ -1084,7 +1111,9 @@ fn project_dom(root: &DomHandle) -> Document {
                         link: if marks.link.is_some() {
                             marks.link.clone()
                         } else if tag == "a" {
-                            attribute(&attrs.borrow(), "href").filter(|value| valid_link(value))
+                            attribute(&attrs.borrow(), "href")
+                                .filter(|value| valid_link(value))
+                                .map(Rc::from)
                         } else {
                             None
                         },
@@ -1120,7 +1149,7 @@ fn project_dom(root: &DomHandle) -> Document {
 enum ProjectionFrame {
     Visit {
         node: DomHandle,
-        marks: Marks,
+        marks: ProjectionMarks,
         preformatted: bool,
     },
     FinishBlock {
@@ -1130,6 +1159,38 @@ enum ProjectionFrame {
     },
     FinishList,
     FinishListItem,
+}
+
+#[derive(Clone, Default)]
+struct ProjectionMarks {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    highlight: bool,
+    link: Option<Rc<str>>,
+}
+
+impl ProjectionMarks {
+    fn to_public(&self) -> Marks {
+        Marks {
+            bold: self.bold,
+            italic: self.italic,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
+            highlight: self.highlight,
+            link: self.link.as_ref().map(|link| link.to_string()),
+        }
+    }
+}
+
+fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
+    public.bold == projected.bold
+        && public.italic == projected.italic
+        && public.underline == projected.underline
+        && public.strikethrough == projected.strikethrough
+        && public.highlight == projected.highlight
+        && public.link.as_deref() == projected.link.as_deref()
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1151,17 +1212,18 @@ struct Projection {
     current_style: BlockStyle,
     current_kind: BlockKind,
     current_list: Option<WorkingList>,
+    list_stack: Vec<ListKind>,
     current_item_style: BlockStyle,
     current_item_checked: Option<bool>,
     explicit_softbreak: bool,
     pending_space: bool,
-    pending_marks: Option<Marks>,
+    pending_marks: Option<ProjectionMarks>,
     flow_has_visible: bool,
 }
 
 impl Projection {
     fn finish(mut self) -> Document {
-        if self.current_list.is_some() {
+        while self.current_list.is_some() {
             self.finish_list();
         }
         self.flush();
@@ -1169,10 +1231,19 @@ impl Projection {
     }
 
     fn ensure_current(&mut self) -> &mut Vec<Inline> {
+        if self.current.is_none()
+            && let Some(kind) = self.current_list.as_ref().map(|list| list.kind)
+        {
+            let checked = (kind == ListKind::Checklist).then_some(false);
+            self.begin_list_item(BlockStyle::default(), checked);
+        }
         self.current.get_or_insert_with(Vec::new)
     }
 
     fn flush(&mut self) {
+        if self.current_list.is_some() {
+            return;
+        }
         self.pending_space = false;
         self.pending_marks = None;
         self.flow_has_visible = false;
@@ -1232,7 +1303,15 @@ impl Projection {
     }
 
     fn begin_list(&mut self, kind: ListKind) {
-        self.flush();
+        if let Some(parent_kind) = self.current_list.as_ref().map(|list| list.kind) {
+            if self.current.is_some() {
+                self.finish_list_item();
+            }
+            self.flush_list_segment();
+            self.list_stack.push(parent_kind);
+        } else {
+            self.flush();
+        }
         self.current_list = Some(WorkingList {
             kind,
             items: Vec::new(),
@@ -1248,6 +1327,16 @@ impl Projection {
         self.pending_space = false;
         self.pending_marks = None;
         self.flow_has_visible = false;
+    }
+
+    fn flush_list_segment(&mut self) {
+        if let Some(list) = self.current_list.take() {
+            self.document.blocks.push(Block::List {
+                kind: list.kind,
+                items: list.items,
+            });
+        }
+        self.current = None;
     }
 
     fn finish_list_item(&mut self) {
@@ -1285,6 +1374,12 @@ impl Projection {
                 items: list.items,
             });
         }
+        if let Some(parent_kind) = self.list_stack.pop() {
+            self.current_list = Some(WorkingList {
+                kind: parent_kind,
+                items: Vec::new(),
+            });
+        }
         self.current = None;
         self.pending_space = false;
         self.pending_marks = None;
@@ -1295,7 +1390,7 @@ impl Projection {
         self.explicit_softbreak = true;
     }
 
-    fn text(&mut self, text: &str, marks: &Marks, preformatted: bool) {
+    fn text(&mut self, text: &str, marks: &ProjectionMarks, preformatted: bool) {
         if text.is_empty() {
             return;
         }
@@ -1338,25 +1433,25 @@ impl Projection {
         self.push_text(" ", &marks);
     }
 
-    fn push_text(&mut self, text: &str, marks: &Marks) {
+    fn push_text(&mut self, text: &str, marks: &ProjectionMarks) {
         let inlines = self.ensure_current();
         if let Some(Inline::Text {
             text: previous,
             marks: previous_marks,
         }) = inlines.last_mut()
-            && previous_marks == marks
+            && projection_marks_match(previous_marks, marks)
         {
             previous.push_str(text);
             return;
         }
         inlines.push(Inline::Text {
             text: text.to_owned(),
-            marks: marks.clone(),
+            marks: marks.to_public(),
         });
         self.flow_has_visible = true;
     }
 
-    fn image(&mut self, attrs: &[Attribute], marks: &Marks) {
+    fn image(&mut self, attrs: &[Attribute], marks: &ProjectionMarks) {
         let source = attribute(attrs, "src");
         let alt = attribute(attrs, "alt").unwrap_or_default();
         let Some(source) = source else {
@@ -1388,14 +1483,62 @@ fn attribute(attrs: &[Attribute], name: &str) -> Option<String> {
 }
 
 fn valid_link(value: &str) -> bool {
-    if value.chars().any(char::is_control) {
+    if value.is_empty() || value.len() > MAX_LINK_LENGTH || value.chars().any(char::is_control) {
         return false;
     }
-    ["http://", "https://", "mailto:"].iter().any(|prefix| {
-        value
-            .get(..prefix.len())
-            .is_some_and(|head| value.len() > prefix.len() && head.eq_ignore_ascii_case(prefix))
-    })
+    if let Some(target) =
+        strip_ascii_prefix(value, "http://").or_else(|| strip_ascii_prefix(value, "https://"))
+    {
+        return valid_http_target(target);
+    }
+    strip_ascii_prefix(value, "mailto:").is_some_and(valid_mailto_target)
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn valid_http_target(target: &str) -> bool {
+    let authority = target.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host_port.is_empty() {
+        return false;
+    }
+    if host_port.starts_with('[') {
+        let Some(close) = host_port.find(']') else {
+            return false;
+        };
+        if close == 1 {
+            return false;
+        }
+        let remainder = &host_port[close + 1..];
+        remainder.is_empty()
+            || remainder
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+    } else {
+        let (host, port) = host_port
+            .split_once(':')
+            .map_or((host_port, None), |(host, port)| (host, Some(port)));
+        !host.is_empty()
+            && port.is_none_or(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+    }
+}
+
+fn valid_mailto_target(target: &str) -> bool {
+    let mailbox = target.split(['?', '#']).next().unwrap_or_default();
+    let Some((local, domain)) = mailbox.rsplit_once('@') else {
+        return false;
+    };
+    !local.is_empty() && !domain.is_empty() && !mailbox.chars().any(char::is_whitespace)
 }
 
 fn block_style(attrs: &[Attribute], default_indent: u8) -> BlockStyle {
@@ -1486,10 +1629,98 @@ mod tests {
         let html = serialize_html(&document);
         assert_eq!(
             html,
-            "<h2 data-align=\"center\" data-indent=\"2\"><a href=\"https://example.com/a\"><mark><del>标题</del></mark></a></h2><ul data-type=\"checklist\"><li data-checked=\"false\">待办</li><li data-checked=\"true\">完成</li></ul>"
+            "<h2 data-align=\"center\" data-indent=\"2\"><a href=\"https://example.com/a\"><mark><s>标题</s></mark></a></h2><ul data-type=\"checklist\"><li data-checked=\"false\">待办</li><li data-checked=\"true\">完成</li></ul>"
         );
         assert_eq!(serialize_html(&parse_html(&html).unwrap()), html);
         assert_eq!(search_text(&parse_html(&html).unwrap()), "标题\n待办\n完成");
+    }
+
+    #[test]
+    fn nested_lists_flatten_without_losing_order_or_resources() {
+        let html = format!(
+            "<ul><li>keep</li><li>outer<img src=\":/{RESOURCE_ID}\" alt=\"outer-image\"><ol><li><p>inner-before</p><h2>inner-after<img src=\":/{RESOURCE_ID}\" alt=\"inner-image\"></h2></li></ol>outer-after</li></ul>"
+        );
+        let document = parse_html(&html).unwrap();
+
+        assert_eq!(
+            search_text(&document),
+            "keep\nouterouter-image\ninner-beforeinner-afterinner-image\nouter-after"
+        );
+        assert_eq!(
+            resource_ids(&document),
+            vec![RESOURCE_ID.to_owned(), RESOURCE_ID.to_owned()]
+        );
+        assert!(matches!(
+            document.blocks.as_slice(),
+            [
+                Block::List {
+                    kind: ListKind::Unordered,
+                    ..
+                },
+                Block::List {
+                    kind: ListKind::Ordered,
+                    ..
+                },
+                Block::List {
+                    kind: ListKind::Unordered,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn long_links_are_bounded_before_marks_are_projected_to_children() {
+        let href = format!(
+            "https://example.com/{}",
+            "x".repeat(MAX_LINK_LENGTH.saturating_add(1))
+        );
+        let html = format!(
+            "<p><a href=\"{href}\">{}</a></p>",
+            "<span>x</span>".repeat(1_000)
+        );
+        let document = parse_html(&html).unwrap();
+        assert_eq!(search_text(&document), "x".repeat(1_000));
+        assert!(!serialize_html(&document).contains("<a href="));
+    }
+
+    #[test]
+    fn styled_empty_paragraphs_round_trip_without_being_collapsed() {
+        let document = Document::from_blocks(vec![
+            paragraph(Vec::new()),
+            Block::Paragraph {
+                style: BlockStyle {
+                    alignment: Alignment::Center,
+                    indent: 2,
+                },
+                inlines: Vec::new(),
+            },
+            Block::Paragraph {
+                style: BlockStyle {
+                    alignment: Alignment::Right,
+                    indent: 1,
+                },
+                inlines: Vec::new(),
+            },
+        ]);
+        let html = serialize_html(&document);
+        assert_eq!(
+            html,
+            "<p><br></p><p data-align=\"center\" data-indent=\"2\"><br></p><p data-align=\"right\" data-indent=\"1\"><br></p>"
+        );
+        assert_eq!(parse_html(&html).unwrap(), document);
+    }
+
+    #[test]
+    fn links_require_a_structurally_valid_absolute_target() {
+        let document = parse_html(
+            r#"<p><a href="http://example.com/path">http</a><a href="https://localhost:8443">https</a><a href="mailto:user@example.com">mail</a><a href="http://">no-host</a><a href="https://?q=1">no-host</a><a href="https://:443">no-host</a><a href="mailto:@example.com">no-mailbox</a><a href="mailto:user">no-domain</a></p>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serialize_html(&document),
+            "<p><a href=\"http://example.com/path\">http</a><a href=\"https://localhost:8443\">https</a><a href=\"mailto:user@example.com\">mail</a>no-hostno-hostno-hostno-mailboxno-domain</p>"
+        );
     }
 
     #[test]
