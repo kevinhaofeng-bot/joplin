@@ -62,6 +62,50 @@ Native ruling: Task 4 virtualizes note cards with `NSCollectionView`, decodes on
 
 Native ruling: Task 3 defines one Rust command descriptor table used by both the fixed toolbar and More menu. Each descriptor owns availability, active/mixed state and execution; AppKit controls never keep independent formatting truth. Save and restore the current `NSRange` around toolbar/popover interaction, keep text-field focus only while entering a link, and return focus to the body after applying a command. Reuse commands in overflow rather than duplicating handlers, omit empty separators, close a menu without reapplying its command, and constrain native popovers to the visible window.
 
+### Typography hierarchy
+
+- The editor's current default heading styles are deliberately restrained: H1 is 30 px, H2 is 24 px, H3 is 18 px, and all three use weight 600.
+- The note title is also 30 px / weight 600 with a 1.3333 line height. The title remains visually dominant through placement, whitespace, metadata separation and editor structure rather than an oversized body-heading scale.
+- The prior H1/H2 defaults were 25/20 px, which confirms that heading scale is treated as a tunable product token rather than content structure being coupled to an arbitrarily large platform font.
+
+Native ruling: keep the native note title at 30 pt semibold, use approximately 30/24/18 pt semibold for H1/H2/H3, and preserve a 17 pt body. Heading attributes must be scoped to text blocks and must never constrain attachment line height. Visual hierarchy comes from rhythm and spacing as much as size.
+
+### Image nodes and surrounding flow
+
+- An image is a dedicated resource node view with persisted natural width and height plus an optional explicit display width. The display height is derived from aspect ratio rather than inherited from surrounding text.
+- The rendered image uses `max-width: 100%` and automatic height. The resource node owns loading, conversion, error, selection and resize states without storing image bytes in note markup.
+- Spacing rules explicitly cover paragraph-to-image, heading-to-image, image-to-paragraph and image-to-image sibling transitions. An image following a heading is not placed inside the heading's line box.
+- Image alignment and text wrapping are separate attributes. Alignment removes wrapping state, and wrapping removes alignment state, avoiding two competing presentation truths.
+
+Native ruling: canonical HTML remains readable and keeps `:/resource-id` references, but the editor projection must present images as independent attachment blocks. Natural dimensions and the available writing measure determine display size. A heading command may not absorb a following image, and a pasted image must terminate the current text block before inserting its resource block. This directly guards against the observed thin-strip image regression when an attachment inherited H1 paragraph geometry.
+
+### Editor model, readable format and collaboration state
+
+- The shipped editor identifies itself as `@evernote/common-editor` 183.272.12 and directly ships ProseMirror model, state, transform and view modules.
+- The same bundle contains Yjs, Y protocols, awareness handling and explicit sync-step commands. It also contains separate XML-tree and Yjs-tree handlers plus a dedicated ENML serializer.
+- This is concrete evidence that Evernote does not force one representation to serve editing, synchronization and durable interchange equally. Structured editor state, collaborative state and readable serialized note content are distinct layers with conversion boundaries.
+
+Native ruling: do not transplant ProseMirror or Yjs into the native client merely because Evernote uses them. Preserve the same separation of concerns with native components: AppKit/TextKit is the editing projection, normalized readable HTML is the durable body format in SQLite, and Loro may carry structured change history and convergence metadata for sync. CRDT bytes must not become the only recoverable representation of a note; the current HTML and searchable text projection remain locally materialized and exportable.
+
+### Toolbar visual system and overflow
+
+- The toolbar renders icons at 24 px, uses one-pixel separators between non-empty command groups and indicates active state with the brand colour. Tooltips carry accessible labels and keyboard shortcuts.
+- Heading and list controls remain pinned because their popovers represent structural choices. Other commands come from the same action catalogue and can move between the primary row and overflow without duplicating command logic.
+- The More menu is a scrollable, bounded panel (roughly 200 px wide and 260 px maximum height). Empty command groups do not leave orphan separators.
+- Pointer-down on toolbar chrome preserves the editor selection; menu form controls are the explicit exception. Popovers flip and shift at window edges instead of clipping.
+
+Native ruling: retain the existing Rust command catalogue, replace one-character placeholder labels with consistent SF Symbols where available, keep a textual block-style control, provide AppKit tooltips and accessibility labels, and move width-constrained commands into the shared More menu. Destructive note deletion belongs in restrained editor chrome or overflow, never overlapped with save status.
+
+### Note-card projection and thumbnail policy
+
+- The note-card data contract is a lightweight projection: note identity, title, last-edited time, editor metadata, snippet, thumbnail URL and notebook identity. The full editor document is not the list item's rendering source.
+- The shipped card typography is compact and consistent: 13 px semibold title with a 20 px line, 13/20 snippet text and 12/16 date metadata. Titles clamp to two lines, snippets clamp according to available card height, and long unbroken text wraps instead of widening the card.
+- The regular thumbnail slot is a fixed 76 by 76 px container with a subtle border and `object-fit: cover`. The selected card uses a one-pixel outline; hover changes the surface over 150 ms rather than introducing motion or scale.
+- Card content uses 16 px horizontal padding and reserves a stable 44 px footer area for date and indicators. Loading uses a structural skeleton rather than a blank or jumping card.
+- The cards view is virtualized. The shipped styles explicitly compensate for a spacer emitted by the virtualizer, and local note storage carries cached snippets and a selected-thumbnail hash so list rendering does not parse every full note body.
+
+Native ruling: keep the current Rust `NotePreview` projection, `NSCollectionView` reuse and visible-only thumbnail decoding. Tune the visual card toward this compact information hierarchy: stable metadata/footer geometry, 13 pt title/snippet scale, restrained selected outline and fixed cropped thumbnail slot. Avoid turning the note browser into a gallery of oversized images; the image supports recognition while title, snippet and recency remain primary.
+
 ## Explicitly excluded Evernote scope
 
 AI editing, collaboration, calendar integration, tasks, meeting recording, transcription, templates, advertising/promotions, rich web cards, PDF/spreadsheet viewers, arbitrary fonts/colors and other expansion features are not product requirements. Their presence in the bundle is evidence of Evernote's current size, not a backlog for Joplin Lite Native.
