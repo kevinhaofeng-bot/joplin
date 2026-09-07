@@ -4,15 +4,16 @@ use joplin_lite_native::core::{
     NoteRepository, ResourceImport,
 };
 use joplin_lite_native::html_body::{
-    Block, Document, HtmlBodyError, Inline, Marks, parse_html, resource_ids, search_text,
-    serialize_html,
+    Alignment, Block, Document, HtmlBodyError, Inline, Marks, parse_html, resource_ids,
+    search_text, serialize_html,
 };
 use joplin_lite_native::native_editor::{
     BlockCommand, EmptyBlockCarrier, InlineCommand, NativeEditorSession, ParagraphCommand,
     RenderedAttachment, RenderedDocument, SelectionState, apply_block_command,
     apply_committed_text_delta, apply_inline_command, apply_link, apply_paragraph_command,
     delete_image_anchor_if_identity, document_from_session, insert_image_anchor, query_block_state,
-    query_inline_state, render_session, session_from_document,
+    query_clear_state, query_inline_state, query_paragraph_command_state, render_session,
+    session_from_document,
 };
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
@@ -1201,6 +1202,108 @@ fn editor_action_kind(action: EditorAction) -> EditorActionKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditorActionPresentation {
+    action: EditorAction,
+    kind: EditorActionKind,
+    label: &'static str,
+    state: SelectionState,
+    enabled: bool,
+}
+
+fn semantic_action_presentation(
+    action: EditorAction,
+    has_note: bool,
+    session: Option<&NativeEditorSession>,
+    selection: NSRange,
+) -> EditorActionPresentation {
+    let kind = editor_action_kind(action);
+    let mut presentation = EditorActionPresentation {
+        action,
+        kind,
+        label: compact_toolbar_label(action),
+        state: SelectionState::Inactive,
+        enabled: has_note,
+    };
+    if !has_note {
+        return presentation;
+    }
+    let inline_state = |command| {
+        session
+            .and_then(|session| query_inline_state(session, selection, command).ok())
+            .unwrap_or(SelectionState::Inactive)
+    };
+    let block_state = |command| {
+        session
+            .and_then(|session| query_block_state(session, selection, command).ok())
+            .unwrap_or(SelectionState::Inactive)
+    };
+    let paragraph_state = |command| {
+        session
+            .and_then(|session| query_paragraph_command_state(session, selection, command).ok())
+            .unwrap_or(SelectionState::Inactive)
+    };
+    match action {
+        EditorAction::Undo => {
+            presentation.enabled = session.is_some_and(NativeEditorSession::can_undo);
+        }
+        EditorAction::Redo => {
+            presentation.enabled = session.is_some_and(NativeEditorSession::can_redo);
+        }
+        EditorAction::BlockStyle => {
+            presentation.label = session
+                .map(|session| block_style_label(session, selection))
+                .unwrap_or("正文");
+            presentation.state = block_state(BlockCommand::Paragraph);
+            presentation.enabled = session.is_some();
+        }
+        EditorAction::Bold => presentation.state = inline_state(InlineCommand::Bold),
+        EditorAction::Italic => presentation.state = inline_state(InlineCommand::Italic),
+        EditorAction::Underline => presentation.state = inline_state(InlineCommand::Underline),
+        EditorAction::Highlight => presentation.state = inline_state(InlineCommand::Highlight),
+        EditorAction::Strikethrough => {
+            presentation.state = inline_state(InlineCommand::Strikethrough)
+        }
+        EditorAction::BulletList => presentation.state = block_state(BlockCommand::UnorderedList),
+        EditorAction::OrderedList => presentation.state = block_state(BlockCommand::OrderedList),
+        EditorAction::Checklist => presentation.state = block_state(BlockCommand::Checklist),
+        EditorAction::Link => {
+            presentation.enabled = selection.length > 0
+                && session.is_some_and(|session| {
+                    query_inline_state(session, selection, InlineCommand::Bold).is_ok()
+                });
+        }
+        EditorAction::AlignLeft => {
+            presentation.state = paragraph_state(ParagraphCommand::Align(Alignment::Left));
+            presentation.enabled = presentation.state != SelectionState::Active;
+        }
+        EditorAction::AlignCenter => {
+            presentation.state = paragraph_state(ParagraphCommand::Align(Alignment::Center));
+            presentation.enabled = presentation.state != SelectionState::Active;
+        }
+        EditorAction::AlignRight => {
+            presentation.state = paragraph_state(ParagraphCommand::Align(Alignment::Right));
+            presentation.enabled = presentation.state != SelectionState::Active;
+        }
+        EditorAction::IncreaseIndent => {
+            presentation.state = paragraph_state(ParagraphCommand::IncreaseIndent);
+            presentation.enabled = presentation.state != SelectionState::Active;
+        }
+        EditorAction::DecreaseIndent => {
+            presentation.state = paragraph_state(ParagraphCommand::DecreaseIndent);
+            presentation.enabled = presentation.state != SelectionState::Active;
+        }
+        EditorAction::Clear => {
+            presentation.state = session
+                .and_then(|session| query_clear_state(session, selection).ok())
+                .unwrap_or(SelectionState::Inactive);
+            presentation.enabled = presentation.state != SelectionState::Inactive;
+        }
+        EditorAction::InsertImage | EditorAction::More => {}
+    }
+    presentation
+}
+
 fn toolbar_actions_for_width(width: f64) -> Vec<EditorAction> {
     EDITOR_ACTION_CATALOGUE
         .iter()
@@ -1216,6 +1319,43 @@ fn toolbar_overflow_actions_for_width(width: f64) -> Vec<EditorAction> {
         .filter(|descriptor| !descriptor.fixed && !visible.contains(&descriptor.action))
         .map(|descriptor| descriptor.action)
         .collect()
+}
+
+fn toolbar_more_enabled_for_layout(
+    width: f64,
+    height: f64,
+    visibility: ShellVisibility,
+    has_note: bool,
+) -> bool {
+    has_note
+        && !toolbar_overflow_actions_for_width(
+            shell_layout(width, height, visibility).toolbar.width,
+        )
+        .is_empty()
+}
+
+fn should_sync_caret_context(
+    selection_sync_guard: bool,
+    loading_guard: bool,
+    body_marked: bool,
+    pending_composition: bool,
+) -> bool {
+    !selection_sync_guard && !loading_guard && !body_marked && !pending_composition
+}
+
+fn autosave_timer_should_reschedule(
+    state: &AutosaveState,
+    note_id: &str,
+    epoch: u64,
+    generation: u64,
+    marked_text: bool,
+) -> bool {
+    marked_text
+        && state.note_id.as_deref() == Some(note_id)
+        && state.epoch == epoch
+        && state.scheduled_epoch == Some(epoch)
+        && state.scheduled_generation == Some(generation)
+        && state.dirty
 }
 
 fn compact_toolbar_label(action: EditorAction) -> &'static str {
@@ -2557,8 +2697,13 @@ define_class!(
             if let Some(body) = self.ivars().body_view.get() {
                 let selection = body.selectedRange();
                 *self.ivars().last_body_selection.borrow_mut() = selection;
-                if !*self.ivars().selection_sync_guard.borrow()
-                    && !*self.ivars().loading_guard.borrow()
+                let should_sync = should_sync_caret_context(
+                    *self.ivars().selection_sync_guard.borrow(),
+                    *self.ivars().loading_guard.borrow(),
+                    body.hasMarkedText(),
+                    self.ivars().pending_editor_composition.borrow().is_some(),
+                );
+                if should_sync
                     && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
                 {
                     session.sync_caret_context(selection);
@@ -2600,14 +2745,25 @@ define_class!(
             if token_note_id != note_id {
                 return;
             }
-            if should_defer_persistence(
-                self.ivars()
-                    .body_view
-                    .get()
-                    .is_some_and(|body| body.hasMarkedText()),
-                self.title_field_has_marked_text(),
-                *self.ivars().loading_guard.borrow(),
-            ) {
+            let marked_text = self
+                .ivars()
+                .body_view
+                .get()
+                .is_some_and(|body| body.hasMarkedText())
+                || self.title_field_has_marked_text();
+            if marked_text {
+                if autosave_timer_should_reschedule(
+                    &self.ivars().autosave.borrow(),
+                    &note_id,
+                    token_epoch,
+                    generation,
+                    true,
+                ) {
+                    self.schedule_autosave_after(&note_id, token_epoch, generation, 0.3);
+                }
+                return;
+            }
+            if *self.ivars().loading_guard.borrow() {
                 return;
             }
             let decision = self
@@ -2737,7 +2893,7 @@ define_class!(
                     SelectionState::Mixed => NSControlStateValueMixed,
                     SelectionState::Inactive => NSControlStateValueOff,
                 });
-                item.setEnabled(self.toolbar_action_enabled(EditorAction::BlockStyle));
+                item.setEnabled(self.current_action_presentation(EditorAction::BlockStyle).enabled);
                 menu.addItem(&item);
             }
             menu.popUpMenuPositioningItem_atLocation_inView(
@@ -2838,7 +2994,13 @@ define_class!(
                     )
                 };
                 unsafe { item.setTarget(Some(self)) };
-                item.setEnabled(self.toolbar_action_enabled(descriptor.action));
+                let presentation = self.current_action_presentation(descriptor.action);
+                item.setState(match presentation.state {
+                    SelectionState::Active => NSControlStateValueOn,
+                    SelectionState::Mixed => NSControlStateValueMixed,
+                    SelectionState::Inactive => NSControlStateValueOff,
+                });
+                item.setEnabled(presentation.enabled);
                 menu.addItem(&item);
             }
             menu.popUpMenuPositioningItem_atLocation_inView(
@@ -3987,6 +4149,7 @@ impl AppDelegate {
         if let Some(label) = self.ivars().editor_empty_label.get() {
             label.setFrame(shell.empty_editor.ns_rect());
         }
+        self.update_formatting_buttons();
     }
 
     fn command_selection(&self) -> Option<NSRange> {
@@ -4012,41 +4175,29 @@ impl AppDelegate {
         self.update_formatting_buttons();
     }
 
-    fn toolbar_action_enabled(&self, action: EditorAction) -> bool {
-        if self.ivars().current_note_id.borrow().is_none() {
-            return false;
-        }
-        match action {
-            EditorAction::Undo => self
-                .ivars()
-                .editor_session
-                .borrow()
-                .as_ref()
-                .is_some_and(NativeEditorSession::can_undo),
-            EditorAction::Redo => self
-                .ivars()
-                .editor_session
-                .borrow()
-                .as_ref()
-                .is_some_and(NativeEditorSession::can_redo),
-            EditorAction::More => self
+    fn current_action_presentation(&self, action: EditorAction) -> EditorActionPresentation {
+        let has_note = self.ivars().current_note_id.borrow().is_some();
+        let selection = self.command_selection().unwrap_or(NSRange::new(0, 0));
+        let session_guard = self.ivars().editor_session.borrow();
+        let mut presentation =
+            semantic_action_presentation(action, has_note, session_guard.as_ref(), selection);
+        if action == EditorAction::More {
+            presentation.enabled = self
                 .ivars()
                 .window
                 .get()
                 .and_then(|window| window.contentView())
                 .map(|content| {
-                    let width = shell_layout(
+                    toolbar_more_enabled_for_layout(
                         content.frame().size.width,
                         content.frame().size.height,
                         *self.ivars().shell_visibility.borrow(),
+                        has_note,
                     )
-                    .toolbar
-                    .width;
-                    !toolbar_overflow_actions_for_width(width).is_empty()
                 })
-                .unwrap_or(true),
-            _ => true,
+                .unwrap_or(false);
         }
+        presentation
     }
 
     fn apply_inline_command(&self, command: InlineCommand) {
@@ -4202,74 +4353,14 @@ impl AppDelegate {
 
     fn update_formatting_buttons(&self) {
         let has_note = self.ivars().current_note_id.borrow().is_some();
-        let toolbar_width = self
-            .ivars()
-            .window
-            .get()
-            .and_then(|window| window.contentView())
-            .map(|content| {
-                shell_layout(
-                    content.frame().size.width,
-                    content.frame().size.height,
-                    *self.ivars().shell_visibility.borrow(),
-                )
-                .toolbar
-                .width
-            })
-            .unwrap_or(0.0);
-        let has_overflow = !toolbar_overflow_actions_for_width(toolbar_width).is_empty();
-        let selection = self
-            .ivars()
-            .body_view
-            .get()
-            .map(|body| body.selectedRange())
-            .unwrap_or(NSRange::new(0, 0));
-        let session_guard = self.ivars().editor_session.borrow();
-        let session = session_guard.as_ref();
-        let state_for_inline = |command| {
-            session
-                .and_then(|session| query_inline_state(session, selection, command).ok())
-                .unwrap_or(SelectionState::Inactive)
-        };
-        let state_for_block = |command| {
-            session
-                .and_then(|session| query_block_state(session, selection, command).ok())
-                .unwrap_or(SelectionState::Inactive)
-        };
-        let (can_undo, can_redo) = session
-            .map(|session| (session.can_undo(), session.can_redo()))
-            .unwrap_or((false, false));
-        let block_label = session
-            .map(|session| block_style_label(session, selection))
-            .unwrap_or("正文");
         for (action, button) in self.ivars().toolbar_buttons.borrow().iter() {
-            let state = match action {
-                EditorAction::Bold => state_for_inline(InlineCommand::Bold),
-                EditorAction::Italic => state_for_inline(InlineCommand::Italic),
-                EditorAction::Underline => state_for_inline(InlineCommand::Underline),
-                EditorAction::Highlight => state_for_inline(InlineCommand::Highlight),
-                EditorAction::Strikethrough => state_for_inline(InlineCommand::Strikethrough),
-                EditorAction::BulletList => state_for_block(BlockCommand::UnorderedList),
-                EditorAction::OrderedList => state_for_block(BlockCommand::OrderedList),
-                EditorAction::Checklist => state_for_block(BlockCommand::Checklist),
-                EditorAction::BlockStyle => state_for_block(BlockCommand::Paragraph),
-                _ => SelectionState::Inactive,
-            };
-            let enabled = has_note
-                && match action {
-                    EditorAction::Undo => can_undo,
-                    EditorAction::Redo => can_redo,
-                    EditorAction::More => has_overflow,
-                    _ => true,
-                };
-            button.setEnabled(enabled);
-            if *action == EditorAction::BlockStyle {
-                button.setTitle(&NSString::from_str(block_label));
-            }
+            let presentation = self.current_action_presentation(*action);
+            button.setEnabled(presentation.enabled);
+            button.setTitle(&NSString::from_str(presentation.label));
             if !has_note {
                 button.setHidden(true);
             }
-            button.setState(match state {
+            button.setState(match presentation.state {
                 SelectionState::Active => NSControlStateValueOn,
                 SelectionState::Mixed => NSControlStateValueMixed,
                 SelectionState::Inactive => NSControlStateValueOff,
@@ -6953,6 +7044,116 @@ mod tests {
         assert_eq!(
             typing_trait_operation(TextFormat::Italic, FormatDecision::Add),
             FontTraitOperation::Have,
+        );
+    }
+
+    #[test]
+    fn red_resize_recomputes_more_enabled_for_the_production_layout() {
+        let wide = super::toolbar_more_enabled_for_layout(
+            1380.0,
+            820.0,
+            super::ShellVisibility::Default,
+            true,
+        );
+        let narrow = super::toolbar_more_enabled_for_layout(
+            1100.0,
+            700.0,
+            super::ShellVisibility::Default,
+            true,
+        );
+        assert!(!wide);
+        assert!(narrow);
+        assert!(
+            super::toolbar_actions_for_width(
+                super::shell_layout(1100.0, 700.0, super::ShellVisibility::Default)
+                    .toolbar
+                    .width
+            )
+            .contains(&super::EditorAction::More)
+        );
+    }
+
+    #[test]
+    fn red_marked_selection_event_preserves_explicit_caret_override() {
+        assert!(!super::should_sync_caret_context(false, false, true, false));
+        assert!(!super::should_sync_caret_context(false, false, false, true));
+        assert!(super::should_sync_caret_context(false, false, false, false));
+    }
+
+    #[test]
+    fn red_action_presentation_is_shared_and_disables_semantic_noops() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "plain".into(),
+                marks: Marks::default(),
+            }],
+        }]);
+        let session = super::session_from_document(&document).unwrap();
+        let selection = NSRange::new(0, 0);
+        let more_strike = super::semantic_action_presentation(
+            super::EditorAction::Strikethrough,
+            true,
+            Some(&session),
+            selection,
+        );
+        let fixed_strike = super::semantic_action_presentation(
+            super::EditorAction::Strikethrough,
+            true,
+            Some(&session),
+            selection,
+        );
+        assert_eq!(more_strike, fixed_strike);
+        assert!(
+            !super::semantic_action_presentation(
+                super::EditorAction::Link,
+                true,
+                Some(&session),
+                selection,
+            )
+            .enabled
+        );
+        assert!(
+            !super::semantic_action_presentation(
+                super::EditorAction::DecreaseIndent,
+                true,
+                Some(&session),
+                selection,
+            )
+            .enabled
+        );
+        assert!(
+            !super::semantic_action_presentation(
+                super::EditorAction::Clear,
+                true,
+                Some(&session),
+                selection,
+            )
+            .enabled
+        );
+    }
+
+    #[test]
+    fn red_marked_timer_keeps_a_dirty_generation_executable() {
+        let mut state = super::AutosaveState::loaded("note-a", "标题", "<p>旧</p>");
+        assert_eq!(state.mark_dirty("note-a", "标题", "<p>新</p>"), Some(1));
+        let epoch = state.epoch;
+        assert!(super::autosave_timer_should_reschedule(
+            &state, "note-a", epoch, 1, true
+        ));
+        assert!(!super::autosave_timer_should_reschedule(
+            &state, "note-a", epoch, 1, false
+        ));
+        assert!(super::autosave_timer_should_reschedule(
+            &state, "note-a", epoch, 1, true
+        ));
+        assert_eq!(
+            state.timer_decision_with_epoch("note-a", epoch, 1),
+            super::AutosaveDecision::Persist {
+                generation: 1,
+                title: "标题".into(),
+                html: "<p>新</p>".into(),
+            }
         );
     }
 }

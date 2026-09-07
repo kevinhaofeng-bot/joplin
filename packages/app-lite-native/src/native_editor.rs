@@ -1302,6 +1302,76 @@ pub fn query_block_state(
     }
 }
 
+pub fn query_paragraph_command_state(
+    session: &NativeEditorSession,
+    selection: NSRange,
+    command: ParagraphCommand,
+) -> Result<SelectionState, EditorCodecError> {
+    let text = session.text.to_addressable_text().map_err(model_error)?;
+    let (start, end) = utf16_range(&text, selection)?;
+    let mut values = Vec::new();
+    for element in session.text.flow() {
+        let FlowElement::Block(block) = element else {
+            continue;
+        };
+        let snapshot = block.snapshot();
+        let overlaps = if start == end {
+            snapshot.position <= start && start <= snapshot.position + snapshot.length
+        } else {
+            snapshot.position < end && snapshot.position + snapshot.length > start
+        };
+        if !overlaps {
+            continue;
+        }
+        let indent = snapshot.block_format.indent.unwrap_or(0);
+        values.push(match command {
+            ParagraphCommand::Align(alignment) => {
+                html_alignment(snapshot.block_format.alignment) == alignment
+            }
+            ParagraphCommand::IncreaseIndent => indent >= 8,
+            ParagraphCommand::DecreaseIndent => indent == 0,
+        });
+    }
+    if values.is_empty() || values.iter().all(|value| !*value) {
+        return Ok(SelectionState::Inactive);
+    }
+    if values.iter().all(|value| *value) {
+        Ok(SelectionState::Active)
+    } else {
+        Ok(SelectionState::Mixed)
+    }
+}
+
+fn format_needs_clear(format: &TextFormat) -> bool {
+    format.font_bold == Some(true)
+        || format.font_italic == Some(true)
+        || format.font_underline == Some(true)
+        || format.font_strikeout == Some(true)
+        || format.anchor_href.is_some()
+        || format
+            .background_color
+            .as_ref()
+            .is_some_and(|color| color.alpha > 0)
+}
+
+pub fn query_clear_state(
+    session: &NativeEditorSession,
+    selection: NSRange,
+) -> Result<SelectionState, EditorCodecError> {
+    let text = session.text.to_addressable_text().map_err(model_error)?;
+    let (start, end) = utf16_range(&text, selection)?;
+    let active = if start == end {
+        format_needs_clear(&session.effective_typing_format(start))
+    } else {
+        selection_needs_clear(session, start, end)
+    };
+    Ok(if active {
+        SelectionState::Active
+    } else {
+        SelectionState::Inactive
+    })
+}
+
 pub fn apply_inline_command(
     session: &mut NativeEditorSession,
     selection: NSRange,
