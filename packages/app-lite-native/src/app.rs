@@ -1914,15 +1914,11 @@ fn should_defer_persistence(body_marked: bool, title_marked: bool, loading: bool
 }
 
 #[cfg(test)]
-fn display_note_title(title: &str, body: &str) -> String {
+fn display_note_title(title: &str, _body: &str) -> String {
     if !title.trim().is_empty() {
         return title.trim().chars().take(120).collect();
     }
-    body.lines()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().chars().take(120).collect())
-        .filter(|line: &String| !line.is_empty())
-        .unwrap_or_else(|| "无标题笔记".to_string())
+    "无标题笔记".to_string()
 }
 
 #[cfg(test)]
@@ -7707,8 +7703,8 @@ mod tests {
     }
 
     #[test]
-    fn blank_title_uses_body_first_line_only_for_list_display() {
-        assert_eq!(display_note_title("", "  正文首行\n第二行"), "正文首行");
+    fn blank_title_uses_placeholder_and_keeps_body_in_summary() {
+        assert_eq!(display_note_title("", "  正文首行\n第二行"), "无标题笔记");
         assert_eq!(
             display_note_title("我的真实标题", "正文首行"),
             "我的真实标题"
@@ -7739,7 +7735,7 @@ mod tests {
             body_text: "首行正文\n第二段".into(),
             ..titled
         };
-        assert_eq!(note_list_title(&untitled), "首行正文");
+        assert_eq!(note_list_title(&untitled), "无标题笔记");
         assert_eq!(note_list_summary(&untitled), "首行正文");
         assert!(!note_list_title(&untitled).contains('<'));
     }

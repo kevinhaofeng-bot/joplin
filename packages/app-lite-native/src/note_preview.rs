@@ -46,7 +46,7 @@ pub fn preview_from_note(note: &Note, now_ms: i64) -> NotePreview {
         Err(_) => (note.body_text.clone(), None),
     };
     let title_source = if note.title.trim().is_empty() {
-        first_nonempty_line(&body_text).unwrap_or("无标题笔记")
+        "无标题笔记"
     } else {
         note.title.trim()
     };
@@ -63,7 +63,7 @@ pub fn preview_from_note(note: &Note, now_ms: i64) -> NotePreview {
 
 pub fn preview_from_list_item(item: &NoteListItem, now_ms: i64) -> NotePreview {
     let title_source = if item.title.trim().is_empty() {
-        first_nonempty_line(&item.body_text).unwrap_or("无标题笔记")
+        "无标题笔记"
     } else {
         item.title.trim()
     };
@@ -201,10 +201,6 @@ fn ascii_fold_char(character: char) -> char {
     character.to_ascii_lowercase()
 }
 
-fn first_nonempty_line(text: &str) -> Option<&str> {
-    text.lines().map(str::trim).find(|line| !line.is_empty())
-}
-
 fn truncate_chars(text: &str, limit: usize) -> String {
     let mut characters = text.chars();
     let truncated: String = characters.by_ref().take(limit).collect();
@@ -269,7 +265,7 @@ mod tests {
             preview,
             NotePreview {
                 note_id: "note-1".into(),
-                title: "正文标题".into(),
+                title: "无标题笔记".into(),
                 snippet: "正文标题\nHello world\nBA".into(),
                 search_text: "正文标题\nHello world\nBA".into(),
                 updated_label: "2分钟前".into(),
@@ -308,7 +304,7 @@ mod tests {
     fn red_preview_parse_failure_is_text_only_and_never_fakes_a_resource() {
         let body = "<div>".repeat(4097);
         let preview = preview_from_note(&note("", &body, "safe fallback", 0), 60_000);
-        assert_eq!(preview.title, "safe fallback");
+        assert_eq!(preview.title, "无标题笔记");
         assert_eq!(preview.snippet, "safe fallback");
         assert_eq!(preview.first_image_id, None);
     }
@@ -325,7 +321,7 @@ mod tests {
             },
             1_700_000_060_000,
         );
-        assert_eq!(preview.title, "😀 projected");
+        assert_eq!(preview.title, "无标题笔记");
         assert_eq!(preview.first_image_id.as_deref(), Some("resource-1"));
     }
 
