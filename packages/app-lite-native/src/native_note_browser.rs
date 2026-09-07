@@ -240,6 +240,17 @@ pub fn restore_selection_after_failed_switch(
     selected_index_for_id(ids, previous_id)
 }
 
+pub fn thumbnail_display_size(
+    pixels: (usize, usize),
+    target_pixel_size: usize,
+) -> Option<(f64, f64)> {
+    if pixels.0 == 0 || pixels.1 == 0 || target_pixel_size == 0 {
+        return None;
+    }
+    let scale = 56.0 / target_pixel_size as f64;
+    Some((pixels.0 as f64 * scale, pixels.1 as f64 * scale))
+}
+
 pub fn make_note_collection_view(
     mtm: MainThreadMarker,
     frame: NSRect,
@@ -412,6 +423,7 @@ mod tests {
         CardVisualState, PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest,
         ThumbnailRequestLedger, browser_metrics, card_layout, card_visual_state,
         preview_list_update, restore_selection_after_failed_switch, selected_index_for_id,
+        thumbnail_display_size,
     };
     use crate::note_preview::NotePreview;
 
@@ -518,6 +530,14 @@ mod tests {
         ledger.complete(&a, false);
         ledger.complete(&c, false);
         assert_eq!(ledger.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn thumbnail_display_size_preserves_non_square_ratio_and_target_scale() {
+        let size = thumbnail_display_size((112, 63), 112).unwrap();
+        assert_eq!(size, (56.0, 31.5));
+        assert!((size.0 / size.1 - 112.0 / 63.0).abs() < f64::EPSILON);
+        assert!(thumbnail_display_size((0, 63), 112).is_none());
     }
 
     #[test]

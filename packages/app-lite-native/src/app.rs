@@ -20,7 +20,7 @@ use joplin_lite_native::native_editor::{
 use joplin_lite_native::native_note_browser::{
     PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
     configure_note_card, make_note_collection_view, preview_list_update,
-    restore_selection_after_failed_switch, selected_index_for_id,
+    restore_selection_after_failed_switch, selected_index_for_id, thumbnail_display_size,
 };
 use joplin_lite_native::note_preview::{NotePreview, preview_from_list_item};
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
@@ -114,7 +114,6 @@ struct PendingEditorComposition {
 
 const THUMBNAIL_QUEUE_CAPACITY: usize = 32;
 const THUMBNAIL_WORKER_COUNT: usize = 2;
-const THUMBNAIL_MAX_PIXEL_SIZE: usize = 112;
 
 struct ThumbnailJob {
     key: ThumbnailKey,
@@ -3029,10 +3028,19 @@ define_class!(
                 queue.drain(..).collect::<Vec<_>>()
             };
             for completion in completions {
+                let display_size = completion.pixels.and_then(|pixels| {
+                    thumbnail_pixels_within_bound(pixels, completion.key.target_size as usize)
+                        .then(|| {
+                            thumbnail_display_size(pixels, completion.key.target_size as usize)
+                        })
+                        .flatten()
+                });
                 let pixels_ok = completion
                     .pixels
-                    .is_some_and(|pixels| thumbnail_pixels_within_bound(pixels, THUMBNAIL_MAX_PIXEL_SIZE));
-                let success = completion.image.is_some() && pixels_ok;
+                    .is_some_and(|pixels| {
+                        thumbnail_pixels_within_bound(pixels, completion.key.target_size as usize)
+                    });
+                let success = completion.image.is_some() && pixels_ok && display_size.is_some();
                 self.ivars()
                     .thumbnail_requests
                     .borrow_mut()
@@ -3042,7 +3050,7 @@ define_class!(
                         let image = NSImage::initWithCGImage_size(
                             NSImage::alloc(),
                             &image,
-                            NSSize::new(56.0, 56.0),
+                            NSSize::new(display_size.unwrap().0, display_size.unwrap().1),
                         );
                         self.ivars()
                             .thumbnail_cache
