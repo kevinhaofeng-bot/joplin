@@ -313,13 +313,6 @@ pub fn configure_note_card(
     card.configure(preview, image, selected, metrics);
 }
 
-fn card_frame_with_metrics(existing: NSRect, metrics: BrowserMetrics) -> NSRect {
-    NSRect::new(
-        existing.origin,
-        NSSize::new(metrics.card_width, metrics.card_height),
-    )
-}
-
 impl NoteCardView {
     fn new(mtm: MainThreadMarker, metrics: BrowserMetrics) -> Retained<Self> {
         let frames = card_layout(metrics, false);
@@ -382,7 +375,9 @@ impl NoteCardView {
         selected: bool,
         metrics: BrowserMetrics,
     ) {
-        self.setFrame(card_frame_with_metrics(self.frame(), metrics));
+        // NSCollectionViewFlowLayout owns this root frame. The data-source
+        // callback runs before layout attributes are applied; changing it here
+        // clobbers the column origin of a reused item.
         let border_color = if selected {
             evernote_green()
         } else {
@@ -456,12 +451,11 @@ fn card_label(
 mod tests {
     use super::{
         CardVisualState, PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest,
-        ThumbnailRequestLedger, browser_metrics, card_frame_with_metrics, card_layout,
-        card_visual_state, preview_list_update, restore_selection_after_failed_switch,
-        selected_index_for_id, thumbnail_display_size,
+        ThumbnailRequestLedger, browser_metrics, card_layout, card_visual_state,
+        preview_list_update, restore_selection_after_failed_switch, selected_index_for_id,
+        thumbnail_display_size,
     };
     use crate::note_preview::NotePreview;
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     #[test]
     fn red_browser_metrics_keep_two_cards_inside_the_360_to_400_rail() {
@@ -520,22 +514,6 @@ mod tests {
         assert!(without_image.title.1 > with_image.title.1);
         assert!(without_image.snippet.3 > with_image.snippet.3);
         assert_eq!(without_image.image.2, with_image.image.2);
-    }
-
-    #[test]
-    fn card_reuse_preserves_collection_layout_origin_for_each_column() {
-        let metrics = browser_metrics(360.0);
-        let first = card_frame_with_metrics(
-            NSRect::new(NSPoint::new(0.0, 112.0), NSSize::new(170.0, 230.0)),
-            metrics,
-        );
-        let second = card_frame_with_metrics(
-            NSRect::new(NSPoint::new(176.0, 112.0), NSSize::new(170.0, 230.0)),
-            metrics,
-        );
-        assert_eq!(first.origin, NSPoint::new(0.0, 112.0));
-        assert_eq!(second.origin, NSPoint::new(176.0, 112.0));
-        assert_ne!(first.origin, second.origin);
     }
 
     #[test]
