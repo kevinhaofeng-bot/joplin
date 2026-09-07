@@ -39,6 +39,16 @@ Lapce 与 Floem editor-core 是本轮明确检查过的 Rust 原生编辑器参�
 
 但不直接依赖 Lapce/Floem editor-core：其 `Document` 事实源是纯文本 `Rope`，逐行 styling 与 phantom text 主要服务代码编辑，并不提供可持久化的标题、列表、链接、图片资源等富文本 schema。Floem 还会引入自定义 winit/wgpu 渲染和输入链，等于放弃已经可用的 AppKit 中文输入、系统文本服务、辅助功能和剪贴板集成。我们的组合保持为 Rust 语义 Document + AppKit `NSTextView` 投影；只有将来单条笔记规模证明 `NSTextStorage` 成为真实瓶颈时，才单独评估 Rope 增量存储，不以猜测替换稳定链。
 
+## Velotype/GPUI 取舍
+
+Velotype 是本轮明确审过源码的 Rust 原生编辑器参考，核对基线为 v0.7.2 / `ed65977be94f2f2703037fcb8b6cbab2e7579571`。它使用 GPUI 实现原生 block tree、块内 `EntityInputHandler`、UTF-16/UTF-8 输入位置转换、IME marked range、跨块选择/复制/删除、撤销快照、Markdown source mapping、图片/表格/代码块运行时和主题 token，证明全 Rust 自绘块编辑器并非概念演示。我们采用其文档树结构操作边界、跨块行为测试、未知语法保留和主题 token 分层作为实现参考。
+
+本轮不 fork Velotype，也不引入 GPUI。它的产品边界是单个 Markdown 文件/工作区编辑器，不包含本项目的笔记库、缩略图列表、SQLite/FTS、资源资料库和可靠同步；其持久事实源仍是 canonical Markdown，而本项目明确选择可读、可索引的 canonical HTML。其跨块选择、焦点与输入法链和 GPUI block runtime 紧密耦合，并非可独立复用的富文本 crate；上游路线图仍列出“更完善的 IME 功能”和“内置图床”。对中文日常记录而言，替换 TextKit 会把已由系统解决的输入、选区、辅助功能和文本服务重新变成本项目责任。若 MVP 后真实测量证明 TextKit 无法满足已经批准的交互，再以独立原型比较 GPUI，不在当前资料格式或数据库上制造迁移。
+
+## Obsidian 格式参考边界
+
+Obsidian 只作为“日常数据库与可读导出可以并存”的产品参考，不作为 Markdown-first 约束。我们的正文可以导入导出 Markdown，但内部格式必须优先服务所见即所得、图片资源、列表/清单、稳定索引和同步事务；不能为了保持纯 Markdown 而牺牲用户可见效果或数据模型。
+
 ## Matrix Rich Text Editor 取舍
 
 Element 的 Matrix Rich Text Editor 是本轮进一步检查的 Rust 富文本参考。其核心约 2.8 万行 Rust，已经实现 UTF-16 选区、DOM range 定位、粗体/斜体/下划线/删除线、链接、嵌套有序/无序列表、缩进、回车/退格边界、菜单 action state 和撤销/重做，并为浏览器及办公软件 HTML 粘贴准备了大量回归样本。这些正是 Task 2 最容易凭直觉写错的编辑算法；实现与测试必须对照其公开行为和反例，尤其是跨节点选区、局部链接、空列表项退出、嵌套列表残余和一条命令一个历史状态。
