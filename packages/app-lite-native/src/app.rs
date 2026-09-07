@@ -50,6 +50,7 @@ use std::sync::Arc;
 
 const RESOURCE_ID_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-id";
 const RESOURCE_ALT_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-alt";
+const MISSING_RESOURCE_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.missing-resource";
 
 struct PreparedNoteContent {
     update: NoteContentUpdate,
@@ -90,6 +91,10 @@ fn resource_alt_attribute_key() -> Retained<NSAttributedStringKey> {
     NSString::from_str(RESOURCE_ALT_ATTRIBUTE)
 }
 
+fn missing_resource_attribute_key() -> Retained<NSAttributedStringKey> {
+    NSString::from_str(MISSING_RESOURCE_ATTRIBUTE)
+}
+
 fn string_for_range(source: &NSAttributedString, range: NSRange) -> String {
     source
         .attributedSubstringFromRange(range)
@@ -104,6 +109,35 @@ fn attribute_string(
     unsafe { attributes.objectForKey_unchecked(key) }
         .and_then(|value| value.downcast_ref::<NSString>())
         .map(ToString::to_string)
+}
+
+fn missing_resource_placeholder_text(alt: &str) -> String {
+    if alt.is_empty() {
+        "[图片]".to_string()
+    } else {
+        format!("[图片：{alt}]")
+    }
+}
+
+fn missing_resource_marker(
+    attributes: &NSDictionary<NSAttributedStringKey, AnyObject>,
+    text: &str,
+) -> Option<(String, String)> {
+    let marker_key = missing_resource_attribute_key();
+    let marked = unsafe { attributes.objectForKey_unchecked(&marker_key) }
+        .and_then(|value| value.downcast_ref::<NSString>())
+        .is_some_and(|value| value.to_string() == "1");
+    if !marked {
+        return None;
+    }
+    let resource_id = attribute_string(attributes, &resource_id_attribute_key())?;
+    let alt = attribute_string(attributes, &resource_alt_attribute_key())?;
+    if text != missing_resource_placeholder_text(&alt)
+        || markdown_marker(&resource_id, &alt).is_err()
+    {
+        return None;
+    }
+    Some((resource_id, alt))
 }
 
 fn marks_from_attributes(attributes: &NSDictionary<NSAttributedStringKey, AnyObject>) -> Marks {
@@ -171,31 +205,38 @@ fn document_from_attributed_string(
         let resource_id = attribute_string(&attributes, &id_key);
         let alt = attribute_string(&attributes, &alt_key).unwrap_or_else(|| "图片".into());
         let has_attachment = unsafe { attributes.objectForKey_unchecked(attachment_key) }.is_some();
-        for character in text.chars() {
-            match character {
-                '\n' | '\r' => blocks.push(Vec::new()),
-                '\u{2028}' | '\u{000b}' => blocks
-                    .last_mut()
-                    .expect("document always has a block")
-                    .push(Inline::SoftBreak),
-                '\u{fffc}' if has_attachment => {
-                    let inlines = blocks.last_mut().expect("document always has a block");
-                    if let Some(resource_id) = resource_id.as_ref()
-                        && markdown_marker(resource_id, "").is_ok()
-                    {
-                        inlines.push(Inline::Image {
-                            resource_id: resource_id.to_string(),
-                            alt: alt.clone(),
-                        });
-                    } else {
-                        append_document_text(inlines, "[图片]", &marks);
+        if let Some((resource_id, alt)) = missing_resource_marker(&attributes, &text) {
+            blocks
+                .last_mut()
+                .expect("document always has a block")
+                .push(Inline::Image { resource_id, alt });
+        } else {
+            for character in text.chars() {
+                match character {
+                    '\n' | '\r' => blocks.push(Vec::new()),
+                    '\u{2028}' | '\u{000b}' => blocks
+                        .last_mut()
+                        .expect("document always has a block")
+                        .push(Inline::SoftBreak),
+                    '\u{fffc}' if has_attachment => {
+                        let inlines = blocks.last_mut().expect("document always has a block");
+                        if let Some(resource_id) = resource_id.as_ref()
+                            && markdown_marker(resource_id, "").is_ok()
+                        {
+                            inlines.push(Inline::Image {
+                                resource_id: resource_id.to_string(),
+                                alt: alt.clone(),
+                            });
+                        } else {
+                            append_document_text(inlines, "[图片]", &marks);
+                        }
                     }
+                    _ => append_document_text(
+                        blocks.last_mut().expect("document always has a block"),
+                        &character.to_string(),
+                        &marks,
+                    ),
                 }
-                _ => append_document_text(
-                    blocks.last_mut().expect("document always has a block"),
-                    &character.to_string(),
-                    &marks,
-                ),
             }
         }
         let next = effective_range
@@ -273,10 +314,32 @@ where
                         output.appendAttributedString(&inline);
                     } else {
                         attachment_failures += 1;
-                        output.appendAttributedString(&attributed_text_with_marks(
-                            if alt.is_empty() { "[图片]" } else { alt },
+                        let placeholder = attributed_text_with_marks(
+                            &missing_resource_placeholder_text(alt),
                             &Marks::default(),
-                        ));
+                        );
+                        let range = NSRange::new(0, placeholder.string().length());
+                        let marker = NSString::from_str("1");
+                        let id = NSString::from_str(resource_id);
+                        let alt = NSString::from_str(alt);
+                        unsafe {
+                            placeholder.addAttribute_value_range(
+                                &missing_resource_attribute_key(),
+                                &marker,
+                                range,
+                            );
+                            placeholder.addAttribute_value_range(
+                                &resource_id_attribute_key(),
+                                &id,
+                                range,
+                            );
+                            placeholder.addAttribute_value_range(
+                                &resource_alt_attribute_key(),
+                                &alt,
+                                range,
+                            );
+                        }
+                        output.appendAttributedString(&placeholder);
                     }
                 }
             }
@@ -3417,6 +3480,34 @@ mod tests {
         assert_eq!(rendered.string().to_string(), "前\u{fffc}后");
         let source_ref: &NSAttributedString = &rendered;
         let round_trip = document_from_attributed_string(source_ref).unwrap();
+        assert_eq!(serialize_html(&round_trip), serialize_html(&document));
+    }
+
+    #[test]
+    fn missing_image_placeholder_preserves_reference_on_editor_round_trip() {
+        let document = Document::from_blocks(vec![Block::Paragraph(vec![
+            Inline::Text {
+                text: "前".into(),
+                marks: Marks::default(),
+            },
+            Inline::Image {
+                resource_id: "0123456789abcdef0123456789abcdef".into(),
+                alt: "截图".into(),
+            },
+            Inline::Image {
+                resource_id: "fedcba9876543210fedcba9876543210".into(),
+                alt: String::new(),
+            },
+            Inline::Text {
+                text: "后".into(),
+                marks: Marks::default(),
+            },
+        ])]);
+        let (rendered, failures) = render_document_to_attributed_string(&document, |_| None, 640.0);
+        assert_eq!(failures, 2);
+        assert_eq!(rendered.string().to_string(), "前[图片：截图][图片]后");
+        let source: &NSAttributedString = &rendered;
+        let round_trip = document_from_attributed_string(source).unwrap();
         assert_eq!(serialize_html(&round_trip), serialize_html(&document));
     }
 
