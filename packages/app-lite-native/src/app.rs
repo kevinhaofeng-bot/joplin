@@ -8,8 +8,9 @@ use joplin_lite_native::html_body::{
     serialize_html,
 };
 use joplin_lite_native::native_editor::{
-    InlineCommand, NativeEditorSession, apply_committed_text_delta, apply_inline_command,
-    document_from_session, insert_image_anchor, render_session, session_from_document,
+    EmptyBlockCarrier, InlineCommand, NativeEditorSession, RenderedDocument,
+    apply_committed_text_delta, apply_inline_command, delete_image_anchor, document_from_session,
+    insert_image_anchor, render_session, session_from_document,
 };
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
@@ -29,13 +30,13 @@ use objc2_app_kit::{
     NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontTraitMask,
     NSForegroundColorAttributeName, NSImage, NSKernAttributeName, NSLayoutAttribute,
     NSLineBreakMode, NSMenu, NSMenuItem, NSMutableAttributedStringAppKitAdditions,
-    NSMutableParagraphStyle, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
-    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSStackView,
-    NSStackViewDistribution, NSStrikethroughStyleAttributeName, NSStrokeColorAttributeName,
-    NSStrokeWidthAttributeName, NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField,
-    NSTextFieldDelegate, NSTextInputClient, NSTextView, NSTextViewDelegate, NSUnderlineStyle,
-    NSUnderlineStyleAttributeName, NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSMutableParagraphStyle, NSParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
+    NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder, NSScrollView,
+    NSSearchField, NSStackView, NSStackViewDistribution, NSStrikethroughStyleAttributeName,
+    NSStrokeColorAttributeName, NSStrokeWidthAttributeName, NSTextAlignment, NSTextAttachment,
+    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextView,
+    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
+    NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
@@ -88,6 +89,103 @@ fn paste_route(body_is_first_responder: bool, has_current_note: bool) -> PasteRo
 
 fn should_sync_editor_change(has_marked_text: bool, loading_guard: bool) -> bool {
     !has_marked_text && !loading_guard
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorTextSyncDecision {
+    Noop,
+    Reject,
+    DeleteImage,
+    ApplyDelta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorSessionSyncResult {
+    Noop,
+    Applied,
+    Rejected,
+}
+
+fn should_persist_after_editor_sync(result: EditorSessionSyncResult) -> bool {
+    matches!(
+        result,
+        EditorSessionSyncResult::Noop | EditorSessionSyncResult::Applied
+    )
+}
+
+fn classify_editor_text_change(old_text: &str, new_text: &str) -> EditorTextSyncDecision {
+    if old_text == new_text {
+        return EditorTextSyncDecision::Noop;
+    }
+    let old_chars: Vec<char> = old_text.chars().collect();
+    let new_chars: Vec<char> = new_text.chars().collect();
+    let mut prefix = 0usize;
+    while prefix < old_chars.len()
+        && prefix < new_chars.len()
+        && old_chars[prefix] == new_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < old_chars.len().saturating_sub(prefix)
+        && suffix < new_chars.len().saturating_sub(prefix)
+        && old_chars[old_chars.len() - suffix - 1] == new_chars[new_chars.len() - suffix - 1]
+    {
+        suffix += 1;
+    }
+    let old_end = old_chars.len() - suffix;
+    let new_end = new_chars.len() - suffix;
+    let removed = &old_chars[prefix..old_end];
+    let replacement = &new_chars[prefix..new_end];
+    if removed == ['\u{fffc}'] && replacement.is_empty() {
+        EditorTextSyncDecision::DeleteImage
+    } else if replacement.contains(&'\u{fffc}') || removed.contains(&'\u{fffc}') {
+        EditorTextSyncDecision::Reject
+    } else {
+        EditorTextSyncDecision::ApplyDelta
+    }
+}
+
+fn editor_text_delta(old_text: &str, new_text: &str) -> Option<(NSRange, String)> {
+    let old_chars: Vec<char> = old_text.chars().collect();
+    let new_chars: Vec<char> = new_text.chars().collect();
+    let mut prefix = 0usize;
+    while prefix < old_chars.len()
+        && prefix < new_chars.len()
+        && old_chars[prefix] == new_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < old_chars.len().saturating_sub(prefix)
+        && suffix < new_chars.len().saturating_sub(prefix)
+        && old_chars[old_chars.len() - suffix - 1] == new_chars[new_chars.len() - suffix - 1]
+    {
+        suffix += 1;
+    }
+    let replacement: String = new_chars[prefix..new_chars.len() - suffix].iter().collect();
+    let location = old_chars[..prefix]
+        .iter()
+        .map(|character| character.len_utf16())
+        .sum();
+    let length = old_chars[prefix..old_chars.len() - suffix]
+        .iter()
+        .map(|character| character.len_utf16())
+        .sum();
+    Some((NSRange::new(location, length), replacement))
+}
+
+fn exact_empty_block_carrier(
+    rendered: &RenderedDocument,
+    selection: NSRange,
+) -> Option<&EmptyBlockCarrier> {
+    if selection.length != 0 {
+        return None;
+    }
+    rendered
+        .empty_block_carriers
+        .iter()
+        .find(|carrier| carrier.addressable_offset == selection.location)
 }
 
 fn resource_id_attribute_key() -> Retained<NSAttributedStringKey> {
@@ -1310,8 +1408,12 @@ define_class!(
             if !should_sync_editor_change(body.hasMarkedText(), loading_guard) {
                 return;
             }
-            self.sync_editor_session_from_view();
-            self.save_current_note();
+            let sync_result = self.sync_editor_session_from_view();
+            if should_persist_after_editor_sync(sync_result) {
+                self.save_current_note();
+            } else {
+                self.set_save_status("正文变更未保存，请重试", true);
+            }
         }
     }
     unsafe impl NSTextFieldDelegate for AppDelegate {}
@@ -1463,6 +1565,57 @@ define_class!(
 );
 
 impl AppDelegate {
+    fn install_rendered_document(
+        &self,
+        body: &NSTextView,
+        rendered: &RenderedDocument,
+        selection: NSRange,
+    ) {
+        if let Some(storage) = unsafe { body.textStorage() } {
+            storage.setAttributedString(&rendered.attributed);
+        }
+        let max_length = rendered.attributed.string().length();
+        let location = selection.location.min(max_length);
+        let length = selection.length.min(max_length.saturating_sub(location));
+        let exact_empty_carrier =
+            exact_empty_block_carrier(rendered, NSRange::new(location, length));
+        if let Some(carrier) = exact_empty_carrier {
+            body.setDefaultParagraphStyle(Some(&carrier.paragraph));
+            let typing = body.typingAttributes();
+            let mutable = typing.mutableCopy();
+            unsafe {
+                mutable.insert(NSParagraphStyleAttributeName, &carrier.paragraph);
+                body.setTypingAttributes(&mutable);
+            }
+        } else {
+            let paragraph = if max_length > 0 {
+                let probe = location.min(max_length - 1);
+                let source: &NSAttributedString = &rendered.attributed;
+                unsafe {
+                    source
+                        .attribute_atIndex_effectiveRange(
+                            NSParagraphStyleAttributeName,
+                            probe,
+                            null_mut(),
+                        )
+                        .and_then(|value| value.downcast::<NSParagraphStyle>().ok())
+                }
+            } else {
+                None
+            };
+            if let Some(paragraph) = paragraph {
+                body.setDefaultParagraphStyle(Some(&paragraph));
+                let typing = body.typingAttributes();
+                let mutable = typing.mutableCopy();
+                unsafe {
+                    mutable.insert(NSParagraphStyleAttributeName, &paragraph);
+                    body.setTypingAttributes(&mutable);
+                }
+            }
+        }
+        body.setSelectedRange(NSRange::new(location, length));
+    }
+
     fn refresh_body_from_session(&self) {
         let Some(body) = self.ivars().body_view.get() else {
             return;
@@ -1488,13 +1641,7 @@ impl AppDelegate {
         let failures = rendered.missing_resources;
         let previous_loading_guard = *self.ivars().loading_guard.borrow();
         *self.ivars().loading_guard.borrow_mut() = true;
-        if let Some(storage) = unsafe { body.textStorage() } {
-            storage.setAttributedString(&rendered.attributed);
-        }
-        let max_length = rendered.attributed.string().length();
-        let location = selection.location.min(max_length);
-        let length = selection.length.min(max_length.saturating_sub(location));
-        body.setSelectedRange(NSRange::new(location, length));
+        self.install_rendered_document(body, &rendered, selection);
         *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
         if failures == 0 {
             self.set_save_status("已保存", false);
@@ -1514,67 +1661,54 @@ impl AppDelegate {
     }
 
     #[allow(deprecated)]
-    fn sync_editor_session_from_view(&self) {
+    fn sync_editor_session_from_view(&self) -> EditorSessionSyncResult {
         if *self.ivars().loading_guard.borrow() {
-            return;
+            return EditorSessionSyncResult::Noop;
         }
         let Some(body) = self.ivars().body_view.get() else {
-            return;
+            return EditorSessionSyncResult::Rejected;
         };
         if body.hasMarkedText() {
-            return;
+            return EditorSessionSyncResult::Noop;
         }
         let Some(storage) = (unsafe { body.textStorage() }) else {
-            return;
+            return EditorSessionSyncResult::Rejected;
         };
         let source: &NSAttributedString = &storage;
         let new_text = source.string().to_string();
         if let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
             && let Ok(old_text) = session.text_document().to_addressable_text()
-            && old_text != new_text
         {
-            let old_chars: Vec<char> = old_text.chars().collect();
-            let new_chars: Vec<char> = new_text.chars().collect();
-            let mut prefix = 0usize;
-            while prefix < old_chars.len()
-                && prefix < new_chars.len()
-                && old_chars[prefix] == new_chars[prefix]
-            {
-                prefix += 1;
-            }
-            let mut suffix = 0usize;
-            while suffix < old_chars.len().saturating_sub(prefix)
-                && suffix < new_chars.len().saturating_sub(prefix)
-                && old_chars[old_chars.len() - suffix - 1]
-                    == new_chars[new_chars.len() - suffix - 1]
-            {
-                suffix += 1;
-            }
-            let replacement: String = new_chars[prefix..new_chars.len() - suffix].iter().collect();
-            let location = old_chars[..prefix]
-                .iter()
-                .map(|character| character.len_utf16())
-                .sum();
-            let length = old_chars[prefix..old_chars.len() - suffix]
-                .iter()
-                .map(|character| character.len_utf16())
-                .sum();
-            if !replacement.contains('\u{fffc}')
-                && apply_committed_text_delta(session, NSRange::new(location, length), &replacement)
-                    .is_ok()
-            {
-                return;
+            match classify_editor_text_change(&old_text, &new_text) {
+                EditorTextSyncDecision::Noop => return EditorSessionSyncResult::Noop,
+                EditorTextSyncDecision::Reject => return EditorSessionSyncResult::Rejected,
+                EditorTextSyncDecision::DeleteImage => {
+                    let Some((range, replacement)) = editor_text_delta(&old_text, &new_text) else {
+                        return EditorSessionSyncResult::Rejected;
+                    };
+                    if !replacement.is_empty() || delete_image_anchor(session, range).is_err() {
+                        return EditorSessionSyncResult::Rejected;
+                    }
+                    return EditorSessionSyncResult::Applied;
+                }
+                EditorTextSyncDecision::ApplyDelta => {
+                    let Some((range, replacement)) = editor_text_delta(&old_text, &new_text) else {
+                        return EditorSessionSyncResult::Rejected;
+                    };
+                    if apply_committed_text_delta(session, range, &replacement).is_ok() {
+                        return EditorSessionSyncResult::Applied;
+                    }
+                    // A live delta that cannot be applied semantically is
+                    // fail-closed. Never flatten attributed presentation back
+                    // into the canonical model.
+                    return EditorSessionSyncResult::Rejected;
+                }
             }
         }
-        // A projection-only edit (for example an attachment import) has no
-        // text delta. Rebuild only as a guarded compatibility fallback; the
-        // normal typing path above keeps the live semantic model and its list
-        // / heading / image anchors intact.
-        if let Ok(document) = document_from_attributed_string(source)
-            && let Ok(session) = session_from_document(&document)
-        {
-            *self.ivars().editor_session.borrow_mut() = Some(session);
-        }
+        // No session or no semantically safe delta: fail closed. The legacy
+        // attributed-string decoder is intentionally limited to migration and
+        // tests; it is never a live writeback path.
+        EditorSessionSyncResult::Rejected
     }
 
     #[allow(deprecated)]
@@ -2593,9 +2727,7 @@ impl AppDelegate {
                         },
                         text_container_available_width(body),
                     );
-                    if let Some(storage) = unsafe { body.textStorage() } {
-                        storage.setAttributedString(&rendered.attributed);
-                    }
+                    self.install_rendered_document(body, &rendered, NSRange::new(0, 0));
                     *self.ivars().editor_session.borrow_mut() = Some(session);
                     if rendered.missing_resources == 0 {
                         ("已保存", false)
@@ -2616,7 +2748,6 @@ impl AppDelegate {
                 ("正文无法读取", true)
             }
         };
-        body.setSelectedRange(NSRange::new(0, 0));
         *self.ivars().loading_guard.borrow_mut() = false;
         self.set_save_status(status, is_error);
         self.update_editor_visibility();
@@ -3436,8 +3567,9 @@ mod tests {
     use objc2::{AnyThread, runtime::AnyObject};
     use objc2_app_kit::{
         NSAttributedStringAttachmentConveniences, NSBitmapImageFileType, NSBitmapImageRep,
-        NSFontAttributeName, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
-        NSPasteboardTypeTIFF, NSTextAttachment, NSUnderlineStyle, NSUnderlineStyleAttributeName,
+        NSFontAttributeName, NSMutableParagraphStyle, NSPasteboard, NSPasteboardTypeFileURL,
+        NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSTextAttachment, NSUnderlineStyle,
+        NSUnderlineStyleAttributeName,
     };
     use objc2_foundation::{
         NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSSize,
@@ -3500,6 +3632,58 @@ mod tests {
         assert!(!super::should_sync_editor_change(true, true));
         assert!(!super::should_sync_editor_change(false, true));
         assert!(super::should_sync_editor_change(false, false));
+    }
+
+    #[test]
+    fn semantic_sync_equal_text_is_noop_and_attachment_sentinel_is_rejected() {
+        assert_eq!(
+            super::classify_editor_text_change("same", "same"),
+            super::EditorTextSyncDecision::Noop
+        );
+        assert_eq!(
+            super::classify_editor_text_change("same", "\u{fffc}"),
+            super::EditorTextSyncDecision::Reject
+        );
+        assert_eq!(
+            super::classify_editor_text_change("a\u{fffc}b", "ab"),
+            super::EditorTextSyncDecision::DeleteImage
+        );
+        assert_eq!(
+            super::classify_editor_text_change("a\u{fffc}b", "a\u{fffc}Xb"),
+            super::EditorTextSyncDecision::ApplyDelta
+        );
+        assert_eq!(
+            super::classify_editor_text_change("ab", "a\u{fffc}b"),
+            super::EditorTextSyncDecision::Reject
+        );
+    }
+
+    #[test]
+    fn empty_carrier_install_decision_requires_collapsed_exact_caret() {
+        let rendered = super::RenderedDocument {
+            attributed: NSMutableAttributedString::from_nsstring(&NSString::from_str("")),
+            missing_resources: 0,
+            empty_block_carriers: vec![super::EmptyBlockCarrier {
+                addressable_offset: 0,
+                paragraph: NSMutableParagraphStyle::new(),
+            }],
+        };
+        assert!(super::exact_empty_block_carrier(&rendered, NSRange::new(0, 0)).is_some());
+        assert!(super::exact_empty_block_carrier(&rendered, NSRange::new(0, 1)).is_none());
+        assert!(super::exact_empty_block_carrier(&rendered, NSRange::new(1, 0)).is_none());
+    }
+
+    #[test]
+    fn rejected_live_sync_never_enters_save_path() {
+        assert!(super::should_persist_after_editor_sync(
+            super::EditorSessionSyncResult::Noop
+        ));
+        assert!(super::should_persist_after_editor_sync(
+            super::EditorSessionSyncResult::Applied
+        ));
+        assert!(!super::should_persist_after_editor_sync(
+            super::EditorSessionSyncResult::Rejected
+        ));
     }
 
     #[test]

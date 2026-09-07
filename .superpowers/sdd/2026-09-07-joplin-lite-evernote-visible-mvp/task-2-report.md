@@ -168,3 +168,85 @@ passed
   marked text.
 - No `TextDocument::to_html()` call, WebKit path, GUI launch, or image
   bytes/base64 insertion into the semantic text model was added.
+
+## Fix 1 second-round review: RED/GREEN evidence (2026-09-07)
+
+### RED: four Important findings reproduced before the second-round fixes
+
+The new regressions were first run against the inherited product code (the
+review document and research notes were not changed):
+
+```text
+cargo test --lib native_editor::tests::renderer_reuses_ordered_list_and_keeps_empty_list_carrier_without_text -- --exact
+FAILED: first and second ordered paragraphs had different NSTextList pointers
+
+cargo test --lib native_editor::tests::list_indent_commands_round_trip_through_list_format -- --exact
+FAILED: list indent after IncreaseIndent was 0, expected 1
+
+cargo test --bin joplin-lite-native app::tests::semantic_sync_equal_text_is_noop_and_attachment_sentinel_is_rejected -- --exact
+FAILED: equal text classified as Rebuild, expected Noop
+
+cargo test --lib native_editor::tests::second_round_history_is_empty_on_load_and_one_record_per_mixed_command -- --exact
+FAILED before the fix at the load-history assertion: construction formatting
+left an undoable entry.
+```
+
+The RED probes also cover the newly discovered attachment boundary: a lone
+removed U+FFFC is routed to an explicit image-anchor delete, while an inserted
+or mixed attachment sentinel remains rejected. A committed image-delete test
+was added before the final GREEN run and verifies canonical removal plus undo
+restoration.
+
+### GREEN: focused and locked gates
+
+```text
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml native_editor::tests:: -- --nocapture
+14 passed; 0 failed
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml app::tests:: -- --nocapture
+35 passed; 0 failed
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml
+75 library tests + 35 app tests + 7 lifecycle tests passed
+
+cargo fmt --manifest-path packages/app-lite-native/Cargo.toml -- --check
+passed
+
+cargo clippy --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --all-targets -- -D warnings
+passed
+
+git diff --check
+passed
+```
+
+### Second-round design and scope
+
+- `NativeEditorSession` keeps `TextDocument` as the sole incremental history
+  owner. Construction calls `clear_undo_redo()` and applies a 200-entry undo
+  limit. Every visible semantic command starts with `break_undo_merge()` and
+  `begin_edit_block()`, then ends with `end_edit_block()` and a sealed merge;
+  the bounded highlight sidecar records the matching pre-command range state,
+  so mixed text/highlight/list commands undo and redo in order without an
+  unbounded full-document snapshot stack. Highlight-only commands also merge a
+  real background-color format operation so they have a native model undo
+  entry; transparent background is treated as not highlighted on readback.
+- Live `textDidChange` now has an explicit Noop/Applied/Rejected result. Equal
+  text is a no-op; an ordinary safe delta uses the semantic text command; a
+  failed delta is fail-closed and never invokes the legacy attributed-string
+  decoder. A lone removed U+FFFC calls `delete_image_anchor`, an explicit
+  resource-aware semantic operation whose canonical model removal is undoable;
+  inserted or mixed attachment sentinels are rejected. Rejected syncs do not
+  enter `save_current_note()` and leave an error status for retry.
+- Renderer list projection reuses one `NSTextList` instance for each
+  consecutive compatible list run; the headless ordered probe observes marker
+  1 and 2 from the shared list. Underlying text remains exactly addressable
+  text. Middle empty blocks apply their paragraph/list style to their native
+  newline carrier. A true zero-character terminal/solo block exposes an
+  `EmptyBlockCarrier` sidecar; shared `install_rendered_document` consumption
+  in both load and refresh applies it only for a collapsed caret at the exact
+  carrier offset via `defaultParagraphStyle` and `typingAttributes`, without
+  adding a fake canonical character.
+- Paragraph alignment/indent commands keep block format semantics, while list
+  indent changes use `ListFormat`; increase/decrease survives
+  `document_from_session` and session reload.

@@ -93,6 +93,8 @@ pub struct NativeEditorSession {
     highlight_redo: Vec<Vec<(usize, usize)>>,
 }
 
+const MAX_EDITOR_UNDO_ENTRIES: usize = 200;
+
 static EDITOR_BACKEND: OnceLock<text_document::DocumentBackend> = OnceLock::new();
 
 fn editor_backend() -> text_document::DocumentBackend {
@@ -142,9 +144,22 @@ impl NativeEditorSession {
         Ok(())
     }
 
-    fn checkpoint_highlights(&mut self) {
+    fn begin_command(&mut self) -> TextCursor {
+        self.text.break_undo_merge();
+        let cursor = self.text.cursor_at(0);
+        cursor.begin_edit_block();
+        if self.highlight_undo.len() >= MAX_EDITOR_UNDO_ENTRIES {
+            self.highlight_undo.remove(0);
+        }
         self.highlight_undo.push(self.highlighted_ranges.clone());
         self.highlight_redo.clear();
+        cursor
+    }
+
+    fn finish_command(&mut self, cursor: TextCursor) {
+        cursor.end_edit_block();
+        self.text.break_undo_merge();
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn is_highlighted(&self, position: usize) -> bool {
@@ -154,9 +169,32 @@ impl NativeEditorSession {
     }
 }
 
+fn run_edit_command<T, F>(
+    session: &mut NativeEditorSession,
+    action: F,
+) -> Result<T, EditorCodecError>
+where
+    F: FnOnce(&mut NativeEditorSession) -> Result<T, EditorCodecError>,
+{
+    let command_cursor = session.begin_command();
+    let result = action(session);
+    session.finish_command(command_cursor);
+    result
+}
+
 pub struct RenderedDocument {
     pub attributed: Retained<NSMutableAttributedString>,
     pub missing_resources: usize,
+    pub empty_block_carriers: Vec<EmptyBlockCarrier>,
+}
+
+/// Projection metadata for a semantic block with no addressable characters.
+/// TextKit cannot attach a paragraph attribute to a zero-length range, so the
+/// renderer keeps the native paragraph/list carrier beside the attributed
+/// string. It is display-only and is never decoded back into the model.
+pub struct EmptyBlockCarrier {
+    pub addressable_offset: usize,
+    pub paragraph: Retained<NSMutableParagraphStyle>,
 }
 
 fn model_error(error: impl std::fmt::Display) -> EditorCodecError {
@@ -339,6 +377,11 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
         }
     }
 
+    // Formatting and object-anchor setup above is construction, not user
+    // editing. Never expose it as undoable history.
+    model.clear_undo_redo();
+    model.set_undo_limit(Some(MAX_EDITOR_UNDO_ENTRIES));
+
     Ok(NativeEditorSession {
         _backend: backend,
         text: model,
@@ -457,7 +500,7 @@ fn marks_from_format(format: &TextFormat) -> Marks {
         italic: format.font_italic == Some(true),
         underline: format.font_underline == Some(true),
         strikethrough: format.font_strikeout == Some(true),
-        highlight: format.background_color.is_some(),
+        highlight: format.background_color.is_some_and(|color| color.alpha > 0),
         link: format.anchor_href.clone(),
     }
 }
@@ -609,6 +652,9 @@ fn utf16_range(text: &str, range: NSRange) -> Result<(usize, usize), EditorCodec
             end_scalar = Some(scalar + 1);
         }
     }
+    if start_scalar.is_none() && range.location == offset {
+        start_scalar = Some(text.chars().count());
+    }
     if end == offset {
         end_scalar = Some(text.chars().count());
     }
@@ -696,18 +742,18 @@ pub fn apply_committed_text_delta(
     }
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, range)?;
-    session.checkpoint_highlights();
-    let cursor = session.text.cursor_at(start);
-    cursor.set_position(end, MoveMode::KeepAnchor);
-    cursor.insert_text(replacement).map_err(model_error)?;
-    adjust_highlight_ranges(
-        &mut session.highlighted_ranges,
-        start,
-        end,
-        replacement.chars().count(),
-    );
-    session.revision = session.revision.wrapping_add(1);
-    Ok(())
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        cursor.insert_text(replacement).map_err(model_error)?;
+        adjust_highlight_ranges(
+            &mut session.highlighted_ranges,
+            start,
+            end,
+            replacement.chars().count(),
+        );
+        Ok(())
+    })
 }
 
 /// Insert a resource-backed object anchor. Pixel data stays in ResourceStore;
@@ -723,18 +769,42 @@ pub fn insert_image_anchor(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
-    session.checkpoint_highlights();
-    let cursor = session.text.cursor_at(start);
-    cursor.set_position(end, MoveMode::KeepAnchor);
-    cursor
-        .insert_image(resource_id, alt, width.max(1), height.max(1))
-        .map_err(model_error)?;
-    adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 1);
-    session
-        .image_dimensions
-        .insert(resource_id.to_owned(), (width.max(1), height.max(1)));
-    session.revision = session.revision.wrapping_add(1);
-    Ok(())
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        cursor
+            .insert_image(resource_id, alt, width.max(1), height.max(1))
+            .map_err(model_error)?;
+        adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 1);
+        session
+            .image_dimensions
+            .insert(resource_id.to_owned(), (width.max(1), height.max(1)));
+        Ok(())
+    })
+}
+
+/// Remove exactly one resource-backed object anchor. Live text synchronization
+/// may call this only after proving that the changed slice is a lone U+FFFC;
+/// arbitrary attributed-string flattening is never used for image edits.
+pub fn delete_image_anchor(
+    session: &mut NativeEditorSession,
+    selection: NSRange,
+) -> Result<(), EditorCodecError> {
+    let text = session.text.to_addressable_text().map_err(model_error)?;
+    let (start, end) = utf16_range(&text, selection)?;
+    if end != start + 1 || text.chars().nth(start) != Some('\u{fffc}') {
+        return Err(EditorCodecError::Unsupported);
+    }
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        let deleted = cursor.remove_selected_text().map_err(model_error)?;
+        if deleted != "\u{fffc}" {
+            return Err(EditorCodecError::Unsupported);
+        }
+        adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 0);
+        Ok(())
+    })
 }
 
 pub fn apply_link(
@@ -749,22 +819,22 @@ pub fn apply_link(
     }
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
-    session.checkpoint_highlights();
-    let cursor = session.text.cursor_at(start);
-    cursor.set_position(end, MoveMode::KeepAnchor);
-    let format = match url {
-        Some(url) => TextFormat {
-            anchor_href: Some(url.to_owned()),
-            ..Default::default()
-        },
-        None => TextFormat {
-            clear_link: true,
-            ..Default::default()
-        },
-    };
-    cursor.merge_char_format(&format).map_err(model_error)?;
-    session.revision = session.revision.wrapping_add(1);
-    Ok(())
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        let format = match url {
+            Some(url) => TextFormat {
+                anchor_href: Some(url.to_owned()),
+                ..Default::default()
+            },
+            None => TextFormat {
+                clear_link: true,
+                ..Default::default()
+            },
+        };
+        cursor.merge_char_format(&format).map_err(model_error)?;
+        Ok(())
+    })
 }
 
 pub fn apply_inline_command(
@@ -775,55 +845,60 @@ pub fn apply_inline_command(
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
     if matches!(command, InlineCommand::Highlight) {
-        session.checkpoint_highlights();
-        toggle_highlight_range(session, start, end);
-        session.revision = session.revision.wrapping_add(1);
-        return Ok(());
+        let active = query_inline_state(session, selection, command)? == SelectionState::Active;
+        return run_edit_command(session, |session| {
+            toggle_highlight_range(session, start, end);
+            let cursor = session.text.cursor_at(start);
+            cursor.set_position(end, MoveMode::KeepAnchor);
+            cursor
+                .merge_char_format(&TextFormat {
+                    background_color: Some(if active {
+                        text_document::Color::rgba(0, 0, 0, 0)
+                    } else {
+                        text_document::Color::rgb(255, 235, 130)
+                    }),
+                    ..Default::default()
+                })
+                .map_err(model_error)
+        });
     }
-    let cursor = session.text.cursor_at(start);
-    cursor.set_position(end, MoveMode::KeepAnchor);
     let active = query_inline_state(session, selection, command)? == SelectionState::Active;
-    session.checkpoint_highlights();
-    if matches!(command, InlineCommand::Clear) {
-        clear_highlight_range(session, start, end);
-    }
-    let format = match command {
-        InlineCommand::Bold => TextFormat {
-            font_bold: Some(!active),
-            ..Default::default()
-        },
-        InlineCommand::Italic => TextFormat {
-            font_italic: Some(!active),
-            ..Default::default()
-        },
-        InlineCommand::Underline => TextFormat {
-            font_underline: Some(!active),
-            ..Default::default()
-        },
-        InlineCommand::Strikethrough => TextFormat {
-            font_strikeout: Some(!active),
-            ..Default::default()
-        },
-        InlineCommand::Highlight => TextFormat {
-            background_color: Some(if active {
-                text_document::Color::rgba(0, 0, 0, 0)
-            } else {
-                text_document::Color::rgb(255, 235, 130)
-            }),
-            ..Default::default()
-        },
-        InlineCommand::Clear => TextFormat {
-            font_bold: Some(false),
-            font_italic: Some(false),
-            font_underline: Some(false),
-            font_strikeout: Some(false),
-            clear_link: true,
-            ..Default::default()
-        },
-    };
-    cursor.merge_char_format(&format).map_err(model_error)?;
-    session.revision = session.revision.wrapping_add(1);
-    Ok(())
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        if matches!(command, InlineCommand::Clear) {
+            clear_highlight_range(session, start, end);
+        }
+        let format = match command {
+            InlineCommand::Bold => TextFormat {
+                font_bold: Some(!active),
+                ..Default::default()
+            },
+            InlineCommand::Italic => TextFormat {
+                font_italic: Some(!active),
+                ..Default::default()
+            },
+            InlineCommand::Underline => TextFormat {
+                font_underline: Some(!active),
+                ..Default::default()
+            },
+            InlineCommand::Strikethrough => TextFormat {
+                font_strikeout: Some(!active),
+                ..Default::default()
+            },
+            InlineCommand::Highlight => unreachable!(),
+            InlineCommand::Clear => TextFormat {
+                font_bold: Some(false),
+                font_italic: Some(false),
+                font_underline: Some(false),
+                font_strikeout: Some(false),
+                background_color: Some(text_document::Color::rgba(0, 0, 0, 0)),
+                clear_link: true,
+                ..Default::default()
+            },
+        };
+        cursor.merge_char_format(&format).map_err(model_error)
+    })
 }
 
 pub fn apply_block_command(
@@ -833,51 +908,51 @@ pub fn apply_block_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
-    session.checkpoint_highlights();
-    let cursor = session.text.cursor_at(start);
-    cursor.set_position(end, MoveMode::KeepAnchor);
-    match command {
-        BlockCommand::Paragraph => {
-            cursor
-                .set_block_format(&BlockFormat {
-                    heading_level: Some(0),
-                    marker: Some(MarkerType::NoMarker),
-                    ..Default::default()
-                })
-                .map_err(model_error)?;
-            remove_lists_in_selection(session, start, end)?;
-        }
-        BlockCommand::Heading(level) => {
-            let heading_level = match level {
-                HeadingLevel::One => 1,
-                HeadingLevel::Two => 2,
-                HeadingLevel::Three => 3,
-            };
-            cursor
-                .set_block_format(&BlockFormat {
-                    heading_level: Some(heading_level),
-                    ..Default::default()
-                })
-                .map_err(model_error)?;
-        }
-        BlockCommand::UnorderedList | BlockCommand::OrderedList | BlockCommand::Checklist => {
-            let style = match command {
-                BlockCommand::OrderedList => ListStyle::Decimal,
-                _ => ListStyle::Disc,
-            };
-            cursor.create_list(style).map_err(model_error)?;
-            if matches!(command, BlockCommand::Checklist) {
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        match command {
+            BlockCommand::Paragraph => {
                 cursor
                     .set_block_format(&BlockFormat {
-                        marker: Some(MarkerType::Unchecked),
+                        heading_level: Some(0),
+                        marker: Some(MarkerType::NoMarker),
+                        ..Default::default()
+                    })
+                    .map_err(model_error)?;
+                remove_lists_in_selection(session, start, end)?;
+            }
+            BlockCommand::Heading(level) => {
+                let heading_level = match level {
+                    HeadingLevel::One => 1,
+                    HeadingLevel::Two => 2,
+                    HeadingLevel::Three => 3,
+                };
+                cursor
+                    .set_block_format(&BlockFormat {
+                        heading_level: Some(heading_level),
                         ..Default::default()
                     })
                     .map_err(model_error)?;
             }
+            BlockCommand::UnorderedList | BlockCommand::OrderedList | BlockCommand::Checklist => {
+                let style = match command {
+                    BlockCommand::OrderedList => ListStyle::Decimal,
+                    _ => ListStyle::Disc,
+                };
+                cursor.create_list(style).map_err(model_error)?;
+                if matches!(command, BlockCommand::Checklist) {
+                    cursor
+                        .set_block_format(&BlockFormat {
+                            marker: Some(MarkerType::Unchecked),
+                            ..Default::default()
+                        })
+                        .map_err(model_error)?;
+                }
+            }
         }
-    }
-    session.revision = session.revision.wrapping_add(1);
-    Ok(())
+        Ok(())
+    })
 }
 
 fn remove_lists_in_selection(
@@ -915,40 +990,61 @@ pub fn apply_paragraph_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
-    session.checkpoint_highlights();
-    let cursor = session.text.cursor_at(start);
-    cursor.set_position(end, MoveMode::KeepAnchor);
-    match command {
-        ParagraphCommand::Align(alignment) => cursor.set_block_format(&BlockFormat {
-            alignment: Some(td_alignment(alignment)),
-            ..Default::default()
-        }),
-        ParagraphCommand::IncreaseIndent => {
-            let current = cursor
-                .block_format()
-                .map_err(model_error)?
-                .indent
-                .unwrap_or(0);
-            cursor.set_block_format(&BlockFormat {
-                indent: Some(current.saturating_add(1).min(8)),
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        match command {
+            ParagraphCommand::Align(alignment) => cursor.set_block_format(&BlockFormat {
+                alignment: Some(td_alignment(alignment)),
                 ..Default::default()
-            })
+            }),
+            ParagraphCommand::IncreaseIndent => {
+                if cursor.current_list().is_some() {
+                    let current = cursor
+                        .current_list()
+                        .and_then(|list| list.format().indent)
+                        .unwrap_or(0);
+                    cursor.set_current_list_format(&text_document::ListFormat {
+                        indent: Some(current.saturating_add(1).min(8)),
+                        ..Default::default()
+                    })
+                } else {
+                    let current = cursor
+                        .block_format()
+                        .map_err(model_error)?
+                        .indent
+                        .unwrap_or(0);
+                    cursor.set_block_format(&BlockFormat {
+                        indent: Some(current.saturating_add(1).min(8)),
+                        ..Default::default()
+                    })
+                }
+            }
+            ParagraphCommand::DecreaseIndent => {
+                if cursor.current_list().is_some() {
+                    let current = cursor
+                        .current_list()
+                        .and_then(|list| list.format().indent)
+                        .unwrap_or(0);
+                    cursor.set_current_list_format(&text_document::ListFormat {
+                        indent: Some(current.saturating_sub(1)),
+                        ..Default::default()
+                    })
+                } else {
+                    let current = cursor
+                        .block_format()
+                        .map_err(model_error)?
+                        .indent
+                        .unwrap_or(0);
+                    cursor.set_block_format(&BlockFormat {
+                        indent: Some(current.saturating_sub(1)),
+                        ..Default::default()
+                    })
+                }
+            }
         }
-        ParagraphCommand::DecreaseIndent => {
-            let current = cursor
-                .block_format()
-                .map_err(model_error)?
-                .indent
-                .unwrap_or(0);
-            cursor.set_block_format(&BlockFormat {
-                indent: Some(current.saturating_sub(1)),
-                ..Default::default()
-            })
-        }
-    }
-    .map_err(model_error)?;
-    session.revision = session.revision.wrapping_add(1);
-    Ok(())
+        .map_err(model_error)
+    })
 }
 
 pub fn toggle_checklist_at_utf16_location(
@@ -970,19 +1066,15 @@ pub fn toggle_checklist_at_utf16_location(
         Some(MarkerType::Unchecked) => MarkerType::Checked,
         _ => return false,
     };
-    session.checkpoint_highlights();
-    if cursor
-        .set_block_format(&BlockFormat {
-            marker: Some(marker),
-            ..Default::default()
-        })
-        .is_ok()
-    {
-        session.revision = session.revision.wrapping_add(1);
-        true
-    } else {
-        false
-    }
+    run_edit_command(session, |_session| {
+        cursor
+            .set_block_format(&BlockFormat {
+                marker: Some(marker),
+                ..Default::default()
+            })
+            .map_err(model_error)
+    })
+    .is_ok()
 }
 
 pub fn query_inline_state(
@@ -1072,26 +1164,44 @@ fn style_for_text(format: &TextFormat, heading_level: Option<u8>) -> Retained<NS
     font
 }
 
-fn list_for_snapshot(snapshot: &text_document::BlockSnapshot) -> Option<Retained<NSTextList>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeListMarker {
+    Ordered,
+    Unordered,
+    Checked,
+    Unchecked,
+}
+
+fn list_marker_for_snapshot(snapshot: &text_document::BlockSnapshot) -> Option<NativeListMarker> {
     let list = snapshot.list_info.as_ref()?;
+    Some(match snapshot.block_format.marker {
+        Some(MarkerType::Checked) => NativeListMarker::Checked,
+        Some(MarkerType::Unchecked) => NativeListMarker::Unchecked,
+        _ if matches!(list.style, ListStyle::Decimal) => NativeListMarker::Ordered,
+        _ => NativeListMarker::Unordered,
+    })
+}
+
+fn new_native_list(marker_kind: NativeListMarker) -> Retained<NSTextList> {
     let marker = unsafe {
-        match snapshot.block_format.marker {
-            Some(MarkerType::Checked) => NSTextListMarkerCheck,
-            Some(MarkerType::Unchecked) => NSTextListMarkerBox,
-            _ if matches!(list.style, ListStyle::Decimal) => NSTextListMarkerDecimal,
-            _ => NSTextListMarkerDisc,
+        match marker_kind {
+            NativeListMarker::Checked => NSTextListMarkerCheck,
+            NativeListMarker::Unchecked => NSTextListMarkerBox,
+            NativeListMarker::Ordered => NSTextListMarkerDecimal,
+            NativeListMarker::Unordered => NSTextListMarkerDisc,
         }
     };
-    Some(NSTextList::initWithMarkerFormat_options_startingItemNumber(
+    NSTextList::initWithMarkerFormat_options_startingItemNumber(
         NSTextList::alloc(),
         marker,
         NSTextListOptions::empty(),
         1,
-    ))
+    )
 }
 
 fn paragraph_style_for_snapshot(
     snapshot: &text_document::BlockSnapshot,
+    list: Option<&NSTextList>,
 ) -> Retained<NSMutableParagraphStyle> {
     let paragraph = NSMutableParagraphStyle::new();
     paragraph.setAlignment(match snapshot.block_format.alignment {
@@ -1101,9 +1211,8 @@ fn paragraph_style_for_snapshot(
         _ => NSTextAlignment::Left,
     });
     paragraph.setHeadIndent(f64::from(snapshot.block_format.indent.unwrap_or(0)) * 24.0);
-    if let Some(list) = list_for_snapshot(snapshot) {
-        let list_ref: &NSTextList = &list;
-        let lists = objc2_foundation::NSArray::<NSTextList>::from_slice(&[list_ref]);
+    if let Some(list) = list {
+        let lists = objc2_foundation::NSArray::<NSTextList>::from_slice(&[list]);
         paragraph.setTextLists(&lists);
     }
     paragraph
@@ -1247,18 +1356,57 @@ where
     let output = NSMutableAttributedString::from_nsstring(&NSString::from_str(""));
     let mut missing_resources = 0;
     let mut rendered_blocks = 0;
+    let mut active_list: Option<(NativeListMarker, Retained<NSTextList>)> = None;
+    let mut previous_paragraph: Option<Retained<NSMutableParagraphStyle>> = None;
+    let mut pending_empty_block: Option<(usize, Retained<NSMutableParagraphStyle>)> = None;
+    let mut empty_block_carriers = Vec::new();
     for element in session.text.flow() {
         let FlowElement::Block(block) = element else {
             continue;
         };
         let snapshot = block.snapshot();
+        let list = match list_marker_for_snapshot(&snapshot) {
+            Some(marker_kind)
+                if active_list
+                    .as_ref()
+                    .is_some_and(|(active_kind, _)| *active_kind == marker_kind) =>
+            {
+                active_list.as_ref().map(|(_, list)| list.clone())
+            }
+            Some(marker_kind) => {
+                let list = new_native_list(marker_kind);
+                active_list = Some((marker_kind, list.clone()));
+                Some(list)
+            }
+            None => {
+                active_list = None;
+                None
+            }
+        };
+        let paragraph = paragraph_style_for_snapshot(&snapshot, list.as_deref());
         if rendered_blocks > 0 {
-            output.appendAttributedString(&NSMutableAttributedString::from_nsstring(
-                &NSString::from_str("\n"),
-            ));
+            let separator_paragraph = pending_empty_block
+                .take()
+                .map(|(_, paragraph)| paragraph)
+                .or_else(|| previous_paragraph.clone())
+                .unwrap_or_else(|| paragraph.clone());
+            let separator = NSMutableAttributedString::from_nsstring(&NSString::from_str("\n"));
+            unsafe {
+                separator.addAttribute_value_range(
+                    NSParagraphStyleAttributeName,
+                    &separator_paragraph,
+                    NSRange::new(0, 1),
+                );
+            }
+            output.appendAttributedString(&separator);
         }
         rendered_blocks += 1;
-        let paragraph = paragraph_style_for_snapshot(&snapshot);
+        if snapshot.fragments.is_empty() {
+            pending_empty_block = Some((output.string().length(), paragraph.clone()));
+        } else {
+            pending_empty_block = None;
+        }
+        previous_paragraph = Some(paragraph.clone());
         let heading_level = snapshot
             .block_format
             .heading_level
@@ -1313,9 +1461,16 @@ where
             }
         }
     }
+    if let Some((addressable_offset, paragraph)) = pending_empty_block {
+        empty_block_carriers.push(EmptyBlockCarrier {
+            addressable_offset,
+            paragraph,
+        });
+    }
     RenderedDocument {
         attributed: output,
         missing_resources,
+        empty_block_carriers,
     }
 }
 
@@ -1446,6 +1601,8 @@ mod tests {
         );
         apply_committed_text_delta(&mut session, NSRange::new(1, 2), "猫").unwrap();
         assert_eq!(session.text.to_addressable_text().unwrap(), "A猫B");
+        apply_committed_text_delta(&mut session, NSRange::new(3, 0), "!").unwrap();
+        assert_eq!(session.text.to_addressable_text().unwrap(), "A猫B!");
     }
 
     #[test]
@@ -1682,5 +1839,248 @@ mod tests {
             .blocks
             .iter()
             .any(|block| matches!(block, Block::Paragraph { inlines, .. } if inlines.iter().any(|inline| matches!(inline, Inline::Text { marks, .. } if marks.highlight)))));
+    }
+
+    #[test]
+    fn second_round_history_is_empty_on_load_and_one_record_per_mixed_command() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "abc".into(),
+                marks: Marks::default(),
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        assert!(
+            !session.can_undo(),
+            "load must not manufacture undo history"
+        );
+
+        apply_committed_text_delta(&mut session, NSRange::new(2, 1), "!").unwrap();
+        apply_inline_command(&mut session, NSRange::new(0, 3), InlineCommand::Highlight).unwrap();
+        apply_block_command(
+            &mut session,
+            NSRange::new(0, 3),
+            BlockCommand::Heading(HeadingLevel::Two),
+        )
+        .unwrap();
+        assert!(session.can_undo());
+
+        session.undo().unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks[0],
+            Block::Paragraph { .. }
+        ));
+        session.undo().unwrap();
+        assert!(!document_from_session(&session)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Paragraph { inlines, .. } if inlines.iter().any(|inline| matches!(inline, Inline::Text { marks, .. } if marks.highlight)))));
+        session.undo().unwrap();
+        assert_eq!(
+            crate::html_body::search_text(&document_from_session(&session).unwrap()),
+            "abc"
+        );
+        assert!(!session.can_undo());
+        assert!(session.can_redo());
+    }
+
+    #[test]
+    fn renderer_reuses_ordered_list_and_keeps_empty_list_carrier_without_text() {
+        let ordered = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Ordered,
+            items: vec![
+                ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "one".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "two".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+            ],
+        }]);
+        let rendered = render_session(&session_from_document(&ordered).unwrap(), |_| None, 640.0);
+        let source: &NSAttributedString = &rendered.attributed;
+        let first = unsafe {
+            source
+                .attribute_atIndex_effectiveRange(NSParagraphStyleAttributeName, 0, null_mut())
+                .unwrap()
+                .downcast_ref::<NSParagraphStyle>()
+                .unwrap()
+                .textLists()
+                .objectAtIndex(0)
+        };
+        let second = unsafe {
+            source
+                .attribute_atIndex_effectiveRange(NSParagraphStyleAttributeName, 4, null_mut())
+                .unwrap()
+                .downcast_ref::<NSParagraphStyle>()
+                .unwrap()
+                .textLists()
+                .objectAtIndex(0)
+        };
+        assert_eq!(Retained::as_ptr(&first), Retained::as_ptr(&second));
+        assert_eq!(first.markerForItemNumber(1).to_string(), "1");
+        assert_eq!(first.markerForItemNumber(2).to_string(), "2");
+
+        let empty = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Checklist,
+            items: vec![ListItem {
+                checked: Some(false),
+                style: BlockStyle::default(),
+                inlines: Vec::new(),
+            }],
+        }]);
+        let empty_session = session_from_document(&empty).unwrap();
+        let empty_rendered = render_session(&empty_session, |_| None, 640.0);
+        assert_eq!(
+            empty_rendered.attributed.string().to_string(),
+            empty_session.text.to_addressable_text().unwrap()
+        );
+        assert_eq!(empty_rendered.attributed.string().length(), 0);
+        assert_eq!(empty_rendered.empty_block_carriers.len(), 1);
+        assert_eq!(
+            empty_rendered.empty_block_carriers[0]
+                .paragraph
+                .textLists()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn renderer_uses_newline_as_carrier_for_middle_empty_block() {
+        let document = Document::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "a".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Paragraph {
+                style: BlockStyle {
+                    indent: 2,
+                    ..BlockStyle::default()
+                },
+                inlines: Vec::new(),
+            },
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "b".into(),
+                    marks: Marks::default(),
+                }],
+            },
+        ]);
+        let session = session_from_document(&document).unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+        assert_eq!(rendered.attributed.string().to_string(), "a\n\nb");
+        assert!(rendered.empty_block_carriers.is_empty());
+        let source: &NSAttributedString = &rendered.attributed;
+        let value = unsafe {
+            source
+                .attribute_atIndex_effectiveRange(NSParagraphStyleAttributeName, 2, null_mut())
+                .unwrap()
+        };
+        let paragraph = value.downcast_ref::<NSParagraphStyle>().unwrap();
+        assert_eq!(paragraph.headIndent(), 48.0);
+    }
+
+    #[test]
+    fn renderer_keeps_empty_paragraph_and_heading_without_fake_text() {
+        let document = Document::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: Vec::new(),
+            },
+            Block::Heading {
+                level: HeadingLevel::One,
+                style: BlockStyle::default(),
+                inlines: Vec::new(),
+            },
+        ]);
+        let session = session_from_document(&document).unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+        assert_eq!(rendered.attributed.string().to_string(), "\n");
+        assert_eq!(rendered.empty_block_carriers.len(), 1);
+        assert_eq!(rendered.empty_block_carriers[0].addressable_offset, 1);
+    }
+
+    #[test]
+    fn list_indent_commands_round_trip_through_list_format() {
+        let document = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Unordered,
+            items: vec![ListItem {
+                checked: None,
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "item".into(),
+                    marks: Marks::default(),
+                }],
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        apply_paragraph_command(
+            &mut session,
+            NSRange::new(0, 4),
+            ParagraphCommand::IncreaseIndent,
+        )
+        .unwrap();
+        let increased = document_from_session(&session).unwrap();
+        let indent = match &increased.blocks[0] {
+            Block::List { items, .. } => items[0].style.indent,
+            _ => panic!("expected list"),
+        };
+        assert_eq!(indent, 1);
+        let reloaded = session_from_document(&increased).unwrap();
+        assert_eq!(document_from_session(&reloaded).unwrap(), increased);
+        let mut reloaded = reloaded;
+        apply_paragraph_command(
+            &mut reloaded,
+            NSRange::new(0, 4),
+            ParagraphCommand::DecreaseIndent,
+        )
+        .unwrap();
+        let decreased = document_from_session(&reloaded).unwrap();
+        let indent = match &decreased.blocks[0] {
+            Block::List { items, .. } => items[0].style.indent,
+            _ => panic!("expected list"),
+        };
+        assert_eq!(indent, 0);
+    }
+
+    #[test]
+    fn explicit_image_delete_updates_canonical_model_and_undo_restores_anchor() {
+        let mut session = session_from_document(&note()).unwrap();
+        delete_image_anchor(&mut session, NSRange::new(5, 1)).unwrap();
+        assert_eq!(session.text.to_addressable_text().unwrap(), "标题😀\n item");
+        assert!(
+            !crate::html_body::resource_ids(&document_from_session(&session).unwrap())
+                .contains(&"res-1".to_string())
+        );
+        session.undo().unwrap();
+        assert_eq!(
+            session.text.to_addressable_text().unwrap(),
+            "标题😀\n\u{fffc} item"
+        );
+        assert!(matches!(
+            &document_from_session(&session).unwrap().blocks[1],
+            Block::List { items, .. }
+                if items.iter().any(|item| item.inlines.iter().any(|inline| matches!(
+                    inline,
+                    Inline::Image { resource_id, .. } if resource_id == "res-1"
+                )))
+        ));
     }
 }
