@@ -7,13 +7,15 @@ use joplin_lite_native::html_body::{
     Alignment, Block, Document, HtmlBodyError, Inline, Marks, parse_html, resource_ids,
     search_text, serialize_html,
 };
+#[cfg(test)]
+use joplin_lite_native::native_editor::LinkSelectionState;
 use joplin_lite_native::native_editor::{
     BlockCommand, EmptyBlockCarrier, InlineCommand, NativeEditorSession, ParagraphCommand,
     RenderedAttachment, RenderedDocument, SelectionState, apply_block_command,
     apply_committed_text_delta, apply_inline_command, apply_link, apply_paragraph_command,
     delete_image_anchor_if_identity, document_from_session, insert_image_anchor, query_block_state,
-    query_clear_state, query_inline_state, query_paragraph_command_state, render_session,
-    session_from_document,
+    query_clear_state, query_inline_state, query_link_selection, query_paragraph_command_state,
+    render_session, session_from_document,
 };
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
@@ -1223,7 +1225,7 @@ fn semantic_action_presentation(
         kind,
         label: compact_toolbar_label(action),
         state: SelectionState::Inactive,
-        enabled: has_note,
+        enabled: has_note && session.is_some(),
     };
     if !has_note {
         return presentation;
@@ -1268,10 +1270,14 @@ fn semantic_action_presentation(
         EditorAction::OrderedList => presentation.state = block_state(BlockCommand::OrderedList),
         EditorAction::Checklist => presentation.state = block_state(BlockCommand::Checklist),
         EditorAction::Link => {
-            presentation.enabled = selection.length > 0
-                && session.is_some_and(|session| {
-                    query_inline_state(session, selection, InlineCommand::Bold).is_ok()
-                });
+            if let Some(link_selection) =
+                session.and_then(|session| query_link_selection(session, selection).ok())
+            {
+                presentation.state = link_selection.state;
+                presentation.enabled = link_selection.has_linkable_text;
+            } else {
+                presentation.enabled = false;
+            }
         }
         EditorAction::AlignLeft => {
             presentation.state = paragraph_state(ParagraphCommand::Align(Alignment::Left));
@@ -1302,6 +1308,18 @@ fn semantic_action_presentation(
         EditorAction::InsertImage | EditorAction::More => {}
     }
     presentation
+}
+
+fn more_has_enabled_child(
+    actions: &[EditorAction],
+    has_note: bool,
+    session: Option<&NativeEditorSession>,
+    selection: NSRange,
+) -> bool {
+    !actions.is_empty()
+        && actions.iter().any(|action| {
+            semantic_action_presentation(*action, has_note, session, selection).enabled
+        })
 }
 
 fn toolbar_actions_for_width(width: f64) -> Vec<EditorAction> {
@@ -1343,19 +1361,39 @@ fn should_sync_caret_context(
     !selection_sync_guard && !loading_guard && !body_marked && !pending_composition
 }
 
-fn autosave_timer_should_reschedule(
-    state: &AutosaveState,
-    note_id: &str,
-    epoch: u64,
-    generation: u64,
-    marked_text: bool,
+fn should_sync_caret_context_after_delegate(
+    selection_sync_guard: bool,
+    loading_guard: bool,
+    body_marked: bool,
+    pending_intent: bool,
+    pending_composition: bool,
 ) -> bool {
-    marked_text
-        && state.note_id.as_deref() == Some(note_id)
-        && state.epoch == epoch
-        && state.scheduled_epoch == Some(epoch)
-        && state.scheduled_generation == Some(generation)
-        && state.dirty
+    should_sync_caret_context(
+        selection_sync_guard,
+        loading_guard,
+        body_marked,
+        pending_composition,
+    ) && !pending_intent
+}
+
+fn sync_caret_after_editor_event(
+    session: &mut NativeEditorSession,
+    result: EditorSessionSyncResult,
+    selection: NSRange,
+    body_marked: bool,
+    loading_guard: bool,
+) {
+    if matches!(
+        result,
+        EditorSessionSyncResult::Noop | EditorSessionSyncResult::Applied
+    ) && should_sync_caret_context(false, loading_guard, body_marked, false)
+    {
+        session.sync_caret_context(selection);
+    }
+}
+
+fn autosave_timer_defer_allowed(marked_text: bool, loading_guard: bool) -> bool {
+    marked_text && !loading_guard
 }
 
 fn compact_toolbar_label(action: EditorAction) -> &'static str {
@@ -1436,6 +1474,8 @@ struct AutosaveState {
     generation: u64,
     scheduled_generation: Option<u64>,
     scheduled_epoch: Option<u64>,
+    deferred_generation: Option<u64>,
+    deferred_epoch: Option<u64>,
     retry_generation: Option<u64>,
     retry_epoch: Option<u64>,
     retry_attempt: u8,
@@ -1457,6 +1497,8 @@ impl AutosaveState {
             generation: 0,
             scheduled_generation: None,
             scheduled_epoch: None,
+            deferred_generation: None,
+            deferred_epoch: None,
             retry_generation: None,
             retry_epoch: None,
             retry_attempt: 0,
@@ -1475,6 +1517,8 @@ impl AutosaveState {
             generation: 0,
             scheduled_generation: None,
             scheduled_epoch: None,
+            deferred_generation: None,
+            deferred_epoch: None,
             retry_generation: None,
             retry_epoch: None,
             retry_attempt: 0,
@@ -1505,6 +1549,8 @@ impl AutosaveState {
             self.dirty = false;
             self.scheduled_generation = None;
             self.scheduled_epoch = None;
+            self.deferred_generation = None;
+            self.deferred_epoch = None;
             self.retry_generation = None;
             self.retry_epoch = None;
             self.retry_attempt = 0;
@@ -1518,6 +1564,8 @@ impl AutosaveState {
         self.pending_html = html.to_owned();
         self.scheduled_generation = Some(self.generation);
         self.scheduled_epoch = Some(self.epoch);
+        self.deferred_generation = None;
+        self.deferred_epoch = None;
         self.retry_generation = None;
         self.retry_epoch = None;
         self.retry_attempt = 0;
@@ -1553,6 +1601,43 @@ impl AutosaveState {
         }
     }
 
+    fn defer_timer_with_epoch(&mut self, note_id: &str, epoch: u64, generation: u64) -> bool {
+        if self.note_id.as_deref() != Some(note_id)
+            || self.epoch != epoch
+            || self.scheduled_epoch != Some(epoch)
+            || self.scheduled_generation != Some(generation)
+            || !self.dirty
+        {
+            return false;
+        }
+        self.scheduled_generation = None;
+        self.scheduled_epoch = None;
+        self.deferred_generation = Some(generation);
+        self.deferred_epoch = Some(epoch);
+        true
+    }
+
+    fn resume_deferred_timer_with_epoch(
+        &mut self,
+        note_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> Option<u64> {
+        if self.note_id.as_deref() != Some(note_id)
+            || self.epoch != epoch
+            || self.deferred_epoch != Some(epoch)
+            || self.deferred_generation != Some(generation)
+            || !self.dirty
+        {
+            return None;
+        }
+        self.deferred_generation = None;
+        self.deferred_epoch = None;
+        self.scheduled_generation = Some(generation);
+        self.scheduled_epoch = Some(epoch);
+        Some(generation)
+    }
+
     fn flush_decision(&self, note_id: &str) -> AutosaveDecision {
         if self.note_id.as_deref() != Some(note_id) || !self.is_dirty() {
             return AutosaveDecision::Noop;
@@ -1572,6 +1657,8 @@ impl AutosaveState {
         self.persisted_html = self.pending_html.clone();
         self.scheduled_generation = None;
         self.scheduled_epoch = None;
+        self.deferred_generation = None;
+        self.deferred_epoch = None;
         self.retry_generation = None;
         self.retry_epoch = None;
         self.retry_attempt = 0;
@@ -1588,6 +1675,8 @@ impl AutosaveState {
             if self.retry_attempt >= AUTOSAVE_MAX_RETRIES {
                 self.scheduled_generation = None;
                 self.scheduled_epoch = None;
+                self.deferred_generation = None;
+                self.deferred_epoch = None;
                 self.retry_generation = None;
                 self.retry_epoch = None;
                 self.dirty = true;
@@ -1595,6 +1684,8 @@ impl AutosaveState {
             }
             self.scheduled_generation = None;
             self.scheduled_epoch = None;
+            self.deferred_generation = None;
+            self.deferred_epoch = None;
             self.retry_generation = Some(generation);
             self.retry_epoch = Some(epoch);
             self.retry_attempt = self.retry_attempt.saturating_add(1);
@@ -2623,6 +2714,7 @@ define_class!(
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, _notification: &NSNotification) {
             self.mark_current_note_dirty();
+            self.resume_deferred_autosave_if_ready();
         }
     }
     unsafe impl NSTextDelegate for AppDelegate {
@@ -2652,10 +2744,21 @@ define_class!(
                 return;
             }
             let sync_result = self.sync_editor_session_from_view();
+            let selection = body.selectedRange();
+            if let Some(session) = self.ivars().editor_session.borrow_mut().as_mut() {
+                sync_caret_after_editor_event(
+                    session,
+                    sync_result,
+                    selection,
+                    body.hasMarkedText(),
+                    loading_guard,
+                );
+            }
             if should_persist_after_editor_sync(sync_result) {
                 if matches!(sync_result, EditorSessionSyncResult::Applied) {
                     self.mark_current_note_dirty();
                 }
+                self.resume_deferred_autosave_if_ready();
             } else if should_restore_after_editor_sync(sync_result) {
                 self.restore_body_from_session_after_rejected_edit();
                 self.set_save_status("正文变更未保存，请重试", true);
@@ -2697,10 +2800,11 @@ define_class!(
             if let Some(body) = self.ivars().body_view.get() {
                 let selection = body.selectedRange();
                 *self.ivars().last_body_selection.borrow_mut() = selection;
-                let should_sync = should_sync_caret_context(
+                let should_sync = should_sync_caret_context_after_delegate(
                     *self.ivars().selection_sync_guard.borrow(),
                     *self.ivars().loading_guard.borrow(),
                     body.hasMarkedText(),
+                    !self.ivars().pending_editor_intents.borrow().is_empty(),
                     self.ivars().pending_editor_composition.borrow().is_some(),
                 );
                 if should_sync
@@ -2711,6 +2815,7 @@ define_class!(
             }
             self.reapply_empty_carrier_for_selection();
             self.update_formatting_buttons();
+            self.resume_deferred_autosave_if_ready();
         }
 
         #[unsafe(method(textViewDidChangeTypingAttributes:))]
@@ -2751,19 +2856,15 @@ define_class!(
                 .get()
                 .is_some_and(|body| body.hasMarkedText())
                 || self.title_field_has_marked_text();
-            if marked_text {
-                if autosave_timer_should_reschedule(
-                    &self.ivars().autosave.borrow(),
-                    &note_id,
-                    token_epoch,
-                    generation,
-                    true,
-                ) {
-                    self.schedule_autosave_after(&note_id, token_epoch, generation, 0.3);
-                }
+            let loading_guard = *self.ivars().loading_guard.borrow();
+            if autosave_timer_defer_allowed(marked_text, loading_guard) {
+                self.ivars()
+                    .autosave
+                    .borrow_mut()
+                    .defer_timer_with_epoch(&note_id, token_epoch, generation);
                 return;
             }
-            if *self.ivars().loading_guard.borrow() {
+            if loading_guard {
                 return;
             }
             let decision = self
@@ -4188,12 +4289,24 @@ impl AppDelegate {
                 .get()
                 .and_then(|window| window.contentView())
                 .map(|content| {
-                    toolbar_more_enabled_for_layout(
+                    if !toolbar_more_enabled_for_layout(
                         content.frame().size.width,
                         content.frame().size.height,
                         *self.ivars().shell_visibility.borrow(),
                         has_note,
-                    )
+                    ) {
+                        return false;
+                    }
+                    let overflow = toolbar_overflow_actions_for_width(
+                        shell_layout(
+                            content.frame().size.width,
+                            content.frame().size.height,
+                            *self.ivars().shell_visibility.borrow(),
+                        )
+                        .toolbar
+                        .width,
+                    );
+                    more_has_enabled_child(&overflow, has_note, session_guard.as_ref(), selection)
                 })
                 .unwrap_or(false);
         }
@@ -5042,6 +5155,37 @@ impl AppDelegate {
 
     fn schedule_autosave(&self, note_id: &str, epoch: u64, generation: u64) {
         self.schedule_autosave_after(note_id, epoch, generation, 0.3);
+    }
+
+    fn resume_deferred_autosave_if_ready(&self) {
+        if should_defer_persistence(
+            self.ivars()
+                .body_view
+                .get()
+                .is_some_and(|body| body.hasMarkedText()),
+            self.title_field_has_marked_text(),
+            *self.ivars().loading_guard.borrow(),
+        ) || !self.ivars().pending_editor_intents.borrow().is_empty()
+            || self.ivars().pending_editor_composition.borrow().is_some()
+        {
+            return;
+        }
+        let Some(note_id) = self.ivars().current_note_id.borrow().clone() else {
+            return;
+        };
+        let resumed = {
+            let mut autosave = self.ivars().autosave.borrow_mut();
+            let epoch = autosave.epoch;
+            let generation = autosave.deferred_generation;
+            generation
+                .and_then(|generation| {
+                    autosave.resume_deferred_timer_with_epoch(&note_id, epoch, generation)
+                })
+                .map(|generation| (epoch, generation))
+        };
+        if let Some((epoch, generation)) = resumed {
+            self.schedule_autosave(&note_id, epoch, generation);
+        }
     }
 
     fn mark_current_note_dirty(&self) {
@@ -7134,26 +7278,215 @@ mod tests {
     }
 
     #[test]
-    fn red_marked_timer_keeps_a_dirty_generation_executable() {
-        let mut state = super::AutosaveState::loaded("note-a", "标题", "<p>旧</p>");
-        assert_eq!(state.mark_dirty("note-a", "标题", "<p>新</p>"), Some(1));
-        let epoch = state.epoch;
-        assert!(super::autosave_timer_should_reschedule(
-            &state, "note-a", epoch, 1, true
+    fn red_pending_edit_selection_event_commits_then_syncs_the_real_caret() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "x".into(),
+                marks: Marks::default(),
+            }],
+        }]);
+        let mut session = super::session_from_document(&document).unwrap();
+        super::apply_inline_command(&mut session, NSRange::new(0, 0), super::InlineCommand::Bold)
+            .unwrap();
+        assert!(!super::should_sync_caret_context_after_delegate(
+            false, false, false, true, false
         ));
-        assert!(!super::autosave_timer_should_reschedule(
-            &state, "note-a", epoch, 1, false
-        ));
-        assert!(super::autosave_timer_should_reschedule(
-            &state, "note-a", epoch, 1, true
-        ));
+        super::apply_committed_text_delta(&mut session, NSRange::new(0, 0), "A").unwrap();
+        super::sync_caret_after_editor_event(
+            &mut session,
+            super::EditorSessionSyncResult::Applied,
+            NSRange::new(1, 0),
+            false,
+            false,
+        );
         assert_eq!(
-            state.timer_decision_with_epoch("note-a", epoch, 1),
-            super::AutosaveDecision::Persist {
-                generation: 1,
-                title: "标题".into(),
-                html: "<p>新</p>".into(),
+            super::query_inline_state(&session, NSRange::new(1, 0), super::InlineCommand::Bold,)
+                .unwrap(),
+            super::SelectionState::Active
+        );
+    }
+
+    #[test]
+    fn red_action_presentation_requires_a_live_session_and_enabled_more_child() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "plain".into(),
+                marks: Marks::default(),
+            }],
+        }]);
+        let session = super::session_from_document(&document).unwrap();
+        let selection = NSRange::new(0, 0);
+        assert!(
+            !super::semantic_action_presentation(
+                super::EditorAction::InsertImage,
+                true,
+                None,
+                selection,
+            )
+            .enabled
+        );
+        assert!(!super::more_has_enabled_child(
+            &[super::EditorAction::Link],
+            true,
+            Some(&session),
+            selection,
+        ));
+        assert!(super::more_has_enabled_child(
+            &[super::EditorAction::Link],
+            true,
+            Some(&session),
+            NSRange::new(0, 5),
+        ));
+        assert!(
+            !super::semantic_action_presentation(super::EditorAction::More, true, None, selection,)
+                .enabled
+        );
+    }
+
+    #[test]
+    fn red_link_presentation_uses_real_text_applicability_and_identity() {
+        let linked = |url: Option<&str>| Marks {
+            link: url.map(str::to_owned),
+            ..Default::default()
+        };
+        let plain = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "plain".into(),
+                marks: linked(None),
+            }],
+        }]);
+        let same = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "plain".into(),
+                marks: linked(Some("https://example.com")),
+            }],
+        }]);
+        let mixed = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![
+                Inline::Text {
+                    text: "plain".into(),
+                    marks: linked(Some("https://example.com")),
+                },
+                Inline::Text {
+                    text: "other".into(),
+                    marks: linked(None),
+                },
+            ],
+        }]);
+        let different = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![
+                Inline::Text {
+                    text: "one".into(),
+                    marks: linked(Some("https://example.com/a")),
+                },
+                Inline::Text {
+                    text: "two".into(),
+                    marks: linked(Some("https://example.com/b")),
+                },
+            ],
+        }]);
+        let separated = Document::from_blocks(vec![
+            Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "first".into(),
+                    marks: linked(Some("https://example.com")),
+                }],
+            },
+            Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "second".into(),
+                    marks: linked(None),
+                }],
+            },
+        ]);
+        let image = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Image {
+                resource_id: "resource".into(),
+                alt: "image".into(),
+            }],
+        }]);
+        let plain = super::session_from_document(&plain).unwrap();
+        let same = super::session_from_document(&same).unwrap();
+        let mixed = super::session_from_document(&mixed).unwrap();
+        let different = super::session_from_document(&different).unwrap();
+        let separated = super::session_from_document(&separated).unwrap();
+        let image = super::session_from_document(&image).unwrap();
+        let range = NSRange::new(0, 5);
+        assert_eq!(
+            super::query_link_selection(&plain, range).unwrap(),
+            super::LinkSelectionState {
+                state: super::SelectionState::Inactive,
+                has_linkable_text: true,
             }
         );
+        assert_eq!(
+            super::query_link_selection(&same, range).unwrap().state,
+            super::SelectionState::Active
+        );
+        assert_eq!(
+            super::query_link_selection(&mixed, NSRange::new(0, 10))
+                .unwrap()
+                .state,
+            super::SelectionState::Mixed
+        );
+        assert_eq!(
+            super::query_link_selection(&different, NSRange::new(0, 6))
+                .unwrap()
+                .state,
+            super::SelectionState::Mixed
+        );
+        assert_eq!(
+            super::query_link_selection(&separated, NSRange::new(0, 12))
+                .unwrap()
+                .state,
+            super::SelectionState::Mixed
+        );
+        assert!(
+            !super::query_link_selection(&image, NSRange::new(0, 1))
+                .unwrap()
+                .has_linkable_text
+        );
+        assert!(super::query_link_selection(&plain, NSRange::new(99, 1)).is_err());
+    }
+
+    #[test]
+    fn red_marked_timer_defers_once_and_resumes_after_noop_or_new_generation() {
+        let mut state = super::AutosaveState::loaded("note-a", "标题", "<p>旧</p>");
+        assert_eq!(state.mark_dirty("note-a", "标题", "<p>A</p>"), Some(1));
+        let epoch = state.epoch;
+        assert!(state.defer_timer_with_epoch("note-a", epoch, 1));
+        assert!(!state.defer_timer_with_epoch("note-a", epoch, 1));
+        assert_eq!(state.scheduled_generation, None);
+        assert_eq!(state.deferred_generation, Some(1));
+        assert_eq!(
+            state.resume_deferred_timer_with_epoch("note-a", epoch, 1),
+            Some(1)
+        );
+        assert_eq!(
+            state.resume_deferred_timer_with_epoch("note-a", epoch, 1),
+            None
+        );
+        assert_eq!(state.scheduled_generation, Some(1));
+        state.defer_timer_with_epoch("note-a", epoch, 1);
+        assert_eq!(state.mark_dirty("note-a", "标题", "<p>B</p>"), Some(2));
+        assert_eq!(state.deferred_generation, None);
+        assert_eq!(state.scheduled_generation, Some(2));
+        state.reset("note-b", "标题", "<p>B</p>");
+        assert!(!state.defer_timer_with_epoch("note-a", epoch, 1));
+        assert_eq!(
+            state.resume_deferred_timer_with_epoch("note-a", epoch, 1),
+            None
+        );
+        assert!(super::autosave_timer_defer_allowed(true, false));
+        assert!(!super::autosave_timer_defer_allowed(true, true));
     }
 }

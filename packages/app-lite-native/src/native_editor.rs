@@ -81,6 +81,12 @@ pub enum SelectionState {
     Mixed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSelectionState {
+    pub state: SelectionState,
+    pub has_linkable_text: bool,
+}
+
 /// The one owner of the live edit history.  AppKit's text storage is a
 /// projection and must not register a second undo manager for these edits.
 pub struct NativeEditorSession {
@@ -1743,6 +1749,68 @@ pub fn query_inline_state(
     } else {
         Ok(SelectionState::Mixed)
     }
+}
+
+pub fn query_link_selection(
+    session: &NativeEditorSession,
+    selection: NSRange,
+) -> Result<LinkSelectionState, EditorCodecError> {
+    let text = session.text.to_addressable_text().map_err(model_error)?;
+    let (start, end) = utf16_range(&text, selection)?;
+    if start == end {
+        return Ok(LinkSelectionState {
+            state: SelectionState::Inactive,
+            has_linkable_text: false,
+        });
+    }
+    let mut links = Vec::new();
+    for element in session.text.flow() {
+        let FlowElement::Block(block) = element else {
+            continue;
+        };
+        let snapshot = block.snapshot();
+        for fragment in snapshot.fragments {
+            let FragmentContent::Text {
+                offset,
+                length,
+                format,
+                ..
+            } = fragment
+            else {
+                continue;
+            };
+            let from = snapshot.position + offset;
+            let to = from + length;
+            if from < end && to > start {
+                links.push(format.anchor_href);
+            }
+        }
+    }
+    if links.is_empty() || links.iter().all(Option::is_none) {
+        return Ok(LinkSelectionState {
+            state: SelectionState::Inactive,
+            has_linkable_text: !links.is_empty(),
+        });
+    }
+    let state = if links
+        .iter()
+        .all(|link| link.is_some() && link == links.first().unwrap())
+    {
+        SelectionState::Active
+    } else {
+        SelectionState::Mixed
+    };
+    Ok(LinkSelectionState {
+        state,
+        has_linkable_text: true,
+    })
+}
+
+pub fn query_link_state(
+    session: &NativeEditorSession,
+    selection: NSRange,
+) -> Result<SelectionState, EditorCodecError> {
+    Ok(query_link_selection(session, selection)?.state)
 }
 
 fn style_for_text(format: &TextFormat, heading_level: Option<u8>) -> Retained<NSFont> {
