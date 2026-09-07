@@ -75,7 +75,9 @@ pub fn parse_html(input: &str) -> Result<Document, HtmlBodyError> {
         return Err(error);
     }
 
-    Ok(project_dom(&root))
+    let document = project_dom(&root);
+    drain_dom(root);
+    Ok(document)
 }
 
 pub fn serialize_html(document: &Document) -> String {
@@ -90,6 +92,8 @@ pub fn serialize_html(document: &Document) -> String {
                 output.push_str("<p>");
                 if inlines.is_empty() {
                     output.push_str("<br>");
+                } else if inlines.len() == 1 && matches!(inlines[0], Inline::SoftBreak) {
+                    output.push_str("<br data-joplin-lite-soft-break=\"true\">");
                 } else {
                     serialize_inlines(inlines, &mut output);
                 }
@@ -693,14 +697,112 @@ fn drain_dom(root: DomHandle) {
 
 fn project_dom(root: &DomHandle) -> Document {
     let mut projection = Projection::default();
-    project_children(root, &mut projection, Marks::default(), false);
+    let mut pending = vec![ProjectionFrame::Visit {
+        node: root.clone(),
+        marks: Marks::default(),
+        in_block: false,
+    }];
+
+    while let Some(frame) = pending.pop() {
+        match frame {
+            ProjectionFrame::FinishBlock { blocks_before } => {
+                projection.finish_block(blocks_before);
+            }
+            ProjectionFrame::Visit {
+                node,
+                marks,
+                in_block,
+            } => match &node.data {
+                DomData::Text(text) => {
+                    let text = text.borrow();
+                    projection.text(&text, &marks, in_block || has_inline_sibling_context(&node));
+                }
+                DomData::Element { name, attrs, .. } => {
+                    let tag = name.local.to_string().to_ascii_lowercase();
+                    if matches!(tag.as_str(), "script" | "style" | "head" | "title") {
+                        continue;
+                    }
+                    let children = node.children.borrow().clone();
+                    if is_block_element(&tag)
+                        || matches!(
+                            tag.as_str(),
+                            "div" | "section" | "article" | "header" | "footer"
+                        )
+                    {
+                        let blocks_before = projection.document.blocks.len();
+                        projection.begin_block();
+                        pending.push(ProjectionFrame::FinishBlock { blocks_before });
+                        for child in children.into_iter().rev() {
+                            pending.push(ProjectionFrame::Visit {
+                                node: child,
+                                marks: marks.clone(),
+                                in_block: true,
+                            });
+                        }
+                        continue;
+                    }
+                    if tag == "br" {
+                        if attribute(&attrs.borrow(), "data-joplin-lite-soft-break").as_deref()
+                            == Some("true")
+                        {
+                            projection.mark_explicit_softbreak();
+                        }
+                        projection.ensure_current().push(Inline::SoftBreak);
+                        continue;
+                    }
+                    if tag == "img" {
+                        projection.image(&attrs.borrow(), &marks);
+                        continue;
+                    }
+                    let next_marks = Marks {
+                        bold: marks.bold || matches!(tag.as_str(), "strong" | "b"),
+                        italic: marks.italic || matches!(tag.as_str(), "em" | "i"),
+                        underline: marks.underline || tag == "u",
+                    };
+                    for child in children.into_iter().rev() {
+                        pending.push(ProjectionFrame::Visit {
+                            node: child,
+                            marks: next_marks.clone(),
+                            in_block,
+                        });
+                    }
+                }
+                DomData::Document
+                | DomData::Doctype { .. }
+                | DomData::Comment(_)
+                | DomData::ProcessingInstruction { .. } => {
+                    let children = node.children.borrow().clone();
+                    for child in children.into_iter().rev() {
+                        pending.push(ProjectionFrame::Visit {
+                            node: child,
+                            marks: marks.clone(),
+                            in_block,
+                        });
+                    }
+                }
+            },
+        }
+    }
+
     projection.finish()
+}
+
+enum ProjectionFrame {
+    Visit {
+        node: DomHandle,
+        marks: Marks,
+        in_block: bool,
+    },
+    FinishBlock {
+        blocks_before: usize,
+    },
 }
 
 #[derive(Default)]
 struct Projection {
     document: Document,
     current: Option<Vec<Inline>>,
+    explicit_softbreak: bool,
 }
 
 impl Projection {
@@ -724,23 +826,31 @@ impl Projection {
     fn begin_block(&mut self) {
         self.flush();
         self.current = Some(Vec::new());
+        self.explicit_softbreak = false;
     }
 
     fn finish_block(&mut self, blocks_before: usize) {
         let Some(inlines) = self.current.take() else {
+            self.explicit_softbreak = false;
             if self.document.blocks.len() == blocks_before {
                 self.document.blocks.push(Block::Paragraph(Vec::new()));
             }
             return;
         };
         let inlines = normalize_inlines(inlines);
-        if inlines.len() == 1 && matches!(inlines[0], Inline::SoftBreak) {
+        if inlines.len() == 1 && matches!(inlines[0], Inline::SoftBreak) && !self.explicit_softbreak
+        {
             self.document.blocks.push(Block::Paragraph(Vec::new()));
         } else if !inlines.is_empty() {
             self.document.blocks.push(Block::Paragraph(inlines));
         } else if self.document.blocks.len() == blocks_before {
             self.document.blocks.push(Block::Paragraph(Vec::new()));
         }
+        self.explicit_softbreak = false;
+    }
+
+    fn mark_explicit_softbreak(&mut self) {
+        self.explicit_softbreak = true;
     }
 
     fn text(&mut self, text: &str, marks: &Marks, allow_formatting_whitespace: bool) {
@@ -808,62 +918,6 @@ impl Projection {
     }
 }
 
-fn project_children(node: &DomHandle, projection: &mut Projection, marks: Marks, in_block: bool) {
-    let children = node.children.borrow().clone();
-    for child in children {
-        project_node(&child, projection, marks.clone(), in_block);
-    }
-}
-
-fn project_node(node: &DomHandle, projection: &mut Projection, marks: Marks, in_block: bool) {
-    match &node.data {
-        DomData::Text(text) => projection.text(&text.borrow(), &marks, in_block),
-        DomData::Element { name, attrs, .. } => {
-            let tag = name.local.to_string().to_ascii_lowercase();
-            if matches!(tag.as_str(), "script" | "style" | "head" | "title") {
-                return;
-            }
-            if is_block_element(&tag) {
-                let blocks_before = projection.document.blocks.len();
-                projection.begin_block();
-                project_children(node, projection, marks, true);
-                projection.finish_block(blocks_before);
-                return;
-            }
-            if matches!(
-                tag.as_str(),
-                "div" | "section" | "article" | "header" | "footer"
-            ) {
-                let blocks_before = projection.document.blocks.len();
-                projection.begin_block();
-                project_children(node, projection, marks, true);
-                projection.finish_block(blocks_before);
-                return;
-            }
-            if tag == "br" {
-                projection.ensure_current().push(Inline::SoftBreak);
-                return;
-            }
-            if tag == "img" {
-                projection.image(&attrs.borrow(), &marks);
-                return;
-            }
-            let next_marks = Marks {
-                bold: marks.bold || matches!(tag.as_str(), "strong" | "b"),
-                italic: marks.italic || matches!(tag.as_str(), "em" | "i"),
-                underline: marks.underline || tag == "u",
-            };
-            project_children(node, projection, next_marks, in_block);
-        }
-        DomData::Document
-        | DomData::Doctype { .. }
-        | DomData::Comment(_)
-        | DomData::ProcessingInstruction { .. } => {
-            project_children(node, projection, marks, in_block);
-        }
-    }
-}
-
 fn attribute(attrs: &[Attribute], name: &str) -> Option<String> {
     attrs
         .iter()
@@ -878,6 +932,49 @@ fn is_block_element(name: &str) -> bool {
 fn is_formatting_whitespace(text: &str) -> bool {
     text.chars()
         .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n'))
+}
+
+fn has_inline_sibling_context(node: &DomHandle) -> bool {
+    let Some(parent) = DomSink::parent(node) else {
+        return false;
+    };
+    let children = parent.children.borrow();
+    let Some(index) = children.iter().position(|child| Rc::ptr_eq(child, node)) else {
+        return false;
+    };
+    let Some(previous) = index
+        .checked_sub(1)
+        .and_then(|position| children.get(position))
+    else {
+        return false;
+    };
+    let Some(next) = children.get(index + 1) else {
+        return false;
+    };
+    is_visible_inline_node(previous) && is_visible_inline_node(next)
+}
+
+fn is_visible_inline_node(node: &DomHandle) -> bool {
+    match &node.data {
+        DomData::Text(text) => !is_formatting_whitespace(&text.borrow()),
+        DomData::Element { name, .. } => {
+            let tag = name.local.to_string().to_ascii_lowercase();
+            !is_block_element(&tag)
+                && !matches!(
+                    tag.as_str(),
+                    "div"
+                        | "section"
+                        | "article"
+                        | "header"
+                        | "footer"
+                        | "script"
+                        | "style"
+                        | "head"
+                        | "title"
+                )
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1240,6 +1337,18 @@ mod tests {
                 limit: MAX_DOM_DEPTH
             })
         );
+    }
+
+    #[test]
+    fn accepted_boundary_html_survives_a_small_stack_worker() {
+        let depth = MAX_DOM_DEPTH - 2;
+        let input = format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth));
+        let worker = std::thread::Builder::new()
+            .name("html-boundary-test".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || parse_html(&input).map(|document| search_text(&document)))
+            .expect("small-stack worker should start");
+        assert_eq!(worker.join().expect("worker must not abort").unwrap(), "x");
     }
 
     #[test]
