@@ -16,7 +16,36 @@ Evernote 是业务与界面的主要原型，Byword 只补充长文写作区的�
 
 ## 选择
 
-采用纯 AppKit 增量改造：`NSTableView` 虚拟化列表、`NSTextView` 原生编辑、Rust Document 模型和 SQLite 中的规范 HTML。拒绝 WKWebView/ProseMirror 路线，因为它重新引入 WebKit 内存与焦点/剪贴板边界；也不在本轮重写成 SwiftUI/TextKit 2，因为会扩大风险且不增加用户价值。
+采用纯 AppKit 增量改造：`NSCollectionView` 虚拟化卡片、`NSTextView` 原生编辑、Rust Document 模型和 SQLite 中的规范 HTML。拒绝 WKWebView/ProseMirror 路线，因为它重新引入 WebKit 内存与焦点/剪贴板边界；也不在本轮重写成 SwiftUI/TextKit 2，因为会扩大风险且不增加用户价值。
+
+## 从 Evernote 实现中实际采用的机制
+
+本机 Evernote 11.32.5 的 `@evernote/common-editor` 源映射与只读本地 schema 显示，它没有把浏览器的富文本 DOM 直接当成笔记文件，而是使用 ProseMirror 语义树、命令事务、独立 ENML 解析/序列化器和资源记录。当前客户端还以 Yjs `internal_rteDoc` 承载实时编辑对象；SQLite 的 `Nodes_Note` 保存标题、摘要、内容散列、缩略图选择和同步状态，独立的离线正文表进入 FTS，附件表保存 MIME、大小、散列及父笔记关系。经典 ENML 仍是可读的序列化/兼容出口，但已不是当前客户端唯一的实时内部表示。我们的原生版本不复制其 Electron/React/ProseMirror/Yjs 技术栈，也不采用二进制正文，但明确复用以下架构原则：
+
+- **语义模型先于视图**：正文由块、行内标记和资源节点构成；`NSTextView` 的字体、前缀和附件只是渲染投影。保存时从语义属性还原 Document，再由唯一序列化器生成规范 HTML。
+- **命令是事务，不是直接改外观**：工具栏先查询当前选择的命令状态，再以一次编辑事务完成标题、列表、标记、对齐或缩进，形成一个清晰的撤销边界。列表按钮再次作用于同类列表时退回普通段落。
+- **显示格式与存储格式分层**：同一套 schema 分别负责编辑显示和规范 HTML；清单方框、缺图提示等视图辅助字符不进入正文。
+- **资源独立于正文**：图片正文节点只保存稳定资源标识和替代文字，二进制、MIME、散列和文件名由资源表管理。粘贴流程先持久化资源，再把资源节点作为同一编辑事务插入，失败不留下伪占位。
+- **可靠保存有两个阶段**：每次真实用户更改立即进入 dirty 状态，同时合并短时间内的连续输入；只有规范 HTML 确实变化才写库。切换笔记、关闭窗口、图片插入和格式命令前强制 flush，异步图片处理未完成时不能误报“已保存”。
+- **编辑上下文独立同步**：光标、选择、活动格式和 undo/redo 状态只在实际变化时刷新工具栏，避免每次输入重建整条工具栏。
+- **版心由布局状态计算**：编辑区按可用宽度动态计算居中版心和左右留白，窗口缩放采用短 debounce；底部保留额外滚动空间，使最后一行也能滚到视线中央。
+- **大文档只处理视口附近内容**：编辑区跟踪可见范围，卡片栏只创建可见卡片并只解码可见首图；任何全量工作都留在轻量文本/元数据层。
+
+这些是后续 Task 2–4 的实现约束，不是调研备注；若代码绕过语义 Document 直接序列化 Cocoa 富文本、把附件塞进正文二进制、或每次击键重建工具栏/列表，都视为架构回归。
+
+## Lapce/Floem 取舍
+
+Lapce 与 Floem editor-core 是本轮明确检查过的 Rust 原生编辑器参考。它们的优势是 `Rope`/`RopeDelta` 大文本增量修改、revision 与 pristine 状态、撤销分组、选择/IME、可见行布局，以及不进入正文的 phantom text。我们采用 revision/pristine、单命令单 undo group 和 projection-only 辅助内容这三项设计。
+
+但不直接依赖 Lapce/Floem editor-core：其 `Document` 事实源是纯文本 `Rope`，逐行 styling 与 phantom text 主要服务代码编辑，并不提供可持久化的标题、列表、链接、图片资源等富文本 schema。Floem 还会引入自定义 winit/wgpu 渲染和输入链，等于放弃已经可用的 AppKit 中文输入、系统文本服务、辅助功能和剪贴板集成。我们的组合保持为 Rust 语义 Document + AppKit `NSTextView` 投影；只有将来单条笔记规模证明 `NSTextStorage` 成为真实瓶颈时，才单独评估 Rope 增量存储，不以猜测替换稳定链。
+
+## Matrix Rich Text Editor 取舍
+
+Element 的 Matrix Rich Text Editor 是本轮进一步检查的 Rust 富文本参考。其核心约 2.8 万行 Rust，已经实现 UTF-16 选区、DOM range 定位、粗体/斜体/下划线/删除线、链接、嵌套有序/无序列表、缩进、回车/退格边界、菜单 action state 和撤销/重做，并为浏览器及办公软件 HTML 粘贴准备了大量回归样本。这些正是 Task 2 最容易凭直觉写错的编辑算法；实现与测试必须对照其公开行为和反例，尤其是跨节点选区、局部链接、空列表项退出、嵌套列表残余和一条命令一个历史状态。
+
+本轮不把 `wysiwyg` crate 直接作为运行时依赖，也不复制其源码。上游 README 明示项目仍处早期、次版本可能破坏 API 且可能出现崩溃；当前版本面向 Matrix 消息编辑器，没有笔记所需的图片资源节点、标题层级、清单状态、块对齐和高亮语义，直接接入会与本项目已经定义的 canonical HTML `Document` 形成第二套事实源。它采用 AGPLv3/商业双许可，虽然本项目同属开源路线，算法参考仍以 clean-room 行为对照和自行实现为界，避免无意引入额外来源义务。若未来上游稳定并补齐笔记语义，可重新评估替换内部范围变换层，而不是替换 AppKit 输入/排版层或 SQLite 正文模型。
+
+因此编辑器组合固定为：AppKit `NSTextView`/TextKit 负责系统级输入、IME、选区、拼写、无障碍和排版；Rust `Document` 负责持久语义；`html5ever` 负责 HTML5 解析；SQLite/FTS5 负责事务与索引；Matrix RTE、Lapce/Floem 和 Evernote 只提供经过验证的算法与产品机制参考。选择现成组件的标准是减少产品风险，而不是追求依赖数量。
 
 ## 信息架构
 
@@ -47,7 +76,7 @@ Evernote 是业务与界面的主要原型，Byword 只补充长文写作区的�
 - 项目符号：`<ul><li>`
 - 编号列表：`<ol><li>`
 - 清单：`<ul data-type="checklist"><li data-checked="true|false">`
-- 行内：`<strong>`、`<em>`、`<u>`、`<s>`、`<mark>`、受限本地/HTTPS `<a>`、`<br>`、本地资源 `<img>`
+- 行内：`<strong>`、`<em>`、`<u>`、`<s>`、`<mark>`、仅允许 `https://`、`http://`、`mailto:` 的 `<a>`、`<br>`、本地资源 `<img>`
 - 段落对齐与缩进使用白名单化的规范属性，不接受任意 CSS。
 
 Document 模型显式表示段落、三级标题、两类列表项和清单状态。AppKit 渲染使用语义字体与段落样式，并用应用自有属性保存块类型；保存时只提取受支持语义，不序列化字体家族、字号、任意颜色或 Cocoa 二进制对象。列表前缀和清单控件属于视图投影，不进入正文文本节点；回车延续列表，空列表项回车退出列表。

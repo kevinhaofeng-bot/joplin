@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-07-joplin-lite-visible-mvp-design.md`
 
+**Evernote implementation evidence:** The installed Evernote 11.32.5 bundle exposes source maps for `@evernote/common-editor` 183.272.12. Its relevant core is a semantic ProseMirror document, transaction-based command/query APIs, separate DOM/ENML parsers and serializers, resource nodes keyed by stable identity, immediate `contentChanged` plus a debounced settled notification, explicit flush, context-change de-thrashing, computed centered note width, and viewport-bounded work. Tasks 2–4 must translate those mechanisms into native AppKit rather than imitate only the pixels.
+
+**Existing editor-core evidence:** Element's Matrix Rich Text Editor is the concrete Rust rich-text algorithm reference for Task 2. Compare its UTF-16 range mapping, cross-node formatting/link mutations, nested-list enter/exit/indent behavior, action-state queries and undo snapshots. Do not add the upstream crate as a runtime dependency or copy its source in this MVP: upstream declares an early, breaking API; its Matrix-composer schema lacks note images, headings, checklists, alignment and highlight; and it would duplicate this project's canonical `Document`. Lapce/Floem remains the reference for revision/pristine and projection-only phantom content, not the persistent rich-note model.
+
 ## Global Constraints
 
 - Evernote is the UI/workflow prototype; Byword only informs the centered long-form writing measure.
@@ -18,6 +22,8 @@
 - Normal runtime never creates, saves or loads RTF. Keep the one-time legacy decoder isolated and frozen.
 - Do not show AI, task, calendar, reminder, template, sharing, collaboration or plugin controls.
 - Every visible formatting/insert command works; future commands stay absent.
+- Editor commands mutate semantic attributes in one undo transaction and expose query state for toolbar refresh; UI controls must not directly mutate fonts as the source of truth.
+- Save only when canonical HTML differs from the last persisted HTML. Dirty status changes immediately; coalescing may delay the write, never the status.
 - Preserve title persistence, Command-N, undo/redo, Finder/bitmap paste, drag/drop, resource safety, search, soft delete and migration backup.
 - Never access an official Joplin profile from normal product code.
 - Luna owns product code; root owns architecture, review, real-window verification and release.
@@ -96,8 +102,9 @@ pub fn render_document<F>(document: &Document, load: F, width: f64) -> RenderedD
 
 - [ ] **Step 1: Move existing codec and tests without behavior changes.** Keep the legacy RTF decoder in `app.rs`, calling the same new codec; do not duplicate it.
 - [ ] **Step 2: Add RED round-trip tests.** Cover H1/H2/H3, bullet/ordered/checklist, strike/highlight/link, alignment/indent, emoji UTF-16 ranges, empty blocks and images.
+- [ ] **Step 2a: Port behavioral edge cases, not source.** Add independently written cases equivalent to Matrix RTE's cross-node partial-link selection, empty list-item exit, nested-list remnants, action-state transitions and one-command-one-history behavior.
 - [ ] **Step 3: Implement semantic attributes.** Define app-owned attributes for block/list/checklist/alignment/indent and tagged projection prefixes. Render native 11/13/17/22/30 pt roles and strip projection prefixes on save.
-- [ ] **Step 4: Implement mutations.** Block commands operate on full paragraphs; inline commands on exact UTF-16 ranges. Applying the active list kind again returns to paragraphs. Clear removes inline semantics but never attachments/block type.
+- [ ] **Step 4: Implement mutations and query state.** Block commands operate on full paragraphs; inline commands on exact UTF-16 ranges. Applying the active list kind again returns to paragraphs. Clear removes inline semantics but never attachments/block type. Expose mixed/active state so the toolbar refreshes only when selection context changes.
 - [ ] **Step 5: Implement Return behavior.** Return continues a nonempty list item; Return on an empty item exits the list. Checklist prefix is `☐`/`☑` and remains toggleable without entering canonical text.
 - [ ] **Step 6: Preserve undo boundaries.** One visible command creates one text-storage edit/undo group; `app.rs` saves once afterward.
 - [ ] **Step 7: Run gates and commit.** Run fmt/full tests/Clippy/diff-check; commit `Add native semantic editor`.
@@ -112,11 +119,11 @@ pub fn render_document<F>(document: &Document, load: F, width: f64) -> RenderedD
 - Test: inline layout/state tests in `app.rs`
 
 - [ ] **Step 1: Add RED layout tests.** Cover 1380×820, 1100×700, browser-collapsed and full-focus layouts; assert three non-overlapping regions, 680-pt document measure, fixed toolbar and bottom save state.
-- [ ] **Step 2: Build the three-region hierarchy.** Use 176–208 pt navigation, 360–400 pt browser and flexible editor workspace. Put a white/dynamic 12-pt-radius editor sheet on a warm system background. Default 1380×820, minimum 1100×700.
+- [ ] **Step 2: Build the three-region hierarchy.** Use 176–208 pt navigation, 360–400 pt browser and flexible editor workspace. Put a white/dynamic 12-pt-radius editor sheet on a warm system background. Default 1380×820, minimum 1100×700. Compute the centered 680-pt measure from live width and retain enough bottom scroll inset for the final line to reach the visual middle.
 - [ ] **Step 3: Build the fixed responsive toolbar.** Add working image insert, undo/redo, block popup, B/I/U, highlight, bullet, ordered and checklist controls. Narrow mode moves working link/alignment/indent/strike/clear commands into `More`.
 - [ ] **Step 4: Add image and link input.** `NSOpenPanel` accepts one local PNG/JPEG and routes through existing validation. A native link sheet accepts only Task 1 schemes and applies to nonempty selection.
 - [ ] **Step 5: Add collapse/focus controls.** Double-chevron toggles navigation+browser; diagonal arrow toggles the browser only. Keep the editor measure centered.
-- [ ] **Step 6: Add 300 ms autosave coalescing.** Track dirty generations; ignore stale timers. Flush before note switch/new/delete/window close/image insert/format actions. Failure keeps dirty state and visible text for retry.
+- [ ] **Step 6: Add 300 ms autosave coalescing.** Mark dirty synchronously, track dirty generations and ignore stale timers. Compare newly serialized canonical HTML with the last persisted HTML to skip phantom writes. Flush before note switch/new/delete/window close/image insert/format actions. Image insertion first persists the resource and then inserts the semantic node as one undoable edit; failure leaves neither a fake node nor a false saved state. Failure keeps dirty state and visible text for retry.
 - [ ] **Step 7: Run gates and commit.** Run fmt/full tests/Clippy/diff-check; commit `Rebuild native editor shell`.
 
 ---
@@ -143,7 +150,7 @@ pub fn browser_metrics(available_width: f64) -> BrowserMetrics;
 - [ ] **Step 1: Add RED preview/geometry tests.** Assert body-text title fallback, tag-free snippet, first image order, Unicode-safe truncation, deterministic dates and exactly two columns at 360–400 pt.
 - [ ] **Step 2: Implement preview projection.** Parse canonical HTML once per refresh. Parse failure returns text-only preview, never a fake resource id.
 - [ ] **Step 3: Implement reusable cards.** Register one `NSCollectionViewItem` subclass with title/snippet/date/image; clear stale images during reuse. Use thin dynamic borders and a green selected outline, no shadow stack.
-- [ ] **Step 4: Load visible thumbnails only.** Decode the first visible resource to a 2×56-pt target; cache by resource id/size with a fixed cap. Missing/corrupt images become text-only and never mutate HTML.
+- [ ] **Step 4: Load visible thumbnails only.** Decode the first visible resource to a 2×56-pt target; cache by resource id/size with a fixed cap. Missing/corrupt images become text-only and never mutate HTML. Selection/context changes update only affected cards and toolbar state; they do not rebuild the collection.
 - [ ] **Step 5: Remove eager stack rows.** Delete note-row/button arrays and tag-index selection. Search and refresh share the collection data source; selection uses note id across reorder/filter.
 - [ ] **Step 6: Add minimal navigation.** Show search, green New Note, selected Notes and count only. Do not add dead Evernote sections.
 - [ ] **Step 7: Prove virtualization.** A 1,600-note smoke retains 1,600 lightweight previews while live item views and image decodes stay bounded by visible cards plus reuse margin.
