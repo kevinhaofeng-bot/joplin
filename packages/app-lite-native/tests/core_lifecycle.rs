@@ -12,7 +12,6 @@ fn note_lifecycle_survives_restart_and_supports_fts() {
         .create_note(CreateNote {
             title: "原生笔记".into(),
             body: "离线正文与搜索".into(),
-            body_rtf: Vec::new(),
             is_draft: false,
         })
         .unwrap();
@@ -23,7 +22,6 @@ fn note_lifecycle_survives_restart_and_supports_fts() {
         UpdateNote {
             title: Some("更新后的标题".into()),
             body: Some("持久化后的正文".into()),
-            body_rtf: None,
         },
     )
     .unwrap();
@@ -32,7 +30,9 @@ fn note_lifecycle_survives_restart_and_supports_fts() {
     let reopened = NoteRepository::open(&path).unwrap();
     let note = reopened.get_note(&id).unwrap().unwrap();
     assert_eq!(note.title, "更新后的标题");
-    assert_eq!(note.body, "持久化后的正文");
+    assert_eq!(note.body, "<p>持久化后的正文</p>");
+    assert_eq!(note.markup_language, 2);
+    assert!(note.body_rtf.is_empty());
     reopened.soft_delete(&id).unwrap();
     assert!(reopened.get_note(&id).unwrap().is_none());
 }
@@ -45,7 +45,6 @@ fn abandoned_blank_drafts_are_removed_but_nonempty_drafts_remain() {
         .create_note(CreateNote {
             title: "".into(),
             body: "".into(),
-            body_rtf: Vec::new(),
             is_draft: true,
         })
         .unwrap();
@@ -53,7 +52,6 @@ fn abandoned_blank_drafts_are_removed_but_nonempty_drafts_remain() {
         .create_note(CreateNote {
             title: "".into(),
             body: "用户已经输入".into(),
-            body_rtf: Vec::new(),
             is_draft: true,
         })
         .unwrap();
@@ -77,7 +75,6 @@ fn search_index_failure_does_not_block_note_writes() {
         .create_note(CreateNote {
             title: "仍可保存".into(),
             body: "索引损坏不应阻塞正文".into(),
-            body_rtf: Vec::new(),
             is_draft: false,
         })
         .unwrap();
@@ -96,7 +93,6 @@ fn soft_delete_commits_when_search_index_is_missing() {
         .create_note(CreateNote {
             title: "待删除".into(),
             body: "正文".into(),
-            body_rtf: Vec::new(),
             is_draft: false,
         })
         .unwrap();
@@ -110,25 +106,27 @@ fn soft_delete_commits_when_search_index_is_missing() {
 }
 
 #[test]
-fn rich_text_payload_survives_restart() {
+fn normal_writes_leave_legacy_rtf_empty() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("notes.sqlite");
     let repo = NoteRepository::open(&path).unwrap();
-    let expected_rtf = b"{\\rtf1\\b native}".to_vec();
     let created = repo
         .create_note(CreateNote {
             title: "格式化".into(),
-            body: "native".into(),
-            body_rtf: expected_rtf.clone(),
+            body: "<strong>native</strong>".into(),
             is_draft: false,
         })
         .unwrap();
     drop(repo);
 
     let reopened = NoteRepository::open(&path).unwrap();
-    assert_eq!(
-        reopened.get_note(&created.id).unwrap().unwrap().body_rtf,
-        expected_rtf
+    assert!(
+        reopened
+            .get_note(&created.id)
+            .unwrap()
+            .unwrap()
+            .body_rtf
+            .is_empty()
     );
 }
 
@@ -141,7 +139,6 @@ fn plain_text_fallback_clears_stale_rich_text_before_restart() {
         .create_note(CreateNote {
             title: "旧标题".into(),
             body: "旧正文".into(),
-            body_rtf: b"{\\rtf1\\b old body}".to_vec(),
             is_draft: false,
         })
         .unwrap();
@@ -152,19 +149,18 @@ fn plain_text_fallback_clears_stale_rich_text_before_restart() {
             UpdateNote {
                 title: Some("最新标题".into()),
                 body: Some("最新纯文本正文".into()),
-                body_rtf: Some(Vec::new()),
             },
         )
         .unwrap();
     assert_eq!(updated.title, "最新标题");
-    assert_eq!(updated.body, "最新纯文本正文");
+    assert_eq!(updated.body, "<p>最新纯文本正文</p>");
     assert!(updated.body_rtf.is_empty());
     drop(repo);
 
     let reopened = NoteRepository::open(&path).unwrap();
     let reopened_note = reopened.get_note(&created.id).unwrap().unwrap();
     assert_eq!(reopened_note.title, "最新标题");
-    assert_eq!(reopened_note.body, "最新纯文本正文");
+    assert_eq!(reopened_note.body, "<p>最新纯文本正文</p>");
     assert!(reopened_note.body_rtf.is_empty());
 }
 

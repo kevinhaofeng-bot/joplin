@@ -458,16 +458,11 @@ fn prepare_note_content_from_editor(
         &projection.body,
     ));
     let formatting_fallback = matches!(save_plan, RtfSavePlan::PlainTextFallback);
-    let body_rtf = match save_plan {
-        RtfSavePlan::Rich(rtf) => rtf,
-        RtfSavePlan::PlainTextFallback => Vec::new(),
-    };
     Ok(PreparedNoteContent {
         update: NoteContentUpdate {
             title,
             body: projection.body,
             body_text: projection.body_text,
-            body_rtf,
             resource_ids: projection.resource_ids,
         },
         formatting_fallback,
@@ -1228,7 +1223,6 @@ define_class!(
         let note = self.ivars().repository.create_note(CreateNote {
             title: String::new(),
             body: String::new(),
-            body_rtf: Vec::new(),
             is_draft: true,
         });
         match note {
@@ -2568,7 +2562,6 @@ impl AppDelegate {
                     title,
                     body: projection.body,
                     body_text: projection.body_text,
-                    body_rtf: Vec::new(),
                     resource_ids: projection.resource_ids,
                 },
                 formatting_fallback: true,

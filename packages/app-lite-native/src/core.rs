@@ -1,9 +1,11 @@
-use crate::body::{BodyError, project_search_text};
+use crate::body::BodyError;
+use crate::html_body::{HtmlBodyError, parse_html, resource_ids, search_text, serialize_html};
 pub use crate::resource_store::ResourceImport;
 use crate::resource_store::{ResourceError, ResourceStore};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,8 +23,14 @@ pub enum CoreError {
     InvalidDatabasePath,
     #[error("body error")]
     Body(#[from] BodyError),
+    #[error("HTML body error")]
+    Html(#[from] HtmlBodyError),
     #[error("resource error")]
     Resource(#[from] ResourceError),
+    #[error("invalid HTML migration: {0}")]
+    MigrationValidation(String),
+    #[error("invalid backup target")]
+    InvalidBackupTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +39,10 @@ pub struct Note {
     pub title: String,
     pub body: String,
     pub body_text: String,
+    /// Transitional read-only copy of the legacy RTF column. Normal APIs
+    /// never accept or write this value; Task 3 removes the last reader.
     pub body_rtf: Vec<u8>,
+    pub markup_language: i64,
     pub is_draft: bool,
     pub created_time: i64,
     pub updated_time: i64,
@@ -42,7 +53,6 @@ pub struct Note {
 pub struct CreateNote {
     pub title: String,
     pub body: String,
-    pub body_rtf: Vec<u8>,
     pub is_draft: bool,
 }
 
@@ -50,15 +60,36 @@ pub struct CreateNote {
 pub struct UpdateNote {
     pub title: Option<String>,
     pub body: Option<String>,
-    pub body_rtf: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteContentUpdate {
     pub title: String,
     pub body: String,
+    /// Transitional derived inputs retained for the AppKit call site. The
+    /// repository ignores them and derives both projections from canonical
+    /// HTML; Task 3 removes these fields from the editor adapter.
     pub body_text: String,
+    pub resource_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyNoteForHtmlMigration {
+    pub id: String,
+    pub title: String,
+    pub body: String,
     pub body_rtf: Vec<u8>,
+    pub is_draft: bool,
+    pub created_time: i64,
+    pub updated_time: i64,
+    pub deleted_time: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlNoteConversion {
+    pub id: String,
+    pub body: String,
+    pub body_text: String,
     pub resource_ids: Vec<String>,
 }
 
@@ -77,13 +108,22 @@ pub struct StoredResource {
 pub struct NoteRepository {
     connection: Mutex<Connection>,
     resource_store: ResourceStore,
+    database_path: PathBuf,
 }
 
 impl NoteRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         let input_path = path.as_ref();
+        let input_parent = input_path.parent().ok_or(CoreError::InvalidDatabasePath)?;
+        if std::fs::symlink_metadata(input_parent)
+            .map_err(|_| CoreError::InvalidDatabasePath)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(CoreError::InvalidDatabasePath);
+        }
         ensure_database_inode(input_path)?;
-        let parent = input_path.parent().ok_or(CoreError::InvalidDatabasePath)?;
+        let parent = input_parent;
         let file_name = input_path
             .file_name()
             .ok_or(CoreError::InvalidDatabasePath)?;
@@ -106,6 +146,7 @@ impl NoteRepository {
         let repository = Self {
             connection: Mutex::new(connection),
             resource_store,
+            database_path: path,
         };
         repository.rebuild_search_index()?;
         Ok(repository)
@@ -114,22 +155,24 @@ impl NoteRepository {
     pub fn create_note(&self, input: CreateNote) -> Result<Note, CoreError> {
         let now = timestamp();
         let id = new_id();
-        let body_text = project_search_text(&input.body);
+        let canonical = canonicalize_html(&input.body)?;
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO notes (id, title, body, body_text, body_rtf, is_draft, created_time, updated_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![id, input.title, input.body, body_text, input.body_rtf, input.is_draft, now],
+            "INSERT INTO notes (id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time)
+             VALUES (?1, ?2, ?3, ?4, X'', 2, ?5, ?6, ?6)",
+            params![id, input.title, canonical.body, canonical.body_text, input.is_draft, now],
         )?;
+        replace_note_resources(&transaction, &id, &canonical.resource_ids)?;
         transaction.commit()?;
-        let _ = replace_index_entry(&connection, &id, &input.title, &body_text);
+        let _ = replace_index_entry(&connection, &id, &input.title, &canonical.body_text);
         Ok(Note {
             id,
             title: input.title,
-            body: input.body,
-            body_text,
-            body_rtf: input.body_rtf,
+            body: canonical.body,
+            body_text: canonical.body_text,
+            body_rtf: Vec::new(),
+            markup_language: 2,
             is_draft: input.is_draft,
             created_time: now,
             updated_time: now,
@@ -142,7 +185,7 @@ impl NoteRepository {
         let connection = self.connection.lock().expect("repository mutex poisoned");
         connection
             .query_row(
-                "SELECT id, title, body, body_text, body_rtf, is_draft, created_time, updated_time, deleted_time
+                "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
                  FROM notes WHERE id = ?1 AND deleted_time = 0",
                 [id],
                 row_to_note,
@@ -154,7 +197,7 @@ impl NoteRepository {
     pub fn list_notes(&self) -> Result<Vec<Note>, CoreError> {
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, title, body, body_text, body_rtf, is_draft, created_time, updated_time, deleted_time
+            "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
              FROM notes WHERE deleted_time = 0 ORDER BY updated_time DESC, id ASC",
         )?;
         let rows = statement.query_map([], row_to_note)?;
@@ -167,7 +210,7 @@ impl NoteRepository {
         let transaction = connection.unchecked_transaction()?;
         let current = transaction
             .query_row(
-                "SELECT id, title, body, body_text, body_rtf, is_draft, created_time, updated_time, deleted_time
+                "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
                  FROM notes WHERE id = ?1 AND deleted_time = 0",
                 [id],
                 row_to_note,
@@ -176,29 +219,31 @@ impl NoteRepository {
         let Some(mut note) = current else {
             return Err(CoreError::InvalidId);
         };
+        let mut resource_ids = note_resource_ids(&transaction, id)?;
         if let Some(title) = input.title {
             note.title = title;
         }
         if let Some(body) = input.body {
-            note.body = body;
-            note.body_text = project_search_text(&note.body);
+            let canonical = canonicalize_html(&body)?;
+            note.body = canonical.body;
+            note.body_text = canonical.body_text;
+            resource_ids = canonical.resource_ids;
         }
-        if let Some(body_rtf) = input.body_rtf {
-            note.body_rtf = body_rtf;
-        }
+        note.body_rtf.clear();
+        note.markup_language = 2;
         note.updated_time = timestamp().max(note.updated_time + 1);
         transaction.execute(
-            "UPDATE notes SET title = ?2, body = ?3, body_text = ?4, body_rtf = ?5,
-             is_draft = 0, updated_time = ?6 WHERE id = ?1 AND deleted_time = 0",
+            "UPDATE notes SET title = ?2, body = ?3, body_text = ?4, body_rtf = X'',
+             markup_language = 2, is_draft = 0, updated_time = ?5 WHERE id = ?1 AND deleted_time = 0",
             params![
                 note.id,
                 note.title,
                 note.body,
                 note.body_text,
-                note.body_rtf,
                 note.updated_time
             ],
         )?;
+        replace_note_resources(&transaction, &note.id, &resource_ids)?;
         note.is_draft = false;
         transaction.commit()?;
         let _ = replace_index_entry(&connection, &note.id, &note.title, &note.body_text);
@@ -294,62 +339,37 @@ impl NoteRepository {
         input: NoteContentUpdate,
     ) -> Result<Note, CoreError> {
         validate_id(id)?;
-        for resource_id in &input.resource_ids {
-            validate_id(resource_id)?;
-        }
+        let canonical = canonicalize_html(&input.body)?;
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let transaction = connection.unchecked_transaction()?;
         let mut note = transaction
             .query_row(
-                "SELECT id, title, body, body_text, body_rtf, is_draft, created_time, updated_time, deleted_time
+                "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
                  FROM notes WHERE id = ?1 AND deleted_time = 0",
                 [id],
                 row_to_note,
             )
             .optional()?
             .ok_or(CoreError::InvalidId)?;
-        let mut associated_resource_ids = Vec::new();
-        let mut seen_resource_ids = HashSet::new();
-        for resource_id in &input.resource_ids {
-            if !seen_resource_ids.insert(resource_id) {
-                continue;
-            }
-            let exists = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM resources WHERE id = ?1)",
-                [resource_id],
-                |row| row.get::<_, i64>(0),
-            )?;
-            if exists != 0 {
-                associated_resource_ids.push(resource_id.clone());
-            }
-        }
         note.title = input.title;
-        note.body = input.body;
-        note.body_text = input.body_text;
-        note.body_rtf = input.body_rtf;
+        note.body = canonical.body;
+        note.body_text = canonical.body_text;
+        note.body_rtf.clear();
+        note.markup_language = 2;
         note.is_draft = false;
         note.updated_time = timestamp().max(note.updated_time + 1);
         transaction.execute(
-            "UPDATE notes SET title = ?2, body = ?3, body_text = ?4, body_rtf = ?5,
-             is_draft = 0, updated_time = ?6 WHERE id = ?1 AND deleted_time = 0",
+            "UPDATE notes SET title = ?2, body = ?3, body_text = ?4, body_rtf = X'',
+             markup_language = 2, is_draft = 0, updated_time = ?5 WHERE id = ?1 AND deleted_time = 0",
             params![
                 note.id,
                 note.title,
                 note.body,
                 note.body_text,
-                note.body_rtf,
                 note.updated_time
             ],
         )?;
-        transaction.execute("DELETE FROM note_resources WHERE note_id = ?1", [id])?;
-        for (position, resource_id) in associated_resource_ids.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO note_resources
-                 (note_id, resource_id, position, is_associated, last_seen_time)
-                 VALUES (?1, ?2, ?3, 1, ?4)",
-                params![id, resource_id, position as i64, timestamp()],
-            )?;
-        }
+        replace_note_resources(&transaction, id, &canonical.resource_ids)?;
         transaction.commit()?;
         let _ = replace_index_entry(&connection, &note.id, &note.title, &note.body_text);
         Ok(note)
@@ -397,7 +417,7 @@ impl NoteRepository {
         }
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT n.id, n.title, n.body, n.body_text, n.body_rtf, n.is_draft, n.created_time,
+            "SELECT n.id, n.title, n.body, n.body_text, n.body_rtf, n.markup_language, n.is_draft, n.created_time,
                     n.updated_time, n.deleted_time
              FROM notes_fts f JOIN notes n ON n.id = f.id
              WHERE notes_fts MATCH ?1 AND n.deleted_time = 0
@@ -410,7 +430,7 @@ impl NoteRepository {
             return Ok(rows);
         }
         let mut fallback = connection.prepare(
-            "SELECT id, title, body, body_text, body_rtf, is_draft, created_time, updated_time, deleted_time
+            "SELECT id, title, body, body_text, body_rtf, markup_language, is_draft, created_time, updated_time, deleted_time
              FROM notes WHERE deleted_time = 0 AND (instr(title, ?1) > 0 OR instr(body_text, ?1) > 0)
              ORDER BY updated_time DESC, id ASC",
         )?;
@@ -443,11 +463,279 @@ impl NoteRepository {
         transaction.commit()?;
         Ok(())
     }
+
+    pub fn list_legacy_notes_for_html_migration(
+        &self,
+    ) -> Result<Vec<LegacyNoteForHtmlMigration>, CoreError> {
+        let connection = self.connection.lock().expect("repository mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, title, body, body_rtf, is_draft, created_time, updated_time, deleted_time
+             FROM notes WHERE markup_language = 1 ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(LegacyNoteForHtmlMigration {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                body_rtf: row.get(3)?,
+                is_draft: row.get::<_, i64>(4)? != 0,
+                created_time: row.get(5)?,
+                updated_time: row.get(6)?,
+                deleted_time: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn backup_before_html_migration(&self) -> Result<PathBuf, CoreError> {
+        let connection = self.connection.lock().expect("repository mutex poisoned");
+        let profile = self
+            .database_path
+            .parent()
+            .ok_or(CoreError::InvalidBackupTarget)?;
+        let version =
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        for _ in 0..32 {
+            let counter = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let target = profile.join(format!(
+                "{}.html-migration-v{}-{}-{}.sqlite",
+                self.database_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(CoreError::InvalidBackupTarget)?,
+                version,
+                timestamp(),
+                counter
+            ));
+            match self.backup_before_html_migration_to_locked(&connection, &target) {
+                Ok(()) => return Ok(target),
+                Err(CoreError::InvalidBackupTarget) => {
+                    if target.exists() {
+                        continue;
+                    }
+                    return Err(CoreError::InvalidBackupTarget);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CoreError::InvalidBackupTarget)
+    }
+
+    pub fn backup_before_html_migration_to(
+        &self,
+        target: impl AsRef<Path>,
+    ) -> Result<PathBuf, CoreError> {
+        let target = target.as_ref().to_path_buf();
+        let connection = self.connection.lock().expect("repository mutex poisoned");
+        self.backup_before_html_migration_to_locked(&connection, &target)?;
+        Ok(target)
+    }
+
+    fn backup_before_html_migration_to_locked(
+        &self,
+        source: &Connection,
+        target: &Path,
+    ) -> Result<(), CoreError> {
+        let profile = self
+            .database_path
+            .parent()
+            .ok_or(CoreError::InvalidBackupTarget)?;
+        let target_parent = target.parent().ok_or(CoreError::InvalidBackupTarget)?;
+        let canonical_parent =
+            std::fs::canonicalize(target_parent).map_err(|_| CoreError::InvalidBackupTarget)?;
+        if canonical_parent != profile
+            || std::fs::symlink_metadata(target_parent)
+                .map_err(|_| CoreError::InvalidBackupTarget)?
+                .file_type()
+                .is_symlink()
+            || target.exists()
+        {
+            return Err(CoreError::InvalidBackupTarget);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)
+            .map_err(|_| CoreError::InvalidBackupTarget)?;
+        let mut destination = Connection::open_with_flags(
+            target,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
+        backup.run_to_completion(64, std::time::Duration::from_millis(0), None)?;
+        drop(backup);
+        drop(destination);
+        Ok(())
+    }
+
+    pub fn apply_html_migration(
+        &self,
+        conversions: Vec<HtmlNoteConversion>,
+    ) -> Result<PathBuf, CoreError> {
+        let backup = self.backup_before_html_migration()?;
+        let connection = self.connection.lock().expect("repository mutex poisoned");
+        let transaction = connection.unchecked_transaction()?;
+        let expected = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM notes WHERE markup_language = 1 ORDER BY id ASC")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if expected.len() != conversions.len() {
+            return Err(CoreError::MigrationValidation(
+                "conversion batch does not cover exactly all legacy notes".into(),
+            ));
+        }
+        let expected_ids = expected.iter().cloned().collect::<HashSet<_>>();
+        let mut seen_ids = HashSet::new();
+        for conversion in &conversions {
+            if !seen_ids.insert(conversion.id.clone()) || !expected_ids.contains(&conversion.id) {
+                return Err(CoreError::MigrationValidation(
+                    "conversion batch contains duplicate or unexpected note ids".into(),
+                ));
+            }
+            validate_conversion(&transaction, conversion)?;
+        }
+        for conversion in conversions {
+            let changed = transaction.execute(
+                "UPDATE notes SET body = ?2, body_text = ?3, body_rtf = X'', markup_language = 2
+                 WHERE id = ?1 AND markup_language = 1",
+                params![conversion.id, conversion.body, conversion.body_text],
+            )?;
+            if changed != 1 {
+                return Err(CoreError::MigrationValidation(
+                    "legacy note changed while migration was being applied".into(),
+                ));
+            }
+            replace_note_resources(&transaction, &conversion.id, &conversion.resource_ids)?;
+            transaction.execute("DELETE FROM notes_fts WHERE id = ?1", [&conversion.id])?;
+            transaction.execute(
+                "INSERT INTO notes_fts (id, title, body_text)
+                 SELECT id, title, body_text FROM notes WHERE id = ?1",
+                [&conversion.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(backup)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalBody {
+    body: String,
+    body_text: String,
+    resource_ids: Vec<String>,
+}
+
+fn canonicalize_html(body: &str) -> Result<CanonicalBody, CoreError> {
+    let document = parse_html(body)?;
+    Ok(CanonicalBody {
+        body: serialize_html(&document),
+        body_text: search_text(&document),
+        resource_ids: resource_ids(&document),
+    })
+}
+
+fn note_resource_ids(
+    transaction: &rusqlite::Transaction<'_>,
+    note_id: &str,
+) -> Result<Vec<String>, CoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT resource_id FROM note_resources WHERE note_id = ?1 ORDER BY position ASC",
+    )?;
+    Ok(statement
+        .query_map([note_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn replace_note_resources(
+    transaction: &rusqlite::Transaction<'_>,
+    note_id: &str,
+    resource_ids: &[String],
+) -> Result<(), CoreError> {
+    let mut seen = HashSet::new();
+    let mut associated = Vec::with_capacity(resource_ids.len());
+    for resource_id in resource_ids {
+        validate_id(resource_id)?;
+        if !seen.insert(resource_id) {
+            continue;
+        }
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM resources WHERE id = ?1)",
+            [resource_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if exists == 0 {
+            continue;
+        }
+        associated.push(resource_id.clone());
+    }
+    transaction.execute("DELETE FROM note_resources WHERE note_id = ?1", [note_id])?;
+    for (position, resource_id) in associated.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO note_resources
+             (note_id, resource_id, position, is_associated, last_seen_time)
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![note_id, resource_id, position as i64, timestamp()],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_conversion(
+    transaction: &rusqlite::Transaction<'_>,
+    conversion: &HtmlNoteConversion,
+) -> Result<(), CoreError> {
+    let document = parse_html(&conversion.body)?;
+    if serialize_html(&document) != conversion.body {
+        return Err(CoreError::MigrationValidation(format!(
+            "body is not canonical HTML: {}",
+            conversion.id
+        )));
+    }
+    if search_text(&document) != conversion.body_text {
+        return Err(CoreError::MigrationValidation(format!(
+            "body_text does not match body: {}",
+            conversion.id
+        )));
+    }
+    let derived_resource_ids = resource_ids(&document);
+    if derived_resource_ids != conversion.resource_ids {
+        return Err(CoreError::MigrationValidation(format!(
+            "resource ids do not match body: {}",
+            conversion.id
+        )));
+    }
+    // This checks both IDs and metadata, while leaving the transaction
+    // untouched until every conversion in the batch has passed validation.
+    let _ = note_resource_ids(transaction, &conversion.id)?;
+    for resource_id in &conversion.resource_ids {
+        validate_id(resource_id)?;
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM resources WHERE id = ?1)",
+            [resource_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if exists == 0 {
+            return Err(CoreError::MigrationValidation(format!(
+                "resource metadata is missing: {resource_id}"
+            )));
+        }
+    }
+    if conversion.resource_ids.iter().collect::<HashSet<_>>().len() != conversion.resource_ids.len()
+    {
+        return Err(CoreError::MigrationValidation(
+            "a note cannot associate the same resource twice".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn migrate_schema(connection: &Connection) -> Result<(), CoreError> {
     let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
     let legacy = version < 2;
+    let notes_existed = table_exists(connection, "notes")?;
     let transaction = connection.unchecked_transaction()?;
     transaction.execute_batch(
         "
@@ -457,6 +745,7 @@ fn migrate_schema(connection: &Connection) -> Result<(), CoreError> {
             body TEXT NOT NULL DEFAULT '',
             body_text TEXT NOT NULL DEFAULT '',
             body_rtf BLOB NOT NULL DEFAULT X'',
+            markup_language INTEGER NOT NULL DEFAULT 2,
             is_draft INTEGER NOT NULL DEFAULT 0,
             created_time INTEGER NOT NULL,
             updated_time INTEGER NOT NULL,
@@ -502,6 +791,21 @@ fn migrate_schema(connection: &Connection) -> Result<(), CoreError> {
         "body_text",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    if version < 3 && notes_existed {
+        ensure_column(
+            &transaction,
+            "notes",
+            "markup_language",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+    } else {
+        ensure_column(
+            &transaction,
+            "notes",
+            "markup_language",
+            "INTEGER NOT NULL DEFAULT 2",
+        )?;
+    }
     ensure_column(
         &transaction,
         "resource_blobs",
@@ -593,8 +897,8 @@ fn migrate_schema(connection: &Connection) -> Result<(), CoreError> {
             )?;
         }
     }
-    if version < 2 {
-        transaction.execute_batch("PRAGMA user_version = 2;")?;
+    if version < 3 {
+        transaction.execute_batch("PRAGMA user_version = 3;")?;
     }
     transaction.commit()?;
     Ok(())
@@ -608,6 +912,16 @@ fn table_columns(
     Ok(statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, CoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
 }
 
 fn ensure_column(
@@ -661,10 +975,11 @@ fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
         body: row.get(2)?,
         body_text: row.get(3)?,
         body_rtf: row.get(4)?,
-        is_draft: row.get::<_, i64>(5)? != 0,
-        created_time: row.get(6)?,
-        updated_time: row.get(7)?,
-        deleted_time: row.get(8)?,
+        markup_language: row.get(5)?,
+        is_draft: row.get::<_, i64>(6)? != 0,
+        created_time: row.get(7)?,
+        updated_time: row.get(8)?,
+        deleted_time: row.get(9)?,
     })
 }
 
@@ -722,8 +1037,8 @@ fn sanitize_fts_query(query: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateNote, NoteContentUpdate, NoteRepository};
-    use crate::body::{markdown_marker, project_search_text};
+    use super::{CoreError, CreateNote, HtmlNoteConversion, NoteContentUpdate, NoteRepository};
+    use crate::html_body::{parse_html, search_text};
     use crate::resource_store::ResourceImport;
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -829,9 +1144,8 @@ mod tests {
                 "0123456789abcdef0123456789abcdef",
                 NoteContentUpdate {
                     title: "updated".into(),
-                    body: "![first](:/0123456789abcdef0123456789abc0)".into(),
+                    body: format!("<p><img src=\":/{}\" alt=\"first\"></p>", first.id),
                     body_text: "first".into(),
-                    body_rtf: Vec::new(),
                     resource_ids: vec![first.id.clone()],
                 },
             )
@@ -842,9 +1156,8 @@ mod tests {
             &note.id,
             NoteContentUpdate {
                 title: "updated again".into(),
-                body: "second".into(),
+                body: format!("<p><img src=\":/{}\" alt=\"second\"></p>", second.id),
                 body_text: "second".into(),
-                body_rtf: Vec::new(),
                 resource_ids: vec![second.id.clone()],
             },
         )
@@ -865,7 +1178,6 @@ mod tests {
             .create_note(CreateNote {
                 title: "标题".into(),
                 body: "初始".into(),
-                body_rtf: Vec::new(),
                 is_draft: false,
             })
             .unwrap();
@@ -875,9 +1187,11 @@ mod tests {
                 &note.id,
                 NoteContentUpdate {
                     title: "更新标题".into(),
-                    body: format!("![缺失](:/{missing})\n![存在](:/{})", resource.id),
+                    body: format!(
+                        "<p><img src=\":/{missing}\" alt=\"缺失\"><img src=\":/{}\" alt=\"存在\"></p>",
+                        resource.id
+                    ),
                     body_text: "缺失\n存在".into(),
-                    body_rtf: Vec::new(),
                     resource_ids: vec![missing.into(), resource.id.clone(), missing.into()],
                 },
             )
@@ -912,7 +1226,6 @@ mod tests {
             .create_note(CreateNote {
                 title: "混合资源".into(),
                 body: "初始".into(),
-                body_rtf: Vec::new(),
                 is_draft: false,
             })
             .unwrap();
@@ -921,12 +1234,10 @@ mod tests {
             NoteContentUpdate {
                 title: "混合资源已保存".into(),
                 body: format!(
-                    "{}\n{}",
-                    markdown_marker(&missing_blob.id, "缺 blob").unwrap(),
-                    markdown_marker(&normal.id, "正常").unwrap()
+                    "<p><img src=\":/{}\" alt=\"缺 blob\"><img src=\":/{}\" alt=\"正常\"></p>",
+                    missing_blob.id, normal.id
                 ),
                 body_text: "缺 blob\n正常".into(),
-                body_rtf: Vec::new(),
                 resource_ids: vec![missing_blob.id.clone(), normal.id.clone()],
             },
         )
@@ -950,16 +1261,15 @@ mod tests {
             .import_resource(png_import(TINY_PNG, "screenshot.png"))
             .unwrap();
         let id = resource.id.as_str();
-        let body = format!("证据\n\n{}", markdown_marker(id, "庭审截图 [1]").unwrap());
+        let body = format!("<p>证据</p><p><img src=\":/{id}\" alt=\"庭审截图 [1]\"></p>");
         let note = repo
             .create_note(CreateNote {
                 title: "图片笔记".into(),
                 body: body.clone(),
-                body_rtf: Vec::new(),
                 is_draft: false,
             })
             .unwrap();
-        assert_eq!(note.body_text, project_search_text(&body));
+        assert_eq!(note.body_text, search_text(&parse_html(&body).unwrap()));
         assert_eq!(repo.search("庭审截图").unwrap().len(), 1);
         assert!(repo.search(&resource.sha256).unwrap().is_empty());
         assert!(
@@ -977,12 +1287,11 @@ mod tests {
         let resource = repo
             .import_resource(png_import(TINY_PNG, "empty-alt.png"))
             .unwrap();
-        let body = markdown_marker(&resource.id, "").unwrap();
+        let body = format!("<p><img src=\":/{}\" alt=\"\"></p>", resource.id);
         let note = repo
             .create_note(CreateNote {
                 title: "纯图片".into(),
                 body,
-                body_rtf: Vec::new(),
                 is_draft: false,
             })
             .unwrap();
@@ -1009,7 +1318,6 @@ mod tests {
             .create_note(CreateNote {
                 title: "第一笔记".into(),
                 body: "共同关键词 一".into(),
-                body_rtf: Vec::new(),
                 is_draft: false,
             })
             .unwrap();
@@ -1017,7 +1325,6 @@ mod tests {
             .create_note(CreateNote {
                 title: "第二笔记".into(),
                 body: "共同关键词 二".into(),
-                body_rtf: Vec::new(),
                 is_draft: false,
             })
             .unwrap();
@@ -1040,5 +1347,268 @@ mod tests {
             reopened.get_note(&second.id).unwrap().unwrap().body_text,
             second_body
         );
+    }
+
+    #[test]
+    fn fresh_schema_and_normal_note_use_html_language_two_and_empty_rtf() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("notes.sqlite");
+        let repo = NoteRepository::open(&db).unwrap();
+        let note = repo
+            .create_note(CreateNote {
+                title: "HTML".into(),
+                body: "<p><strong>正文</strong> 😀</p>".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        assert_eq!(note.markup_language, 2);
+        assert_eq!(note.body, "<p><strong>正文</strong> 😀</p>");
+        assert_eq!(note.body_text, "正文 😀");
+        assert!(note.body_rtf.is_empty());
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT body_rtf, markup_language FROM notes WHERE id = ?1",
+                    [&note.id],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (Vec::new(), 2)
+        );
+    }
+
+    #[test]
+    fn v2_schema_upgrade_marks_existing_rows_legacy_without_changing_content() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("notes.sqlite");
+        let old_rtf = b"{\\rtf1\\b legacy}".to_vec();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE notes (
+                    id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                    body_text TEXT NOT NULL, body_rtf BLOB NOT NULL,
+                    is_draft INTEGER NOT NULL, created_time INTEGER NOT NULL,
+                    updated_time INTEGER NOT NULL, deleted_time INTEGER NOT NULL DEFAULT 0
+                );
+                PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO notes
+                 (id, title, body, body_text, body_rtf, is_draft, created_time, updated_time)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 101, 202)",
+                rusqlite::params![
+                    "0123456789abcdef0123456789abcdef",
+                    "旧标题",
+                    "旧 body",
+                    "旧 text",
+                    old_rtf
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let repo = NoteRepository::open(&db).unwrap();
+        let note = repo
+            .list_legacy_notes_for_html_migration()
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(note.title, "旧标题");
+        assert_eq!(note.body, "旧 body");
+        assert_eq!(note.body_rtf, b"{\\rtf1\\b legacy}".to_vec());
+        assert_eq!((note.created_time, note.updated_time), (101, 202));
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT markup_language FROM notes WHERE id = ?1",
+                    [&note.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn html_migration_is_atomic_and_builds_ordered_resources_and_fts() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("notes.sqlite");
+        let repo = NoteRepository::open(&db).unwrap();
+        let first_resource = repo
+            .import_resource(png_import(TINY_PNG, "first.png"))
+            .unwrap();
+        let second_resource = repo
+            .import_resource(png_import(b"other bytes", "second.png"))
+            .unwrap();
+        let first = repo
+            .create_note(CreateNote {
+                title: "第一".into(),
+                body: "legacy".into(),
+                is_draft: true,
+            })
+            .unwrap();
+        let second = repo
+            .create_note(CreateNote {
+                title: "第二".into(),
+                body: "legacy".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        let old_rtf = b"{\\rtf1 first}".to_vec();
+        let connection = repo.connection.lock().unwrap();
+        connection
+            .execute(
+                "UPDATE notes SET markup_language = 1, body = 'old first', body_rtf = ?2
+                 WHERE id = ?1",
+                rusqlite::params![first.id, old_rtf],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE notes SET markup_language = 1, body = 'old second', body_rtf = X'727466'
+                 WHERE id = ?1",
+                [&second.id],
+            )
+            .unwrap();
+        drop(connection);
+        let first_body = format!(
+            "<p>迁移 <img src=\":/{}\" alt=\"第一图\"><img src=\":/{}\" alt=\"第二图\"></p>",
+            first_resource.id, second_resource.id
+        );
+        let second_body = "<p><strong>另一个正文</strong></p>".to_owned();
+        let backup = repo
+            .apply_html_migration(vec![
+                HtmlNoteConversion {
+                    id: first.id.clone(),
+                    body: first_body.clone(),
+                    body_text: "迁移 第一图第二图".into(),
+                    resource_ids: vec![first_resource.id.clone(), second_resource.id.clone()],
+                },
+                HtmlNoteConversion {
+                    id: second.id.clone(),
+                    body: second_body.clone(),
+                    body_text: "另一个正文".into(),
+                    resource_ids: Vec::new(),
+                },
+            ])
+            .unwrap();
+        assert!(backup.exists());
+        let migrated = repo.get_note(&first.id).unwrap().unwrap();
+        assert_eq!(migrated.markup_language, 2);
+        assert_eq!(migrated.body, first_body);
+        assert_eq!(migrated.body_text, "迁移 第一图第二图");
+        assert!(migrated.body_rtf.is_empty());
+        assert_eq!(repo.search("第一图").unwrap().len(), 1);
+        let connection = repo.connection.lock().unwrap();
+        let associations: Vec<String> = connection
+            .prepare("SELECT resource_id FROM note_resources WHERE note_id = ?1 ORDER BY position")
+            .unwrap()
+            .query_map([&first.id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            associations,
+            vec![first_resource.id.clone(), second_resource.id.clone()]
+        );
+        drop(connection);
+        let backup_connection = Connection::open(backup).unwrap();
+        assert_eq!(
+            backup_connection
+                .query_row(
+                    "SELECT body, body_rtf FROM notes WHERE id = ?1",
+                    [&first.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .unwrap(),
+            ("old first".into(), b"{\\rtf1 first}".to_vec())
+        );
+    }
+
+    #[test]
+    fn invalid_html_migration_batches_roll_back_without_changing_legacy_rows() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("notes.sqlite");
+        let repo = NoteRepository::open(&db).unwrap();
+        let note = repo
+            .create_note(CreateNote {
+                title: "legacy".into(),
+                body: "old".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE notes SET markup_language = 1, body = 'old', body_rtf = X'727466' WHERE id = ?1",
+                [&note.id],
+            )
+            .unwrap();
+        let bad = HtmlNoteConversion {
+            id: note.id.clone(),
+            body: "<p>new</p>".into(),
+            body_text: "wrong".into(),
+            resource_ids: Vec::new(),
+        };
+        assert!(matches!(
+            repo.apply_html_migration(vec![bad]),
+            Err(CoreError::MigrationValidation(_))
+        ));
+        let unchanged = repo.get_note(&note.id).unwrap().unwrap();
+        assert_eq!(unchanged.body, "old");
+        assert_eq!(unchanged.markup_language, 1);
+        assert_eq!(unchanged.body_rtf, b"rtf".to_vec());
+        assert!(matches!(
+            repo.apply_html_migration(Vec::new()),
+            Err(CoreError::MigrationValidation(_))
+        ));
+        assert!(matches!(
+            repo.apply_html_migration(vec![HtmlNoteConversion {
+                id: "ffffffffffffffffffffffffffffffff".into(),
+                body: "<p>new</p>".into(),
+                body_text: "new".into(),
+                resource_ids: Vec::new(),
+            }]),
+            Err(CoreError::MigrationValidation(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_rejects_symlink_preexisting_and_out_of_profile_targets() {
+        let temp = tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let repo = NoteRepository::open(profile.join("notes.sqlite")).unwrap();
+        let existing = profile.join("existing.sqlite");
+        std::fs::write(&existing, b"existing").unwrap();
+        assert!(matches!(
+            repo.backup_before_html_migration_to(&existing),
+            Err(CoreError::InvalidBackupTarget)
+        ));
+        let target = profile.join("target.sqlite");
+        let outside = temp.path().join("outside.sqlite");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+        assert!(matches!(
+            repo.backup_before_html_migration_to(&target),
+            Err(CoreError::InvalidBackupTarget)
+        ));
+        assert!(matches!(
+            repo.backup_before_html_migration_to(&outside),
+            Err(CoreError::InvalidBackupTarget)
+        ));
     }
 }
