@@ -1,13 +1,28 @@
 use crate::note_preview::NotePreview;
 
-use objc2::{ClassType, MainThreadOnly, rc::Retained};
+use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send, rc::Retained};
 use objc2_app_kit::{
     NSBox, NSBoxType, NSCollectionView, NSCollectionViewFlowLayout, NSCollectionViewItem, NSColor,
     NSFont, NSImage, NSImageScaling, NSImageView, NSLineBreakMode, NSTextAlignment, NSTextField,
 };
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 pub const NOTE_CARD_IDENTIFIER: &str = "joplin-lite-note-card";
+
+struct NoteCardViewIvars {
+    image_view: Retained<NSImageView>,
+    title: Retained<NSTextField>,
+    snippet: Retained<NSTextField>,
+    updated: Retained<NSTextField>,
+}
+
+define_class!(
+    #[unsafe(super = NSBox)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = NoteCardViewIvars]
+    struct NoteCardView;
+    unsafe impl NSObjectProtocol for NoteCardView {}
+);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrowserMetrics {
@@ -287,100 +302,116 @@ pub fn configure_note_card(
     metrics: BrowserMetrics,
     mtm: MainThreadMarker,
 ) {
-    let card = match item.view().downcast::<NSBox>() {
+    let card = match item.view().downcast::<NoteCardView>() {
         Ok(card) => card,
         Err(_) => {
-            let card = build_note_card(metrics, mtm);
+            let card = NoteCardView::new(mtm, metrics);
             item.setView(&card);
             card
         }
     };
-    card.setFrame(NSRect::new(
-        NSPoint::new(0.0, 0.0),
-        NSSize::new(metrics.card_width, metrics.card_height),
-    ));
-    let border_color = if selected {
-        evernote_green()
-    } else {
-        NSColor::separatorColor()
-    };
-    card.setBorderColor(&border_color);
-
-    let frames = card_layout(metrics, image.is_some());
-    let subviews = card.subviews();
-    let image_view = subviews
-        .objectAtIndex(0)
-        .downcast::<NSImageView>()
-        .expect("note card image view");
-    image_view.setFrame(frame_from_tuple(frames.image));
-    image_view.setImage(image);
-    image_view.setHidden(image.is_none());
-    image_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-    let title = subviews
-        .objectAtIndex(1)
-        .downcast::<NSTextField>()
-        .expect("note card title");
-    title.setFrame(frame_from_tuple(frames.title));
-    let snippet = subviews
-        .objectAtIndex(2)
-        .downcast::<NSTextField>()
-        .expect("note card snippet");
-    snippet.setFrame(frame_from_tuple(frames.snippet));
-    let updated = subviews
-        .objectAtIndex(3)
-        .downcast::<NSTextField>()
-        .expect("note card updated label");
-    updated.setFrame(frame_from_tuple(frames.updated));
-    title.setStringValue(&NSString::from_str(&preview.title));
-    snippet.setStringValue(&NSString::from_str(&preview.snippet));
-    updated.setStringValue(&NSString::from_str(&preview.updated_label));
+    card.configure(preview, image, selected, metrics);
 }
 
-fn build_note_card(metrics: BrowserMetrics, mtm: MainThreadMarker) -> Retained<NSBox> {
-    let frames = card_layout(metrics, false);
-    let card = NSBox::initWithFrame(
-        NSBox::alloc(mtm),
-        NSRect::new(
+impl NoteCardView {
+    fn new(mtm: MainThreadMarker, metrics: BrowserMetrics) -> Retained<Self> {
+        let frames = card_layout(metrics, false);
+        let image_view =
+            NSImageView::initWithFrame(NSImageView::alloc(mtm), frame_from_tuple(frames.image));
+        image_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        image_view.setHidden(true);
+        let title = card_label(
+            mtm,
+            "",
+            frame_from_tuple(frames.title),
+            13.0,
+            NSColor::labelColor(),
+            2,
+        );
+        let snippet = card_label(
+            mtm,
+            "",
+            frame_from_tuple(frames.snippet),
+            11.0,
+            NSColor::secondaryLabelColor(),
+            2,
+        );
+        let updated = card_label(
+            mtm,
+            "",
+            frame_from_tuple(frames.updated),
+            10.0,
+            NSColor::tertiaryLabelColor(),
+            1,
+        );
+        let this = Self::alloc(mtm).set_ivars(NoteCardViewIvars {
+            image_view,
+            title,
+            snippet,
+            updated,
+        });
+        let card: Retained<Self> = unsafe {
+            msg_send![super(this), initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(metrics.card_width, metrics.card_height),
+            )]
+        };
+        card.setBoxType(NSBoxType::Custom);
+        card.setTransparent(false);
+        card.setCornerRadius(8.0);
+        card.setBorderWidth(1.0);
+        card.setFillColor(&NSColor::textBackgroundColor());
+        card.addSubview(&card.ivars().image_view);
+        card.addSubview(&card.ivars().title);
+        card.addSubview(&card.ivars().snippet);
+        card.addSubview(&card.ivars().updated);
+        card
+    }
+
+    fn configure(
+        &self,
+        preview: &NotePreview,
+        image: Option<&NSImage>,
+        selected: bool,
+        metrics: BrowserMetrics,
+    ) {
+        self.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
             NSSize::new(metrics.card_width, metrics.card_height),
-        ),
-    );
-    card.setBoxType(NSBoxType::Custom);
-    card.setTransparent(false);
-    card.setCornerRadius(8.0);
-    card.setBorderWidth(1.0);
-    card.setFillColor(&NSColor::textBackgroundColor());
+        ));
+        let border_color = if selected {
+            evernote_green()
+        } else {
+            NSColor::separatorColor()
+        };
+        self.setBorderColor(&border_color);
 
-    let image_view =
-        NSImageView::initWithFrame(NSImageView::alloc(mtm), frame_from_tuple(frames.image));
-    image_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-    image_view.setHidden(true);
-    card.addSubview(&image_view);
-    card.addSubview(&card_label(
-        mtm,
-        "",
-        frame_from_tuple(frames.title),
-        13.0,
-        NSColor::labelColor(),
-        2,
-    ));
-    card.addSubview(&card_label(
-        mtm,
-        "",
-        frame_from_tuple(frames.snippet),
-        11.0,
-        NSColor::secondaryLabelColor(),
-        2,
-    ));
-    card.addSubview(&card_label(
-        mtm,
-        "",
-        frame_from_tuple(frames.updated),
-        10.0,
-        NSColor::tertiaryLabelColor(),
-        1,
-    ));
-    card
+        let frames = card_layout(metrics, image.is_some());
+        self.ivars()
+            .image_view
+            .setFrame(frame_from_tuple(frames.image));
+        self.ivars().image_view.setImage(image);
+        self.ivars().image_view.setHidden(image.is_none());
+        self.ivars()
+            .image_view
+            .setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        self.ivars().title.setFrame(frame_from_tuple(frames.title));
+        self.ivars()
+            .snippet
+            .setFrame(frame_from_tuple(frames.snippet));
+        self.ivars()
+            .updated
+            .setFrame(frame_from_tuple(frames.updated));
+        self.ivars()
+            .title
+            .setStringValue(&NSString::from_str(&preview.title));
+        self.ivars()
+            .snippet
+            .setStringValue(&NSString::from_str(&preview.snippet));
+        self.ivars()
+            .updated
+            .setStringValue(&NSString::from_str(&preview.updated_label));
+    }
 }
 
 fn evernote_green() -> Retained<NSColor> {
@@ -465,7 +496,15 @@ mod tests {
                 image_id: Some("image-a".into()),
             }
         );
-        assert_eq!(card_visual_state(&without_image).image_id, None);
+        assert_eq!(
+            card_visual_state(&without_image),
+            CardVisualState {
+                title: "B".into(),
+                snippet: "new".into(),
+                updated_label: "昨天".into(),
+                image_id: None,
+            }
+        );
     }
 
     #[test]
