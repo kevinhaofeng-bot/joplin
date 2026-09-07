@@ -9,7 +9,7 @@ use joplin_lite_native::html_body::{
 };
 use joplin_lite_native::native_editor::{
     InlineCommand, NativeEditorSession, apply_committed_text_delta, apply_inline_command,
-    document_from_session, insert_image_anchor, session_from_document,
+    document_from_session, insert_image_anchor, render_session, session_from_document,
 };
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
@@ -43,7 +43,6 @@ use objc2_foundation::{
     NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSURL, ns_string,
 };
 use std::cell::{OnceCell, RefCell};
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -85,6 +84,10 @@ fn paste_route(body_is_first_responder: bool, has_current_note: bool) -> PasteRo
     } else {
         PasteRoute::NativeResponder
     }
+}
+
+fn should_sync_editor_change(has_marked_text: bool, loading_guard: bool) -> bool {
+    !has_marked_text && !loading_guard
 }
 
 fn resource_id_attribute_key() -> Retained<NSAttributedStringKey> {
@@ -265,6 +268,7 @@ fn document_from_attributed_string(
     ))
 }
 
+#[allow(dead_code)]
 fn attributed_text_with_marks(text: &str, marks: &Marks) -> Retained<NSMutableAttributedString> {
     let attributed = NSMutableAttributedString::from_nsstring(&NSString::from_str(text));
     if text.is_empty() {
@@ -298,6 +302,7 @@ fn attributed_text_with_marks(text: &str, marks: &Marks) -> Retained<NSMutableAt
     attributed
 }
 
+#[allow(dead_code)]
 fn render_document_to_attributed_string<F>(
     document: &Document,
     mut resource_loader: F,
@@ -369,24 +374,6 @@ where
         }
     }
     (output, attachment_failures)
-}
-
-fn render_note_document(
-    document: &Document,
-    repository: &NoteRepository,
-    available_width: f64,
-) -> (Retained<NSMutableAttributedString>, usize) {
-    let mut resources = HashMap::new();
-    for resource_id in resource_ids(document) {
-        if let Ok(Some(resource)) = repository.get_resource(&resource_id) {
-            resources.insert(resource_id, resource);
-        }
-    }
-    render_document_to_attributed_string(
-        document,
-        |resource_id| resources.get(resource_id).cloned(),
-        available_width,
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1314,7 +1301,15 @@ define_class!(
     }
     unsafe impl NSTextDelegate for AppDelegate {
         #[unsafe(method(textDidChange:))]
+        #[allow(deprecated)]
         fn text_did_change(&self, _notification: &NSNotification) {
+            let loading_guard = *self.ivars().loading_guard.borrow();
+            let Some(body) = self.ivars().body_view.get() else {
+                return;
+            };
+            if !should_sync_editor_change(body.hasMarkedText(), loading_guard) {
+                return;
+            }
             self.sync_editor_session_from_view();
             self.save_current_note();
         }
@@ -1469,29 +1464,37 @@ define_class!(
 
 impl AppDelegate {
     fn refresh_body_from_session(&self) {
-        let Some(document) = self
-            .ivars()
-            .editor_session
-            .borrow()
-            .as_ref()
-            .and_then(|session| document_from_session(session).ok())
-        else {
-            return;
-        };
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
-        let (rendered, failures) = render_note_document(
-            &document,
-            &self.ivars().repository,
-            text_container_available_width(body),
-        );
+        let selection = body.selectedRange();
+        let rendered = {
+            let session_guard = self.ivars().editor_session.borrow();
+            let Some(session) = session_guard.as_ref() else {
+                return;
+            };
+            render_session(
+                session,
+                |resource_id| {
+                    self.ivars()
+                        .repository
+                        .get_resource(resource_id)
+                        .ok()
+                        .flatten()
+                },
+                text_container_available_width(body),
+            )
+        };
+        let failures = rendered.missing_resources;
         let previous_loading_guard = *self.ivars().loading_guard.borrow();
         *self.ivars().loading_guard.borrow_mut() = true;
         if let Some(storage) = unsafe { body.textStorage() } {
-            storage.setAttributedString(&rendered);
+            storage.setAttributedString(&rendered.attributed);
         }
-        body.setSelectedRange(NSRange::new(0, 0));
+        let max_length = rendered.attributed.string().length();
+        let location = selection.location.min(max_length);
+        let length = selection.length.min(max_length.saturating_sub(location));
+        body.setSelectedRange(NSRange::new(location, length));
         *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
         if failures == 0 {
             self.set_save_status("已保存", false);
@@ -1510,6 +1513,7 @@ impl AppDelegate {
             .unwrap_or((false, false))
     }
 
+    #[allow(deprecated)]
     fn sync_editor_session_from_view(&self) {
         if *self.ivars().loading_guard.borrow() {
             return;
@@ -1517,6 +1521,9 @@ impl AppDelegate {
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
+        if body.hasMarkedText() {
+            return;
+        }
         let Some(storage) = (unsafe { body.textStorage() }) else {
             return;
         };
@@ -2011,6 +2018,7 @@ impl AppDelegate {
             return;
         }
         let range = body.selectedRange();
+        let mut semantic_changed = false;
         if range.length > 0 {
             let command = match format {
                 TextFormat::Bold => Some(InlineCommand::Bold),
@@ -2021,8 +2029,18 @@ impl AppDelegate {
             if let Some(command) = command
                 && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
             {
-                let _ = apply_inline_command(session, range, command);
+                semantic_changed = apply_inline_command(session, range, command).is_ok();
             }
+        }
+        if range.length > 0 && semantic_changed {
+            self.refresh_body_from_session();
+            body.setSelectedRange(range);
+            if let Some(window) = self.ivars().window.get() {
+                window.makeFirstResponder(Some(body));
+            }
+            self.update_formatting_buttons();
+            self.save_current_note();
+            return;
         }
         let active = if range.length == 0 {
             self.typing_style_active(body, format)
@@ -2562,23 +2580,36 @@ impl AppDelegate {
             .setStringValue(&NSString::from_str(&note.title));
         let body = self.ivars().body_view.get().unwrap();
         let (status, is_error) = match parse_html(&note.body) {
-            Ok(document) => {
-                let session = session_from_document(&document).ok();
-                let (rendered, failures) = render_note_document(
-                    &document,
-                    &self.ivars().repository,
-                    text_container_available_width(body),
-                );
-                if let Some(storage) = unsafe { body.textStorage() } {
-                    storage.setAttributedString(&rendered);
+            Ok(document) => match session_from_document(&document) {
+                Ok(session) => {
+                    let rendered = render_session(
+                        &session,
+                        |resource_id| {
+                            self.ivars()
+                                .repository
+                                .get_resource(resource_id)
+                                .ok()
+                                .flatten()
+                        },
+                        text_container_available_width(body),
+                    );
+                    if let Some(storage) = unsafe { body.textStorage() } {
+                        storage.setAttributedString(&rendered.attributed);
+                    }
+                    *self.ivars().editor_session.borrow_mut() = Some(session);
+                    if rendered.missing_resources == 0 {
+                        ("已保存", false)
+                    } else {
+                        ("部分图片未恢复，已保留引用", true)
+                    }
                 }
-                *self.ivars().editor_session.borrow_mut() = session;
-                if failures == 0 {
-                    ("已保存", false)
-                } else {
-                    ("部分图片未恢复，已保留引用", true)
+                Err(error) => {
+                    eprintln!("native editor load failed: {error}");
+                    *self.ivars().editor_session.borrow_mut() = None;
+                    body.setString(ns_string!("正文无法读取"));
+                    ("正文无法读取", true)
                 }
-            }
+            },
             Err(_) => {
                 *self.ivars().editor_session.borrow_mut() = None;
                 body.setString(ns_string!("正文无法读取"));
@@ -2784,8 +2815,15 @@ impl AppDelegate {
         }
     }
 
+    #[allow(deprecated)]
     fn save_current_note(&self) -> bool {
-        if *self.ivars().loading_guard.borrow() {
+        if *self.ivars().loading_guard.borrow()
+            || self
+                .ivars()
+                .body_view
+                .get()
+                .is_some_and(|body| body.hasMarkedText())
+        {
             return false;
         }
         self.save_current_note_unchecked()
@@ -3454,6 +3492,14 @@ mod tests {
             rendered.string().to_string(),
             "中文😀\u{2028}第二段\n第三段"
         );
+    }
+
+    #[test]
+    fn ime_marked_text_skips_semantic_sync_and_save_until_commit() {
+        assert!(!super::should_sync_editor_change(true, false));
+        assert!(!super::should_sync_editor_change(true, true));
+        assert!(!super::should_sync_editor_change(false, true));
+        assert!(super::should_sync_editor_change(false, false));
     }
 
     #[test]

@@ -11,9 +11,12 @@ use crate::html_body::{
 };
 use objc2::{AnyThread, rc::Retained};
 use objc2_app_kit::{
-    NSAttachmentAttributeName, NSAttributedStringAttachmentConveniences, NSFont,
-    NSFontAttributeName, NSImage, NSMutableParagraphStyle, NSParagraphStyleAttributeName,
-    NSTextAlignment, NSTextAttachment,
+    NSAttributedStringAttachmentConveniences, NSBackgroundColorAttributeName, NSColor, NSFont,
+    NSFontAttributeName, NSFontDescriptorSymbolicTraits, NSImage, NSMutableParagraphStyle,
+    NSParagraphStyleAttributeName, NSStrikethroughStyleAttributeName, NSTextAlignment,
+    NSTextAttachment, NSTextList, NSTextListMarkerBox, NSTextListMarkerCheck,
+    NSTextListMarkerDecimal, NSTextListMarkerDisc, NSTextListOptions, NSUnderlineStyle,
+    NSUnderlineStyleAttributeName,
 };
 use objc2_foundation::{
     NSAttributedString, NSAttributedStringKey, NSData, NSMutableAttributedString, NSNumber,
@@ -32,7 +35,6 @@ const RESOURCE_ALT_KEY: &str = "com.kevinhao.joplin-lite.resource-alt";
 const RESOURCE_WIDTH_KEY: &str = "com.kevinhao.joplin-lite.resource-width";
 const RESOURCE_HEIGHT_KEY: &str = "com.kevinhao.joplin-lite.resource-height";
 const MISSING_RESOURCE_KEY: &str = "com.kevinhao.joplin-lite.missing-resource";
-const PROJECTION_PREFIX_KEY: &str = "com.kevinhao.joplin-lite.projection-prefix";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EditorCodecError {
@@ -86,6 +88,9 @@ pub struct NativeEditorSession {
     pub(crate) text: TextDocument,
     pub(crate) revision: u64,
     image_dimensions: HashMap<String, (u32, u32)>,
+    highlighted_ranges: Vec<(usize, usize)>,
+    highlight_undo: Vec<Vec<(usize, usize)>>,
+    highlight_redo: Vec<Vec<(usize, usize)>>,
 }
 
 static EDITOR_BACKEND: OnceLock<text_document::DocumentBackend> = OnceLock::new();
@@ -119,14 +124,33 @@ impl NativeEditorSession {
 
     pub fn undo(&mut self) -> Result<(), EditorCodecError> {
         self.text.undo().map_err(model_error)?;
+        if let Some(previous) = self.highlight_undo.pop() {
+            self.highlight_redo.push(self.highlighted_ranges.clone());
+            self.highlighted_ranges = previous;
+        }
         self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
     pub fn redo(&mut self) -> Result<(), EditorCodecError> {
         self.text.redo().map_err(model_error)?;
+        if let Some(next) = self.highlight_redo.pop() {
+            self.highlight_undo.push(self.highlighted_ranges.clone());
+            self.highlighted_ranges = next;
+        }
         self.revision = self.revision.wrapping_add(1);
         Ok(())
+    }
+
+    fn checkpoint_highlights(&mut self) {
+        self.highlight_undo.push(self.highlighted_ranges.clone());
+        self.highlight_redo.clear();
+    }
+
+    fn is_highlighted(&self, position: usize) -> bool {
+        self.highlighted_ranges
+            .iter()
+            .any(|(start, end)| *start <= position && position < *end)
     }
 }
 
@@ -190,6 +214,31 @@ fn logical_block(block: Block) -> LogicalBlock {
     }
 }
 
+fn highlight_ranges(blocks: &[LogicalBlock]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut document_offset = 0usize;
+    for logical in blocks {
+        let mut local_offset = 0usize;
+        for inline in block_inlines(&logical.block) {
+            match inline {
+                Inline::Text { text, marks } => {
+                    let length = text.chars().count();
+                    if marks.highlight && length > 0 {
+                        ranges.push((
+                            document_offset + local_offset,
+                            document_offset + local_offset + length,
+                        ));
+                    }
+                    local_offset += length;
+                }
+                Inline::SoftBreak | Inline::Image { .. } => local_offset += 1,
+            }
+        }
+        document_offset += logical.text.chars().count() + logical.images.len() + 1;
+    }
+    ranges
+}
+
 pub fn session_from_document(document: &Document) -> Result<NativeEditorSession, EditorCodecError> {
     let blocks = logical_blocks(document);
     let text = blocks
@@ -201,14 +250,55 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
     let model = TextDocument::try_new_in(&backend).map_err(model_error)?;
     model.set_plain_text(&text).map_err(model_error)?;
 
-    let mut image_dimensions = HashMap::new();
-    let mut document_offset = 0usize;
+    let mut plain_offsets = Vec::with_capacity(blocks.len());
+    let mut plain_lengths = Vec::with_capacity(blocks.len());
+    let mut addressable_offsets = Vec::with_capacity(blocks.len());
+    let mut plain_offset = 0usize;
+    let mut addressable_offset = 0usize;
     for logical in &blocks {
+        let plain_length = logical.text.chars().count();
+        plain_offsets.push(plain_offset);
+        plain_lengths.push(plain_length);
+        addressable_offsets.push(addressable_offset);
+        plain_offset += plain_length + 1;
+        addressable_offset += plain_length + logical.images.len() + 1;
+    }
+    let mut index = 0usize;
+    while index < blocks.len() {
+        let Some(kind) = (match &blocks[index].block {
+            Block::List { kind, .. } => Some(*kind),
+            _ => None,
+        }) else {
+            index += 1;
+            continue;
+        };
+        let run_start = index;
+        index += 1;
+        while index < blocks.len()
+            && matches!(&blocks[index].block, Block::List { kind: next, .. } if *next == kind)
+        {
+            index += 1;
+        }
+        let start = plain_offsets[run_start];
+        let end = plain_offsets[index - 1] + plain_lengths[index - 1];
+        let cursor = model.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        let style = match kind {
+            ListKind::Ordered => ListStyle::Decimal,
+            ListKind::Unordered | ListKind::Checklist => ListStyle::Disc,
+        };
+        cursor.create_list(style).map_err(model_error)?;
+    }
+
+    let mut image_dimensions = HashMap::new();
+    for (index, logical) in blocks.iter().enumerate() {
+        let plain_offset = plain_offsets[index];
+        let addressable_offset = addressable_offsets[index];
         let block_len = logical.text.chars().count();
-        let cursor = model.cursor_at(document_offset);
-        cursor.set_position(document_offset + block_len, MoveMode::KeepAnchor);
+        let cursor = model.cursor_at(plain_offset);
+        cursor.set_position(plain_offset + block_len, MoveMode::KeepAnchor);
         apply_block_style(&cursor, &logical.block)?;
-        apply_list_style(&model, &cursor, &logical.block)?;
+        apply_list_item_style(&cursor, &logical.block)?;
 
         let mut local_offset = 0usize;
         let inlines = block_inlines(&logical.block);
@@ -217,11 +307,8 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
                 Inline::Text { text, marks } => {
                     let len = text.chars().count();
                     if len > 0 {
-                        let range = model.cursor_at(document_offset + local_offset);
-                        range.set_position(
-                            document_offset + local_offset + len,
-                            MoveMode::KeepAnchor,
-                        );
+                        let range = model.cursor_at(plain_offset + local_offset);
+                        range.set_position(plain_offset + local_offset + len, MoveMode::KeepAnchor);
                         range
                             .set_char_format(&text_format(marks))
                             .map_err(model_error)?;
@@ -240,7 +327,7 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
         // anchors from right to left so their positions are stable and never
         // require feeding an object sentinel through set_plain_text.
         for (position, resource_id, alt) in logical.images.iter().rev() {
-            let image = model.cursor_at(document_offset + *position);
+            let image = model.cursor_at(addressable_offset + *position);
             // TextDocument requires positive dimensions for an image anchor;
             // actual pixels stay in ResourceStore and are never copied here.
             image
@@ -250,7 +337,6 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
                 .entry(resource_id.clone())
                 .or_insert((1, 1));
         }
-        document_offset += block_len + logical.images.len() + 1;
     }
 
     Ok(NativeEditorSession {
@@ -258,6 +344,9 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
         text: model,
         revision: 0,
         image_dimensions,
+        highlighted_ranges: highlight_ranges(&blocks),
+        highlight_undo: Vec::new(),
+        highlight_redo: Vec::new(),
     })
 }
 
@@ -291,22 +380,13 @@ fn apply_block_style(cursor: &TextCursor, block: &Block) -> Result<(), EditorCod
         .map_err(model_error)
 }
 
-fn apply_list_style(
-    _model: &TextDocument,
-    cursor: &TextCursor,
-    block: &Block,
-) -> Result<(), EditorCodecError> {
+fn apply_list_item_style(cursor: &TextCursor, block: &Block) -> Result<(), EditorCodecError> {
     let Some(kind) = (match block {
         Block::List { kind, .. } => Some(*kind),
         _ => None,
     }) else {
         return Ok(());
     };
-    let style = match kind {
-        ListKind::Ordered => ListStyle::Decimal,
-        ListKind::Unordered | ListKind::Checklist => ListStyle::Disc,
-    };
-    cursor.create_list(style).map_err(model_error)?;
     if let ListKind::Checklist = kind {
         let marker = match block {
             Block::List { items, .. } => {
@@ -392,16 +472,21 @@ pub fn document_from_session(session: &NativeEditorSession) -> Result<Document, 
         let mut inlines = Vec::new();
         for fragment in snapshot.fragments {
             match fragment {
-                FragmentContent::Text { text, format, .. } => {
-                    for character in text.chars() {
+                FragmentContent::Text {
+                    text,
+                    format,
+                    offset,
+                    ..
+                } => {
+                    for (index, character) in text.chars().enumerate() {
                         if character == '\u{2028}' || character == '\u{000b}' {
                             inlines.push(Inline::SoftBreak);
                         } else if character != '\r' {
-                            append_text(
-                                &mut inlines,
-                                &character.to_string(),
-                                &marks_from_format(&format),
-                            );
+                            let mut marks = marks_from_format(&format);
+                            if session.is_highlighted(snapshot.position + offset + index) {
+                                marks.highlight = true;
+                            }
+                            append_text(&mut inlines, &character.to_string(), &marks);
                         }
                     }
                 }
@@ -533,6 +618,74 @@ fn utf16_range(text: &str, range: NSRange) -> Result<(usize, usize), EditorCodec
     }
 }
 
+fn adjust_highlight_ranges(
+    ranges: &mut Vec<(usize, usize)>,
+    start: usize,
+    end: usize,
+    replacement_length: usize,
+) {
+    let removed = end.saturating_sub(start);
+    let delta = replacement_length as isize - removed as isize;
+    let mut adjusted = Vec::new();
+    for (range_start, range_end) in ranges.drain(..) {
+        if range_end <= start {
+            adjusted.push((range_start, range_end));
+        } else if range_start >= end {
+            let shifted_start = (range_start as isize + delta) as usize;
+            let shifted_end = (range_end as isize + delta) as usize;
+            adjusted.push((shifted_start, shifted_end));
+        } else {
+            if range_start < start {
+                adjusted.push((range_start, start));
+            }
+            if range_end > end {
+                let suffix_start = start + replacement_length;
+                adjusted.push((suffix_start, suffix_start + range_end - end));
+            }
+        }
+    }
+    *ranges = adjusted;
+}
+
+fn toggle_highlight_range(session: &mut NativeEditorSession, start: usize, end: usize) {
+    let active = (start..end).all(|position| session.is_highlighted(position));
+    if active {
+        let mut result = Vec::new();
+        for (range_start, range_end) in session.highlighted_ranges.drain(..) {
+            if range_end <= start || range_start >= end {
+                result.push((range_start, range_end));
+                continue;
+            }
+            if range_start < start {
+                result.push((range_start, start));
+            }
+            if range_end > end {
+                result.push((end, range_end));
+            }
+        }
+        session.highlighted_ranges = result;
+    } else {
+        session.highlighted_ranges.push((start, end));
+    }
+}
+
+fn clear_highlight_range(session: &mut NativeEditorSession, start: usize, end: usize) {
+    let mut result = Vec::new();
+    for (range_start, range_end) in session.highlighted_ranges.drain(..) {
+        if range_end <= start || range_start >= end {
+            result.push((range_start, range_end));
+            continue;
+        }
+        if range_start < start {
+            result.push((range_start, start));
+        }
+        if range_end > end {
+            result.push((end, range_end));
+        }
+    }
+    session.highlighted_ranges = result;
+}
+
 pub fn apply_committed_text_delta(
     session: &mut NativeEditorSession,
     range: NSRange,
@@ -543,9 +696,16 @@ pub fn apply_committed_text_delta(
     }
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, range)?;
+    session.checkpoint_highlights();
     let cursor = session.text.cursor_at(start);
     cursor.set_position(end, MoveMode::KeepAnchor);
     cursor.insert_text(replacement).map_err(model_error)?;
+    adjust_highlight_ranges(
+        &mut session.highlighted_ranges,
+        start,
+        end,
+        replacement.chars().count(),
+    );
     session.revision = session.revision.wrapping_add(1);
     Ok(())
 }
@@ -563,11 +723,13 @@ pub fn insert_image_anchor(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    session.checkpoint_highlights();
     let cursor = session.text.cursor_at(start);
     cursor.set_position(end, MoveMode::KeepAnchor);
     cursor
         .insert_image(resource_id, alt, width.max(1), height.max(1))
         .map_err(model_error)?;
+    adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 1);
     session
         .image_dimensions
         .insert(resource_id.to_owned(), (width.max(1), height.max(1)));
@@ -587,6 +749,7 @@ pub fn apply_link(
     }
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    session.checkpoint_highlights();
     let cursor = session.text.cursor_at(start);
     cursor.set_position(end, MoveMode::KeepAnchor);
     let format = match url {
@@ -611,9 +774,19 @@ pub fn apply_inline_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    if matches!(command, InlineCommand::Highlight) {
+        session.checkpoint_highlights();
+        toggle_highlight_range(session, start, end);
+        session.revision = session.revision.wrapping_add(1);
+        return Ok(());
+    }
     let cursor = session.text.cursor_at(start);
     cursor.set_position(end, MoveMode::KeepAnchor);
     let active = query_inline_state(session, selection, command)? == SelectionState::Active;
+    session.checkpoint_highlights();
+    if matches!(command, InlineCommand::Clear) {
+        clear_highlight_range(session, start, end);
+    }
     let format = match command {
         InlineCommand::Bold => TextFormat {
             font_bold: Some(!active),
@@ -660,6 +833,7 @@ pub fn apply_block_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    session.checkpoint_highlights();
     let cursor = session.text.cursor_at(start);
     cursor.set_position(end, MoveMode::KeepAnchor);
     match command {
@@ -741,6 +915,7 @@ pub fn apply_paragraph_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    session.checkpoint_highlights();
     let cursor = session.text.cursor_at(start);
     cursor.set_position(end, MoveMode::KeepAnchor);
     match command {
@@ -795,6 +970,7 @@ pub fn toggle_checklist_at_utf16_location(
         Some(MarkerType::Unchecked) => MarkerType::Checked,
         _ => return false,
     };
+    session.checkpoint_highlights();
     if cursor
         .set_block_format(&BlockFormat {
             marker: Some(marker),
@@ -816,6 +992,18 @@ pub fn query_inline_state(
 ) -> Result<SelectionState, EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    if command == InlineCommand::Highlight {
+        let values: Vec<bool> = (start..end)
+            .map(|position| session.is_highlighted(position))
+            .collect();
+        if values.is_empty() || values.iter().all(|value| !*value) {
+            return Ok(SelectionState::Inactive);
+        }
+        if values.iter().all(|value| *value) {
+            return Ok(SelectionState::Active);
+        }
+        return Ok(SelectionState::Mixed);
+    }
     let mut values = Vec::new();
     for element in session.text.flow() {
         let FlowElement::Block(block) = element else {
@@ -860,81 +1048,233 @@ pub fn query_inline_state(
     }
 }
 
-fn style_for_block(_block_format: &text_document::BlockFormat, heading: bool) -> Retained<NSFont> {
-    let size = if heading { 22.0 } else { 17.0 };
-    NSFont::systemFontOfSize(size)
+fn style_for_text(format: &TextFormat, heading_level: Option<u8>) -> Retained<NSFont> {
+    let size = match heading_level {
+        Some(1) => 30.0,
+        Some(2) => 24.0,
+        Some(3) => 20.0,
+        _ => 17.0,
+    };
+    let mut font = NSFont::systemFontOfSize(size);
+    let descriptor = font.fontDescriptor();
+    let mut traits = descriptor.symbolicTraits();
+    if format.font_bold == Some(true) || format.font_weight.is_some_and(|weight| weight >= 600) {
+        traits.insert(NSFontDescriptorSymbolicTraits::TraitBold);
+    }
+    if format.font_italic == Some(true) {
+        traits.insert(NSFontDescriptorSymbolicTraits::TraitItalic);
+    }
+    if let Some(converted) =
+        NSFont::fontWithDescriptor_size(&descriptor.fontDescriptorWithSymbolicTraits(traits), size)
+    {
+        font = converted;
+    }
+    font
 }
 
-pub fn render_session<F>(session: &NativeEditorSession, mut load: F, width: f64) -> RenderedDocument
+fn list_for_snapshot(snapshot: &text_document::BlockSnapshot) -> Option<Retained<NSTextList>> {
+    let list = snapshot.list_info.as_ref()?;
+    let marker = unsafe {
+        match snapshot.block_format.marker {
+            Some(MarkerType::Checked) => NSTextListMarkerCheck,
+            Some(MarkerType::Unchecked) => NSTextListMarkerBox,
+            _ if matches!(list.style, ListStyle::Decimal) => NSTextListMarkerDecimal,
+            _ => NSTextListMarkerDisc,
+        }
+    };
+    Some(NSTextList::initWithMarkerFormat_options_startingItemNumber(
+        NSTextList::alloc(),
+        marker,
+        NSTextListOptions::empty(),
+        1,
+    ))
+}
+
+fn paragraph_style_for_snapshot(
+    snapshot: &text_document::BlockSnapshot,
+) -> Retained<NSMutableParagraphStyle> {
+    let paragraph = NSMutableParagraphStyle::new();
+    paragraph.setAlignment(match snapshot.block_format.alignment {
+        Some(TdAlignment::Center) => NSTextAlignment::Center,
+        Some(TdAlignment::Right) => NSTextAlignment::Right,
+        Some(TdAlignment::Justify) => NSTextAlignment::Justified,
+        _ => NSTextAlignment::Left,
+    });
+    paragraph.setHeadIndent(f64::from(snapshot.block_format.indent.unwrap_or(0)) * 24.0);
+    if let Some(list) = list_for_snapshot(snapshot) {
+        let list_ref: &NSTextList = &list;
+        let lists = objc2_foundation::NSArray::<NSTextList>::from_slice(&[list_ref]);
+        paragraph.setTextLists(&lists);
+    }
+    paragraph
+}
+
+fn apply_text_attributes(
+    piece: &NSMutableAttributedString,
+    format: &TextFormat,
+    heading_level: Option<u8>,
+    paragraph: &NSMutableParagraphStyle,
+) {
+    let range = NSRange::new(0, piece.string().length());
+    if range.length == 0 {
+        return;
+    }
+    let font = style_for_text(format, heading_level);
+    unsafe {
+        piece.addAttribute_value_range(NSFontAttributeName, &font, range);
+        piece.addAttribute_value_range(NSParagraphStyleAttributeName, paragraph, range);
+        if format.font_underline == Some(true) {
+            let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
+            piece.addAttribute_value_range(NSUnderlineStyleAttributeName, &value, range);
+        }
+        if format.font_strikeout == Some(true) {
+            let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
+            piece.addAttribute_value_range(NSStrikethroughStyleAttributeName, &value, range);
+        }
+        if let Some(color) = format.background_color {
+            let value = NSColor::colorWithRed_green_blue_alpha(
+                f64::from(color.red) / 255.0,
+                f64::from(color.green) / 255.0,
+                f64::from(color.blue) / 255.0,
+                f64::from(color.alpha) / 255.0,
+            );
+            piece.addAttribute_value_range(NSBackgroundColorAttributeName, &value, range);
+        }
+        if let Some(href) = &format.anchor_href {
+            let key = NSAttributedStringKey::from_str("NSLink");
+            if let Some(value) = NSURL::initWithString(NSURL::alloc(), &NSString::from_str(href)) {
+                piece.addAttribute_value_range(&key, &value, range);
+            }
+        }
+    }
+}
+
+fn apply_highlight_overlay(
+    piece: &NSMutableAttributedString,
+    session: &NativeEditorSession,
+    start: usize,
+    text: &str,
+) {
+    let color = NSColor::systemYellowColor();
+    let mut utf16_offset = 0usize;
+    for (index, character) in text.chars().enumerate() {
+        let utf16_length = character.len_utf16();
+        if session.is_highlighted(start + index) {
+            unsafe {
+                piece.addAttribute_value_range(
+                    NSBackgroundColorAttributeName,
+                    &color,
+                    NSRange::new(utf16_offset, utf16_length),
+                );
+            }
+        }
+        utf16_offset += utf16_length;
+    }
+}
+
+fn attachment_piece(
+    resource: Option<&StoredResource>,
+    name: &str,
+    alt: &str,
+    width: u32,
+    height: u32,
+    available_width: f64,
+) -> Retained<NSMutableAttributedString> {
+    let attachment = match resource {
+        Some(resource) => {
+            let data = NSData::with_bytes(&resource.bytes);
+            let attachment =
+                NSTextAttachment::initWithData_ofType(NSTextAttachment::alloc(), Some(&data), None);
+            if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+                attachment.setImage(Some(&image));
+                let ratio = if image.size().width > 0.0 {
+                    (available_width / image.size().width).min(1.0)
+                } else {
+                    1.0
+                };
+                attachment.setBounds(objc2_foundation::NSRect::new(
+                    objc2_foundation::NSPoint::new(0.0, 0.0),
+                    NSSize::new(image.size().width * ratio, image.size().height * ratio),
+                ));
+            }
+            attachment
+        }
+        None => NSTextAttachment::init(NSTextAttachment::alloc()),
+    };
+    let attributed = NSAttributedString::attributedStringWithAttachment(&attachment);
+    let piece = NSMutableAttributedString::from_attributed_nsstring(&attributed);
+    let range = NSRange::new(0, 1);
+    unsafe {
+        piece.addAttribute_value_range(
+            &NSString::from_str(RESOURCE_ID_KEY),
+            &NSString::from_str(name),
+            range,
+        );
+        piece.addAttribute_value_range(
+            &NSString::from_str(RESOURCE_ALT_KEY),
+            &NSString::from_str(alt),
+            range,
+        );
+        piece.addAttribute_value_range(
+            &NSString::from_str(RESOURCE_WIDTH_KEY),
+            &NSNumber::numberWithUnsignedLongLong(width as u64),
+            range,
+        );
+        piece.addAttribute_value_range(
+            &NSString::from_str(RESOURCE_HEIGHT_KEY),
+            &NSNumber::numberWithUnsignedLongLong(height as u64),
+            range,
+        );
+        if resource.is_none() {
+            piece.addAttribute_value_range(
+                &NSString::from_str(MISSING_RESOURCE_KEY),
+                &NSString::from_str("1"),
+                range,
+            );
+        }
+    }
+    piece
+}
+
+pub fn render_session<F>(
+    session: &NativeEditorSession,
+    mut load: F,
+    _width: f64,
+) -> RenderedDocument
 where
     F: FnMut(&str) -> Option<StoredResource>,
 {
     let output = NSMutableAttributedString::from_nsstring(&NSString::from_str(""));
     let mut missing_resources = 0;
-    let _ = width;
+    let mut rendered_blocks = 0;
     for element in session.text.flow() {
         let FlowElement::Block(block) = element else {
             continue;
         };
         let snapshot = block.snapshot();
-        let heading = snapshot
+        if rendered_blocks > 0 {
+            output.appendAttributedString(&NSMutableAttributedString::from_nsstring(
+                &NSString::from_str("\n"),
+            ));
+        }
+        rendered_blocks += 1;
+        let paragraph = paragraph_style_for_snapshot(&snapshot);
+        let heading_level = snapshot
             .block_format
             .heading_level
-            .is_some_and(|level| level > 0);
-        if let Some(list) = snapshot.list_info.as_ref() {
-            let marker = match snapshot.block_format.marker {
-                Some(MarkerType::Checked) => "☑".to_owned(),
-                Some(MarkerType::Unchecked) => "☐".to_owned(),
-                _ => list.marker.clone(),
-            };
-            let prefix = NSMutableAttributedString::from_nsstring(&NSString::from_str(&format!(
-                "{marker} "
-            )));
-            let prefix_key = NSString::from_str(PROJECTION_PREFIX_KEY);
-            let marker_value = NSString::from_str("1");
-            unsafe {
-                prefix.addAttribute_value_range(
-                    &prefix_key,
-                    &marker_value,
-                    NSRange::new(0, prefix.string().length()),
-                );
-            }
-            output.appendAttributedString(&prefix);
-        }
+            .filter(|level| *level > 0);
         for fragment in snapshot.fragments {
             match fragment {
-                FragmentContent::Text { text, format, .. } => {
+                FragmentContent::Text {
+                    text,
+                    format,
+                    offset,
+                    ..
+                } => {
                     let piece =
                         NSMutableAttributedString::from_nsstring(&NSString::from_str(&text));
-                    let range = NSRange::new(0, piece.string().length());
-                    let font = style_for_block(&format_to_block(&format), heading);
-                    let paragraph = NSMutableParagraphStyle::new();
-                    paragraph.setAlignment(match snapshot.block_format.alignment {
-                        Some(TdAlignment::Center) => NSTextAlignment::Center,
-                        Some(TdAlignment::Right) => NSTextAlignment::Right,
-                        Some(TdAlignment::Justify) => NSTextAlignment::Justified,
-                        _ => NSTextAlignment::Left,
-                    });
-                    paragraph
-                        .setHeadIndent(f64::from(snapshot.block_format.indent.unwrap_or(0)) * 24.0);
-                    unsafe {
-                        piece.addAttribute_value_range(NSFontAttributeName, &font, range);
-                        piece.addAttribute_value_range(
-                            NSParagraphStyleAttributeName,
-                            &paragraph,
-                            range,
-                        );
-                    }
-                    if let Some(href) = format.anchor_href {
-                        let key = NSAttributedStringKey::from_str("NSLink");
-                        let value =
-                            NSURL::initWithString(NSURL::alloc(), &NSString::from_str(&href));
-                        if let Some(value) = value {
-                            unsafe {
-                                piece.addAttribute_value_range(&key, &value, range);
-                            }
-                        }
-                    }
+                    apply_text_attributes(&piece, &format, heading_level, &paragraph);
+                    apply_highlight_overlay(&piece, session, snapshot.position + offset, &text);
                     output.appendAttributedString(&piece);
                 }
                 FragmentContent::Image {
@@ -944,86 +1284,24 @@ where
                     height: image_height,
                     ..
                 } => {
-                    let Some(resource) = load(&name) else {
+                    let resource = load(&name);
+                    if resource.is_none() {
                         missing_resources += 1;
-                        let text = if alt.is_empty() {
-                            "[图片]".to_owned()
-                        } else {
-                            format!("[图片：{alt}]")
-                        };
-                        let placeholder =
-                            NSMutableAttributedString::from_nsstring(&NSString::from_str(&text));
-                        let marker_key = NSString::from_str(MISSING_RESOURCE_KEY);
-                        let marker = NSString::from_str("1");
-                        let id_key = NSString::from_str(RESOURCE_ID_KEY);
-                        let alt_key = NSString::from_str(RESOURCE_ALT_KEY);
-                        unsafe {
-                            placeholder.addAttribute_value_range(
-                                &marker_key,
-                                &marker,
-                                NSRange::new(0, placeholder.string().length()),
-                            );
-                            placeholder.addAttribute_value_range(
-                                &id_key,
-                                &NSString::from_str(&name),
-                                NSRange::new(0, placeholder.string().length()),
-                            );
-                            placeholder.addAttribute_value_range(
-                                &alt_key,
-                                &NSString::from_str(&alt),
-                                NSRange::new(0, placeholder.string().length()),
-                            );
-                        }
-                        output.appendAttributedString(&placeholder);
-                        continue;
                     };
-                    let data = NSData::with_bytes(&resource.bytes);
-                    let attachment = NSTextAttachment::initWithData_ofType(
-                        NSTextAttachment::alloc(),
-                        Some(&data),
-                        None,
+                    let piece = attachment_piece(
+                        resource.as_ref(),
+                        &name,
+                        &alt,
+                        image_width.max(1),
+                        image_height.max(1),
+                        _width.max(1.0),
                     );
-                    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
-                        attachment.setImage(Some(&image));
-                        let ratio = if image.size().width > 0.0 {
-                            (width / image.size().width).min(1.0)
-                        } else {
-                            1.0
-                        };
-                        attachment.setBounds(objc2_foundation::NSRect::new(
-                            objc2_foundation::NSPoint::new(0.0, 0.0),
-                            NSSize::new(image.size().width * ratio, image.size().height * ratio),
-                        ));
-                    }
-                    let attributed =
-                        NSAttributedString::attributedStringWithAttachment(&attachment);
-                    let piece = NSMutableAttributedString::from_attributed_nsstring(&attributed);
                     unsafe {
-                        let id_key = NSString::from_str(RESOURCE_ID_KEY);
-                        let alt_key = NSString::from_str(RESOURCE_ALT_KEY);
-                        let width_key = NSString::from_str(RESOURCE_WIDTH_KEY);
-                        let height_key = NSString::from_str(RESOURCE_HEIGHT_KEY);
                         piece.addAttribute_value_range(
-                            &id_key,
-                            &NSString::from_str(&name),
+                            NSParagraphStyleAttributeName,
+                            &paragraph,
                             NSRange::new(0, 1),
                         );
-                        piece.addAttribute_value_range(
-                            &alt_key,
-                            &NSString::from_str(&alt),
-                            NSRange::new(0, 1),
-                        );
-                        piece.addAttribute_value_range(
-                            &width_key,
-                            &NSNumber::numberWithUnsignedLongLong(image_width as u64),
-                            NSRange::new(0, 1),
-                        );
-                        piece.addAttribute_value_range(
-                            &height_key,
-                            &NSNumber::numberWithUnsignedLongLong(image_height as u64),
-                            NSRange::new(0, 1),
-                        );
-                        let _ = NSAttachmentAttributeName;
                     }
                     output.appendAttributedString(&piece);
                 }
@@ -1034,18 +1312,11 @@ where
                 }
             }
         }
-        output.appendAttributedString(&NSMutableAttributedString::from_nsstring(
-            &NSString::from_str("\n"),
-        ));
     }
     RenderedDocument {
         attributed: output,
         missing_resources,
     }
-}
-
-fn format_to_block(_format: &TextFormat) -> text_document::BlockFormat {
-    text_document::BlockFormat::default()
 }
 
 fn valid_editor_link(value: &str) -> bool {
@@ -1103,6 +1374,11 @@ fn strip_editor_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_app_kit::{
+        NSBackgroundColorAttributeName, NSFontAttributeName, NSParagraphStyle,
+        NSStrikethroughStyleAttributeName, NSUnderlineStyleAttributeName,
+    };
+    use std::ptr::null_mut;
 
     fn note() -> Document {
         Document::from_blocks(vec![
@@ -1223,5 +1499,188 @@ mod tests {
             SelectionState::Inactive
         );
         assert_eq!(session.text.to_addressable_text().unwrap(), "abc");
+    }
+
+    #[test]
+    fn renderer_underlying_text_matches_addressable_text_without_projection_prefixes() {
+        let session = session_from_document(&note()).unwrap();
+        let expected = session.text.to_addressable_text().unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+
+        assert_eq!(rendered.attributed.string().to_string(), expected);
+        assert_eq!(
+            rendered.attributed.string().to_string(),
+            "标题😀\n\u{fffc} item"
+        );
+        assert_eq!(rendered.missing_resources, 1);
+    }
+
+    #[test]
+    fn renderer_separates_list_items_with_native_text_list_markers() {
+        let document = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Unordered,
+            items: vec![
+                ListItem {
+                    checked: None,
+                    style: BlockStyle {
+                        indent: 2,
+                        ..BlockStyle::default()
+                    },
+                    inlines: vec![Inline::Text {
+                        text: "one".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "two".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+            ],
+        }]);
+        let session = session_from_document(&document).unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+        assert_eq!(
+            rendered.attributed.string().to_string(),
+            session.text.to_addressable_text().unwrap()
+        );
+        assert_eq!(rendered.attributed.string().to_string(), "one\ntwo");
+        let source: &NSAttributedString = &rendered.attributed;
+        let key = unsafe { NSParagraphStyleAttributeName };
+        for location in [0, 4] {
+            let value = unsafe {
+                source
+                    .attribute_atIndex_effectiveRange(key, location, null_mut())
+                    .unwrap()
+            };
+            let style = value.downcast_ref::<NSParagraphStyle>().unwrap();
+            assert_eq!(style.textLists().count(), 1);
+        }
+    }
+
+    #[test]
+    fn renderer_distinguishes_heading_levels() {
+        let document = Document::from_blocks(vec![
+            Block::Heading {
+                level: HeadingLevel::One,
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "H1".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Heading {
+                level: HeadingLevel::Two,
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "H2".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Heading {
+                level: HeadingLevel::Three,
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "H3".into(),
+                    marks: Marks::default(),
+                }],
+            },
+        ]);
+        let session = session_from_document(&document).unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+        let source: &NSAttributedString = &rendered.attributed;
+
+        let h1 = unsafe {
+            source
+                .attribute_atIndex_effectiveRange(NSFontAttributeName, 0, null_mut())
+                .unwrap()
+        };
+        let h2 = unsafe {
+            source
+                .attribute_atIndex_effectiveRange(NSFontAttributeName, 3, null_mut())
+                .unwrap()
+        };
+        let h3 = unsafe {
+            source
+                .attribute_atIndex_effectiveRange(NSFontAttributeName, 6, null_mut())
+                .unwrap()
+        };
+        let h1 = h1.downcast_ref::<NSFont>().unwrap().pointSize();
+        let h2 = h2.downcast_ref::<NSFont>().unwrap().pointSize();
+        let h3 = h3.downcast_ref::<NSFont>().unwrap().pointSize();
+        assert!(h1 > h2 && h2 > h3);
+    }
+
+    #[test]
+    fn renderer_projects_all_inline_marks() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "marks".into(),
+                marks: Marks {
+                    bold: true,
+                    italic: true,
+                    underline: true,
+                    strikethrough: true,
+                    highlight: true,
+                    ..Marks::default()
+                },
+            }],
+        }]);
+        let session = session_from_document(&document).unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+        let source: &NSAttributedString = &rendered.attributed;
+        let marks_offset = 0;
+        let mark_keys = unsafe {
+            [
+                ("font", NSFontAttributeName),
+                ("underline", NSUnderlineStyleAttributeName),
+                ("strike", NSStrikethroughStyleAttributeName),
+                ("highlight", NSBackgroundColorAttributeName),
+            ]
+        };
+        for (label, key) in mark_keys {
+            assert!(
+                unsafe {
+                    source
+                        .attribute_atIndex_effectiveRange(key, marks_offset, null_mut())
+                        .is_some()
+                },
+                "missing {label} projection"
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_sidecar_round_trips_and_shares_text_document_undo_owner() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "marked".into(),
+                marks: Marks {
+                    highlight: true,
+                    ..Marks::default()
+                },
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        assert_eq!(document_from_session(&session).unwrap(), document);
+        apply_inline_command(&mut session, NSRange::new(0, 6), InlineCommand::Highlight).unwrap();
+        assert!(!document_from_session(&session)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Paragraph { inlines, .. } if inlines.iter().any(|inline| matches!(inline, Inline::Text { marks, .. } if marks.highlight)))));
+        session.undo().unwrap();
+        assert_eq!(document_from_session(&session).unwrap(), document);
+        session.redo().unwrap();
+        assert!(!document_from_session(&session)
+            .unwrap()
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Paragraph { inlines, .. } if inlines.iter().any(|inline| matches!(inline, Inline::Text { marks, .. } if marks.highlight)))));
     }
 }
