@@ -1492,16 +1492,15 @@ fn toolbar_overflow_actions_for_width(width: f64) -> Vec<EditorAction> {
 }
 
 fn toolbar_more_enabled_for_layout(
-    width: f64,
-    height: f64,
-    visibility: ShellVisibility,
+    _width: f64,
+    _height: f64,
+    _visibility: ShellVisibility,
     has_note: bool,
 ) -> bool {
+    // More always contains the destructive "Delete note" item when a note is
+    // selected. It must therefore remain reachable even when every formatting
+    // action fits in the current toolbar (wide and focus layouts).
     has_note
-        && !toolbar_overflow_actions_for_width(
-            shell_layout(width, height, visibility).toolbar.width,
-        )
-        .is_empty()
 }
 
 fn should_sync_caret_context(
@@ -4843,7 +4842,16 @@ impl AppDelegate {
                         .toolbar
                         .width,
                     );
-                    more_has_enabled_child(&overflow, has_note, session_guard.as_ref(), selection)
+                    // Delete note is always an enabled child for a selected
+                    // note, even if there are no formatting actions in the
+                    // overflow list.
+                    has_note
+                        || more_has_enabled_child(
+                            &overflow,
+                            has_note,
+                            session_guard.as_ref(),
+                            selection,
+                        )
                 })
                 .unwrap_or(false);
         }
@@ -7906,8 +7914,45 @@ mod tests {
             super::ShellVisibility::Default,
             true,
         );
-        assert!(!wide);
+        let focus = super::toolbar_more_enabled_for_layout(
+            1380.0,
+            820.0,
+            super::ShellVisibility::Focus,
+            true,
+        );
+        let no_note_wide = super::toolbar_more_enabled_for_layout(
+            1380.0,
+            820.0,
+            super::ShellVisibility::Default,
+            false,
+        );
+        let no_note_focus = super::toolbar_more_enabled_for_layout(
+            1380.0,
+            820.0,
+            super::ShellVisibility::Focus,
+            false,
+        );
+        assert!(
+            super::toolbar_overflow_actions_for_width(
+                super::shell_layout(1380.0, 820.0, super::ShellVisibility::Default)
+                    .toolbar
+                    .width,
+            )
+            .is_empty()
+        );
+        assert!(
+            super::toolbar_overflow_actions_for_width(
+                super::shell_layout(1380.0, 820.0, super::ShellVisibility::Focus)
+                    .toolbar
+                    .width,
+            )
+            .is_empty()
+        );
+        assert!(wide);
         assert!(narrow);
+        assert!(focus);
+        assert!(!no_note_wide);
+        assert!(!no_note_focus);
         assert!(
             super::toolbar_actions_for_width(
                 super::shell_layout(1100.0, 700.0, super::ShellVisibility::Default)
