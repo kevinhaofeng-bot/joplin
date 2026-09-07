@@ -363,6 +363,48 @@ impl NoteRepository {
         })
     }
 
+    /// Rolls back resource metadata created by an import that was never
+    /// attached to a note. The content-addressed blob remains on disk so it
+    /// can be reused safely by a later import or collected by GC.
+    pub fn rollback_unassociated_resource(&self, resource_id: &str) -> Result<(), CoreError> {
+        validate_id(resource_id)?;
+        let connection = self.connection.lock().expect("repository mutex poisoned");
+        let transaction = connection.unchecked_transaction()?;
+        let sha256 = transaction
+            .query_row(
+                "SELECT sha256 FROM resources
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM note_resources WHERE resource_id = ?1
+                   )",
+                [resource_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(sha256) = sha256 else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        transaction.execute(
+            "DELETE FROM resources
+             WHERE id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM note_resources WHERE resource_id = ?1
+               )",
+            [resource_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM resource_blobs
+             WHERE sha256 = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM resources WHERE sha256 = ?1
+               )",
+            [sha256],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn get_resource(&self, id: &str) -> Result<Option<StoredResource>, CoreError> {
         validate_id(id)?;
         let metadata = {
@@ -1554,6 +1596,50 @@ mod tests {
             reopened.get_resource(&first.id).unwrap().unwrap().sha256,
             first.sha256
         );
+    }
+
+    #[test]
+    fn rollback_unassociated_resource_preserves_associations_and_shared_blobs() {
+        let temp = tempdir().unwrap();
+        let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
+        let first = repo
+            .import_resource(png_import(TINY_PNG, "first.png"))
+            .unwrap();
+        let second = repo
+            .import_resource(png_import(TINY_PNG, "second.png"))
+            .unwrap();
+
+        repo.rollback_unassociated_resource(&first.id).unwrap();
+        assert!(repo.get_resource(&first.id).unwrap().is_none());
+        assert!(repo.get_resource(&second.id).unwrap().is_some());
+        assert_eq!(count_rows(&repo, "resources"), 1);
+        assert_eq!(count_rows(&repo, "resource_blobs"), 1);
+
+        repo.create_note(CreateNote {
+            title: "关联图片".into(),
+            body: format!("<p><img src=\":/{}\" alt=\"图片\"></p>", second.id),
+            is_draft: false,
+        })
+        .unwrap();
+        repo.rollback_unassociated_resource(&second.id).unwrap();
+        assert!(repo.get_resource(&second.id).unwrap().is_some());
+        assert_eq!(count_rows(&repo, "resources"), 1);
+        assert_eq!(count_rows(&repo, "resource_blobs"), 1);
+
+        let unique = repo
+            .import_resource(ResourceImport {
+                bytes: b"different image bytes",
+                title: "unique.png",
+                mime: "image/png",
+                file_extension: "png",
+            })
+            .unwrap();
+        assert!(unique.path.exists());
+        assert_eq!(count_rows(&repo, "resource_blobs"), 2);
+        repo.rollback_unassociated_resource(&unique.id).unwrap();
+        assert!(repo.get_resource(&unique.id).unwrap().is_none());
+        assert_eq!(count_rows(&repo, "resource_blobs"), 1);
+        assert!(unique.path.exists());
     }
 
     #[test]

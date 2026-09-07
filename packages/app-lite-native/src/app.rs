@@ -10,13 +10,13 @@ use joplin_lite_native::html_body::{
 #[cfg(test)]
 use joplin_lite_native::native_editor::LinkSelectionState;
 use joplin_lite_native::native_editor::{
-    BlockCommand, EmptyBlockCarrier, InlineCommand, NativeEditorSession, ParagraphCommand,
-    RenderedAttachment, RenderedDocument, SelectionState, apply_block_command,
-    apply_committed_text_delta, apply_inline_command, apply_link, apply_paragraph_command,
-    delete_image_anchor_if_identity, document_from_session, editor_attachment_image,
-    image_paragraph_tail_indent, insert_image_anchor, query_block_state, query_clear_state,
-    query_inline_state, query_link_selection, query_paragraph_command_state, render_session,
-    session_from_document,
+    BlockCommand, EditorCodecError as NativeEditorCodecError, EmptyBlockCarrier, InlineCommand,
+    NativeEditorSession, ParagraphCommand, RenderedAttachment, RenderedDocument, SelectionState,
+    apply_block_command, apply_committed_text_delta, apply_inline_command, apply_link,
+    apply_paragraph_command, delete_image_anchor_if_identity, document_from_session,
+    editor_attachment_image, image_paragraph_tail_indent, insert_image_anchor, query_block_state,
+    query_clear_state, query_inline_state, query_link_selection, query_paragraph_command_state,
+    render_session, session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
     PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
@@ -1996,6 +1996,28 @@ fn candidate_with_attachment(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageInsertViewUpdate {
     InstallSession { selection: NSRange },
+}
+
+fn prepare_image_insert_candidate(
+    live: &NativeEditorSession,
+    insertion_range: NSRange,
+    resource_id: &str,
+    alt: &str,
+    title: String,
+) -> Result<(NativeEditorSession, PreparedNoteContent), NativeEditorCodecError> {
+    let document = document_from_session(live)?;
+    let mut candidate = session_from_document(&document)?;
+    insert_image_anchor(&mut candidate, insertion_range, resource_id, alt, 1, 1)?;
+    let candidate_document = document_from_session(&candidate)?;
+    Ok((
+        candidate,
+        PreparedNoteContent {
+            update: NoteContentUpdate {
+                title,
+                body: serialize_html(&candidate_document),
+            },
+        },
+    ))
 }
 
 fn image_insert_view_update(
@@ -4329,18 +4351,6 @@ impl AppDelegate {
         let before_string = body.string().to_string();
         let before_selection = body.selectedRange();
         let (before_can_undo, before_can_redo) = self.native_undo_state();
-        let failed = commit_after_persistence(|| false, || {});
-        let after_failure_string = body.string().to_string();
-        let after_failure_selection = body.selectedRange();
-        let (after_failure_can_undo, after_failure_can_redo) = self.native_undo_state();
-        println!(
-            "nativeUndoSmoke failure result={} unchanged={} selection_unchanged={} undo_unchanged={} redo_unchanged={}",
-            failed,
-            before_string == after_failure_string,
-            before_selection == after_failure_selection,
-            before_can_undo == after_failure_can_undo,
-            before_can_redo == after_failure_can_redo,
-        );
 
         if bytes.len() > 32 {
             let truncated = bytes[..32].to_vec();
@@ -5303,30 +5313,25 @@ impl AppDelegate {
             .get()
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
-        let prepared = {
-            let mut session_guard = self.ivars().editor_session.borrow_mut();
-            let Some(session) = session_guard.as_mut() else {
+        let (_candidate, prepared) = {
+            let session_guard = self.ivars().editor_session.borrow();
+            let Some(session) = session_guard.as_ref() else {
+                self.rollback_imported_resource(&stored.id);
                 self.set_save_status("编辑器状态不可用，未覆盖正文", true);
                 return false;
             };
-            if let Err(error) =
-                insert_image_anchor(session, insertion_range, &stored.id, &stored.title, 1, 1)
-            {
-                eprintln!("native image anchor failed: {error}");
-                self.set_save_status("图片未插入：编辑器状态不可用", true);
-                return false;
-            }
-            match document_from_session(session) {
-                Ok(document) => PreparedNoteContent {
-                    update: NoteContentUpdate {
-                        title,
-                        body: serialize_html(&document),
-                    },
-                },
+            match prepare_image_insert_candidate(
+                session,
+                insertion_range,
+                &stored.id,
+                &stored.title,
+                title,
+            ) {
+                Ok(candidate) => candidate,
                 Err(error) => {
-                    let _ = session.undo();
-                    eprintln!("native editor projection failed: {error}");
-                    self.set_save_status("保存失败", true);
+                    self.rollback_imported_resource(&stored.id);
+                    eprintln!("native image candidate failed: {error}");
+                    self.set_save_status("图片未插入：编辑器状态不可用", true);
                     return false;
                 }
             }
@@ -5336,17 +5341,45 @@ impl AppDelegate {
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().selection_sync_guard.borrow_mut() = true;
         let persisted = self.persist_note_content(&note_id, prepared);
-        let inserted = match image_insert_view_update(persisted, insertion_range) {
-            Some(ImageInsertViewUpdate::InstallSession { selection }) => {
-                self.refresh_body_from_session_at(body, selection);
-                true
+        let applied = if persisted {
+            let mut session_guard = self.ivars().editor_session.borrow_mut();
+            if let Some(session) = session_guard.as_mut() {
+                if let Err(error) =
+                    insert_image_anchor(session, insertion_range, &stored.id, &stored.title, 1, 1)
+                {
+                    eprintln!("native image live apply failed: {error}");
+                    false
+                } else {
+                    true
+                }
+            } else {
+                eprintln!("native image live apply failed: editor state unavailable");
+                false
             }
-            None => false,
+        } else {
+            false
+        };
+        let inserted = if applied {
+            match image_insert_view_update(persisted, insertion_range) {
+                Some(ImageInsertViewUpdate::InstallSession { selection }) => {
+                    self.refresh_body_from_session_at(body, selection);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
         };
         *self.ivars().selection_sync_guard.borrow_mut() = previous_selection_guard;
         *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
-        if !inserted && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut() {
-            let _ = session.undo();
+        if !persisted {
+            self.rollback_imported_resource(&stored.id);
+        }
+        if persisted && !applied {
+            if let Ok(Some(note)) = self.ivars().repository.get_note(&note_id) {
+                self.load_note(&note);
+            }
+            return false;
         }
         if !inserted && let Ok(Some(note)) = self.ivars().repository.get_note(&note_id) {
             self.ivars()
@@ -5356,6 +5389,16 @@ impl AppDelegate {
             self.set_save_status("保存失败，内容保留待重试", true);
         }
         inserted
+    }
+
+    fn rollback_imported_resource(&self, resource_id: &str) {
+        if let Err(error) = self
+            .ivars()
+            .repository
+            .rollback_unassociated_resource(resource_id)
+        {
+            eprintln!("image resource metadata rollback failed: {error}");
+        }
     }
 
     fn load_note(&self, note: &Note) {
@@ -6006,18 +6049,6 @@ fn inline_attachment(
     inline_attachment_with_alt(resource, &resource.title)
 }
 
-fn commit_after_persistence<P, A>(persist: P, apply: A) -> bool
-where
-    P: FnOnce() -> bool,
-    A: FnOnce(),
-{
-    if !persist() {
-        return false;
-    }
-    apply();
-    true
-}
-
 fn image_insert_gate(has_note: bool, has_marked_text: bool, flush_succeeded: bool) -> bool {
     has_note && !has_marked_text && flush_succeeded
 }
@@ -6465,12 +6496,12 @@ mod tests {
         DataDirError, DataFileError, FontTraitOperation, FormatDecision, FormatTarget,
         LegacyMigrationFailure, Note, PasteFileError, PasteRoute, PasteboardImage, TextFormat,
         apply_image_paragraph_style, candidate_with_attachment, choose_data_dir,
-        commit_after_persistence, display_note_title, document_from_attributed_string,
-        ensure_notes_database_file, format_decision, format_target, image_signature_matches_mime,
-        inline_attachment_with_width, inline_image_display_size, is_local_file_url_host,
-        is_promised_pasteboard_type, legacy_migration_recovery_message, note_list_summary,
-        note_list_title, paste_route, read_drag_image_file, read_pasteboard_image_from,
-        read_regular_image_file, render_document_to_attributed_string, render_session,
+        display_note_title, document_from_attributed_string, ensure_notes_database_file,
+        format_decision, format_target, image_signature_matches_mime, inline_attachment_with_width,
+        inline_image_display_size, is_local_file_url_host, is_promised_pasteboard_type,
+        legacy_migration_recovery_message, note_list_summary, note_list_title, paste_route,
+        read_drag_image_file, read_pasteboard_image_from, read_regular_image_file,
+        render_document_to_attributed_string, render_session,
         selection_snapshot_for_reentrant_appkit, typing_trait_operation,
         valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
@@ -8037,27 +8068,96 @@ mod tests {
     }
 
     #[test]
-    fn persistence_gate_skips_live_apply_when_persistence_fails() {
-        let mut apply_count = 0;
-        assert!(!commit_after_persistence(
-            || false,
-            || {
-                apply_count += 1;
-            },
-        ));
-        assert_eq!(apply_count, 0);
+    fn red_failed_image_candidate_preserves_live_undo_and_redo_history() {
+        let document = Document::from_blocks(vec![paragraph(vec![Inline::Text {
+            text: "ab".into(),
+            marks: Marks::default(),
+        }])]);
+        let mut live = super::session_from_document(&document).unwrap();
+        super::apply_committed_text_delta(&mut live, NSRange::new(2, 0), "!").unwrap();
+        live.undo().unwrap();
+        assert!(live.can_redo());
+
+        let before_document = super::document_from_session(&live).unwrap();
+        let before_revision = live.revision();
+        let before_can_undo = live.can_undo();
+        let before_can_redo = live.can_redo();
+        let before_redo_document = Document::from_blocks(vec![paragraph(vec![Inline::Text {
+            text: "ab!".into(),
+            marks: Marks::default(),
+        }])]);
+
+        let (_candidate, prepared) = super::prepare_image_insert_candidate(
+            &live,
+            NSRange::new(2, 0),
+            "0123456789abcdef0123456789abcdef",
+            "失败图片",
+            "标题".into(),
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .update
+                .body
+                .contains("0123456789abcdef0123456789abcdef")
+        );
+        let persistence_succeeded = false;
+        assert!(!persistence_succeeded);
+
+        assert_eq!(
+            super::document_from_session(&live).unwrap(),
+            before_document
+        );
+        assert_eq!(live.revision(), before_revision);
+        assert_eq!(live.can_undo(), before_can_undo);
+        assert_eq!(live.can_redo(), before_can_redo);
+        let mut redo = live;
+        redo.redo().unwrap();
+        assert_eq!(
+            super::document_from_session(&redo).unwrap(),
+            before_redo_document
+        );
     }
 
     #[test]
-    fn red_persisted_image_insert_installs_session_projection_after_image() {
-        let insertion = NSRange::new(4, 2);
+    fn image_insert_success_adds_one_undoable_live_command() {
+        let document = Document::from_blocks(vec![paragraph(vec![Inline::Text {
+            text: "ab".into(),
+            marks: Marks::default(),
+        }])]);
+        let mut live = super::session_from_document(&document).unwrap();
+        let before_revision = live.revision();
+        let (_candidate, _prepared) = super::prepare_image_insert_candidate(
+            &live,
+            NSRange::new(2, 0),
+            "0123456789abcdef0123456789abcdef",
+            "图片",
+            "标题".into(),
+        )
+        .unwrap();
+        super::insert_image_anchor(
+            &mut live,
+            NSRange::new(2, 0),
+            "0123456789abcdef0123456789abcdef",
+            "图片",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(live.revision(), before_revision + 1);
         assert_eq!(
-            super::image_insert_view_update(true, insertion),
-            Some(super::ImageInsertViewUpdate::InstallSession {
-                selection: NSRange::new(5, 0)
-            })
+            live.text_document().to_addressable_text().unwrap(),
+            "ab\u{fffc}"
         );
-        assert_eq!(super::image_insert_view_update(false, insertion), None);
+        assert!(live.can_undo());
+        live.undo().unwrap();
+        assert_eq!(live.text_document().to_addressable_text().unwrap(), "ab");
+        assert!(live.can_redo());
+        live.redo().unwrap();
+        assert_eq!(
+            live.text_document().to_addressable_text().unwrap(),
+            "ab\u{fffc}"
+        );
     }
 
     #[test]
