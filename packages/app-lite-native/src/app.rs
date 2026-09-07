@@ -425,6 +425,19 @@ fn display_note_title(title: &str, body: &str) -> String {
         .unwrap_or_else(|| "无标题笔记".to_string())
 }
 
+fn note_list_title(note: &Note) -> String {
+    display_note_title(&note.title, &note.body_text)
+}
+
+fn note_list_summary(note: &Note) -> String {
+    note.body_text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().chars().take(52).collect::<String>())
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| "暂无正文".to_string())
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum FormatDecision {
     Add,
@@ -673,13 +686,19 @@ fn show_legacy_migration_failure(
 ) {
     let alert = NSAlert::new(mtm);
     alert.setMessageText(ns_string!("笔记迁移未完成"));
-    alert.setInformativeText(&NSString::from_str(&format!(
-        "笔记 {}：{}\n备份位置：{}\n请先保留当前数据，再修复后重试。",
+    alert.setInformativeText(&NSString::from_str(&legacy_migration_recovery_message(
+        failure, profile,
+    )));
+    let _ = alert.runModal();
+}
+
+fn legacy_migration_recovery_message(failure: &LegacyMigrationFailure, profile: &Path) -> String {
+    format!(
+        "笔记 {}：{}\n数据目录：{}\n迁移尚未完成；如果迁移已经开始，备份可能位于该目录。请先保留当前数据，再修复后重试。",
         failure.note_id,
         failure.reason,
         profile.display()
-    )));
-    let _ = alert.runModal();
+    )
 }
 
 fn canonicalize_for_comparison(path: &Path) -> Result<PathBuf, DataDirError> {
@@ -3031,14 +3050,8 @@ fn inline_attachment_with_width(
 }
 
 fn set_note_button_title(button: &NSButton, note: &Note, selected: bool) {
-    let title = display_note_title(&note.title, &note.body);
-    let summary = note
-        .body
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().chars().take(52).collect::<String>())
-        .filter(|line| !line.is_empty())
-        .unwrap_or_else(|| "暂无正文".to_string());
+    let title = note_list_title(note);
+    let summary = note_list_summary(note);
     let label = format!("{title}\n{summary}");
     let attributed = NSMutableAttributedString::from_nsstring(&NSString::from_str(&label));
     let title_font = NSFont::systemFontOfSize_weight(15.0, if selected { 0.3 } else { 0.0 });
@@ -3164,13 +3177,15 @@ impl AppDelegate {
 mod tests {
     use super::{
         ContentLayout, DataDirError, DataFileError, FontTraitOperation, FormatDecision,
-        FormatTarget, PasteFileError, PasteRoute, PasteboardImage, TextFormat,
-        candidate_with_attachment, choose_data_dir, commit_after_persistence, content_layout,
-        display_note_title, document_from_attributed_string, ensure_notes_database_file,
-        format_decision, format_target, image_signature_matches_mime, inline_image_display_size,
-        is_local_file_url_host, is_promised_pasteboard_type, paste_route, read_drag_image_file,
-        read_pasteboard_image_from, read_regular_image_file, render_document_to_attributed_string,
-        typing_trait_operation, valid_image_bytes_for_mime, validate_canonical_data_dir,
+        FormatTarget, LegacyMigrationFailure, Note, PasteFileError, PasteRoute, PasteboardImage,
+        TextFormat, candidate_with_attachment, choose_data_dir, commit_after_persistence,
+        content_layout, display_note_title, document_from_attributed_string,
+        ensure_notes_database_file, format_decision, format_target, image_signature_matches_mime,
+        inline_image_display_size, is_local_file_url_host, is_promised_pasteboard_type,
+        legacy_migration_recovery_message, note_list_summary, note_list_title, paste_route,
+        read_drag_image_file, read_pasteboard_image_from, read_regular_image_file,
+        render_document_to_attributed_string, typing_trait_operation, valid_image_bytes_for_mime,
+        validate_canonical_data_dir,
     };
     use joplin_lite_native::core::{LegacyNoteForHtmlMigration, NoteRepository, StoredResource};
     use joplin_lite_native::html_body::{Block, Document, Inline, Marks, serialize_html};
@@ -3452,6 +3467,46 @@ mod tests {
             "我的真实标题"
         );
         assert_eq!(display_note_title("", ""), "无标题笔记");
+    }
+
+    #[test]
+    fn note_list_projection_uses_search_text_instead_of_canonical_html() {
+        let titled = Note {
+            id: "titled".into(),
+            title: "项目标题".into(),
+            body: "<p>正文不应直接显示</p>".into(),
+            body_text: "正文不应直接显示".into(),
+            markup_language: 2,
+            is_draft: false,
+            created_time: 1,
+            updated_time: 1,
+            deleted_time: 0,
+        };
+        assert_eq!(note_list_title(&titled), "项目标题");
+        assert_eq!(note_list_summary(&titled), "正文不应直接显示");
+        assert!(!note_list_summary(&titled).contains('<'));
+
+        let untitled = Note {
+            title: String::new(),
+            body: "<p>首行正文</p><p>第二段</p>".into(),
+            body_text: "首行正文\n第二段".into(),
+            ..titled
+        };
+        assert_eq!(note_list_title(&untitled), "首行正文");
+        assert_eq!(note_list_summary(&untitled), "首行正文");
+        assert!(!note_list_title(&untitled).contains('<'));
+    }
+
+    #[test]
+    fn legacy_migration_message_describes_profile_not_existing_backup() {
+        let failure = LegacyMigrationFailure {
+            note_id: "note-1".into(),
+            reason: "RTF 解码失败".into(),
+        };
+        let message = legacy_migration_recovery_message(&failure, Path::new("/tmp/profile"));
+        assert!(message.contains("数据目录：/tmp/profile"));
+        assert!(message.contains("备份可能位于该目录"));
+        assert!(!message.contains("备份位置：/tmp/profile"));
     }
 
     #[test]
