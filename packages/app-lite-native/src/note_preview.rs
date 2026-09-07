@@ -1,4 +1,4 @@
-use crate::core::Note;
+use crate::core::{Note, NoteListItem};
 use crate::html_body::{parse_html, resource_ids, search_text};
 
 const MAX_PREVIEW_TITLE_CHARS: usize = 120;
@@ -11,6 +11,7 @@ pub struct NotePreview {
     pub snippet: String,
     pub updated_label: String,
     pub first_image_id: Option<String>,
+    pub updated_time: i64,
 }
 
 pub fn preview_from_note(note: &Note, now_ms: i64) -> NotePreview {
@@ -33,6 +34,23 @@ pub fn preview_from_note(note: &Note, now_ms: i64) -> NotePreview {
         snippet: truncate_chars(&body_text, MAX_PREVIEW_SNIPPET_CHARS),
         updated_label: updated_label(note.updated_time, now_ms),
         first_image_id,
+        updated_time: note.updated_time,
+    }
+}
+
+pub fn preview_from_list_item(item: &NoteListItem, now_ms: i64) -> NotePreview {
+    let title_source = if item.title.trim().is_empty() {
+        first_nonempty_line(&item.body_text).unwrap_or("无标题笔记")
+    } else {
+        item.title.trim()
+    };
+    NotePreview {
+        note_id: item.id.clone(),
+        title: truncate_chars(title_source, MAX_PREVIEW_TITLE_CHARS),
+        snippet: truncate_chars(&item.body_text, MAX_PREVIEW_SNIPPET_CHARS),
+        updated_label: updated_label(item.updated_time, now_ms),
+        first_image_id: item.first_image_id.clone(),
+        updated_time: item.updated_time,
     }
 }
 
@@ -70,7 +88,7 @@ fn updated_label(updated_time: i64, now_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{NotePreview, preview_from_note};
-    use crate::core::Note;
+    use crate::core::{Note, NoteListItem};
 
     fn note(title: &str, body: &str, body_text: &str, updated_time: i64) -> Note {
         Note {
@@ -105,6 +123,7 @@ mod tests {
                 snippet: "正文标题\nHello world\nBA".into(),
                 updated_label: "2分钟前".into(),
                 first_image_id: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+                updated_time: 1_700_000_000_000,
             }
         );
         assert!(!preview.snippet.contains('<'));
@@ -141,5 +160,21 @@ mod tests {
         assert_eq!(preview.title, "safe fallback");
         assert_eq!(preview.snippet, "safe fallback");
         assert_eq!(preview.first_image_id, None);
+    }
+
+    #[test]
+    fn lightweight_preview_uses_projected_text_without_parsing_html() {
+        let preview = super::preview_from_list_item(
+            &NoteListItem {
+                id: "note-2".into(),
+                title: String::new(),
+                body_text: "😀 projected".into(),
+                updated_time: 1_700_000_000_000,
+                first_image_id: Some("resource-1".into()),
+            },
+            1_700_000_060_000,
+        );
+        assert_eq!(preview.title, "😀 projected");
+        assert_eq!(preview.first_image_id.as_deref(), Some("resource-1"));
     }
 }

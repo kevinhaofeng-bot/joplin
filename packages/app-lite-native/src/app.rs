@@ -1,7 +1,7 @@
 use joplin_lite_native::body::{markdown_marker, marker_spans};
 use joplin_lite_native::core::{
     CreateNote, HtmlNoteConversion, LegacyNoteForHtmlMigration, Note, NoteContentUpdate,
-    NoteRepository, ResourceImport,
+    NoteListItem, NoteRepository, ResourceImport,
 };
 use joplin_lite_native::html_body::{
     Alignment, Block, Document, HtmlBodyError, Inline, Marks, parse_html, resource_ids,
@@ -18,10 +18,11 @@ use joplin_lite_native::native_editor::{
     render_session, session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
-    ThumbnailCache, ThumbnailKey, configure_note_card, make_note_collection_view,
+    PreviewListUpdate, ThumbnailCache, ThumbnailKey, configure_note_card,
+    make_note_collection_view, preview_list_update, restore_selection_after_failed_switch,
     selected_index_for_id,
 };
-use joplin_lite_native::note_preview::{NotePreview, preview_from_note};
+use joplin_lite_native::note_preview::{NotePreview, preview_from_list_item};
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
@@ -2145,8 +2146,8 @@ struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     repository: Arc<NoteRepository>,
     current_note_id: RefCell<Option<String>>,
-    notes: RefCell<Vec<Note>>,
     note_previews: RefCell<Vec<NotePreview>>,
+    note_filter_query: RefCell<String>,
     thumbnail_cache: RefCell<ThumbnailCache<Retained<NSImage>>>,
     thumbnail_decode_count: Cell<usize>,
     loading_guard: RefCell<bool>,
@@ -2646,7 +2647,9 @@ define_class!(
             application.activateIgnoringOtherApps(true);
 
             self.refresh_notes();
-            if let Some(note) = self.ivars().notes.borrow().first().cloned() {
+            if let Some(id) = self.ivars().note_previews.borrow().first().map(|p| p.note_id.clone())
+                && let Ok(Some(note)) = self.ivars().repository.get_note(&id)
+            {
                 self.load_note(&note);
             } else {
                 self.update_editor_visibility();
@@ -2680,7 +2683,7 @@ define_class!(
                 self.search_notes(&query.to_string_lossy());
                 println!(
                     "searchNotes: result count={}",
-                    self.ivars().notes.borrow().len()
+                    self.ivars().note_previews.borrow().len()
                 );
             }
             if std::env::var_os("JOPLIN_LITE_NATIVE_SMOKE_DELETE_CURRENT").is_some() {
@@ -3309,6 +3312,7 @@ define_class!(
                     .get()
                     .unwrap()
                     .setStringValue(ns_string!(""));
+                self.ivars().note_filter_query.borrow_mut().clear();
                 self.load_note(&note);
                 self.refresh_notes();
                 if let Some(window) = self.ivars().window.get() {
@@ -3355,7 +3359,9 @@ define_class!(
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
         self.search_notes(&query);
-        if let Some(note) = self.ivars().notes.borrow().first().cloned() {
+        if let Some(id) = self.ivars().note_previews.borrow().first().map(|p| p.note_id.clone())
+            && let Ok(Some(note)) = self.ivars().repository.get_note(&id)
+        {
             self.load_note(&note);
         } else {
             self.clear_current_note();
@@ -3397,27 +3403,81 @@ impl AppDelegate {
     }
 
     fn select_note_index(&self, index: usize) {
-        let Some(note) = self.ivars().notes.borrow().get(index).cloned() else {
+        let Some(note_id) = self
+            .ivars()
+            .note_previews
+            .borrow()
+            .get(index)
+            .map(|preview| preview.note_id.clone())
+        else {
             return;
         };
-        if self.ivars().current_note_id.borrow().as_deref() == Some(note.id.as_str()) {
+        if self.ivars().current_note_id.borrow().as_deref() == Some(note_id.as_str()) {
             return;
         }
         let ids = self
             .ivars()
-            .notes
+            .note_previews
             .borrow()
             .iter()
-            .map(|note| note.id.clone())
+            .map(|preview| preview.note_id.clone())
             .collect::<Vec<_>>();
-        let previous_index =
-            selected_index_for_id(&ids, self.ivars().current_note_id.borrow().as_deref());
+        let previous_id = self.ivars().current_note_id.borrow().clone();
         if !self.save_current_note() {
+            let previous_index = selected_index_for_id(&ids, previous_id.as_deref());
+            self.restore_selection_after_failed_switch(
+                previous_id.as_deref(),
+                previous_index,
+                index,
+            );
             return;
         }
+        let latest_ids = self
+            .ivars()
+            .note_previews
+            .borrow()
+            .iter()
+            .map(|preview| preview.note_id.clone())
+            .collect::<Vec<_>>();
+        let previous_index = selected_index_for_id(&latest_ids, previous_id.as_deref());
+        let target_index = selected_index_for_id(&latest_ids, Some(note_id.as_str()));
+        let Some(target_index) = target_index else {
+            self.restore_selection_after_failed_switch(
+                previous_id.as_deref(),
+                previous_index,
+                index,
+            );
+            return;
+        };
+        let Ok(Some(note)) = self.ivars().repository.get_note(&note_id) else {
+            self.restore_selection_after_failed_switch(
+                previous_id.as_deref(),
+                previous_index,
+                target_index,
+            );
+            return;
+        };
         self.load_note(&note);
         self.update_note_selection();
-        self.reload_collection_items(previous_index, Some(index));
+        self.reload_collection_items(previous_index, Some(target_index));
+    }
+
+    fn restore_selection_after_failed_switch(
+        &self,
+        previous_id: Option<&str>,
+        previous_index: Option<usize>,
+        attempted_index: usize,
+    ) {
+        let ids = self
+            .ivars()
+            .note_previews
+            .borrow()
+            .iter()
+            .map(|preview| preview.note_id.clone())
+            .collect::<Vec<_>>();
+        let restored = restore_selection_after_failed_switch(&ids, previous_id);
+        self.update_note_selection();
+        self.reload_collection_items(restored.or(previous_index), Some(attempted_index));
     }
 
     fn reload_collection_items(&self, previous_index: Option<usize>, next_index: Option<usize>) {
@@ -4233,7 +4293,7 @@ impl AppDelegate {
                 NSSize::new(40.0, 20.0),
             ));
             count.setStringValue(&NSString::from_str(
-                &self.ivars().notes.borrow().len().to_string(),
+                &self.ivars().note_previews.borrow().len().to_string(),
             ));
             count.setHidden(shell.browser.width == 0.0);
         }
@@ -4260,7 +4320,9 @@ impl AppDelegate {
                 NSPoint::new(list.x + 12.0, list.y + (list.height - 32.0) * 0.5),
                 NSSize::new((list.width - 24.0).max(200.0), 32.0),
             ));
-            label.setHidden(shell.browser.width == 0.0 || !self.ivars().notes.borrow().is_empty());
+            label.setHidden(
+                shell.browser.width == 0.0 || !self.ivars().note_previews.borrow().is_empty(),
+            );
         }
         if let Some(label) = self.ivars().library_label.get() {
             label.setFrame(NSRect::new(
@@ -4937,15 +4999,7 @@ impl AppDelegate {
         if !inserted && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut() {
             let _ = session.undo();
         }
-        if !inserted
-            && let Some(note) = self
-                .ivars()
-                .notes
-                .borrow()
-                .iter()
-                .find(|note| note.id == note_id)
-                .cloned()
-        {
+        if !inserted && let Ok(Some(note)) = self.ivars().repository.get_note(&note_id) {
             self.ivars()
                 .autosave
                 .borrow_mut()
@@ -5118,35 +5172,53 @@ impl AppDelegate {
     }
 
     fn refresh_notes(&self) {
-        if let Ok(notes) = self.ivars().repository.list_notes() {
-            self.replace_note_list(notes);
+        let query = self.ivars().note_filter_query.borrow().clone();
+        self.search_notes(&query);
+    }
+
+    fn note_list_items(
+        &self,
+        query: &str,
+    ) -> Result<Vec<NoteListItem>, joplin_lite_native::core::CoreError> {
+        if query.trim().is_empty() {
+            self.ivars().repository.list_note_previews()
+        } else {
+            self.ivars().repository.search_note_previews(query)
         }
     }
 
     fn search_notes(&self, query: &str) {
-        let notes = if query.trim().is_empty() {
-            self.ivars().repository.list_notes()
-        } else {
-            self.ivars().repository.search(query)
-        };
-        if let Ok(notes) = notes {
-            self.replace_note_list(notes);
+        *self.ivars().note_filter_query.borrow_mut() = query.to_owned();
+        if let Ok(items) = self.note_list_items(query) {
+            self.replace_note_list(items);
         }
     }
 
-    fn replace_note_list(&self, notes: Vec<Note>) {
+    fn replace_note_list(&self, items: Vec<NoteListItem>) {
         let Some(collection) = self.ivars().note_collection.get() else {
             return;
         };
         let now = current_time_millis();
-        let previews = notes
+        let previews = items
             .iter()
-            .map(|note| preview_from_note(note, now))
+            .map(|item| preview_from_list_item(item, now))
             .collect::<Vec<_>>();
-        *self.ivars().notes.borrow_mut() = notes;
+        let update = preview_list_update(&self.ivars().note_previews.borrow(), &previews);
         *self.ivars().note_previews.borrow_mut() = previews;
-        collection.reloadData();
-        let is_empty = self.ivars().notes.borrow().is_empty();
+        match update {
+            PreviewListUpdate::ReloadAll => collection.reloadData(),
+            PreviewListUpdate::ReloadIndices(indices) => {
+                let paths = indices
+                    .into_iter()
+                    .map(|index| NSIndexPath::indexPathForItem_inSection(index as isize, 0))
+                    .collect::<Vec<_>>();
+                if !paths.is_empty() {
+                    let refs = paths.iter().map(|path| &**path).collect::<Vec<_>>();
+                    collection.reloadItemsAtIndexPaths(&NSSet::from_slice(&refs));
+                }
+            }
+        }
+        let is_empty = self.ivars().note_previews.borrow().is_empty();
         if let Some(label) = self.ivars().list_empty_label.get() {
             label.setHidden(!is_empty);
         }
@@ -5171,10 +5243,10 @@ impl AppDelegate {
         }
         let ids = self
             .ivars()
-            .notes
+            .note_previews
             .borrow()
             .iter()
-            .map(|note| note.id.clone())
+            .map(|preview| preview.note_id.clone())
             .collect::<Vec<_>>();
         let selected_id = self.ivars().current_note_id.borrow().clone();
         if let Some(index) = selected_index_for_id(&ids, selected_id.as_deref()) {
@@ -5357,22 +5429,14 @@ impl AppDelegate {
                 .mark_dirty(id, &update.title, &update.body);
         match self.ivars().repository.update_note_content(id, update) {
             Ok(updated) => {
-                let index = self
-                    .ivars()
-                    .notes
-                    .borrow()
-                    .iter()
-                    .position(|note| note.id == updated.id);
-                if let Some(index) = index {
-                    self.ivars().notes.borrow_mut()[index] = updated.clone();
-                    if let Some(preview) = self.ivars().note_previews.borrow_mut().get_mut(index) {
-                        *preview = preview_from_note(&updated, current_time_millis());
-                    }
-                    if let Some(collection) = self.ivars().note_collection.get() {
-                        let path = NSIndexPath::indexPathForItem_inSection(index as isize, 0);
-                        let paths = NSSet::from_slice(&[&*path]);
-                        collection.reloadItemsAtIndexPaths(&paths);
-                    }
+                // Re-query the lightweight projection so title/body changes are
+                // immediately re-filtered and updated_time ordering is restored.
+                // The diff helper reloads only affected cards when membership and
+                // order are unchanged; otherwise the collection performs one
+                // structural reload.
+                let query = self.ivars().note_filter_query.borrow().clone();
+                if let Ok(items) = self.note_list_items(&query) {
+                    self.replace_note_list(items);
                 }
                 if self.ivars().current_note_id.borrow().as_deref() == Some(id)
                     && let Some(label) = self.ivars().updated_label.get()
@@ -5897,8 +5961,8 @@ impl AppDelegate {
             window: OnceCell::new(),
             repository,
             current_note_id: RefCell::new(None),
-            notes: RefCell::new(Vec::new()),
             note_previews: RefCell::new(Vec::new()),
+            note_filter_query: RefCell::new(String::new()),
             thumbnail_cache: RefCell::new(ThumbnailCache::new(32)),
             thumbnail_decode_count: Cell::new(0),
             loading_guard: RefCell::new(false),

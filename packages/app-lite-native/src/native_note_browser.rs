@@ -25,22 +25,6 @@ pub fn browser_metrics(_available_width: f64) -> BrowserMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VirtualizationBudget {
-    pub preview_count: usize,
-    pub live_item_limit: usize,
-    pub image_decode_limit: usize,
-}
-
-pub fn virtualization_budget(total: usize, visible_items: usize) -> VirtualizationBudget {
-    let bounded_visible = visible_items.saturating_add(8).min(total);
-    VirtualizationBudget {
-        preview_count: total,
-        live_item_limit: bounded_visible,
-        image_decode_limit: bounded_visible,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardVisualState {
     pub title: String,
@@ -153,6 +137,40 @@ impl<T> ThumbnailCache<T> {
 
 pub fn selected_index_for_id(ids: &[String], selected_id: Option<&str>) -> Option<usize> {
     selected_id.and_then(|id| ids.iter().position(|candidate| candidate == id))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewListUpdate {
+    ReloadAll,
+    ReloadIndices(Vec<usize>),
+}
+
+pub fn preview_list_update(old: &[NotePreview], new: &[NotePreview]) -> PreviewListUpdate {
+    let old_ids = old
+        .iter()
+        .map(|preview| &preview.note_id)
+        .collect::<Vec<_>>();
+    let new_ids = new
+        .iter()
+        .map(|preview| &preview.note_id)
+        .collect::<Vec<_>>();
+    if old_ids != new_ids {
+        return PreviewListUpdate::ReloadAll;
+    }
+    PreviewListUpdate::ReloadIndices(
+        old.iter()
+            .zip(new)
+            .enumerate()
+            .filter_map(|(index, (before, after))| (before != after).then_some(index))
+            .collect(),
+    )
+}
+
+pub fn restore_selection_after_failed_switch(
+    ids: &[String],
+    previous_id: Option<&str>,
+) -> Option<usize> {
+    selected_index_for_id(ids, previous_id)
 }
 
 pub fn make_note_collection_view(
@@ -324,8 +342,9 @@ fn card_label(
 #[cfg(test)]
 mod tests {
     use super::{
-        CardVisualState, ThumbnailCache, ThumbnailKey, browser_metrics, card_layout,
-        card_visual_state, selected_index_for_id, virtualization_budget,
+        CardVisualState, PreviewListUpdate, ThumbnailCache, ThumbnailKey, browser_metrics,
+        card_layout, card_visual_state, preview_list_update, restore_selection_after_failed_switch,
+        selected_index_for_id,
     };
     use crate::note_preview::NotePreview;
 
@@ -341,14 +360,6 @@ mod tests {
     }
 
     #[test]
-    fn red_1600_previews_have_bounded_live_views_and_decodes() {
-        let budget = virtualization_budget(1600, 12);
-        assert_eq!(budget.preview_count, 1600);
-        assert!(budget.live_item_limit <= 20);
-        assert!(budget.image_decode_limit <= 20);
-    }
-
-    #[test]
     fn red_card_reuse_clears_an_old_image_and_replaces_all_content() {
         let with_image = NotePreview {
             note_id: "a".into(),
@@ -356,6 +367,7 @@ mod tests {
             snippet: "old".into(),
             updated_label: "刚刚".into(),
             first_image_id: Some("image-a".into()),
+            updated_time: 1,
         };
         let without_image = NotePreview {
             note_id: "b".into(),
@@ -363,6 +375,7 @@ mod tests {
             snippet: "new".into(),
             updated_label: "昨天".into(),
             first_image_id: None,
+            updated_time: 2,
         };
         assert_eq!(
             card_visual_state(&with_image),
@@ -423,5 +436,44 @@ mod tests {
             Some(0)
         );
         assert_eq!(selected_index_for_id(&["note-a".into()], selected), None);
+    }
+
+    #[test]
+    fn failed_switch_restores_previous_selection_by_id() {
+        let ids = vec!["old".into(), "new".into()];
+        assert_eq!(
+            restore_selection_after_failed_switch(&ids, Some("old")),
+            Some(0)
+        );
+        assert_eq!(
+            restore_selection_after_failed_switch(&ids, Some("gone")),
+            None
+        );
+    }
+
+    #[test]
+    fn same_order_only_reloads_changed_cards_but_reorder_reloads_collection() {
+        let old = vec![NotePreview {
+            note_id: "a".into(),
+            title: "A".into(),
+            snippet: "".into(),
+            updated_label: "刚刚".into(),
+            first_image_id: None,
+            updated_time: 1,
+        }];
+        let mut changed = old.clone();
+        changed[0].snippet = "changed".into();
+        assert_eq!(
+            preview_list_update(&old, &changed),
+            PreviewListUpdate::ReloadIndices(vec![0])
+        );
+        let reordered = vec![NotePreview {
+            note_id: "b".into(),
+            ..old[0].clone()
+        }];
+        assert_eq!(
+            preview_list_update(&old, &reordered),
+            PreviewListUpdate::ReloadAll
+        );
     }
 }

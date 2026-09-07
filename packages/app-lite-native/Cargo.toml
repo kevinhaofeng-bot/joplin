@@ -36,5 +36,5 @@ objc2-app-kit = { version = "0.3.2", features = [
 ] }
 
 [dev-dependencies]
-rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks"] }
 tempfile = "3"

@@ -92,6 +92,18 @@ pub struct Note {
     pub deleted_time: i64,
 }
 
+/// Lightweight row used by the note browser. It deliberately excludes the
+/// canonical HTML body so large notes never become part of the browser's
+/// resident list projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteListItem {
+    pub id: String,
+    pub title: String,
+    pub body_text: String,
+    pub updated_time: i64,
+    pub first_image_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateNote {
     pub title: String,
@@ -239,6 +251,23 @@ impl NoteRepository {
              FROM notes WHERE deleted_time = 0 ORDER BY updated_time DESC, id ASC",
         )?;
         let rows = statement.query_map([], row_to_note)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_note_previews(&self) -> Result<Vec<NoteListItem>, CoreError> {
+        let connection = self.connection.lock().expect("repository mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT n.id, substr(n.title, 1, 120), substr(n.body_text, 1, 96), n.updated_time,
+                    (SELECT nr.resource_id
+                     FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
+                     WHERE nr.note_id = n.id AND nr.is_associated = 1
+                       AND r.deleted_time = 0
+                       AND r.mime IN ('image/png', 'image/jpeg')
+                     ORDER BY nr.position ASC, nr.resource_id ASC LIMIT 1)
+             FROM notes n WHERE n.deleted_time = 0
+             ORDER BY n.updated_time DESC, n.id ASC",
+        )?;
+        let rows = statement.query_map([], row_to_note_list_item)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -477,6 +506,46 @@ impl NoteRepository {
              ORDER BY updated_time DESC, id ASC",
         )?;
         let fallback_rows = fallback.query_map([query], row_to_note)?;
+        Ok(fallback_rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn search_note_previews(&self, query: &str) -> Result<Vec<NoteListItem>, CoreError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return self.list_note_previews();
+        }
+        let connection = self.connection.lock().expect("repository mutex poisoned");
+        let select =
+            "SELECT n.id, substr(n.title, 1, 120), substr(n.body_text, 1, 96), n.updated_time,
+                    (SELECT nr.resource_id
+                     FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
+                     WHERE nr.note_id = n.id AND nr.is_associated = 1
+                       AND r.deleted_time = 0
+                       AND r.mime IN ('image/png', 'image/jpeg')
+                     ORDER BY nr.position ASC, nr.resource_id ASC LIMIT 1)
+             FROM notes_fts f JOIN notes n ON n.id = f.id
+             WHERE notes_fts MATCH ?1 AND n.deleted_time = 0
+             ORDER BY n.updated_time DESC, n.id ASC";
+        let mut statement = connection.prepare(select)?;
+        let rows = statement
+            .query_map([sanitize_fts_query(query)], row_to_note_list_item)?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+        let mut fallback = connection.prepare(
+            "SELECT n.id, substr(n.title, 1, 120), substr(n.body_text, 1, 96), n.updated_time,
+                    (SELECT nr.resource_id
+                     FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
+                     WHERE nr.note_id = n.id AND nr.is_associated = 1
+                       AND r.deleted_time = 0
+                       AND r.mime IN ('image/png', 'image/jpeg')
+                     ORDER BY nr.position ASC, nr.resource_id ASC LIMIT 1)
+             FROM notes n WHERE n.deleted_time = 0
+               AND (instr(n.title, ?1) > 0 OR instr(n.body_text, ?1) > 0)
+             ORDER BY n.updated_time DESC, n.id ASC",
+        )?;
+        let fallback_rows = fallback.query_map([query], row_to_note_list_item)?;
         Ok(fallback_rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1282,6 +1351,16 @@ fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
     })
 }
 
+fn row_to_note_list_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteListItem> {
+    Ok(NoteListItem {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        body_text: row.get(2)?,
+        updated_time: row.get(3)?,
+        first_image_id: row.get(4)?,
+    })
+}
+
 fn replace_index_entry(
     connection: &Connection,
     id: &str,
@@ -1343,12 +1422,49 @@ mod tests {
     use crate::html_body::{parse_html, search_text};
     use crate::resource_store::ResourceImport;
     use rusqlite::Connection;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::channel;
     use std::time::Duration;
     use tempfile::tempdir;
 
     const TINY_PNG: &[u8] = b"tiny png bytes";
+
+    #[test]
+    fn lightweight_note_projection_never_reads_canonical_body() {
+        let temp = tempdir().unwrap();
+        let repo = NoteRepository::open(temp.path().join("notes.sqlite")).unwrap();
+        repo.create_note(CreateNote {
+            title: "标题".repeat(100),
+            body: format!("<p>{}</p>", "不会读取正文 BLOB ".repeat(100)),
+            is_draft: false,
+        })
+        .unwrap();
+        let read_body = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&read_body);
+        repo.connection
+            .lock()
+            .unwrap()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if let AuthAction::Read {
+                    table_name: "notes",
+                    column_name: "body",
+                } = context.action
+                {
+                    seen.store(true, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }));
+        let rows = repo.list_note_previews().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].title.chars().count() <= 120);
+        assert!(rows[0].body_text.chars().count() <= 96);
+        assert_eq!(repo.search_note_previews("正文").unwrap().len(), 1);
+        assert!(!read_body.load(Ordering::SeqCst));
+    }
 
     fn png_import(bytes: &'static [u8], title: &'static str) -> ResourceImport<'static> {
         ResourceImport {
