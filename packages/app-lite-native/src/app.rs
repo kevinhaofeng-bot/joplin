@@ -65,6 +65,23 @@ struct EditorSnapshot {
     selection: NSRange,
 }
 
+#[derive(Debug, Clone)]
+struct PendingEditorIntent {
+    range: NSRange,
+    replacement: String,
+    old_view_text: String,
+    old_semantic_text: String,
+    covered_attachments: Vec<RenderedAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingIntentDecision {
+    Noop,
+    ApplyText { range: NSRange, replacement: String },
+    DeleteImage { range: NSRange, resource_id: String },
+    Reject,
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 enum EditorCodecError {
     #[error("HTML document error: {0}")]
@@ -87,11 +104,13 @@ fn paste_route(body_is_first_responder: bool, has_current_note: bool) -> PasteRo
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn should_sync_editor_change(has_marked_text: bool, loading_guard: bool) -> bool {
     !has_marked_text && !loading_guard
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum EditorTextSyncDecision {
     Noop,
     Reject,
@@ -113,6 +132,7 @@ fn should_persist_after_editor_sync(result: EditorSessionSyncResult) -> bool {
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn classify_editor_text_change(old_text: &str, new_text: &str) -> EditorTextSyncDecision {
     if old_text == new_text {
         return EditorTextSyncDecision::Noop;
@@ -146,7 +166,11 @@ fn classify_editor_text_change(old_text: &str, new_text: &str) -> EditorTextSync
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn editor_text_delta(old_text: &str, new_text: &str) -> Option<(NSRange, String)> {
+    if old_text.contains('\u{fffc}') || new_text.contains('\u{fffc}') {
+        return None;
+    }
     let old_chars: Vec<char> = old_text.chars().collect();
     let new_chars: Vec<char> = new_text.chars().collect();
     let mut prefix = 0usize;
@@ -173,6 +197,84 @@ fn editor_text_delta(old_text: &str, new_text: &str) -> Option<(NSRange, String)
         .map(|character| character.len_utf16())
         .sum();
     Some((NSRange::new(location, length), replacement))
+}
+
+fn utf16_scalar_range(text: &str, range: NSRange) -> Option<(usize, usize)> {
+    let end = range.location.checked_add(range.length)?;
+    let mut offset = 0usize;
+    let mut start = (range.location == 0).then_some(0);
+    let mut finish = (end == 0).then_some(0);
+    for (scalar, character) in text.chars().enumerate() {
+        if offset == range.location {
+            start = Some(scalar);
+        }
+        offset += character.len_utf16();
+        if offset == end {
+            finish = Some(scalar + 1);
+        }
+    }
+    if start.is_none() && range.location == offset {
+        start = Some(text.chars().count());
+    }
+    if finish.is_none() && end == offset {
+        finish = Some(text.chars().count());
+    }
+    Some((start?, finish?))
+}
+
+fn apply_utf16_intent_to_text(old_text: &str, range: NSRange, replacement: &str) -> Option<String> {
+    let (start, end) = utf16_scalar_range(old_text, range)?;
+    let mut result = String::new();
+    result.extend(old_text.chars().take(start));
+    result.push_str(replacement);
+    result.extend(old_text.chars().skip(end));
+    Some(result)
+}
+
+fn decide_pending_editor_intent(
+    intent: &PendingEditorIntent,
+    new_view_text: &str,
+) -> PendingIntentDecision {
+    if intent.old_view_text != intent.old_semantic_text {
+        return PendingIntentDecision::Reject;
+    }
+    let Some(expected_new_text) =
+        apply_utf16_intent_to_text(&intent.old_view_text, intent.range, &intent.replacement)
+    else {
+        return PendingIntentDecision::Reject;
+    };
+    if expected_new_text != new_view_text {
+        return PendingIntentDecision::Reject;
+    }
+    let Some((start, end)) = utf16_scalar_range(&intent.old_semantic_text, intent.range) else {
+        return PendingIntentDecision::Reject;
+    };
+    let old_slice: String = intent
+        .old_semantic_text
+        .chars()
+        .skip(start)
+        .take(end - start)
+        .collect();
+    if old_slice.contains('\u{fffc}') || intent.replacement.contains('\u{fffc}') {
+        if old_slice == "\u{fffc}"
+            && intent.replacement.is_empty()
+            && intent.covered_attachments.len() == 1
+        {
+            return PendingIntentDecision::DeleteImage {
+                range: intent.range,
+                resource_id: intent.covered_attachments[0].resource_id.clone(),
+            };
+        }
+        return PendingIntentDecision::Reject;
+    }
+    if old_slice == intent.replacement {
+        PendingIntentDecision::Noop
+    } else {
+        PendingIntentDecision::ApplyText {
+            range: intent.range,
+            replacement: intent.replacement.clone(),
+        }
+    }
 }
 
 fn exact_empty_block_carrier(
@@ -1035,6 +1137,8 @@ struct AppDelegateIvars {
     editor_session: RefCell<Option<NativeEditorSession>>,
     projection_attachments: RefCell<Vec<RenderedAttachment>>,
     projection_empty_carriers: RefCell<Vec<EmptyBlockCarrier>>,
+    pending_editor_intents: RefCell<Vec<PendingEditorIntent>>,
+    pending_editor_intent_invalid: RefCell<bool>,
     sidebar_background: OnceCell<Retained<NSBox>>,
     sidebar_separator: OnceCell<Retained<NSBox>>,
     list_scroll: OnceCell<Retained<NSScrollView>>,
@@ -1484,7 +1588,12 @@ define_class!(
             let Some(body) = self.ivars().body_view.get() else {
                 return;
             };
-            if !should_sync_editor_change(body.hasMarkedText(), loading_guard) {
+            if loading_guard {
+                self.clear_pending_editor_intent();
+                return;
+            }
+            if body.hasMarkedText() {
+                self.clear_pending_editor_intent();
                 return;
             }
             let sync_result = self.sync_editor_session_from_view();
@@ -1497,6 +1606,21 @@ define_class!(
     }
     unsafe impl NSTextFieldDelegate for AppDelegate {}
     unsafe impl NSTextViewDelegate for AppDelegate {
+        #[unsafe(method(textView:shouldChangeTextInRange:replacementString:))]
+        fn text_view_should_change_text_in_range_replacement_string(
+            &self,
+            text_view: &NSTextView,
+            affected_char_range: NSRange,
+            replacement_string: Option<&NSString>,
+        ) -> bool {
+            self.capture_pending_editor_intent(
+                text_view,
+                affected_char_range,
+                replacement_string,
+            );
+            true
+        }
+
         #[unsafe(method(textView:doCommandBySelector:))]
         unsafe fn text_view_do_command_by_selector(
             &self,
@@ -1645,12 +1769,86 @@ define_class!(
 );
 
 impl AppDelegate {
+    fn clear_pending_editor_intent(&self) {
+        self.ivars().pending_editor_intents.borrow_mut().clear();
+        *self.ivars().pending_editor_intent_invalid.borrow_mut() = false;
+    }
+
+    fn capture_pending_editor_intent(
+        &self,
+        body: &NSTextView,
+        range: NSRange,
+        replacement: Option<&NSString>,
+    ) {
+        if *self.ivars().loading_guard.borrow() {
+            self.clear_pending_editor_intent();
+            return;
+        }
+        if body.hasMarkedText() {
+            self.clear_pending_editor_intent();
+            return;
+        }
+        let Some(storage) = (unsafe { body.textStorage() }) else {
+            *self.ivars().pending_editor_intent_invalid.borrow_mut() = true;
+            return;
+        };
+        let source: &NSAttributedString = &storage;
+        let old_view_text = source.string().to_string();
+        let old_semantic_text = self
+            .ivars()
+            .editor_session
+            .borrow()
+            .as_ref()
+            .and_then(|session| session.text_document().to_addressable_text().ok());
+        let Some(old_semantic_text) = old_semantic_text else {
+            *self.ivars().pending_editor_intent_invalid.borrow_mut() = true;
+            return;
+        };
+        let end = range.location.saturating_add(range.length);
+        let covered_attachments = self
+            .ivars()
+            .projection_attachments
+            .borrow()
+            .iter()
+            .filter(|attachment| {
+                attachment.addressable_offset >= range.location
+                    && attachment.addressable_offset < end
+            })
+            .cloned()
+            .collect();
+        self.ivars()
+            .pending_editor_intents
+            .borrow_mut()
+            .push(PendingEditorIntent {
+                range,
+                replacement: replacement.map(ToString::to_string).unwrap_or_default(),
+                old_view_text,
+                old_semantic_text,
+                covered_attachments,
+            });
+    }
+
+    fn take_pending_editor_intent(&self) -> (Option<PendingEditorIntent>, bool) {
+        let intents = std::mem::take(&mut *self.ivars().pending_editor_intents.borrow_mut());
+        let invalid = *self.ivars().pending_editor_intent_invalid.borrow();
+        *self.ivars().pending_editor_intent_invalid.borrow_mut() = false;
+        let exactly_one = intents.len() == 1;
+        let intent = exactly_one.then(|| {
+            intents
+                .into_iter()
+                .next()
+                .expect("one pending editor intent")
+        });
+        (intent, invalid || !exactly_one)
+    }
+
     fn install_rendered_document(
         &self,
         body: &NSTextView,
         rendered: &RenderedDocument,
         selection: NSRange,
     ) {
+        self.clear_pending_editor_intent();
         if let Some(storage) = unsafe { body.textStorage() } {
             storage.setAttributedString(&rendered.attributed);
         }
@@ -1797,82 +1995,80 @@ impl AppDelegate {
     #[allow(deprecated)]
     fn sync_editor_session_from_view(&self) -> EditorSessionSyncResult {
         if *self.ivars().loading_guard.borrow() {
+            self.clear_pending_editor_intent();
             return EditorSessionSyncResult::Noop;
         }
         let Some(body) = self.ivars().body_view.get() else {
+            self.clear_pending_editor_intent();
             return EditorSessionSyncResult::Rejected;
         };
         if body.hasMarkedText() {
+            self.clear_pending_editor_intent();
             return EditorSessionSyncResult::Noop;
         }
         let Some(storage) = (unsafe { body.textStorage() }) else {
+            self.clear_pending_editor_intent();
             return EditorSessionSyncResult::Rejected;
         };
         let source: &NSAttributedString = &storage;
         let new_text = source.string().to_string();
-        if let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
-            && let Ok(old_text) = session.text_document().to_addressable_text()
-        {
-            match classify_editor_text_change(&old_text, &new_text) {
-                EditorTextSyncDecision::Noop => return EditorSessionSyncResult::Noop,
-                EditorTextSyncDecision::Reject => return EditorSessionSyncResult::Rejected,
-                EditorTextSyncDecision::DeleteImage => {
-                    let Some((range, replacement)) = editor_text_delta(&old_text, &new_text) else {
-                        return EditorSessionSyncResult::Rejected;
-                    };
-                    if !replacement.is_empty() {
-                        return EditorSessionSyncResult::Rejected;
-                    }
-                    let expected_resource_id = self
-                        .ivars()
-                        .projection_attachments
-                        .borrow()
-                        .iter()
-                        .find(|attachment| attachment.addressable_offset == range.location)
-                        .map(|attachment| attachment.resource_id.clone());
-                    let Some(expected_resource_id) = expected_resource_id else {
-                        return EditorSessionSyncResult::Rejected;
-                    };
-                    if delete_image_anchor_if_identity(session, range, Some(&expected_resource_id))
-                        .is_err()
-                    {
-                        return EditorSessionSyncResult::Rejected;
-                    }
-                    if !adjust_projection_attachments(
-                        &mut self.ivars().projection_attachments.borrow_mut(),
-                        range,
-                        0,
-                        Some(&expected_resource_id),
-                    ) {
-                        return EditorSessionSyncResult::Rejected;
-                    }
-                    return EditorSessionSyncResult::Applied;
-                }
-                EditorTextSyncDecision::ApplyDelta => {
-                    let Some((range, replacement)) = editor_text_delta(&old_text, &new_text) else {
-                        return EditorSessionSyncResult::Rejected;
-                    };
-                    if apply_committed_text_delta(session, range, &replacement).is_ok()
-                        && adjust_projection_attachments(
-                            &mut self.ivars().projection_attachments.borrow_mut(),
-                            range,
-                            NSString::from_str(&replacement).length(),
-                            None,
-                        )
-                    {
-                        return EditorSessionSyncResult::Applied;
-                    }
-                    // A live delta that cannot be applied semantically is
-                    // fail-closed. Never flatten attributed presentation back
-                    // into the canonical model.
+        let (pending, invalid) = self.take_pending_editor_intent();
+        let Some(intent) = pending else {
+            // A live change is accepted only when AppKit gave us exactly one
+            // pre-mutation intent. The old/new string diff remains a legacy
+            // test and migration helper, never a live writeback path.
+            return EditorSessionSyncResult::Rejected;
+        };
+        if invalid {
+            return EditorSessionSyncResult::Rejected;
+        }
+        let decision = decide_pending_editor_intent(&intent, &new_text);
+        let mut next_attachments = self.ivars().projection_attachments.borrow().clone();
+        let result = match decision {
+            PendingIntentDecision::Noop => return EditorSessionSyncResult::Noop,
+            PendingIntentDecision::Reject => return EditorSessionSyncResult::Rejected,
+            PendingIntentDecision::ApplyText { range, replacement } => {
+                let replacement_length = NSString::from_str(&replacement).length();
+                if !adjust_projection_attachments(
+                    &mut next_attachments,
+                    range,
+                    replacement_length,
+                    None,
+                ) {
                     return EditorSessionSyncResult::Rejected;
                 }
+                let mut session_guard = self.ivars().editor_session.borrow_mut();
+                let Some(session) = session_guard.as_mut() else {
+                    return EditorSessionSyncResult::Rejected;
+                };
+                apply_committed_text_delta(session, range, &replacement).is_ok()
             }
+            PendingIntentDecision::DeleteImage { range, resource_id } => {
+                if !adjust_projection_attachments(
+                    &mut next_attachments,
+                    range,
+                    0,
+                    Some(&resource_id),
+                ) {
+                    return EditorSessionSyncResult::Rejected;
+                }
+                let mut session_guard = self.ivars().editor_session.borrow_mut();
+                let Some(session) = session_guard.as_mut() else {
+                    return EditorSessionSyncResult::Rejected;
+                };
+                delete_image_anchor_if_identity(session, range, Some(&resource_id)).is_ok()
+            }
+        };
+        if result {
+            *self.ivars().projection_attachments.borrow_mut() = next_attachments;
+            EditorSessionSyncResult::Applied
+        } else {
+            // Semantic application is intentionally attempted only after all
+            // range and projection checks pass. A failed live command is
+            // therefore fail-closed and cannot save the stale model as if it
+            // had accepted the view mutation.
+            EditorSessionSyncResult::Rejected
         }
-        // No session or no semantically safe delta: fail closed. The legacy
-        // attributed-string decoder is intentionally limited to migration and
-        // tests; it is never a live writeback path.
-        EditorSessionSyncResult::Rejected
     }
 
     #[allow(deprecated)]
@@ -2873,6 +3069,7 @@ impl AppDelegate {
     }
 
     fn load_note(&self, note: &Note) {
+        self.clear_pending_editor_intent();
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = Some(note.id.clone());
         self.ivars()
@@ -2928,6 +3125,7 @@ impl AppDelegate {
     }
 
     fn clear_current_note(&self) {
+        self.clear_pending_editor_intent();
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = None;
         *self.ivars().editor_session.borrow_mut() = None;
@@ -3700,6 +3898,8 @@ impl AppDelegate {
             editor_session: RefCell::new(None),
             projection_attachments: RefCell::new(Vec::new()),
             projection_empty_carriers: RefCell::new(Vec::new()),
+            pending_editor_intents: RefCell::new(Vec::new()),
+            pending_editor_intent_invalid: RefCell::new(false),
             sidebar_background: OnceCell::new(),
             sidebar_separator: OnceCell::new(),
             list_scroll: OnceCell::new(),
@@ -3835,6 +4035,66 @@ mod tests {
         assert_eq!(
             super::editor_text_delta("😀x", "前😀x"),
             Some((NSRange::new(0, 0), "前".into()))
+        );
+    }
+
+    #[test]
+    fn attachment_string_diff_is_ambiguous_without_pending_appkit_intent() {
+        assert_eq!(
+            super::editor_text_delta("\u{fffc}\u{fffc}", "\u{fffc}"),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_appkit_intent_preserves_attachment_identity_and_rejects_stale_views() {
+        let intent = |location: usize, resource_id: &str| super::PendingEditorIntent {
+            range: NSRange::new(location, 1),
+            replacement: String::new(),
+            old_view_text: "\u{fffc}\u{fffc}".into(),
+            old_semantic_text: "\u{fffc}\u{fffc}".into(),
+            covered_attachments: vec![super::RenderedAttachment {
+                addressable_offset: location,
+                resource_id: resource_id.into(),
+            }],
+        };
+
+        assert!(matches!(
+            super::decide_pending_editor_intent(&intent(0, "image-a"), "\u{fffc}"),
+            super::PendingIntentDecision::DeleteImage { range, resource_id }
+                if range == NSRange::new(0, 1) && resource_id == "image-a"
+        ));
+        assert!(matches!(
+            super::decide_pending_editor_intent(&intent(1, "image-b"), "\u{fffc}"),
+            super::PendingIntentDecision::DeleteImage { range, resource_id }
+                if range == NSRange::new(1, 1) && resource_id == "image-b"
+        ));
+
+        let mut stale = intent(0, "image-a");
+        stale.old_view_text = "\u{fffc}".into();
+        assert_eq!(
+            super::decide_pending_editor_intent(&stale, ""),
+            super::PendingIntentDecision::Reject
+        );
+    }
+
+    #[test]
+    fn pending_appkit_intent_accepts_zero_offset_utf16_text_insertion() {
+        let intent = super::PendingEditorIntent {
+            range: NSRange::new(0, 0),
+            replacement: "前".into(),
+            old_view_text: "😀x".into(),
+            old_semantic_text: "😀x".into(),
+            covered_attachments: Vec::new(),
+        };
+        assert!(matches!(
+            super::decide_pending_editor_intent(&intent, "前😀x"),
+            super::PendingIntentDecision::ApplyText { range, replacement }
+                if range == NSRange::new(0, 0) && replacement == "前"
+        ));
+        assert_eq!(
+            super::apply_utf16_intent_to_text("😀x", NSRange::new(1, 0), "前"),
+            None
         );
     }
 

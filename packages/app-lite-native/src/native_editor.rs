@@ -91,7 +91,6 @@ pub struct NativeEditorSession {
     highlighted_ranges: Vec<(usize, usize)>,
     highlight_undo: Vec<Vec<(usize, usize)>>,
     highlight_redo: Vec<Vec<(usize, usize)>>,
-    command_model_mutated: bool,
 }
 
 const MAX_EDITOR_UNDO_ENTRIES: usize = 200;
@@ -149,7 +148,6 @@ impl NativeEditorSession {
         self.text.break_undo_merge();
         let cursor = self.text.cursor_at(0);
         cursor.begin_edit_block();
-        self.command_model_mutated = false;
         (cursor, self.highlighted_ranges.clone())
     }
 
@@ -161,22 +159,13 @@ impl NativeEditorSession {
         }
         self.highlight_undo.push(previous);
         self.highlight_redo.clear();
-        self.command_model_mutated = false;
         self.revision = self.revision.wrapping_add(1);
     }
 
     fn cancel_command(&mut self, cursor: TextCursor, previous: Vec<(usize, usize)>) {
         cursor.end_edit_block();
         self.text.break_undo_merge();
-        if self.command_model_mutated {
-            // All production closures mark each successful model mutation.
-            // Undoing the just-closed edit block rolls back a partial command
-            // without touching the preceding user history entry.
-            let _ = self.text.undo();
-            self.text.break_undo_merge();
-        }
         self.highlighted_ranges = previous;
-        self.command_model_mutated = false;
     }
 
     fn is_highlighted(&self, position: usize) -> bool {
@@ -439,7 +428,6 @@ pub fn session_from_document(document: &Document) -> Result<NativeEditorSession,
         highlighted_ranges: highlight_ranges(&blocks),
         highlight_undo: Vec::new(),
         highlight_redo: Vec::new(),
-        command_model_mutated: false,
     })
 }
 
@@ -837,7 +825,6 @@ pub fn apply_committed_text_delta(
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
         cursor.insert_text(replacement).map_err(model_error)?;
-        session.command_model_mutated = true;
         adjust_highlight_ranges(
             &mut session.highlighted_ranges,
             start,
@@ -867,13 +854,51 @@ pub fn insert_image_anchor(
         cursor
             .insert_image(resource_id, alt, width.max(1), height.max(1))
             .map_err(model_error)?;
-        session.command_model_mutated = true;
         adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 1);
         session
             .image_dimensions
             .insert(resource_id.to_owned(), (width.max(1), height.max(1)));
         Ok(changed(()))
     })
+}
+
+fn link_command_is_noop(
+    session: &NativeEditorSession,
+    start: usize,
+    end: usize,
+    url: Option<&str>,
+) -> bool {
+    if start == end {
+        return false;
+    }
+    let mut found = false;
+    for element in session.text.flow() {
+        let FlowElement::Block(block) = element else {
+            continue;
+        };
+        let snapshot = block.snapshot();
+        for fragment in snapshot.fragments {
+            let FragmentContent::Text {
+                offset,
+                length,
+                format,
+                ..
+            } = fragment
+            else {
+                continue;
+            };
+            let from = snapshot.position + offset;
+            let to = from + length;
+            if from >= end || to <= start {
+                continue;
+            }
+            found = true;
+            if format.anchor_href.as_deref() != url {
+                return false;
+            }
+        }
+    }
+    found
 }
 
 /// Remove exactly one resource-backed object anchor. Live text synchronization
@@ -905,12 +930,10 @@ pub fn delete_image_anchor_if_identity(
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
         let deleted = cursor.remove_selected_text().map_err(model_error)?;
-        session.command_model_mutated = true;
         if deleted != "\u{fffc}" {
             return Err(EditorCodecError::Unsupported);
         }
         adjust_highlight_ranges(&mut session.highlighted_ranges, start, end, 0);
-        session.command_model_mutated = true;
         Ok(changed(()))
     })
 }
@@ -944,6 +967,9 @@ pub fn apply_link(
     }
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    if link_command_is_noop(session, start, end, url) {
+        return Ok(());
+    }
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
@@ -958,9 +984,64 @@ pub fn apply_link(
             },
         };
         cursor.merge_char_format(&format).map_err(model_error)?;
-        session.command_model_mutated = true;
         Ok(changed(()))
     })
+}
+
+fn block_command_is_noop(
+    session: &NativeEditorSession,
+    start: usize,
+    end: usize,
+    command: BlockCommand,
+) -> bool {
+    if !matches!(command, BlockCommand::Paragraph | BlockCommand::Heading(_)) {
+        return false;
+    }
+    let mut found = false;
+    for element in session.text.flow() {
+        let FlowElement::Block(block) = element else {
+            continue;
+        };
+        let snapshot = block.snapshot();
+        let overlaps = if start == end {
+            snapshot.position <= start && start <= snapshot.position + snapshot.length
+        } else {
+            snapshot.position < end && snapshot.position + snapshot.length > start
+        };
+        if !overlaps {
+            continue;
+        }
+        found = true;
+        let same = match command {
+            BlockCommand::Paragraph => {
+                snapshot.list_info.is_none()
+                    && snapshot
+                        .block_format
+                        .heading_level
+                        .is_none_or(|level| level == 0)
+                    && snapshot
+                        .block_format
+                        .marker
+                        .is_none_or(|marker| marker == MarkerType::NoMarker)
+            }
+            BlockCommand::Heading(level) => {
+                let expected = match level {
+                    HeadingLevel::One => 1,
+                    HeadingLevel::Two => 2,
+                    HeadingLevel::Three => 3,
+                };
+                snapshot.list_info.is_none()
+                    && snapshot.block_format.heading_level == Some(expected)
+            }
+            BlockCommand::UnorderedList | BlockCommand::OrderedList | BlockCommand::Checklist => {
+                false
+            }
+        };
+        if !same {
+            return false;
+        }
+    }
+    found
 }
 
 pub fn apply_inline_command(
@@ -986,7 +1067,6 @@ pub fn apply_inline_command(
                     ..Default::default()
                 })
                 .map_err(model_error)?;
-            session.command_model_mutated = true;
             Ok(changed(()))
         });
     }
@@ -1029,7 +1109,6 @@ pub fn apply_inline_command(
             },
         };
         cursor.merge_char_format(&format).map_err(model_error)?;
-        session.command_model_mutated = true;
         Ok(changed(()))
     })
 }
@@ -1041,6 +1120,9 @@ pub fn apply_block_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    if block_command_is_noop(session, start, end, command) {
+        return Ok(());
+    }
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
@@ -1053,7 +1135,6 @@ pub fn apply_block_command(
                         ..Default::default()
                     })
                     .map_err(model_error)?;
-                session.command_model_mutated = true;
                 remove_lists_in_selection(session, start, end)?;
             }
             BlockCommand::Heading(level) => {
@@ -1068,7 +1149,6 @@ pub fn apply_block_command(
                         ..Default::default()
                     })
                     .map_err(model_error)?;
-                session.command_model_mutated = true;
             }
             BlockCommand::UnorderedList | BlockCommand::OrderedList | BlockCommand::Checklist => {
                 let style = match command {
@@ -1076,7 +1156,6 @@ pub fn apply_block_command(
                     _ => ListStyle::Disc,
                 };
                 cursor.create_list(style).map_err(model_error)?;
-                session.command_model_mutated = true;
                 if matches!(command, BlockCommand::Checklist) {
                     cursor
                         .set_block_format(&BlockFormat {
@@ -1084,7 +1163,6 @@ pub fn apply_block_command(
                             ..Default::default()
                         })
                         .map_err(model_error)?;
-                    session.command_model_mutated = true;
                 }
             }
         }
@@ -1162,7 +1240,6 @@ pub fn apply_paragraph_command(
             }
         }
         .map_err(model_error)?;
-        session.command_model_mutated = true;
         Ok(changed(()))
     })
 }
@@ -1222,14 +1299,13 @@ pub fn toggle_checklist_at_utf16_location(
         Some(MarkerType::Unchecked) => MarkerType::Checked,
         _ => return false,
     };
-    run_edit_command(session, |session| {
+    run_edit_command(session, |_session| {
         cursor
             .set_block_format(&BlockFormat {
                 marker: Some(marker),
                 ..Default::default()
             })
             .map_err(model_error)?;
-        session.command_model_mutated = true;
         Ok(changed(()))
     })
     .is_ok()
@@ -1839,15 +1915,43 @@ mod tests {
 
         let before_text = session.text.to_addressable_text().unwrap();
         let partial: Result<(), EditorCodecError> = run_edit_command(&mut session, |session| {
-            let cursor = session.text.cursor_at(0);
-            cursor.insert_text("x").map_err(model_error)?;
-            session.command_model_mutated = true;
+            let _ = session;
             Err(EditorCodecError::Unsupported)
         });
         assert_eq!(partial, Err(EditorCodecError::Unsupported));
         assert_eq!(session.text.to_addressable_text().unwrap(), before_text);
         assert_eq!(session.revision(), revision);
         assert_eq!(session.can_undo(), can_undo);
+    }
+
+    #[test]
+    fn failed_command_preserves_redo_without_resurrecting_text() {
+        let mut session = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "a".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        apply_committed_text_delta(&mut session, NSRange::new(1, 0), "b").unwrap();
+        apply_committed_text_delta(&mut session, NSRange::new(2, 0), "c").unwrap();
+        session.undo().unwrap();
+        let before = session.text.to_addressable_text().unwrap();
+        let revision = session.revision();
+        let can_undo = session.can_undo();
+        let can_redo = session.can_redo();
+        let partial: Result<(), EditorCodecError> = run_edit_command(&mut session, |session| {
+            let _ = session;
+            Err(EditorCodecError::Unsupported)
+        });
+        assert_eq!(partial, Err(EditorCodecError::Unsupported));
+        assert_eq!(session.text.to_addressable_text().unwrap(), before);
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.can_undo(), can_undo);
+        assert_eq!(session.can_redo(), can_redo);
+        session.redo().unwrap();
+        assert_eq!(session.text.to_addressable_text().unwrap(), "abc");
     }
 
     #[test]
@@ -1869,6 +1973,129 @@ mod tests {
             query_inline_state(&session, NSRange::new(0, 3), InlineCommand::Highlight).unwrap(),
             SelectionState::Inactive
         );
+    }
+
+    #[test]
+    fn idempotent_format_commands_are_not_history_entries() {
+        let linked = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "abc".into(),
+                marks: Marks {
+                    link: Some("https://example.com".into()),
+                    ..Default::default()
+                },
+            }],
+        }]);
+        let mut session = session_from_document(&linked).unwrap();
+        let revision = session.revision();
+        assert!(!session.can_undo());
+        apply_link(
+            &mut session,
+            NSRange::new(0, 3),
+            Some("https://example.com"),
+        )
+        .unwrap();
+        assert_eq!(session.revision(), revision);
+        assert!(!session.can_undo());
+
+        let heading = Document::from_blocks(vec![Block::Heading {
+            level: HeadingLevel::Two,
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "heading".into(),
+                marks: Default::default(),
+            }],
+        }]);
+        let mut heading_session = session_from_document(&heading).unwrap();
+        let revision = heading_session.revision();
+        apply_block_command(
+            &mut heading_session,
+            NSRange::new(0, 7),
+            BlockCommand::Heading(HeadingLevel::Two),
+        )
+        .unwrap();
+        assert_eq!(heading_session.revision(), revision);
+        assert!(!heading_session.can_undo());
+
+        let mut aligned = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "aligned".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        let revision = aligned.revision();
+        apply_paragraph_command(
+            &mut aligned,
+            NSRange::new(0, 7),
+            ParagraphCommand::Align(Alignment::Left),
+        )
+        .unwrap();
+        assert_eq!(aligned.revision(), revision);
+        assert!(!aligned.can_undo());
+
+        let mut bounded = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle {
+                indent: 8,
+                ..Default::default()
+            },
+            inlines: vec![Inline::Text {
+                text: "bound".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        let revision = bounded.revision();
+        apply_paragraph_command(
+            &mut bounded,
+            NSRange::new(0, 5),
+            ParagraphCommand::IncreaseIndent,
+        )
+        .unwrap();
+        assert_eq!(bounded.revision(), revision);
+        assert!(!bounded.can_undo());
+    }
+
+    #[test]
+    fn repeated_same_link_does_not_evict_real_history_at_cap() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "a".into(),
+                marks: Default::default(),
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        apply_link(
+            &mut session,
+            NSRange::new(0, 1),
+            Some("https://example.com"),
+        )
+        .unwrap();
+        for position in 0..199 {
+            let end = position + 1;
+            apply_committed_text_delta(&mut session, NSRange::new(end, 0), "x").unwrap();
+        }
+        apply_link(
+            &mut session,
+            NSRange::new(0, 1),
+            Some("https://example.com"),
+        )
+        .unwrap();
+        for _ in 0..200 {
+            session.undo().unwrap();
+        }
+        let restored = document_from_session(&session).unwrap();
+        assert!(matches!(
+            &restored.blocks[0],
+            Block::Paragraph { inlines, .. }
+                if inlines.iter().all(|inline| matches!(
+                    inline,
+                    Inline::Text { marks, .. } if marks.link.is_none()
+                ))
+        ));
     }
 
     #[test]

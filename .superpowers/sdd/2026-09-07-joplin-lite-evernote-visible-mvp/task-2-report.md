@@ -335,3 +335,89 @@ passed
   paragraph carrier is stored by the shared load/refresh install helper and is
   reapplied when a collapsed selection moves onto the exact carrier offset;
   canonical text, model history, and SQLite never receive a fake character.
+
+## Fix 1 fourth-round review: RED/GREEN evidence (2026-09-07)
+
+### RED: three independent regressions reproduced before the fixes
+
+The new regressions were run against the inherited `5f1bd97bc` product code
+before changing the corresponding paths:
+
+```text
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --bin joplin-lite-native pending
+FAILED: adjacent U+FFFC old/new strings inferred a range but carried no A/B
+        resource identity; deleting either side was ambiguous
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --lib failed_command_preserves_redo_without_resurrecting_text
+FAILED: cancelling a command by TextDocument::undo() left a redo entry that
+        resurrected cancelled text ("badab" versus "abc")
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --lib idempotent_format_commands_are_not_history_entries
+FAILED: applying the same link and same H2 incremented revision/history
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --lib repeated_same_link_does_not_evict_real_history_at_cap
+FAILED: repeated same-link commands consumed the 200-entry history budget
+```
+
+### GREEN: focused and locked gates
+
+```text
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --bin joplin-lite-native pending
+3 passed; 0 failed
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --lib failed_command_preserves_redo_without_resurrecting_text
+1 passed; 0 failed
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --lib idempotent_format_commands_are_not_history_entries
+1 passed; 0 failed
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --lib repeated_same_link_does_not_evict_real_history_at_cap
+1 passed; 0 failed
+
+cargo test --locked --manifest-path packages/app-lite-native/Cargo.toml --all-targets
+83 library + 39 app + 7 lifecycle tests passed; 0 failed
+
+cargo clippy --locked --manifest-path packages/app-lite-native/Cargo.toml \
+  --all-targets -- -D warnings
+passed
+
+cargo fmt --manifest-path packages/app-lite-native/Cargo.toml -- --check
+passed
+```
+
+### Fourth-round design and scope
+
+- AppKit now captures one pre-mutation `textView:shouldChangeTextInRange:replacementString:`
+  intent. `textDidChange` validates that intent against both the old semantic
+  text and the actual new view text; missing, stale, multiple, invalid UTF-16,
+  composition-intermediate, and ambiguous attachment edits fail closed. The
+  live path never calls `editor_text_delta`; that helper remains only for
+  legacy/test coverage. Plain zero-offset UTF-16 insertion, emoji boundaries,
+  paste, and explicit image insertion remain on their existing routes.
+- Attachment deletion consumes the captured AppKit range plus the projection's
+  resource identity, so adjacent A/B and A/A/B edits cannot select an image by
+  string position alone. Projection offsets are updated on a clone and only
+  committed after semantic application succeeds; rejected edits never enter
+  `save_current_note()`.
+- `run_edit_command` no longer calls `TextDocument::undo()` on an error: the
+  shared TextDocument history remains untouched for preflight/no-op/failing
+  commands, including an existing redo branch. Production edit closures are
+  ordered so fallible validation occurs before the first model mutation; no
+  full-document snapshot history is introduced. The sidecar highlight history
+  remains bounded to 200 entries and aligned only on a changed command.
+- Link, heading, alignment, indent-bound, and clear-format preflights classify
+  idempotent commands as no-ops. Active inline marks and active list commands
+  retain their toggle/exit semantics and remain real history entries.
+
+The earlier third-round note that a failed partial model edit is rolled back by
+`TextDocument::undo()` is superseded by this round: the production contract is
+validate-then-apply, and the cancellation path deliberately does not mutate
+either undo or redo history.
