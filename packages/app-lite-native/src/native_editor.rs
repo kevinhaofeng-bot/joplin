@@ -374,7 +374,9 @@ fn logical_blocks(document: &Document) -> Vec<LogicalBlock> {
     for block in &document.blocks {
         match block {
             Block::Paragraph { .. } | Block::Heading { .. } => {
-                result.push(logical_block(block.clone()));
+                for block in split_image_blocks(block) {
+                    result.push(logical_block(block));
+                }
             }
             Block::List { kind, items } => {
                 for item in items {
@@ -387,6 +389,62 @@ fn logical_blocks(document: &Document) -> Vec<LogicalBlock> {
         }
     }
     result
+}
+
+/// NSTextAttachment participates in the line fragment that contains it.  If
+/// an image remains inside a heading (or any other text block), TextKit uses
+/// that block's font metrics for the attachment and can clip the image or
+/// leave following text on the same line.  Normalize image-bearing prose
+/// blocks into an image paragraph so the attachment receives a full line and
+/// the next text block starts at the normal leading edge.  The persisted HTML
+/// remains deterministic: the native edit boundary simply makes the image's
+/// block structure explicit on the next save.
+fn split_image_blocks(block: &Block) -> Vec<Block> {
+    let (kind, style, inlines) = match block {
+        Block::Paragraph { style, inlines } => (None, *style, inlines.as_slice()),
+        Block::Heading {
+            level,
+            style,
+            inlines,
+        } => (Some(*level), *style, inlines.as_slice()),
+        Block::List { .. } => return vec![block.clone()],
+    };
+    if !inlines
+        .iter()
+        .any(|inline| matches!(inline, Inline::Image { .. }))
+    {
+        return vec![block.clone()];
+    }
+
+    let mut blocks = Vec::new();
+    let mut text_inlines = Vec::new();
+    let push_text = |blocks: &mut Vec<Block>, text_inlines: &mut Vec<Inline>| {
+        if text_inlines.is_empty() {
+            return;
+        }
+        let inlines = std::mem::take(text_inlines);
+        blocks.push(match kind {
+            Some(level) => Block::Heading {
+                level,
+                style,
+                inlines,
+            },
+            None => Block::Paragraph { style, inlines },
+        });
+    };
+    for inline in inlines {
+        if matches!(inline, Inline::Image { .. }) {
+            push_text(&mut blocks, &mut text_inlines);
+            blocks.push(Block::Paragraph {
+                style,
+                inlines: vec![inline.clone()],
+            });
+        } else {
+            text_inlines.push(inline.clone());
+        }
+    }
+    push_text(&mut blocks, &mut text_inlines);
+    blocks
 }
 
 fn logical_block(block: Block) -> LogicalBlock {
@@ -1841,13 +1899,16 @@ fn style_for_text(format: &TextFormat, heading_level: Option<u8>) -> Retained<NS
     let size = match heading_level {
         Some(1) => 30.0,
         Some(2) => 24.0,
-        Some(3) => 20.0,
+        Some(3) => 18.0,
         _ => 17.0,
     };
     let mut font = NSFont::systemFontOfSize(size);
     let descriptor = font.fontDescriptor();
     let mut traits = descriptor.symbolicTraits();
-    if format.font_bold == Some(true) || format.font_weight.is_some_and(|weight| weight >= 600) {
+    if heading_level.is_some()
+        || format.font_bold == Some(true)
+        || format.font_weight.is_some_and(|weight| weight >= 600)
+    {
         traits.insert(NSFontDescriptorSymbolicTraits::TraitBold);
     }
     if format.font_italic == Some(true) {
@@ -1908,6 +1969,8 @@ fn paragraph_style_for_snapshot(
         Some(TdAlignment::Justify) => NSTextAlignment::Justified,
         _ => NSTextAlignment::Left,
     });
+    paragraph.setLineSpacing(4.0);
+    paragraph.setParagraphSpacing(6.0);
     paragraph.setHeadIndent(f64::from(snapshot.block_format.indent.unwrap_or(0)) * 24.0);
     if let Some(list) = list {
         let lists = objc2_foundation::NSArray::<NSTextList>::from_slice(&[list]);
@@ -2282,8 +2345,9 @@ fn strip_editor_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use objc2_app_kit::{
-        NSBackgroundColorAttributeName, NSFontAttributeName, NSParagraphStyle,
-        NSStrikethroughStyleAttributeName, NSUnderlineStyleAttributeName,
+        NSBackgroundColorAttributeName, NSFontAttributeName, NSLayoutManager, NSParagraphStyle,
+        NSStrikethroughStyleAttributeName, NSTextContainer, NSTextStorage,
+        NSUnderlineStyleAttributeName,
     };
     use std::ptr::null_mut;
 
@@ -2335,6 +2399,145 @@ mod tests {
             session.text.to_addressable_text().unwrap(),
             "标题😀\n\u{fffc} item"
         );
+    }
+
+    #[test]
+    fn rendered_image_anchor_is_emitted_once_even_when_inline_with_heading() {
+        let document = Document::from_blocks(vec![Block::Heading {
+            level: HeadingLevel::One,
+            style: BlockStyle::default(),
+            inlines: vec![
+                Inline::Text {
+                    text: "标题".into(),
+                    marks: Marks::default(),
+                },
+                Inline::Image {
+                    resource_id: "0123456789abcdef0123456789abcdef".into(),
+                    alt: "图片".into(),
+                },
+            ],
+        }]);
+        let session = session_from_document(&document).unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+
+        assert_eq!(
+            rendered
+                .attributed
+                .string()
+                .to_string()
+                .chars()
+                .filter(|character| *character == '\u{fffc}')
+                .count(),
+            1,
+            "one semantic image must produce one native attachment"
+        );
+    }
+
+    #[test]
+    fn heading_image_is_a_full_line_before_following_text() {
+        let document = Document::from_blocks(vec![Block::Heading {
+            level: HeadingLevel::One,
+            style: BlockStyle::default(),
+            inlines: vec![
+                Inline::Text {
+                    text: "标题".into(),
+                    marks: Marks::default(),
+                },
+                Inline::Image {
+                    resource_id: "0123456789abcdef0123456789abcdef".into(),
+                    alt: "图片".into(),
+                },
+                Inline::Text {
+                    text: "后文".into(),
+                    marks: Marks::default(),
+                },
+            ],
+        }]);
+        let session = session_from_document(&document).unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+        let storage = NSTextStorage::new();
+        let layout = NSLayoutManager::new();
+        let container = NSTextContainer::initWithContainerSize(
+            NSTextContainer::alloc(),
+            NSSize::new(640.0, 1200.0),
+        );
+        storage.addLayoutManager(&layout);
+        layout.addTextContainer(&container);
+        container.setLineFragmentPadding(0.0);
+        storage.setAttributedString(&rendered.attributed);
+        layout.ensureLayoutForTextContainer(&container);
+
+        let mut image_effective_range = NSRange::new(0, 0);
+        let image_line = unsafe {
+            layout.lineFragmentRectForGlyphAtIndex_effectiveRange(2, &mut image_effective_range)
+        };
+        let mut text_effective_range = NSRange::new(0, 0);
+        let text_line = unsafe {
+            layout.lineFragmentRectForGlyphAtIndex_effectiveRange(3, &mut text_effective_range)
+        };
+        let text_location = layout.locationForGlyphAtIndex(3);
+        assert!(
+            text_line.origin.y > image_line.origin.y,
+            "heading image must not share a clipped heading line"
+        );
+        assert!(
+            text_location.x <= 1.0,
+            "text after heading image must restart at the left edge"
+        );
+    }
+
+    #[test]
+    fn consecutive_images_use_separate_full_lines() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![
+                Inline::Text {
+                    text: "前".into(),
+                    marks: Marks::default(),
+                },
+                Inline::Image {
+                    resource_id: "0123456789abcdef0123456789abcdef".into(),
+                    alt: "一".into(),
+                },
+                Inline::Image {
+                    resource_id: "fedcba9876543210fedcba9876543210".into(),
+                    alt: "二".into(),
+                },
+                Inline::Text {
+                    text: "后".into(),
+                    marks: Marks::default(),
+                },
+            ],
+        }]);
+        let session = session_from_document(&document).unwrap();
+        let rendered = render_session(&session, |_| None, 640.0);
+        assert_eq!(
+            rendered.attributed.string().to_string(),
+            "前\n\u{fffc}\n\u{fffc}\n后"
+        );
+
+        let storage = NSTextStorage::new();
+        let layout = NSLayoutManager::new();
+        let container = NSTextContainer::initWithContainerSize(
+            NSTextContainer::alloc(),
+            NSSize::new(640.0, 1200.0),
+        );
+        storage.addLayoutManager(&layout);
+        layout.addTextContainer(&container);
+        container.setLineFragmentPadding(0.0);
+        storage.setAttributedString(&rendered.attributed);
+        layout.ensureLayoutForTextContainer(&container);
+        let mut first_range = NSRange::new(0, 0);
+        let first_line =
+            unsafe { layout.lineFragmentRectForGlyphAtIndex_effectiveRange(2, &mut first_range) };
+        let mut second_range = NSRange::new(0, 0);
+        let second_line =
+            unsafe { layout.lineFragmentRectForGlyphAtIndex_effectiveRange(4, &mut second_range) };
+        let mut text_range = NSRange::new(0, 0);
+        let text_line =
+            unsafe { layout.lineFragmentRectForGlyphAtIndex_effectiveRange(6, &mut text_range) };
+        assert!(second_line.origin.y > first_line.origin.y);
+        assert!(text_line.origin.y > second_line.origin.y);
     }
 
     #[test]
@@ -3082,6 +3285,7 @@ mod tests {
         let h1 = h1.downcast_ref::<NSFont>().unwrap().pointSize();
         let h2 = h2.downcast_ref::<NSFont>().unwrap().pointSize();
         let h3 = h3.downcast_ref::<NSFont>().unwrap().pointSize();
+        assert_eq!((h1, h2, h3), (30.0, 24.0, 18.0));
         assert!(h1 > h2 && h2 > h3);
     }
 
@@ -3430,7 +3634,7 @@ mod tests {
         );
 
         let mut second = session_from_document(&document).unwrap();
-        delete_image_anchor_if_identity(&mut second, NSRange::new(1, 1), Some("image-b")).unwrap();
+        delete_image_anchor_if_identity(&mut second, NSRange::new(2, 1), Some("image-b")).unwrap();
         assert_eq!(
             image_ids(&document_from_session(&second).unwrap()),
             vec!["image-a".to_string()]

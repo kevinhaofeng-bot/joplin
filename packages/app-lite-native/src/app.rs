@@ -33,11 +33,11 @@ use objc2_app_kit::{
     NSApplicationTerminateReply, NSAttachmentAttributeName,
     NSAttributedStringAppKitDocumentFormats, NSAttributedStringAttachmentConveniences,
     NSBackingStoreType, NSBezelStyle, NSBitmapImageFileType, NSBitmapImageRep, NSBorderType, NSBox,
-    NSBoxType, NSButton, NSButtonType, NSCollectionView, NSCollectionViewDataSource,
-    NSCollectionViewDelegate, NSCollectionViewFlowLayout, NSCollectionViewItem, NSColor,
-    NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination, NSDraggingInfo,
-    NSEventModifierFlags, NSFont, NSFontAttributeName, NSImage,
+    NSBoxType, NSButton, NSButtonType, NSCellImagePosition, NSCollectionView,
+    NSCollectionViewDataSource, NSCollectionViewDelegate, NSCollectionViewFlowLayout,
+    NSCollectionViewItem, NSColor, NSControlStateValueMixed, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation, NSDraggingDestination,
+    NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName, NSImage,
     NSIndexPathNSCollectionViewAdditions, NSLineBreakMode, NSMenu, NSMenuItem, NSModalResponseOK,
     NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle, NSParagraphStyleAttributeName,
     NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder,
@@ -1451,11 +1451,35 @@ fn more_has_enabled_child(
 }
 
 fn toolbar_actions_for_width(width: f64) -> Vec<EditorAction> {
-    EDITOR_ACTION_CATALOGUE
+    let mut visible = Vec::new();
+    for descriptor in EDITOR_ACTION_CATALOGUE
         .iter()
-        .filter(|descriptor| descriptor.fixed || (descriptor.wide_only && width >= 680.0))
-        .map(|descriptor| descriptor.action)
-        .collect()
+        .filter(|descriptor| descriptor.action != EditorAction::More)
+    {
+        if !(descriptor.fixed || (descriptor.wide_only && width >= 680.0)) {
+            continue;
+        }
+        let mut candidate = visible.clone();
+        candidate.push(descriptor.action);
+        candidate.push(EditorAction::More);
+        if toolbar_required_width(&candidate) <= width.max(0.0) || visible.is_empty() {
+            visible.push(descriptor.action);
+        }
+    }
+    visible.push(EditorAction::More);
+    visible
+}
+
+fn toolbar_required_width(actions: &[EditorAction]) -> f64 {
+    if actions.is_empty() {
+        return 0.0;
+    }
+    let group_gaps = actions
+        .windows(2)
+        .filter(|pair| action_group(pair[0]) != action_group(pair[1]))
+        .count() as f64
+        * 4.0;
+    actions.len() as f64 * 32.0 + group_gaps
 }
 
 fn toolbar_overflow_actions_for_width(width: f64) -> Vec<EditorAction> {
@@ -1547,6 +1571,31 @@ fn compact_toolbar_label(action: EditorAction) -> &'static str {
         EditorAction::Strikethrough => "删",
         EditorAction::Clear => "清",
     }
+}
+
+fn toolbar_symbol_name(action: EditorAction) -> Option<&'static str> {
+    Some(match action {
+        EditorAction::InsertImage => "photo",
+        EditorAction::Undo => "arrow.uturn.backward",
+        EditorAction::Redo => "arrow.uturn.forward",
+        EditorAction::Bold => "bold",
+        EditorAction::Italic => "italic",
+        EditorAction::Underline => "underline",
+        EditorAction::Highlight => "highlighter",
+        EditorAction::BulletList => "list.bullet",
+        EditorAction::OrderedList => "list.number",
+        EditorAction::Checklist => "checklist",
+        EditorAction::More => "ellipsis",
+        EditorAction::Link => "link",
+        EditorAction::AlignLeft => "text.alignleft",
+        EditorAction::AlignCenter => "text.aligncenter",
+        EditorAction::AlignRight => "text.alignright",
+        EditorAction::IncreaseIndent => "increase.indent",
+        EditorAction::DecreaseIndent => "decrease.indent",
+        EditorAction::Strikethrough => "strikethrough",
+        EditorAction::Clear => "textformat",
+        EditorAction::BlockStyle => return None,
+    })
 }
 
 fn action_group(action: EditorAction) -> EditorActionGroup {
@@ -2509,7 +2558,16 @@ define_class!(
                 )
             };
             new_button.setBezelStyle(NSBezelStyle::Push);
-            new_button.setBezelColor(Some(&NSColor::controlAccentColor()));
+            // Evernote-style single primary action: a stable green accent is
+            // easier to find than the system-blue default and remains clear
+            // in the native disabled/pressed states.
+            let evernote_green = NSColor::colorWithSRGBRed_green_blue_alpha(
+                0.0,
+                0.66,
+                0.18,
+                1.0,
+            );
+            new_button.setBezelColor(Some(&evernote_green));
             new_button.setContentTintColor(Some(&NSColor::whiteColor()));
             content.addSubview(&new_button);
 
@@ -2666,7 +2724,11 @@ define_class!(
             delete_button.setBordered(false);
             delete_button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
             delete_button.setHasDestructiveAction(true);
-            content.addSubview(&delete_button);
+            // Deletion is intentionally exposed only from the overflow menu.
+            // Keeping this action object lets the existing selector and smoke
+            // path remain stable without reserving a second bottom-right
+            // control that can collide with the save status.
+            delete_button.setHidden(true);
 
             let save_status = NSTextField::initWithFrame(
                 NSTextField::alloc(mtm),
@@ -3357,6 +3419,20 @@ define_class!(
                 item.setEnabled(presentation.enabled);
                 menu.addItem(&item);
             }
+            // Destructive note actions belong in the explicit overflow menu,
+            // never in the editor's persistent status area.
+            menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
+            let delete_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(self.mtm()),
+                    ns_string!("删除笔记"),
+                    Some(sel!(deleteNote:)),
+                    ns_string!(""),
+                )
+            };
+            unsafe { delete_item.setTarget(Some(self)) };
+            delete_item.setEnabled(self.ivars().current_note_id.borrow().is_some());
+            menu.addItem(&delete_item);
             menu.popUpMenuPositioningItem_atLocation_inView(
                 None,
                 NSPoint::new(0.0, 0.0),
@@ -3781,9 +3857,14 @@ impl AppDelegate {
             let Some(selector) = Self::toolbar_selector(action) else {
                 continue;
             };
+            let initial_title = NSString::from_str(if action == EditorAction::BlockStyle {
+                compact_toolbar_label(action)
+            } else {
+                ""
+            });
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str(compact_toolbar_label(action)),
+                    &initial_title,
                     Some(target),
                     Some(selector),
                     mtm,
@@ -3797,6 +3878,17 @@ impl AppDelegate {
             });
             button.setBezelStyle(NSBezelStyle::Toolbar);
             button.setBordered(false);
+            if let Some(symbol_name) = toolbar_symbol_name(action) {
+                let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(symbol_name),
+                    Some(&NSString::from_str(descriptor.label)),
+                );
+                if let Some(image) = image {
+                    image.setSize(NSSize::new(24.0, 24.0));
+                    button.setImage(Some(&image));
+                    button.setImagePosition(NSCellImagePosition::ImageOnly);
+                }
+            }
             button.setToolTip(Some(&NSString::from_str(descriptor.label)));
             content.addSubview(&button);
             target
@@ -4480,12 +4572,6 @@ impl AppDelegate {
             width: shell.browser.width,
             height: (shell.browser.height - 96.0).max(120.0),
         };
-        let delete = LayoutRect {
-            x: shell.body.right() - 62.0,
-            y: shell.sheet.y + 12.0,
-            width: 62.0,
-            height: 26.0,
-        };
         if let Some(separator) = self.ivars().sidebar_separator.get() {
             separator.setFrame(NSRect::new(
                 NSPoint::new(shell.navigation.width - 1.0, 0.0),
@@ -4621,8 +4707,9 @@ impl AppDelegate {
                 NSPoint::new(x, shell.toolbar.y),
                 NSSize::new(28.0, shell.toolbar.height),
             ));
-            let title = if *action == EditorAction::BlockStyle {
-                self.ivars()
+            if *action == EditorAction::BlockStyle {
+                let title = self
+                    .ivars()
                     .editor_session
                     .borrow()
                     .as_ref()
@@ -4632,11 +4719,11 @@ impl AppDelegate {
                             self.command_selection().unwrap_or(NSRange::new(0, 0)),
                         )
                     })
-                    .unwrap_or(compact_toolbar_label(*action))
+                    .unwrap_or(compact_toolbar_label(*action));
+                button.setTitle(&NSString::from_str(title));
             } else {
-                compact_toolbar_label(*action)
-            };
-            button.setTitle(&NSString::from_str(title));
+                button.setTitle(ns_string!(""));
+            }
             button.setToolTip(Some(&NSString::from_str(
                 editor_action_catalogue()
                     .iter()
@@ -4665,7 +4752,7 @@ impl AppDelegate {
             *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
         }
         if let Some(button) = self.ivars().delete_button.get() {
-            button.setFrame(delete.ns_rect());
+            button.setHidden(true);
         }
         if let Some(status) = self.ivars().save_status.get() {
             status.setFrame(shell.status.ns_rect());
@@ -6906,7 +6993,7 @@ mod tests {
         let mut effective_range = NSRange::new(0, 0);
         let attributes = unsafe {
             source.attributesAtIndex_longestEffectiveRange_inRange(
-                1,
+                2,
                 &mut effective_range,
                 NSRange::new(0, source.length()),
             )
@@ -6923,7 +7010,7 @@ mod tests {
             .size();
         assert!(image_size.width > 0.0 && image_size.height > 0.0);
         assert_eq!(bounds.size, inline_image_display_size(image_size, 640.0));
-        assert_eq!(rendered.attributed.string().to_string(), "前\u{fffc}后");
+        assert_eq!(rendered.attributed.string().to_string(), "前\n\u{fffc}\n后");
 
         let resource = StoredResource {
             id: resource_id.into(),
@@ -7011,13 +7098,13 @@ mod tests {
         let mut attachment_effective_range = NSRange::new(0, 0);
         let attachment_line = unsafe {
             layout
-                .lineFragmentRectForGlyphAtIndex_effectiveRange(1, &mut attachment_effective_range)
+                .lineFragmentRectForGlyphAtIndex_effectiveRange(2, &mut attachment_effective_range)
         };
         let mut following_effective_range = NSRange::new(0, 0);
         let following_line = unsafe {
-            layout.lineFragmentRectForGlyphAtIndex_effectiveRange(2, &mut following_effective_range)
+            layout.lineFragmentRectForGlyphAtIndex_effectiveRange(4, &mut following_effective_range)
         };
-        let following_location = layout.locationForGlyphAtIndex(2);
+        let following_location = layout.locationForGlyphAtIndex(4);
         assert!(
             following_line.origin.y > attachment_line.origin.y,
             "following text must be below image line: image={attachment_line:?}, text={following_line:?}"
@@ -7122,14 +7209,7 @@ mod tests {
             assert!((actual_center - expected_center).abs() < f64::EPSILON);
         }
         let wide = super::shell_layout(1800.0, 900.0, super::ShellVisibility::Default);
-        let delete = super::LayoutRect {
-            x: wide.body.right() - 62.0,
-            y: wide.sheet.y + 12.0,
-            width: 62.0,
-            height: 26.0,
-        };
         assert_eq!(wide.body.width, 680.0);
-        assert_eq!(wide.body.x + wide.body.width, delete.x + delete.width);
         assert_eq!(
             wide.body.x + wide.body.width,
             wide.status.x + wide.status.width + 10.0
@@ -7195,6 +7275,15 @@ mod tests {
         assert_eq!(ids.len(), unique.len());
         assert!(!super::toolbar_actions_for_width(600.0).contains(&super::EditorAction::Link));
         assert!(super::toolbar_actions_for_width(900.0).contains(&super::EditorAction::Link));
+        for descriptor in catalogue {
+            if descriptor.action != super::EditorAction::BlockStyle {
+                assert!(
+                    super::toolbar_symbol_name(descriptor.action).is_some(),
+                    "{} must use a native SF Symbol",
+                    descriptor.label
+                );
+            }
+        }
     }
 
     #[test]
