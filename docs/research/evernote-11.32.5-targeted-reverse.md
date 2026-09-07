@@ -37,9 +37,10 @@ Native ruling: keep creation local-first and recoverable: flush the current note
 
 - Evernote exposes ordinary note creation as `Cmd-N` and ordinary search as `Cmd-K` in its shared keyboard-command catalogue. These are product-level commands, not shortcuts wired only to whichever widget currently owns focus.
 - The live macOS UI repeats `⌘K` inside the persistent search field, making the path discoverable while keeping it one keystroke away during editing.
+- Activating `Cmd-K` opens a centred quick-search overlay above the current note, with recent notes and entity filters available before typing. The underlying selection remains visible and is not replaced merely because search gained focus.
 - Global search, note-local find and AI search are separate commands in the catalogue. Ordinary search therefore does not overload editor Find or require an expanded feature surface.
 
-Native ruling: retain the existing `Cmd-N` create-first path and add a native `Cmd-K` application command that focuses the persistent note search field and selects its current query for immediate replacement. Keep `Cmd-F` available to the focused AppKit text system for in-note find behavior; do not conflate it with library search. The shortcut must reuse the same `searchNotes:` action and filtering state as mouse input, with no parallel search implementation.
+Native ruling: retain the existing `Cmd-N` create-first path and add a native `Cmd-K` application command that focuses the persistent note search field and selects its current query for immediate replacement. A second search overlay would duplicate the same one-note-type scope without adding useful capability, so the lightweight client borrows Evernote's keyboard reachability rather than its multi-entity palette. Keep `Cmd-F` available to the focused AppKit text system for in-note find behavior; do not conflate it with library search. The shortcut must reuse the same `searchNotes:` action and filtering state as mouse input, with no parallel search implementation.
 
 ### Composition safety
 
