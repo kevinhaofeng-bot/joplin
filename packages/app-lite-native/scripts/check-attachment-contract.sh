@@ -12,7 +12,7 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-EXPECTED_VERSION="0.6.0"
+EXPECTED_VERSION="0.7.0"
 SOURCE_SCAN="$(mktemp "${TMPDIR:-/tmp}/joplin-lite-source.XXXXXX")"
 MACHO_LIST=""
 cleanup() {

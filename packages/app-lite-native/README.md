@@ -1,6 +1,6 @@
 # Joplin Lite Native
 
-这是一个 macOS 原生 Rust/AppKit 0.6.0 RC。应用采用 Evernote 风格的三栏工作区：极简导航、可复用的笔记卡片浏览栏，以及带固定工具栏的原生所见即所得编辑器。正文不经过 WebKit、Tauri、Electron 或 Node.js。
+这是一个 macOS 原生 Rust/AppKit 0.7.0 RC。应用采用 Evernote 风格的三栏工作区：极简导航、可复用的笔记卡片浏览栏，以及带固定工具栏的原生所见即所得编辑器。正文不经过 WebKit、Tauri、Electron 或 Node.js。
 
 ## 运行
 
