@@ -47,6 +47,25 @@ Element 的 Matrix Rich Text Editor 是本轮进一步检查的 Rust 富文本�
 
 因此编辑器组合固定为：AppKit `NSTextView`/TextKit 负责系统级输入、IME、选区、拼写、无障碍和排版；Rust `Document` 负责持久语义；`html5ever` 负责 HTML5 解析；SQLite/FTS5 负责事务与索引；Matrix RTE、Lapce/Floem 和 Evernote 只提供经过验证的算法与产品机制参考。选择现成组件的标准是减少产品风险，而不是追求依赖数量。
 
+## Iced、Slint、Loro 与 cosmic-text 取舍
+
+用户提出的四项 Rust 技术已经按当前官方实现重新核对。本项目作出以下决定：
+
+- **Iced 不作为 GUI 底座。** Iced 0.14 的 `text_editor` 是以纯字符串/行和编辑 action 为中心的多行输入部件，不是持久富文本编辑器；默认运行时还会引入 winit 与 wgpu/tiny-skia 自绘链。它适合真正需要 Windows/Linux 同构界面的应用，但替换 AppKit 后，macOS 中文输入、文本服务、辅助功能、拖放和附件命中测试都会重新成为本项目的维护责任。
+- **Slint 不作为 GUI 底座。** Slint 1.17 的 `TextEdit` 仍以单个字符串和整块字体属性为主；官方 StyledText 工作明确只覆盖富文本显示，不覆盖用户编辑，完整 rich text editor 追踪项仍未完成。它的 winit + FemtoVG/Skia/software renderer 更适合嵌入式或自绘跨平台 UI，不适合本轮要求的 Evernote 级 macOS 写作手感。
+- **cosmic-text 不替换 TextKit。** cosmic-text 0.19 已经是优秀的 Rust 字形塑形、双向文本、换行、字体回退、点击定位和基础编辑引擎，也能正确覆盖简体中文与彩色 emoji；但它不是完整的原生控件、富文档 schema、输入法客户端、拼写/无障碍系统或附件编辑器。在 macOS 上接入它会重复 CoreText/TextKit 已经可靠提供的能力。若未来开发 Linux 客户端，可把它作为那一端的文字布局候选，而不改变共享 Rust `Document`。
+- **Loro 选为原生客户端下一阶段同步核心。** Loro 1.x 是 MIT 许可的 Rust local-first CRDT，已有富文本 marks、稳定光标、可移动树/列表、增量更新、快照、校验、undo manager 和 Rust/Swift 绑定，正面解决断网编辑、乱序/重复更新与多设备合并。它比把 Yjs 带回 WebKit 更符合本项目方向。
+
+Loro 不进入当前可见 MVP 的 GUI/编辑热路径，避免推迟用户验收；Task 2 仍以 deterministic `Document` transaction 为边界，使后续 Loro adapter 能消费同一组语义操作。可见 MVP 通过后，单独实现并验证以下同步结构：
+
+1. 一个 `library:<vault-id>` Loro room 保存笔记/笔记本/标签的目录、删除墓碑、版本和资源清单；每条笔记使用 `note:<note-id>` room 保存标题、块顺序、块属性与富文本 marks。
+2. 图片和其他二进制不进入 CRDT 文本，继续按 SHA-256 存储；Loro 只同步资源标识、MIME、大小和引用。NAS 提供幂等的哈希 blob 上传/下载与垃圾回收保留期。
+3. SQLite `notes.body` 中的规范 HTML 与 `body_text`/FTS 始终是可读、可搜索的物化当前态。Loro snapshot/oplog 允许是二进制，但只能作为带版本和校验的同步元数据；导入更新后必须在一个本地事务中重新物化 HTML、资源关联和 FTS。损坏或缺失 Loro 元数据时，可从 HTML 重建新同步历史，不能丢正文。
+4. NAS 可复用 Loro protocol v1 的 Rust WebSocket server 和 SQLite persistence 起步，但官方协议明确不处理 collection-level synchronization，因此资料库清单、鉴权、设备撤销、资源传输、备份和可观测重试仍由本项目薄层负责，不能把“用了 CRDT”误报为“同步已经可靠”。
+5. 现有 Joplin Server/PostgreSQL 部署继续作为迁移与恢复轨道，不在 MVP 期间拆除。Loro 原生同步必须先通过双/三副本中文与 emoji 并发编辑、格式/列表冲突、离线重连、重复乱序帧、快照压缩、资源中断续传、1,600 笔记规模和 NAS 恢复演练，才允许成为默认同步；官方 Joplin 客户端不理解 Loro 历史，因此长期兼容方式是受控导入导出/迁移桥，而不是两个协议同时双向写同一资料库。
+
+这一决定保留了真正有价值的现成能力：macOS 端使用系统原生编辑栈，跨设备合并使用 Rust CRDT；两者通过本项目可读的语义文档层连接，而不是让 GUI 框架或同步日志反过来定义笔记格式。
+
 ## 信息架构
 
 窗口采用 Evernote 式三栏骨架，默认尺寸 1380×820 pt；窄窗口允许导航栏压缩，但不删掉新建和笔记浏览：

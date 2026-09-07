@@ -14,12 +14,15 @@
 
 **Existing editor-core evidence:** Element's Matrix Rich Text Editor is the concrete Rust rich-text algorithm reference for Task 2. Compare its UTF-16 range mapping, cross-node formatting/link mutations, nested-list enter/exit/indent behavior, action-state queries and undo snapshots. Do not add the upstream crate as a runtime dependency or copy its source in this MVP: upstream declares an early, breaking API; its Matrix-composer schema lacks note images, headings, checklists, alignment and highlight; and it would duplicate this project's canonical `Document`. Lapce/Floem remains the reference for revision/pristine and projection-only phantom content, not the persistent rich-note model.
 
+**Rust stack ruling:** Keep AppKit/TextKit for this macOS MVP; Iced/Slint do not currently provide the required native rich-editing surface, and cosmic-text is a layout engine rather than a replacement for system IME/accessibility/spellcheck/attachment editing. Select Loro for the follow-on native sync phase, behind the canonical `Document` transaction boundary. Do not add Loro to Tasks 1–5 or make its binary snapshot/oplog the only note body. SQLite canonical HTML/FTS remains readable materialized state; Joplin Server remains an undisturbed migration/recovery rail until a separate Loro multi-replica and NAS-resource gate passes.
+
 ## Global Constraints
 
 - Evernote is the UI/workflow prototype; Byword only informs the centered long-form writing measure.
 - No Tauri, WKWebView, WebKit, JavaScriptCore, Electron, Node, helper process, or downloaded web font.
 - `notes.body` remains the only canonical body; `body_text` and resource associations are derived.
 - Normal runtime never creates, saves or loads RTF. Keep the one-time legacy decoder isolated and frozen.
+- Normal runtime keeps readable canonical HTML and derived FTS even after Loro sync is introduced; a CRDT snapshot/oplog may never be the only copy of note content.
 - Do not show AI, task, calendar, reminder, template, sharing, collaboration or plugin controls.
 - Every visible formatting/insert command works; future commands stay absent.
 - Editor commands mutate semantic attributes in one undo transaction and expose query state for toolbar refresh; UI controls must not directly mutate fonts as the source of truth.
