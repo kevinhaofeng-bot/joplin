@@ -2990,9 +2990,11 @@ define_class!(
                     .as_deref()
                     == Some(preview.note_id.as_str());
                 let image = self.thumbnail_for_preview(&preview);
+                let query = self.ivars().note_filter_query.borrow().clone();
                 configure_note_card(
                     &item,
                     &preview,
+                    &query,
                     image.as_deref(),
                     selected,
                     joplin_lite_native::native_note_browser::browser_metrics(
@@ -4796,9 +4798,11 @@ impl AppDelegate {
             let selected =
                 self.ivars().current_note_id.borrow().as_deref() == Some(preview.note_id.as_str());
             let image = self.thumbnail_for_preview(&preview);
+            let query = self.ivars().note_filter_query.borrow().clone();
             configure_note_card(
                 &item,
                 &preview,
+                &query,
                 image.as_deref(),
                 selected,
                 metrics,

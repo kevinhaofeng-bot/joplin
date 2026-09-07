@@ -509,7 +509,9 @@ impl NoteRepository {
         }
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let mut statement = connection.prepare(&search_query_sql(
-            "n.id, substr(n.title, 1, 120), substr(n.body_text, 1, 96), n.updated_time,
+            // Search cards need the projected body text to derive a context
+            // window around a deep match; canonical HTML is still excluded.
+            "n.id, substr(n.title, 1, 120), n.body_text, n.updated_time,
              (SELECT nr.resource_id
               FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
               WHERE nr.note_id = n.id AND nr.is_associated = 1

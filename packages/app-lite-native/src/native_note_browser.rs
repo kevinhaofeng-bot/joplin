@@ -1,12 +1,16 @@
-use crate::note_preview::NotePreview;
+use crate::note_preview::{NotePreview, PreviewRange, preview_display_for_preview};
 
 use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send, rc::Retained};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBox, NSBoxType, NSCollectionView, NSCollectionViewFlowLayout,
-    NSCollectionViewItem, NSColor, NSFont, NSImage, NSImageScaling, NSImageView, NSLineBreakMode,
+    NSAutoresizingMaskOptions, NSBackgroundColorAttributeName, NSBox, NSBoxType, NSCollectionView,
+    NSCollectionViewFlowLayout, NSCollectionViewItem, NSColor, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSImage, NSImageScaling, NSImageView, NSLineBreakMode,
     NSTextAlignment, NSTextField,
 };
-use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    MainThreadMarker, NSAttributedString, NSMutableAttributedString, NSObjectProtocol, NSPoint,
+    NSRange, NSRect, NSSize, NSString,
+};
 
 pub const NOTE_CARD_IDENTIFIER: &str = "joplin-lite-note-card";
 
@@ -298,6 +302,7 @@ pub fn make_note_collection_view(
 pub fn configure_note_card(
     item: &NSCollectionViewItem,
     preview: &NotePreview,
+    query: &str,
     image: Option<&NSImage>,
     selected: bool,
     metrics: BrowserMetrics,
@@ -321,7 +326,7 @@ pub fn configure_note_card(
     // The collection item root remains owned by NSCollectionViewFlowLayout;
     // this typed child follows its bounds as the reusable item is laid out.
     card.setFrame(root.bounds());
-    card.configure(preview, image, selected, metrics);
+    card.configure(preview, query, image, selected, metrics);
 }
 
 impl NoteCardView {
@@ -382,6 +387,7 @@ impl NoteCardView {
     fn configure(
         &self,
         preview: &NotePreview,
+        query: &str,
         image: Option<&NSImage>,
         selected: bool,
         metrics: BrowserMetrics,
@@ -412,15 +418,49 @@ impl NoteCardView {
         self.ivars()
             .updated
             .setFrame(frame_from_tuple(frames.updated));
-        self.ivars()
-            .title
-            .setStringValue(&NSString::from_str(&preview.title));
-        self.ivars()
-            .snippet
-            .setStringValue(&NSString::from_str(&preview.snippet));
+        let display = preview_display_for_preview(preview, query);
+        set_card_label_value(
+            &self.ivars().title,
+            &display.title,
+            &display.title_highlights,
+        );
+        set_card_label_value(
+            &self.ivars().snippet,
+            &display.snippet,
+            &display.snippet_highlights,
+        );
         self.ivars()
             .updated
             .setStringValue(&NSString::from_str(&preview.updated_label));
+    }
+}
+
+fn set_card_label_value(field: &NSTextField, value: &str, highlights: &[PreviewRange]) {
+    if highlights.is_empty() {
+        field.setStringValue(&NSString::from_str(value));
+        return;
+    }
+    let attributed = NSMutableAttributedString::from_nsstring(&NSString::from_str(value));
+    let range = NSRange::new(0, attributed.string().length());
+    let font = field.font();
+    let text_color = field.textColor();
+    let highlight_color = NSColor::systemYellowColor().colorWithAlphaComponent(0.32);
+    unsafe {
+        if let Some(font) = font.as_ref() {
+            attributed.addAttribute_value_range(NSFontAttributeName, font, range);
+        }
+        if let Some(text_color) = text_color.as_ref() {
+            attributed.addAttribute_value_range(NSForegroundColorAttributeName, text_color, range);
+        }
+        for highlight in highlights {
+            attributed.addAttribute_value_range(
+                NSBackgroundColorAttributeName,
+                &highlight_color,
+                NSRange::new(highlight.location, highlight.length),
+            );
+        }
+        let source: &NSAttributedString = &attributed;
+        field.setAttributedStringValue(source);
     }
 }
 
@@ -485,6 +525,7 @@ mod tests {
             note_id: "a".into(),
             title: "A".into(),
             snippet: "old".into(),
+            search_text: "old".into(),
             updated_label: "刚刚".into(),
             first_image_id: Some("image-a".into()),
             updated_time: 1,
@@ -493,6 +534,7 @@ mod tests {
             note_id: "b".into(),
             title: "B".into(),
             snippet: "new".into(),
+            search_text: "new".into(),
             updated_label: "昨天".into(),
             first_image_id: None,
             updated_time: 2,
@@ -622,6 +664,7 @@ mod tests {
             note_id: "a".into(),
             title: "A".into(),
             snippet: "".into(),
+            search_text: "".into(),
             updated_label: "刚刚".into(),
             first_image_id: None,
             updated_time: 1,
