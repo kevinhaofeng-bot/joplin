@@ -78,10 +78,77 @@ pub fn card_layout(metrics: BrowserMetrics, has_image: bool) -> CardLayout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ThumbnailKey {
     pub resource_id: String,
     pub target_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailRequest {
+    Start,
+    InFlight,
+    Negative,
+    Deferred,
+}
+
+/// Main-thread owned ledger shared by the production request path. It bounds
+/// both outstanding work and failed-resource memory, so rapid collection
+/// scrolling cannot create an unbounded stream of jobs or failures.
+#[derive(Debug, Clone)]
+pub struct ThumbnailRequestLedger {
+    max_in_flight: usize,
+    max_negative: usize,
+    in_flight: Vec<ThumbnailKey>,
+    negative: Vec<ThumbnailKey>,
+}
+
+impl ThumbnailRequestLedger {
+    pub fn new(max_in_flight: usize, max_negative: usize) -> Self {
+        Self {
+            max_in_flight,
+            max_negative,
+            in_flight: Vec::new(),
+            negative: Vec::new(),
+        }
+    }
+
+    pub fn request(&mut self, key: &ThumbnailKey) -> ThumbnailRequest {
+        if self.negative.iter().any(|entry| entry == key) {
+            return ThumbnailRequest::Negative;
+        }
+        if self.in_flight.iter().any(|entry| entry == key) {
+            return ThumbnailRequest::InFlight;
+        }
+        if self.in_flight.len() >= self.max_in_flight {
+            return ThumbnailRequest::Deferred;
+        }
+        self.in_flight.push(key.clone());
+        ThumbnailRequest::Start
+    }
+
+    pub fn complete(&mut self, key: &ThumbnailKey, success: bool) {
+        self.in_flight.retain(|entry| entry != key);
+        if !success && self.max_negative != 0 {
+            self.negative.retain(|entry| entry != key);
+            self.negative.push(key.clone());
+            while self.negative.len() > self.max_negative {
+                self.negative.remove(0);
+            }
+        }
+    }
+
+    pub fn cancel(&mut self, key: &ThumbnailKey) {
+        self.in_flight.retain(|entry| entry != key);
+    }
+
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    pub fn negative_len(&self) -> usize {
+        self.negative.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -342,9 +409,9 @@ fn card_label(
 #[cfg(test)]
 mod tests {
     use super::{
-        CardVisualState, PreviewListUpdate, ThumbnailCache, ThumbnailKey, browser_metrics,
-        card_layout, card_visual_state, preview_list_update, restore_selection_after_failed_switch,
-        selected_index_for_id,
+        CardVisualState, PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest,
+        ThumbnailRequestLedger, browser_metrics, card_layout, card_visual_state,
+        preview_list_update, restore_selection_after_failed_switch, selected_index_for_id,
     };
     use crate::note_preview::NotePreview;
 
@@ -422,6 +489,35 @@ mod tests {
         assert_eq!(cache.get(&b), None);
         assert_eq!(cache.get(&a), Some(1));
         assert_eq!(cache.get(&c), Some(3));
+    }
+
+    #[test]
+    fn thumbnail_requests_deduplicate_and_negative_cache_is_bounded() {
+        let mut ledger = ThumbnailRequestLedger::new(2, 2);
+        let a = ThumbnailKey {
+            resource_id: "a".into(),
+            target_size: 112,
+        };
+        let b = ThumbnailKey {
+            resource_id: "b".into(),
+            target_size: 112,
+        };
+        let c = ThumbnailKey {
+            resource_id: "c".into(),
+            target_size: 112,
+        };
+        assert_eq!(ledger.request(&a), ThumbnailRequest::Start);
+        assert_eq!(ledger.request(&a), ThumbnailRequest::InFlight);
+        assert_eq!(ledger.request(&b), ThumbnailRequest::Start);
+        assert_eq!(ledger.request(&c), ThumbnailRequest::Deferred);
+        ledger.complete(&a, false);
+        assert_eq!(ledger.request(&a), ThumbnailRequest::Negative);
+        assert_eq!(ledger.request(&c), ThumbnailRequest::Start);
+        ledger.complete(&b, false);
+        assert_eq!(ledger.negative_len(), 2);
+        ledger.complete(&a, false);
+        ledger.complete(&c, false);
+        assert_eq!(ledger.in_flight_len(), 0);
     }
 
     #[test]

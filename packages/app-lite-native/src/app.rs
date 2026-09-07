@@ -18,9 +18,9 @@ use joplin_lite_native::native_editor::{
     render_session, session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
-    PreviewListUpdate, ThumbnailCache, ThumbnailKey, configure_note_card,
-    make_note_collection_view, preview_list_update, restore_selection_after_failed_switch,
-    selected_index_for_id,
+    PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
+    configure_note_card, make_note_collection_view, preview_list_update,
+    restore_selection_after_failed_switch, selected_index_for_id,
 };
 use joplin_lite_native::note_preview::{NotePreview, preview_from_list_item};
 use joplin_lite_native::resource_store::MAX_IMAGE_BYTES;
@@ -45,19 +45,30 @@ use objc2_app_kit::{
     NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow, NSWindowDelegate,
     NSWindowStyleMask,
 };
+use objc2_core_foundation::{
+    CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
+};
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSDictionary,
     NSIndexPath, NSMutableAttributedString, NSMutableCopying, NSNotification, NSNumber, NSObject,
     NSObjectProtocol, NSPoint, NSRange, NSRect, NSSet, NSSize, NSString, NSURL, ns_string,
 };
+use objc2_image_io::{
+    CGImageSource, kCGImageSourceCreateThumbnailFromImageAlways,
+    kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize,
+};
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null_mut};
-use std::sync::Arc;
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESOURCE_ID_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-id";
@@ -99,6 +110,112 @@ struct PendingEditorComposition {
     current_marked_range: NSRange,
     replacement: String,
     covered_attachments: Vec<RenderedAttachment>,
+}
+
+const THUMBNAIL_QUEUE_CAPACITY: usize = 32;
+const THUMBNAIL_WORKER_COUNT: usize = 2;
+const THUMBNAIL_MAX_PIXEL_SIZE: usize = 112;
+
+struct ThumbnailJob {
+    key: ThumbnailKey,
+    repository: Arc<NoteRepository>,
+}
+
+struct ThumbnailCompletion {
+    key: ThumbnailKey,
+    image: Option<CFRetained<CGImage>>,
+    pixels: Option<(usize, usize)>,
+}
+
+struct ThumbnailRuntime {
+    jobs: SyncSender<ThumbnailJob>,
+    completions: Arc<Mutex<VecDeque<ThumbnailCompletion>>>,
+}
+
+static THUMBNAIL_RUNTIME: OnceLock<ThumbnailRuntime> = OnceLock::new();
+
+fn thumbnail_runtime() -> &'static ThumbnailRuntime {
+    THUMBNAIL_RUNTIME.get_or_init(|| {
+        let (jobs, receiver) = sync_channel::<ThumbnailJob>(THUMBNAIL_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let completions = Arc::new(Mutex::new(VecDeque::new()));
+        for worker in 0..THUMBNAIL_WORKER_COUNT {
+            let receiver = Arc::clone(&receiver);
+            let completions = Arc::clone(&completions);
+            thread::Builder::new()
+                .name(format!("joplin-thumbnail-{worker}"))
+                .spawn(move || {
+                    loop {
+                        let job = receiver.lock().expect("thumbnail queue poisoned").recv();
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        let image = load_downsampled_thumbnail(&job.repository, &job.key);
+                        let pixels = image.as_ref().map(|image| {
+                            (CGImage::width(Some(image)), CGImage::height(Some(image)))
+                        });
+                        completions
+                            .lock()
+                            .expect("thumbnail completion queue poisoned")
+                            .push_back(ThumbnailCompletion {
+                                key: job.key,
+                                image,
+                                pixels,
+                            });
+                    }
+                })
+                .expect("thumbnail worker thread must start");
+        }
+        ThumbnailRuntime { jobs, completions }
+    })
+}
+
+fn submit_thumbnail_job(job: ThumbnailJob) -> bool {
+    match thumbnail_runtime().jobs.try_send(job) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn downsampled_thumbnail_image(bytes: &[u8], max_pixel_size: usize) -> Option<CFRetained<CGImage>> {
+    if bytes.is_empty() || max_pixel_size == 0 {
+        return None;
+    }
+    let data = CFData::from_bytes(bytes);
+    let always: CFRetained<CFType> = CFBoolean::new(true).into();
+    let transform: CFRetained<CFType> = CFBoolean::new(true).into();
+    let max_size: CFRetained<CFType> = CFNumber::new_isize(max_pixel_size as isize).into();
+    let keys: [&CFString; 3] = unsafe {
+        [
+            kCGImageSourceCreateThumbnailFromImageAlways,
+            kCGImageSourceThumbnailMaxPixelSize,
+            kCGImageSourceCreateThumbnailWithTransform,
+        ]
+    };
+    let values: [&CFType; 3] = [always.as_ref(), max_size.as_ref(), transform.as_ref()];
+    let options = CFDictionary::<CFString, CFType>::from_slices(&keys, &values);
+    let options: &CFDictionary = unsafe { options.cast_unchecked() };
+    let source = unsafe { CGImageSource::with_data(&data, Some(options)) }?;
+    let image = unsafe { source.thumbnail_at_index(0, Some(options)) }?;
+    let pixels = (CGImage::width(Some(&image)), CGImage::height(Some(&image)));
+    thumbnail_pixels_within_bound(pixels, max_pixel_size).then_some(image)
+}
+
+fn load_downsampled_thumbnail(
+    repository: &NoteRepository,
+    key: &ThumbnailKey,
+) -> Option<CFRetained<CGImage>> {
+    let resource = repository.get_resource(&key.resource_id).ok().flatten()?;
+    if !matches!(resource.mime.as_str(), "image/png" | "image/jpeg")
+        || !image_signature_matches_mime(&resource.bytes, &resource.mime)
+    {
+        return None;
+    }
+    downsampled_thumbnail_image(&resource.bytes, key.target_size as usize)
+}
+
+fn thumbnail_pixels_within_bound(pixels: (usize, usize), max_pixel_size: usize) -> bool {
+    pixels.0 > 0 && pixels.1 > 0 && pixels.0 <= max_pixel_size && pixels.1 <= max_pixel_size
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2150,6 +2267,10 @@ struct AppDelegateIvars {
     note_filter_query: RefCell<String>,
     thumbnail_cache: RefCell<ThumbnailCache<Retained<NSImage>>>,
     thumbnail_decode_count: Cell<usize>,
+    thumbnail_decode_attempts: Cell<usize>,
+    thumbnail_negative_count: Cell<usize>,
+    thumbnail_requests: RefCell<ThumbnailRequestLedger>,
+    thumbnail_drain_scheduled: Cell<bool>,
     loading_guard: RefCell<bool>,
     autosave: RefCell<AutosaveState>,
     shell_visibility: RefCell<ShellVisibility>,
@@ -2896,6 +3017,57 @@ define_class!(
         }
     }
     impl AppDelegate {
+        #[unsafe(method(drainThumbnailQueue:))]
+        fn drain_thumbnail_queue(&self, _sender: &NSObject) {
+            self.ivars().thumbnail_drain_scheduled.set(false);
+            let completions = {
+                let runtime = thumbnail_runtime();
+                let mut queue = runtime
+                    .completions
+                    .lock()
+                    .expect("thumbnail completion queue poisoned");
+                queue.drain(..).collect::<Vec<_>>()
+            };
+            for completion in completions {
+                let pixels_ok = completion
+                    .pixels
+                    .is_some_and(|pixels| thumbnail_pixels_within_bound(pixels, THUMBNAIL_MAX_PIXEL_SIZE));
+                let success = completion.image.is_some() && pixels_ok;
+                self.ivars()
+                    .thumbnail_requests
+                    .borrow_mut()
+                    .complete(&completion.key, success);
+                if success {
+                    if let Some(image) = completion.image {
+                        let image = NSImage::initWithCGImage_size(
+                            NSImage::alloc(),
+                            &image,
+                            NSSize::new(56.0, 56.0),
+                        );
+                        self.ivars()
+                            .thumbnail_cache
+                            .borrow_mut()
+                            .insert(completion.key.clone(), image);
+                        self.ivars().thumbnail_decode_count.set(
+                            self.ivars().thumbnail_decode_count.get().saturating_add(1),
+                        );
+                    }
+                    self.reload_visible_thumbnail_card(&completion.key);
+                } else {
+                    self.ivars().thumbnail_negative_count.set(
+                        self.ivars().thumbnail_negative_count.get().saturating_add(1),
+                    );
+                }
+            }
+            // A worker completion frees one bounded queue slot. Revisit all
+            // visible previews so deferred keys can now be submitted, while
+            // only the matching card is actually reloaded above.
+            self.request_visible_thumbnails();
+            if self.ivars().thumbnail_requests.borrow().in_flight_len() > 0 {
+                self.schedule_thumbnail_drain();
+            }
+        }
+
         #[unsafe(method(runAutosave:))]
         fn run_autosave(&self, sender: &NSObject) {
             let Some(token) = sender.downcast_ref::<NSString>() else {
@@ -3380,26 +3552,81 @@ impl AppDelegate {
         if let Some(image) = self.ivars().thumbnail_cache.borrow_mut().get(&key) {
             return Some(image);
         }
-        let resource = self
-            .ivars()
-            .repository
-            .get_resource(resource_id)
-            .ok()
-            .flatten()?;
-        if !matches!(resource.mime.as_str(), "image/png" | "image/jpeg")
-            || !image_signature_matches_mime(&resource.bytes, &resource.mime)
-        {
+        let request = self.ivars().thumbnail_requests.borrow_mut().request(&key);
+        if !matches!(request, ThumbnailRequest::Start) {
             return None;
         }
-        let image = decoded_thumbnail(&resource.bytes, 112.0)?;
-        self.ivars()
-            .thumbnail_decode_count
-            .set(self.ivars().thumbnail_decode_count.get().saturating_add(1));
-        self.ivars()
-            .thumbnail_cache
-            .borrow_mut()
-            .insert(key, image.clone());
-        Some(image)
+        let job = ThumbnailJob {
+            key: key.clone(),
+            repository: Arc::clone(&self.ivars().repository),
+        };
+        if !submit_thumbnail_job(job) {
+            self.ivars().thumbnail_requests.borrow_mut().cancel(&key);
+            return None;
+        }
+        self.ivars().thumbnail_decode_attempts.set(
+            self.ivars()
+                .thumbnail_decode_attempts
+                .get()
+                .saturating_add(1),
+        );
+        self.schedule_thumbnail_drain();
+        None
+    }
+
+    fn schedule_thumbnail_drain(&self) {
+        if self.ivars().thumbnail_drain_scheduled.replace(true) {
+            return;
+        }
+        let token = NSObject::new();
+        unsafe {
+            let _: () = msg_send![
+                self,
+                performSelector: sel!(drainThumbnailQueue:),
+                withObject: &*token,
+                afterDelay: 0.05
+            ];
+        }
+    }
+
+    fn request_visible_thumbnails(&self) {
+        let Some(collection) = self.ivars().note_collection.get() else {
+            return;
+        };
+        for item in collection.visibleItems().iter() {
+            let Some(index_path) = collection.indexPathForItem(&item) else {
+                continue;
+            };
+            let index = index_path.item() as usize;
+            let Some(preview) = self.ivars().note_previews.borrow().get(index).cloned() else {
+                continue;
+            };
+            let _ = self.thumbnail_for_preview(&preview);
+        }
+    }
+
+    fn reload_visible_thumbnail_card(&self, key: &ThumbnailKey) {
+        let Some(collection) = self.ivars().note_collection.get() else {
+            return;
+        };
+        let mut paths = Vec::new();
+        for item in collection.visibleItems().iter() {
+            let Some(index_path) = collection.indexPathForItem(&item) else {
+                continue;
+            };
+            let index = index_path.item() as usize;
+            let preview = self.ivars().note_previews.borrow().get(index).cloned();
+            let Some(preview) = preview else {
+                continue;
+            };
+            if preview.first_image_id.as_deref() == Some(key.resource_id.as_str()) {
+                paths.push(index_path);
+            }
+        }
+        if !paths.is_empty() {
+            let refs = paths.iter().map(|path| &**path).collect::<Vec<_>>();
+            collection.reloadItemsAtIndexPaths(&NSSet::from_slice(&refs));
+        }
     }
 
     fn select_note_index(&self, index: usize) {
@@ -5630,34 +5857,6 @@ fn decoded_image(bytes: &[u8]) -> Option<Retained<NSImage>> {
     Some(image)
 }
 
-#[allow(deprecated)]
-fn decoded_thumbnail(bytes: &[u8], target: f64) -> Option<Retained<NSImage>> {
-    let source = decoded_image(bytes)?;
-    let draw_size = thumbnail_dimensions(source.size(), target)?;
-    let thumbnail = NSImage::initWithSize(NSImage::alloc(), NSSize::new(target, target));
-    thumbnail.lockFocus();
-    source.drawInRect(NSRect::new(
-        NSPoint::new(
-            (target - draw_size.width) / 2.0,
-            (target - draw_size.height) / 2.0,
-        ),
-        draw_size,
-    ));
-    thumbnail.unlockFocus();
-    Some(thumbnail)
-}
-
-fn thumbnail_dimensions(source_size: NSSize, target: f64) -> Option<NSSize> {
-    if source_size.width <= 0.0 || source_size.height <= 0.0 || target <= 0.0 {
-        return None;
-    }
-    let scale = (target / source_size.width).min(target / source_size.height);
-    Some(NSSize::new(
-        source_size.width * scale,
-        source_size.height * scale,
-    ))
-}
-
 fn image_signature_matches_mime(bytes: &[u8], mime: &str) -> bool {
     match mime {
         "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
@@ -5965,6 +6164,10 @@ impl AppDelegate {
             note_filter_query: RefCell::new(String::new()),
             thumbnail_cache: RefCell::new(ThumbnailCache::new(32)),
             thumbnail_decode_count: Cell::new(0),
+            thumbnail_decode_attempts: Cell::new(0),
+            thumbnail_negative_count: Cell::new(0),
+            thumbnail_requests: RefCell::new(ThumbnailRequestLedger::new(32, 64)),
+            thumbnail_drain_scheduled: Cell::new(false),
             loading_guard: RefCell::new(false),
             autosave: RefCell::new(AutosaveState::empty()),
             shell_visibility: RefCell::new(ShellVisibility::Default),
@@ -6017,8 +6220,7 @@ mod tests {
         is_local_file_url_host, is_promised_pasteboard_type, legacy_migration_recovery_message,
         note_list_summary, note_list_title, paste_route, read_drag_image_file,
         read_pasteboard_image_from, read_regular_image_file, render_document_to_attributed_string,
-        thumbnail_dimensions, typing_trait_operation, valid_image_bytes_for_mime,
-        validate_canonical_data_dir,
+        typing_trait_operation, valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
     use joplin_lite_native::core::{LegacyNoteForHtmlMigration, NoteRepository, StoredResource};
     use joplin_lite_native::html_body::{Block, Document, Inline, Marks, serialize_html};
@@ -7216,15 +7418,6 @@ mod tests {
         assert!(!valid_image_bytes_for_mime(&truncated_jpeg, "image/jpeg"));
         assert!(!valid_image_bytes_for_mime(GIF, "image/png"));
         assert!(!valid_image_bytes_for_mime(TIFF, "image/jpeg"));
-    }
-
-    #[test]
-    fn thumbnail_dimensions_are_bounded_and_preserve_aspect_ratio() {
-        let size = thumbnail_dimensions(NSSize::new(4000.0, 2000.0), 112.0).unwrap();
-        assert_eq!(size.width, 112.0);
-        assert_eq!(size.height, 56.0);
-        assert!(size.width <= 112.0 && size.height <= 112.0);
-        assert!(thumbnail_dimensions(NSSize::new(0.0, 1.0), 112.0).is_none());
     }
 
     #[test]

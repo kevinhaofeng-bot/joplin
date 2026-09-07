@@ -25,11 +25,14 @@ text-document = "=1.12.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-foundation = "0.3.2"
+objc2-core-foundation = { version = "0.3.2", features = ["CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGImage"] }
+objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "objc2", "objc2-core-graphics"] }
 objc2-app-kit = { version = "0.3.2", features = [
     "NSAlert", "NSApplication", "NSBitmapImageRep", "NSButton", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSMenu",
     "NSFontManager", "NSMenuItem", "NSOpenPanel", "NSSavePanel", "NSResponder", "NSScrollView", "NSSearchField", "NSSplitView",
     "NSCollectionView", "NSCollectionViewFlowLayout", "NSCollectionViewLayout", "NSViewController", "NSUserInterfaceItemIdentification", "NSImageView",
-    "NSBox", "NSLayoutConstraint", "NSParagraphStyle", "NSAttributedString",
+    "NSBox", "NSLayoutConstraint", "NSParagraphStyle", "NSAttributedString", "objc2-core-graphics",
     "NSTextStorage", "NSTextList",
     "NSText", "NSTextAttachment", "NSTextField", "NSTextView", "NSView", "NSWindow",
     "NSPasteboard", "NSPasteboardItem",
