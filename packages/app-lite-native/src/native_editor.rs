@@ -18,9 +18,17 @@ use objc2_app_kit::{
     NSTextListMarkerDecimal, NSTextListMarkerDisc, NSTextListOptions, NSUnderlineStyle,
     NSUnderlineStyleAttributeName,
 };
+use objc2_core_foundation::{
+    CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
+};
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{
-    NSAttributedString, NSAttributedStringKey, NSData, NSMutableAttributedString, NSNumber,
-    NSRange, NSSize, NSString, NSURL,
+    NSAttributedString, NSAttributedStringKey, NSMutableAttributedString, NSNumber, NSRange,
+    NSSize, NSString, NSURL,
+};
+use objc2_image_io::{
+    CGImageSource, kCGImageSourceCreateThumbnailFromImageAlways,
+    kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -35,6 +43,7 @@ const RESOURCE_ALT_KEY: &str = "com.kevinhao.joplin-lite.resource-alt";
 const RESOURCE_WIDTH_KEY: &str = "com.kevinhao.joplin-lite.resource-width";
 const RESOURCE_HEIGHT_KEY: &str = "com.kevinhao.joplin-lite.resource-height";
 const MISSING_RESOURCE_KEY: &str = "com.kevinhao.joplin-lite.missing-resource";
+pub const INLINE_IMAGE_MAX_PIXEL_SIZE: usize = 1280;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EditorCodecError {
@@ -1962,6 +1971,49 @@ fn apply_highlight_overlay(
     }
 }
 
+fn downsampled_editor_image(bytes: &[u8], max_pixel_size: usize) -> Option<CFRetained<CGImage>> {
+    if bytes.is_empty() || max_pixel_size == 0 {
+        return None;
+    }
+    let data = CFData::from_bytes(bytes);
+    let always: CFRetained<CFType> = CFBoolean::new(true).into();
+    let transform: CFRetained<CFType> = CFBoolean::new(true).into();
+    let max_size: CFRetained<CFType> = CFNumber::new_isize(max_pixel_size as isize).into();
+    let keys: [&CFString; 3] = unsafe {
+        [
+            kCGImageSourceCreateThumbnailFromImageAlways,
+            kCGImageSourceThumbnailMaxPixelSize,
+            kCGImageSourceCreateThumbnailWithTransform,
+        ]
+    };
+    let values: [&CFType; 3] = [always.as_ref(), max_size.as_ref(), transform.as_ref()];
+    let options = CFDictionary::<CFString, CFType>::from_slices(&keys, &values);
+    let options: &CFDictionary = unsafe { options.cast_unchecked() };
+    let source = unsafe { CGImageSource::with_data(&data, Some(options)) }?;
+    let image = unsafe { source.thumbnail_at_index(0, Some(options)) }?;
+    let width = CGImage::width(Some(&image));
+    let height = CGImage::height(Some(&image));
+    (width > 0 && height > 0 && width <= max_pixel_size && height <= max_pixel_size)
+        .then_some(image)
+}
+
+/// Build the bounded display representation used by NSTextAttachment.
+///
+/// The canonical resource bytes stay in the repository and are never replaced
+/// by this projection.  Keeping the attachment on a bounded CGImage avoids
+/// forcing AppKit to retain a full-resolution decoded bitmap for every image
+/// in the editor.
+pub fn editor_attachment_image(bytes: &[u8]) -> Option<Retained<NSImage>> {
+    let image = downsampled_editor_image(bytes, INLINE_IMAGE_MAX_PIXEL_SIZE)?;
+    let width = CGImage::width(Some(&image));
+    let height = CGImage::height(Some(&image));
+    Some(NSImage::initWithCGImage_size(
+        NSImage::alloc(),
+        &image,
+        NSSize::new(width as f64, height as f64),
+    ))
+}
+
 fn attachment_piece(
     resource: Option<&StoredResource>,
     name: &str,
@@ -1972,10 +2024,8 @@ fn attachment_piece(
 ) -> Retained<NSMutableAttributedString> {
     let attachment = match resource {
         Some(resource) => {
-            let data = NSData::with_bytes(&resource.bytes);
-            let attachment =
-                NSTextAttachment::initWithData_ofType(NSTextAttachment::alloc(), Some(&data), None);
-            if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+            let attachment = NSTextAttachment::init(NSTextAttachment::alloc());
+            if let Some(image) = editor_attachment_image(&resource.bytes) {
                 attachment.setImage(Some(&image));
                 let ratio = if image.size().width > 0.0 {
                     (available_width / image.size().width).min(1.0)

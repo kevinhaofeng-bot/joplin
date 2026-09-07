@@ -13,9 +13,9 @@ use joplin_lite_native::native_editor::{
     BlockCommand, EmptyBlockCarrier, InlineCommand, NativeEditorSession, ParagraphCommand,
     RenderedAttachment, RenderedDocument, SelectionState, apply_block_command,
     apply_committed_text_delta, apply_inline_command, apply_link, apply_paragraph_command,
-    delete_image_anchor_if_identity, document_from_session, insert_image_anchor, query_block_state,
-    query_clear_state, query_inline_state, query_link_selection, query_paragraph_command_state,
-    render_session, session_from_document,
+    delete_image_anchor_if_identity, document_from_session, editor_attachment_image,
+    insert_image_anchor, query_block_state, query_clear_state, query_inline_state,
+    query_link_selection, query_paragraph_command_state, render_session, session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
     PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
@@ -3741,7 +3741,12 @@ impl AppDelegate {
             return;
         };
         self.layout_content(content.frame().size.width, content.frame().size.height);
-        self.restore_command_selection(*self.ivars().last_body_selection.borrow());
+        // Copy the range before calling into AppKit. `setSelectedRange` can
+        // synchronously re-enter textViewDidChangeSelection, which mutably
+        // updates this RefCell. Keeping the Ref borrow in the call expression
+        // would make that legitimate delegate re-entry panic.
+        let selection = selection_snapshot_for_reentrant_appkit(&self.ivars().last_body_selection);
+        self.restore_command_selection(selection);
     }
 
     fn toolbar_selector(action: EditorAction) -> Option<Sel> {
@@ -6072,20 +6077,18 @@ fn first_attachment_bounds(body: &NSTextView) -> Option<NSRect> {
     None
 }
 
+fn selection_snapshot_for_reentrant_appkit(cell: &RefCell<NSRange>) -> NSRange {
+    let selection = cell.borrow();
+    *selection
+}
+
 fn inline_attachment_with_width(
     resource: &joplin_lite_native::core::StoredResource,
     alt: &str,
     available_width: f64,
 ) -> Option<Retained<NSMutableAttributedString>> {
-    let image = decoded_image(&resource.bytes)?;
-    let data = NSData::with_bytes(&resource.bytes);
-    let uti = NSString::from_str(if resource.mime == "image/jpeg" {
-        "public.jpeg"
-    } else {
-        "public.png"
-    });
-    let attachment =
-        NSTextAttachment::initWithData_ofType(NSTextAttachment::alloc(), Some(&data), Some(&uti));
+    let image = editor_attachment_image(&resource.bytes)?;
+    let attachment = NSTextAttachment::init(NSTextAttachment::alloc());
     attachment.setImage(Some(&image));
     attachment.setBounds(NSRect::new(
         NSPoint::new(0.0, 0.0),
@@ -6219,21 +6222,23 @@ mod tests {
         is_local_file_url_host, is_promised_pasteboard_type, legacy_migration_recovery_message,
         note_list_summary, note_list_title, paste_route, read_drag_image_file,
         read_pasteboard_image_from, read_regular_image_file, render_document_to_attributed_string,
-        typing_trait_operation, valid_image_bytes_for_mime, validate_canonical_data_dir,
+        render_session, selection_snapshot_for_reentrant_appkit, typing_trait_operation,
+        valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
     use joplin_lite_native::core::{LegacyNoteForHtmlMigration, NoteRepository, StoredResource};
     use joplin_lite_native::html_body::{Block, Document, Inline, Marks, serialize_html};
     use objc2::{AnyThread, runtime::AnyObject};
     use objc2_app_kit::{
-        NSAttributedStringAttachmentConveniences, NSBitmapImageFileType, NSBitmapImageRep,
-        NSFontAttributeName, NSMutableParagraphStyle, NSPasteboard, NSPasteboardTypeFileURL,
-        NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSTextAttachment, NSUnderlineStyle,
-        NSUnderlineStyleAttributeName,
+        NSAttachmentAttributeName, NSAttributedStringAttachmentConveniences, NSBitmapImageFileType,
+        NSBitmapImageRep, NSFontAttributeName, NSMutableParagraphStyle, NSPasteboard,
+        NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSTextAttachment,
+        NSUnderlineStyle, NSUnderlineStyleAttributeName,
     };
     use objc2_foundation::{
         NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSSize,
         NSString, NSURL,
     };
+    use std::cell::RefCell;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
@@ -6820,6 +6825,101 @@ mod tests {
         let source_ref: &NSAttributedString = &rendered;
         let round_trip = document_from_attributed_string(source_ref).unwrap();
         assert_eq!(serialize_html(&round_trip), serialize_html(&document));
+    }
+
+    #[test]
+    fn live_rendered_attachment_has_image_and_visible_geometry() {
+        let resource_id = "0123456789abcdef0123456789abcdef";
+        let document = Document::from_blocks(vec![paragraph(vec![
+            Inline::Text {
+                text: "前".into(),
+                marks: Marks::default(),
+            },
+            Inline::Image {
+                resource_id: resource_id.into(),
+                alt: "截图".into(),
+            },
+            Inline::Text {
+                text: "后".into(),
+                marks: Marks::default(),
+            },
+        ])]);
+        let session = super::session_from_document(&document).unwrap();
+        let rendered = render_session(
+            &session,
+            |id| {
+                Some(StoredResource {
+                    id: id.into(),
+                    sha256: "0".repeat(64),
+                    size: TEST_PNG.len(),
+                    title: "截图.png".into(),
+                    mime: "image/png".into(),
+                    file_extension: "png".into(),
+                    path: PathBuf::new(),
+                    bytes: TEST_PNG.to_vec(),
+                })
+            },
+            640.0,
+        );
+        let source: &NSAttributedString = &rendered.attributed;
+        let attachment_key = unsafe { NSAttachmentAttributeName };
+        let mut effective_range = NSRange::new(0, 0);
+        let attributes = unsafe {
+            source.attributesAtIndex_longestEffectiveRange_inRange(
+                1,
+                &mut effective_range,
+                NSRange::new(0, source.length()),
+            )
+        };
+        let attachment = unsafe { attributes.objectForKey_unchecked(attachment_key) }
+            .and_then(|value| value.downcast_ref::<NSTextAttachment>())
+            .expect("rendered semantic image must carry NSTextAttachment");
+        assert!(attachment.image().is_some());
+        let bounds = attachment.bounds();
+        assert!(bounds.size.width > 0.0 && bounds.size.height > 0.0);
+        let image_size = attachment
+            .image()
+            .expect("display image must be attached")
+            .size();
+        assert!(image_size.width > 0.0 && image_size.height > 0.0);
+        assert_eq!(bounds.size, inline_image_display_size(image_size, 640.0));
+        assert_eq!(rendered.attributed.string().to_string(), "前\u{fffc}后");
+
+        let resource = StoredResource {
+            id: resource_id.into(),
+            sha256: "0".repeat(64),
+            size: TEST_PNG.len(),
+            title: "截图.png".into(),
+            mime: "image/png".into(),
+            file_extension: "png".into(),
+            path: PathBuf::new(),
+            bytes: TEST_PNG.to_vec(),
+        };
+        let inserted = super::inline_attachment_with_width(&resource, "截图", 640.0)
+            .expect("live insert must produce a display attachment");
+        let inserted_source: &NSAttributedString = &inserted;
+        let mut inserted_effective_range = NSRange::new(0, 0);
+        let inserted_attributes = unsafe {
+            inserted_source.attributesAtIndex_longestEffectiveRange_inRange(
+                0,
+                &mut inserted_effective_range,
+                NSRange::new(0, inserted_source.length()),
+            )
+        };
+        let inserted_attachment =
+            unsafe { inserted_attributes.objectForKey_unchecked(attachment_key) }
+                .and_then(|value| value.downcast_ref::<NSTextAttachment>())
+                .expect("live insert must carry NSTextAttachment");
+        assert!(inserted_attachment.bounds().size.width > 0.0);
+        assert!(inserted_attachment.image().is_some());
+    }
+
+    #[test]
+    fn relayout_selection_snapshot_releases_borrow_before_appkit_reentry() {
+        let remembered = RefCell::new(NSRange::new(4, 2));
+        let snapshot = selection_snapshot_for_reentrant_appkit(&remembered);
+        *remembered.borrow_mut() = NSRange::new(0, 0);
+        assert_eq!(snapshot, NSRange::new(4, 2));
     }
 
     #[test]
