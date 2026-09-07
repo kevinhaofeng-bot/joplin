@@ -962,7 +962,9 @@ fn project_dom(root: &DomHandle) -> Document {
             } => projection.finish_block(blocks_before, kind, style),
             ProjectionFrame::FinishList => projection.finish_list(),
             ProjectionFrame::FinishListItem => projection.finish_list_item(),
-            ProjectionFrame::FinishListBlock => projection.finish_list_block(),
+            ProjectionFrame::FinishListBlock { preserve_empty } => {
+                projection.finish_list_block(preserve_empty)
+            }
             ProjectionFrame::Visit {
                 node,
                 marks,
@@ -1027,7 +1029,9 @@ fn project_dom(root: &DomHandle) -> Document {
                         if !projection.list_contexts.is_empty() {
                             projection.begin_list_block();
                             projection.ensure_current();
-                            pending.push(ProjectionFrame::FinishListBlock);
+                            pending.push(ProjectionFrame::FinishListBlock {
+                                preserve_empty: true,
+                            });
                             for child in children.into_iter().rev() {
                                 pending.push(ProjectionFrame::Visit {
                                     node: child,
@@ -1061,13 +1065,14 @@ fn project_dom(root: &DomHandle) -> Document {
                         )
                     {
                         if !projection.list_contexts.is_empty() {
-                            let is_list_block = matches!(tag.as_str(), "p" | "pre" | "blockquote");
+                            let is_list_block = is_list_block_element(&tag);
+                            let preserve_empty = is_list_semantic_block(&tag);
                             if is_list_block {
                                 projection.begin_list_block();
                             }
                             projection.ensure_current();
                             if is_list_block {
-                                pending.push(ProjectionFrame::FinishListBlock);
+                                pending.push(ProjectionFrame::FinishListBlock { preserve_empty });
                             }
                             let child_preformatted = preformatted || tag == "pre";
                             for child in children.into_iter().rev() {
@@ -1177,7 +1182,9 @@ enum ProjectionFrame {
     },
     FinishList,
     FinishListItem,
-    FinishListBlock,
+    FinishListBlock {
+        preserve_empty: bool,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -1382,9 +1389,24 @@ impl Projection {
         self.current_item_has_content = false;
     }
 
-    fn finish_list_block(&mut self) {
+    fn finish_list_block(&mut self, preserve_empty: bool) {
         if self.current.is_some() {
-            self.finish_list_item();
+            if !self.current_item_has_content && !preserve_empty {
+                self.discard_current_list_item();
+            } else {
+                self.finish_list_item();
+            }
+        }
+    }
+
+    fn discard_current_list_item(&mut self) {
+        if self.current.is_some() {
+            self.current = None;
+            self.pending_space = false;
+            self.pending_marks = None;
+            self.flow_has_visible = false;
+            self.explicit_softbreak = false;
+            self.current_item_has_content = false;
         }
     }
 
@@ -1644,7 +1666,36 @@ fn heading_level(tag: &str) -> Option<HeadingLevel> {
 }
 
 fn is_block_element(name: &str) -> bool {
-    matches!(name, "p" | "h1" | "h2" | "h3" | "li" | "pre" | "blockquote")
+    matches!(
+        name,
+        "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "pre" | "blockquote"
+    )
+}
+
+fn is_list_block_element(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "pre"
+            | "blockquote"
+            | "div"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+    )
+}
+
+fn is_list_semantic_block(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "blockquote"
+    )
 }
 
 fn is_formatting_whitespace(text: &str) -> bool {
@@ -1825,6 +1876,67 @@ mod tests {
             serialize_html(&consecutive),
             "<ul><li><br><br></li><li>two</li></ul>"
         );
+    }
+
+    #[test]
+    fn list_block_wrappers_preserve_boundaries_without_wrapper_empty_items() {
+        let inline_wrapper = parse_html("<ul><li>before<div>inside</div>after</li></ul>").unwrap();
+        assert_eq!(search_text(&inline_wrapper), "before\ninside\nafter");
+        let Block::List {
+            items: inline_items,
+            ..
+        } = &inline_wrapper.blocks[0]
+        else {
+            panic!("expected list");
+        };
+        assert_eq!(inline_items.len(), 3);
+
+        let wrapped_blocks =
+            parse_html("<ul><li><div><p>one</p><h4>two</h4></div></li></ul>").unwrap();
+        assert_eq!(search_text(&wrapped_blocks), "one\ntwo");
+        let Block::List {
+            items: wrapped_items,
+            ..
+        } = &wrapped_blocks.blocks[0]
+        else {
+            panic!("expected list");
+        };
+        assert_eq!(wrapped_items.len(), 2);
+
+        let empty_wrapper = parse_html("<ul><li><div></div>after</li></ul>").unwrap();
+        assert_eq!(search_text(&empty_wrapper), "after");
+        let Block::List {
+            items: empty_items, ..
+        } = &empty_wrapper.blocks[0]
+        else {
+            panic!("expected list");
+        };
+        assert_eq!(empty_items.len(), 1);
+    }
+
+    #[test]
+    fn adjacent_wrappers_keep_marks_images_and_resource_order() {
+        let document = parse_html(&format!(
+            "<ul><li><section><strong>one</strong><img src=\":/{RESOURCE_ID}\" alt=\"a\"></section><article><em>two</em><img src=\":/{SECOND_RESOURCE_ID}\" alt=\"b\"></article></li></ul>"
+        ))
+        .unwrap();
+        assert_eq!(search_text(&document), "onea\ntwob");
+        assert_eq!(
+            resource_ids(&document),
+            vec![RESOURCE_ID.to_owned(), SECOND_RESOURCE_ID.to_owned()]
+        );
+        let Block::List { items, .. } = &document.blocks[0] else {
+            panic!("expected list");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            &items[0].inlines[0],
+            Inline::Text { marks, .. } if marks.bold
+        ));
+        assert!(matches!(
+            &items[1].inlines[0],
+            Inline::Text { marks, .. } if marks.italic
+        ));
     }
 
     #[test]
