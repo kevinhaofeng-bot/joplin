@@ -10,7 +10,17 @@ use thiserror::Error;
 pub enum HtmlBodyError {
     #[error("HTML parser failed")]
     Parse,
+    #[error("HTML document exceeds the maximum DOM depth of {limit}")]
+    DepthLimit { limit: usize },
+    #[error("HTML document exceeds the maximum DOM node count of {limit}")]
+    NodeLimit { limit: usize },
 }
+
+// These limits protect the projection and destruction paths without imposing a
+// small byte limit on ordinary long notes. The parser itself remains HTML5;
+// only the in-memory tree we are willing to project is bounded.
+const MAX_DOM_DEPTH: usize = 4096;
+const MAX_DOM_NODES: usize = 1_000_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Document {
@@ -19,7 +29,13 @@ pub struct Document {
 
 impl Document {
     pub fn from_blocks(blocks: Vec<Block>) -> Self {
-        Self { blocks }
+        Self {
+            blocks: normalize_blocks(blocks),
+        }
+    }
+
+    fn normalized(&self) -> Self {
+        Self::from_blocks(self.blocks.clone())
     }
 }
 
@@ -54,10 +70,16 @@ pub fn parse_html(input: &str) -> Result<Document, HtmlBodyError> {
     .from_utf8()
     .one(input.as_bytes());
 
+    if let Err(error) = check_dom_limits(&root) {
+        drain_dom(root);
+        return Err(error);
+    }
+
     Ok(project_dom(&root))
 }
 
 pub fn serialize_html(document: &Document) -> String {
+    let document = document.normalized();
     if document.blocks.iter().all(block_is_empty) {
         return String::new();
     }
@@ -66,7 +88,11 @@ pub fn serialize_html(document: &Document) -> String {
         match block {
             Block::Paragraph(inlines) => {
                 output.push_str("<p>");
-                serialize_inlines(inlines, &mut output);
+                if inlines.is_empty() {
+                    output.push_str("<br>");
+                } else {
+                    serialize_inlines(inlines, &mut output);
+                }
                 output.push_str("</p>");
             }
         }
@@ -125,10 +151,79 @@ fn block_is_empty(block: &Block) -> bool {
     }
 }
 
-fn serialize_inlines(inlines: &[Inline], output: &mut String) {
+fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
+    blocks
+        .into_iter()
+        .map(|block| match block {
+            Block::Paragraph(inlines) => Block::Paragraph(normalize_inlines(inlines)),
+        })
+        .collect()
+}
+
+fn normalize_inlines(inlines: Vec<Inline>) -> Vec<Inline> {
+    let mut normalized = Vec::new();
     for inline in inlines {
         match inline {
-            Inline::Text { text, marks } => serialize_text(text, marks, output),
+            Inline::Text { text, marks } => {
+                let mut current = String::new();
+                for character in text.chars() {
+                    match character {
+                        '\r' => current.push('\n'),
+                        '\t' => current.push_str("    "),
+                        '\n' => {
+                            append_normalized_text(&mut normalized, &current, &marks);
+                            current.clear();
+                            normalized.push(Inline::SoftBreak);
+                        }
+                        _ => current.push(character),
+                    }
+                }
+                append_normalized_text(&mut normalized, &current, &marks);
+            }
+            other => normalized.push(other),
+        }
+    }
+    let snapshot = normalized.clone();
+    for (index, inline) in normalized.iter_mut().enumerate() {
+        let Inline::Text { text, .. } = inline else {
+            continue;
+        };
+        let mut characters: Vec<char> = text.chars().collect();
+        for position in 0..characters.len() {
+            if characters[position] == ' '
+                && !ordinary_space_can_collapse(&characters, position, &snapshot, index)
+            {
+                characters[position] = '\u{00a0}';
+            }
+        }
+        *text = characters.into_iter().collect();
+    }
+    normalized
+}
+
+fn append_normalized_text(inlines: &mut Vec<Inline>, text: &str, marks: &Marks) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(Inline::Text {
+        text: previous,
+        marks: previous_marks,
+    }) = inlines.last_mut()
+        && previous_marks == marks
+    {
+        previous.push_str(text);
+        return;
+    }
+    inlines.push(Inline::Text {
+        text: text.to_owned(),
+        marks: marks.clone(),
+    });
+}
+
+fn serialize_inlines(inlines: &[Inline], output: &mut String) {
+    for (index, inline) in inlines.iter().enumerate() {
+        match inline {
+            Inline::Text { text, marks } => serialize_text(text, marks, inlines, index, output),
             Inline::SoftBreak => output.push_str("<br>"),
             Inline::Image { resource_id, alt } => {
                 if crate::body::validate_resource_id(resource_id).is_ok() {
@@ -138,14 +233,20 @@ fn serialize_inlines(inlines: &[Inline], output: &mut String) {
                     escape_attribute(alt, output);
                     output.push_str("\">");
                 } else {
-                    escape_text(alt, output);
+                    escape_plain_text(alt, output);
                 }
             }
         }
     }
 }
 
-fn serialize_text(text: &str, marks: &Marks, output: &mut String) {
+fn serialize_text(
+    text: &str,
+    marks: &Marks,
+    inlines: &[Inline],
+    index: usize,
+    output: &mut String,
+) {
     if marks.bold {
         output.push_str("<strong>");
     }
@@ -155,7 +256,7 @@ fn serialize_text(text: &str, marks: &Marks, output: &mut String) {
     if marks.underline {
         output.push_str("<u>");
     }
-    escape_text(text, output);
+    escape_text_run(text, inlines, index, output);
     if marks.underline {
         output.push_str("</u>");
     }
@@ -167,7 +268,25 @@ fn serialize_text(text: &str, marks: &Marks, output: &mut String) {
     }
 }
 
-fn escape_text(text: &str, output: &mut String) {
+fn escape_text_run(text: &str, inlines: &[Inline], index: usize, output: &mut String) {
+    let characters: Vec<char> = text.chars().collect();
+    for (position, character) in characters.iter().copied().enumerate() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#39;"),
+            '\u{00a0}' => output.push_str("&nbsp;"),
+            ' ' if !ordinary_space_can_collapse(&characters, position, inlines, index) => {
+                output.push_str("&nbsp;")
+            }
+            _ => output.push(character),
+        }
+    }
+}
+
+fn escape_plain_text(text: &str, output: &mut String) {
     for character in text.chars() {
         match character {
             '&' => output.push_str("&amp;"),
@@ -175,9 +294,46 @@ fn escape_text(text: &str, output: &mut String) {
             '>' => output.push_str("&gt;"),
             '"' => output.push_str("&quot;"),
             '\'' => output.push_str("&#39;"),
-            ' ' => output.push_str("&nbsp;"),
+            ' ' | '\u{00a0}' => output.push_str("&nbsp;"),
             _ => output.push(character),
         }
+    }
+}
+
+fn ordinary_space_can_collapse(
+    characters: &[char],
+    position: usize,
+    inlines: &[Inline],
+    index: usize,
+) -> bool {
+    let previous = if position > 0 {
+        Some(characters[position - 1])
+    } else {
+        previous_text_char(inlines, index)
+    };
+    let next = if position + 1 < characters.len() {
+        Some(characters[position + 1])
+    } else {
+        next_text_char(inlines, index)
+    };
+    previous.is_some_and(|character| !matches!(character, ' ' | '\u{00a0}'))
+        && next.is_some_and(|character| !matches!(character, ' ' | '\u{00a0}'))
+}
+
+fn previous_text_char(inlines: &[Inline], index: usize) -> Option<char> {
+    match index
+        .checked_sub(1)
+        .and_then(|previous| inlines.get(previous))
+    {
+        Some(Inline::Text { text, .. }) => text.chars().next_back(),
+        _ => None,
+    }
+}
+
+fn next_text_char(inlines: &[Inline], index: usize) -> Option<char> {
+    match inlines.get(index + 1) {
+        Some(Inline::Text { text, .. }) => text.chars().next(),
+        _ => None,
     }
 }
 
@@ -215,7 +371,7 @@ enum DomData {
     Element {
         name: QualName,
         attrs: RefCell<Vec<Attribute>>,
-        template_contents: Option<DomHandle>,
+        template_contents: RefCell<Option<DomHandle>>,
         mathml_annotation_xml_integration_point: bool,
     },
     Text(RefCell<StrTendril>),
@@ -339,7 +495,7 @@ impl TreeSink for DomSink {
         attrs: Vec<Attribute>,
         flags: ElementFlags,
     ) -> Self::Handle {
-        let template_contents = flags.template.then(|| Self::node(DomData::Document));
+        let template_contents = RefCell::new(flags.template.then(|| Self::node(DomData::Document)));
         Self::node(DomData::Element {
             name,
             attrs: RefCell::new(attrs),
@@ -366,8 +522,11 @@ impl TreeSink for DomSink {
         prev_element: &Self::Handle,
         child: NodeOrText<Self::Handle>,
     ) {
-        if let Some(parent) = Self::parent(element) {
-            Self::append_to(&parent, child);
+        if Self::parent(element).is_some() {
+            // The HTML5 tree builder uses this hook for foster parenting. A
+            // table's stray text belongs immediately before the table, not at
+            // the end of its parent.
+            self.append_before_sibling(element, child);
         } else {
             Self::append_to(prev_element, child);
         }
@@ -393,9 +552,12 @@ impl TreeSink for DomSink {
     fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
         match &target.data {
             DomData::Element {
-                template_contents: Some(contents),
-                ..
-            } => contents.clone(),
+                template_contents, ..
+            } => template_contents
+                .borrow()
+                .as_ref()
+                .expect("template contents")
+                .clone(),
             _ => panic!("template contents requested for a non-template node"),
         }
     }
@@ -483,6 +645,52 @@ impl TreeSink for DomSink {
     }
 }
 
+fn check_dom_limits(root: &DomHandle) -> Result<(), HtmlBodyError> {
+    let mut pending = vec![(root.clone(), 0usize)];
+    let mut count = 0usize;
+    while let Some((node, depth)) = pending.pop() {
+        count += 1;
+        if count > MAX_DOM_NODES {
+            return Err(HtmlBodyError::NodeLimit {
+                limit: MAX_DOM_NODES,
+            });
+        }
+        if depth > MAX_DOM_DEPTH {
+            return Err(HtmlBodyError::DepthLimit {
+                limit: MAX_DOM_DEPTH,
+            });
+        }
+        let children = node.children.borrow();
+        for child in children.iter().rev() {
+            pending.push((child.clone(), depth + 1));
+        }
+        if let DomData::Element {
+            template_contents, ..
+        } = &node.data
+            && let Some(contents) = template_contents.borrow().as_ref()
+        {
+            pending.push((contents.clone(), depth + 1));
+        }
+    }
+    Ok(())
+}
+
+fn drain_dom(root: DomHandle) {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        *node.parent.borrow_mut() = None;
+        let children = std::mem::take(&mut *node.children.borrow_mut());
+        pending.extend(children);
+        if let DomData::Element {
+            template_contents, ..
+        } = &node.data
+            && let Some(contents) = template_contents.borrow_mut().take()
+        {
+            pending.push(contents);
+        }
+    }
+}
+
 fn project_dom(root: &DomHandle) -> Document {
     let mut projection = Projection::default();
     project_children(root, &mut projection, Marks::default(), false);
@@ -498,7 +706,7 @@ struct Projection {
 impl Projection {
     fn finish(mut self) -> Document {
         self.flush();
-        self.document
+        Document::from_blocks(self.document.blocks)
     }
 
     fn ensure_current(&mut self) -> &mut Vec<Inline> {
@@ -506,7 +714,9 @@ impl Projection {
     }
 
     fn flush(&mut self) {
-        if let Some(inlines) = self.current.take() {
+        if let Some(inlines) = self.current.take()
+            && !inlines.is_empty()
+        {
             self.document.blocks.push(Block::Paragraph(inlines));
         }
     }
@@ -514,6 +724,23 @@ impl Projection {
     fn begin_block(&mut self) {
         self.flush();
         self.current = Some(Vec::new());
+    }
+
+    fn finish_block(&mut self, blocks_before: usize) {
+        let Some(inlines) = self.current.take() else {
+            if self.document.blocks.len() == blocks_before {
+                self.document.blocks.push(Block::Paragraph(Vec::new()));
+            }
+            return;
+        };
+        let inlines = normalize_inlines(inlines);
+        if inlines.len() == 1 && matches!(inlines[0], Inline::SoftBreak) {
+            self.document.blocks.push(Block::Paragraph(Vec::new()));
+        } else if !inlines.is_empty() {
+            self.document.blocks.push(Block::Paragraph(inlines));
+        } else if self.document.blocks.len() == blocks_before {
+            self.document.blocks.push(Block::Paragraph(Vec::new()));
+        }
     }
 
     fn text(&mut self, text: &str, marks: &Marks, allow_formatting_whitespace: bool) {
@@ -528,7 +755,6 @@ impl Projection {
             match character {
                 '\r' => normalized.push('\n'),
                 '\t' => normalized.push_str("    "),
-                '\u{00a0}' => normalized.push(' '),
                 _ => normalized.push(character),
             }
         }
@@ -598,18 +824,20 @@ fn project_node(node: &DomHandle, projection: &mut Projection, marks: Marks, in_
                 return;
             }
             if is_block_element(&tag) {
+                let blocks_before = projection.document.blocks.len();
                 projection.begin_block();
                 project_children(node, projection, marks, true);
-                projection.flush();
+                projection.finish_block(blocks_before);
                 return;
             }
             if matches!(
                 tag.as_str(),
                 "div" | "section" | "article" | "header" | "footer"
             ) {
+                let blocks_before = projection.document.blocks.len();
                 projection.begin_block();
                 project_children(node, projection, marks, true);
-                projection.flush();
+                projection.finish_block(blocks_before);
                 return;
             }
             if tag == "br" {
@@ -667,7 +895,7 @@ mod tests {
         let html = serialize_html(&document);
         assert_eq!(
             html,
-            "<p>&nbsp;&nbsp;中文&nbsp;😀&nbsp;&amp;&nbsp;&lt;&nbsp;&gt;&nbsp;&quot;&nbsp;&#39;&nbsp;&nbsp;</p>"
+            "<p>&nbsp;&nbsp;中文 😀 &amp; &lt; &gt; &quot; &#39;&nbsp;&nbsp;</p>"
         );
         assert_eq!(parse_html(&html).unwrap(), document);
     }
@@ -703,7 +931,7 @@ mod tests {
         let html = serialize_html(&document);
         assert_eq!(
             html,
-            "<p><strong>前</strong><br><img src=\":/0123456789abcdef0123456789abcdef\" alt=\"截图 &amp; 证据.png\"><em><u>后</u></em></p><p></p>"
+            "<p><strong>前</strong><br><img src=\":/0123456789abcdef0123456789abcdef\" alt=\"截图 &amp; 证据.png\"><em><u>后</u></em></p><p><br></p>"
         );
         assert_eq!(parse_html(&html).unwrap(), document);
     }
@@ -851,12 +1079,12 @@ mod tests {
             document,
             Document::from_blocks(vec![Block::Paragraph(vec![
                 Inline::Text {
-                    text: " a    b".into(),
+                    text: "\u{00a0}a    b".into(),
                     marks: Marks::default(),
                 },
                 Inline::SoftBreak,
                 Inline::Text {
-                    text: "c ".into(),
+                    text: "c\u{00a0}".into(),
                     marks: Marks::default(),
                 },
             ])])
@@ -867,7 +1095,7 @@ mod tests {
         );
         assert_eq!(
             parse_html("&nbsp;").map(|doc| search_text(&doc)).unwrap(),
-            " "
+            "\u{00a0}"
         );
     }
 
@@ -892,6 +1120,133 @@ mod tests {
             serialize_html(&document),
             "<p>&nbsp;&nbsp;first<br>&nbsp;&nbsp;second</p>"
         );
+    }
+
+    #[test]
+    fn ordinary_spaces_remain_natural_breaks_across_mark_runs() {
+        let document = Document::from_blocks(vec![Block::Paragraph(vec![
+            Inline::Text {
+                text: "one ".into(),
+                marks: Marks::default(),
+            },
+            Inline::Text {
+                text: "two".into(),
+                marks: Marks {
+                    bold: true,
+                    ..Marks::default()
+                },
+            },
+            Inline::Text {
+                text: " three".into(),
+                marks: Marks::default(),
+            },
+        ])]);
+        assert_eq!(
+            serialize_html(&document),
+            "<p>one <strong>two</strong> three</p>"
+        );
+
+        let repeated = Document::from_blocks(vec![Block::Paragraph(vec![
+            Inline::Text {
+                text: "a ".into(),
+                marks: Marks::default(),
+            },
+            Inline::Text {
+                text: " ".into(),
+                marks: Marks {
+                    italic: true,
+                    ..Marks::default()
+                },
+            },
+            Inline::Text {
+                text: "b".into(),
+                marks: Marks::default(),
+            },
+        ])]);
+        assert_eq!(serialize_html(&repeated), "<p>a&nbsp;<em>&nbsp;</em>b</p>");
+    }
+
+    #[test]
+    fn public_text_boundaries_normalize_tabs_newlines_and_adjacent_runs() {
+        let document = Document::from_blocks(vec![Block::Paragraph(vec![
+            Inline::Text {
+                text: "a\tb".into(),
+                marks: Marks::default(),
+            },
+            Inline::Text {
+                text: "c\nd".into(),
+                marks: Marks::default(),
+            },
+            Inline::Text {
+                text: String::new(),
+                marks: Marks::default(),
+            },
+        ])]);
+        assert_eq!(
+            document,
+            Document::from_blocks(vec![Block::Paragraph(vec![
+                Inline::Text {
+                    text: "a    bc".into(),
+                    marks: Marks::default(),
+                },
+                Inline::SoftBreak,
+                Inline::Text {
+                    text: "d".into(),
+                    marks: Marks::default(),
+                },
+            ])])
+        );
+    }
+
+    #[test]
+    fn empty_paragraphs_have_a_visible_reversible_placeholder() {
+        let document = Document::from_blocks(vec![
+            Block::Paragraph(vec![Inline::Text {
+                text: "first".into(),
+                marks: Marks::default(),
+            }]),
+            Block::Paragraph(Vec::new()),
+            Block::Paragraph(vec![Inline::Text {
+                text: "last".into(),
+                marks: Marks::default(),
+            }]),
+        ]);
+        let html = serialize_html(&document);
+        assert_eq!(html, "<p>first</p><p><br></p><p>last</p>");
+        assert_eq!(parse_html(&html).unwrap(), document);
+        assert_eq!(
+            serialize_html(&Document::from_blocks(vec![
+                Block::Paragraph(Vec::new()),
+                Block::Paragraph(Vec::new()),
+            ])),
+            ""
+        );
+        assert_eq!(parse_html("<div><p>x</p></div>").unwrap().blocks.len(), 1);
+    }
+
+    #[test]
+    fn table_foster_parenting_keeps_stray_text_before_table_cells() {
+        let document = parse_html("<table>before<tr><td>cell</td></tr>after</table>").unwrap();
+        assert_eq!(search_text(&document), "beforeaftercell");
+    }
+
+    #[test]
+    fn deeply_nested_html_is_rejected_without_recursive_drop() {
+        let depth = MAX_DOM_DEPTH + 1;
+        let input = format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth));
+        assert_eq!(
+            parse_html(&input),
+            Err(HtmlBodyError::DepthLimit {
+                limit: MAX_DOM_DEPTH
+            })
+        );
+    }
+
+    #[test]
+    fn large_flat_html_remains_accepted() {
+        let input = format!("<p>{}</p>", "<span>x</span>".repeat(100_000));
+        let document = parse_html(&input).unwrap();
+        assert_eq!(search_text(&document).len(), 100_000);
     }
 
     #[test]
