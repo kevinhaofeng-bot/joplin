@@ -13,6 +13,20 @@ use thiserror::Error;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+static FAIL_NEXT_BACKUP_AFTER_CREATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static PAUSE_AFTER_MIGRATION_BACKUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static MIGRATION_BACKUP_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static RELEASE_MIGRATION_BACKUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("storage error")]
@@ -29,8 +43,12 @@ pub enum CoreError {
     Resource(#[from] ResourceError),
     #[error("invalid HTML migration: {0}")]
     MigrationValidation(String),
+    #[error("note requires HTML migration before it can be edited")]
+    MigrationRequired,
     #[error("invalid backup target")]
     InvalidBackupTarget,
+    #[error("HTML migration backup failed")]
+    BackupFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +106,7 @@ pub struct LegacyNoteForHtmlMigration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HtmlNoteConversion {
     pub id: String,
+    pub source_updated_time: i64,
     pub body: String,
     pub body_text: String,
     pub resource_ids: Vec<String>,
@@ -219,6 +238,9 @@ impl NoteRepository {
         let Some(mut note) = current else {
             return Err(CoreError::InvalidId);
         };
+        if note.markup_language == 1 {
+            return Err(CoreError::MigrationRequired);
+        }
         let mut resource_ids = note_resource_ids(&transaction, id)?;
         if let Some(title) = input.title {
             note.title = title;
@@ -339,7 +361,6 @@ impl NoteRepository {
         input: NoteContentUpdate,
     ) -> Result<Note, CoreError> {
         validate_id(id)?;
-        let canonical = canonicalize_html(&input.body)?;
         let connection = self.connection.lock().expect("repository mutex poisoned");
         let transaction = connection.unchecked_transaction()?;
         let mut note = transaction
@@ -351,6 +372,10 @@ impl NoteRepository {
             )
             .optional()?
             .ok_or(CoreError::InvalidId)?;
+        if note.markup_language == 1 {
+            return Err(CoreError::MigrationRequired);
+        }
+        let canonical = canonicalize_html(&input.body)?;
         note.title = input.title;
         note.body = canonical.body;
         note.body_text = canonical.body_text;
@@ -489,6 +514,13 @@ impl NoteRepository {
 
     pub fn backup_before_html_migration(&self) -> Result<PathBuf, CoreError> {
         let connection = self.connection.lock().expect("repository mutex poisoned");
+        self.backup_before_html_migration_locked(&connection)
+    }
+
+    fn backup_before_html_migration_locked(
+        &self,
+        connection: &Connection,
+    ) -> Result<PathBuf, CoreError> {
         let profile = self
             .database_path
             .parent()
@@ -507,13 +539,10 @@ impl NoteRepository {
                 timestamp(),
                 counter
             ));
-            match self.backup_before_html_migration_to_locked(&connection, &target) {
+            match self.backup_before_html_migration_to_locked(connection, &target) {
                 Ok(()) => return Ok(target),
                 Err(CoreError::InvalidBackupTarget) => {
-                    if target.exists() {
-                        continue;
-                    }
-                    return Err(CoreError::InvalidBackupTarget);
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -548,32 +577,57 @@ impl NoteRepository {
                 .map_err(|_| CoreError::InvalidBackupTarget)?
                 .file_type()
                 .is_symlink()
-            || target.exists()
+            || std::fs::symlink_metadata(target).is_ok()
         {
             return Err(CoreError::InvalidBackupTarget);
         }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(target)
-            .map_err(|_| CoreError::InvalidBackupTarget)?;
-        let mut destination = Connection::open_with_flags(
-            target,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
-        backup.run_to_completion(64, std::time::Duration::from_millis(0), None)?;
-        drop(backup);
-        drop(destination);
-        Ok(())
+        let result = (|| {
+            #[cfg(test)]
+            if FAIL_NEXT_BACKUP_AFTER_CREATE.swap(false, Ordering::Relaxed) {
+                return Err(CoreError::BackupFailure);
+            }
+            let destination_flags = OpenFlags::from_bits_retain(
+                (OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+                    .bits()
+                    | rusqlite::ffi::SQLITE_OPEN_EXCLUSIVE,
+            );
+            let mut destination = Connection::open_with_flags(target, destination_flags)?;
+            let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
+            backup.run_to_completion(64, std::time::Duration::from_millis(0), None)?;
+            drop(backup);
+            drop(destination);
+            let integrity = Connection::open_with_flags(
+                target,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+            if integrity != "ok" {
+                return Err(CoreError::BackupFailure);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(target);
+        }
+        result
     }
 
     pub fn apply_html_migration(
         &self,
         conversions: Vec<HtmlNoteConversion>,
     ) -> Result<PathBuf, CoreError> {
-        let backup = self.backup_before_html_migration()?;
         let connection = self.connection.lock().expect("repository mutex poisoned");
+        let backup = self.backup_before_html_migration_locked(&connection)?;
+        #[cfg(test)]
+        if PAUSE_AFTER_MIGRATION_BACKUP.load(Ordering::Acquire) {
+            MIGRATION_BACKUP_PAUSED.store(true, Ordering::Release);
+            while !RELEASE_MIGRATION_BACKUP.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            MIGRATION_BACKUP_PAUSED.store(false, Ordering::Release);
+        }
         let transaction = connection.unchecked_transaction()?;
         let expected = {
             let mut statement = transaction
@@ -598,10 +652,20 @@ impl NoteRepository {
             validate_conversion(&transaction, conversion)?;
         }
         for conversion in conversions {
+            let deleted_time = transaction.query_row(
+                "SELECT deleted_time FROM notes WHERE id = ?1 AND markup_language = 1",
+                [&conversion.id],
+                |row| row.get::<_, i64>(0),
+            )?;
             let changed = transaction.execute(
                 "UPDATE notes SET body = ?2, body_text = ?3, body_rtf = X'', markup_language = 2
-                 WHERE id = ?1 AND markup_language = 1",
-                params![conversion.id, conversion.body, conversion.body_text],
+                 WHERE id = ?1 AND markup_language = 1 AND updated_time = ?4",
+                params![
+                    conversion.id,
+                    conversion.body,
+                    conversion.body_text,
+                    conversion.source_updated_time
+                ],
             )?;
             if changed != 1 {
                 return Err(CoreError::MigrationValidation(
@@ -610,11 +674,13 @@ impl NoteRepository {
             }
             replace_note_resources(&transaction, &conversion.id, &conversion.resource_ids)?;
             transaction.execute("DELETE FROM notes_fts WHERE id = ?1", [&conversion.id])?;
-            transaction.execute(
-                "INSERT INTO notes_fts (id, title, body_text)
-                 SELECT id, title, body_text FROM notes WHERE id = ?1",
-                [&conversion.id],
-            )?;
+            if deleted_time == 0 {
+                transaction.execute(
+                    "INSERT INTO notes_fts (id, title, body_text)
+                     SELECT id, title, body_text FROM notes WHERE id = ?1",
+                    [&conversion.id],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(backup)
@@ -694,6 +760,17 @@ fn validate_conversion(
             conversion.id
         )));
     }
+    let (markup_language, updated_time) = transaction.query_row(
+        "SELECT markup_language, updated_time FROM notes WHERE id = ?1",
+        [&conversion.id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    if markup_language != 1 || updated_time != conversion.source_updated_time {
+        return Err(CoreError::MigrationValidation(format!(
+            "legacy note source changed: {}",
+            conversion.id
+        )));
+    }
     if search_text(&document) != conversion.body_text {
         return Err(CoreError::MigrationValidation(format!(
             "body_text does not match body: {}",
@@ -722,12 +799,6 @@ fn validate_conversion(
                 "resource metadata is missing: {resource_id}"
             )));
         }
-    }
-    if conversion.resource_ids.iter().collect::<HashSet<_>>().len() != conversion.resource_ids.len()
-    {
-        return Err(CoreError::MigrationValidation(
-            "a note cannot associate the same resource twice".into(),
-        ));
     }
     Ok(())
 }
@@ -1037,10 +1108,18 @@ fn sanitize_fts_query(query: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreError, CreateNote, HtmlNoteConversion, NoteContentUpdate, NoteRepository};
+    use super::{
+        CoreError, CreateNote, FAIL_NEXT_BACKUP_AFTER_CREATE, HtmlNoteConversion,
+        MIGRATION_BACKUP_PAUSED, NoteContentUpdate, NoteRepository, PAUSE_AFTER_MIGRATION_BACKUP,
+        RELEASE_MIGRATION_BACKUP, UpdateNote,
+    };
     use crate::html_body::{parse_html, search_text};
     use crate::resource_store::ResourceImport;
     use rusqlite::Connection;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     const TINY_PNG: &[u8] = b"tiny png bytes";
@@ -1138,6 +1217,14 @@ mod tests {
             .unwrap();
         let second = repo
             .import_resource(png_import(b"other bytes", "second.png"))
+            .unwrap();
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE notes SET markup_language = 2 WHERE id = '0123456789abcdef0123456789abcdef'",
+                [],
+            )
             .unwrap();
         let note = repo
             .update_note_content(
@@ -1441,6 +1528,65 @@ mod tests {
     }
 
     #[test]
+    fn normal_updates_reject_legacy_rows_without_touching_any_projection() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("notes.sqlite");
+        let repo = NoteRepository::open(&db).unwrap();
+        let note = repo
+            .create_note(CreateNote {
+                title: "旧标题".into(),
+                body: "旧正文".into(),
+                is_draft: true,
+            })
+            .unwrap();
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE notes SET title = '旧标题', body = 'legacy marker', body_text = '旧正文',
+                 body_rtf = X'727466', markup_language = 1, updated_time = 12345 WHERE id = ?1",
+                [&note.id],
+            )
+            .unwrap();
+        let before = repo.get_note(&note.id).unwrap().unwrap();
+        assert!(matches!(
+            repo.update_note(
+                &note.id,
+                UpdateNote {
+                    title: Some("不应写入".into()),
+                    body: None,
+                }
+            ),
+            Err(CoreError::MigrationRequired)
+        ));
+        assert!(matches!(
+            repo.update_note_content(
+                &note.id,
+                NoteContentUpdate {
+                    title: "不应写入".into(),
+                    body: "<p>new</p>".into(),
+                    body_text: "new".into(),
+                    resource_ids: Vec::new(),
+                }
+            ),
+            Err(CoreError::MigrationRequired)
+        ));
+        let after = repo.get_note(&note.id).unwrap().unwrap();
+        assert_eq!(after, before);
+        let connection = repo.connection.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM notes_fts WHERE id = ?1",
+                    [&note.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn html_migration_is_atomic_and_builds_ordered_resources_and_fts() {
         let temp = tempdir().unwrap();
         let db = temp.path().join("notes.sqlite");
@@ -1476,27 +1622,33 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "UPDATE notes SET markup_language = 1, body = 'old second', body_rtf = X'727466'
+                "UPDATE notes SET markup_language = 1, body = 'old second', body_rtf = X'727466', deleted_time = 777
                  WHERE id = ?1",
                 [&second.id],
             )
             .unwrap();
         drop(connection);
         let first_body = format!(
-            "<p>迁移 <img src=\":/{}\" alt=\"第一图\"><img src=\":/{}\" alt=\"第二图\"></p>",
-            first_resource.id, second_resource.id
+            "<p>迁移 <img src=\":/{}\" alt=\"第一图\"><img src=\":/{}\" alt=\"第一图\"><img src=\":/{}\" alt=\"第二图\"></p>",
+            first_resource.id, first_resource.id, second_resource.id
         );
         let second_body = "<p><strong>另一个正文</strong></p>".to_owned();
         let backup = repo
             .apply_html_migration(vec![
                 HtmlNoteConversion {
                     id: first.id.clone(),
+                    source_updated_time: first.updated_time,
                     body: first_body.clone(),
-                    body_text: "迁移 第一图第二图".into(),
-                    resource_ids: vec![first_resource.id.clone(), second_resource.id.clone()],
+                    body_text: "迁移 第一图第一图第二图".into(),
+                    resource_ids: vec![
+                        first_resource.id.clone(),
+                        first_resource.id.clone(),
+                        second_resource.id.clone(),
+                    ],
                 },
                 HtmlNoteConversion {
                     id: second.id.clone(),
+                    source_updated_time: second.updated_time,
                     body: second_body.clone(),
                     body_text: "另一个正文".into(),
                     resource_ids: Vec::new(),
@@ -1507,7 +1659,7 @@ mod tests {
         let migrated = repo.get_note(&first.id).unwrap().unwrap();
         assert_eq!(migrated.markup_language, 2);
         assert_eq!(migrated.body, first_body);
-        assert_eq!(migrated.body_text, "迁移 第一图第二图");
+        assert_eq!(migrated.body_text, "迁移 第一图第一图第二图");
         assert!(migrated.body_rtf.is_empty());
         assert_eq!(repo.search("第一图").unwrap().len(), 1);
         let connection = repo.connection.lock().unwrap();
@@ -1521,6 +1673,29 @@ mod tests {
         assert_eq!(
             associations,
             vec![first_resource.id.clone(), second_resource.id.clone()]
+        );
+        drop(connection);
+        assert_eq!(repo.search("另一个正文").unwrap().len(), 0);
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT markup_language, deleted_time FROM notes WHERE id = ?1",
+                    [&second.id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (2, 777)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM notes_fts WHERE id = ?1",
+                    [&second.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
         drop(connection);
         let backup_connection = Connection::open(backup).unwrap();
@@ -1558,6 +1733,7 @@ mod tests {
             .unwrap();
         let bad = HtmlNoteConversion {
             id: note.id.clone(),
+            source_updated_time: note.updated_time,
             body: "<p>new</p>".into(),
             body_text: "wrong".into(),
             resource_ids: Vec::new(),
@@ -1570,6 +1746,25 @@ mod tests {
         assert_eq!(unchanged.body, "old");
         assert_eq!(unchanged.markup_language, 1);
         assert_eq!(unchanged.body_rtf, b"rtf".to_vec());
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE notes SET updated_time = 54321 WHERE id = ?1",
+                [&note.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            repo.apply_html_migration(vec![HtmlNoteConversion {
+                id: note.id.clone(),
+                source_updated_time: note.updated_time,
+                body: "<p>new</p>".into(),
+                body_text: "new".into(),
+                resource_ids: Vec::new(),
+            }]),
+            Err(CoreError::MigrationValidation(_))
+        ));
+        assert_eq!(repo.get_note(&note.id).unwrap().unwrap().body, "old");
         assert!(matches!(
             repo.apply_html_migration(Vec::new()),
             Err(CoreError::MigrationValidation(_))
@@ -1577,12 +1772,80 @@ mod tests {
         assert!(matches!(
             repo.apply_html_migration(vec![HtmlNoteConversion {
                 id: "ffffffffffffffffffffffffffffffff".into(),
+                source_updated_time: 0,
                 body: "<p>new</p>".into(),
                 body_text: "new".into(),
                 resource_ids: Vec::new(),
             }]),
             Err(CoreError::MigrationValidation(_))
         ));
+    }
+
+    #[test]
+    fn migration_lock_covers_backup_through_commit() {
+        let temp = tempdir().unwrap();
+        let repo = Arc::new(NoteRepository::open(temp.path().join("notes.sqlite")).unwrap());
+        let note = repo
+            .create_note(CreateNote {
+                title: "legacy".into(),
+                body: "old".into(),
+                is_draft: false,
+            })
+            .unwrap();
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE notes SET markup_language = 1 WHERE id = ?1",
+                [&note.id],
+            )
+            .unwrap();
+        PAUSE_AFTER_MIGRATION_BACKUP.store(true, Ordering::Release);
+        RELEASE_MIGRATION_BACKUP.store(false, Ordering::Release);
+        let migration_repo = Arc::clone(&repo);
+        let migration_id = note.id.clone();
+        let source_updated_time = note.updated_time;
+        let migration = std::thread::spawn(move || {
+            migration_repo.apply_html_migration(vec![HtmlNoteConversion {
+                id: migration_id,
+                source_updated_time,
+                body: "<p>new</p>".into(),
+                body_text: "new".into(),
+                resource_ids: Vec::new(),
+            }])
+        });
+        for _ in 0..200 {
+            if MIGRATION_BACKUP_PAUSED.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(MIGRATION_BACKUP_PAUSED.load(Ordering::Acquire));
+        let (started_sender, started_receiver) = channel();
+        let update_repo = Arc::clone(&repo);
+        let update_id = note.id.clone();
+        let update = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            update_repo.update_note(
+                &update_id,
+                UpdateNote {
+                    title: Some("after migration".into()),
+                    body: None,
+                },
+            )
+        });
+        started_receiver.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        RELEASE_MIGRATION_BACKUP.store(true, Ordering::Release);
+        assert!(migration.join().unwrap().unwrap().exists());
+        assert_eq!(repo.get_note(&note.id).unwrap().unwrap().body, "<p>new</p>");
+        assert_eq!(update.join().unwrap().unwrap().title, "after migration");
+        assert_eq!(
+            repo.get_note(&note.id).unwrap().unwrap().title,
+            "after migration"
+        );
+        PAUSE_AFTER_MIGRATION_BACKUP.store(false, Ordering::Release);
+        MIGRATION_BACKUP_PAUSED.store(false, Ordering::Release);
     }
 
     #[cfg(unix)]
@@ -1610,5 +1873,12 @@ mod tests {
             repo.backup_before_html_migration_to(&outside),
             Err(CoreError::InvalidBackupTarget)
         ));
+        let failed = profile.join("failed.sqlite");
+        FAIL_NEXT_BACKUP_AFTER_CREATE.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            repo.backup_before_html_migration_to(&failed),
+            Err(CoreError::BackupFailure)
+        ));
+        assert!(!failed.exists());
     }
 }
