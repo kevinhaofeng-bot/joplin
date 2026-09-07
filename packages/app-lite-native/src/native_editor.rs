@@ -44,6 +44,11 @@ const RESOURCE_WIDTH_KEY: &str = "com.kevinhao.joplin-lite.resource-width";
 const RESOURCE_HEIGHT_KEY: &str = "com.kevinhao.joplin-lite.resource-height";
 const MISSING_RESOURCE_KEY: &str = "com.kevinhao.joplin-lite.missing-resource";
 pub const INLINE_IMAGE_MAX_PIXEL_SIZE: usize = 1280;
+pub const INLINE_IMAGE_MAX_WIDTH: f64 = 640.0;
+
+pub fn image_paragraph_tail_indent(available_width: f64) -> f64 {
+    -(available_width - INLINE_IMAGE_MAX_WIDTH).max(0.0)
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EditorCodecError {
@@ -1547,10 +1552,12 @@ fn remove_lists_in_selection(session: &NativeEditorSession, start: usize, end: u
             continue;
         };
         let snapshot = block.snapshot();
-        if let Some(_list) = snapshot.list_info
-            && snapshot.position < end
-            && snapshot.position + snapshot.length >= start
-        {
+        let overlaps = if start == end {
+            snapshot.position <= start && start <= snapshot.position + snapshot.length
+        } else {
+            snapshot.position < end && snapshot.position + snapshot.length >= start
+        };
+        if snapshot.list_info.is_some() && overlaps {
             positions.push(snapshot.position);
         }
     }
@@ -1892,6 +1899,7 @@ fn new_native_list(marker_kind: NativeListMarker) -> Retained<NSTextList> {
 fn paragraph_style_for_snapshot(
     snapshot: &text_document::BlockSnapshot,
     list: Option<&NSTextList>,
+    available_width: f64,
 ) -> Retained<NSMutableParagraphStyle> {
     let paragraph = NSMutableParagraphStyle::new();
     paragraph.setAlignment(match snapshot.block_format.alignment {
@@ -1904,6 +1912,13 @@ fn paragraph_style_for_snapshot(
     if let Some(list) = list {
         let lists = objc2_foundation::NSArray::<NSTextList>::from_slice(&[list]);
         paragraph.setTextLists(&lists);
+    }
+    if snapshot
+        .fragments
+        .iter()
+        .any(|fragment| matches!(fragment, FragmentContent::Image { .. }))
+    {
+        paragraph.setTailIndent(image_paragraph_tail_indent(available_width));
     }
     paragraph
 }
@@ -2115,7 +2130,7 @@ where
                 None
             }
         };
-        let paragraph = paragraph_style_for_snapshot(&snapshot, list.as_deref());
+        let paragraph = paragraph_style_for_snapshot(&snapshot, list.as_deref(), _width);
         if rendered_blocks > 0 {
             let separator_paragraph = pending_empty_block
                 .take()
@@ -2663,6 +2678,43 @@ mod tests {
             assert_eq!(document_from_session(&session).unwrap(), document);
             assert!(session.can_redo());
             session.redo().unwrap();
+            assert!(matches!(
+                document_from_session(&session).unwrap().blocks.as_slice(),
+                [Block::Paragraph { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn formatted_selection_then_collapsed_list_toggle_exits_each_list_kind() {
+        for command in [
+            BlockCommand::UnorderedList,
+            BlockCommand::OrderedList,
+            BlockCommand::Checklist,
+        ] {
+            let mut session =
+                session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+                    style: Default::default(),
+                    inlines: vec![Inline::Text {
+                        text: "abc".into(),
+                        marks: Default::default(),
+                    }],
+                }]))
+                .unwrap();
+            for inline in [
+                InlineCommand::Italic,
+                InlineCommand::Underline,
+                InlineCommand::Highlight,
+                InlineCommand::Strikethrough,
+            ] {
+                apply_inline_command(&mut session, NSRange::new(0, 3), inline).unwrap();
+            }
+            apply_block_command(&mut session, NSRange::new(0, 0), command).unwrap();
+            assert!(matches!(
+                document_from_session(&session).unwrap().blocks.as_slice(),
+                [Block::List { .. }]
+            ));
+            apply_block_command(&mut session, NSRange::new(0, 0), command).unwrap();
             assert!(matches!(
                 document_from_session(&session).unwrap().blocks.as_slice(),
                 [Block::Paragraph { .. }]

@@ -14,8 +14,9 @@ use joplin_lite_native::native_editor::{
     RenderedAttachment, RenderedDocument, SelectionState, apply_block_command,
     apply_committed_text_delta, apply_inline_command, apply_link, apply_paragraph_command,
     delete_image_anchor_if_identity, document_from_session, editor_attachment_image,
-    insert_image_anchor, query_block_state, query_clear_state, query_inline_state,
-    query_link_selection, query_paragraph_command_state, render_session, session_from_document,
+    image_paragraph_tail_indent, insert_image_anchor, query_block_state, query_clear_state,
+    query_inline_state, query_link_selection, query_paragraph_command_state, render_session,
+    session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
     PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
@@ -41,9 +42,9 @@ use objc2_app_kit::{
     NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle, NSParagraphStyleAttributeName,
     NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder,
     NSScrollView, NSSearchField, NSText, NSTextAlignment, NSTextAttachment, NSTextDelegate,
-    NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextView, NSTextViewDelegate,
-    NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextStorage, NSTextView,
+    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
@@ -5918,6 +5919,7 @@ fn commit_live_image_insert(
 #[allow(deprecated)]
 fn insert_inline_attachment(body: &NSTextView, inline: &NSMutableAttributedString) {
     unsafe { body.insertText(inline as &AnyObject) };
+    resize_inline_attachments(body);
 }
 
 fn inline_attachment_with_alt(
@@ -5947,6 +5949,40 @@ fn inline_image_display_size(image_size: NSSize, available_width: f64) -> NSSize
     NSSize::new(width * scale, height * scale)
 }
 
+fn apply_image_paragraph_style(
+    storage: &NSTextStorage,
+    attachment_location: usize,
+    available_width: f64,
+) {
+    let length = storage.length();
+    if attachment_location >= length {
+        return;
+    }
+    let paragraph_range = storage
+        .string()
+        .paragraphRangeForRange(NSRange::new(attachment_location, 1));
+    let paragraph_style = unsafe {
+        storage
+            .attribute_atIndex_effectiveRange(
+                NSParagraphStyleAttributeName,
+                paragraph_range.location,
+                null_mut(),
+            )
+            .and_then(|value| value.downcast::<NSParagraphStyle>().ok())
+    };
+    let mutable = paragraph_style
+        .map(|style| style.mutableCopy())
+        .unwrap_or_else(NSMutableParagraphStyle::new);
+    let desired_tail_indent = image_paragraph_tail_indent(available_width);
+    if (mutable.tailIndent() - desired_tail_indent).abs() < f64::EPSILON {
+        return;
+    }
+    mutable.setTailIndent(desired_tail_indent);
+    unsafe {
+        storage.addAttribute_value_range(NSParagraphStyleAttributeName, &mutable, paragraph_range);
+    }
+}
+
 fn resize_inline_attachments(body: &NSTextView) {
     let Some(storage) = (unsafe { body.textStorage() }) else {
         return;
@@ -5972,6 +6008,7 @@ fn resize_inline_attachments(body: &NSTextView) {
             && let Some(attachment) = value.downcast_ref::<NSTextAttachment>()
             && let Some(image) = attachment.image()
         {
+            apply_image_paragraph_style(storage.as_ref(), location, available_width);
             let bounds = attachment.bounds();
             let size = inline_image_display_size(image.size(), available_width);
             if bounds.size != size {
@@ -6216,13 +6253,14 @@ mod tests {
     use super::{
         DataDirError, DataFileError, FontTraitOperation, FormatDecision, FormatTarget,
         LegacyMigrationFailure, Note, PasteFileError, PasteRoute, PasteboardImage, TextFormat,
-        candidate_with_attachment, choose_data_dir, commit_after_persistence, display_note_title,
-        document_from_attributed_string, ensure_notes_database_file, format_decision,
-        format_target, image_signature_matches_mime, inline_image_display_size,
-        is_local_file_url_host, is_promised_pasteboard_type, legacy_migration_recovery_message,
-        note_list_summary, note_list_title, paste_route, read_drag_image_file,
-        read_pasteboard_image_from, read_regular_image_file, render_document_to_attributed_string,
-        render_session, selection_snapshot_for_reentrant_appkit, typing_trait_operation,
+        apply_image_paragraph_style, candidate_with_attachment, choose_data_dir,
+        commit_after_persistence, display_note_title, document_from_attributed_string,
+        ensure_notes_database_file, format_decision, format_target, image_signature_matches_mime,
+        inline_attachment_with_width, inline_image_display_size, is_local_file_url_host,
+        is_promised_pasteboard_type, legacy_migration_recovery_message, note_list_summary,
+        note_list_title, paste_route, read_drag_image_file, read_pasteboard_image_from,
+        read_regular_image_file, render_document_to_attributed_string, render_session,
+        selection_snapshot_for_reentrant_appkit, typing_trait_operation,
         valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
     use joplin_lite_native::core::{LegacyNoteForHtmlMigration, NoteRepository, StoredResource};
@@ -6230,9 +6268,10 @@ mod tests {
     use objc2::{AnyThread, runtime::AnyObject};
     use objc2_app_kit::{
         NSAttachmentAttributeName, NSAttributedStringAttachmentConveniences, NSBitmapImageFileType,
-        NSBitmapImageRep, NSFontAttributeName, NSMutableParagraphStyle, NSPasteboard,
-        NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSTextAttachment,
-        NSUnderlineStyle, NSUnderlineStyleAttributeName,
+        NSBitmapImageRep, NSFontAttributeName, NSLayoutManager, NSMutableParagraphStyle,
+        NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF,
+        NSTextAttachment, NSTextContainer, NSTextStorage, NSUnderlineStyle,
+        NSUnderlineStyleAttributeName,
     };
     use objc2_foundation::{
         NSAttributedString, NSData, NSDictionary, NSMutableAttributedString, NSRange, NSSize,
@@ -6250,6 +6289,7 @@ mod tests {
         0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
         0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
+    const LARGE_TEST_PNG: &[u8] = include_bytes!("../assets/AppIcon-source.png");
 
     fn paragraph(inlines: Vec<Inline>) -> Block {
         Block::Paragraph {
@@ -6851,12 +6891,12 @@ mod tests {
                 Some(StoredResource {
                     id: id.into(),
                     sha256: "0".repeat(64),
-                    size: TEST_PNG.len(),
+                    size: LARGE_TEST_PNG.len(),
                     title: "截图.png".into(),
                     mime: "image/png".into(),
                     file_extension: "png".into(),
                     path: PathBuf::new(),
-                    bytes: TEST_PNG.to_vec(),
+                    bytes: LARGE_TEST_PNG.to_vec(),
                 })
             },
             640.0,
@@ -6920,6 +6960,122 @@ mod tests {
         let snapshot = selection_snapshot_for_reentrant_appkit(&remembered);
         *remembered.borrow_mut() = NSRange::new(0, 0);
         assert_eq!(snapshot, NSRange::new(4, 2));
+    }
+
+    #[test]
+    fn textkit_places_text_after_inline_image_on_a_new_left_aligned_line() {
+        let resource_id = "0123456789abcdef0123456789abcdef";
+        let document = Document::from_blocks(vec![paragraph(vec![
+            Inline::Text {
+                text: "前".into(),
+                marks: Marks::default(),
+            },
+            Inline::Image {
+                resource_id: resource_id.into(),
+                alt: "截图".into(),
+            },
+            Inline::Text {
+                text: "需后".into(),
+                marks: Marks::default(),
+            },
+        ])]);
+        let session = super::session_from_document(&document).unwrap();
+        let rendered = render_session(
+            &session,
+            |id| {
+                Some(StoredResource {
+                    id: id.into(),
+                    sha256: "0".repeat(64),
+                    size: LARGE_TEST_PNG.len(),
+                    title: "截图.png".into(),
+                    mime: "image/png".into(),
+                    file_extension: "png".into(),
+                    path: PathBuf::new(),
+                    bytes: LARGE_TEST_PNG.to_vec(),
+                })
+            },
+            680.0,
+        );
+        let storage = NSTextStorage::new();
+        let layout = NSLayoutManager::new();
+        let container = NSTextContainer::initWithContainerSize(
+            NSTextContainer::alloc(),
+            NSSize::new(680.0, 1200.0),
+        );
+        storage.addLayoutManager(&layout);
+        layout.addTextContainer(&container);
+        container.setLineFragmentPadding(0.0);
+        storage.setAttributedString(&rendered.attributed);
+        layout.ensureLayoutForTextContainer(&container);
+
+        let mut attachment_effective_range = NSRange::new(0, 0);
+        let attachment_line = unsafe {
+            layout
+                .lineFragmentRectForGlyphAtIndex_effectiveRange(1, &mut attachment_effective_range)
+        };
+        let mut following_effective_range = NSRange::new(0, 0);
+        let following_line = unsafe {
+            layout.lineFragmentRectForGlyphAtIndex_effectiveRange(2, &mut following_effective_range)
+        };
+        let following_location = layout.locationForGlyphAtIndex(2);
+        assert!(
+            following_line.origin.y > attachment_line.origin.y,
+            "following text must be below image line: image={attachment_line:?}, text={following_line:?}"
+        );
+        assert!(
+            following_location.x <= 1.0,
+            "following text must restart at the document left edge: {following_location:?}"
+        );
+    }
+
+    #[test]
+    fn live_insert_projection_applies_image_block_style_without_changing_text() {
+        let resource = StoredResource {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            sha256: "0".repeat(64),
+            size: LARGE_TEST_PNG.len(),
+            title: "截图.png".into(),
+            mime: "image/png".into(),
+            file_extension: "png".into(),
+            path: PathBuf::new(),
+            bytes: LARGE_TEST_PNG.to_vec(),
+        };
+        let inline = inline_attachment_with_width(&resource, "截图", 680.0).unwrap();
+        assert_eq!(inline.string().to_string(), "\u{fffc}");
+        assert!(inline_image_display_size(NSSize::new(1280.0, 1280.0), 680.0).width <= 640.0);
+
+        let source = NSMutableAttributedString::from_nsstring(&NSString::from_str("前需后"));
+        let source_ref: &NSAttributedString = &source;
+        let candidate = candidate_with_attachment(source_ref, NSRange::new(1, 0), &inline)
+            .expect("image insertion candidate must preserve a valid range");
+        assert_eq!(candidate.string().to_string(), "前\u{fffc}需后");
+
+        let storage = NSTextStorage::new();
+        let layout = NSLayoutManager::new();
+        let container = NSTextContainer::initWithContainerSize(
+            NSTextContainer::alloc(),
+            NSSize::new(680.0, 1200.0),
+        );
+        storage.addLayoutManager(&layout);
+        layout.addTextContainer(&container);
+        container.setLineFragmentPadding(0.0);
+        storage.setAttributedString(&candidate);
+        apply_image_paragraph_style(&storage, 1, 680.0);
+        layout.ensureLayoutForTextContainer(&container);
+
+        let mut attachment_effective_range = NSRange::new(0, 0);
+        let attachment_line = unsafe {
+            layout
+                .lineFragmentRectForGlyphAtIndex_effectiveRange(1, &mut attachment_effective_range)
+        };
+        let mut following_effective_range = NSRange::new(0, 0);
+        let following_line = unsafe {
+            layout.lineFragmentRectForGlyphAtIndex_effectiveRange(2, &mut following_effective_range)
+        };
+        let following_location = layout.locationForGlyphAtIndex(2);
+        assert!(following_line.origin.y > attachment_line.origin.y);
+        assert!(following_location.x <= 1.0);
+        assert_eq!(storage.string().to_string(), "前\u{fffc}需后");
     }
 
     #[test]
