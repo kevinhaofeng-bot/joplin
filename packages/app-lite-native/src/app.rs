@@ -3270,6 +3270,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_migration_decoder_preserves_rtf_bold_italic_underline_runs() {
+        let legacy = LegacyNoteForHtmlMigration {
+            id: "legacy-marks".into(),
+            title: "旧格式".into(),
+            body: "BoldItalicUnderline".into(),
+            body_rtf: br"{\rtf1\ansi\b Bold\b0\i Italic\i0\ul Underline\ul0}".to_vec(),
+            is_draft: false,
+            created_time: 1,
+            updated_time: 2,
+            deleted_time: 0,
+        };
+        let decoded = super::decode_legacy_rtf_for_html_migration(&legacy).unwrap();
+        let source: &NSAttributedString = &decoded;
+        let document = document_from_attributed_string(source).unwrap();
+        assert_eq!(
+            serialize_html(&document),
+            "<p><strong>Bold</strong><em>Italic</em><u>Underline</u></p>"
+        );
+    }
+
+    #[test]
     fn legacy_marker_migration_overlays_resources_before_html_conversion() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("notes.sqlite");
