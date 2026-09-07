@@ -313,30 +313,35 @@ fn ordinary_space_can_collapse(
     let previous = if position > 0 {
         Some(characters[position - 1])
     } else {
-        previous_text_char(inlines, index)
+        previous_flow_char(inlines, index)
     };
     let next = if position + 1 < characters.len() {
         Some(characters[position + 1])
     } else {
-        next_text_char(inlines, index)
+        next_flow_char(inlines, index)
     };
     previous.is_some_and(|character| !matches!(character, ' ' | '\u{00a0}'))
         && next.is_some_and(|character| !matches!(character, ' ' | '\u{00a0}'))
 }
 
-fn previous_text_char(inlines: &[Inline], index: usize) -> Option<char> {
+fn previous_flow_char(inlines: &[Inline], index: usize) -> Option<char> {
     match index
         .checked_sub(1)
         .and_then(|previous| inlines.get(previous))
     {
         Some(Inline::Text { text, .. }) => text.chars().next_back(),
+        // Images occupy an inline position in the rendered flow. Treat them
+        // as a non-whitespace boundary so ordinary spaces around an image do
+        // not become NBSP merely because there is no adjacent text node.
+        Some(Inline::Image { .. }) => Some('\u{fffc}'),
         _ => None,
     }
 }
 
-fn next_text_char(inlines: &[Inline], index: usize) -> Option<char> {
+fn next_flow_char(inlines: &[Inline], index: usize) -> Option<char> {
     match inlines.get(index + 1) {
         Some(Inline::Text { text, .. }) => text.chars().next(),
+        Some(Inline::Image { .. }) => Some('\u{fffc}'),
         _ => None,
     }
 }
@@ -700,7 +705,7 @@ fn project_dom(root: &DomHandle) -> Document {
     let mut pending = vec![ProjectionFrame::Visit {
         node: root.clone(),
         marks: Marks::default(),
-        in_block: false,
+        preformatted: false,
     }];
 
     while let Some(frame) = pending.pop() {
@@ -711,11 +716,10 @@ fn project_dom(root: &DomHandle) -> Document {
             ProjectionFrame::Visit {
                 node,
                 marks,
-                in_block,
+                preformatted,
             } => match &node.data {
                 DomData::Text(text) => {
-                    let text = text.borrow();
-                    projection.text(&text, &marks, in_block || has_inline_sibling_context(&node));
+                    projection.text(&text.borrow(), &marks, preformatted);
                 }
                 DomData::Element { name, attrs, .. } => {
                     let tag = name.local.to_string().to_ascii_lowercase();
@@ -732,11 +736,12 @@ fn project_dom(root: &DomHandle) -> Document {
                         let blocks_before = projection.document.blocks.len();
                         projection.begin_block();
                         pending.push(ProjectionFrame::FinishBlock { blocks_before });
+                        let child_preformatted = preformatted || tag == "pre";
                         for child in children.into_iter().rev() {
                             pending.push(ProjectionFrame::Visit {
                                 node: child,
                                 marks: marks.clone(),
-                                in_block: true,
+                                preformatted: child_preformatted,
                             });
                         }
                         continue;
@@ -748,6 +753,7 @@ fn project_dom(root: &DomHandle) -> Document {
                             projection.mark_explicit_softbreak();
                         }
                         projection.ensure_current().push(Inline::SoftBreak);
+                        projection.flow_has_visible = true;
                         continue;
                     }
                     if tag == "img" {
@@ -763,7 +769,7 @@ fn project_dom(root: &DomHandle) -> Document {
                         pending.push(ProjectionFrame::Visit {
                             node: child,
                             marks: next_marks.clone(),
-                            in_block,
+                            preformatted,
                         });
                     }
                 }
@@ -776,7 +782,7 @@ fn project_dom(root: &DomHandle) -> Document {
                         pending.push(ProjectionFrame::Visit {
                             node: child,
                             marks: marks.clone(),
-                            in_block,
+                            preformatted,
                         });
                     }
                 }
@@ -791,7 +797,7 @@ enum ProjectionFrame {
     Visit {
         node: DomHandle,
         marks: Marks,
-        in_block: bool,
+        preformatted: bool,
     },
     FinishBlock {
         blocks_before: usize,
@@ -803,6 +809,9 @@ struct Projection {
     document: Document,
     current: Option<Vec<Inline>>,
     explicit_softbreak: bool,
+    pending_space: bool,
+    pending_marks: Option<Marks>,
+    flow_has_visible: bool,
 }
 
 impl Projection {
@@ -816,6 +825,9 @@ impl Projection {
     }
 
     fn flush(&mut self) {
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
         if let Some(inlines) = self.current.take()
             && !inlines.is_empty()
         {
@@ -832,6 +844,9 @@ impl Projection {
     fn finish_block(&mut self, blocks_before: usize) {
         let Some(inlines) = self.current.take() else {
             self.explicit_softbreak = false;
+            self.pending_space = false;
+            self.pending_marks = None;
+            self.flow_has_visible = false;
             if self.document.blocks.len() == blocks_before {
                 self.document.blocks.push(Block::Paragraph(Vec::new()));
             }
@@ -847,17 +862,24 @@ impl Projection {
             self.document.blocks.push(Block::Paragraph(Vec::new()));
         }
         self.explicit_softbreak = false;
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
     }
 
     fn mark_explicit_softbreak(&mut self) {
         self.explicit_softbreak = true;
     }
 
-    fn text(&mut self, text: &str, marks: &Marks, allow_formatting_whitespace: bool) {
+    fn text(&mut self, text: &str, marks: &Marks, preformatted: bool) {
         if text.is_empty() {
             return;
         }
-        if !allow_formatting_whitespace && is_formatting_whitespace(text) {
+        if !preformatted && is_formatting_whitespace(text) {
+            if self.flow_has_visible {
+                self.pending_space = true;
+                self.pending_marks = Some(marks.clone());
+            }
             return;
         }
         let mut normalized = String::new();
@@ -871,12 +893,25 @@ impl Projection {
         let mut pieces = normalized.split('\n').peekable();
         while let Some(piece) = pieces.next() {
             if !piece.is_empty() {
+                self.flush_pending_space();
                 self.push_text(piece, marks);
             }
             if pieces.peek().is_some() {
                 self.ensure_current().push(Inline::SoftBreak);
+                self.flow_has_visible = true;
             }
         }
+    }
+
+    fn flush_pending_space(&mut self) {
+        if !self.pending_space || !self.flow_has_visible {
+            self.pending_space = false;
+            self.pending_marks = None;
+            return;
+        }
+        let marks = self.pending_marks.take().unwrap_or_default();
+        self.pending_space = false;
+        self.push_text(" ", &marks);
     }
 
     fn push_text(&mut self, text: &str, marks: &Marks) {
@@ -894,6 +929,7 @@ impl Projection {
             text: text.to_owned(),
             marks: marks.clone(),
         });
+        self.flow_has_visible = true;
     }
 
     fn image(&mut self, attrs: &[Attribute], marks: &Marks) {
@@ -911,10 +947,12 @@ impl Projection {
             self.text(&alt, marks, true);
             return;
         }
+        self.flush_pending_space();
         self.ensure_current().push(Inline::Image {
             resource_id: resource_id.to_owned(),
             alt,
         });
+        self.flow_has_visible = true;
     }
 }
 
@@ -932,89 +970,6 @@ fn is_block_element(name: &str) -> bool {
 fn is_formatting_whitespace(text: &str) -> bool {
     text.chars()
         .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n'))
-}
-
-fn has_inline_sibling_context(node: &DomHandle) -> bool {
-    let mut cursor = node.clone();
-    loop {
-        let Some(parent) = DomSink::parent(&cursor) else {
-            return false;
-        };
-        let children = parent.children.borrow();
-        let Some(index) = children.iter().position(|child| Rc::ptr_eq(child, &cursor)) else {
-            return false;
-        };
-        let previous = visible_sibling(&children, index, -1);
-        let next = visible_sibling(&children, index, 1);
-        if let (Some(previous), Some(next)) = (previous, next) {
-            return is_visible_inline_node(previous) && is_visible_inline_node(next);
-        }
-        if !is_inline_container(&parent) {
-            return false;
-        }
-        cursor = parent.clone();
-    }
-}
-
-fn visible_sibling(children: &[DomHandle], index: usize, direction: isize) -> Option<&DomHandle> {
-    let mut position = index as isize + direction;
-    while position >= 0 && (position as usize) < children.len() {
-        let node = &children[position as usize];
-        match &node.data {
-            DomData::Comment(_) | DomData::ProcessingInstruction { .. } => {
-                position += direction;
-            }
-            _ => return Some(node),
-        }
-    }
-    None
-}
-
-fn is_inline_container(node: &DomHandle) -> bool {
-    match &node.data {
-        DomData::Element { name, .. } => {
-            let tag = name.local.to_string().to_ascii_lowercase();
-            !is_block_element(&tag)
-                && !matches!(
-                    tag.as_str(),
-                    "div"
-                        | "section"
-                        | "article"
-                        | "header"
-                        | "footer"
-                        | "script"
-                        | "style"
-                        | "head"
-                        | "title"
-                        | "br"
-                        | "img"
-                )
-        }
-        _ => false,
-    }
-}
-
-fn is_visible_inline_node(node: &DomHandle) -> bool {
-    match &node.data {
-        DomData::Text(text) => !is_formatting_whitespace(&text.borrow()),
-        DomData::Element { name, .. } => {
-            let tag = name.local.to_string().to_ascii_lowercase();
-            !is_block_element(&tag)
-                && !matches!(
-                    tag.as_str(),
-                    "div"
-                        | "section"
-                        | "article"
-                        | "header"
-                        | "footer"
-                        | "script"
-                        | "style"
-                        | "head"
-                        | "title"
-                )
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -1313,6 +1268,29 @@ mod tests {
             search_text(&parse_html("<strong>one</strong><!-- comment --> <em>two</em>").unwrap()),
             "one two"
         );
+    }
+
+    #[test]
+    fn collapsible_whitespace_follows_inline_flow_matrix() {
+        let cases = [
+            ("<strong>one</strong> <em>two</em>", "one two"),
+            ("<span><strong>one</strong> </span><em>two</em>", "one two"),
+            (
+                "<strong>one</strong><!-- comment --> <em>two</em>",
+                "one two",
+            ),
+            (
+                "<strong>one</strong> <img src=\":/0123456789abcdef0123456789abcdef\" alt=\"pic\"> <em>two</em>",
+                "one pic two",
+            ),
+            (" <em>two</em>", "two"),
+            ("<strong>one</strong> ", "one"),
+            ("<p>one</p> \n <p>two</p>", "one\ntwo"),
+            ("<p><strong>one</strong> <em>two</em></p>", "one two"),
+        ];
+        for (html, expected) in cases {
+            assert_eq!(search_text(&parse_html(html).unwrap()), expected, "{html}");
+        }
     }
 
     #[test]
