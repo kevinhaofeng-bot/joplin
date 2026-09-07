@@ -24,6 +24,15 @@ Scope: read-only inspection of the installed application bundle and source maps.
 
 Native ruling: Task 3 uses immediate dirty state, a 300 ms coalesced SQLite save, canonical-HTML equality suppression, generation tokens for stale timers, pending-resource veto and explicit flush on note switch/new/delete/window close/image insert/format commands. The exact 500 ms web debounce is not copied because AppKit/SQLite latency differs; the two-stage lifecycle is the important mechanism.
 
+### New-note creation and first focus
+
+- The ordinary new-note command enters a dedicated creation transaction rather than constructing an unsaved editor-only document. The transaction calls the note-create mutation first and receives a stable note ID before selection and navigation proceed.
+- Successful creation clears active search filters, marks the result as newly created, selects it in the appropriate note/notebook view and only then hands the document to the editor. Optional tag application and post-create actions are sequenced after the base note exists.
+- An empty note carries a localized untitled label as creation fallback, while the editor still maintains title focus and body focus as separate state. Empty-note autofocus follows the persisted `cursorStartTitle` preference; the shipped default setup uses the body.
+- Creation paths for pasted text, clipboard images and attachments reuse the same durable create-first contract with explicit initial ENML and resource input instead of inventing temporary editor-only formats.
+
+Native ruling: keep creation local-first and recoverable: flush the current note, create an empty draft row with a stable ID, clear search, select/load the new row and focus the body so typing starts immediately. The visible `无标题笔记` string remains a card/title placeholder only; it must never overwrite an empty stored title or a title the user entered. Title and body focus remain independently controllable so a future preference can switch the first cursor target without changing creation or persistence semantics. Clipboard-image and attachment creation must continue through the same resource transaction rather than a special binary note-body format.
+
 ### Composition safety
 
 - Evernote's controlled text input tracks composition start/end and does not overwrite the DOM value while composition is active.
