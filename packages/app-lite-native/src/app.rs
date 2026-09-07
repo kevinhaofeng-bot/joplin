@@ -80,11 +80,6 @@ struct PreparedNoteContent {
     update: NoteContentUpdate,
 }
 
-struct EditorSnapshot {
-    attributed: Retained<NSMutableAttributedString>,
-    selection: NSRange,
-}
-
 #[derive(Debug, Clone)]
 struct PendingEditorIntent {
     range: NSRange,
@@ -635,39 +630,6 @@ fn attribute_string(
     unsafe { attributes.objectForKey_unchecked(key) }
         .and_then(|value| value.downcast_ref::<NSString>())
         .map(ToString::to_string)
-}
-
-#[allow(deprecated)]
-fn projection_attachments_from_storage(body: &NSTextView) -> Vec<RenderedAttachment> {
-    let Some(storage) = (unsafe { body.textStorage() }) else {
-        return Vec::new();
-    };
-    let length = storage.length();
-    let key = resource_id_attribute_key();
-    let mut result = Vec::new();
-    let mut location = 0usize;
-    while location < length {
-        let mut effective_range = NSRange::new(location, 0);
-        let attributes = unsafe {
-            storage.attributesAtIndex_longestEffectiveRange_inRange(
-                location,
-                &mut effective_range,
-                NSRange::new(0, length),
-            )
-        };
-        if let Some(resource_id) = attribute_string(&attributes, &key) {
-            result.push(RenderedAttachment {
-                addressable_offset: location,
-                resource_id,
-            });
-        }
-        let next = effective_range.location + effective_range.length;
-        if next <= location {
-            break;
-        }
-        location = next;
-    }
-    result
 }
 
 fn missing_resource_placeholder_text(alt: &str) -> String {
@@ -2013,6 +1975,7 @@ fn typing_trait_operation(format: TextFormat, decision: FormatDecision) -> FontT
     }
 }
 
+#[cfg(test)]
 fn candidate_with_attachment(
     source: &NSAttributedString,
     insertion_range: NSRange,
@@ -2028,6 +1991,24 @@ fn candidate_with_attachment(
     let candidate = source.mutableCopy();
     candidate.replaceCharactersInRange_withAttributedString(insertion_range, inline);
     Some(candidate)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageInsertViewUpdate {
+    InstallSession { selection: NSRange },
+}
+
+fn image_insert_view_update(
+    persisted: bool,
+    insertion_range: NSRange,
+) -> Option<ImageInsertViewUpdate> {
+    persisted.then(|| ImageInsertViewUpdate::InstallSession {
+        selection: NSRange::new(insertion_range.location.saturating_add(1), 0),
+    })
+}
+
+fn toolbar_state_title(action: EditorAction, label: &str) -> Option<&str> {
+    (action == EditorAction::BlockStyle).then_some(label)
 }
 
 fn canonical_marker_ranges(body: &str) -> Vec<(NSRange, String, String)> {
@@ -4130,7 +4111,10 @@ impl AppDelegate {
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
-        let selection = body.selectedRange();
+        self.refresh_body_from_session_at(body, body.selectedRange());
+    }
+
+    fn refresh_body_from_session_at(&self, body: &NSTextView, selection: NSRange) {
         let rendered = {
             let session_guard = self.ivars().editor_session.borrow();
             let Some(session) = session_guard.as_ref() else {
@@ -4345,21 +4329,7 @@ impl AppDelegate {
         let before_string = body.string().to_string();
         let before_selection = body.selectedRange();
         let (before_can_undo, before_can_redo) = self.native_undo_state();
-        let smoke_resource = joplin_lite_native::core::StoredResource {
-            id: "0123456789abcdef0123456789abcdef".into(),
-            sha256: "0".repeat(64),
-            size: bytes.len(),
-            title: "smoke.png".into(),
-            mime: "image/png".into(),
-            file_extension: "png".into(),
-            path: PathBuf::new(),
-            bytes: bytes.clone(),
-        };
-        let Some(inline) = inline_attachment(&smoke_resource) else {
-            eprintln!("native undo smoke attachment construction failed");
-            return;
-        };
-        let failed = commit_live_image_insert(body, before_selection, &inline, || false);
+        let failed = commit_after_persistence(|| false, || {});
         let after_failure_string = body.string().to_string();
         let after_failure_selection = body.selectedRange();
         let (after_failure_can_undo, after_failure_can_redo) = self.native_undo_state();
@@ -5093,7 +5063,11 @@ impl AppDelegate {
         for (action, button) in self.ivars().toolbar_buttons.borrow().iter() {
             let presentation = self.current_action_presentation(*action);
             button.setEnabled(presentation.enabled);
-            button.setTitle(&NSString::from_str(presentation.label));
+            if let Some(title) = toolbar_state_title(*action, presentation.label) {
+                button.setTitle(&NSString::from_str(title));
+            } else {
+                button.setTitle(ns_string!(""));
+            }
             if !has_note {
                 button.setHidden(true);
             }
@@ -5166,24 +5140,13 @@ impl AppDelegate {
         else {
             return false;
         };
-        let Some(attributed) = (unsafe { body.textStorage() }).map(|storage| {
-            let source: &NSAttributedString = &storage;
-            source.mutableCopy()
-        }) else {
-            return false;
-        };
-        let snapshot = EditorSnapshot {
-            attributed,
-            selection: body.selectedRange(),
-        };
         let point = body.convertPoint_fromView(sender.draggingLocation(), None);
         let character_index = body.characterIndexForInsertionAtPoint(point);
-        self.insert_image_data_from_snapshot(
+        self.insert_image_data_at_range(
             &bytes,
             &title,
             &mime,
             body,
-            snapshot,
             NSRange::new(character_index, 0),
         )
     }
@@ -5303,27 +5266,15 @@ impl AppDelegate {
             self.set_save_status("图片未插入：格式不支持", true);
             return false;
         }
-        let Some(attributed) = (unsafe { body.textStorage() }).map(|storage| {
-            let source: &NSAttributedString = &storage;
-            source.mutableCopy()
-        }) else {
-            return false;
-        };
-        let snapshot = EditorSnapshot {
-            attributed,
-            selection: body.selectedRange(),
-        };
-        let insertion_range = snapshot.selection;
-        self.insert_image_data_from_snapshot(bytes, title, mime, body, snapshot, insertion_range)
+        self.insert_image_data_at_range(bytes, title, mime, body, body.selectedRange())
     }
 
-    fn insert_image_data_from_snapshot(
+    fn insert_image_data_at_range(
         &self,
         bytes: &[u8],
         title: &str,
         mime: &str,
         body: &NSTextView,
-        snapshot: EditorSnapshot,
         insertion_range: NSRange,
     ) -> bool {
         if body.hasMarkedText() || !self.save_current_note() {
@@ -5346,19 +5297,6 @@ impl AppDelegate {
                 return false;
             }
         };
-        let Some(inline) = inline_attachment_with_width(
-            &stored,
-            &stored.title,
-            text_container_available_width(body),
-        ) else {
-            self.set_save_status("图片未插入：格式不支持", true);
-            return false;
-        };
-        let source: &NSAttributedString = &snapshot.attributed;
-        if candidate_with_attachment(source, insertion_range, &inline).is_none() {
-            self.set_save_status("图片未插入：格式不支持", true);
-            return false;
-        }
         let title = self
             .ivars()
             .title_field
@@ -5397,9 +5335,14 @@ impl AppDelegate {
         let previous_selection_guard = *self.ivars().selection_sync_guard.borrow();
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().selection_sync_guard.borrow_mut() = true;
-        let inserted = commit_live_image_insert(body, insertion_range, &inline, || {
-            self.persist_note_content(&note_id, prepared)
-        });
+        let persisted = self.persist_note_content(&note_id, prepared);
+        let inserted = match image_insert_view_update(persisted, insertion_range) {
+            Some(ImageInsertViewUpdate::InstallSession { selection }) => {
+                self.refresh_body_from_session_at(body, selection);
+                true
+            }
+            None => false,
+        };
         *self.ivars().selection_sync_guard.borrow_mut() = previous_selection_guard;
         *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
         if !inserted && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut() {
@@ -5411,10 +5354,6 @@ impl AppDelegate {
                 .borrow_mut()
                 .reset(&note.id, &note.title, &note.body);
             self.set_save_status("保存失败，内容保留待重试", true);
-        }
-        if inserted {
-            *self.ivars().projection_attachments.borrow_mut() =
-                projection_attachments_from_storage(body);
         }
         inserted
     }
@@ -6081,18 +6020,6 @@ where
 
 fn image_insert_gate(has_note: bool, has_marked_text: bool, flush_succeeded: bool) -> bool {
     has_note && !has_marked_text && flush_succeeded
-}
-
-fn commit_live_image_insert(
-    body: &NSTextView,
-    insertion_range: NSRange,
-    inline: &NSMutableAttributedString,
-    persist: impl FnOnce() -> bool,
-) -> bool {
-    commit_after_persistence(persist, || {
-        body.setSelectedRange(insertion_range);
-        insert_inline_attachment(body, inline);
-    })
 }
 
 #[allow(deprecated)]
@@ -8119,6 +8046,34 @@ mod tests {
             },
         ));
         assert_eq!(apply_count, 0);
+    }
+
+    #[test]
+    fn red_persisted_image_insert_installs_session_projection_after_image() {
+        let insertion = NSRange::new(4, 2);
+        assert_eq!(
+            super::image_insert_view_update(true, insertion),
+            Some(super::ImageInsertViewUpdate::InstallSession {
+                selection: NSRange::new(5, 0)
+            })
+        );
+        assert_eq!(super::image_insert_view_update(false, insertion), None);
+    }
+
+    #[test]
+    fn red_format_refresh_keeps_image_only_actions_titleless() {
+        assert_eq!(
+            super::toolbar_state_title(super::EditorAction::BlockStyle, "标题 1"),
+            Some("标题 1")
+        );
+        assert_eq!(
+            super::toolbar_state_title(super::EditorAction::Highlight, "高亮"),
+            None
+        );
+        assert_eq!(
+            super::toolbar_state_title(super::EditorAction::Strikethrough, "删除线"),
+            None
+        );
     }
 
     #[test]
