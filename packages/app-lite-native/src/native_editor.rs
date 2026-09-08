@@ -1597,9 +1597,7 @@ pub fn query_clear_state(
     } else {
         selection_needs_clear(session, start, end)
     };
-    let block_active = !block_command_is_noop(session, start, end, BlockCommand::Paragraph);
-    let active = inline_active || block_active;
-    Ok(if active {
+    Ok(if inline_active {
         SelectionState::Active
     } else {
         SelectionState::Inactive
@@ -1617,8 +1615,7 @@ pub fn apply_clear_formatting(
     } else {
         selection_needs_clear(session, start, end)
     };
-    let block_active = !block_command_is_noop(session, start, end, BlockCommand::Paragraph);
-    if !inline_active && !block_active {
+    if !inline_active {
         return Ok(());
     }
     let cleared_typing_format = TextFormat {
@@ -1639,17 +1636,6 @@ pub fn apply_clear_formatting(
                 cursor.merge_char_format(&cleared_typing_format),
                 "clear inline format",
             );
-        }
-        if block_active {
-            must_apply(
-                cursor.set_block_format(&BlockFormat {
-                    heading_level: Some(0),
-                    marker: Some(MarkerType::NoMarker),
-                    ..Default::default()
-                }),
-                "clear paragraph format",
-            );
-            remove_lists_in_selection(session, start, end);
         }
     });
     if start == end && inline_active {
@@ -1750,12 +1736,26 @@ fn selection_has_text(session: &NativeEditorSession, start: usize, end: usize) -
         };
         let snapshot = block.snapshot();
         snapshot.fragments.into_iter().any(|fragment| {
-            let FragmentContent::Text { offset, length, .. } = fragment else {
+            let FragmentContent::Text {
+                text,
+                offset,
+                length,
+                ..
+            } = fragment
+            else {
                 return false;
             };
             let from = snapshot.position + offset;
             let to = from + length;
-            from < end && to > start
+            if from >= end || to <= start {
+                return false;
+            }
+            text.chars().enumerate().any(|(index, character)| {
+                let position = from + index;
+                position >= start
+                    && position < end
+                    && !matches!(character, '\u{2028}' | '\u{000b}' | '\r')
+            })
         })
     })
 }
@@ -3419,7 +3419,26 @@ mod tests {
     }
 
     #[test]
-    fn clear_formatting_removes_block_style_as_well_as_inline_marks() {
+    fn inline_commands_on_soft_break_only_selection_are_noops() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "a\u{2028}b".into(),
+                marks: Marks::default(),
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        let before = document_from_session(&session).unwrap();
+        let revision = session.revision();
+        assert!(!session.can_undo());
+        apply_inline_command(&mut session, NSRange::new(1, 1), InlineCommand::Bold).unwrap();
+        assert_eq!(session.revision(), revision);
+        assert!(!session.can_undo());
+        assert_eq!(document_from_session(&session).unwrap(), before);
+    }
+
+    #[test]
+    fn clear_formatting_preserves_block_style_and_removes_inline_marks() {
         let document = Document::from_blocks(vec![Block::Heading {
             level: HeadingLevel::One,
             style: Default::default(),
@@ -3439,8 +3458,45 @@ mod tests {
         apply_clear_formatting(&mut session, NSRange::new(0, 4)).unwrap();
         assert!(matches!(
             document_from_session(&session).unwrap().blocks.as_slice(),
-            [Block::Paragraph { inlines, .. }]
+            [Block::Heading {
+                level: HeadingLevel::One,
+                inlines,
+                ..
+            }]
                 if matches!(inlines.as_slice(), [Inline::Text { marks, .. }] if !marks.bold)
+        ));
+    }
+
+    #[test]
+    fn clear_formatting_preserves_list_kind_and_removes_inline_marks() {
+        let document = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Ordered,
+            items: vec![ListItem {
+                checked: None,
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "编号项".into(),
+                    marks: Marks {
+                        bold: true,
+                        ..Default::default()
+                    },
+                }],
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        apply_clear_formatting(&mut session, NSRange::new(0, 3)).unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [Block::List {
+                kind: ListKind::Ordered,
+                items,
+            }] if matches!(
+                items.as_slice(),
+                [ListItem { inlines, .. }] if matches!(
+                    inlines.as_slice(),
+                    [Inline::Text { marks, .. }] if !marks.bold
+                )
+            )
         ));
     }
 

@@ -38,12 +38,12 @@ use objc2_app_kit::{
     NSCollectionViewFlowLayout, NSCollectionViewItem, NSColor, NSControlStateValueMixed,
     NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation,
     NSDraggingDestination, NSDraggingInfo, NSEventModifierFlags, NSFont, NSFontAttributeName,
-    NSImage, NSIndexPathNSCollectionViewAdditions, NSLayoutManager, NSLineBreakMode, NSMenu,
-    NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle,
-    NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
-    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField,
-    NSStrikethroughStyleAttributeName, NSText, NSTextAlignment, NSTextAttachment, NSTextDelegate,
-    NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextStorage, NSTextView,
+    NSImage, NSIndexPathNSCollectionViewAdditions, NSLayoutManager, NSLineBreakMode,
+    NSLinkAttributeName, NSMenu, NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle,
+    NSOpenPanel, NSParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
+    NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder, NSScrollView,
+    NSSearchField, NSStrikethroughStyleAttributeName, NSText, NSTextAlignment, NSTextAttachment,
+    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextStorage, NSTextView,
     NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow,
     NSWindowDelegate, NSWindowStyleMask,
 };
@@ -2038,6 +2038,7 @@ struct TypingFormatProjection {
     font_underline: Option<bool>,
     font_strikeout: Option<bool>,
     has_background: bool,
+    clear_background: bool,
     clear_link: bool,
 }
 
@@ -2048,7 +2049,8 @@ fn typing_format_projection(format: &NativeTextFormat) -> TypingFormatProjection
         font_underline: format.font_underline,
         font_strikeout: format.font_strikeout,
         has_background: format.background_color.is_some_and(|color| color.alpha > 0),
-        clear_link: format.clear_link,
+        clear_background: format.background_color.is_none_or(|color| color.alpha == 0),
+        clear_link: format.clear_link || format.anchor_href.is_none(),
     }
 }
 
@@ -2057,20 +2059,19 @@ fn sync_typing_attributes_with_format(body: &NSTextView, format: &NativeTextForm
     let typing = body.typingAttributes();
     let mutable = typing.mutableCopy();
     let font_key = unsafe { NSFontAttributeName };
-    if (projection.font_bold.is_some() || projection.font_italic.is_some())
-        && let Some(font) = unsafe { typing.objectForKey_unchecked(font_key) }
-            .and_then(|value| value.downcast_ref::<NSFont>())
+    if let Some(font) = unsafe { typing.objectForKey_unchecked(font_key) }
+        .and_then(|value| value.downcast_ref::<NSFont>())
     {
         let descriptor = font.fontDescriptor();
         let mut traits = descriptor.symbolicTraits();
         if projection.font_bold == Some(true) {
             traits.insert(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitBold);
-        } else if projection.font_bold == Some(false) {
+        } else {
             traits.remove(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitBold);
         }
         if projection.font_italic == Some(true) {
             traits.insert(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitItalic);
-        } else if projection.font_italic == Some(false) {
+        } else {
             traits.remove(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitItalic);
         }
         if let Some(font) = NSFont::fontWithDescriptor_size(
@@ -2084,14 +2085,14 @@ fn sync_typing_attributes_with_format(body: &NSTextView, format: &NativeTextForm
     if projection.font_underline == Some(true) {
         let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
         mutable.insert(underline_key, &value);
-    } else if projection.font_underline == Some(false) {
+    } else {
         mutable.removeObjectForKey(underline_key);
     }
     let strike_key = unsafe { NSStrikethroughStyleAttributeName };
     if projection.font_strikeout == Some(true) {
         let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
         mutable.insert(strike_key, &value);
-    } else if projection.font_strikeout == Some(false) {
+    } else {
         mutable.removeObjectForKey(strike_key);
     }
     if let Some(color) = format.background_color {
@@ -2106,10 +2107,17 @@ fn sync_typing_attributes_with_format(body: &NSTextView, format: &NativeTextForm
         } else {
             mutable.removeObjectForKey(unsafe { NSBackgroundColorAttributeName });
         }
+    } else if projection.clear_background {
+        mutable.removeObjectForKey(unsafe { NSBackgroundColorAttributeName });
     }
-    if projection.clear_link {
-        let link_key = NSAttributedStringKey::from_str("NSLink");
-        mutable.removeObjectForKey(&link_key);
+    if let Some(href) = format.anchor_href.as_deref().filter(|_| !format.clear_link) {
+        if let Some(value) = NSURL::initWithString(NSURL::alloc(), &NSString::from_str(href)) {
+            mutable.insert(unsafe { NSLinkAttributeName }, &value);
+        } else {
+            mutable.removeObjectForKey(unsafe { NSLinkAttributeName });
+        }
+    } else if projection.clear_link {
+        mutable.removeObjectForKey(unsafe { NSLinkAttributeName });
     }
     unsafe { body.setTypingAttributes(&mutable) };
 }
@@ -3003,10 +3011,21 @@ define_class!(
         }
     }
     unsafe impl NSControlTextEditingDelegate for AppDelegate {
+        #[unsafe(method(controlTextDidBeginEditing:))]
+        fn control_text_did_begin_editing(&self, _notification: &NSNotification) {
+            self.update_formatting_buttons();
+        }
+
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, _notification: &NSNotification) {
             self.mark_current_note_dirty();
             self.resume_deferred_autosave_if_ready();
+            self.update_formatting_buttons();
+        }
+
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn control_text_did_end_editing(&self, _notification: &NSNotification) {
+            self.update_formatting_buttons();
         }
     }
     unsafe impl NSTextDelegate for AppDelegate {
@@ -3630,7 +3649,17 @@ define_class!(
 
     #[unsafe(method(undoText:))]
     fn undo_text(&self, _sender: &NSObject) {
+        if self.non_body_text_focus() {
+            if let Some(window) = self.ivars().window.get()
+                && let Some(first_responder) = window.firstResponder()
+            {
+                unsafe { first_responder.tryToPerform_with(sel!(undo:), None) };
+            }
+            self.update_formatting_buttons();
+            return;
+        }
         let Some(selection) = self.command_selection() else {
+            self.update_formatting_buttons();
             return;
         };
         let changed = self
@@ -3656,7 +3685,17 @@ define_class!(
 
     #[unsafe(method(redoText:))]
     fn redo_text(&self, _sender: &NSObject) {
+        if self.non_body_text_focus() {
+            if let Some(window) = self.ivars().window.get()
+                && let Some(first_responder) = window.firstResponder()
+            {
+                unsafe { first_responder.tryToPerform_with(sel!(redo:), None) };
+            }
+            self.update_formatting_buttons();
+            return;
+        }
         let Some(selection) = self.command_selection() else {
+            self.update_formatting_buttons();
             return;
         };
         let changed = self
@@ -4974,11 +5013,7 @@ impl AppDelegate {
         }
     }
 
-    fn command_selection(&self) -> Option<NSRange> {
-        let body = self.ivars().body_view.get()?;
-        let current_note_id = self.ivars().current_note_id.borrow().clone();
-        let selection_note_id = self.ivars().last_body_selection_note_id.borrow().clone();
-        let mut non_body_focus = false;
+    fn non_body_text_focus(&self) -> bool {
         if let Some(window) = self.ivars().window.get()
             && let Some(first_responder) = window.firstResponder()
         {
@@ -4995,12 +5030,19 @@ impl AppDelegate {
                         Retained::<NSText>::as_ptr(&editor) as *const NSResponder == first_ptr
                     })
             });
-            non_body_focus = title_focused || search_focused;
+            return title_focused || search_focused;
         }
+        false
+    }
+
+    fn command_selection(&self) -> Option<NSRange> {
+        let body = self.ivars().body_view.get()?;
+        let current_note_id = self.ivars().current_note_id.borrow().clone();
+        let selection_note_id = self.ivars().last_body_selection_note_id.borrow().clone();
         if !command_selection_is_available(
             current_note_id.as_deref(),
             selection_note_id.as_deref(),
-            non_body_focus,
+            self.non_body_text_focus(),
         ) {
             return None;
         }
@@ -5027,10 +5069,18 @@ impl AppDelegate {
 
     fn current_action_presentation(&self, action: EditorAction) -> EditorActionPresentation {
         let has_note = self.ivars().current_note_id.borrow().is_some();
-        let selection = self.command_selection().unwrap_or(NSRange::new(0, 0));
+        let command_selection = self.command_selection();
+        let selection = command_selection.unwrap_or(NSRange::new(0, 0));
         let session_guard = self.ivars().editor_session.borrow();
+        // A loaded session must not drive body formatting state while a title
+        // or search field editor owns first responder.  command_selection is
+        // the shared gate for all toolbar/menu semantic commands.
+        let command_session = command_selection
+            .is_some()
+            .then_some(session_guard.as_ref())
+            .flatten();
         let mut presentation =
-            semantic_action_presentation(action, has_note, session_guard.as_ref(), selection);
+            semantic_action_presentation(action, has_note, command_session, selection);
         if action == EditorAction::More {
             presentation.enabled = self
                 .ivars()
@@ -5059,12 +5109,7 @@ impl AppDelegate {
                     // note, even if there are no formatting actions in the
                     // overflow list.
                     has_note
-                        || more_has_enabled_child(
-                            &overflow,
-                            has_note,
-                            session_guard.as_ref(),
-                            selection,
-                        )
+                        || more_has_enabled_child(&overflow, has_note, command_session, selection)
                 })
                 .unwrap_or(false);
         }
@@ -5072,7 +5117,17 @@ impl AppDelegate {
     }
 
     fn apply_inline_command(&self, command: InlineCommand) {
+        if self
+            .ivars()
+            .body_view
+            .get()
+            .is_some_and(|body| body.hasMarkedText())
+        {
+            self.update_formatting_buttons();
+            return;
+        }
         let Some(selection) = self.command_selection() else {
+            self.update_formatting_buttons();
             return;
         };
         if self.ivars().current_note_id.borrow().is_none() {
@@ -5098,7 +5153,17 @@ impl AppDelegate {
     }
 
     fn apply_block_command(&self, command: BlockCommand) {
+        if self
+            .ivars()
+            .body_view
+            .get()
+            .is_some_and(|body| body.hasMarkedText())
+        {
+            self.update_formatting_buttons();
+            return;
+        }
         let Some(selection) = self.command_selection() else {
+            self.update_formatting_buttons();
             return;
         };
         if self.ivars().current_note_id.borrow().is_none() {
@@ -5124,7 +5189,17 @@ impl AppDelegate {
     }
 
     fn apply_paragraph_command(&self, command: ParagraphCommand) {
+        if self
+            .ivars()
+            .body_view
+            .get()
+            .is_some_and(|body| body.hasMarkedText())
+        {
+            self.update_formatting_buttons();
+            return;
+        }
         let Some(selection) = self.command_selection() else {
+            self.update_formatting_buttons();
             return;
         };
         if self.ivars().current_note_id.borrow().is_none() {
@@ -5150,7 +5225,17 @@ impl AppDelegate {
     }
 
     fn show_link_editor(&self) {
+        if self
+            .ivars()
+            .body_view
+            .get()
+            .is_some_and(|body| body.hasMarkedText())
+        {
+            self.update_formatting_buttons();
+            return;
+        }
         let Some(selection) = self.command_selection() else {
+            self.update_formatting_buttons();
             return;
         };
         if self.ivars().current_note_id.borrow().is_none() {
@@ -5200,12 +5285,15 @@ impl AppDelegate {
     #[allow(deprecated)]
     fn apply_format(&self, format: TextFormat) {
         let Some(body) = self.ivars().body_view.get() else {
+            self.update_formatting_buttons();
             return;
         };
         if body.hasMarkedText() {
+            self.update_formatting_buttons();
             return;
         }
         let Some(range) = self.command_selection() else {
+            self.update_formatting_buttons();
             return;
         };
         if self.ivars().current_note_id.borrow().is_none() {
@@ -5661,8 +5749,12 @@ impl AppDelegate {
                         },
                         text_container_available_width(body),
                     );
-                    self.install_rendered_document(body, &rendered, NSRange::new(0, 0));
+                    // Install the new semantic session before rendering the
+                    // collapsed caret attributes. Otherwise
+                    // install_rendered_document can consult the previous
+                    // note's typing context while replacing the view.
                     *self.ivars().editor_session.borrow_mut() = Some(session);
+                    self.install_rendered_document(body, &rendered, NSRange::new(0, 0));
                     if rendered.missing_resources == 0 {
                         ("已保存", false)
                     } else {
@@ -6785,9 +6877,17 @@ mod tests {
                 font_underline: Some(true),
                 font_strikeout: Some(true),
                 has_background: true,
+                clear_background: false,
                 clear_link: true,
             }
         );
+    }
+
+    #[test]
+    fn default_typing_projection_clears_old_background_and_link() {
+        let projection = super::typing_format_projection(&text_document::TextFormat::default());
+        assert!(projection.clear_background);
+        assert!(projection.clear_link);
     }
 
     #[test]
