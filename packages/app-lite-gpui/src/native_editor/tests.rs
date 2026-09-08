@@ -2,6 +2,7 @@ use super::core::EditorCore;
 use super::history::History;
 use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1084,6 +1085,269 @@ async fn entity_input_candidate_range_is_remapped_before_restore(cx: &mut gpui::
             assert!(candidate_selection.is_caret());
         });
     });
+}
+
+#[gpui::test]
+async fn entity_input_explicit_candidate_range_updates_composition_base(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("abcd"), cx));
+    let original_selection = cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(1);
+            let original_selection = editor.selection();
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "X",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "aXbcd");
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(0..2),
+                "Y",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "Ybcd");
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "Z", window, editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "Zbcd");
+            assert_eq!(editor.undo_depth(), 1);
+            original_selection
+        })
+    });
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "abcd"
+    );
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
+}
+
+#[gpui::test]
+async fn entity_input_commit_restores_reverse_selection_affinities(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("abcd"), cx));
+    let original_selection = cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            let node = editor.document().first_node_id().expect("paragraph");
+            let original_selection = Selection::new(
+                DocPoint::with_affinity(node, 3, Affinity::Before),
+                DocPoint::with_affinity(node, 1, Affinity::After),
+            );
+            editor.set_selection_for_test(original_selection);
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "X",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "Y", window, editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "aYd");
+            assert_eq!(editor.undo_depth(), 1);
+            original_selection
+        })
+    });
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
+}
+
+#[gpui::test]
+async fn entity_input_marked_endpoints_use_final_grapheme_boundaries(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("\u{301}"), cx));
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(0);
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "a",
+                Some(0..0),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "a\u{301}");
+            assert!(editor.selection().is_caret());
+            assert!(matches!(editor.selection().head.utf8_offset, 0 | 3));
+            assert_eq!(
+                <EditorCore as EntityInputHandler>::marked_text_range(editor, window, editor_cx,),
+                Some(0..2)
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn measured_reflow_shapes_every_final_member_without_fixed_pass_hole(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let document = Document::from_paragraphs((0..32).map(|index| format!("row-{index}")));
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| {
+        let mut tall = window.text_style();
+        tall.line_height = px(1000.0).into();
+        layout.shape_visible_with_style(&document, 0.0, 100_000.0, 680.0, tall, window);
+        layout.shape_visible_with_style(
+            &document,
+            120.0,
+            120.0,
+            680.0,
+            window.text_style(),
+            window,
+        );
+    });
+    let final_range = layout.visible_range();
+    let final_blocks = document
+        .blocks()
+        .get(final_range)
+        .expect("final viewport range");
+    assert!(!final_blocks.is_empty());
+    for block in final_blocks {
+        let cached = layout
+            .cache
+            .get(&block.id)
+            .expect("final viewport/prefetch member must be cached");
+        assert!(
+            !cached.layout.text_lines.is_empty(),
+            "final member {} was exposed without shaping",
+            block.id.raw()
+        );
+    }
+}
+
+#[gpui::test]
+async fn shaped_cache_budget_accounts_dynamic_selection_geometry_scratch(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let text = "word ".repeat(12_000);
+    let document = Document::from_paragraph(text);
+    let node = document.first_node_id().expect("paragraph");
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 100_000.0, 80.0, window);
+    });
+    let cached = layout.cache.get(&node).expect("long paragraph cache");
+    let selection = Selection::new(cached.layout.before, cached.layout.after);
+    let rects = layout.selection_rects(selection);
+    assert!(
+        rects.len() > 8,
+        "soft wrapping must exercise geometry growth"
+    );
+    let conservative_scratch = rects
+        .len()
+        .saturating_mul(size_of::<Bounds<gpui::Pixels>>())
+        .saturating_mul(3);
+    assert!(
+        cached.selection_geometry_bytes >= conservative_scratch,
+        "selection geometry reserve {} is below simultaneously-live scratch {}",
+        cached.selection_geometry_bytes,
+        conservative_scratch
+    );
+    assert!(layout.used_bytes() <= layout.budget_bytes());
+    assert!(layout.peak_accounted_bytes() <= layout.budget_bytes());
+}
+
+#[gpui::test]
+async fn entity_input_repeated_candidates_do_not_clone_document_or_history(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let document = Document::from_paragraphs(
+        (0..20_000).map(|index| format!("block-{index}-{}", "z".repeat(1_024))),
+    );
+    let first_id = document.blocks().first().expect("first block").id;
+    let last_id = document.blocks().last().expect("last block").id;
+    let entity = cx.new(|cx| EditorCore::new(document, cx));
+    let (first_revision, last_revision) = entity.read_with(cx, |editor, _| {
+        (
+            editor
+                .document()
+                .block(first_id)
+                .expect("first block")
+                .revision,
+            editor
+                .document()
+                .block(last_id)
+                .expect("last block")
+                .revision,
+        )
+    });
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(0);
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "x",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            for text in ["y", "z", "w"] {
+                <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                    editor,
+                    None,
+                    text,
+                    Some(1..1),
+                    window,
+                    editor_cx,
+                );
+            }
+            assert_eq!(editor.undo_depth(), 1);
+        });
+    });
+    let allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    let (block_count, first_after, last_after, undo_depth) = entity.read_with(cx, |editor, _| {
+        (
+            editor.document().block_count(),
+            editor
+                .document()
+                .block(first_id)
+                .expect("first block")
+                .revision,
+            editor
+                .document()
+                .block(last_id)
+                .expect("last block")
+                .revision,
+            editor.undo_depth(),
+        )
+    });
+    assert!(
+        allocated < 32_000_000,
+        "repeated IME candidates cloned the whole note/history: {allocated} bytes"
+    );
+    assert_eq!(block_count, 20_000);
+    assert_eq!(first_after, first_revision);
+    assert!(last_after > last_revision);
+    assert_eq!(undo_depth, 1);
 }
 
 #[gpui::test]

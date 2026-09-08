@@ -333,12 +333,12 @@ impl LayoutRegistry {
         // A measured height can change which blocks belong to the viewport
         // and prefetch window. Rebuild membership after each shaping pass so
         // blocks entering after expansion/contraction are shaped in the same
-        // production call, rather than waiting for a later frame.
-        // A large estimated block can initially push several prefetched
-        // blocks out, while contraction can reveal the same blocks in waves.
-        // Iterate to a fixed point with a bounded guard so a pathological
-        // font backend cannot turn one paint into an unbounded loop.
-        for _ in 0..8 {
+        // production call, rather than waiting for a later frame. A large
+        // estimated block can initially push several prefetched blocks out,
+        // while contraction can reveal the same blocks in waves. The cache
+        // key makes each member shape at most once per style, so this loop
+        // converges when the measured membership reaches a fixed point.
+        loop {
             let visible_ids: Vec<NodeId> =
                 self.visible.iter().map(|layout| layout.node_id).collect();
             let mut estimates_changed = false;
@@ -1038,6 +1038,9 @@ impl LayoutRegistry {
             return;
         }
         self.make_room_for(bytes);
+        self.peak_accounted_bytes = self
+            .peak_accounted_bytes
+            .max(self.used_bytes.saturating_add(bytes));
         self.used_bytes = self.used_bytes.saturating_add(bytes);
         self.cache.insert(
             node_id,
@@ -1187,6 +1190,8 @@ fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -
                 .saturating_add(
                     line.wrap_boundaries()
                         .len()
+                        .checked_next_power_of_two()
+                        .unwrap_or(usize::MAX)
                         .saturating_mul(size_of::<WrapBoundary>())
                         .saturating_add(ARC_ALLOCATION_OVERHEAD),
                 )
@@ -1206,6 +1211,7 @@ fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -
 }
 
 fn selection_geometry_reserve(layout: &BlockLayout, requested: usize) -> usize {
+    const SIMULTANEOUS_GEOMETRY_VECTORS: usize = 3;
     let visual_rows = layout
         .text_lines
         .iter()
@@ -1214,7 +1220,7 @@ fn selection_geometry_reserve(layout: &BlockLayout, requested: usize) -> usize {
     let row_storage = visual_rows
         .saturating_mul(size_of::<Bounds<Pixels>>())
         .saturating_add(size_of::<Vec<Bounds<Pixels>>>());
-    requested.max(row_storage)
+    requested.max(row_storage.saturating_mul(SIMULTANEOUS_GEOMETRY_VECTORS))
 }
 
 fn contains(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {

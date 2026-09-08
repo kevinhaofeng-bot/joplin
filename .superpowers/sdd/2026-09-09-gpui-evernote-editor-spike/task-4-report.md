@@ -211,3 +211,50 @@ cargo test --manifest-path packages/app-lite-gpui/Cargo.toml \
 | donor layout/cache 的可见窗口与保留成本边界 | `LayoutRegistry::rebuild_visible_window`、`make_room_for`、`estimate_cache_bytes`、`selection_geometry_reserve`、`peak_accounted_bytes`；visible 仍只保存 geometry，shaped lines 只在 cache 单一所有权中保留。 |
 
 本轮仍只修改 `packages/app-lite-gpui/src/native_editor/{core.rs,layout.rs,tests.rs}` 与本报告；没有修改 donor、plan/spec、验收矩阵、控制器 ledger 或 findings。headless GREEN 仍不替代真机 IME 候选窗、主题字体和 Metal/RSS 预算验收。
+
+## Fix round 4/5（六项复审 findings）
+
+本轮严格先走真实生产入口 RED，再改 native 实现。新增回归均通过
+`EntityInputHandler`、`EditorCore` 和 `LayoutRegistry` 的公开生产序列，未以
+`Document::apply` 或测试专用替代路径绕过输入、历史、缓存或视口行为。
+
+### RED → GREEN
+
+基线 `e789f250f` 的精确回归先得到 62 个既有 native 测试通过、6 个新增测试失败：
+
+| 测试 | RED 暴露的问题 | GREEN 修复/证据 |
+| --- | --- | --- |
+| `entity_input_explicit_candidate_range_updates_composition_base` | 显式候选范围更新后仍沿用旧 replacement base，最终得到 `Zabcd` 而非 `Zbcd` | `replace_last_with` 在恢复 provisional inverse 后重新映射 candidate/base flat offsets，并保存实际 `composition_base_range`；真实序列最终 `Zbcd`，一次 Undo 恢复原文档/selection。 |
+| `entity_input_commit_restores_reverse_selection_affinities` | Undo 只恢复 normalized forward range，丢失 reverse anchor/head 与 affinity | History replacement 使用原始 `composition_base` 作为 `before_selection`；Undo 精确恢复方向与两端 affinity。 |
+| `entity_input_marked_endpoints_use_final_grapheme_boundaries` | 插入后按候选字符串算 endpoint，组合字符相邻时发布非法 byte caret/marked range | marked、selected、collapsed caret 均在最终文档 block text 上经 `resolve_grapheme_offset`；`a + U+0301` 回归通过。 |
+| `measured_reflow_shapes_every_final_member_without_fixed_pass_hole` | 固定 8 轮 reflow 后第九个最终成员进入窗口但没有 shaped lines | `shape_visible_with_style` 改为按 membership 稳定性循环，真实 `WrappedLine` 测量后继续 shape 新成员；最终 viewport/prefetch 成员同一调用均有 cache layout。 |
+| `shaped_cache_budget_accounts_dynamic_selection_geometry_scratch` | wrap capacity 和同时存在的多组 selection geometry 未计入 admission/peak | `estimate_cache_bytes` 按 capacity 保守计 wrap storage，selection reserve 计三组同时存活的 bounds scratch；cache admission 前腾挪，`used_bytes` 与 observed peak 均不超 budget。 |
+| `entity_input_repeated_candidates_do_not_clone_document_or_history` | 每次候选更新深拷贝 20,000 块文档/历史，分配明显随全文增长 | `History::replace_last_with` + `Document::replace_after_inverse` 只回放局部 inverse/replacement；无 `Document`/`History` clone。大文档真实 EntityInputHandler 重复候选保持 20,000 blocks、仅目标 block revision 变化、undo depth 1，分配门槛通过。 |
+
+随后把热路径中逆 `RestoreBlocks` 的整篇 `HashSet` 分配去掉：已拥有的 replacement
+块直接交给 `splice`，局部同 ID inverse 只做替换范围 pairwise 校验；只有引入外部
+ID 的结构性恢复才扫描 outside range。`apply_transaction` 仅校验 changed nodes，普通
+`apply_batch` 仍在批边界执行完整 `validate_invariants`，所以没有削弱普通事务的全局
+审计。结构恢复仍保留 block-slice 校验、replacement 内重复校验与 outside ID 冲突校验。
+
+最终 focused native suite：
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml \
+  --bin velotype native_editor::tests:: --offline
+68 passed, 0 failed
+```
+
+### Round 4 donor/GPUI 复用映射
+
+| donor/既有 native 算法 | round 4 native 适配 |
+| --- | --- |
+| `components/block/input.rs:116-179`、`runtime/mod.rs:1539-1615,1726-1747` 的 marked/candidate/commit 协议 | `core.rs::replace_and_mark_utf16` 与 `commit_marked_text_with_range` 保持 marked range、candidate internal selection、composition base 分离；候选更新和 commit 走统一 `EntityInputHandler` 入口。 |
+| `editor/history.rs:77-137`、`editor/mod.rs:295-298` 的 provisional undo/reapply 与单条 history 语义 | native `History::replace_last_with`、`Document::replace_after_inverse` 用局部 inverse journal 原子恢复，再替换同一 history entry；失败时恢复 revision、next id、selection、marked 前状态。 |
+| `editor/selection.rs:1031-1052` 的全文 endpoint 映射与 donor grapheme boundary | `flat_offset_for_point_in`、`remap_candidate_selection_after_inverse` 保留 affinity；最终 block text 上复用 `resolve_grapheme_offset`，不在 candidate string 内提前截断。 |
+| `components/block/element.rs:242-263,279-312,353-512,938-985` 的真实 `shape_text`/`WrappedLine` 及 measured reflow | `LayoutRegistry::shape_visible_with_style` 循环至 membership 稳定，cache 只保存实际 `WrappedLine` layout，不留固定 8 轮洞。 |
+| donor cache/geometry 的 capacity 与 selection segment 约束 | `estimate_cache_bytes`、`selection_geometry_reserve`、`insert_shaped` admission/peak accounting；wrap boundary capacity 与三组同时存活 geometry 均进入硬预算。 |
+
+Round 4/5 仍只修改 `packages/app-lite-gpui/src/native_editor/` 下的实现/测试与本报告；
+没有修改 donor、plan/spec、验收矩阵、控制器 ledger 或 findings。Headless GREEN 仍不
+替代真机候选窗、主题字体、Metal/RSS 和异步图片解码验收。

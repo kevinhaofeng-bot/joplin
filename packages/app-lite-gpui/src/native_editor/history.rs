@@ -71,6 +71,48 @@ impl History {
         )
     }
 
+    /// Replace the latest provisional composition operation in place. The
+    /// document owns the inverse/replacement rollback journal, so a failed
+    /// candidate update cannot consume history or alter document revisions.
+    /// Only the localized transaction payload is retained; the document and
+    /// history are never cloned for this hot path.
+    pub fn replace_last_with<F>(
+        &mut self,
+        document: &mut Document,
+        before_selection: Selection,
+        make_replacement: F,
+    ) -> Result<ApplyOutcome, DocumentError>
+    where
+        F: FnOnce(&Document) -> Result<Transaction, DocumentError>,
+    {
+        let old_inverse = self
+            .undo
+            .back()
+            .map(|entry| entry.inverse.clone())
+            .ok_or(DocumentError::HistoryEmpty)?;
+        let (outcome, replacement) =
+            document.replace_after_inverse(old_inverse, before_selection, make_replacement)?;
+
+        self.clear_redo();
+        let entry = self.undo.back_mut().ok_or(DocumentError::HistoryEmpty)?;
+        let old_bytes = entry.bytes;
+        entry.inverse = outcome.inverse.clone();
+        entry.forward = TransactionBatch(vec![replacement]);
+        entry.before_selection = before_selection;
+        entry.after_selection = outcome.selection;
+        entry.bytes = entry
+            .inverse
+            .estimated_bytes()
+            .saturating_add(entry.forward.estimated_bytes());
+        self.used_bytes = self
+            .used_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(entry.bytes);
+        self.current_selection = Some(outcome.selection);
+        self.trim_to_budget();
+        Ok(outcome)
+    }
+
     /// Apply one user action made up of several model transactions as a
     /// single undoable history entry. The document already provides atomic
     /// batch rollback; this method keeps that batch atomic at the editor's

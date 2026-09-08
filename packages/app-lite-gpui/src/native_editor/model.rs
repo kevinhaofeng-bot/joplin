@@ -543,6 +543,74 @@ impl Document {
         })
     }
 
+    /// Replace one already-applied provisional operation without cloning the
+    /// document. The inverse is applied and the replacement is then executed
+    /// against the restored base document inside one rollback journal. If
+    /// either the inverse, the caller's preflight closure, or the replacement
+    /// fails, the original document revision, allocation cursor, blocks and
+    /// contents are restored exactly.
+    pub(crate) fn replace_after_inverse<F>(
+        &mut self,
+        inverse: TransactionBatch,
+        before_selection: Selection,
+        make_replacement: F,
+    ) -> Result<(ApplyOutcome, Transaction), DocumentError>
+    where
+        F: FnOnce(&Document) -> Result<Transaction, DocumentError>,
+    {
+        let initial_revision = self.revision;
+        let initial_next_id = self.next_id;
+        let mut rollback_journal = Vec::new();
+        let mut changed_nodes = SmallVec::new();
+
+        for transaction in inverse.0 {
+            let outcome = match self.apply_transaction(transaction) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.rollback_journal(rollback_journal, initial_revision, initial_next_id);
+                    return Err(error);
+                }
+            };
+            for node_id in outcome.changed_nodes.iter().copied() {
+                push_unique(&mut changed_nodes, node_id);
+            }
+            rollback_journal.push(outcome.inverse);
+        }
+
+        if let Err(error) = self.validate_selection(before_selection) {
+            self.rollback_journal(rollback_journal, initial_revision, initial_next_id);
+            return Err(error);
+        }
+
+        let replacement = match make_replacement(self) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                self.rollback_journal(rollback_journal, initial_revision, initial_next_id);
+                return Err(error);
+            }
+        };
+        let replacement_for_return = replacement.clone();
+        let outcome = match self.apply_transaction(replacement) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.rollback_journal(rollback_journal, initial_revision, initial_next_id);
+                return Err(error);
+            }
+        };
+        for node_id in outcome.changed_nodes.iter().copied() {
+            push_unique(&mut changed_nodes, node_id);
+        }
+        Ok((
+            ApplyOutcome {
+                selection: outcome.selection,
+                changed_nodes,
+                inverse: outcome.inverse,
+                estimated_bytes: outcome.estimated_bytes,
+            },
+            replacement_for_return,
+        ))
+    }
+
     fn rollback_journal(
         &mut self,
         inverse_batches: Vec<TransactionBatch>,
@@ -587,22 +655,17 @@ impl Document {
                     "document contains a duplicate or zero node id".into(),
                 ));
             }
-            validate_kind(&block.kind)?;
-            match (&block.kind, &block.content) {
-                (BlockKind::Image, BlockContent::Image { .. })
-                | (BlockKind::Attachment, BlockContent::Attachment { .. })
-                | (BlockKind::Divider, BlockContent::Empty) => {}
-                (
-                    BlockKind::Paragraph
-                    | BlockKind::Heading { .. }
-                    | BlockKind::BulletItem { .. }
-                    | BlockKind::OrderedItem { .. }
-                    | BlockKind::CheckItem { .. }
-                    | BlockKind::Quote
-                    | BlockKind::Code,
-                    BlockContent::Text { text, styles },
-                ) => validate_styles(block.id, text, styles)?,
-                _ => return Err(DocumentError::InvalidBlockContent(block.id)),
+            validate_block_invariants(block)?;
+        }
+        Ok(())
+    }
+
+    fn validate_changed_nodes(&self, changed_nodes: &[NodeId]) -> Result<(), DocumentError> {
+        for node_id in changed_nodes {
+            // A removed block is retained in changed_nodes so layout can
+            // evict stale geometry; it has no live content left to validate.
+            if let Some(block) = self.blocks.iter().find(|block| block.id == *node_id) {
+                validate_block_invariants(block)?;
             }
         }
         Ok(())
@@ -679,7 +742,13 @@ impl Document {
                 block.revision = self.revision;
             }
         }
-        if let Err(error) = self.validate_invariants() {
+        // The IME replacement path calls this primitive repeatedly while
+        // restoring and reapplying one provisional block. Validate only the
+        // blocks it touched here; ordinary multi-operation edits retain the
+        // full document audit at the batch boundary above. Structural
+        // operations (including RestoreBlocks) perform their own complete
+        // node-id collision checks before reaching this point.
+        if let Err(error) = self.validate_changed_nodes(&changed_nodes) {
             self.rollback_journal(vec![inverse], original_revision, original_next_id);
             return Err(error);
         }
@@ -1776,31 +1845,52 @@ impl Document {
             ));
         }
         validate_block_slice(&blocks)?;
-        let mut outside_ids = std::collections::HashSet::new();
-        for (position, block) in self.blocks.iter().enumerate() {
-            if position < index || position >= index.saturating_add(remove_count) {
-                outside_ids.insert(block.id);
-            }
-        }
-        let mut replacement_ids = std::collections::HashSet::new();
+        // Inverse ranges are normally one small contiguous run (for example
+        // the provisional IME block). Do not allocate a set proportional to
+        // the whole document just to validate that local replacement. The
+        // pairwise check is deliberately bounded by the supplied replacement
+        // range; only a replacement that introduces an id from outside that
+        // range needs the full outside-range collision scan.
+        let mut replacement_ids = SmallVec::<[NodeId; 4]>::new();
         for block in &blocks {
-            if !replacement_ids.insert(block.id) || outside_ids.contains(&block.id) {
+            if replacement_ids.contains(&block.id) {
                 return Err(DocumentError::InvalidOperation(
                     "inverse block range would duplicate a node id".into(),
                 ));
             }
+            replacement_ids.push(block.id);
         }
+        let all_ids_are_replaced = blocks.iter().all(|replacement| {
+            self.blocks[index..index + remove_count]
+                .iter()
+                .any(|current| current.id == replacement.id)
+        });
+        if !all_ids_are_replaced
+            && blocks.iter().any(|replacement| {
+                self.blocks.iter().enumerate().any(|(position, current)| {
+                    (position < index || position >= index.saturating_add(remove_count))
+                        && current.id == replacement.id
+                })
+            })
+        {
+            return Err(DocumentError::InvalidOperation(
+                "inverse block range would duplicate a node id".into(),
+            ));
+        }
+        let replacement_count = blocks.len();
         let old_blocks = self.blocks[index..index + remove_count].to_vec();
-        self.blocks
-            .splice(index..index + remove_count, blocks.clone());
+        self.blocks.splice(index..index + remove_count, blocks);
         let mut changed_nodes = SmallVec::new();
-        for block in old_blocks.iter().chain(blocks.iter()) {
+        for block in &old_blocks {
             push_unique(&mut changed_nodes, block.id);
+        }
+        for node_id in replacement_ids {
+            push_unique(&mut changed_nodes, node_id);
         }
         let selection = self.selection_near_index(index);
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
             index,
-            remove_count: blocks.len(),
+            remove_count: replacement_count,
             blocks: old_blocks,
         }]);
         Ok((selection, changed_nodes, inverse))
@@ -1861,6 +1951,26 @@ fn is_structural_block(block: &Block) -> bool {
             | (BlockKind::Attachment, BlockContent::Attachment { .. })
             | (BlockKind::Divider, BlockContent::Empty)
     )
+}
+
+fn validate_block_invariants(block: &Block) -> Result<(), DocumentError> {
+    validate_kind(&block.kind)?;
+    match (&block.kind, &block.content) {
+        (BlockKind::Image, BlockContent::Image { .. })
+        | (BlockKind::Attachment, BlockContent::Attachment { .. })
+        | (BlockKind::Divider, BlockContent::Empty) => Ok(()),
+        (
+            BlockKind::Paragraph
+            | BlockKind::Heading { .. }
+            | BlockKind::BulletItem { .. }
+            | BlockKind::OrderedItem { .. }
+            | BlockKind::CheckItem { .. }
+            | BlockKind::Quote
+            | BlockKind::Code,
+            BlockContent::Text { text, styles },
+        ) => validate_styles(block.id, text, styles),
+        _ => Err(DocumentError::InvalidBlockContent(block.id)),
+    }
 }
 
 fn validate_kind(kind: &BlockKind) -> Result<(), DocumentError> {
