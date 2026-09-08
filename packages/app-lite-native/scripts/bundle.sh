@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DIST_DIR="$PACKAGE_DIR/dist"
 STAGING_DIR=""
-ICON_SOURCE="$PACKAGE_DIR/assets/AppIcon-source.png"
+ICON_MAIN_SOURCE="$PACKAGE_DIR/assets/AppIcon-source.png"
+ICON_SMALL_SOURCE="$PACKAGE_DIR/assets/AppIcon-small-source.png"
 
 bash "$SCRIPT_DIR/check-icon-contract.sh"
 
@@ -30,13 +31,18 @@ chmod 755 "$CONTENTS_PATH/MacOS/joplin-lite-native"
 ICONSET_PATH="$STAGING_DIR/AppIcon.iconset"
 mkdir -p "$ICONSET_PATH"
 for spec in \
-  "icon_16x16.png:16" "icon_16x16@2x.png:32" \
-  "icon_32x32.png:32" "icon_32x32@2x.png:64" \
-  "icon_128x128.png:128" "icon_128x128@2x.png:256" \
-  "icon_256x256.png:256" "icon_256x256@2x.png:512" \
-  "icon_512x512.png:512" "icon_512x512@2x.png:1024"; do
-  IFS=: read -r filename size <<< "$spec"
-  sips --resampleHeightWidth "$size" "$size" "$ICON_SOURCE" \
+  "icon_16x16.png:16:small" "icon_16x16@2x.png:32:small" \
+  "icon_32x32.png:32:small" "icon_32x32@2x.png:64:small" \
+  "icon_128x128.png:128:small" "icon_128x128@2x.png:256:main" \
+  "icon_256x256.png:256:main" "icon_256x256@2x.png:512:main" \
+  "icon_512x512.png:512:main" "icon_512x512@2x.png:1024:main"; do
+  IFS=: read -r filename size source_kind <<< "$spec"
+  if [[ "$source_kind" == small ]]; then
+    source="$ICON_SMALL_SOURCE"
+  else
+    source="$ICON_MAIN_SOURCE"
+  fi
+  sips --resampleHeightWidth "$size" "$size" "$source" \
     --out "$ICONSET_PATH/$filename" >/dev/null
 done
 iconutil --convert icns --output "$CONTENTS_PATH/Resources/AppIcon.icns" "$ICONSET_PATH"
