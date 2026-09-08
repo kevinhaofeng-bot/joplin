@@ -1,6 +1,6 @@
 # Joplin Lite Native
 
-这是一个 macOS 原生 Rust/AppKit 0.7.2 RC。应用采用 Evernote 风格的三栏工作区：极简导航、可复用的笔记卡片浏览栏，以及带固定工具栏的原生所见即所得编辑器。正文不经过 WebKit、Tauri、Electron 或 Node.js。
+这是一个 macOS 原生 Rust/AppKit 0.7.3 RC。应用采用 Evernote 风格的三栏工作区：极简导航、可复用的笔记卡片浏览栏，以及带固定工具栏的原生所见即所得编辑器。正文不经过 WebKit、Tauri、Electron 或 Node.js。
 
 ## 运行
 
@@ -33,7 +33,7 @@ packages/app-lite-native/scripts/bundle.sh
 - 标题与正文独立编辑，支持中文、emoji、输入法组合文本、撤销/重做和延迟自动保存；保存失败会保留可见内容并允许重试。
 - 语义富文本支持正文、H1/H2/H3、粗体、斜体、下划线、高亮、删除线、链接、对齐、缩进、项目符号、编号列表和清单；工具栏使用原生 SF Symbols，并随窗口宽度把次要命令收进“更多”。
 - 图片支持 PNG/JPEG 像素剪贴板、TIFF 剪贴板（规范化为 PNG）和 Finder PNG/JPEG 文件拖入；图片在编辑投影中是独立块，不继承标题行高，缺失资源仍保持可恢复的语义锚点，正文不存储图片 bytes 或 base64。
-- 0.7.2 收口了图片粘贴即时显示、图片独立块的真实 caret 与连续插图路径；固定工具栏的 SF Symbols 不与文字叠放，并使用多尺寸绿色笔记本小鼠图标。
+- 0.7.3 已验证折叠 caret 的行内格式所见即所得、标题与列表互斥、逐段缩进、标题/搜索之外的 first-responder 撤销重做路由、真实格式适用性与 no-op 防护、当前对齐状态、Clear 保留 block 类型，以及 Unicode/emoji 边界处理。
 - 正文持久化为规范 UTF-8 HTML；`body_text` 仅用于搜索索引，旧 RTF 只用于一次性迁移，正常编辑与保存不再写入 RTF。
 - 数据目录、SQLite 文件和资源 blob 有符号链接防护；删除为软删除，搜索和卡片列表共用同一数据源。
 
