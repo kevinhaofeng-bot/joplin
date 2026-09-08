@@ -15,8 +15,9 @@ use joplin_lite_native::native_editor::{
     apply_block_command, apply_clear_formatting, apply_committed_text_delta, apply_inline_command,
     apply_link, apply_paragraph_command, delete_image_anchor_if_identity, document_from_session,
     editor_attachment_image, effective_typing_format_at, image_paragraph_tail_indent,
-    insert_image_block_anchor, query_block_state, query_clear_state, query_inline_state,
-    query_link_selection, query_paragraph_command_state, render_session, session_from_document,
+    insert_image_block_anchor, query_block_state, query_clear_state, query_inline_applicability,
+    query_inline_state, query_link_selection, query_paragraph_command_state, render_session,
+    session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
     PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
@@ -42,10 +43,10 @@ use objc2_app_kit::{
     NSLinkAttributeName, NSMenu, NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle,
     NSOpenPanel, NSParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
     NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder, NSScrollView,
-    NSSearchField, NSStrikethroughStyleAttributeName, NSText, NSTextAlignment, NSTextAttachment,
-    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextStorage, NSTextView,
-    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSSearchField, NSSearchFieldDelegate, NSStrikethroughStyleAttributeName, NSText,
+    NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField, NSTextFieldDelegate,
+    NSTextInputClient, NSTextStorage, NSTextView, NSTextViewDelegate, NSUnderlineStyle,
+    NSUnderlineStyleAttributeName, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
@@ -1352,6 +1353,9 @@ fn semantic_action_presentation(
             .and_then(|session| query_paragraph_command_state(session, selection, command).ok())
             .unwrap_or(SelectionState::Inactive)
     };
+    let inline_applicable = session
+        .and_then(|session| query_inline_applicability(session, selection).ok())
+        .unwrap_or(false);
     match action {
         EditorAction::Undo => {
             presentation.enabled = session.is_some_and(NativeEditorSession::can_undo);
@@ -1366,12 +1370,25 @@ fn semantic_action_presentation(
             presentation.state = block_state(BlockCommand::Paragraph);
             presentation.enabled = session.is_some();
         }
-        EditorAction::Bold => presentation.state = inline_state(InlineCommand::Bold),
-        EditorAction::Italic => presentation.state = inline_state(InlineCommand::Italic),
-        EditorAction::Underline => presentation.state = inline_state(InlineCommand::Underline),
-        EditorAction::Highlight => presentation.state = inline_state(InlineCommand::Highlight),
+        EditorAction::Bold => {
+            presentation.state = inline_state(InlineCommand::Bold);
+            presentation.enabled = inline_applicable;
+        }
+        EditorAction::Italic => {
+            presentation.state = inline_state(InlineCommand::Italic);
+            presentation.enabled = inline_applicable;
+        }
+        EditorAction::Underline => {
+            presentation.state = inline_state(InlineCommand::Underline);
+            presentation.enabled = inline_applicable;
+        }
+        EditorAction::Highlight => {
+            presentation.state = inline_state(InlineCommand::Highlight);
+            presentation.enabled = inline_applicable;
+        }
         EditorAction::Strikethrough => {
-            presentation.state = inline_state(InlineCommand::Strikethrough)
+            presentation.state = inline_state(InlineCommand::Strikethrough);
+            presentation.enabled = inline_applicable;
         }
         EditorAction::BulletList => presentation.state = block_state(BlockCommand::UnorderedList),
         EditorAction::OrderedList => presentation.state = block_state(BlockCommand::OrderedList),
@@ -2694,6 +2711,7 @@ define_class!(
             unsafe {
                 search_field.setTarget(Some(self));
                 search_field.setAction(Some(sel!(searchNotes:)));
+                search_field.setDelegate(Some(ProtocolObject::from_ref(self)));
             }
             content.addSubview(&search_field);
 
@@ -3079,6 +3097,7 @@ define_class!(
         }
     }
     unsafe impl NSTextFieldDelegate for AppDelegate {}
+    unsafe impl NSSearchFieldDelegate for AppDelegate {}
     #[allow(non_snake_case)]
     unsafe impl NSCollectionViewDataSource for AppDelegate {
         #[unsafe(method(collectionView:numberOfItemsInSection:))]
@@ -3779,6 +3798,7 @@ define_class!(
         };
         if window.makeFirstResponder(Some(search)) {
             unsafe { search.selectText(None) };
+            self.update_formatting_buttons();
         }
     }
 
@@ -5116,6 +5136,19 @@ impl AppDelegate {
         presentation
     }
 
+    fn inline_command_is_applicable(&self, selection: NSRange, command: InlineCommand) -> bool {
+        self.ivars()
+            .editor_session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| match command {
+                InlineCommand::Clear => query_clear_state(session, selection)
+                    .map(|state| state != SelectionState::Inactive)
+                    .unwrap_or(false),
+                _ => query_inline_applicability(session, selection).unwrap_or(false),
+            })
+    }
+
     fn apply_inline_command(&self, command: InlineCommand) {
         if self
             .ivars()
@@ -5133,16 +5166,35 @@ impl AppDelegate {
         if self.ivars().current_note_id.borrow().is_none() {
             return;
         }
+        if !self.inline_command_is_applicable(selection, command) {
+            self.restore_command_selection(selection);
+            return;
+        }
         if !self.save_current_note() {
             self.restore_command_selection(selection);
             return;
         }
-        let changed = self
+        let before_revision = self
+            .ivars()
+            .editor_session
+            .borrow()
+            .as_ref()
+            .map(NativeEditorSession::revision)
+            .unwrap_or_default();
+        let applied = self
             .ivars()
             .editor_session
             .borrow_mut()
             .as_mut()
             .is_some_and(|session| apply_inline_command(session, selection, command).is_ok());
+        let after_revision = self
+            .ivars()
+            .editor_session
+            .borrow()
+            .as_ref()
+            .map(NativeEditorSession::revision)
+            .unwrap_or(before_revision);
+        let changed = applied && after_revision != before_revision;
         if changed {
             self.refresh_body_from_session();
             self.restore_command_selection(selection);
@@ -5299,45 +5351,50 @@ impl AppDelegate {
         if self.ivars().current_note_id.borrow().is_none() {
             return;
         }
-        if !self.save_current_note() {
-            self.restore_command_selection(range);
-            return;
-        }
         let command = match format {
             TextFormat::Bold => InlineCommand::Bold,
             TextFormat::Italic => InlineCommand::Italic,
             TextFormat::Underline => InlineCommand::Underline,
-            TextFormat::Clear => {
-                let before_revision = self
-                    .ivars()
-                    .editor_session
-                    .borrow()
-                    .as_ref()
-                    .map(NativeEditorSession::revision)
-                    .unwrap_or_default();
-                let applied = self
-                    .ivars()
-                    .editor_session
-                    .borrow_mut()
-                    .as_mut()
-                    .is_some_and(|session| apply_clear_formatting(session, range).is_ok());
-                let after_revision = self
-                    .ivars()
-                    .editor_session
-                    .borrow()
-                    .as_ref()
-                    .map(NativeEditorSession::revision)
-                    .unwrap_or(before_revision);
-                if applied && after_revision != before_revision {
-                    self.refresh_body_from_session();
-                    self.restore_command_selection(range);
-                    self.save_current_note();
-                } else {
-                    self.restore_command_selection(range);
-                }
-                return;
-            }
+            TextFormat::Clear => InlineCommand::Clear,
         };
+        if !self.inline_command_is_applicable(range, command) {
+            self.restore_command_selection(range);
+            return;
+        }
+        if !self.save_current_note() {
+            self.restore_command_selection(range);
+            return;
+        }
+        if matches!(format, TextFormat::Clear) {
+            let before_revision = self
+                .ivars()
+                .editor_session
+                .borrow()
+                .as_ref()
+                .map(NativeEditorSession::revision)
+                .unwrap_or_default();
+            let applied = self
+                .ivars()
+                .editor_session
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|session| apply_clear_formatting(session, range).is_ok());
+            let after_revision = self
+                .ivars()
+                .editor_session
+                .borrow()
+                .as_ref()
+                .map(NativeEditorSession::revision)
+                .unwrap_or(before_revision);
+            if applied && after_revision != before_revision {
+                self.refresh_body_from_session();
+                self.restore_command_selection(range);
+                self.save_current_note();
+            } else {
+                self.restore_command_selection(range);
+            }
+            return;
+        }
         let before_revision = self
             .ivars()
             .editor_session
@@ -8751,6 +8808,70 @@ mod tests {
             )
             .enabled
         );
+    }
+
+    #[test]
+    fn inline_format_presentation_requires_a_real_text_or_caret_target() {
+        let image_session =
+            super::session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Image {
+                    resource_id: "image-only".into(),
+                    alt: "图".into(),
+                }],
+            }]))
+            .unwrap();
+        let soft_break_session =
+            super::session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![Inline::Text {
+                    text: "\u{2028}".into(),
+                    marks: Marks::default(),
+                }],
+            }]))
+            .unwrap();
+        let empty_session =
+            super::session_from_document(&Document::from_blocks(vec![Block::Heading {
+                level: joplin_lite_native::html_body::HeadingLevel::Two,
+                style: Default::default(),
+                inlines: Vec::new(),
+            }]))
+            .unwrap();
+        for action in [
+            super::EditorAction::Bold,
+            super::EditorAction::Italic,
+            super::EditorAction::Underline,
+            super::EditorAction::Highlight,
+            super::EditorAction::Strikethrough,
+        ] {
+            assert!(
+                !super::semantic_action_presentation(
+                    action,
+                    true,
+                    Some(&image_session),
+                    NSRange::new(0, 1),
+                )
+                .enabled
+            );
+            assert!(
+                !super::semantic_action_presentation(
+                    action,
+                    true,
+                    Some(&soft_break_session),
+                    NSRange::new(0, 1),
+                )
+                .enabled
+            );
+            assert!(
+                !super::semantic_action_presentation(
+                    action,
+                    true,
+                    Some(&empty_session),
+                    NSRange::new(0, 0),
+                )
+                .enabled
+            );
+        }
     }
 
     #[test]

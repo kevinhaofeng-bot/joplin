@@ -1750,14 +1750,56 @@ fn selection_has_text(session: &NativeEditorSession, start: usize, end: usize) -
             if from >= end || to <= start {
                 return false;
             }
-            text.chars().enumerate().any(|(index, character)| {
-                let position = from + index;
-                position >= start
-                    && position < end
-                    && !matches!(character, '\u{2028}' | '\u{000b}' | '\r')
+            let mut position = from;
+            text.chars().any(|character| {
+                let next = position + character.len_utf16();
+                let visible = position < end
+                    && next > start
+                    && !matches!(character, '\u{2028}' | '\u{000b}' | '\r');
+                position = next;
+                visible
             })
         })
     })
+}
+
+/// Reports whether an inline command has a semantic target at `selection`.
+///
+/// A non-collapsed range must contain real text; image sentinels, soft breaks,
+/// and empty structural blocks are not formatting targets.  A collapsed caret
+/// is valid only when it is inside or at the boundary of a non-empty text run,
+/// so an empty paragraph/list item and an image-only block cannot manufacture
+/// a typing-format command.
+pub fn query_inline_applicability(
+    session: &NativeEditorSession,
+    selection: NSRange,
+) -> Result<bool, EditorCodecError> {
+    let text = session.text.to_addressable_text().map_err(model_error)?;
+    let (start, end) = utf16_range(&text, selection)?;
+    if start != end {
+        return Ok(selection_has_text(session, start, end));
+    }
+    Ok(session.text.flow().into_iter().any(|element| {
+        let FlowElement::Block(block) = element else {
+            return false;
+        };
+        let snapshot = block.snapshot();
+        snapshot.fragments.into_iter().any(|fragment| {
+            let FragmentContent::Text { text, offset, .. } = fragment else {
+                return false;
+            };
+            if text
+                .chars()
+                .all(|character| matches!(character, '\u{2028}' | '\u{000b}' | '\r'))
+            {
+                return false;
+            }
+            let from = snapshot.position + offset;
+            let length = text.encode_utf16().count();
+            let to = from + length;
+            from <= start && start <= to
+        })
+    }))
 }
 
 pub fn apply_block_command(
@@ -3435,6 +3477,50 @@ mod tests {
         assert_eq!(session.revision(), revision);
         assert!(!session.can_undo());
         assert_eq!(document_from_session(&session).unwrap(), before);
+    }
+
+    #[test]
+    fn inline_applicability_rejects_images_soft_breaks_and_empty_structures() {
+        let text = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "正文".into(),
+                marks: Marks::default(),
+            }],
+        }]))
+        .unwrap();
+        assert!(query_inline_applicability(&text, NSRange::new(0, 0)).unwrap());
+        assert!(query_inline_applicability(&text, NSRange::new(0, 2)).unwrap());
+
+        let image = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Image {
+                resource_id: "image-only".into(),
+                alt: "图".into(),
+            }],
+        }]))
+        .unwrap();
+        assert!(!query_inline_applicability(&image, NSRange::new(0, 1)).unwrap());
+        assert!(!query_inline_applicability(&image, NSRange::new(0, 0)).unwrap());
+
+        let soft_break = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "\u{2028}".into(),
+                marks: Marks::default(),
+            }],
+        }]))
+        .unwrap();
+        assert!(!query_inline_applicability(&soft_break, NSRange::new(0, 1)).unwrap());
+        assert!(!query_inline_applicability(&soft_break, NSRange::new(0, 0)).unwrap());
+
+        let empty = session_from_document(&Document::from_blocks(vec![Block::Heading {
+            level: HeadingLevel::Two,
+            style: BlockStyle::default(),
+            inlines: Vec::new(),
+        }]))
+        .unwrap();
+        assert!(!query_inline_applicability(&empty, NSRange::new(0, 0)).unwrap());
     }
 
     #[test]
