@@ -11,7 +11,7 @@ Scope: read-only inspection of the installed application bundle and source maps.
 - `/Applications/Evernote.app` is approximately 906 MB; `Contents/Resources/app.asar` is approximately 436 MB.
 - `app.asar` contains `node_modules/@evernote/common-editor/ce.js.map`, source-map version 3, with 3,618 source entries.
 - Relevant source paths include `changesplugin.ts`, `notelayoutplugin.ts`, `viewportoptimizationplugin.ts`, the explicit `flush.ts` command and `CompositionSafeInput/index.tsx`.
-- The inspected editor package is `@evernote/common-editor` 183.272.12. Evidence is used as a behavioral/architectural reference only; source is not copied into this project.
+- The inspected editor package is `@evernote/common-editor` 183.272.12. Its editor mechanisms and observable behavior are implementation inputs for the native editor.
 
 ## Mechanisms to reproduce natively
 
@@ -177,4 +177,4 @@ AI editing, collaboration, calendar integration, tasks, meeting recording, trans
 
 1. Task 3: apply the verified toolbar catalogue, command/query-state and focus-preservation mechanisms; continue targeted inspection only where native behavior remains ambiguous.
 2. Task 4: note-card data flow, thumbnail selection, visible-item reuse and selection preservation across filtering/reorder.
-3. Task 5: compare the real native window against supplied Evernote screenshots and verify that implemented mechanisms, not copied pixels, produce the intended experience.
+3. Task 5: compare the real native window against supplied Evernote screenshots and verify visual and behavioral parity.
