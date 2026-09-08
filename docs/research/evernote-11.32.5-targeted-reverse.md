@@ -4,6 +4,8 @@ Date: 2026-09-07
 Installed build: `11.32.5` / `20260830093737`  
 Scope: read-only inspection of the installed application bundle and source maps. User note contents are out of scope.
 
+> Status note (2026-09-09): the observations and identified Evernote mechanisms in this file remain active evidence for the new GPUI editor. Earlier paragraphs labelled `Native ruling` were written for the retired AppKit/Joplin-compatible client. Where they conflict with `docs/superpowers/specs/2026-09-09-evernote-native-editor-core-design.md`, preserve the Evernote observation and use the newer GPUI ruling.
+
 ## Evidence surface
 
 - `/Applications/Evernote.app` is approximately 906 MB; `Contents/Resources/app.asar` is approximately 436 MB.
