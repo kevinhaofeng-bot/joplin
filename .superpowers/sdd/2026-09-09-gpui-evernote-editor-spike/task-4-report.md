@@ -333,3 +333,64 @@ Round 5 修改范围为 native editor 实现/测试、本报告，以及为直�
 所需的 packages/app-lite-gpui/Cargo.toml/Cargo.lock；没有修改 donor、plan/spec、
 验收矩阵、控制器 ledger 或 findings。剩余顾虑仍是 headless 测试不能替代真机 IME
 候选窗、主题字体/Metal/RSS、异步图片解码和真实 UI 外壳集成验收。
+
+## Task 4R 边界恢复（2026-09-09）
+
+本轮严格按 brief 先写生产入口回归并运行 RED，再修改实现。四个新增测试均通过
+真实 `EntityInputHandler`、`EditorCore`、`LayoutRegistry` 和 GPUI shape/window 路径；
+没有通过 `Document::apply` 或测试专用布局路径绕过输入、历史、缓存、视口或预算。
+
+### RED -> GREEN
+
+基线 `6f794cfa3` 加入四个回归后先运行：
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor --offline -- --nocapture
+    76 passed, 4 failed
+
+| 测试 | RED 暴露的问题 | GREEN 修复/证据 |
+| --- | --- | --- |
+| `entity_input_actual_span_survives_right_grapheme_join` | 从执行后 caret 反推插入长度，把 `b` 放到右侧 combining mark 后，结果为 `\u{301}b` | transaction 在执行前记录精确 `InsertedTextSpan`，`ApplyOutcome` 贯穿 batch/model/history；marked span 从真实插入区间生成，结果为 `b\u{301}`，一次 Undo 恢复原文/selection。 |
+| `entity_input_explicit_replacement_outside_expanded_public_mark` | 把显式 UTF-16 replacement range 错误夹到 expanded public marked span 内，`aQ` 的 `2..3` 替换后错误保留 `Q` | 明确区分 public marked range 与实际 candidate interval；真实平台 replacement range 优先，只有完整覆盖 expanded public span 的既有 seam 才回到 actual interval，结果为 `ab`，一次 Undo 恢复。 |
+| `empty_hard_lines_hit_test_by_y` | 全空 hard lines 走 x fallback，第二、三行 y 命中都回到 offset 0 | `point_to_doc` 按每个 `WrappedLine` 的 y 和 hard-line 累计 offset 命中空行；`"\\n\\n"` 三行分别发布 0、1、2。 |
+| `crlf_visual_end_never_publishes_invalid_grapheme_offset` | visual end 直接发布 CRLF 中间 byte offset 2 | layout point 在最终全文 grapheme 边界上吸附，并把 CRLF 中间点调整到合法 affinity；move_end/insert 不再发布 InvalidGraphemeOffset。 |
+
+最终 focused native suite：
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor --offline -- --nocapture
+    80 passed, 0 failed, 752 filtered out
+
+四个新增 focused tests 也逐项独立运行并全部通过。完整 bin 验收（保留 brief 指定
+的既有单项 skip）为：
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype --offline \
+      -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
+    831 passed, 0 failed, 1 filtered
+
+### Task 4R donor/GPUI 复用映射
+
+| donor/GPUI 路径 | native 复用/适配 |
+| --- | --- |
+| `components/block/input.rs` 的 `EntityInputHandler` replacement/marked/selection 协议 | `core.rs::replace_and_mark_utf16` 保留 replacement range 优先；公开 grapheme-safe range 与 actual candidate interval 分离，commit/candidate 更新仍走同一生产入口。 |
+| GPUI 0.2.2 `examples/input.rs:300-349` | 复用“replacement range 优先于 marked range”以及 marked span 从执行前 `range.start..range.start + new_text.len()` 生成的语义；不从执行后 caret 反推。 |
+| macOS `platform/mac/window.rs:2234-2272` | 复用平台 bridge 透传真实文档 `replacementRange` 的边界定义；显式范围不再被 public IME grapheme 扩张吞掉。 |
+| `components/block/element.rs:243-312` 的 `hard_line_ranges`、`line_index_for_offset`、`wrapped_line_for_y` | `layout.rs::point_to_doc` 采用同一 hard-line/y 语义，空行也按实际行高和累计 offset 命中；不拼接全文字符串。 |
+| native 既有 `gpui_sum_tree 0.2.2` `HeightItem`/`HeightSummary`/`SeekTarget`/`insert_or_replace`、selection streaming 与 scoped allocator gate | 本轮只在 transaction/IME 边界和 layout point 最终 grapheme 吸附处接入；sum-tree、两遍 selection geometry、硬 cache/selection 预算均未削弱或重写。 |
+
+### Task 4R 验收命令
+
+    cargo check --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype --offline
+    PASS
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run --offline
+    PASS
+
+    cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml --all -- --check
+    PASS
+
+    git diff --check
+    PASS
+
+修改仅涉及 native editor 实现/测试和本报告，没有开始 Task 5，也没有修改 brief、
+findings、验收矩阵、donor 或既有预算/sum-tree/selection streaming gate。已知限制仍
+与前轮相同：headless GREEN 不能替代真实 macOS IME 候选窗、主题字体、Metal/RSS、
+异步图片解码和真实 UI 外壳集成验收。

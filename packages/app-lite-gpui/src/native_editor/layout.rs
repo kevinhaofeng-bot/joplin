@@ -600,15 +600,6 @@ impl LayoutRegistry {
         if cached.is_image {
             return Some(image_side(layout.bounds, position, layout.node_id));
         }
-        if cached.layout.text_lines.iter().all(|line| line.len() == 0) {
-            return Some(
-                if position.x <= layout.bounds.left() + layout.bounds.size.width / 2.0 {
-                    layout.before
-                } else {
-                    layout.after
-                },
-            );
-        }
         let line_height = cached.line_height;
         let relative_y = (position.y - layout.bounds.top()).max(px(0.0));
         let mut line_top = px(0.0);

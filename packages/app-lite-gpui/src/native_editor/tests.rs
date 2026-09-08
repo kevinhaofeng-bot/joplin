@@ -1260,6 +1260,145 @@ async fn entity_input_marked_endpoints_keep_actual_candidate_interval(
 }
 
 #[gpui::test]
+async fn entity_input_actual_span_survives_right_grapheme_join(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("\u{301}"), cx));
+    let original_selection = cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(0);
+            let original_selection = editor.selection();
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "a",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "a\u{301}");
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "b", window, editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "b\u{301}");
+            assert_eq!(editor.undo_depth(), 1);
+            original_selection
+        })
+    });
+
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "\u{301}"
+    );
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
+}
+
+#[gpui::test]
+async fn entity_input_explicit_replacement_outside_expanded_public_mark(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("aQ"), cx));
+    let original_selection = cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(1);
+            let original_selection = editor.selection();
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "\u{301}",
+                Some(0..0),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "a\u{301}Q");
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor,
+                Some(2..3),
+                "b",
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "ab");
+            assert_eq!(editor.undo_depth(), 1);
+            original_selection
+        })
+    });
+
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "aQ"
+    );
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
+}
+
+#[gpui::test]
+async fn empty_hard_lines_hit_test_by_y(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let document = Document::from_paragraph("\n\n");
+    let node = document.first_node_id().expect("paragraph");
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 1_000.0, 680.0, window);
+    });
+
+    let (bounds, line_heights) = {
+        let cached = layout.block_layout(node).expect("empty paragraph layout");
+        let line_height = layout.line_height(node).expect("line height");
+        assert_eq!(cached.text_lines.len(), 3);
+        (
+            cached.bounds,
+            cached
+                .text_lines
+                .iter()
+                .map(|line| line.size(line_height).height)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut line_top = bounds.top();
+    for (expected, line_height) in line_heights.into_iter().enumerate() {
+        let hit = layout
+            .point_to_doc(point(
+                bounds.left() + bounds.size.width / 4.0,
+                line_top + line_height / 2.0,
+            ))
+            .expect("empty hard-line hit should resolve");
+        assert_eq!(hit.node_id, node);
+        assert_eq!(hit.utf8_offset, expected);
+        line_top += line_height;
+    }
+}
+
+#[gpui::test]
+async fn crlf_visual_end_never_publishes_invalid_grapheme_offset(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let mut editor = EditorCore::for_test("a\r\nb", cx);
+    editor.set_caret_utf8(0);
+    cx.update(|window, _| {
+        let document = editor.document().clone();
+        editor
+            .layout
+            .shape_visible_with_window(&document, 0.0, 1_000.0, 680.0, window);
+    });
+
+    editor.move_end();
+    assert_ne!(editor.selection().head.utf8_offset, 2);
+    editor.insert_text("X").unwrap();
+    assert!(editor.input_error().is_none());
+}
+
+#[gpui::test]
 async fn measured_reflow_shapes_every_final_member_without_fixed_pass_hole(
     cx: &mut gpui::TestAppContext,
 ) {

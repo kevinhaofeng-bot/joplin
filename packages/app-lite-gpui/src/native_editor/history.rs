@@ -190,6 +190,7 @@ impl History {
             changed_nodes,
             inverse,
             estimated_bytes,
+            inserted_span: None,
         })
     }
 
@@ -220,6 +221,7 @@ impl History {
             changed_nodes,
             inverse,
             estimated_bytes,
+            inserted_span: None,
         })
     }
 

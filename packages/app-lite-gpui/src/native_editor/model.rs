@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use smallvec::SmallVec;
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
+use super::transaction::{ApplyOutcome, InsertedTextSpan, Transaction, TransactionBatch};
 
 /// Maximum nesting depth accepted by list transactions.
 pub const MAX_LIST_DEPTH: u8 = 64;
@@ -506,6 +506,7 @@ impl Document {
         let mut inverse_batches = Vec::new();
         let mut selection = self.end_selection();
         let mut estimated_bytes = 0usize;
+        let mut inserted_span = None;
         let initial_revision = self.revision;
         let initial_next_id = self.next_id;
 
@@ -518,6 +519,9 @@ impl Document {
                 }
             };
             selection = outcome.selection;
+            if outcome.inserted_span.is_some() {
+                inserted_span = outcome.inserted_span;
+            }
             for node_id in outcome.changed_nodes {
                 push_unique(&mut changed_nodes, node_id);
             }
@@ -540,6 +544,7 @@ impl Document {
             changed_nodes,
             inverse: TransactionBatch(inverse),
             estimated_bytes,
+            inserted_span,
         })
     }
 
@@ -606,6 +611,7 @@ impl Document {
                 changed_nodes,
                 inverse: outcome.inverse,
                 estimated_bytes: outcome.estimated_bytes,
+                inserted_span: outcome.inserted_span,
             },
             replacement_for_return,
         ))
@@ -690,41 +696,82 @@ impl Document {
     ) -> Result<ApplyOutcome, DocumentError> {
         let original_revision = self.revision;
         let original_next_id = self.next_id;
-        let (selection, changed_nodes, inverse) = match transaction {
+        let (selection, changed_nodes, inverse, inserted_span) = match transaction {
             Transaction::InsertText { selection, text } => {
                 self.apply_insert_text(selection, text)?
             }
-            Transaction::DeleteRange { selection } => self.apply_delete_range(selection)?,
-            Transaction::SplitBlock { at } => self.apply_split_block(at)?,
-            Transaction::MergeBlocks { left, right } => self.apply_merge_blocks(left, right)?,
+            Transaction::DeleteRange { selection } => {
+                let (selection, changed_nodes, inverse) = self.apply_delete_range(selection)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::SplitBlock { at } => {
+                let (selection, changed_nodes, inverse) = self.apply_split_block(at)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::MergeBlocks { left, right } => {
+                let (selection, changed_nodes, inverse) = self.apply_merge_blocks(left, right)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::SetBlockKind { selection, kind } => {
-                self.apply_set_block_kind(selection, kind)?
+                let (selection, changed_nodes, inverse) =
+                    self.apply_set_block_kind(selection, kind)?;
+                (selection, changed_nodes, inverse, None)
             }
             Transaction::ToggleMark { selection, mark } => {
-                self.apply_toggle_mark(selection, mark)?
+                let (selection, changed_nodes, inverse) =
+                    self.apply_toggle_mark(selection, mark)?;
+                (selection, changed_nodes, inverse, None)
             }
-            Transaction::SetLink { selection, url } => self.apply_set_link(selection, url)?,
+            Transaction::SetLink { selection, url } => {
+                let (selection, changed_nodes, inverse) = self.apply_set_link(selection, url)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::SetAlignment {
                 selection,
                 alignment,
-            } => self.apply_set_alignment(selection, alignment)?,
-            Transaction::IndentList { selection } => self.apply_indent_list(selection)?,
-            Transaction::OutdentList { selection } => self.apply_outdent_list(selection)?,
+            } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_set_alignment(selection, alignment)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::IndentList { selection } => {
+                let (selection, changed_nodes, inverse) = self.apply_indent_list(selection)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::OutdentList { selection } => {
+                let (selection, changed_nodes, inverse) = self.apply_outdent_list(selection)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::InsertImage {
                 selection,
                 resource_id,
                 natural_size,
-            } => self.apply_insert_image(selection, resource_id, natural_size)?,
-            Transaction::RemoveNode { node_id } => self.apply_remove_node(node_id)?,
+            } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_insert_image(selection, resource_id, natural_size)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::RemoveNode { node_id } => {
+                let (selection, changed_nodes, inverse) = self.apply_remove_node(node_id)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::SetImageDisplayWidth {
                 node_id,
                 display_width,
-            } => self.apply_set_image_width(node_id, display_width)?,
+            } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_set_image_width(node_id, display_width)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::RestoreBlocks {
                 index,
                 remove_count,
                 blocks,
-            } => self.apply_restore_blocks(index, remove_count, blocks)?,
+            } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_restore_blocks(index, remove_count, blocks)?;
+                (selection, changed_nodes, inverse, None)
+            }
         };
 
         let mut changed_nodes = changed_nodes;
@@ -766,6 +813,7 @@ impl Document {
             },
             inverse,
             estimated_bytes,
+            inserted_span,
         })
     }
 
@@ -976,10 +1024,23 @@ impl Document {
         &mut self,
         selection: Selection,
         text: String,
-    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+    ) -> Result<
+        (
+            Selection,
+            SmallVec<[NodeId; 4]>,
+            TransactionBatch,
+            Option<InsertedTextSpan>,
+        ),
+        DocumentError,
+    > {
         if let Some(insert_at) = self.adjacent_structural_seam(selection)? {
             if text.is_empty() {
-                return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+                return Ok((
+                    selection,
+                    SmallVec::new(),
+                    TransactionBatch::default(),
+                    None,
+                ));
             }
             let inserted = Block::text(self.new_node_id(), BlockKind::Paragraph, text.clone());
             let inserted_id = inserted.id;
@@ -998,6 +1059,10 @@ impl Document {
                     remove_count: 1,
                     blocks: Vec::new(),
                 }]),
+                Some(InsertedTextSpan {
+                    node_id: inserted_id,
+                    range: 0..text.len(),
+                }),
             ));
         }
         let bounds = self.editable_selection_bounds(selection)?;
@@ -1013,7 +1078,12 @@ impl Document {
             let original = self.blocks[start_index].clone();
             if selection.is_caret() {
                 if text.is_empty() {
-                    return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+                    return Ok((
+                        selection,
+                        SmallVec::new(),
+                        TransactionBatch::default(),
+                        None,
+                    ));
                 }
                 let inserted = Block::text(self.new_node_id(), BlockKind::Paragraph, text.clone());
                 let inserted_id = inserted.id;
@@ -1037,6 +1107,10 @@ impl Document {
                         remove_count: 1,
                         blocks: Vec::new(),
                     }]),
+                    Some(InsertedTextSpan {
+                        node_id: inserted_id,
+                        range: 0..text.len(),
+                    }),
                 ));
             }
 
@@ -1058,6 +1132,10 @@ impl Document {
                     remove_count: 1,
                     blocks: vec![original],
                 }]),
+                Some(InsertedTextSpan {
+                    node_id: block_id,
+                    range: 0..text.len(),
+                }),
             ));
         }
 
@@ -1066,7 +1144,12 @@ impl Document {
         let is_empty = start_index == end_index && start_offset == end_offset;
 
         if text.is_empty() && is_empty {
-            return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+            return Ok((
+                selection,
+                SmallVec::new(),
+                TransactionBatch::default(),
+                None,
+            ));
         }
 
         let insertion_offset = if !is_empty {
@@ -1122,7 +1205,15 @@ impl Document {
             remove_count: 1,
             blocks: originals,
         }]);
-        Ok((after, changed_nodes, inverse))
+        Ok((
+            after,
+            changed_nodes,
+            inverse,
+            Some(InsertedTextSpan {
+                node_id: block_id,
+                range: insertion_offset..insertion_offset.saturating_add(inserted_len),
+            }),
+        ))
     }
 
     fn apply_delete_range(

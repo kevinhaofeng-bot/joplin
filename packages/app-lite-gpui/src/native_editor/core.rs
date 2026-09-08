@@ -430,9 +430,20 @@ impl EditorCore {
                 text: new_text.to_owned(),
             })?
         };
-        let node_id = outcome.selection.head.node_id;
-        let end = outcome.selection.head.utf8_offset;
-        let start = end.saturating_sub(new_text.len());
+        let (node_id, start, end) = if let Some(inserted_span) = outcome.inserted_span {
+            (
+                inserted_span.node_id,
+                inserted_span.range.start,
+                inserted_span.range.end,
+            )
+        } else {
+            debug_assert!(
+                new_text.is_empty(),
+                "non-empty InsertText composition outcome must expose its exact span"
+            );
+            let point = outcome.selection.head;
+            (point.node_id, point.utf8_offset, point.utf8_offset)
+        };
         let selected_relative = new_selected_range_utf16
             .as_ref()
             .map(|range| input::utf16_range_to_utf8_in(new_text, range))
@@ -697,7 +708,7 @@ impl EditorCore {
         }
         let point = self.selection.head;
         if let Some(boundary) = self.layout.visual_line_boundary(point, false) {
-            self.selection = Selection::caret(boundary);
+            self.selection = Selection::caret(self.snap_layout_point(boundary));
         } else if let Some(block) = self.document.block(point.node_id) {
             if block.kind == BlockKind::Image {
                 self.selection =
@@ -720,7 +731,7 @@ impl EditorCore {
         }
         let point = self.selection.head;
         if let Some(boundary) = self.layout.visual_line_boundary(point, true) {
-            self.selection = Selection::caret(boundary);
+            self.selection = Selection::caret(self.snap_layout_point(boundary));
         } else if let Some(block) = self.document.block(point.node_id) {
             if block.kind == BlockKind::Image {
                 self.selection =
@@ -768,7 +779,7 @@ impl EditorCore {
         let preferred_x = self.preferred_x.or_else(|| self.layout.caret_x(point));
         if let Some(target) = self.layout.visual_move(point, direction, self.preferred_x) {
             let x = self.preferred_x.or_else(|| self.layout.caret_x(point));
-            self.selection = Selection::caret(target);
+            self.selection = Selection::caret(self.snap_layout_point(target));
             self.preferred_x = x;
             self.clear_composition();
             return;
@@ -781,6 +792,7 @@ impl EditorCore {
                 let block = self.document.blocks().get(candidate)?;
                 self.layout
                     .visual_edge_point(block.id, preferred_x, true)
+                    .map(|point| self.snap_layout_point(point))
                     .or_else(|| self.text_point_at_index(candidate, point.utf8_offset))
             })
         } else {
@@ -788,6 +800,7 @@ impl EditorCore {
                 let block = self.document.blocks().get(candidate)?;
                 self.layout
                     .visual_edge_point(block.id, preferred_x, false)
+                    .map(|point| self.snap_layout_point(point))
                     .or_else(|| self.text_point_at_index(candidate, point.utf8_offset))
             })
         };
@@ -1121,39 +1134,16 @@ impl EditorCore {
         let actual_range = self.actual_marked_flat_range(marked);
         // With an ordinary candidate the platform range may intentionally
         // include text immediately before/after the marked span (the donor
-        // accepts that explicit replacement). Only collapse to the internal
-        // interval when the public span was expanded by grapheme snapping.
-        if public_range == actual_range {
-            return requested;
-        }
-        if requested_range.start <= public_range.start && requested_range.end >= public_range.end {
+        // accepts that explicit replacement). Only the exact public span
+        // itself is treated as the IME's expanded view of the candidate; an
+        // explicit range outside it remains a real document range.
+        if public_range != actual_range
+            && requested_range.start <= public_range.start
+            && requested_range.end >= public_range.end
+        {
             return actual;
         }
-        let start = requested_range
-            .start
-            .clamp(actual_range.start, actual_range.end);
-        let end = requested_range
-            .end
-            .clamp(actual_range.start, actual_range.end);
-        if start == actual_range.start && end == actual_range.end {
-            return actual;
-        }
-        let node_start = flat_offset_for_point_in(
-            &self.document,
-            DocPoint::with_affinity(marked.node_id, 0, Affinity::Before),
-        );
-        Selection::new(
-            DocPoint::with_affinity(
-                marked.node_id,
-                start.saturating_sub(node_start),
-                Affinity::Before,
-            ),
-            DocPoint::with_affinity(
-                marked.node_id,
-                end.saturating_sub(node_start),
-                Affinity::After,
-            ),
-        )
+        requested
     }
 
     fn validate_input_range(&self, range_utf16: &Range<usize>) -> Result<(), DocumentError> {
@@ -1270,6 +1260,34 @@ impl EditorCore {
         affinity: Affinity,
     ) -> DocPoint {
         point_for_document_offset_in(&self.document, offset, affinity)
+    }
+
+    /// Layout operates on individual shaped hard lines, while the document
+    /// model validates grapheme boundaries over the complete block text. A
+    /// CRLF pair is one grapheme cluster even though shaping exposes the
+    /// carriage return at the visual end of the preceding line, so final
+    /// navigation points must be snapped against the model text here.
+    fn snap_layout_point(&self, point: DocPoint) -> DocPoint {
+        let Some(text) = self
+            .document
+            .block(point.node_id)
+            .and_then(|block| block.content.as_text())
+        else {
+            return point;
+        };
+        let offset = point.utf8_offset.min(text.len());
+        let affinity = if text.as_bytes().get(offset.saturating_sub(1)) == Some(&b'\r')
+            && text.as_bytes().get(offset) == Some(&b'\n')
+        {
+            Affinity::Before
+        } else {
+            point.affinity
+        };
+        DocPoint::with_affinity(
+            point.node_id,
+            resolve_grapheme_offset(text, offset, affinity),
+            affinity,
+        )
     }
 }
 
@@ -1541,6 +1559,7 @@ impl EntityInputHandler for EditorCore {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let point = self.layout.point_to_doc(point)?;
+        let point = self.snap_layout_point(point);
         let document_text = self.document_text();
         Some(input::utf8_to_utf16_in(
             &document_text,

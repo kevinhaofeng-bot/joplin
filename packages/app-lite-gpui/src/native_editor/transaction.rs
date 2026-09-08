@@ -5,6 +5,7 @@
 //! structural operations (including images) atomic.
 
 use std::mem::size_of;
+use std::ops::Range;
 
 use smallvec::SmallVec;
 
@@ -138,6 +139,16 @@ impl TransactionBatch {
     }
 }
 
+/// Exact text span written by an `InsertText` transaction in the resulting
+/// document. This is captured before the model snaps the post-edit caret to a
+/// grapheme boundary, so composition bookkeeping never has to reconstruct an
+/// inserted interval from that public caret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InsertedTextSpan {
+    pub node_id: NodeId,
+    pub range: Range<usize>,
+}
+
 /// Result of one transaction or an atomically applied batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplyOutcome {
@@ -145,6 +156,7 @@ pub struct ApplyOutcome {
     pub changed_nodes: SmallVec<[NodeId; 4]>,
     pub inverse: TransactionBatch,
     pub estimated_bytes: usize,
+    pub inserted_span: Option<InsertedTextSpan>,
 }
 
 impl ApplyOutcome {
@@ -154,6 +166,7 @@ impl ApplyOutcome {
             changed_nodes: SmallVec::new(),
             inverse: TransactionBatch::default(),
             estimated_bytes: 0,
+            inserted_span: None,
         }
     }
 }
