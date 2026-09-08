@@ -1112,13 +1112,26 @@ pub fn insert_image_block_anchor(
     run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
         cursor.set_position(end, MoveMode::KeepAnchor);
-        must_apply(cursor.insert_block(), "split image block");
-        must_apply(
-            cursor.insert_image(resource_id, alt, width.max(1), height.max(1)),
-            "insert block image anchor",
-        );
-        if !cursor.at_end() {
-            must_apply(cursor.insert_block(), "close image block");
+        if start == 0 {
+            if end != start {
+                must_apply(cursor.remove_selected_text(), "replace image selection");
+            }
+            must_apply(
+                cursor.insert_image(resource_id, alt, width.max(1), height.max(1)),
+                "insert block image anchor",
+            );
+            if !cursor.at_end() {
+                must_apply(cursor.insert_block(), "close image block");
+            }
+        } else {
+            must_apply(cursor.insert_block(), "split image block");
+            must_apply(
+                cursor.insert_image(resource_id, alt, width.max(1), height.max(1)),
+                "insert block image anchor",
+            );
+            if !cursor.at_end() {
+                must_apply(cursor.insert_block(), "close image block");
+            }
         }
         let new_length = must_apply(
             session.text.to_addressable_text(),
@@ -2525,6 +2538,67 @@ mod tests {
                     style: BlockStyle::default(),
                     inlines: vec![Inline::Text {
                         text: "b".into(),
+                        marks: Default::default(),
+                    }],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn red_block_image_insert_at_empty_and_paragraph_start_has_no_blank_prefix() {
+        let mut empty = session_from_document(&Document::from_blocks(vec![])).unwrap();
+        insert_image_block_anchor(
+            &mut empty,
+            NSRange::new(0, 0),
+            "0123456789abcdef0123456789abcdef",
+            "空笔记图片",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            document_from_session(&empty).unwrap(),
+            Document::from_blocks(vec![Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Image {
+                    resource_id: "0123456789abcdef0123456789abcdef".into(),
+                    alt: "空笔记图片".into(),
+                }],
+            }])
+        );
+
+        let mut start = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "ab".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        insert_image_block_anchor(
+            &mut start,
+            NSRange::new(0, 0),
+            "fedcba9876543210fedcba9876543210",
+            "段首图片",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            document_from_session(&start).unwrap(),
+            Document::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Image {
+                        resource_id: "fedcba9876543210fedcba9876543210".into(),
+                        alt: "段首图片".into(),
+                    }],
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "ab".into(),
                         marks: Default::default(),
                     }],
                 },
