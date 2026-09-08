@@ -48,7 +48,11 @@ impl History {
             .selection_hint()
             .or(self.current_selection)
             .unwrap_or_else(|| document.end_selection());
-        self.apply_recorded(document, before_selection, transaction)
+        self.apply_batch_with_selection(
+            document,
+            before_selection,
+            TransactionBatch(vec![transaction]),
+        )
     }
 
     /// Apply a structural operation with the editor's active selection.
@@ -60,18 +64,26 @@ impl History {
         before_selection: Selection,
         transaction: Transaction,
     ) -> Result<ApplyOutcome, DocumentError> {
-        document.validate_selection(before_selection)?;
-        self.apply_recorded(document, before_selection, transaction)
+        self.apply_batch_with_selection(
+            document,
+            before_selection,
+            TransactionBatch(vec![transaction]),
+        )
     }
 
-    fn apply_recorded(
+    /// Apply one user action made up of several model transactions as a
+    /// single undoable history entry. The document already provides atomic
+    /// batch rollback; this method keeps that batch atomic at the editor's
+    /// history boundary as well.
+    pub fn apply_batch_with_selection(
         &mut self,
         document: &mut Document,
         before_selection: Selection,
-        transaction: Transaction,
+        batch: TransactionBatch,
     ) -> Result<ApplyOutcome, DocumentError> {
-        let forward = TransactionBatch(vec![transaction.clone()]);
-        let outcome = document.apply(transaction)?;
+        document.validate_selection(before_selection)?;
+        let forward = batch.clone();
+        let outcome = document.apply_batch(batch)?;
         self.current_selection = Some(outcome.selection);
 
         // A no-op remains a valid transaction result but does not create an

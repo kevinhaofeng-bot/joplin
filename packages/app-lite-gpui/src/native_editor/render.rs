@@ -5,18 +5,18 @@
 //! selection geometry, glyphs/images, then the caret.
 
 use gpui::{
-    App, Bounds, Corners, ElementInputHandler, Entity, Pixels, ShapedLine, Window, fill, point, px,
-    rgba,
+    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, Pixels, TextAlign, Window,
+    WrappedLine, fill, outline, point, px, rgba,
 };
 
 use super::core::EditorCore;
 use super::layout::BlockLayout;
-use super::model::{DocPoint, Selection};
+use super::model::Selection;
 
 #[derive(Clone)]
 struct RenderBlock {
     layout: BlockLayout,
-    text_lines: Vec<ShapedLine>,
+    text_lines: Vec<WrappedLine>,
     is_image: bool,
     line_height: Option<Pixels>,
 }
@@ -26,6 +26,7 @@ struct RenderSnapshot {
     blocks: Vec<RenderBlock>,
     selection_rects: Vec<Bounds<Pixels>>,
     selection: Selection,
+    caret_bounds: Option<Bounds<Pixels>>,
 }
 
 fn snapshot(editor: &EditorCore) -> RenderSnapshot {
@@ -47,6 +48,11 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
         blocks,
         selection_rects: layout.selection_rects(editor.selection()),
         selection: editor.selection(),
+        caret_bounds: editor
+            .selection()
+            .is_caret()
+            .then(|| layout.caret_bounds_for_point(editor.selection().head))
+            .flatten(),
     }
 }
 
@@ -76,11 +82,17 @@ fn paint_snapshot(
             .blocks
             .iter()
             .any(|block| block.is_image && block.layout.bounds == *rect);
-        let mut quad = fill(*rect, rgba(0x4f8cff55));
         if is_image {
+            let mut quad = outline(
+                image_selection_outline(*rect),
+                rgba(0x4f8cffdd),
+                BorderStyle::default(),
+            );
             quad.corner_radii = Corners::all(px(6.0));
+            window.paint_quad(quad);
+        } else {
+            window.paint_quad(fill(*rect, rgba(0x4f8cff55)));
         }
-        window.paint_quad(quad);
     }
 
     // 3. Glyphs/images.
@@ -96,9 +108,17 @@ fn paint_snapshot(
             line.paint(
                 point(
                     block.layout.bounds.left(),
-                    block.layout.bounds.top() + line_height * line_index as f32,
+                    block.layout.bounds.top()
+                        + block
+                            .text_lines
+                            .iter()
+                            .take(line_index)
+                            .map(|line| line.size(line_height).height)
+                            .fold(px(0.0), |top, height| top + height),
                 ),
                 line_height,
+                TextAlign::Left,
+                Some(block.layout.bounds),
                 window,
                 cx,
             )?;
@@ -108,61 +128,11 @@ fn paint_snapshot(
     // 4. Caret. Image before/after positions use the same vertical caret
     // geometry as paragraph text through LayoutRegistry::caret_bounds.
     if snapshot.selection.is_caret() {
-        let point = snapshot.selection.head;
-        if let Some(bounds) = caret_bounds(snapshot, point) {
+        if let Some(bounds) = snapshot.caret_bounds {
             window.paint_quad(fill(bounds, rgba(0x2167dfff)));
         }
     }
     Ok(())
-}
-
-fn caret_bounds(snapshot: &RenderSnapshot, caret: DocPoint) -> Option<Bounds<Pixels>> {
-    let block = snapshot
-        .blocks
-        .iter()
-        .find(|block| block.layout.node_id == caret.node_id)?;
-    if block.is_image {
-        let x = if caret.utf8_offset == 0 {
-            block.layout.bounds.left()
-        } else {
-            block.layout.bounds.right()
-        };
-        return Some(Bounds::new(
-            point(x, block.layout.bounds.top()),
-            gpui::size(px(1.0), block.layout.bounds.size.height),
-        ));
-    }
-    let line_height = block.line_height.unwrap_or(px(24.0));
-    let offset = caret.utf8_offset.min(block.layout.after.utf8_offset);
-    if block.text_lines.is_empty() {
-        return Some(Bounds::new(
-            point(
-                block.layout.bounds.left() + px(offset as f32 * 8.0),
-                block.layout.bounds.top(),
-            ),
-            gpui::size(px(1.0), block.layout.bounds.size.height),
-        ));
-    }
-    let mut line_start = 0usize;
-    for (line_index, line) in block.text_lines.iter().enumerate() {
-        if offset <= line_start.saturating_add(line.len()) {
-            return Some(Bounds::new(
-                point(
-                    block.layout.bounds.left() + line.x_for_index(offset - line_start),
-                    block.layout.bounds.top() + line_height * line_index as f32,
-                ),
-                gpui::size(px(1.0), line_height),
-            ));
-        }
-        line_start = line_start.saturating_add(line.len());
-    }
-    Some(Bounds::new(
-        point(
-            block.layout.bounds.right(),
-            block.layout.bounds.bottom() - line_height,
-        ),
-        gpui::size(px(1.0), line_height),
-    ))
 }
 
 /// Paint an editor entity and install GPUI's real input bridge for the same
