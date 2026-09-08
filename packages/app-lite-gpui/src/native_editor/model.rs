@@ -267,7 +267,7 @@ impl Selection {
     }
 
     pub fn is_caret(self) -> bool {
-        self.anchor.node_id == self.head.node_id && self.anchor.utf8_offset == self.head.utf8_offset
+        self.anchor == self.head
     }
 }
 
@@ -480,22 +480,29 @@ impl Document {
         self.apply_batch(TransactionBatch(vec![transaction]))
     }
 
-    /// Apply all operations in a batch atomically.  A candidate clone is
-    /// validated after every operation; the live document is replaced only if
-    /// the complete batch succeeds.
+    /// Apply all operations in a batch atomically.  Each successful operation
+    /// contributes its local inverse to a rollback journal; no full-document
+    /// clone is made for a keystroke transaction.  The journal is replayed if
+    /// a later operation fails.
     pub fn apply_batch(&mut self, batch: TransactionBatch) -> Result<ApplyOutcome, DocumentError> {
         if batch.is_empty() {
             return Ok(ApplyOutcome::empty(self.end_selection()));
         }
 
-        let mut candidate = self.clone();
         let mut changed_nodes: SmallVec<[NodeId; 4]> = SmallVec::new();
         let mut inverse_batches = Vec::new();
-        let mut selection = candidate.end_selection();
+        let mut selection = self.end_selection();
         let mut estimated_bytes = 0usize;
+        let initial_revision = self.revision;
 
         for transaction in batch.0 {
-            let outcome = candidate.apply_transaction(transaction)?;
+            let outcome = match self.apply_transaction(transaction) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.rollback_journal(inverse_batches, initial_revision);
+                    return Err(error);
+                }
+            };
             selection = outcome.selection;
             for node_id in outcome.changed_nodes {
                 push_unique(&mut changed_nodes, node_id);
@@ -504,19 +511,31 @@ impl Document {
             inverse_batches.push(outcome.inverse);
         }
 
+        let rollback_batches = inverse_batches.clone();
         let mut inverse = Vec::new();
         for batch in inverse_batches.into_iter().rev() {
             inverse.extend(batch.0);
         }
 
-        candidate.validate_invariants()?;
-        *self = candidate;
+        if let Err(error) = self.validate_invariants() {
+            self.rollback_journal(rollback_batches, initial_revision);
+            return Err(error);
+        }
         Ok(ApplyOutcome {
             selection,
             changed_nodes,
             inverse: TransactionBatch(inverse),
             estimated_bytes,
         })
+    }
+
+    fn rollback_journal(&mut self, inverse_batches: Vec<TransactionBatch>, revision: u64) {
+        for inverse in inverse_batches.into_iter().rev() {
+            for transaction in inverse.0.into_iter().rev() {
+                let _ = self.apply_transaction(transaction);
+            }
+        }
+        self.revision = revision;
     }
 
     /// Check all structural and inline invariants without changing anything.
@@ -566,6 +585,7 @@ impl Document {
         &mut self,
         transaction: Transaction,
     ) -> Result<ApplyOutcome, DocumentError> {
+        let original_revision = self.revision;
         let (selection, changed_nodes, inverse) = match transaction {
             Transaction::InsertText { selection, text } => {
                 self.apply_insert_text(selection, text)?
@@ -608,13 +628,20 @@ impl Document {
             return Ok(ApplyOutcome::empty(selection));
         }
 
+        if let Err(error) = self.validate_selection(selection) {
+            self.rollback_journal(vec![inverse], original_revision);
+            return Err(error);
+        }
         self.revision = self.revision.saturating_add(1);
         for node_id in &changed_nodes {
             if let Some(block) = self.blocks.iter_mut().find(|block| block.id == *node_id) {
                 block.revision = self.revision;
             }
         }
-        self.validate_invariants()?;
+        if let Err(error) = self.validate_invariants() {
+            self.rollback_journal(vec![inverse], original_revision);
+            return Err(error);
+        }
         let estimated_bytes = inverse.estimated_bytes();
         Ok(ApplyOutcome {
             selection,
@@ -642,17 +669,21 @@ impl Document {
     fn validate_point(&self, point: DocPoint) -> Result<usize, DocumentError> {
         let index = self.node_index(point.node_id)?;
         let block = &self.blocks[index];
-        let Some(text) = block.content.as_text() else {
-            return Err(DocumentError::InvalidBlockContent(point.node_id));
-        };
-        if point.utf8_offset > text.len() || !text.is_char_boundary(point.utf8_offset) {
+        if let Some(text) = block.content.as_text() {
+            if point.utf8_offset > text.len() || !text.is_char_boundary(point.utf8_offset) {
+                return Err(DocumentError::InvalidUtf8Offset {
+                    node_id: point.node_id,
+                    offset: point.utf8_offset,
+                });
+            }
+            if !is_grapheme_boundary(text, point.utf8_offset) {
+                return Err(DocumentError::InvalidGraphemeOffset {
+                    node_id: point.node_id,
+                    offset: point.utf8_offset,
+                });
+            }
+        } else if point.utf8_offset != 0 {
             return Err(DocumentError::InvalidUtf8Offset {
-                node_id: point.node_id,
-                offset: point.utf8_offset,
-            });
-        }
-        if !is_grapheme_boundary(text, point.utf8_offset) {
-            return Err(DocumentError::InvalidGraphemeOffset {
                 node_id: point.node_id,
                 offset: point.utf8_offset,
             });
@@ -675,8 +706,16 @@ impl Document {
     ) -> Result<(usize, usize, usize, usize), DocumentError> {
         let anchor_index = self.validate_point(selection.anchor)?;
         let head_index = self.validate_point(selection.head)?;
-        let anchor = (anchor_index, selection.anchor.utf8_offset);
-        let head = (head_index, selection.head.utf8_offset);
+        let anchor = (
+            anchor_index,
+            selection.anchor.utf8_offset,
+            affinity_order(selection.anchor.affinity),
+        );
+        let head = (
+            head_index,
+            selection.head.utf8_offset,
+            affinity_order(selection.head.affinity),
+        );
         match anchor.cmp(&head) {
             Ordering::Less | Ordering::Equal => Ok((
                 anchor_index,
@@ -733,6 +772,26 @@ impl Document {
         Ok(())
     }
 
+    fn ensure_editable_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<(), DocumentError> {
+        let start = &self.blocks[start_index];
+        let end = &self.blocks[end_index];
+        if start_index == end_index {
+            return Ok(());
+        }
+        if !is_text_block(start) && !is_structural_block(start)
+            || !is_text_block(end) && !is_structural_block(end)
+        {
+            return Err(DocumentError::InvalidOperation(
+                "range endpoints are not editable blocks".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn apply_insert_text(
         &mut self,
         selection: Selection,
@@ -740,7 +799,60 @@ impl Document {
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         let (start_index, start_offset, end_index, end_offset) =
             self.selection_bounds(selection)?;
-        self.ensure_text_blocks(start_index, end_index)?;
+        self.ensure_editable_range(start_index, end_index)?;
+
+        if start_index == end_index && !is_text_block(&self.blocks[start_index]) {
+            let original = self.blocks[start_index].clone();
+            if selection.is_caret() {
+                if text.is_empty() {
+                    return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+                }
+                let inserted = Block::text(self.new_node_id(), BlockKind::Paragraph, text.clone());
+                let inserted_id = inserted.id;
+                let insert_at = match selection.anchor.affinity {
+                    Affinity::Before => start_index,
+                    Affinity::After => start_index.saturating_add(1),
+                };
+                self.blocks.insert(insert_at, inserted);
+                let mut changed_nodes = SmallVec::new();
+                push_unique(&mut changed_nodes, inserted_id);
+                let after = Selection::caret(DocPoint::with_affinity(
+                    inserted_id,
+                    text.len(),
+                    Affinity::After,
+                ));
+                return Ok((
+                    after,
+                    changed_nodes,
+                    TransactionBatch(vec![Transaction::RestoreBlocks {
+                        index: insert_at,
+                        remove_count: 1,
+                        blocks: Vec::new(),
+                    }]),
+                ));
+            }
+
+            let block_id = original.id;
+            let replacement = Block::text(block_id, BlockKind::Paragraph, text.clone());
+            self.blocks[start_index] = replacement;
+            let mut changed_nodes = SmallVec::new();
+            push_unique(&mut changed_nodes, block_id);
+            let after = Selection::caret(DocPoint::with_affinity(
+                block_id,
+                text.len(),
+                Affinity::After,
+            ));
+            return Ok((
+                after,
+                changed_nodes,
+                TransactionBatch(vec![Transaction::RestoreBlocks {
+                    index: start_index,
+                    remove_count: 1,
+                    blocks: vec![original],
+                }]),
+            ));
+        }
+
         let originals = self.blocks[start_index..=end_index].to_vec();
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
         let is_empty = start_index == end_index && start_offset == end_offset;
@@ -749,19 +861,22 @@ impl Document {
             return Ok((selection, SmallVec::new(), TransactionBatch::default()));
         }
 
-        if !is_empty {
-            self.delete_range_mut(start_index, start_offset, end_index, end_offset)?;
-        }
+        let insertion_offset = if !is_empty {
+            self.delete_range_mut(start_index, start_offset, end_index, end_offset)?
+        } else {
+            start_offset
+        };
 
         let block_id = self.blocks[start_index].id;
         let inserted_len = text.len();
         let block = &mut self.blocks[start_index];
         let (old_text, old_styles) = text_parts(&block.content)?;
         let mut new_text = String::with_capacity(old_text.len() + inserted_len);
-        new_text.push_str(&old_text[..start_offset]);
+        new_text.push_str(&old_text[..insertion_offset]);
         new_text.push_str(&text);
-        new_text.push_str(&old_text[start_offset..]);
-        let new_styles = insert_styles(old_styles, start_offset, inserted_len);
+        new_text.push_str(&old_text[insertion_offset..]);
+        let mut new_styles = insert_styles(old_styles, insertion_offset, inserted_len);
+        normalize_styles_for_text(&new_text, &mut new_styles);
         block.content = BlockContent::Text {
             text: new_text,
             styles: new_styles,
@@ -772,9 +887,20 @@ impl Document {
             push_unique(&mut changed_nodes, node_id);
         }
         push_unique(&mut changed_nodes, block_id);
+        let after_offset = {
+            let text = self.blocks[start_index]
+                .content
+                .as_text()
+                .expect("insert text retains a text block");
+            resolve_grapheme_offset(
+                text,
+                insertion_offset.saturating_add(inserted_len),
+                Affinity::After,
+            )
+        };
         let after = Selection::caret(DocPoint::with_affinity(
             block_id,
-            start_offset.saturating_add(inserted_len),
+            after_offset,
             Affinity::After,
         ));
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
@@ -791,7 +917,33 @@ impl Document {
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         let (start_index, start_offset, end_index, end_offset) =
             self.selection_bounds(selection)?;
-        self.ensure_text_blocks(start_index, end_index)?;
+        self.ensure_editable_range(start_index, end_index)?;
+
+        if start_index == end_index && !is_text_block(&self.blocks[start_index]) {
+            if selection.is_caret() {
+                return Ok((
+                    Selection::caret(selection.anchor),
+                    SmallVec::new(),
+                    TransactionBatch::default(),
+                ));
+            }
+            if self.blocks.len() <= 1 {
+                return Err(DocumentError::CannotRemoveLastNode);
+            }
+            let removed = self.blocks.remove(start_index);
+            let mut changed_nodes = SmallVec::new();
+            push_unique(&mut changed_nodes, removed.id);
+            return Ok((
+                self.selection_near_index(start_index),
+                changed_nodes,
+                TransactionBatch(vec![Transaction::RestoreBlocks {
+                    index: start_index,
+                    remove_count: 0,
+                    blocks: vec![removed],
+                }]),
+            ));
+        }
+
         if start_index == end_index && start_offset == end_offset {
             return Ok((
                 Selection::caret(DocPoint::with_affinity(
@@ -806,7 +958,8 @@ impl Document {
 
         let originals = self.blocks[start_index..=end_index].to_vec();
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
-        self.delete_range_mut(start_index, start_offset, end_index, end_offset)?;
+        let result_offset =
+            self.delete_range_mut(start_index, start_offset, end_index, end_offset)?;
         let node_id = self.blocks[start_index].id;
         let mut changed_nodes = SmallVec::new();
         for node_id in original_ids {
@@ -815,7 +968,7 @@ impl Document {
         push_unique(&mut changed_nodes, node_id);
         let after = Selection::caret(DocPoint::with_affinity(
             node_id,
-            start_offset,
+            result_offset,
             Affinity::After,
         ));
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
@@ -826,54 +979,79 @@ impl Document {
         Ok((after, changed_nodes, inverse))
     }
 
-    /// Delete a normalized text range while retaining one merged start block.
+    /// Delete a normalized range while retaining one merged start block.
     fn delete_range_mut(
         &mut self,
         start_index: usize,
         start_offset: usize,
         end_index: usize,
         end_offset: usize,
-    ) -> Result<(), DocumentError> {
+    ) -> Result<usize, DocumentError> {
         if start_index == end_index {
             let block = &mut self.blocks[start_index];
             let (text, styles) = text_parts(&block.content)?;
             let (new_text, new_styles) = delete_text(text, styles, start_offset, end_offset);
+            let result_offset = resolve_grapheme_offset(&new_text, start_offset, Affinity::After);
             block.content = BlockContent::Text {
                 text: new_text,
                 styles: new_styles,
             };
-            return Ok(());
+            return Ok(result_offset);
         }
 
         let start_block = self.blocks[start_index].clone();
         let end_block = self.blocks[end_index].clone();
-        let (start_text, start_styles) = text_parts(&start_block.content)?;
-        let (end_text, end_styles) = text_parts(&end_block.content)?;
-        let prefix = &start_text[..start_offset];
-        let suffix = &end_text[end_offset..];
+        let (prefix, prefix_styles) = match &start_block.content {
+            BlockContent::Text { text, styles } => (
+                text[..start_offset].to_owned(),
+                clip_styles(styles, 0, start_offset, 0),
+            ),
+            _ => (String::new(), SmallVec::new()),
+        };
+        let (suffix, suffix_styles) = match &end_block.content {
+            BlockContent::Text { text, styles } => (
+                text[end_offset..].to_owned(),
+                clip_styles(
+                    styles,
+                    end_offset,
+                    text.len(),
+                    prefix.len() as isize - end_offset as isize,
+                ),
+            ),
+            _ => (String::new(), SmallVec::new()),
+        };
         let mut merged_text = String::with_capacity(prefix.len() + suffix.len());
-        merged_text.push_str(prefix);
-        merged_text.push_str(suffix);
-        let mut merged_styles = clip_styles(start_styles, 0, start_offset, 0);
-        merged_styles.extend(clip_styles(
-            end_styles,
-            end_offset,
-            end_text.len(),
-            -(end_offset as isize),
-        ));
-        normalize_styles(&mut merged_styles);
+        merged_text.push_str(&prefix);
+        merged_text.push_str(&suffix);
+        let mut merged_styles = prefix_styles;
+        merged_styles.extend(suffix_styles);
+        normalize_styles_for_text(&merged_text, &mut merged_styles);
+        let start_is_text = is_text_block(&start_block);
         let merged = Block {
             id: start_block.id,
-            kind: start_block.kind,
+            kind: if start_is_text {
+                start_block.kind
+            } else {
+                BlockKind::Paragraph
+            },
             content: BlockContent::Text {
                 text: merged_text,
                 styles: merged_styles,
             },
-            alignment: start_block.alignment,
+            alignment: if start_is_text {
+                start_block.alignment
+            } else {
+                TextAlignment::Left
+            },
             revision: start_block.revision,
         };
+        let result_offset = resolve_grapheme_offset(
+            merged.content.as_text().expect("merged block is text"),
+            prefix.len(),
+            Affinity::After,
+        );
         self.blocks.splice(start_index..=end_index, [merged]);
-        Ok(())
+        Ok(result_offset)
     }
 
     fn apply_split_block(
@@ -953,7 +1131,10 @@ impl Document {
             right_text.len(),
             left_len as isize,
         ));
-        normalize_styles(&mut merged_styles);
+        let mut merged_text = String::with_capacity(left_len + right_text.len());
+        merged_text.push_str(left_text);
+        merged_text.push_str(right_text);
+        normalize_styles_for_text(&merged_text, &mut merged_styles);
         self.blocks[left_index].content = BlockContent::Text {
             text: merged_text,
             styles: merged_styles,
@@ -962,8 +1143,15 @@ impl Document {
         let mut changed_nodes = SmallVec::new();
         push_unique(&mut changed_nodes, left_id);
         push_unique(&mut changed_nodes, right_id);
-        let selection =
-            Selection::caret(DocPoint::with_affinity(left_id, left_len, Affinity::After));
+        let merged_text = self.blocks[left_index]
+            .content
+            .as_text()
+            .expect("merged blocks retain text content");
+        let selection = Selection::caret(DocPoint::with_affinity(
+            left_id,
+            resolve_grapheme_offset(merged_text, left_len, Affinity::After),
+            Affinity::After,
+        ));
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
             index: left_index,
             remove_count: 1,
@@ -1202,18 +1390,79 @@ impl Document {
         }
         let (start_index, start_offset, end_index, end_offset) =
             self.selection_bounds(selection)?;
-        self.ensure_text_blocks(start_index, end_index)?;
+        self.ensure_editable_range(start_index, end_index)?;
+
+        if start_index == end_index && !is_text_block(&self.blocks[start_index]) {
+            let original = self.blocks[start_index].clone();
+            if selection.is_caret() {
+                let image = Block {
+                    id: self.new_node_id(),
+                    kind: BlockKind::Image,
+                    content: BlockContent::Image {
+                        resource_id,
+                        natural_size,
+                        display_width: None,
+                    },
+                    alignment: TextAlignment::Left,
+                    revision: 0,
+                };
+                let image_id = image.id;
+                let insert_at = match selection.anchor.affinity {
+                    Affinity::Before => start_index,
+                    Affinity::After => start_index.saturating_add(1),
+                };
+                self.blocks.insert(insert_at, image);
+                let mut changed_nodes = SmallVec::new();
+                push_unique(&mut changed_nodes, image_id);
+                return Ok((
+                    Selection::caret(DocPoint::with_affinity(image_id, 0, Affinity::After)),
+                    changed_nodes,
+                    TransactionBatch(vec![Transaction::RestoreBlocks {
+                        index: insert_at,
+                        remove_count: 1,
+                        blocks: Vec::new(),
+                    }]),
+                ));
+            }
+
+            let image_id = original.id;
+            self.blocks[start_index] = Block {
+                id: image_id,
+                kind: BlockKind::Image,
+                content: BlockContent::Image {
+                    resource_id,
+                    natural_size,
+                    display_width: None,
+                },
+                alignment: original.alignment,
+                revision: original.revision,
+            };
+            let mut changed_nodes = SmallVec::new();
+            push_unique(&mut changed_nodes, image_id);
+            return Ok((
+                Selection::caret(DocPoint::with_affinity(image_id, 0, Affinity::After)),
+                changed_nodes,
+                TransactionBatch(vec![Transaction::RestoreBlocks {
+                    index: start_index,
+                    remove_count: 1,
+                    blocks: vec![original],
+                }]),
+            ));
+        }
+
         let originals = self.blocks[start_index..=end_index].to_vec();
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
         let is_empty = start_index == end_index && start_offset == end_offset;
-        if !is_empty {
-            self.delete_range_mut(start_index, start_offset, end_index, end_offset)?;
-        }
+        let insertion_offset = if !is_empty {
+            self.delete_range_mut(start_index, start_offset, end_index, end_offset)?
+        } else {
+            start_offset
+        };
 
         let original_block = self.blocks[start_index].clone();
         let (text, styles) = text_parts(&original_block.content)?;
         let (left_text, left_styles, right_text, right_styles) =
-            split_text(text, styles, start_offset);
+            split_text(text, styles, insertion_offset);
         let image_id = self.new_node_id();
         let right_id = self.new_node_id();
         let left = Block {
@@ -1408,6 +1657,19 @@ fn is_text_kind(kind: &BlockKind) -> bool {
     )
 }
 
+fn is_text_block(block: &Block) -> bool {
+    matches!(block.content, BlockContent::Text { .. }) && is_text_kind(&block.kind)
+}
+
+fn is_structural_block(block: &Block) -> bool {
+    matches!(
+        (&block.kind, &block.content),
+        (BlockKind::Image, BlockContent::Image { .. })
+            | (BlockKind::Attachment, BlockContent::Attachment { .. })
+            | (BlockKind::Divider, BlockContent::Empty)
+    )
+}
+
 fn validate_kind(kind: &BlockKind) -> Result<(), DocumentError> {
     match kind {
         BlockKind::Heading { level } if !(1..=6).contains(level) => {
@@ -1509,6 +1771,84 @@ fn is_grapheme_boundary(text: &str, offset: usize) -> bool {
         .any(|(start, _)| start == offset)
 }
 
+fn affinity_order(affinity: Affinity) -> u8 {
+    match affinity {
+        Affinity::Before => 0,
+        Affinity::After => 1,
+    }
+}
+
+fn resolve_grapheme_offset(text: &str, preferred: usize, affinity: Affinity) -> usize {
+    let preferred = preferred.min(text.len());
+    if is_grapheme_boundary(text, preferred) {
+        return preferred;
+    }
+    let mut previous = 0;
+    for (start, _) in text.grapheme_indices(true) {
+        if start >= preferred {
+            return match affinity {
+                Affinity::Before => previous,
+                Affinity::After => start,
+            };
+        }
+        previous = start;
+    }
+    match affinity {
+        Affinity::Before => previous,
+        Affinity::After => text.len(),
+    }
+}
+
+/// Snap style boundaries out of a newly joined grapheme and rebuild the
+/// non-overlapping run list by taking the union of marks per grapheme-safe
+/// segment.  Joining text can make an old byte boundary cease to be a
+/// grapheme boundary; a run must expand to cover that complete grapheme.
+fn normalize_styles_for_text(text: &str, styles: &mut SmallVec<[StyledRun; 4]>) {
+    if styles.is_empty() {
+        return;
+    }
+    let mut boundaries = vec![0, text.len()];
+    for run in styles.iter() {
+        boundaries.push(resolve_grapheme_offset(
+            text,
+            run.range.start,
+            Affinity::Before,
+        ));
+        boundaries.push(resolve_grapheme_offset(
+            text,
+            run.range.end,
+            Affinity::After,
+        ));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let source = styles.clone();
+    let mut normalized = SmallVec::new();
+    for window in boundaries.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        if start >= end {
+            continue;
+        }
+        let mut marks: SmallVec<[Mark; 4]> = SmallVec::new();
+        for run in &source {
+            let run_start = resolve_grapheme_offset(text, run.range.start, Affinity::Before);
+            let run_end = resolve_grapheme_offset(text, run.range.end, Affinity::After);
+            if run_start < end && run_end > start {
+                marks.extend(run.marks.iter().cloned());
+            }
+        }
+        normalize_marks(&mut marks);
+        if !marks.is_empty() {
+            normalized.push(StyledRun {
+                range: start..end,
+                marks,
+            });
+        }
+    }
+    normalize_styles(&mut normalized);
+    *styles = normalized;
+}
+
 fn split_text(
     text: &str,
     styles: &[StyledRun],
@@ -1602,7 +1942,7 @@ fn delete_text(
             });
         }
     }
-    normalize_styles(&mut new_styles);
+    normalize_styles_for_text(&new_text, &mut new_styles);
     (new_text, new_styles)
 }
 
@@ -1656,12 +1996,7 @@ fn toggle_style_range(
             });
         }
     }
-    // Preserve styled material outside the selection.
-    for run in styles {
-        if run.range.end <= start || run.range.start >= end {
-            updated.push(run.clone());
-        }
-    }
+    append_style_residuals(&mut updated, styles, start, end);
     normalize_styles(&mut updated);
     let _ = text;
     updated
@@ -1702,14 +2037,38 @@ fn set_link_range(
             });
         }
     }
-    for run in styles {
-        if run.range.end <= start || run.range.start >= end {
-            updated.push(run.clone());
-        }
-    }
+    append_style_residuals(&mut updated, styles, start, end);
     normalize_styles(&mut updated);
     let _ = text;
     updated
+}
+
+fn append_style_residuals(
+    updated: &mut SmallVec<[StyledRun; 4]>,
+    styles: &[StyledRun],
+    start: usize,
+    end: usize,
+) {
+    for run in styles {
+        if run.range.start < start {
+            let left_end = run.range.end.min(start);
+            if run.range.start < left_end {
+                updated.push(StyledRun {
+                    range: run.range.start..left_end,
+                    marks: run.marks.clone(),
+                });
+            }
+        }
+        if run.range.end > end {
+            let right_start = run.range.start.max(end);
+            if right_start < run.range.end {
+                updated.push(StyledRun {
+                    range: right_start..run.range.end,
+                    marks: run.marks.clone(),
+                });
+            }
+        }
+    }
 }
 
 fn marks_for_segment(styles: &[StyledRun], start: usize, end: usize) -> SmallVec<[Mark; 4]> {

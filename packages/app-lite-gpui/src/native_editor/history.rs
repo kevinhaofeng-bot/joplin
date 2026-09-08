@@ -24,6 +24,7 @@ pub struct History {
     used_bytes: usize,
     undo: VecDeque<HistoryEntry>,
     redo: VecDeque<HistoryEntry>,
+    current_selection: Option<Selection>,
 }
 
 impl History {
@@ -34,6 +35,7 @@ impl History {
             used_bytes: 0,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
+            current_selection: None,
         }
     }
 
@@ -44,9 +46,32 @@ impl History {
     ) -> Result<ApplyOutcome, DocumentError> {
         let before_selection = transaction
             .selection_hint()
+            .or(self.current_selection)
             .unwrap_or_else(|| document.end_selection());
+        self.apply_recorded(document, before_selection, transaction)
+    }
+
+    /// Apply a structural operation with the editor's active selection.
+    /// Structural transactions do not carry a selection of their own, so the
+    /// caller supplies it explicitly instead of falling back to document end.
+    pub fn apply_with_selection(
+        &mut self,
+        document: &mut Document,
+        before_selection: Selection,
+        transaction: Transaction,
+    ) -> Result<ApplyOutcome, DocumentError> {
+        self.apply_recorded(document, before_selection, transaction)
+    }
+
+    fn apply_recorded(
+        &mut self,
+        document: &mut Document,
+        before_selection: Selection,
+        transaction: Transaction,
+    ) -> Result<ApplyOutcome, DocumentError> {
         let forward = TransactionBatch(vec![transaction.clone()]);
         let outcome = document.apply(transaction)?;
+        self.current_selection = Some(outcome.selection);
 
         // A no-op remains a valid transaction result but does not create an
         // entry that would make undo appear to change the document.
@@ -59,6 +84,10 @@ impl History {
             .estimated_bytes()
             .saturating_add(outcome.inverse.estimated_bytes());
         if self.max_entries == 0 || self.max_bytes == 0 || bytes > self.max_bytes {
+            // The current edit has already committed.  Older inverse
+            // operations are no longer safe to apply on top of it when the
+            // edit cannot itself be represented within the budget.
+            self.clear_undo();
             return Ok(outcome);
         }
 
@@ -87,7 +116,10 @@ impl History {
         // that localized inverse as the redo operation so a redo never
         // re-allocates a node id that later history entries reference.
         entry.forward = inverse_outcome.inverse;
+        self.reprice_entry(&mut entry);
+        self.current_selection = Some(entry.before_selection);
         self.redo.push_back(entry.clone());
+        self.trim_to_budget();
         Ok(entry.before_selection)
     }
 
@@ -99,7 +131,10 @@ impl History {
         let entry = self.redo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
         let mut entry = entry;
         entry.inverse = redo_outcome.inverse;
+        self.reprice_entry(&mut entry);
+        self.current_selection = Some(entry.after_selection);
         self.undo.push_back(entry.clone());
+        self.trim_to_budget();
         Ok(entry.after_selection)
     }
 
@@ -140,11 +175,30 @@ impl History {
         }
     }
 
+    fn clear_undo(&mut self) {
+        while let Some(entry) = self.undo.pop_front() {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        }
+    }
+
+    fn reprice_entry(&mut self, entry: &mut HistoryEntry) {
+        let old_bytes = entry.bytes;
+        entry.bytes = entry
+            .inverse
+            .estimated_bytes()
+            .saturating_add(entry.forward.estimated_bytes());
+        self.used_bytes = self
+            .used_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(entry.bytes);
+    }
+
     fn trim_to_budget(&mut self) {
-        while self.undo.len() > self.max_entries || self.used_bytes > self.max_bytes {
-            let Some(entry) = self.undo.pop_front() else {
-                break;
-            };
+        while self.undo.len().saturating_add(self.redo.len()) > self.max_entries
+            || self.used_bytes > self.max_bytes
+        {
+            let entry = self.undo.pop_front().or_else(|| self.redo.pop_front());
+            let Some(entry) = entry else { break };
             self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
         }
     }

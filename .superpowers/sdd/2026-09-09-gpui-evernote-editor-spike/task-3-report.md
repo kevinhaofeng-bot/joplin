@@ -72,3 +72,68 @@ cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- \
 
 - 简报的 `--all-targets -- --skip` 命令会把测试过滤器传给 Criterion bench；bin 目标等价回归已通过，但若 CI 直接采用简报命令，应将 donor 测试目标与 bench 目标分开传参。
 - 新 native API 当前没有接入 UI、同步、CRDT 或持久化，按本任务范围保留给后续任务。
+
+## Fix round 1：findings 回归与修复
+
+### 修复内容
+
+- 超预算的已提交编辑现在明确切断旧 undo 链，避免旧 inverse 覆盖超预算编辑后的文档；undo/redo 每次替换 forward/inverse 后重新计算 entry 字节数并按条数/字节预算裁剪。
+- ToggleMark/SetLink 对相交 run 切出选区左、右残余；跨块删除及 InsertText/InsertImage 替换将 suffix 平移 `start_offset - end_offset`，保留 prefix 长度。
+- Image/Attachment/Divider 现在接受 offset 0 的 Before/After `DocPoint`；文本/结构节点范围可消费中间图片，图片替换、文本替换和跨图片删除均由统一事务处理。
+- 所有事务 outcome selection 在提交前验证；拼接后的 caret/merge/delete 按 affinity 解析到 grapheme 边界，样式边界在拼接 grapheme 上重新规范化。
+- `History::apply_with_selection` 接受 MergeBlocks、RemoveNode、SetImageDisplayWidth 等无 selection_hint 事务的真实编辑前选区；History 同步跟踪最近选区。
+- `Document::apply_batch` 改为受影响事务 inverse 组成的局部 rollback journal；不再为每次按键深克隆完整 Document。失败事务自身也先用局部 inverse 回滚，再回滚批次前序操作。
+
+### Findings 覆盖测试
+
+`packages/app-lite-gpui/src/native_editor/tests.rs` 新增/扩展：
+
+- `over_budget_edit_cuts_stale_undo_history`
+- `marks_and_links_preserve_residual_runs_at_selection_edges`
+- `cross_block_delete_shifts_suffix_styles_after_retained_prefix`
+- `image_before_after_points_and_cross_image_ranges_use_document_transactions`
+- `cross_image_input_replacement_consumes_structural_nodes`
+- `insertion_resolves_grapheme_seam_before_returning_cursor`
+- `undo_redo_reprices_replacement_payloads_and_trims_to_budget`
+- `non_selection_transactions_restore_explicit_history_selection`（覆盖 MergeBlocks、RemoveNode、SetImageDisplayWidth）
+- `small_edit_does_not_allocate_a_full_document_clone`
+- `invalid_batch_rolls_back_prior_local_operations`
+
+### Fix round TDD 证据
+
+RED 使用 detached 基线 `94607b671`，只在临时工作树为新增测试加了未实现语义的 `apply_with_selection` 编译桥，未修改本工作树：
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests -- --nocapture
+running 15 tests
+test result: FAILED. 6 passed; 9 failed; 0 ignored; 0 measured; 753 filtered out
+失败覆盖：over_budget、marks/link residual、suffix style、image range/input、grapheme seam、history selection、replacement budget、full-document allocation。
+```
+
+GREEN 聚焦验证：
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests -- --nocapture
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out
+```
+
+### Fix round 完整验证
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run
+Finished test profile; all test and bench executables generated; exit 0
+
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
+test result: ok. 767 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out
+
+cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml -- --check
+git diff --check
+通过；exit 0
+```
+
+### Fix round 自审与顾虑
+
+- 旧报告中“候选文档 clone”是初始实现状态；本轮已改为局部 inverse journal，`semantic_snapshot()` 仍仅作为测试语义比较辅助，不进入事务提交路径。
+- 分配回归测试在 20,000 个约 1 KiB block 上执行，20 MiB 阈值留出 invariant 校验和并行测试噪声；旧完整 clone 基线约 32.6 MiB，本轮 focused 与 bin 回归均通过。
+- 结构事务若调用方没有当前选区，应通过 `apply_with_selection` 传入编辑前选区；History 仅在没有显式选区且没有最近选区时保留文档末尾 fallback，未扩展 UI 状态。
