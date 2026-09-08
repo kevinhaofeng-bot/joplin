@@ -30,6 +30,9 @@ chmod 755 "$CONTENTS_PATH/MacOS/joplin-lite-native"
 
 ICONSET_PATH="$STAGING_DIR/AppIcon.iconset"
 mkdir -p "$ICONSET_PATH"
+MASK_TOOL="$STAGING_DIR/mask-icon"
+swiftc "$SCRIPT_DIR/mask-icon.swift" -o "$MASK_TOOL" \
+  -framework CoreGraphics -framework ImageIO
 for spec in \
   "icon_16x16.png:16:small" "icon_16x16@2x.png:32:small" \
   "icon_32x32.png:32:small" "icon_32x32@2x.png:64:small" \
@@ -42,9 +45,9 @@ for spec in \
   else
     source="$ICON_MAIN_SOURCE"
   fi
-  sips --resampleHeightWidth "$size" "$size" "$source" \
-    --out "$ICONSET_PATH/$filename" >/dev/null
+  "$MASK_TOOL" "$source" "$ICONSET_PATH/$filename" "$size"
 done
+"$SCRIPT_DIR/check-icon-contract.sh" --iconset "$ICONSET_PATH"
 iconutil --convert icns --output "$CONTENTS_PATH/Resources/AppIcon.icns" "$ICONSET_PATH"
 
 codesign --force --deep --sign - "$BUNDLE_PATH"
