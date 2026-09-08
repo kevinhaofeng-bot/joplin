@@ -1752,7 +1752,7 @@ fn selection_has_text(session: &NativeEditorSession, start: usize, end: usize) -
             }
             let mut position = from;
             text.chars().any(|character| {
-                let next = position + character.len_utf16();
+                let next = position + 1;
                 let visible = position < end
                     && next > start
                     && !matches!(character, '\u{2028}' | '\u{000b}' | '\r');
@@ -1795,7 +1795,7 @@ pub fn query_inline_applicability(
                 return false;
             }
             let from = snapshot.position + offset;
-            let length = text.encode_utf16().count();
+            let length = text.chars().count();
             let to = from + length;
             from <= start && start <= to
         })
@@ -3521,6 +3521,45 @@ mod tests {
         }]))
         .unwrap();
         assert!(!query_inline_applicability(&empty, NSRange::new(0, 0)).unwrap());
+    }
+
+    #[test]
+    fn inline_applicability_keeps_utf16_emoji_softbreak_and_empty_block_boundaries() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "😀\u{2028}b".into(),
+                marks: Marks::default(),
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        let before = document_from_session(&session).unwrap();
+        let revision = session.revision();
+        assert!(!query_inline_applicability(&session, NSRange::new(2, 1)).unwrap());
+        apply_inline_command(&mut session, NSRange::new(2, 1), InlineCommand::Bold).unwrap();
+        assert_eq!(session.revision(), revision);
+        assert!(!session.can_undo());
+        assert_eq!(document_from_session(&session).unwrap(), before);
+
+        let empty_heading = session_from_document(&Document::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "😀".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Heading {
+                level: HeadingLevel::Two,
+                style: BlockStyle::default(),
+                inlines: Vec::new(),
+            },
+        ]))
+        .unwrap();
+        // The first paragraph occupies two UTF-16 units and the block
+        // separator occupies one more; location 3 is the empty heading's
+        // caret, not the end of the emoji text run.
+        assert!(!query_inline_applicability(&empty_heading, NSRange::new(3, 0)).unwrap());
     }
 
     #[test]
