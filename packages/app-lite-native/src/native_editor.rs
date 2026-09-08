@@ -43,6 +43,7 @@ const RESOURCE_ALT_KEY: &str = "com.kevinhao.joplin-lite.resource-alt";
 const RESOURCE_WIDTH_KEY: &str = "com.kevinhao.joplin-lite.resource-width";
 const RESOURCE_HEIGHT_KEY: &str = "com.kevinhao.joplin-lite.resource-height";
 const MISSING_RESOURCE_KEY: &str = "com.kevinhao.joplin-lite.missing-resource";
+pub const PROJECTION_PREFIX_KEY: &str = "com.kevinhao.joplin-lite.projection-prefix";
 pub const INLINE_IMAGE_MAX_PIXEL_SIZE: usize = 1280;
 pub const INLINE_IMAGE_MAX_WIDTH: f64 = 640.0;
 
@@ -340,6 +341,95 @@ pub struct RenderedDocument {
     pub missing_resources: usize,
     pub empty_block_carriers: Vec<EmptyBlockCarrier>,
     pub attachments: Vec<RenderedAttachment>,
+    pub projection_prefixes: Vec<RenderedProjectionPrefix>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedProjectionPrefix {
+    pub projected_range: NSRange,
+    pub semantic_offset: usize,
+    pub text: String,
+}
+
+fn utf16_slice(text: &str, range: NSRange) -> Option<String> {
+    let (start, end) = utf16_range(text, range).ok()?;
+    Some(text.chars().skip(start).take(end - start).collect())
+}
+
+/// Remove only tagged UI prefixes from a rendered projection.  The canonical
+/// editor model never sees these characters.
+pub fn semantic_text_from_projection(
+    projected: &str,
+    prefixes: &[RenderedProjectionPrefix],
+) -> Option<String> {
+    let mut result = projected.to_owned();
+    for prefix in prefixes.iter().rev() {
+        if utf16_slice(&result, prefix.projected_range).as_deref() != Some(prefix.text.as_str()) {
+            return None;
+        }
+        let (start, end) = utf16_range(&result, prefix.projected_range).ok()?;
+        let mut chars = result.chars().collect::<Vec<_>>();
+        chars.drain(start..end);
+        result = chars.into_iter().collect();
+    }
+    Some(result)
+}
+
+/// Convert an AppKit projection range to the semantic UTF-16 range.  Editing
+/// a marker itself is rejected; insertion immediately before/after it remains
+/// addressable and maps to the adjacent semantic boundary.
+pub fn semantic_range_from_projection(
+    range: NSRange,
+    prefixes: &[RenderedProjectionPrefix],
+) -> Option<NSRange> {
+    let end = range.location.checked_add(range.length)?;
+    let mut start_shift = 0usize;
+    let mut end_shift = 0usize;
+    for prefix in prefixes {
+        let prefix_end = prefix
+            .projected_range
+            .location
+            .checked_add(prefix.projected_range.length)?;
+        if range.length > 0 && range.location < prefix_end && end > prefix.projected_range.location
+        {
+            let covers_whole_prefix =
+                range.location <= prefix.projected_range.location && end >= prefix_end;
+            if !covers_whole_prefix {
+                return None;
+            }
+        }
+        if prefix_end <= range.location {
+            start_shift = start_shift.checked_add(prefix.projected_range.length)?;
+        }
+        if prefix_end <= end {
+            end_shift = end_shift.checked_add(prefix.projected_range.length)?;
+        }
+    }
+    let start = range.location.checked_sub(start_shift)?;
+    let semantic_end = end.checked_sub(end_shift)?;
+    Some(NSRange::new(start, semantic_end.checked_sub(start)?))
+}
+
+pub fn projection_range_from_semantic(
+    range: NSRange,
+    prefixes: &[RenderedProjectionPrefix],
+) -> Option<NSRange> {
+    let end = range.location.checked_add(range.length)?;
+    let mut start_shift = 0usize;
+    let mut end_shift = 0usize;
+    for prefix in prefixes {
+        if prefix.semantic_offset < range.location
+            || range.length == 0 && prefix.semantic_offset == range.location
+        {
+            start_shift = start_shift.checked_add(prefix.projected_range.length)?;
+        }
+        if prefix.semantic_offset < end || range.length == 0 && prefix.semantic_offset == end {
+            end_shift = end_shift.checked_add(prefix.projected_range.length)?;
+        }
+    }
+    let start = range.location.checked_add(start_shift)?;
+    let projected_end = end.checked_add(end_shift)?;
+    Some(NSRange::new(start, projected_end.checked_sub(start)?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2239,6 +2329,15 @@ fn list_marker_for_snapshot(snapshot: &text_document::BlockSnapshot) -> Option<N
     })
 }
 
+fn projection_prefix_for_marker(marker: NativeListMarker, item_number: usize) -> String {
+    match marker {
+        NativeListMarker::Ordered => format!("{item_number}. "),
+        NativeListMarker::Checked => "☑ ".to_owned(),
+        NativeListMarker::Unchecked => "☐ ".to_owned(),
+        NativeListMarker::Unordered => "• ".to_owned(),
+    }
+}
+
 fn new_native_list(marker_kind: NativeListMarker) -> Retained<NSTextList> {
     let marker = unsafe {
         match marker_kind {
@@ -2270,11 +2369,20 @@ fn paragraph_style_for_snapshot(
     });
     paragraph.setLineSpacing(4.0);
     paragraph.setParagraphSpacing(6.0);
-    paragraph.setHeadIndent(f64::from(snapshot.block_format.indent.unwrap_or(0)) * 24.0);
-    if let Some(list) = list {
-        let lists = objc2_foundation::NSArray::<NSTextList>::from_slice(&[list]);
-        paragraph.setTextLists(&lists);
+    let block_indent = f64::from(snapshot.block_format.indent.unwrap_or(0)) * 24.0;
+    if list.is_some() {
+        // AppKit only draws NSTextList markers when the paragraph reserves a
+        // first-line gutter.  Keep the semantic text unchanged and indent
+        // continuation lines by one marker width.
+        paragraph.setFirstLineHeadIndent(block_indent);
+        paragraph.setHeadIndent(block_indent + 24.0);
+    } else {
+        paragraph.setHeadIndent(block_indent);
     }
+    // Visible list/checklist markers are emitted as tagged projection-only
+    // prefix text in `render_session`.  Keeping NSTextList here would draw a
+    // second marker and would not give AppKit a safe edit mapping.
+    let _ = list;
     if snapshot
         .fragments
         .iter()
@@ -2462,13 +2570,16 @@ where
     F: FnMut(&str) -> Option<StoredResource>,
 {
     let output = NSMutableAttributedString::from_nsstring(&NSString::from_str(""));
+    let semantic_text = session.text.to_addressable_text().unwrap_or_default();
     let mut missing_resources = 0;
     let mut rendered_blocks = 0;
     let mut active_list: Option<(NativeListMarker, Retained<NSTextList>)> = None;
+    let mut active_list_item_number = 0usize;
     let mut previous_paragraph: Option<Retained<NSMutableParagraphStyle>> = None;
     let mut pending_empty_block: Option<(usize, Retained<NSMutableParagraphStyle>)> = None;
     let mut empty_block_carriers = Vec::new();
     let mut attachments = Vec::new();
+    let mut projection_prefixes = Vec::new();
     for element in session.text.flow() {
         let FlowElement::Block(block) = element else {
             continue;
@@ -2485,13 +2596,18 @@ where
             Some(marker_kind) => {
                 let list = new_native_list(marker_kind);
                 active_list = Some((marker_kind, list.clone()));
+                active_list_item_number = 1;
                 Some(list)
             }
             None => {
                 active_list = None;
+                active_list_item_number = 0;
                 None
             }
         };
+        if active_list.is_some() && active_list_item_number == 0 {
+            active_list_item_number = 1;
+        }
         let paragraph = paragraph_style_for_snapshot(&snapshot, list.as_deref(), _width);
         if rendered_blocks > 0 {
             let separator_paragraph = pending_empty_block
@@ -2520,6 +2636,36 @@ where
             .block_format
             .heading_level
             .filter(|level| *level > 0);
+        if let Some((marker_kind, _)) = active_list.as_ref() {
+            let prefix = projection_prefix_for_marker(*marker_kind, active_list_item_number);
+            let prefix_range = NSRange::new(
+                output.string().length(),
+                NSString::from_str(&prefix).length(),
+            );
+            let prefix_piece =
+                NSMutableAttributedString::from_nsstring(&NSString::from_str(&prefix));
+            apply_text_attributes(
+                &prefix_piece,
+                &TextFormat::default(),
+                heading_level,
+                &paragraph,
+            );
+            unsafe {
+                prefix_piece.addAttribute_value_range(
+                    &NSAttributedStringKey::from_str(PROJECTION_PREFIX_KEY),
+                    &NSString::from_str("1"),
+                    NSRange::new(0, prefix_piece.string().length()),
+                );
+            }
+            output.appendAttributedString(&prefix_piece);
+            projection_prefixes.push(RenderedProjectionPrefix {
+                projected_range: prefix_range,
+                semantic_offset: utf16_offset_at_scalar(&semantic_text, snapshot.position)
+                    .unwrap_or(snapshot.position),
+                text: prefix,
+            });
+            active_list_item_number = active_list_item_number.saturating_add(1);
+        }
         for fragment in snapshot.fragments {
             match fragment {
                 FragmentContent::Text {
@@ -2585,6 +2731,7 @@ where
         missing_resources,
         empty_block_carriers,
         attachments,
+        projection_prefixes,
     }
 }
 
@@ -4446,10 +4593,17 @@ mod tests {
         let expected = session.text.to_addressable_text().unwrap();
         let rendered = render_session(&session, |_| None, 640.0);
 
-        assert_eq!(rendered.attributed.string().to_string(), expected);
+        assert_eq!(
+            semantic_text_from_projection(
+                &rendered.attributed.string().to_string(),
+                &rendered.projection_prefixes,
+            )
+            .unwrap(),
+            expected
+        );
         assert_eq!(
             rendered.attributed.string().to_string(),
-            "标题😀\n\u{fffc} item"
+            "标题😀\n☑ \u{fffc} item"
         );
         assert_eq!(rendered.missing_resources, 1);
     }
@@ -4482,21 +4636,36 @@ mod tests {
         }]);
         let session = session_from_document(&document).unwrap();
         let rendered = render_session(&session, |_| None, 640.0);
+        assert_eq!(rendered.attributed.string().to_string(), "• one\n• two");
         assert_eq!(
-            rendered.attributed.string().to_string(),
+            semantic_text_from_projection(
+                &rendered.attributed.string().to_string(),
+                &rendered.projection_prefixes,
+            )
+            .unwrap(),
             session.text.to_addressable_text().unwrap()
         );
-        assert_eq!(rendered.attributed.string().to_string(), "one\ntwo");
+        assert_eq!(
+            rendered
+                .projection_prefixes
+                .iter()
+                .map(|prefix| prefix.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["• ", "• "]
+        );
         let source: &NSAttributedString = &rendered.attributed;
-        let key = unsafe { NSParagraphStyleAttributeName };
-        for location in [0, 4] {
+        let key = NSAttributedStringKey::from_str(PROJECTION_PREFIX_KEY);
+        for prefix in &rendered.projection_prefixes {
             let value = unsafe {
                 source
-                    .attribute_atIndex_effectiveRange(key, location, null_mut())
+                    .attribute_atIndex_effectiveRange(
+                        &key,
+                        prefix.projected_range.location,
+                        null_mut(),
+                    )
                     .unwrap()
             };
-            let style = value.downcast_ref::<NSParagraphStyle>().unwrap();
-            assert_eq!(style.textLists().count(), 1);
+            assert_eq!(value.downcast_ref::<NSString>().unwrap().to_string(), "1");
         }
     }
 
@@ -4693,28 +4862,15 @@ mod tests {
             ],
         }]);
         let rendered = render_session(&session_from_document(&ordered).unwrap(), |_| None, 640.0);
-        let source: &NSAttributedString = &rendered.attributed;
-        let first = unsafe {
-            source
-                .attribute_atIndex_effectiveRange(NSParagraphStyleAttributeName, 0, null_mut())
-                .unwrap()
-                .downcast_ref::<NSParagraphStyle>()
-                .unwrap()
-                .textLists()
-                .objectAtIndex(0)
-        };
-        let second = unsafe {
-            source
-                .attribute_atIndex_effectiveRange(NSParagraphStyleAttributeName, 4, null_mut())
-                .unwrap()
-                .downcast_ref::<NSParagraphStyle>()
-                .unwrap()
-                .textLists()
-                .objectAtIndex(0)
-        };
-        assert_eq!(Retained::as_ptr(&first), Retained::as_ptr(&second));
-        assert_eq!(first.markerForItemNumber(1).to_string(), "1");
-        assert_eq!(first.markerForItemNumber(2).to_string(), "2");
+        assert_eq!(rendered.attributed.string().to_string(), "1. one\n2. two");
+        assert_eq!(
+            rendered
+                .projection_prefixes
+                .iter()
+                .map(|prefix| prefix.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1. ", "2. "]
+        );
 
         let empty = Document::from_blocks(vec![Block::List {
             kind: ListKind::Checklist,
@@ -4726,19 +4882,16 @@ mod tests {
         }]);
         let empty_session = session_from_document(&empty).unwrap();
         let empty_rendered = render_session(&empty_session, |_| None, 640.0);
+        assert_eq!(empty_rendered.attributed.string().to_string(), "☐ ");
         assert_eq!(
-            empty_rendered.attributed.string().to_string(),
+            semantic_text_from_projection(
+                &empty_rendered.attributed.string().to_string(),
+                &empty_rendered.projection_prefixes,
+            )
+            .unwrap(),
             empty_session.text.to_addressable_text().unwrap()
         );
-        assert_eq!(empty_rendered.attributed.string().length(), 0);
         assert_eq!(empty_rendered.empty_block_carriers.len(), 1);
-        assert_eq!(
-            empty_rendered.empty_block_carriers[0]
-                .paragraph
-                .textLists()
-                .count(),
-            1
-        );
     }
 
     #[test]

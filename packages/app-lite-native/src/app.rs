@@ -11,13 +11,15 @@ use joplin_lite_native::html_body::{
 use joplin_lite_native::native_editor::LinkSelectionState;
 use joplin_lite_native::native_editor::{
     BlockCommand, EditorCodecError as NativeEditorCodecError, EmptyBlockCarrier, InlineCommand,
-    NativeEditorSession, ParagraphCommand, RenderedAttachment, RenderedDocument, SelectionState,
-    apply_block_command, apply_clear_formatting, apply_committed_text_delta, apply_inline_command,
-    apply_link, apply_paragraph_command, delete_image_anchor_if_identity, document_from_session,
-    editor_attachment_image, effective_typing_format_at, image_paragraph_tail_indent,
-    insert_image_block_anchor, query_block_state, query_clear_state, query_inline_applicability,
-    query_inline_state, query_link_selection, query_paragraph_command_state, render_session,
-    session_from_document,
+    NativeEditorSession, ParagraphCommand, RenderedAttachment, RenderedDocument,
+    RenderedProjectionPrefix, SelectionState, apply_block_command, apply_clear_formatting,
+    apply_committed_text_delta, apply_inline_command, apply_link, apply_paragraph_command,
+    delete_image_anchor_if_identity, document_from_session, editor_attachment_image,
+    effective_typing_format_at, image_paragraph_tail_indent, insert_image_block_anchor,
+    projection_range_from_semantic, query_block_state, query_clear_state,
+    query_inline_applicability, query_inline_state, query_link_selection,
+    query_paragraph_command_state, render_session, semantic_range_from_projection,
+    semantic_text_from_projection, session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
     PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
@@ -42,11 +44,12 @@ use objc2_app_kit::{
     NSImage, NSIndexPathNSCollectionViewAdditions, NSLayoutManager, NSLineBreakMode,
     NSLinkAttributeName, NSMenu, NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle,
     NSOpenPanel, NSParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
-    NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSResponder, NSScrollView,
-    NSSearchField, NSSearchFieldDelegate, NSStrikethroughStyleAttributeName, NSText,
-    NSTextAlignment, NSTextAttachment, NSTextDelegate, NSTextField, NSTextFieldDelegate,
-    NSTextInputClient, NSTextStorage, NSTextView, NSTextViewDelegate, NSUnderlineStyle,
-    NSUnderlineStyleAttributeName, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF,
+    NSResponder, NSScrollView, NSSearchField, NSSearchFieldDelegate,
+    NSStrikethroughStyleAttributeName, NSText, NSTextAlignment, NSTextAttachment, NSTextDelegate,
+    NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextStorage, NSTextView,
+    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
@@ -83,9 +86,10 @@ struct PreparedNoteContent {
     update: NoteContentUpdate,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingEditorIntent {
     range: NSRange,
+    semantic_range: Option<NSRange>,
     replacement: String,
     old_view_text: String,
     old_semantic_text: String,
@@ -105,6 +109,7 @@ struct PendingEditorComposition {
     baseline_view_text: String,
     baseline_semantic_text: String,
     baseline_range: NSRange,
+    baseline_semantic_range: Option<NSRange>,
     current_view_text: String,
     current_marked_range: NSRange,
     replacement: String,
@@ -238,12 +243,33 @@ enum PasteRoute {
     NativeResponder,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyPasteDispatch {
+    DirectTextInsertion,
+    ResponderPaste,
+}
+
 fn paste_route(body_is_first_responder: bool, has_current_note: bool) -> PasteRoute {
     if body_is_first_responder && has_current_note {
         PasteRoute::BodyImporter
     } else {
         PasteRoute::NativeResponder
     }
+}
+
+fn body_paste_dispatch(body_is_first_responder: bool) -> BodyPasteDispatch {
+    if body_is_first_responder {
+        BodyPasteDispatch::DirectTextInsertion
+    } else {
+        BodyPasteDispatch::ResponderPaste
+    }
+}
+
+fn should_relayout_editor_after_preview_update(
+    update: &PreviewListUpdate,
+    preserve_editor_geometry: bool,
+) -> bool {
+    !preserve_editor_geometry && matches!(update, PreviewListUpdate::ReloadAll)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -392,7 +418,8 @@ fn decide_pending_editor_intent(
     if expected_new_text != new_view_text {
         return PendingIntentDecision::Reject;
     }
-    let Some((start, end)) = utf16_scalar_range(&intent.old_semantic_text, intent.range) else {
+    let semantic_range = intent.semantic_range.unwrap_or(intent.range);
+    let Some((start, end)) = utf16_scalar_range(&intent.old_semantic_text, semantic_range) else {
         return PendingIntentDecision::Reject;
     };
     let old_slice: String = intent
@@ -407,7 +434,7 @@ fn decide_pending_editor_intent(
             && intent.covered_attachments.len() == 1
         {
             return PendingIntentDecision::DeleteImage {
-                range: intent.range,
+                range: semantic_range,
                 resource_id: intent.covered_attachments[0].resource_id.clone(),
             };
         }
@@ -417,7 +444,7 @@ fn decide_pending_editor_intent(
         PendingIntentDecision::Noop
     } else {
         PendingIntentDecision::ApplyText {
-            range: intent.range,
+            range: semantic_range,
             replacement: intent.replacement.clone(),
         }
     }
@@ -455,6 +482,38 @@ fn preflight_pending_editor_intent(
     Ok(())
 }
 
+fn preflight_projected_editor_intent(
+    intent: &PendingEditorIntent,
+    prefixes: &[RenderedProjectionPrefix],
+) -> Result<(), PendingIntentRejection> {
+    if semantic_text_from_projection(&intent.old_view_text, prefixes).as_deref()
+        != Some(intent.old_semantic_text.as_str())
+    {
+        return Err(PendingIntentRejection::StaleBaseline);
+    }
+    let semantic_range = intent.semantic_range.unwrap_or(intent.range);
+    let mut semantic_intent = intent.clone();
+    semantic_intent.range = semantic_range;
+    semantic_intent.semantic_range = None;
+    semantic_intent.old_view_text = semantic_intent.old_semantic_text.clone();
+    preflight_pending_editor_intent(&semantic_intent)
+}
+
+fn append_pending_editor_intent(
+    intents: &mut Vec<PendingEditorIntent>,
+    intent: PendingEditorIntent,
+) -> bool {
+    if !intents.is_empty() {
+        if intents.last() == Some(&intent) {
+            return true;
+        }
+        intents.clear();
+        return false;
+    }
+    intents.push(intent);
+    true
+}
+
 fn accumulate_marked_editor_intent(
     current: Option<PendingEditorComposition>,
     old_view_text: &str,
@@ -474,12 +533,15 @@ fn accumulate_marked_editor_intent(
         None => {
             let intent = PendingEditorIntent {
                 range,
+                semantic_range: None,
                 replacement: replacement.to_owned(),
                 old_view_text: old_view_text.to_owned(),
                 old_semantic_text: old_semantic_text.to_owned(),
                 covered_attachments,
             };
-            preflight_pending_editor_intent(&intent)?;
+            let mut semantic_intent = intent.clone();
+            semantic_intent.old_view_text = semantic_intent.old_semantic_text.clone();
+            preflight_pending_editor_intent(&semantic_intent)?;
             if marked_range != range {
                 return Err(PendingIntentRejection::InvalidUtf16);
             }
@@ -492,6 +554,7 @@ fn accumulate_marked_editor_intent(
                 baseline_view_text: old_view_text.to_owned(),
                 baseline_semantic_text: old_semantic_text.to_owned(),
                 baseline_range: range,
+                baseline_semantic_range: None,
                 current_view_text,
                 current_marked_range: NSRange::new(
                     range.location,
@@ -542,6 +605,7 @@ fn finish_marked_editor_intent(
     }
     let intent = PendingEditorIntent {
         range: composition.baseline_range,
+        semantic_range: composition.baseline_semantic_range,
         replacement: composition.replacement.clone(),
         old_view_text: composition.baseline_view_text.clone(),
         old_semantic_text: composition.baseline_semantic_text.clone(),
@@ -605,6 +669,47 @@ fn adjust_projection_attachments(
         }
     }
     removed_resource_id.is_none() || removed
+}
+
+fn adjust_projection_prefixes_with_semantic(
+    prefixes: &mut [RenderedProjectionPrefix],
+    projection_range: NSRange,
+    semantic_range: NSRange,
+    replacement_length: usize,
+) -> bool {
+    let range = projection_range;
+    let Some(end) = range.location.checked_add(range.length) else {
+        return false;
+    };
+    if prefixes.iter().any(|prefix| {
+        range.length > 0
+            && range.location < prefix.projected_range.location + prefix.projected_range.length
+            && end > prefix.projected_range.location
+    }) {
+        return false;
+    }
+    let delta = replacement_length as isize - range.length as isize;
+    let semantic_end = semantic_range
+        .location
+        .saturating_add(semantic_range.length);
+    let semantic_delta = replacement_length as isize - semantic_range.length as isize;
+    for prefix in prefixes.iter_mut() {
+        if prefix.projected_range.location >= end {
+            let shifted = prefix.projected_range.location as isize + delta;
+            if shifted < 0 {
+                return false;
+            }
+            prefix.projected_range.location = shifted as usize;
+            if prefix.semantic_offset >= semantic_end {
+                let semantic_shifted = prefix.semantic_offset as isize + semantic_delta;
+                if semantic_shifted < 0 {
+                    return false;
+                }
+                prefix.semantic_offset = semantic_shifted as usize;
+            }
+        }
+    }
+    true
 }
 
 fn resource_id_attribute_key() -> Retained<NSAttributedStringKey> {
@@ -2453,6 +2558,7 @@ struct AppDelegateIvars {
     collection_selection_guard: Cell<bool>,
     editor_session: RefCell<Option<NativeEditorSession>>,
     projection_attachments: RefCell<Vec<RenderedAttachment>>,
+    projection_prefixes: RefCell<Vec<RenderedProjectionPrefix>>,
     projection_empty_carriers: RefCell<Vec<EmptyBlockCarrier>>,
     pending_editor_intents: RefCell<Vec<PendingEditorIntent>>,
     pending_editor_composition: RefCell<Option<PendingEditorComposition>>,
@@ -3193,10 +3299,14 @@ define_class!(
         #[unsafe(method(textViewDidChangeSelection:))]
         fn text_view_did_change_selection(&self, _notification: &NSNotification) {
             if let Some(body) = self.ivars().body_view.get() {
-                let selection = body.selectedRange();
-                *self.ivars().last_body_selection.borrow_mut() = selection;
+                let projected_selection = body.selectedRange();
+                *self.ivars().last_body_selection.borrow_mut() = projected_selection;
                 *self.ivars().last_body_selection_note_id.borrow_mut() =
                     self.ivars().current_note_id.borrow().clone();
+                let selection = semantic_range_from_projection(
+                    projected_selection,
+                    &self.ivars().projection_prefixes.borrow(),
+                );
                 let should_sync = should_sync_caret_context_after_delegate(
                     *self.ivars().selection_sync_guard.borrow(),
                     *self.ivars().loading_guard.borrow(),
@@ -3205,6 +3315,7 @@ define_class!(
                     self.ivars().pending_editor_composition.borrow().is_some(),
                 );
                 if should_sync
+                    && let Some(selection) = selection
                     && let Some(session) = self.ivars().editor_session.borrow_mut().as_mut()
                 {
                     session.sync_caret_context(selection);
@@ -3689,12 +3800,6 @@ define_class!(
             .is_some_and(|session| session.can_undo() && session.undo().is_ok());
         if changed {
             self.refresh_body_from_session();
-            let selection = self
-                .ivars()
-                .body_view
-                .get()
-                .map(|body| body.selectedRange())
-                .unwrap_or(selection);
             self.restore_command_selection(selection);
             self.save_current_note();
         } else {
@@ -3725,12 +3830,6 @@ define_class!(
             .is_some_and(|session| session.can_redo() && session.redo().is_ok());
         if changed {
             self.refresh_body_from_session();
-            let selection = self
-                .ivars()
-                .body_view
-                .get()
-                .map(|body| body.selectedRange())
-                .unwrap_or(selection);
             self.restore_command_selection(selection);
             self.save_current_note();
         } else {
@@ -4039,7 +4138,9 @@ impl AppDelegate {
         // updates this RefCell. Keeping the Ref borrow in the call expression
         // would make that legitimate delegate re-entry panic.
         let selection = selection_snapshot_for_reentrant_appkit(&self.ivars().last_body_selection);
-        self.restore_command_selection(selection);
+        if let Some(body) = self.ivars().body_view.get() {
+            self.set_selected_range_programmatically(body, selection);
+        }
     }
 
     fn toolbar_selector(action: EditorAction) -> Option<Sel> {
@@ -4159,6 +4260,12 @@ impl AppDelegate {
             })
             .cloned()
             .collect();
+        let projection_prefixes = self.ivars().projection_prefixes.borrow().clone();
+        let semantic_range = semantic_range_from_projection(range, &projection_prefixes);
+        if semantic_range.is_none() {
+            self.clear_pending_editor_intent();
+            return false;
+        }
         let replacement = replacement.map(ToString::to_string).unwrap_or_default();
         let marked_range = if body.hasMarkedText() {
             Some(body.markedRange())
@@ -4177,7 +4284,10 @@ impl AppDelegate {
                 covered_attachments,
             );
             match next {
-                Ok(next) => {
+                Ok(mut next) => {
+                    if self.ivars().pending_editor_composition.borrow().is_none() {
+                        next.baseline_semantic_range = semantic_range;
+                    }
                     *self.ivars().pending_editor_composition.borrow_mut() = Some(next);
                     true
                 }
@@ -4187,26 +4297,22 @@ impl AppDelegate {
                 }
             }
         } else {
-            if !self.ivars().pending_editor_intents.borrow().is_empty() {
-                self.clear_pending_editor_intent();
-                return false;
-            }
             let intent = PendingEditorIntent {
                 range,
+                semantic_range,
                 replacement,
                 old_view_text,
                 old_semantic_text,
                 covered_attachments,
             };
-            if preflight_pending_editor_intent(&intent).is_err() {
+            if preflight_projected_editor_intent(&intent, &projection_prefixes).is_err() {
                 self.clear_pending_editor_intent();
                 return false;
             }
-            self.ivars()
-                .pending_editor_intents
-                .borrow_mut()
-                .push(intent);
-            true
+            append_pending_editor_intent(
+                &mut self.ivars().pending_editor_intents.borrow_mut(),
+                intent,
+            )
         }
     }
 
@@ -4235,6 +4341,7 @@ impl AppDelegate {
             storage.setAttributedString(&rendered.attributed);
         }
         *self.ivars().projection_attachments.borrow_mut() = rendered.attachments.clone();
+        *self.ivars().projection_prefixes.borrow_mut() = rendered.projection_prefixes.clone();
         *self.ivars().projection_empty_carriers.borrow_mut() =
             rendered.empty_block_carriers.clone();
         let max_length = rendered.attributed.string().length();
@@ -4285,6 +4392,11 @@ impl AppDelegate {
         if selection.length != 0 {
             return;
         }
+        let Some(selection) =
+            semantic_range_from_projection(selection, &self.ivars().projection_prefixes.borrow())
+        else {
+            return;
+        };
         let format = {
             let session_guard = self.ivars().editor_session.borrow();
             session_guard
@@ -4316,7 +4428,12 @@ impl AppDelegate {
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
-        self.refresh_body_from_session_at(body, body.selectedRange());
+        let selection = semantic_range_from_projection(
+            body.selectedRange(),
+            &self.ivars().projection_prefixes.borrow(),
+        )
+        .unwrap_or_else(|| body.selectedRange());
+        self.refresh_body_from_session_at(body, selection);
     }
 
     fn refresh_body_from_session_at(&self, body: &NSTextView, selection: NSRange) {
@@ -4340,7 +4457,10 @@ impl AppDelegate {
         let failures = rendered.missing_resources;
         let previous_loading_guard = *self.ivars().loading_guard.borrow();
         *self.ivars().loading_guard.borrow_mut() = true;
-        self.install_rendered_document(body, &rendered, selection);
+        let projected_selection =
+            projection_range_from_semantic(selection, &rendered.projection_prefixes)
+                .unwrap_or(selection);
+        self.install_rendered_document(body, &rendered, projected_selection);
         *self.ivars().loading_guard.borrow_mut() = previous_loading_guard;
         if failures == 0 {
             self.set_save_status("已保存", false);
@@ -4369,8 +4489,8 @@ impl AppDelegate {
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
-        let selection = body.selectedRange();
-        if selection.length != 0 {
+        let projected_selection = body.selectedRange();
+        if projected_selection.length != 0 {
             return;
         }
         let carrier = self
@@ -4378,7 +4498,7 @@ impl AppDelegate {
             .projection_empty_carriers
             .borrow()
             .iter()
-            .find(|carrier| carrier.addressable_offset == selection.location)
+            .find(|carrier| carrier.addressable_offset == projected_selection.location)
             .cloned();
         if let Some(carrier) = carrier {
             body.setDefaultParagraphStyle(Some(&carrier.paragraph));
@@ -4388,7 +4508,7 @@ impl AppDelegate {
                 mutable.insert(NSParagraphStyleAttributeName, &carrier.paragraph);
                 body.setTypingAttributes(&mutable);
             }
-            self.sync_typing_attributes_for_selection(body, selection);
+            self.sync_typing_attributes_for_selection(body, projected_selection);
             return;
         }
 
@@ -4400,7 +4520,7 @@ impl AppDelegate {
             return;
         }
         let source: &NSAttributedString = &storage;
-        let probe = selection.location.min(length - 1);
+        let probe = projected_selection.location.min(length - 1);
         let Some(paragraph) = (unsafe {
             source
                 .attribute_atIndex_effectiveRange(NSParagraphStyleAttributeName, probe, null_mut())
@@ -4415,7 +4535,7 @@ impl AppDelegate {
             mutable.insert(NSParagraphStyleAttributeName, &paragraph);
             body.setTypingAttributes(&mutable);
         }
-        self.sync_typing_attributes_for_selection(body, selection);
+        self.sync_typing_attributes_for_selection(body, projected_selection);
     }
 
     #[allow(deprecated)]
@@ -4439,66 +4559,115 @@ impl AppDelegate {
         let source: &NSAttributedString = &storage;
         let new_text = source.string().to_string();
         let composition = self.ivars().pending_editor_composition.borrow().clone();
-        let (decision, invalid) = if let Some(composition) = composition {
+        let (decision, projection_range, invalid) = if let Some(composition) = composition {
             self.clear_pending_editor_intent();
-            (finish_marked_editor_intent(&composition, &new_text), false)
+            (
+                finish_marked_editor_intent(&composition, &new_text),
+                composition.baseline_range,
+                false,
+            )
         } else {
             let (pending, invalid) = self.take_pending_editor_intent();
             let Some(intent) = pending else {
                 // A live change is accepted only when AppKit gave us exactly one
                 // pre-mutation intent. The old/new string diff remains a legacy
                 // test and migration helper, never a live writeback path.
+                eprintln!("native editor sync rejected: pending intent missing or duplicated");
                 return EditorSessionSyncResult::Rejected;
             };
             if invalid {
+                eprintln!("native editor sync rejected: pending intent marked invalid");
                 return EditorSessionSyncResult::Rejected;
             }
-            (decide_pending_editor_intent(&intent, &new_text), false)
+            (
+                decide_pending_editor_intent(&intent, &new_text),
+                intent.range,
+                false,
+            )
         };
         if invalid {
             // A live change is accepted only when AppKit gave us exactly one
             // pre-mutation intent. The old/new string diff remains a legacy
             // test and migration helper, never a live writeback path.
+            eprintln!("native editor sync rejected: pending intent invalid after dispatch");
             return EditorSessionSyncResult::Rejected;
         }
         let mut next_attachments = self.ivars().projection_attachments.borrow().clone();
+        let mut next_prefixes = self.ivars().projection_prefixes.borrow().clone();
         let result = match decision {
             PendingIntentDecision::Noop => return EditorSessionSyncResult::Noop,
-            PendingIntentDecision::Reject => return EditorSessionSyncResult::Rejected,
+            PendingIntentDecision::Reject => {
+                eprintln!("native editor sync rejected: projection did not match intent");
+                return EditorSessionSyncResult::Rejected;
+            }
             PendingIntentDecision::ApplyText { range, replacement } => {
                 let replacement_length = NSString::from_str(&replacement).length();
+                if !adjust_projection_prefixes_with_semantic(
+                    &mut next_prefixes,
+                    projection_range,
+                    range,
+                    replacement_length,
+                ) {
+                    eprintln!("native editor sync rejected: projection prefix range invalid");
+                    return EditorSessionSyncResult::Rejected;
+                }
                 if !adjust_projection_attachments(
                     &mut next_attachments,
-                    range,
+                    projection_range,
                     replacement_length,
                     None,
                 ) {
+                    eprintln!("native editor sync rejected: attachment range invalid");
                     return EditorSessionSyncResult::Rejected;
                 }
                 let mut session_guard = self.ivars().editor_session.borrow_mut();
                 let Some(session) = session_guard.as_mut() else {
+                    eprintln!("native editor sync rejected: semantic session unavailable");
                     return EditorSessionSyncResult::Rejected;
                 };
-                apply_committed_text_delta(session, range, &replacement).is_ok()
+                let applied = apply_committed_text_delta(session, range, &replacement).is_ok();
+                if !applied {
+                    eprintln!("native editor sync rejected: semantic delta failed");
+                }
+                applied
             }
             PendingIntentDecision::DeleteImage { range, resource_id } => {
+                if !adjust_projection_prefixes_with_semantic(
+                    &mut next_prefixes,
+                    projection_range,
+                    range,
+                    0,
+                ) {
+                    eprintln!("native editor sync rejected: projection prefix delete invalid");
+                    return EditorSessionSyncResult::Rejected;
+                }
                 if !adjust_projection_attachments(
                     &mut next_attachments,
-                    range,
+                    projection_range,
                     0,
                     Some(&resource_id),
                 ) {
+                    eprintln!("native editor sync rejected: image attachment range invalid");
                     return EditorSessionSyncResult::Rejected;
                 }
                 let mut session_guard = self.ivars().editor_session.borrow_mut();
                 let Some(session) = session_guard.as_mut() else {
+                    eprintln!(
+                        "native editor sync rejected: semantic session unavailable for image"
+                    );
                     return EditorSessionSyncResult::Rejected;
                 };
-                delete_image_anchor_if_identity(session, range, Some(&resource_id)).is_ok()
+                let applied =
+                    delete_image_anchor_if_identity(session, range, Some(&resource_id)).is_ok();
+                if !applied {
+                    eprintln!("native editor sync rejected: image delta failed");
+                }
+                applied
             }
         };
         if result {
             *self.ivars().projection_attachments.borrow_mut() = next_attachments;
+            *self.ivars().projection_prefixes.borrow_mut() = next_prefixes;
             EditorSessionSyncResult::Applied
         } else {
             // Semantic application is intentionally attempted only after all
@@ -5066,12 +5235,17 @@ impl AppDelegate {
         ) {
             return None;
         }
-        let selection = body.selectedRange();
+        let selection = semantic_range_from_projection(
+            body.selectedRange(),
+            &self.ivars().projection_prefixes.borrow(),
+        )?;
         if selection.length > 0 {
-            *self.ivars().last_body_selection.borrow_mut() = selection;
             Some(selection)
         } else {
-            Some(*self.ivars().last_body_selection.borrow())
+            semantic_range_from_projection(
+                *self.ivars().last_body_selection.borrow(),
+                &self.ivars().projection_prefixes.borrow(),
+            )
         }
     }
 
@@ -5079,8 +5253,11 @@ impl AppDelegate {
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
-        self.set_selected_range_programmatically(body, selection);
-        *self.ivars().last_body_selection.borrow_mut() = selection;
+        let projected =
+            projection_range_from_semantic(selection, &self.ivars().projection_prefixes.borrow())
+                .unwrap_or(selection);
+        self.set_selected_range_programmatically(body, projected);
+        *self.ivars().last_body_selection.borrow_mut() = projected;
         if let Some(window) = self.ivars().window.get() {
             window.makeFirstResponder(Some(body));
         }
@@ -5464,8 +5641,11 @@ impl AppDelegate {
         );
         if route == PasteRoute::NativeResponder {
             if body_is_first_responder {
-                if let Some(body) = body {
-                    unsafe { body.paste(None) };
+                if let Some(body) = body
+                    && body_paste_dispatch(body_is_first_responder)
+                        == BodyPasteDispatch::DirectTextInsertion
+                {
+                    let _ = paste_plain_text_into_body(body);
                 }
             } else if let Some(first_responder) = first_responder {
                 unsafe {
@@ -5478,7 +5658,9 @@ impl AppDelegate {
             return;
         };
         match self.read_pasteboard_image() {
-            PasteboardImage::NotImage => unsafe { body.paste(None) },
+            PasteboardImage::NotImage => {
+                let _ = paste_plain_text_into_body(body);
+            }
             PasteboardImage::Rejected(message) => self.set_save_status(message, true),
             PasteboardImage::Data { bytes, title, mime } => {
                 let _ = self.insert_image_data(&bytes, &title, &mime);
@@ -5509,13 +5691,13 @@ impl AppDelegate {
         };
         let point = body.convertPoint_fromView(sender.draggingLocation(), None);
         let character_index = body.characterIndexForInsertionAtPoint(point);
-        self.insert_image_data_at_range(
-            &bytes,
-            &title,
-            &mime,
-            body,
+        let Some(character_index) = semantic_range_from_projection(
             NSRange::new(character_index, 0),
-        )
+            &self.ivars().projection_prefixes.borrow(),
+        ) else {
+            return false;
+        };
+        self.insert_image_data_at_range(&bytes, &title, &mime, body, character_index)
     }
 
     fn read_pasteboard_image(&self) -> PasteboardImage {
@@ -5547,6 +5729,18 @@ fn read_pasteboard_image_from(pasteboard: &NSPasteboard) -> PasteboardImage {
         return normalize_paste_image(data.to_vec(), "clipboard.jpg", "image/jpeg");
     }
     PasteboardImage::NotImage
+}
+
+#[allow(deprecated)]
+fn paste_plain_text_into_body(body: &NSTextView) -> bool {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let Some(text) = (unsafe { pasteboard.stringForType(NSPasteboardTypeString) }) else {
+        return false;
+    };
+    unsafe {
+        body.insertText(&text as &AnyObject);
+    }
+    true
 }
 
 fn read_file_url_pasteboard_image(pasteboard: &NSPasteboard) -> PasteboardImage {
@@ -5633,7 +5827,13 @@ impl AppDelegate {
             self.set_save_status("图片未插入：格式不支持", true);
             return false;
         }
-        self.insert_image_data_at_range(bytes, title, mime, body, body.selectedRange())
+        let Some(insertion_range) = semantic_range_from_projection(
+            body.selectedRange(),
+            &self.ivars().projection_prefixes.borrow(),
+        ) else {
+            return false;
+        };
+        self.insert_image_data_at_range(bytes, title, mime, body, insertion_range)
     }
 
     fn insert_image_data_at_range(
@@ -5811,7 +6011,12 @@ impl AppDelegate {
                     // install_rendered_document can consult the previous
                     // note's typing context while replacing the view.
                     *self.ivars().editor_session.borrow_mut() = Some(session);
-                    self.install_rendered_document(body, &rendered, NSRange::new(0, 0));
+                    let initial_selection = projection_range_from_semantic(
+                        NSRange::new(0, 0),
+                        &rendered.projection_prefixes,
+                    )
+                    .unwrap_or(NSRange::new(0, 0));
+                    self.install_rendered_document(body, &rendered, initial_selection);
                     if rendered.missing_resources == 0 {
                         ("已保存", false)
                     } else {
@@ -5822,6 +6027,7 @@ impl AppDelegate {
                     eprintln!("native editor load failed: {error}");
                     *self.ivars().editor_session.borrow_mut() = None;
                     self.ivars().projection_attachments.borrow_mut().clear();
+                    self.ivars().projection_prefixes.borrow_mut().clear();
                     self.ivars().projection_empty_carriers.borrow_mut().clear();
                     body.setString(ns_string!("正文无法读取"));
                     ("正文无法读取", true)
@@ -5830,6 +6036,7 @@ impl AppDelegate {
             Err(_) => {
                 *self.ivars().editor_session.borrow_mut() = None;
                 self.ivars().projection_attachments.borrow_mut().clear();
+                self.ivars().projection_prefixes.borrow_mut().clear();
                 self.ivars().projection_empty_carriers.borrow_mut().clear();
                 body.setString(ns_string!("正文无法读取"));
                 ("正文无法读取", true)
@@ -5851,6 +6058,7 @@ impl AppDelegate {
         self.ivars().autosave.borrow_mut().clear();
         *self.ivars().editor_session.borrow_mut() = None;
         self.ivars().projection_attachments.borrow_mut().clear();
+        self.ivars().projection_prefixes.borrow_mut().clear();
         self.ivars().projection_empty_carriers.borrow_mut().clear();
         self.ivars()
             .title_field
@@ -5962,6 +6170,18 @@ impl AppDelegate {
     }
 
     fn replace_note_list(&self, items: Vec<NoteListItem>) {
+        self.replace_note_list_with_mode(items, false);
+    }
+
+    fn replace_note_list_preserving_editor(&self, items: Vec<NoteListItem>) {
+        self.replace_note_list_with_mode(items, true);
+    }
+
+    fn replace_note_list_with_mode(
+        &self,
+        items: Vec<NoteListItem>,
+        preserve_editor_geometry: bool,
+    ) {
         let Some(collection) = self.ivars().note_collection.get() else {
             return;
         };
@@ -5972,6 +6192,8 @@ impl AppDelegate {
             .collect::<Vec<_>>();
         let update = preview_list_update(&self.ivars().note_previews.borrow(), &previews);
         *self.ivars().note_previews.borrow_mut() = previews;
+        let should_relayout =
+            should_relayout_editor_after_preview_update(&update, preserve_editor_geometry);
         match update {
             PreviewListUpdate::ReloadAll => collection.reloadData(),
             PreviewListUpdate::ReloadIndices(indices) => {
@@ -5989,14 +6211,16 @@ impl AppDelegate {
         if let Some(label) = self.ivars().list_empty_label.get() {
             label.setHidden(!is_empty);
         }
-        let (width, height) = self
-            .ivars()
-            .window
-            .get()
-            .and_then(|window| window.contentView())
-            .map(|content| (content.frame().size.width, content.frame().size.height))
-            .unwrap_or((1100.0, 720.0));
-        self.layout_content(width, height);
+        if should_relayout {
+            let (width, height) = self
+                .ivars()
+                .window
+                .get()
+                .and_then(|window| window.contentView())
+                .map(|content| (content.frame().size.width, content.frame().size.height))
+                .unwrap_or((1100.0, 720.0));
+            self.layout_content(width, height);
+        }
         self.update_note_selection();
     }
 
@@ -6203,7 +6427,7 @@ impl AppDelegate {
                 // structural reload.
                 let query = self.ivars().note_filter_query.borrow().clone();
                 if let Ok(items) = self.note_list_items(&query) {
-                    self.replace_note_list(items);
+                    self.replace_note_list_preserving_editor(items);
                 }
                 if self.ivars().current_note_id.borrow().as_deref() == Some(id)
                     && let Some(label) = self.ivars().updated_label.get()
@@ -6833,6 +7057,7 @@ impl AppDelegate {
             collection_selection_guard: Cell::new(false),
             editor_session: RefCell::new(None),
             projection_attachments: RefCell::new(Vec::new()),
+            projection_prefixes: RefCell::new(Vec::new()),
             projection_empty_carriers: RefCell::new(Vec::new()),
             pending_editor_intents: RefCell::new(Vec::new()),
             pending_editor_composition: RefCell::new(None),
@@ -6869,14 +7094,14 @@ impl AppDelegate {
 mod tests {
     use super::{
         DataDirError, DataFileError, FontTraitOperation, FormatDecision, FormatTarget,
-        LegacyMigrationFailure, Note, PasteFileError, PasteRoute, PasteboardImage, TextFormat,
-        apply_image_paragraph_style, candidate_with_attachment, choose_data_dir,
-        display_note_title, document_from_attributed_string, ensure_notes_database_file,
-        format_decision, format_target, image_signature_matches_mime, inline_attachment_with_width,
-        inline_image_display_size, is_local_file_url_host, is_promised_pasteboard_type,
-        legacy_migration_recovery_message, note_list_summary, note_list_title, paste_route,
-        read_drag_image_file, read_pasteboard_image_from, read_regular_image_file,
-        render_document_to_attributed_string, render_session,
+        LegacyMigrationFailure, Note, PasteFileError, PasteRoute, PasteboardImage,
+        PreviewListUpdate, TextFormat, apply_image_paragraph_style, candidate_with_attachment,
+        choose_data_dir, display_note_title, document_from_attributed_string,
+        ensure_notes_database_file, format_decision, format_target, image_signature_matches_mime,
+        inline_attachment_with_width, inline_image_display_size, is_local_file_url_host,
+        is_promised_pasteboard_type, legacy_migration_recovery_message, note_list_summary,
+        note_list_title, paste_route, read_drag_image_file, read_pasteboard_image_from,
+        read_regular_image_file, render_document_to_attributed_string, render_session,
         selection_snapshot_for_reentrant_appkit, typing_trait_operation,
         valid_image_bytes_for_mime, validate_canonical_data_dir,
     };
@@ -7027,6 +7252,7 @@ mod tests {
     fn pending_appkit_intent_preserves_attachment_identity_and_rejects_stale_views() {
         let intent = |location: usize, resource_id: &str| super::PendingEditorIntent {
             range: NSRange::new(location, 1),
+            semantic_range: None,
             replacement: String::new(),
             old_view_text: "\u{fffc}\u{fffc}".into(),
             old_semantic_text: "\u{fffc}\u{fffc}".into(),
@@ -7059,6 +7285,7 @@ mod tests {
     fn pending_appkit_intent_accepts_zero_offset_utf16_text_insertion() {
         let intent = super::PendingEditorIntent {
             range: NSRange::new(0, 0),
+            semantic_range: None,
             replacement: "前".into(),
             old_view_text: "😀x".into(),
             old_semantic_text: "😀x".into(),
@@ -7073,6 +7300,21 @@ mod tests {
             super::apply_utf16_intent_to_text("😀x", NSRange::new(1, 0), "前"),
             None
         );
+    }
+
+    #[test]
+    fn duplicate_appkit_text_intent_is_idempotent_before_text_did_change() {
+        let intent = super::PendingEditorIntent {
+            range: NSRange::new(1, 0),
+            semantic_range: None,
+            replacement: "Q".into(),
+            old_view_text: "前\u{fffc}后".into(),
+            old_semantic_text: "前\u{fffc}后".into(),
+            covered_attachments: Vec::new(),
+        };
+        let mut pending = vec![intent.clone()];
+        assert!(super::append_pending_editor_intent(&mut pending, intent));
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
@@ -7206,6 +7448,7 @@ mod tests {
         };
         let multi = super::PendingEditorIntent {
             range: NSRange::new(0, 2),
+            semantic_range: None,
             replacement: String::new(),
             old_view_text: "\u{fffc}\u{fffc}".into(),
             old_semantic_text: "\u{fffc}\u{fffc}".into(),
@@ -7219,6 +7462,7 @@ mod tests {
             old_view_text: "old".into(),
             old_semantic_text: "new".into(),
             range: NSRange::new(0, 0),
+            semantic_range: None,
             replacement: "x".into(),
             covered_attachments: Vec::new(),
         };
@@ -7230,6 +7474,7 @@ mod tests {
         for (location, id) in [(0, "image-a"), (1, "image-a2"), (2, "image-b")] {
             let intent = super::PendingEditorIntent {
                 range: NSRange::new(location, 1),
+                semantic_range: None,
                 replacement: String::new(),
                 old_view_text: "\u{fffc}\u{fffc}\u{fffc}".into(),
                 old_semantic_text: "\u{fffc}\u{fffc}\u{fffc}".into(),
@@ -7263,6 +7508,7 @@ mod tests {
                 paragraph: NSMutableParagraphStyle::new(),
             }],
             attachments: Vec::new(),
+            projection_prefixes: Vec::new(),
         };
         assert!(super::exact_empty_block_carrier(&rendered, NSRange::new(0, 0)).is_some());
         assert!(super::exact_empty_block_carrier(&rendered, NSRange::new(0, 1)).is_none());
@@ -8258,6 +8504,78 @@ mod tests {
         assert_eq!(paste_route(true, true), PasteRoute::BodyImporter);
         assert_eq!(paste_route(false, true), PasteRoute::NativeResponder);
         assert_eq!(paste_route(true, false), PasteRoute::NativeResponder);
+    }
+
+    #[test]
+    fn body_paste_never_reenters_text_view_paste_delegate() {
+        assert_eq!(
+            super::body_paste_dispatch(true),
+            super::BodyPasteDispatch::DirectTextInsertion
+        );
+        assert_eq!(
+            super::body_paste_dispatch(false),
+            super::BodyPasteDispatch::ResponderPaste
+        );
+    }
+
+    #[test]
+    fn autosave_preview_refresh_preserves_editor_geometry() {
+        assert!(!super::should_relayout_editor_after_preview_update(
+            &PreviewListUpdate::ReloadIndices(vec![0]),
+            false,
+        ));
+        assert!(super::should_relayout_editor_after_preview_update(
+            &PreviewListUpdate::ReloadAll,
+            false,
+        ));
+        assert!(!super::should_relayout_editor_after_preview_update(
+            &PreviewListUpdate::ReloadAll,
+            true,
+        ));
+    }
+
+    #[test]
+    fn projection_prefix_mapping_survives_sequential_text_edits() {
+        let mut prefixes = vec![
+            super::RenderedProjectionPrefix {
+                projected_range: NSRange::new(0, 2),
+                semantic_offset: 0,
+                text: "• ".into(),
+            },
+            super::RenderedProjectionPrefix {
+                projected_range: NSRange::new(6, 2),
+                semantic_offset: 4,
+                text: "• ".into(),
+            },
+        ];
+        assert_eq!(
+            super::semantic_text_from_projection("• one\n• two", &prefixes).as_deref(),
+            Some("one\ntwo")
+        );
+        assert_eq!(
+            super::semantic_range_from_projection(NSRange::new(5, 0), &prefixes),
+            Some(NSRange::new(3, 0))
+        );
+        assert!(super::adjust_projection_prefixes_with_semantic(
+            &mut prefixes,
+            NSRange::new(5, 0),
+            NSRange::new(3, 0),
+            1,
+        ));
+        assert_eq!(prefixes[1].projected_range, NSRange::new(7, 2));
+        assert_eq!(prefixes[1].semantic_offset, 5);
+        assert_eq!(
+            super::semantic_range_from_projection(NSRange::new(9, 0), &prefixes),
+            Some(NSRange::new(5, 0))
+        );
+        assert_eq!(
+            super::semantic_range_from_projection(NSRange::new(0, 12), &prefixes),
+            Some(NSRange::new(0, 8))
+        );
+        assert_eq!(
+            super::projection_range_from_semantic(NSRange::new(0, 8), &prefixes),
+            Some(NSRange::new(0, 12))
+        );
     }
 
     #[test]
