@@ -4,6 +4,7 @@
 //! only viewport geometry, so an evicted shaped block cannot remain alive in a
 //! second renderer-owned vector.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
 use std::ops::Range;
@@ -12,6 +13,7 @@ use gpui::{
     Bounds, Font, Pixels, Point, ShapedGlyph, SharedString, TextRun, TextStyle, WrapBoundary,
     WrappedLine, WrappedLineLayout, point, px, size,
 };
+use sum_tree::{Bias, ContextLessSummary, Dimension, Item, KeyedItem, SeekTarget, SumTree};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::model::{Affinity, BlockContent, BlockKind, DocPoint, Document, NodeId, Selection};
@@ -97,6 +99,91 @@ pub struct CachedBlockLayout {
     shape_key: ShapeKey,
 }
 
+/// A compact, document-order height index. This follows GPUI's list
+/// implementation: the tree stores one item per block and summarizes both
+/// item count and measured height, so viewport seeks and localized height
+/// replacements share the same balanced tree rather than rebuilding a full
+/// prefix vector for every convergence wave.
+#[derive(Clone, Debug, Default)]
+struct HeightSummary {
+    count: usize,
+    height: f32,
+    max_index: usize,
+}
+
+impl ContextLessSummary for HeightSummary {
+    fn zero() -> Self {
+        Self::default()
+    }
+
+    fn add_summary(&mut self, summary: &Self) {
+        self.count = self.count.saturating_add(summary.count);
+        self.height += summary.height;
+        self.max_index = self.max_index.max(summary.max_index);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HeightItem {
+    index: usize,
+    node_id: NodeId,
+    revision: u64,
+    height: f32,
+}
+
+impl Item for HeightItem {
+    type Summary = HeightSummary;
+
+    fn summary(&self, _: ()) -> Self::Summary {
+        HeightSummary {
+            count: 1,
+            height: self.height.max(1.0),
+            max_index: self.index,
+        }
+    }
+}
+
+impl KeyedItem for HeightItem {
+    type Key = Count;
+
+    fn key(&self) -> Self::Key {
+        Count(self.index)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Count(usize);
+
+impl<'a> Dimension<'a, HeightSummary> for Count {
+    fn zero(_: ()) -> Self {
+        Self(0)
+    }
+
+    fn add_summary(&mut self, summary: &'a HeightSummary, _: ()) {
+        self.0 = summary.max_index;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeightTarget(f32);
+
+impl SeekTarget<'_, HeightSummary, HeightSummary> for HeightTarget {
+    fn cmp(&self, cursor_location: &HeightSummary, _: ()) -> Ordering {
+        self.0
+            .partial_cmp(&cursor_location.height)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CountTarget(usize);
+
+impl SeekTarget<'_, HeightSummary, HeightSummary> for CountTarget {
+    fn cmp(&self, cursor_location: &HeightSummary, _: ()) -> Ordering {
+        Ord::cmp(&self.0, &cursor_location.count)
+    }
+}
+
 /// One document-wide layout registry. Blocks do not own focus or input
 /// entities; all hit testing, selection geometry and caret geometry route
 /// through this registry.
@@ -115,9 +202,9 @@ pub struct LayoutRegistry {
     estimate_revisions: HashMap<NodeId, u64>,
     estimate_width: f32,
     estimate_document_revision: Option<u64>,
-    height_signature: Vec<(NodeId, u64)>,
+    height_tree: SumTree<HeightItem>,
     height_document_revision: Option<u64>,
-    prefix_heights: Vec<f32>,
+    height_index_work: usize,
     shape_count: usize,
     layout_scan_count: usize,
 }
@@ -145,9 +232,9 @@ impl LayoutRegistry {
             estimate_revisions: HashMap::new(),
             estimate_width: 0.0,
             estimate_document_revision: None,
-            height_signature: Vec::new(),
+            height_tree: SumTree::new(()),
             height_document_revision: None,
-            prefix_heights: Vec::new(),
+            height_index_work: 0,
             shape_count: 0,
             layout_scan_count: 0,
         }
@@ -213,6 +300,10 @@ impl LayoutRegistry {
         self.layout_scan_count
     }
 
+    pub fn height_index_work_count(&self) -> usize {
+        self.height_index_work
+    }
+
     /// Build exact geometry for the viewport plus one viewport of prefetch on
     /// either side. Height lookup uses a prefix index; the full text is only
     /// inspected when a block revision or width changes.
@@ -240,8 +331,12 @@ impl LayoutRegistry {
         let viewport_bottom = viewport_top.max(0.0) + viewport_height;
         let prefetch_top = (viewport_top.max(0.0) - viewport_height * PREFETCH_VIEWPORTS).max(0.0);
         let prefetch_bottom = viewport_bottom + viewport_height * PREFETCH_VIEWPORTS;
-        let first = lower_bound(&self.prefix_heights, prefetch_top);
-        let end = upper_bound(&self.prefix_heights, prefetch_bottom).min(document.block_count());
+        let first = self
+            .height_index_at_or_before(prefetch_top)
+            .min(document.block_count());
+        let end = self
+            .height_index_after(prefetch_bottom)
+            .min(document.block_count());
         self.first_visible = first.min(end);
         self.last_visible = end.max(self.first_visible).min(document.block_count());
 
@@ -270,13 +365,8 @@ impl LayoutRegistry {
             let Some(block) = document.blocks().get(index) else {
                 continue;
             };
-            let y = self.prefix_heights.get(index).copied().unwrap_or_default();
-            let height = self
-                .prefix_heights
-                .get(index + 1)
-                .copied()
-                .unwrap_or(y + self.height_for(block.id))
-                - y;
+            let y = self.height_prefix(index);
+            let height = self.height_prefix(index + 1) - y;
             let (before, after, is_image) = block_points(block);
             let layout = BlockLayout {
                 node_id: block.id,
@@ -389,8 +479,9 @@ impl LayoutRegistry {
                     .get(&node_id)
                     .is_none_or(|height| (*height - f32::from(measured_height)).abs() > 0.01)
                 {
-                    self.estimated_heights
-                        .insert(node_id, f32::from(measured_height));
+                    let measured_height = f32::from(measured_height);
+                    self.estimated_heights.insert(node_id, measured_height);
+                    self.update_height_index(node_id, measured_height, block.revision);
                     estimates_changed = true;
                 }
                 let Some(geometry) = self.visible.iter().find(|layout| layout.node_id == node_id)
@@ -404,9 +495,6 @@ impl LayoutRegistry {
             if !estimates_changed {
                 break;
             }
-            self.height_signature.clear();
-            self.height_document_revision = None;
-            self.ensure_height_index(document);
             self.rebuild_visible_window(document, viewport_top, viewport_height, width);
         }
         self.enforce_budget();
@@ -469,7 +557,6 @@ impl LayoutRegistry {
             self.lru.retain(|cached| cached != node_id);
         }
         if !changed_nodes.is_empty() {
-            self.height_signature.clear();
             self.height_document_revision = None;
             self.document_order.clear();
             self.document_order_revision = None;
@@ -513,8 +600,7 @@ impl LayoutRegistry {
         if cached.is_image {
             return Some(image_side(layout.bounds, position, layout.node_id));
         }
-        let text = joined_line_text(&cached.layout.text_lines);
-        if text.is_empty() {
+        if cached.layout.text_lines.iter().all(|line| line.len() == 0) {
             return Some(
                 if position.x <= layout.bounds.left() + layout.bounds.size.width / 2.0 {
                     layout.before
@@ -526,7 +612,7 @@ impl LayoutRegistry {
         let line_height = cached.line_height;
         let relative_y = (position.y - layout.bounds.top()).max(px(0.0));
         let mut line_top = px(0.0);
-        let hard_ranges = hard_line_ranges(&text);
+        let mut hard_start = 0;
         for (line_index, line) in cached.layout.text_lines.iter().enumerate() {
             let height = line.size(line_height).height;
             if relative_y < line_top + height || line_index + 1 == cached.layout.text_lines.len() {
@@ -535,21 +621,22 @@ impl LayoutRegistry {
                 let local = line
                     .closest_index_for_position(point(local_x, local_y), line_height)
                     .unwrap_or_else(|offset| offset);
-                let start = hard_ranges
-                    .get(line_index)
-                    .map(|range| range.start)
-                    .unwrap_or(0);
-                let end = hard_ranges
-                    .get(line_index)
-                    .map(|range| range.end)
-                    .unwrap_or(layout.after.utf8_offset);
+                let end = hard_start + line.len();
                 return Some(DocPoint::with_affinity(
                     layout.node_id,
-                    snap_grapheme_offset(&text, (start + local).min(end), Affinity::After),
+                    hard_start
+                        + snap_grapheme_offset(
+                            line.text.as_ref(),
+                            local.min(line.len()),
+                            Affinity::After,
+                        )
+                        .min(line.len())
+                        .min(end.saturating_sub(hard_start)),
                     Affinity::After,
                 ));
             }
             line_top += height;
+            hard_start = hard_start.saturating_add(line.len() + 1);
         }
         Some(layout.after)
     }
@@ -567,9 +654,8 @@ impl LayoutRegistry {
         if cached.is_image || cached.layout.text_lines.is_empty() {
             return None;
         }
-        let text = joined_line_text(&cached.layout.text_lines);
-        let ranges = hard_line_ranges(&text);
-        let (line_index, offset_in_line) = line_index_for_offset(&ranges, caret.utf8_offset);
+        let (line_index, _hard_start, offset_in_line) =
+            line_position_for_offset(&cached.layout.text_lines, caret.utf8_offset);
         let line = cached.layout.text_lines.get(line_index)?;
         let line_height = cached.line_height;
         let current_position =
@@ -601,19 +687,15 @@ impl LayoutRegistry {
                     .closest_index_for_position(point(x, target_y), line_height)
                     .unwrap_or_else(|offset| offset)
                     .min(target_line.len());
-                let hard_start = ranges
-                    .get(target_line_index)
-                    .map(|range| range.start)
-                    .unwrap_or_default();
-                let hard_end = ranges
-                    .get(target_line_index)
-                    .map(|range| range.end)
-                    .unwrap_or(hard_start);
-                let snapped = snap_grapheme_offset(
-                    &text,
-                    (hard_start + local).min(hard_end),
-                    Affinity::After,
-                );
+                let target_start = line_start_offset(&cached.layout.text_lines, target_line_index);
+                let target_line_len = target_line.len();
+                let snapped = target_start
+                    + snap_grapheme_offset(
+                        target_line.text.as_ref(),
+                        local.min(target_line_len),
+                        Affinity::After,
+                    )
+                    .min(target_line_len);
                 return Some(DocPoint::with_affinity(
                     caret.node_id,
                     snapped,
@@ -631,9 +713,8 @@ impl LayoutRegistry {
         if cached.is_image || cached.layout.text_lines.is_empty() {
             return None;
         }
-        let text = joined_line_text(&cached.layout.text_lines);
-        let ranges = hard_line_ranges(&text);
-        let (line_index, offset_in_line) = line_index_for_offset(&ranges, caret.utf8_offset);
+        let (line_index, hard_start, offset_in_line) =
+            line_position_for_offset(&cached.layout.text_lines, caret.utf8_offset);
         let line = cached.layout.text_lines.get(line_index)?;
         let offsets = wrapped_row_offsets(line);
         let row = row_index_for_offset(&offsets, offset_in_line, caret.affinity);
@@ -642,26 +723,20 @@ impl LayoutRegistry {
         } else {
             offsets.get(row).copied().unwrap_or(0)
         };
-        let hard_start = ranges
-            .get(line_index)
-            .map(|range| range.start)
-            .unwrap_or_default();
-        let hard_end = ranges
-            .get(line_index)
-            .map(|range| range.end)
-            .unwrap_or(hard_start);
-        let offset = (hard_start + local).min(hard_end);
+        let offset = hard_start + local.min(line.len());
         Some(DocPoint::with_affinity(
             caret.node_id,
-            snap_grapheme_offset(
-                &text,
-                offset,
-                if end {
-                    Affinity::After
-                } else {
-                    Affinity::Before
-                },
-            ),
+            hard_start
+                + snap_grapheme_offset(
+                    line.text.as_ref(),
+                    offset.saturating_sub(hard_start),
+                    if end {
+                        Affinity::After
+                    } else {
+                        Affinity::Before
+                    },
+                )
+                .min(line.len()),
             if end {
                 Affinity::After
             } else {
@@ -692,8 +767,6 @@ impl LayoutRegistry {
                 },
             ));
         }
-        let text = joined_line_text(&cached.layout.text_lines);
-        let ranges = hard_line_ranges(&text);
         let (line_index, line) = if last_row {
             let index = cached.layout.text_lines.len().checked_sub(1)?;
             (index, cached.layout.text_lines.get(index)?)
@@ -714,15 +787,10 @@ impl LayoutRegistry {
             )
             .unwrap_or_else(|offset| offset)
             .min(line.len());
-        let start = ranges
-            .get(line_index)
-            .map(|range| range.start)
-            .unwrap_or_default();
-        let end = ranges
-            .get(line_index)
-            .map(|range| range.end)
-            .unwrap_or(start);
-        let offset = snap_grapheme_offset(&text, (start + local).min(end), Affinity::After);
+        let start = line_start_offset(&cached.layout.text_lines, line_index);
+        let offset = start
+            + snap_grapheme_offset(line.text.as_ref(), local.min(line.len()), Affinity::After)
+                .min(line.len());
         Some(DocPoint::with_affinity(node_id, offset, Affinity::After))
     }
 
@@ -738,61 +806,17 @@ impl LayoutRegistry {
         node_id: NodeId,
         range: Range<usize>,
     ) -> Vec<Bounds<Pixels>> {
-        let cached = match self.cache.get(&node_id) {
-            Some(cached) => cached,
-            None => return Vec::new(),
+        let Some(cached) = self.cache.get(&node_id) else {
+            return Vec::new();
         };
         if cached.is_image || range.start >= range.end {
             return Vec::new();
         }
-        let text = joined_line_text(&cached.layout.text_lines);
-        if cached.layout.text_lines.is_empty() {
-            let left = cached.layout.bounds.left() + px(range.start as f32 * FALLBACK_GLYPH_WIDTH);
-            let right = cached.layout.bounds.left() + px(range.end as f32 * FALLBACK_GLYPH_WIDTH);
-            return vec![Bounds::from_corners(
-                point(left, cached.layout.bounds.top()),
-                point(
-                    right.max(left + px(CARET_WIDTH)),
-                    cached.layout.bounds.bottom(),
-                ),
-            )];
-        }
-        let ranges = hard_line_ranges(&text);
-        let (start_line, start_offset) = line_index_for_offset(&ranges, range.start);
-        let (end_line, end_offset) = line_index_for_offset(&ranges, range.end);
-        let mut segments = Vec::new();
-        for line_index in start_line..=end_line {
-            let Some(line) = cached.layout.text_lines.get(line_index) else {
-                continue;
-            };
-            let hard_range = &ranges[line_index];
-            let line_start = if line_index == start_line {
-                start_offset
-            } else {
-                0
-            };
-            let line_end = if line_index == end_line {
-                end_offset
-            } else {
-                hard_range.len()
-            };
-            let line_top = cached.layout.bounds.top()
-                + cached
-                    .layout
-                    .text_lines
-                    .iter()
-                    .take(line_index)
-                    .map(|line| line.size(cached.line_height).height)
-                    .fold(px(0.0), |top, height| top + height);
-            segments.extend(range_segment_bounds_for_line(
-                line,
-                line_top,
-                cached.layout.bounds.left(),
-                cached.line_height,
-                line_start,
-                line_end,
-            ));
-        }
+        let mut segments = Vec::with_capacity(selection_segment_capacity(
+            &cached.layout.text_lines,
+            &range,
+        ));
+        append_range_segment_bounds(&cached.layout, cached.line_height, range, &mut segments);
         segments
     }
 
@@ -821,9 +845,8 @@ impl LayoutRegistry {
             };
             return Some(Bounds::new(point(x, y), size(px(CARET_WIDTH), height)));
         }
-        let text = joined_line_text(&layout.text_lines);
-        let ranges = hard_line_ranges(&text);
-        let (line_index, offset_in_line) = line_index_for_offset(&ranges, caret.utf8_offset);
+        let (line_index, _hard_start, offset_in_line) =
+            line_position_for_offset(&layout.text_lines, caret.utf8_offset);
         let line_top = layout
             .text_lines
             .iter()
@@ -831,8 +854,13 @@ impl LayoutRegistry {
             .map(|line| line.size(cached.line_height).height)
             .fold(px(0.0), |top, height| top + height);
         let line = layout.text_lines.get(line_index)?;
-        let position =
-            line.position_for_index(offset_in_line.min(line.len()), cached.line_height)?;
+        let offset_in_line = snap_grapheme_offset(
+            line.text.as_ref(),
+            offset_in_line.min(line.len()),
+            caret.affinity,
+        )
+        .min(line.len());
+        let position = line.position_for_index(offset_in_line, cached.line_height)?;
         Some(Bounds::new(
             point(
                 layout.bounds.left() + position.x,
@@ -856,7 +884,39 @@ impl LayoutRegistry {
         };
         let start_key = self.point_key(start);
         let end_key = self.point_key(end);
-        let mut rects = Vec::new();
+        let mut rect_capacity = 0usize;
+        for layout in &self.visible {
+            let before_key = self.point_key(layout.before);
+            let after_key = self.point_key(layout.after);
+            if self.is_image(layout.node_id) {
+                if start_key <= self.point_key(layout.before)
+                    && end_key >= self.point_key(layout.after)
+                {
+                    rect_capacity = rect_capacity.saturating_add(1);
+                }
+                continue;
+            }
+            if end_key <= before_key || start_key >= after_key {
+                continue;
+            }
+            let start_offset = if start.node_id == layout.node_id {
+                start.utf8_offset
+            } else {
+                0
+            };
+            let end_offset = if end.node_id == layout.node_id {
+                end.utf8_offset
+            } else {
+                layout.after.utf8_offset
+            };
+            if let Some(cached) = self.cache.get(&layout.node_id) {
+                rect_capacity = rect_capacity.saturating_add(selection_segment_capacity(
+                    &cached.layout.text_lines,
+                    &(start_offset..end_offset),
+                ));
+            }
+        }
+        let mut rects = Vec::with_capacity(rect_capacity);
         for layout in &self.visible {
             let before_key = self.point_key(layout.before);
             let after_key = self.point_key(layout.after);
@@ -881,7 +941,14 @@ impl LayoutRegistry {
             } else {
                 layout.after.utf8_offset
             };
-            rects.extend(self.range_segment_bounds(layout.node_id, start_offset..end_offset));
+            if let Some(cached) = self.cache.get(&layout.node_id) {
+                append_range_segment_bounds(
+                    &cached.layout,
+                    cached.line_height,
+                    start_offset..end_offset,
+                    &mut rects,
+                );
+            }
         }
         rects
     }
@@ -922,7 +989,6 @@ impl LayoutRegistry {
         }
         if width_changed {
             self.estimate_revisions.clear();
-            self.height_signature.clear();
             self.height_document_revision = None;
         }
         self.estimate_width = width;
@@ -955,27 +1021,75 @@ impl LayoutRegistry {
 
     fn ensure_height_index(&mut self, document: &Document) {
         if self.height_document_revision == Some(document.revision())
-            && !self.prefix_heights.is_empty()
+            && self.height_tree.summary().count == document.block_count()
         {
             return;
         }
-        let signature = document
+        let items = document
             .blocks()
             .iter()
-            .map(|block| (block.id, block.revision))
-            .collect::<Vec<_>>();
-        if signature == self.height_signature && !self.prefix_heights.is_empty() {
-            return;
-        }
-        self.height_signature = signature;
-        self.prefix_heights.clear();
-        self.prefix_heights.push(0.0);
-        for block in document.blocks() {
-            let next =
-                self.prefix_heights.last().copied().unwrap_or_default() + self.height_for(block.id);
-            self.prefix_heights.push(next);
-        }
+            .enumerate()
+            .map(|(index, block)| HeightItem {
+                index,
+                node_id: block.id,
+                revision: block.revision,
+                height: self.height_for(block.id),
+            });
+        self.height_tree = SumTree::from_iter(items, ());
+        self.height_index_work = self
+            .height_index_work
+            .saturating_add(document.block_count());
         self.height_document_revision = Some(document.revision());
+    }
+
+    fn update_height_index(&mut self, node_id: NodeId, height: f32, revision: u64) {
+        let Some(&index) = self.document_order.get(&node_id) else {
+            return;
+        };
+        self.height_tree.insert_or_replace(
+            HeightItem {
+                index,
+                node_id,
+                revision,
+                height: height.max(1.0),
+            },
+            (),
+        );
+        // This is a logical localized tree replacement, not a document scan.
+        // Keep the observable counter conservative and independent of the
+        // implementation's internal node fan-out.
+        self.height_index_work = self.height_index_work.saturating_add(1);
+    }
+
+    fn height_prefix(&self, index: usize) -> f32 {
+        let (start, _, _) =
+            self.height_tree
+                .find::<HeightSummary, _>((), &CountTarget(index), Bias::Right);
+        start.height
+    }
+
+    fn height_index_at_or_before(&self, target: f32) -> usize {
+        let (start, _, _) = self.height_tree.find::<HeightSummary, _>(
+            (),
+            &HeightTarget(target.max(0.0)),
+            Bias::Left,
+        );
+        start.count
+    }
+
+    fn height_index_after(&self, target: f32) -> usize {
+        let target = target.max(0.0);
+        let (start, _, item) =
+            self.height_tree
+                .find::<HeightSummary, _>((), &HeightTarget(target), Bias::Right);
+        if item.is_none() {
+            return start.count;
+        }
+        if (start.height - target).abs() <= f32::EPSILON {
+            start.count
+        } else {
+            start.count.saturating_add(1)
+        }
     }
 
     fn height_for(&self, node_id: NodeId) -> f32 {
@@ -1086,17 +1200,34 @@ impl LayoutRegistry {
     }
 
     fn reflow_visible(&mut self) {
-        for visible in &mut self.visible {
-            let index = self
-                .document_order
-                .get(&visible.node_id)
-                .copied()
-                .unwrap_or_default();
-            let y = self.prefix_heights.get(index).copied().unwrap_or_default();
-            let height = self.prefix_heights.get(index + 1).copied().unwrap_or(y) - y;
+        let positions = self
+            .visible
+            .iter()
+            .map(|visible| {
+                let index = self
+                    .document_order
+                    .get(&visible.node_id)
+                    .copied()
+                    .unwrap_or_default();
+                (
+                    visible.node_id,
+                    self.height_prefix(index),
+                    self.height_prefix(index + 1),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (node_id, y, next_y) in positions {
+            let height = next_y - y;
+            let Some(visible) = self
+                .visible
+                .iter_mut()
+                .find(|visible| visible.node_id == node_id)
+            else {
+                continue;
+            };
             visible.bounds.origin.y = px(y);
             visible.bounds.size.height = px(height.max(1.0));
-            if let Some(cached) = self.cache.get_mut(&visible.node_id) {
+            if let Some(cached) = self.cache.get_mut(&node_id) {
                 cached.layout.bounds = visible.bounds;
             }
         }
@@ -1211,16 +1342,20 @@ fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -
 }
 
 fn selection_geometry_reserve(layout: &BlockLayout, requested: usize) -> usize {
-    const SIMULTANEOUS_GEOMETRY_VECTORS: usize = 3;
+    // `selection_rects` computes the final output capacity from the selected
+    // wrapped rows and streams every row boundary into that one vector. No
+    // joined text, hard-line range vector, or per-line row-offset vector is
+    // live on this path; account only for the output allocation and its
+    // fixed Vec header before admitting the shaped block.
     let visual_rows = layout
         .text_lines
         .iter()
         .map(|line| line.wrap_boundaries().len().saturating_add(1))
         .sum::<usize>();
-    let row_storage = visual_rows
+    let output_storage = visual_rows
         .saturating_mul(size_of::<Bounds<Pixels>>())
         .saturating_add(size_of::<Vec<Bounds<Pixels>>>());
-    requested.max(row_storage.saturating_mul(SIMULTANEOUS_GEOMETRY_VECTORS))
+    requested.max(output_storage)
 }
 
 fn contains(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {
@@ -1253,37 +1388,55 @@ fn union_bounds(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Bounds<Pixels> {
     )
 }
 
-fn hard_line_ranges(text: &str) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    for (index, _) in text.match_indices('\n') {
-        ranges.push(start..index);
-        start = index + 1;
-    }
-    ranges.push(start..text.len());
-    ranges
+fn line_start_offset(lines: &[WrappedLine], line_index: usize) -> usize {
+    lines
+        .iter()
+        .take(line_index)
+        .enumerate()
+        .fold(0, |offset, (index, line)| {
+            offset.saturating_add(line.len() + usize::from(index < line_index))
+        })
 }
 
-fn joined_line_text(lines: &[WrappedLine]) -> String {
-    let mut text = String::new();
+/// Resolve a document byte offset directly against the borrowed wrapped
+/// lines. `WrappedLine` values already preserve hard-line boundaries, so the
+/// newline byte is accounted for while walking without joining all lines into
+/// a temporary document string or allocating range metadata.
+fn line_position_for_offset(lines: &[WrappedLine], offset: usize) -> (usize, usize, usize) {
+    if lines.is_empty() {
+        return (0, 0, 0);
+    }
+    let mut start: usize = 0;
     for (index, line) in lines.iter().enumerate() {
-        if index > 0 {
-            text.push('\n');
+        let end = start.saturating_add(line.len());
+        if offset <= end || index + 1 == lines.len() {
+            return (index, start, offset.min(end).saturating_sub(start));
         }
-        text.push_str(line.text.as_ref());
+        start = end.saturating_add(1);
     }
-    text
+    let index = lines.len().saturating_sub(1);
+    let line = &lines[index];
+    (index, start, line.len())
 }
 
-fn line_index_for_offset(ranges: &[Range<usize>], offset: usize) -> (usize, usize) {
-    let clamped = offset.min(ranges.last().map(|range| range.end).unwrap_or(0));
-    for (index, range) in ranges.iter().enumerate() {
-        if clamped <= range.end {
-            return (index, clamped.saturating_sub(range.start));
-        }
+/// Count the geometry rows touched by a document-byte range without creating
+/// the temporary row-offset vector used by visual navigation. The result is
+/// an upper bound for the output rectangle capacity, so the real selection
+/// path can allocate its final `Bounds` vector once.
+fn selection_segment_capacity(lines: &[WrappedLine], range: &Range<usize>) -> usize {
+    if range.start >= range.end {
+        return 0;
     }
-    let index = ranges.len().saturating_sub(1);
-    (index, ranges.get(index).map(Range::len).unwrap_or_default())
+    if lines.is_empty() {
+        return 1;
+    }
+    let (start_line, _, _) = line_position_for_offset(lines, range.start);
+    let (end_line, _, _) = line_position_for_offset(lines, range.end);
+    (start_line..=end_line)
+        .filter_map(|line_index| lines.get(line_index))
+        .map(wrapped_row_count)
+        .sum::<usize>()
+        .max(1)
 }
 
 fn wrap_boundary_offset(line: &WrappedLine, wrap_index: usize) -> Option<usize> {
@@ -1311,6 +1464,37 @@ fn wrapped_row_offsets(line: &WrappedLine) -> Vec<usize> {
     offsets
 }
 
+fn wrapped_row_count(line: &WrappedLine) -> usize {
+    let mut count = 0usize;
+    for_each_wrapped_row(line, |_, _| count = count.saturating_add(1));
+    count
+}
+
+/// Visit the same row intervals as `wrapped_row_offsets`, but keep all
+/// offsets in locals. Selection/caret geometry uses this path because its
+/// output vector is already owned by the caller and no per-line scratch is
+/// necessary.
+fn for_each_wrapped_row(line: &WrappedLine, mut visit: impl FnMut(usize, usize)) {
+    if line.len() == 0 {
+        visit(0, 0);
+        return;
+    }
+    let mut row_start = 0usize;
+    for index in 0..line.wrap_boundaries().len() {
+        let Some(offset) = wrap_boundary_offset(line, index) else {
+            continue;
+        };
+        let row_end = offset.min(line.len());
+        if row_end > row_start {
+            visit(row_start, row_end);
+            row_start = row_end;
+        }
+    }
+    if row_start < line.len() {
+        visit(row_start, line.len());
+    }
+}
+
 fn row_index_for_offset(offsets: &[usize], offset: usize, affinity: Affinity) -> usize {
     if offsets.len() < 2 {
         return 0;
@@ -1330,6 +1514,60 @@ fn row_index_for_offset(offsets: &[usize], offset: usize, affinity: Affinity) ->
     offsets.len().saturating_sub(2)
 }
 
+fn append_range_segment_bounds(
+    layout: &BlockLayout,
+    line_height: Pixels,
+    range: Range<usize>,
+    segments: &mut Vec<Bounds<Pixels>>,
+) {
+    if range.start >= range.end {
+        return;
+    }
+    if layout.text_lines.is_empty() {
+        let left = layout.bounds.left() + px(range.start as f32 * FALLBACK_GLYPH_WIDTH);
+        let right = layout.bounds.left() + px(range.end as f32 * FALLBACK_GLYPH_WIDTH);
+        segments.push(Bounds::from_corners(
+            point(left, layout.bounds.top()),
+            point(right.max(left + px(CARET_WIDTH)), layout.bounds.bottom()),
+        ));
+        return;
+    }
+    let (start_line, _, start_offset) = line_position_for_offset(&layout.text_lines, range.start);
+    let (end_line, _, end_offset) = line_position_for_offset(&layout.text_lines, range.end);
+    let mut line_top = layout.bounds.top()
+        + layout
+            .text_lines
+            .iter()
+            .take(start_line)
+            .map(|line| line.size(line_height).height)
+            .fold(px(0.0), |top, height| top + height);
+    for line_index in start_line..=end_line {
+        let Some(line) = layout.text_lines.get(line_index) else {
+            continue;
+        };
+        let line_start = if line_index == start_line {
+            start_offset
+        } else {
+            0
+        };
+        let line_end = if line_index == end_line {
+            end_offset
+        } else {
+            line.len()
+        };
+        range_segment_bounds_for_line(
+            line,
+            line_top,
+            layout.bounds.left(),
+            line_height,
+            line_start,
+            line_end,
+            segments,
+        );
+        line_top += line.size(line_height).height;
+    }
+}
+
 fn range_segment_bounds_for_line(
     line: &WrappedLine,
     line_top: Pixels,
@@ -1337,16 +1575,15 @@ fn range_segment_bounds_for_line(
     line_height: Pixels,
     start_offset: usize,
     end_offset: usize,
-) -> Vec<Bounds<Pixels>> {
-    let offsets = wrapped_row_offsets(line);
-    let mut segments = Vec::new();
-    for row_index in 0..offsets.len().saturating_sub(1) {
-        let row_start = offsets[row_index];
-        let row_end = offsets[row_index + 1];
+    segments: &mut Vec<Bounds<Pixels>>,
+) {
+    let mut row_index = 0usize;
+    for_each_wrapped_row(line, |row_start, row_end| {
         let segment_start = start_offset.max(row_start).min(row_end);
         let segment_end = end_offset.min(row_end).max(row_start);
         if segment_start >= segment_end {
-            continue;
+            row_index = row_index.saturating_add(1);
+            return;
         }
         let row_start_x = line.unwrapped_layout.x_for_index(row_start);
         let start_x = line.unwrapped_layout.x_for_index(segment_start) - row_start_x;
@@ -1359,8 +1596,8 @@ fn range_segment_bounds_for_line(
                 row_top + line_height,
             ),
         ));
-    }
-    segments
+        row_index = row_index.saturating_add(1);
+    });
 }
 
 fn snap_grapheme_offset(text: &str, offset: usize, affinity: Affinity) -> usize {
@@ -1384,16 +1621,6 @@ fn snap_grapheme_offset(text: &str, offset: usize, affinity: Affinity) -> usize 
         .map(|(start, _)| start)
         .find(|start| *start > offset)
         .unwrap_or(text.len())
-}
-
-fn lower_bound(values: &[f32], target: f32) -> usize {
-    values
-        .partition_point(|value| *value < target)
-        .saturating_sub(1)
-}
-
-fn upper_bound(values: &[f32], target: f32) -> usize {
-    values.partition_point(|value| *value <= target)
 }
 
 #[cfg(test)]

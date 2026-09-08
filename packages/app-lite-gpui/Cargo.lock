@@ -7047,6 +7047,7 @@ dependencies = [
  "embed-resource",
  "futures",
  "gpui",
+ "gpui_sum_tree",
  "mermaid-rs-renderer",
  "pulldown-cmark",
  "ratex-layout",

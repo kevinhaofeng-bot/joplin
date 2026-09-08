@@ -2,6 +2,7 @@ use super::core::EditorCore;
 use super::history::History;
 use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,11 +20,20 @@ use super::transaction::{Transaction, TransactionBatch};
 
 struct CountingAllocator;
 
-static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Keep the measurement state on the test worker that owns the real
+    // selection call. A process-global counter lets another concurrently
+    // running gpui test contaminate the observed scratch peak.
+    static MEASURING_ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        MEASURING_ALLOCATIONS.with(|measuring| {
+            if let Some(bytes) = measuring.get() {
+                measuring.set(Some(bytes.saturating_add(layout.size())));
+            }
+        });
         unsafe { System.alloc(layout) }
     }
 
@@ -34,6 +44,25 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+struct AllocationMeasurement;
+
+impl AllocationMeasurement {
+    fn begin() -> Self {
+        MEASURING_ALLOCATIONS.with(|measuring| measuring.set(Some(0)));
+        Self
+    }
+
+    fn bytes(&self) -> usize {
+        MEASURING_ALLOCATIONS.with(|measuring| measuring.get().unwrap_or(0))
+    }
+}
+
+impl Drop for AllocationMeasurement {
+    fn drop(&mut self) {
+        MEASURING_ALLOCATIONS.with(|measuring| measuring.set(None));
+    }
+}
 
 #[test]
 fn paste_image_splits_paragraph_once() {
@@ -511,7 +540,7 @@ fn small_edit_does_not_allocate_a_full_document_clone() {
         (0..20_000).map(|index| format!("block-{index}-{}", "z".repeat(1_024))),
     );
     let node = doc.first_node_id().unwrap();
-    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    let measurement = AllocationMeasurement::begin();
     doc.apply(Transaction::InsertText {
         selection: Selection::caret(DocPoint::new(node, 0)),
         text: "x".into(),
@@ -520,9 +549,9 @@ fn small_edit_does_not_allocate_a_full_document_clone() {
     assert!(
         // Invariant validation and concurrently running tests allocate a
         // little noise; keep the limit well below the ~32 MiB full clone.
-        ALLOCATED_BYTES.load(Ordering::Relaxed) < 24_000_000,
+        measurement.bytes() < 24_000_000,
         "small edit allocated a full-document-sized candidate: {} bytes",
-        ALLOCATED_BYTES.load(Ordering::Relaxed)
+        measurement.bytes()
     );
 }
 
@@ -1174,31 +1203,60 @@ async fn entity_input_commit_restores_reverse_selection_affinities(cx: &mut gpui
 }
 
 #[gpui::test]
-async fn entity_input_marked_endpoints_use_final_grapheme_boundaries(
+async fn entity_input_marked_endpoints_keep_actual_candidate_interval(
     cx: &mut gpui::TestAppContext,
 ) {
     let mut cx = cx.add_empty_window();
-    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("\u{301}"), cx));
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("a"), cx));
+    let original_selection =
+        cx.update(|_, cx| entity.read_with(cx, |editor, _| editor.selection()));
     cx.update(|window, cx| {
         entity.update(cx, |editor, editor_cx| {
-            editor.set_caret_utf8(0);
+            editor.set_caret_utf8(1);
             <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
                 editor,
                 None,
-                "a",
+                "\u{301}",
                 Some(0..0),
                 window,
                 editor_cx,
             );
             assert_eq!(editor.visible_text(), "a\u{301}");
             assert!(editor.selection().is_caret());
-            assert!(matches!(editor.selection().head.utf8_offset, 0 | 3));
+            assert_eq!(editor.selection().head.utf8_offset, 3);
             assert_eq!(
                 <EditorCore as EntityInputHandler>::marked_text_range(editor, window, editor_cx,),
                 Some(0..2)
             );
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(0..2),
+                "\u{308}",
+                Some(0..0),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "a\u{308}");
+            assert!(editor.selection().is_caret());
+            assert_eq!(
+                <EditorCore as EntityInputHandler>::marked_text_range(editor, window, editor_cx,),
+                Some(0..2)
+            );
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "b", window, editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "ab");
+            assert_eq!(editor.undo_depth(), 1);
         });
     });
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(entity.read_with(cx, |editor, _| editor.visible_text()), "a");
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
 }
 
 #[gpui::test]
@@ -1241,6 +1299,51 @@ async fn measured_reflow_shapes_every_final_member_without_fixed_pass_hole(
 }
 
 #[gpui::test]
+async fn measured_reflow_uses_incremental_height_sum_tree_for_large_document(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let document = Document::from_paragraphs((0..20_000).map(|index| format!("row-{index}")));
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| {
+        let mut tall = window.text_style();
+        tall.line_height = px(1000.0).into();
+        layout.shape_visible_with_style(&document, 0.0, 100_000.0, 680.0, tall, window);
+    });
+    let work_before = layout.height_index_work_count();
+    cx.update(|window, _| {
+        layout.shape_visible_with_style(
+            &document,
+            120.0,
+            120.0,
+            680.0,
+            window.text_style(),
+            window,
+        );
+    });
+    let index_work = layout.height_index_work_count().saturating_sub(work_before);
+    assert!(
+        index_work < 4_096,
+        "height index work scaled with full-document convergence waves: {index_work}"
+    );
+    let final_range = layout.visible_range();
+    for block in document
+        .blocks()
+        .get(final_range)
+        .expect("final viewport range")
+    {
+        assert!(
+            layout
+                .cache
+                .get(&block.id)
+                .is_some_and(|cached| !cached.layout.text_lines.is_empty()),
+            "final member {} was exposed without shaping",
+            block.id.raw()
+        );
+    }
+}
+
+#[gpui::test]
 async fn shaped_cache_budget_accounts_dynamic_selection_geometry_scratch(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -1259,15 +1362,60 @@ async fn shaped_cache_budget_accounts_dynamic_selection_geometry_scratch(
         rects.len() > 8,
         "soft wrapping must exercise geometry growth"
     );
-    let conservative_scratch = rects
+    let output_storage = rects
         .len()
         .saturating_mul(size_of::<Bounds<gpui::Pixels>>())
-        .saturating_mul(3);
+        .saturating_add(size_of::<Vec<Bounds<gpui::Pixels>>>());
     assert!(
-        cached.selection_geometry_bytes >= conservative_scratch,
-        "selection geometry reserve {} is below simultaneously-live scratch {}",
+        cached.selection_geometry_bytes >= output_storage,
+        "selection geometry reserve {} is below final output storage {}",
         cached.selection_geometry_bytes,
-        conservative_scratch
+        output_storage
+    );
+    assert!(layout.used_bytes() <= layout.budget_bytes());
+    assert!(layout.peak_accounted_bytes() <= layout.budget_bytes());
+}
+
+#[gpui::test]
+async fn selection_geometry_real_path_peak_covers_allocator(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let text = "wide-ascii ".repeat(12_000);
+    let document = Document::from_paragraph(text);
+    let node = document.first_node_id().expect("paragraph");
+    let mut baseline = LayoutRegistry::new();
+    cx.update(|window, _| {
+        baseline.shape_visible_with_window(&document, 0.0, 100_000.0, 160.0, window);
+    });
+    let baseline_cached = baseline
+        .cache
+        .get(&node)
+        .expect("baseline shaped paragraph");
+    let admission_budget = baseline_cached
+        .bytes
+        .saturating_add(256 * 1024)
+        .min(LAYOUT_CACHE_BUDGET_BYTES - 1);
+    assert!(admission_budget < LAYOUT_CACHE_BUDGET_BYTES);
+    let mut layout = LayoutRegistry::with_budget(admission_budget);
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 100_000.0, 160.0, window);
+    });
+    let cached = layout
+        .cache
+        .get(&node)
+        .expect("near-budget shaped paragraph");
+    let selection = Selection::new(cached.layout.before, cached.layout.after);
+    let measurement = AllocationMeasurement::begin();
+    let rects = layout.selection_rects(selection);
+    let observed = measurement.bytes();
+    assert!(
+        rects.len() > 100,
+        "selection must span many soft-wrapped rows"
+    );
+    let margin = 64 * 1024;
+    assert!(
+        observed <= cached.selection_geometry_bytes.saturating_add(margin),
+        "selection scratch allocation {observed} exceeded reserved {} plus margin {margin}",
+        cached.selection_geometry_bytes
     );
     assert!(layout.used_bytes() <= layout.budget_bytes());
     assert!(layout.peak_accounted_bytes() <= layout.budget_bytes());
@@ -1298,7 +1446,7 @@ async fn entity_input_repeated_candidates_do_not_clone_document_or_history(
                 .revision,
         )
     });
-    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    let measurement = AllocationMeasurement::begin();
     cx.update(|window, cx| {
         entity.update(cx, |editor, editor_cx| {
             editor.set_caret_utf8(0);
@@ -1323,7 +1471,7 @@ async fn entity_input_repeated_candidates_do_not_clone_document_or_history(
             assert_eq!(editor.undo_depth(), 1);
         });
     });
-    let allocated = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    let allocated = measurement.bytes();
     let (block_count, first_after, last_after, undo_depth) = entity.read_with(cx, |editor, _| {
         (
             editor.document().block_count(),

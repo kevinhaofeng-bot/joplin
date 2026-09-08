@@ -113,7 +113,7 @@ cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor --off
 | Important-2 历史原子性 | `History::apply_batch_with_selection` 让 IME commit 和 Return（DeleteRange+SplitBlock）各为一个 undo entry；候选中间更新先撤销 provisional entry。 |
 | Important-3 notify/error | 两个 `EntityInputHandler` 替换回调在成功和失败路径都 `cx.notify()`；`last_input_error` 可读，越界 UTF-16 range 明确报告 `DocumentError`。 |
 | Important-4 软换行/真实高度 | `shape_visible_with_window` 直接调用 GPUI `shape_text(...).into_vec()`，保留 `WrappedLine`/真实 line height，实际高度回写 prefix index 并推动后续 block。 |
-| Important-5 硬换行偏移 | `joined_line_text` 与 donor hard-line ranges 为每个 `WrappedLine` 插入换行 byte；命中、caret、range segment 共用同一 hard-line start。 |
+| Important-5 硬换行偏移 | donor hard-line ranges 的换行 byte 语义由 line_start_offset/line_position_for_offset 直接按借用 WrappedLine 长度复现；命中、caret、range segment 共用同一 hard-line start。 |
 | Important-6 跨视口选择 | `selection_rects` 用全文 document order 与 visible block 求交，并逐 WrappedLine/soft row 返回 segment，不生成跨行 union selection。 |
 | Important-7 图片 affinity | `Before < After` 进入 `point_key`；纯 caret 不产生 atom selection；图片 caret 按 affinity 左/右定位并采用邻接文本 line height；反向 Before/After range 仍命中图片。 |
 | Important-8 真实 16 MiB | cache bytes 计入 `WrappedLine`、layout、text、wrap boundaries、runs、glyphs 和 selection geometry；visible 只留 geometry，拒绝/驱逐 shaped entry 后不留第二份 text lines；真实 128 KiB shaped block + 极小 budget 回归通过。 |
@@ -132,7 +132,7 @@ cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor --off
 | `components/block/runtime/mod.rs:1539-1615,1726-1747` 的 composition base/marked 更新路径 | `EditorCore::replace_and_mark_utf16` / `commit_marked_text`；provisional transaction 经 History undo/reapply 合并成一次用户动作。 |
 | `editor/selection.rs:1031-1052` 的输入 selection 更新 | `selection_for_input_range` + `point_for_document_offset_with_affinity`；整篇换行和 U+FFFC 都纳入 UTF-16 flat text。 |
 | `editor/history.rs:77-137`、`editor/mod.rs:295-298`、`editor/tests.rs:2566-2668` 的捕获/非合并 undo 语义 | native `History::apply_batch_with_selection`；Return 和 IME commit 保留单条非合并 entry。 |
-| `components/block/element.rs:242-263,279-312,353-512,938-985` 的 hard-line、WrappedLine、position/closest/range segment | `native_editor/layout.rs` 的 `hard_line_ranges`、`wrapped_row_offsets`、`visual_move`、`visual_line_boundary`、`range_segment_bounds_for_line`、`point_to_doc`。 |
+| `components/block/element.rs:242-263,279-312,353-512,938-985` 的 hard-line、WrappedLine、position/closest/range segment | `native_editor/layout.rs` 的 `line_start_offset`/`line_position_for_offset`、`wrapped_row_offsets`（仅视觉导航）、`visual_move`、`visual_line_boundary`、`range_segment_bounds_for_line`、`point_to_doc`。 |
 | `editor/selection.rs:364-493` 的跨 viewport selection 端点/可见绘制 | `LayoutRegistry::point_key` + `selection_rects`，只输出可见逐行 segment。 |
 | donor 的图片 Before/After affinity 与 caret geometry | `layout.rs::image_side`、`caret_bounds_for_point`、`visual_edge_point`；`render.rs` 只消费 registry geometry。 |
 | donor `components/block/runtime/mod.rs:1879-2020`、`interactions.rs:663-704`、`events.rs:2167-2228` 的 preferred-x 视觉移动 | `LayoutRegistry::visual_move/visual_edge_point` + `EditorCore::preferred_x`，跨块入口使用同一 x。 |
@@ -258,3 +258,78 @@ cargo test --manifest-path packages/app-lite-gpui/Cargo.toml \
 Round 4/5 仍只修改 `packages/app-lite-gpui/src/native_editor/` 下的实现/测试与本报告；
 没有修改 donor、plan/spec、验收矩阵、控制器 ledger 或 findings。Headless GREEN 仍不
 替代真机候选窗、主题字体、Metal/RSS 和异步图片解码验收。
+
+## Fix round 5/5（三项最终复审 findings）
+
+本轮基线为 934ac18a9。先把三个 production-path 回归置为 RED，再按 donor/GPUI
+已有协议修复；没有通过测试 helper、直接 Document::apply 或测试专用布局路径绕过
+EntityInputHandler、EditorCore、LayoutRegistry。
+
+### RED -> GREEN
+
+初始精确回归为 76 个 native tests 中 73 个通过、3 个失败：
+
+| 测试 | RED 暴露的问题 | GREEN 修复/证据 |
+| --- | --- | --- |
+| entity_input_marked_endpoints_keep_actual_candidate_interval | 组合标记相邻时把公开 grapheme span 当作候选实际区间，第二次候选/commit 顺序错误（左侧出现 combining mark）； | MarkedText 显式保存 public utf8_range 与 internal actual_utf8_range；候选更新、commit、inverse remap 只用 actual interval，公开 range 仍在最终文档上吸附 grapheme；二次候选、commit、一次 Undo 和原始 caret 均通过。 |
+| measured_reflow_uses_incremental_height_sum_tree_for_large_document | 20,000 块在收敛波次反复重建全文前缀，index work 为 280,000（后续旧 keyed summary 仍为 20,014）； | 直接接入 gpui_sum_tree 0.2.2 的 Item/Summary/Dimension/SeekTarget/insert_or_replace；结构/宽度变化才全量建树，测量高度只更新单个路径，最终成员均已 shape，20k work 增量为有界局部值。 |
+| selection_geometry_real_path_peak_covers_allocator | near-budget 长段在旧 scratch 组合下要么无法 admission，要么真实 selection_rects 分配峰值超过 reserve； | 删除 joined text、hard-line range Vec 和 per-line row-offset Vec；先按选中可见 wrapped rows 预留唯一最终 Bounds Vec，再流式写入。计数 allocator 改为当前测试线程的 scoped Cell，真实 selection 调用的 observed allocation 由 reserve + 64 KiB margin 覆盖，16 MiB accounted used/peak 仍不超。 |
+
+最终 focused native suite：
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml \
+      --bin velotype native_editor --offline -- --nocapture
+    76 passed, 0 failed
+
+### 三项 finding 对照
+
+1. IME 公开/内部坐标分离：MarkedText::utf8_range 是平台可见、grapheme-safe
+   marked span；actual_utf8_range 是候选文档中真实插入字节区间。
+   candidate_selection_for_marked_range 只有在 public span 因组合字符扩大时才将平台范围
+   约束到 actual interval，保留 donor 对普通显式 candidate range 的语义。这样
+   "a" + combining mark + 第二次候选 + "b" 得到 "ab"，一次 Undo 恢复 "a" 和原方向/affinity
+   selection。
+2. 增量高度索引：LayoutRegistry::height_tree 以文档序 block 为 item，HeightSummary
+   同时维护 count/height/max index；viewport seek 使用 tree find，实测高度使用
+   insert_or_replace。height_index_work_count 的 20k 回归证明第二次 style/viewport
+   shape 不按全文块数乘收敛波次增长，最终 visible/prefetch 集合中的每个 block 都有真实
+   shaped layout。
+3. 几何 scratch 与硬预算：selection_rects 两遍扫描可见布局，第一遍按实际 wrapped
+   row 上界一次性分配唯一输出 Vec，第二遍调用无分配的
+   append_range_segment_bounds/for_each_wrapped_row；hard-line 起点和行高在借用的
+   WrappedLine 上累计。selection_geometry_reserve 只计最终 Bounds capacity 和 Vec
+   header；回归通过真实 near-budget admission、真实 selection/caret geometry 和 scoped
+   allocator 观测，而不是复算实现公式。
+
+### Round 5 donor/GPUI 复用映射
+
+| donor/GPUI 算法或路径 | round 5 native 适配 |
+| --- | --- |
+| components/block/input.rs:116-179、runtime/mod.rs:1539-1615,1726-1747 的 marked/candidate/commit 协议 | core.rs::MarkedText、candidate_selection_for_marked_range、replace_and_mark_utf16、commit_marked_text_with_range；公开 marked span 和内部 actual candidate interval 分开，失败仍由现有 transaction/history 原子边界处理。 |
+| editor/selection.rs:1031-1052 的全文 flat endpoint/affinity 与 donor grapheme boundary | actual_marked_flat_range、selection_flat_range 和最终文档 grapheme resolution；不从 public expanded span 反推候选 inverse 坐标。 |
+| GPUI gpui-0.2.2/src/elements/list.rs:1112-1184 的 Item/Summary/Count/Height/seek/splice 模式；底层 gpui_sum_tree-0.2.2/src/sum_tree.rs | layout.rs::HeightItem/HeightSummary/Count/HeightTarget/CountTarget/SumTree；Cargo 以 sum_tree = { package = "gpui_sum_tree", version = "0.2.2" } 直接声明可见依赖，并锁定到 donor 已有 0.2.2。 |
+| components/block/element.rs:242-263,279-312,353-512,938-985 的 shape_text、WrappedLine measured height、position/closest/range segment | shape_visible_with_style 保留 shape_text(...).into_vec() 和真实 line height；line_start_offset/line_position_for_offset/for_each_wrapped_row/append_range_segment_bounds 直接消费借用的 wrapped lines，不创建 joined text 或 hard-line ranges。 |
+| donor selection range geometry 与 GPUI Bounds capacity 语义 | selection_rects 先计算 wrapped-row capacity 后填充单一 Vec；selection_geometry_reserve 与 near-budget allocator regression 共同守住最终 output allocation，线程本地 measurement 避免并发测试互相污染。 |
+
+### Round 5 验收命令
+
+    cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml --all -- --check
+    PASS
+
+    cargo check --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype --offline
+    PASS
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run --offline
+    PASS
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype --offline \
+      --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
+    827 passed, 0 failed, 1 filtered
+
+    git diff --check
+    PASS
+
+Round 5 修改范围为 native editor 实现/测试、本报告，以及为直接复用 GPUI sum tree
+所需的 packages/app-lite-gpui/Cargo.toml/Cargo.lock；没有修改 donor、plan/spec、
+验收矩阵、控制器 ledger 或 findings。剩余顾虑仍是 headless 测试不能替代真机 IME
+候选窗、主题字体/Metal/RSS、异步图片解码和真实 UI 外壳集成验收。
