@@ -1,7 +1,10 @@
+use super::core::EditorCore;
 use super::history::History;
+use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use gpui::{AppContext, Bounds, EntityInputHandler, point, px};
 use smallvec::SmallVec;
 
 use super::model::{
@@ -875,4 +878,236 @@ fn replacement_preserves_style_isolation_across_combining_grapheme_seam() {
     // The combining mark joins the inserted `x` into one grapheme; the
     // resulting grapheme remains Italic without importing Bold from the left.
     assert_run_marks(&doc.blocks()[0], 1, 4, &[Mark::Italic]);
+}
+
+#[test]
+fn long_document_layout_is_bounded() {
+    let document = Document::from_paragraphs((0..10_000).map(|index| format!("block-{index}")));
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 4_000.0, 480.0, 680.0);
+    assert!(layout.visible_range().len() < document.block_count());
+    assert!(layout.exact_cache_len() <= layout.visible_range().len());
+    assert!(layout.used_bytes() <= LAYOUT_CACHE_BUDGET_BYTES);
+}
+
+#[test]
+fn layout_cache_evicts_before_16_mib() {
+    let document = Document::from_paragraphs((0..10_000).map(|_| "x".repeat(4_096)));
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 240.0, 680.0);
+    assert!(layout.used_bytes() <= 16 * 1024 * 1024);
+    assert!(layout.exact_cache_len() < document.block_count());
+    let ids = layout
+        .exact_cache_ids()
+        .collect::<std::collections::HashSet<_>>();
+    assert!(ids.len() <= layout.visible_range().len());
+}
+
+#[test]
+fn image_hit_testing_exposes_before_and_after_document_points() {
+    let mut document = Document::from_paragraph("甲");
+    document
+        .apply(Transaction::InsertImage {
+            selection: document.end_selection(),
+            resource_id: "image".into(),
+            natural_size: (1600, 900),
+        })
+        .unwrap();
+    let image_id = document.blocks()[1].id;
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 640.0, 680.0);
+    let image = layout
+        .visible()
+        .iter()
+        .find(|block| block.node_id == image_id)
+        .cloned();
+    let image = image.expect("image should be in the viewport window");
+    let before = layout
+        .point_to_doc(point(
+            image.bounds.left() + px(2.0),
+            image.bounds.top() + px(2.0),
+        ))
+        .expect("image hit should resolve");
+    let after = layout
+        .point_to_doc(point(
+            image.bounds.right() - px(2.0),
+            image.bounds.bottom() - px(2.0),
+        ))
+        .expect("image hit should resolve");
+    assert_eq!(before.node_id, image_id);
+    assert_eq!(before.affinity, Affinity::Before);
+    assert_eq!(after.node_id, image_id);
+    assert_eq!(after.affinity, Affinity::After);
+}
+
+#[gpui::test]
+fn ime_commit_preserves_utf16_selection(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    editor
+        .replace_and_mark_utf16(None, "中华", Some(0..2))
+        .unwrap();
+    assert_eq!(editor.visible_text(), "前中华后");
+    assert_eq!(editor.marked_text(), Some("中华"));
+    editor.commit_marked_text("中国").unwrap();
+    assert_eq!(editor.visible_text(), "前中国后");
+    assert_eq!(editor.marked_text(), None);
+}
+
+#[gpui::test]
+fn cross_block_selection_includes_image_atom(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::fixture_text_image_text("甲", "image", "乙", cx);
+    editor.select_document_range(0, editor.document_len());
+    assert_eq!(editor.copy_plain_text(), "甲\n\u{fffc}\n乙");
+    editor.delete_selection().unwrap();
+    assert_eq!(editor.document().block_kinds(), [BlockKind::Paragraph]);
+    editor.undo().unwrap();
+    assert_eq!(editor.copy_plain_text(), "甲\n\u{fffc}\n乙");
+}
+
+#[gpui::test]
+fn editing_commands_cross_block_boundaries(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::fixture_text_image_list("甲", "image", "乙", cx);
+    let left_id = editor.document().blocks()[0].id;
+    let image_id = editor.document().blocks()[1].id;
+    let list_id = editor.document().blocks()[2].id;
+    editor.command_a();
+    assert_eq!(editor.copy_plain_text(), "甲\n\u{fffc}\n乙");
+    editor.cut_selection().unwrap();
+    assert_eq!(editor.document().block_kinds(), [BlockKind::Paragraph]);
+    editor.undo().unwrap();
+    editor.redo().unwrap();
+    assert_eq!(editor.document().block_kinds(), [BlockKind::Paragraph]);
+    editor.undo().unwrap();
+    editor.move_to_image_after();
+    editor.move_left();
+    assert!(editor.caret_is_before_image());
+    editor.move_right();
+    assert!(editor.caret_is_after_image());
+    editor.move_up();
+    assert_eq!(editor.selection().head.node_id, left_id);
+    editor.move_end();
+    assert_eq!(editor.selection().head.utf8_offset, "甲".len());
+    editor.move_down();
+    assert_eq!(editor.selection().head.node_id, list_id);
+    editor.move_home();
+    assert_eq!(editor.selection().head.utf8_offset, 0);
+    editor.move_up();
+    assert_eq!(editor.selection().head.node_id, left_id);
+    editor.move_to_image_after();
+    editor.insert_paragraph_break().unwrap();
+    editor.undo().unwrap();
+    editor.backspace().unwrap();
+    editor.undo().unwrap();
+    editor.move_to_image_before();
+    editor.delete_forward().unwrap();
+    editor.undo().unwrap();
+    editor.command_a();
+    editor.paste_plain_text("跨块").unwrap();
+    assert_eq!(editor.visible_text(), "跨块");
+    editor.undo().unwrap();
+    editor.redo().unwrap();
+    assert_eq!(editor.visible_text(), "跨块");
+    editor.undo().unwrap();
+    assert_eq!(editor.document().blocks()[1].id, image_id);
+    editor.command_a();
+    assert_eq!(editor.copy_plain_text(), "甲\n\u{fffc}\n乙");
+}
+
+#[gpui::test]
+async fn entity_input_uses_document_wide_utf16_coordinates(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let editor = EditorCore::fixture_text_image_list("甲", "image", "乙", &mut cx);
+    let entity = cx.new(|_| editor);
+
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            let document = editor.document().clone();
+            editor.layout.layout_document(&document, 0.0, 640.0, 680.0);
+            let mut actual_range = None;
+            let text = <EditorCore as EntityInputHandler>::text_for_range(
+                editor,
+                0..5,
+                &mut actual_range,
+                window,
+                editor_cx,
+            )
+            .expect("full document input range");
+            assert_eq!(text, "甲\n\u{fffc}\n乙");
+            assert_eq!(actual_range, Some(0..5));
+
+            editor.select_document_range(0, editor.document_len());
+            let selected = <EditorCore as EntityInputHandler>::selected_text_range(
+                editor, false, window, editor_cx,
+            )
+            .expect("document selection");
+            assert_eq!(selected.range, 0..5);
+            assert!(!selected.reversed);
+
+            let image = editor
+                .layout
+                .visible()
+                .iter()
+                .find(|block| editor.layout.is_image(block.node_id))
+                .cloned()
+                .expect("image layout");
+            let image_after = <EditorCore as EntityInputHandler>::character_index_for_point(
+                editor,
+                point(
+                    image.bounds.right() - px(2.0),
+                    image.bounds.bottom() - px(2.0),
+                ),
+                window,
+                editor_cx,
+            )
+            .expect("image hit index");
+            assert_eq!(image_after, 3);
+
+            let bounds = <EditorCore as EntityInputHandler>::bounds_for_range(
+                editor,
+                0..5,
+                Bounds::default(),
+                window,
+                editor_cx,
+            )
+            .expect("cross-block range bounds");
+            assert!(bounds.size.width > px(0.0));
+            assert!(bounds.size.height > px(0.0));
+
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(1..4),
+                "中新",
+                Some(1..3),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "甲中新乙");
+            assert_eq!(editor.marked_text(), Some("新"));
+            assert_eq!(
+                <EditorCore as EntityInputHandler>::marked_text_range(editor, window, editor_cx,),
+                Some(2..3)
+            );
+            editor.undo().unwrap();
+            let document = editor.document().clone();
+            editor.layout.layout_document(&document, 0.0, 640.0, 680.0);
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor,
+                Some(1..4),
+                "新",
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "甲新乙");
+            assert_eq!(editor.document().block_kinds(), [BlockKind::Paragraph]);
+        });
+    });
+}
+
+#[gpui::test]
+fn editor_core_keeps_one_stable_focus_owner(cx: &mut gpui::TestAppContext) {
+    let editor = EditorCore::for_test("唯一焦点", cx);
+    let first = editor.focus_handle() as *const _;
+    let second = editor.focus_handle() as *const _;
+    assert_eq!(first, second);
 }
