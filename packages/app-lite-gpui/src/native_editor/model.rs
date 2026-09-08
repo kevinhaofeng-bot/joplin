@@ -823,6 +823,26 @@ impl Document {
         Ok(bounds)
     }
 
+    /// Return the insertion slot for the empty seam between two adjacent
+    /// structural blocks.  An image's `After` point and the next image's
+    /// `Before` point are a real document boundary even though no text block
+    /// owns that span.
+    fn adjacent_structural_seam(
+        &self,
+        selection: Selection,
+    ) -> Result<Option<usize>, DocumentError> {
+        let bounds = self.selection_bounds_with_affinity(selection)?;
+        if bounds.start_index.saturating_add(1) != bounds.end_index
+            || bounds.start_affinity != Affinity::After
+            || bounds.end_affinity != Affinity::Before
+            || !is_structural_block(&self.blocks[bounds.start_index])
+            || !is_structural_block(&self.blocks[bounds.end_index])
+        {
+            return Ok(None);
+        }
+        Ok(Some(bounds.end_index))
+    }
+
     fn text_range_for_block(
         &self,
         index: usize,
@@ -888,6 +908,29 @@ impl Document {
         selection: Selection,
         text: String,
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        if let Some(insert_at) = self.adjacent_structural_seam(selection)? {
+            if text.is_empty() {
+                return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+            }
+            let inserted = Block::text(self.new_node_id(), BlockKind::Paragraph, text.clone());
+            let inserted_id = inserted.id;
+            self.blocks.insert(insert_at, inserted);
+            let mut changed_nodes = SmallVec::new();
+            push_unique(&mut changed_nodes, inserted_id);
+            return Ok((
+                Selection::caret(DocPoint::with_affinity(
+                    inserted_id,
+                    text.len(),
+                    Affinity::After,
+                )),
+                changed_nodes,
+                TransactionBatch(vec![Transaction::RestoreBlocks {
+                    index: insert_at,
+                    remove_count: 1,
+                    blocks: Vec::new(),
+                }]),
+            ));
+        }
         let bounds = self.editable_selection_bounds(selection)?;
         let (start_index, start_offset, end_index, end_offset) = (
             bounds.start_index,
@@ -958,7 +1001,13 @@ impl Document {
         }
 
         let insertion_offset = if !is_empty {
-            self.delete_range_mut(start_index, start_offset, end_index, end_offset)?
+            self.delete_range_mut(
+                start_index,
+                start_offset,
+                end_index,
+                end_offset,
+                !text.is_empty(),
+            )?
         } else {
             start_offset
         };
@@ -1011,6 +1060,13 @@ impl Document {
         &mut self,
         selection: Selection,
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        if self.adjacent_structural_seam(selection)?.is_some() {
+            return Ok((
+                Selection::caret(selection.anchor),
+                SmallVec::new(),
+                TransactionBatch::default(),
+            ));
+        }
         let bounds = self.editable_selection_bounds(selection)?;
         let (start_index, start_offset, end_index, end_offset) = (
             bounds.start_index,
@@ -1059,7 +1115,8 @@ impl Document {
 
         let originals = self.blocks[start_index..=end_index].to_vec();
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
-        let raw_offset = self.delete_range_mut(start_index, start_offset, end_index, end_offset)?;
+        let raw_offset =
+            self.delete_range_mut(start_index, start_offset, end_index, end_offset, false)?;
         let node_id = self.blocks[start_index].id;
         let result_offset = {
             let text = self.blocks[start_index]
@@ -1093,11 +1150,13 @@ impl Document {
         start_offset: usize,
         end_index: usize,
         end_offset: usize,
+        preserve_style_seam: bool,
     ) -> Result<usize, DocumentError> {
         if start_index == end_index {
             let block = &mut self.blocks[start_index];
             let (text, styles) = text_parts(&block.content)?;
-            let (new_text, new_styles) = delete_text(text, styles, start_offset, end_offset);
+            let (new_text, new_styles) =
+                delete_text(text, styles, start_offset, end_offset, preserve_style_seam);
             block.content = BlockContent::Text {
                 text: new_text,
                 styles: new_styles,
@@ -1131,7 +1190,9 @@ impl Document {
         merged_text.push_str(&suffix);
         let mut merged_styles = prefix_styles;
         merged_styles.extend(suffix_styles);
-        normalize_styles_for_text(&merged_text, &mut merged_styles);
+        if !preserve_style_seam {
+            normalize_styles_for_text(&merged_text, &mut merged_styles);
+        }
         let start_is_text = is_text_block(&start_block);
         let merged = Block {
             id: start_block.id,
@@ -1489,6 +1550,32 @@ impl Document {
                 "an image natural size must be non-zero".into(),
             ));
         }
+        if let Some(insert_at) = self.adjacent_structural_seam(selection)? {
+            let image = Block {
+                id: self.new_node_id(),
+                kind: BlockKind::Image,
+                content: BlockContent::Image {
+                    resource_id,
+                    natural_size,
+                    display_width: None,
+                },
+                alignment: TextAlignment::Left,
+                revision: 0,
+            };
+            let image_id = image.id;
+            self.blocks.insert(insert_at, image);
+            let mut changed_nodes = SmallVec::new();
+            push_unique(&mut changed_nodes, image_id);
+            return Ok((
+                Selection::caret(DocPoint::with_affinity(image_id, 0, Affinity::After)),
+                changed_nodes,
+                TransactionBatch(vec![Transaction::RestoreBlocks {
+                    index: insert_at,
+                    remove_count: 1,
+                    blocks: Vec::new(),
+                }]),
+            ));
+        }
         let bounds = self.editable_selection_bounds(selection)?;
         let (start_index, start_offset, end_index, end_offset) = (
             bounds.start_index,
@@ -1560,7 +1647,7 @@ impl Document {
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
         let is_empty = start_index == end_index && start_offset == end_offset;
         let insertion_offset = if !is_empty {
-            self.delete_range_mut(start_index, start_offset, end_index, end_offset)?
+            self.delete_range_mut(start_index, start_offset, end_index, end_offset, true)?
         } else {
             start_offset
         };
@@ -1815,6 +1902,10 @@ fn validate_block_slice(blocks: &[Block]) -> Result<(), DocumentError> {
 }
 
 fn validate_styles(node_id: NodeId, text: &str, styles: &[StyledRun]) -> Result<(), DocumentError> {
+    if styles.is_empty() {
+        return Ok(());
+    }
+    let grapheme_boundaries = validation_grapheme_boundaries(text);
     let mut previous: Option<&StyledRun> = None;
     for run in styles {
         if run.range.start >= run.range.end || run.range.end > text.len() {
@@ -1830,8 +1921,8 @@ fn validate_styles(node_id: NodeId, text: &str, styles: &[StyledRun]) -> Result<
                 offset: run.range.start,
             });
         }
-        if !is_grapheme_boundary(text, run.range.start)
-            || !is_grapheme_boundary(text, run.range.end)
+        if grapheme_boundaries.binary_search(&run.range.start).is_err()
+            || grapheme_boundaries.binary_search(&run.range.end).is_err()
         {
             return Err(DocumentError::InvalidGraphemeOffset {
                 node_id,
@@ -1911,6 +2002,9 @@ fn resolve_grapheme_offset(text: &str, preferred: usize, affinity: Affinity) -> 
 static GRAPHEME_RESOLUTION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
+static VALIDATION_GRAPHEME_STEPS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
 pub(crate) fn reset_grapheme_resolution_counter() {
     GRAPHEME_RESOLUTION_CALLS.store(0, AtomicOrdering::Relaxed);
 }
@@ -1918,6 +2012,16 @@ pub(crate) fn reset_grapheme_resolution_counter() {
 #[cfg(test)]
 pub(crate) fn grapheme_resolution_counter() -> usize {
     GRAPHEME_RESOLUTION_CALLS.load(AtomicOrdering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_grapheme_counter() {
+    VALIDATION_GRAPHEME_STEPS.store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn validation_grapheme_counter() -> usize {
+    VALIDATION_GRAPHEME_STEPS.load(AtomicOrdering::Relaxed)
 }
 
 /// Snap style boundaries out of a newly joined grapheme and rebuild the
@@ -1991,6 +2095,26 @@ fn grapheme_boundaries(text: &str) -> Vec<usize> {
     boundaries.push(0);
     for (start, _) in text.grapheme_indices(true).skip(1) {
         boundaries.push(start);
+    }
+    if boundaries.last().copied() != Some(text.len()) {
+        boundaries.push(text.len());
+    }
+    boundaries
+}
+
+/// Build the reusable boundary index consumed by `validate_styles`.  Keeping
+/// this scan separate from the normalization helper makes the validation hot
+/// path observable in tests and ensures every run endpoint uses binary search
+/// against one index rather than rescanning the text.
+fn validation_grapheme_boundaries(text: &str) -> Vec<usize> {
+    let mut boundaries = Vec::with_capacity(text.len().saturating_add(1));
+    boundaries.push(0);
+    for (start, _) in text.grapheme_indices(true) {
+        #[cfg(test)]
+        VALIDATION_GRAPHEME_STEPS.fetch_add(1, AtomicOrdering::Relaxed);
+        if start != 0 {
+            boundaries.push(start);
+        }
     }
     if boundaries.last().copied() != Some(text.len()) {
         boundaries.push(text.len());
@@ -2086,6 +2210,7 @@ fn delete_text(
     styles: &[StyledRun],
     start: usize,
     end: usize,
+    preserve_style_seam: bool,
 ) -> (String, SmallVec<[StyledRun; 4]>) {
     let mut new_text = String::with_capacity(text.len().saturating_sub(end - start));
     new_text.push_str(&text[..start]);
@@ -2102,7 +2227,9 @@ fn delete_text(
             });
         }
     }
-    normalize_styles_for_text(&new_text, &mut new_styles);
+    if !preserve_style_seam {
+        normalize_styles_for_text(&new_text, &mut new_styles);
+    }
     (new_text, new_styles)
 }
 

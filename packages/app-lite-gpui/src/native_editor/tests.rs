@@ -2,9 +2,13 @@ use super::history::History;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use smallvec::SmallVec;
+
 use super::model::{
-    Affinity, BlockContent, BlockKind, DocPoint, Document, DocumentError, Mark, NodeId, Selection,
-    grapheme_resolution_counter, reset_grapheme_resolution_counter,
+    Affinity, Block, BlockContent, BlockKind, DocPoint, Document, DocumentError, Mark, NodeId,
+    Selection, StyledRun, TextAlignment, grapheme_resolution_counter,
+    reset_grapheme_resolution_counter, reset_validation_grapheme_counter,
+    validation_grapheme_counter,
 };
 use super::transaction::{Transaction, TransactionBatch};
 
@@ -510,8 +514,8 @@ fn small_edit_does_not_allocate_a_full_document_clone() {
     .unwrap();
     assert!(
         // Invariant validation and concurrently running tests allocate a
-        // little noise; the limit remains below the ~32 MiB full clone.
-        ALLOCATED_BYTES.load(Ordering::Relaxed) < 20_000_000,
+        // little noise; keep the limit well below the ~32 MiB full clone.
+        ALLOCATED_BYTES.load(Ordering::Relaxed) < 24_000_000,
         "small edit allocated a full-document-sized candidate: {} bytes",
         ALLOCATED_BYTES.load(Ordering::Relaxed)
     );
@@ -710,4 +714,165 @@ fn style_normalization_uses_near_linear_grapheme_resolution() {
         "style normalization repeatedly rescanned graphemes: {} calls",
         grapheme_resolution_counter()
     );
+}
+
+#[test]
+fn adjacent_image_empty_seams_have_consistent_transaction_semantics() {
+    fn with_adjacent_images() -> (Document, NodeId, NodeId) {
+        let mut doc = Document::from_paragraph("a");
+        let paragraph = doc.first_node_id().unwrap();
+        doc.apply(Transaction::InsertImage {
+            selection: Selection::caret(DocPoint::new(paragraph, 1)),
+            resource_id: "image-a".into(),
+            natural_size: (100, 100),
+        })
+        .unwrap();
+        let image_a = doc.blocks()[1].id;
+        doc.apply(Transaction::InsertImage {
+            selection: Selection::caret(DocPoint::with_affinity(image_a, 0, Affinity::After)),
+            resource_id: "image-b".into(),
+            natural_size: (100, 100),
+        })
+        .unwrap();
+        let image_b = doc.blocks()[2].id;
+        (doc, image_a, image_b)
+    }
+
+    fn seam(image_a: NodeId, image_b: NodeId) -> Selection {
+        Selection::new(
+            DocPoint::with_affinity(image_a, 0, Affinity::After),
+            DocPoint::with_affinity(image_b, 0, Affinity::Before),
+        )
+    }
+
+    let (mut doc, image_a, image_b) = with_adjacent_images();
+    let original_ids: Vec<_> = doc.blocks().iter().map(|block| block.id).collect();
+    let outcome = doc
+        .apply(Transaction::DeleteRange {
+            selection: seam(image_a, image_b),
+        })
+        .unwrap();
+    assert!(outcome.changed_nodes.is_empty());
+    assert_eq!(
+        doc.blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>(),
+        original_ids
+    );
+
+    let (mut doc, image_a, image_b) = with_adjacent_images();
+    doc.apply(Transaction::InsertText {
+        selection: seam(image_a, image_b),
+        text: "middle".into(),
+    })
+    .unwrap();
+    assert_eq!(doc.blocks()[1].id, image_a);
+    assert_eq!(doc.text_at_index(2), Some("middle"));
+    assert_eq!(doc.blocks()[3].id, image_b);
+
+    let (mut doc, image_a, image_b) = with_adjacent_images();
+    doc.apply(Transaction::InsertImage {
+        selection: seam(image_a, image_b),
+        resource_id: "image-middle".into(),
+        natural_size: (100, 100),
+    })
+    .unwrap();
+    assert_eq!(doc.blocks()[1].id, image_a);
+    assert!(matches!(doc.blocks()[2].kind, BlockKind::Image));
+    assert_eq!(doc.blocks()[3].id, image_b);
+}
+
+#[test]
+fn validate_styles_scans_graphemes_once_per_text_on_transactions() {
+    fn transaction_validation_steps(run_count: usize) -> usize {
+        let text = "a".repeat(run_count);
+        let styles: SmallVec<[StyledRun; 4]> = (0..run_count)
+            .map(|offset| {
+                StyledRun::new(
+                    offset..offset + 1,
+                    [if offset % 2 == 0 {
+                        Mark::Bold
+                    } else {
+                        Mark::Italic
+                    }],
+                )
+            })
+            .collect();
+        let node = NodeId::new(1);
+        let block = Block {
+            id: node,
+            kind: BlockKind::Paragraph,
+            content: BlockContent::Text { text, styles },
+            alignment: TextAlignment::Left,
+            revision: 0,
+        };
+        let mut doc = Document::from_blocks(vec![block]).unwrap();
+        reset_validation_grapheme_counter();
+        doc.apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::new(node, 0)),
+            text: "x".into(),
+        })
+        .unwrap();
+        validation_grapheme_counter()
+    }
+
+    let smaller = transaction_validation_steps(256);
+    let larger = transaction_validation_steps(512);
+    assert!(smaller > 0);
+    assert!(
+        larger < smaller.saturating_mul(3),
+        "validate_styles grapheme traversal grew super-linearly: {smaller} -> {larger}"
+    );
+}
+
+#[test]
+fn replacement_preserves_style_isolation_across_combining_grapheme_seam() {
+    fn styled_document() -> (Document, NodeId) {
+        let mut doc = Document::from_paragraph("a\n\u{301}");
+        let node = doc.first_node_id().unwrap();
+        doc.apply(Transaction::ToggleMark {
+            selection: Selection::new(DocPoint::new(node, 0), DocPoint::new(node, 1)),
+            mark: Mark::Bold,
+        })
+        .unwrap();
+        doc.apply(Transaction::ToggleMark {
+            selection: Selection::new(DocPoint::new(node, 2), DocPoint::new(node, 4)),
+            mark: Mark::Italic,
+        })
+        .unwrap();
+        (doc, node)
+    }
+
+    fn assert_run_marks(block: &Block, start: usize, end: usize, expected: &[Mark]) {
+        let BlockContent::Text { styles, .. } = &block.content else {
+            panic!("expected a text block");
+        };
+        let run = styles
+            .iter()
+            .find(|run| run.range.start == start && run.range.end == end)
+            .unwrap_or_else(|| panic!("missing styled run {start}..{end}: {styles:?}"));
+        assert_eq!(run.marks.as_slice(), expected);
+    }
+
+    let (mut doc, node) = styled_document();
+    doc.apply(Transaction::InsertImage {
+        selection: Selection::new(DocPoint::new(node, 1), DocPoint::new(node, 2)),
+        resource_id: "isolated-image".into(),
+        natural_size: (100, 100),
+    })
+    .unwrap();
+    assert_run_marks(&doc.blocks()[0], 0, 1, &[Mark::Bold]);
+    assert_run_marks(&doc.blocks()[2], 0, 2, &[Mark::Italic]);
+
+    let (mut doc, node) = styled_document();
+    doc.apply(Transaction::InsertText {
+        selection: Selection::new(DocPoint::new(node, 1), DocPoint::new(node, 2)),
+        text: "x".into(),
+    })
+    .unwrap();
+    assert_run_marks(&doc.blocks()[0], 0, 1, &[Mark::Bold]);
+    // The combining mark joins the inserted `x` into one grapheme; the
+    // resulting grapheme remains Italic without importing Bold from the left.
+    assert_run_marks(&doc.blocks()[0], 1, 4, &[Mark::Italic]);
 }

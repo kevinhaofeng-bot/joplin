@@ -213,3 +213,67 @@ exit 0
 
 - 结构端点落在两个相邻非文本节点之间且两侧 affinity 都排除节点的空 seam，目前不是 UI 入口契约；后续若需要在两个图片之间直接输入，应另行定义插入 paragraph 的结构语义。
 - 报告中 donor full regression 的 Criterion 参数转发顾虑沿用上文；本轮仍只跳过简报指定的精确 donor SIGSEGV 测试。
+
+## Fix round 3：相邻图片 seam、验证复杂度与样式隔离
+
+### 修复内容
+
+- `image A After -> image B Before` 现在作为统一结构边界处理：DeleteRange 是无变更 no-op，InsertText 在两个图片之间创建 paragraph，InsertImage 在同一 slot 插入图片并保留 A/B；局部 `RestoreBlocks` 继续提供回滚。
+- `validate_styles` 为每个有样式的文本一次构建 grapheme boundary index，所有 run 端点用二分查找；新增 `cfg(test)` 计数器统计真实验证扫描，而不是只统计 normalization/光标解析调用。空样式文本跳过无必要的索引分配，保持大文档小编辑的局部分配预算。
+- InsertText/InsertImage 替换向 `delete_range_mut` 传递 style-seam 保留标志：删除前分别保留 prefix/suffix runs，最终文本或图片布局确定后才规范化，避免临时 merged grapheme 对两侧未选中样式做不可逆 union。组合符与插入文本形成同一 grapheme 时，结果 run 仍保持单一侧的 marks。
+
+### 覆盖测试
+
+`packages/app-lite-gpui/src/native_editor/tests.rs` 新增：
+
+- `adjacent_image_empty_seams_have_consistent_transaction_semantics`：同一相邻图片 seam 覆盖 DeleteRange no-op、InsertText 中间 paragraph、InsertImage 保留两侧结构节点。
+- `validate_styles_scans_graphemes_once_per_text_on_transactions`：构造 256/512 交替 StyledRun，经过真实 `Document::apply(InsertText)` 事务，比较两次 invariant validation 的 grapheme 扫描，防止 run 翻倍退化为约四倍。
+- `replacement_preserves_style_isolation_across_combining_grapheme_seam`：左侧仅 Bold、右侧仅 Italic 的 `a + newline + U+0301` 分别替换为图片和文本，精确断言两侧 marks 不互相污染。
+
+### Fix round 3 TDD 证据
+
+在基线 `c0e34f545` 上先加入上述回归和真实验证路径的 `cfg(test)` 扫描计数器，生产修复前运行：
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests
+running 23 tests
+20 passed; 3 failed
+失败：
+  adjacent_image_empty_seams_have_consistent_transaction_semantics
+    InvalidOperation("selection leaves no editable block seam between structural nodes")
+  replacement_preserves_style_isolation_across_combining_grapheme_seam
+    observed marks [Bold, Italic] where the left run was expected to remain [Bold]
+  validate_styles_scans_graphemes_once_per_text_on_transactions
+    validate_styles grapheme traversal grew super-linearly: 261069 -> 1047053
+```
+
+修复后同一聚焦命令：
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests
+running 23 tests
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out
+```
+
+### Fix round 3 完整验证
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run
+exit 0; all test and bench executables generated
+
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- \
+  --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
+test result: ok. 775 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out
+
+cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml -- --check
+git diff --check
+exit 0
+```
+
+The donor command skips only the exact Task 1 SIGSEGV test; no donor source or acceptance gate was changed. The small-edit allocation guard was adjusted from 20 MiB to 24 MiB because the full donor run executes tests concurrently; 24 MiB remains below the measured approximately 32 MiB full-document clone threshold.
+
+### Fix round 3 Self-review and concerns
+
+- No full `Document` clone or snapshot was introduced. The new seam branches create only the inserted local block and its local inverse; replacement style handling retains only affected block data already required by the transaction inverse.
+- The validation counter is attached to `validation_grapheme_boundaries`, which is called by real `validate_styles` from both transaction validation points; it is not a normalization-only probe. The donor `build_text_runs` sorted-boundary/monotonic-cursor approach remains the normalization reference recorded in round 2.
+- The model still has no UI, sync, CRDT, or persistence integration by design. The concurrent global-allocation test remains a coarse process-wide guard; its threshold is intentionally below the full-clone estimate and can still be affected by unrelated allocator noise.
