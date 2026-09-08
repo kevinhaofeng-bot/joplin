@@ -6,8 +6,11 @@
 //! edits and history to store inverse operations.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use smallvec::SmallVec;
 use unicode_segmentation::UnicodeSegmentation;
@@ -342,6 +345,16 @@ pub struct Document {
     revision: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SelectionBounds {
+    start_index: usize,
+    start_offset: usize,
+    start_affinity: Affinity,
+    end_index: usize,
+    end_offset: usize,
+    end_affinity: Affinity,
+}
+
 impl Document {
     pub fn new() -> Self {
         Self::from_paragraph("")
@@ -494,12 +507,13 @@ impl Document {
         let mut selection = self.end_selection();
         let mut estimated_bytes = 0usize;
         let initial_revision = self.revision;
+        let initial_next_id = self.next_id;
 
         for transaction in batch.0 {
             let outcome = match self.apply_transaction(transaction) {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    self.rollback_journal(inverse_batches, initial_revision);
+                    self.rollback_journal(inverse_batches, initial_revision, initial_next_id);
                     return Err(error);
                 }
             };
@@ -518,7 +532,7 @@ impl Document {
         }
 
         if let Err(error) = self.validate_invariants() {
-            self.rollback_journal(rollback_batches, initial_revision);
+            self.rollback_journal(rollback_batches, initial_revision, initial_next_id);
             return Err(error);
         }
         Ok(ApplyOutcome {
@@ -529,13 +543,39 @@ impl Document {
         })
     }
 
-    fn rollback_journal(&mut self, inverse_batches: Vec<TransactionBatch>, revision: u64) {
+    fn rollback_journal(
+        &mut self,
+        inverse_batches: Vec<TransactionBatch>,
+        revision: u64,
+        next_id: u64,
+    ) {
         for inverse in inverse_batches.into_iter().rev() {
-            for transaction in inverse.0.into_iter().rev() {
-                let _ = self.apply_transaction(transaction);
-            }
+            self.restore_inverse_batch(inverse);
         }
         self.revision = revision;
+        self.next_id = next_id;
+    }
+
+    fn restore_inverse_batch(&mut self, inverse: TransactionBatch) {
+        for transaction in inverse.0.into_iter().rev() {
+            match transaction {
+                Transaction::RestoreBlocks {
+                    index,
+                    remove_count,
+                    blocks,
+                } => {
+                    debug_assert!(
+                        index <= self.blocks.len()
+                            && remove_count <= self.blocks.len().saturating_sub(index)
+                    );
+                    self.blocks
+                        .splice(index..index.saturating_add(remove_count), blocks);
+                }
+                other => {
+                    unreachable!("transaction journal contains non-local inverse: {other:?}");
+                }
+            }
+        }
     }
 
     /// Check all structural and inline invariants without changing anything.
@@ -586,6 +626,7 @@ impl Document {
         transaction: Transaction,
     ) -> Result<ApplyOutcome, DocumentError> {
         let original_revision = self.revision;
+        let original_next_id = self.next_id;
         let (selection, changed_nodes, inverse) = match transaction {
             Transaction::InsertText { selection, text } => {
                 self.apply_insert_text(selection, text)?
@@ -629,7 +670,7 @@ impl Document {
         }
 
         if let Err(error) = self.validate_selection(selection) {
-            self.rollback_journal(vec![inverse], original_revision);
+            self.rollback_journal(vec![inverse], original_revision, original_next_id);
             return Err(error);
         }
         self.revision = self.revision.saturating_add(1);
@@ -639,7 +680,7 @@ impl Document {
             }
         }
         if let Err(error) = self.validate_invariants() {
-            self.rollback_journal(vec![inverse], original_revision);
+            self.rollback_journal(vec![inverse], original_revision, original_next_id);
             return Err(error);
         }
         let estimated_bytes = inverse.estimated_bytes();
@@ -659,7 +700,7 @@ impl Document {
         })
     }
 
-    fn validate_selection(&self, selection: Selection) -> Result<(), DocumentError> {
+    pub(crate) fn validate_selection(&self, selection: Selection) -> Result<(), DocumentError> {
         self.validate_point(selection.anchor)?;
         self.validate_point(selection.head)?;
         let _ = self.selection_bounds(selection)?;
@@ -704,6 +745,19 @@ impl Document {
         &self,
         selection: Selection,
     ) -> Result<(usize, usize, usize, usize), DocumentError> {
+        let bounds = self.selection_bounds_with_affinity(selection)?;
+        Ok((
+            bounds.start_index,
+            bounds.start_offset,
+            bounds.end_index,
+            bounds.end_offset,
+        ))
+    }
+
+    fn selection_bounds_with_affinity(
+        &self,
+        selection: Selection,
+    ) -> Result<SelectionBounds, DocumentError> {
         let anchor_index = self.validate_point(selection.anchor)?;
         let head_index = self.validate_point(selection.head)?;
         let anchor = (
@@ -717,19 +771,56 @@ impl Document {
             affinity_order(selection.head.affinity),
         );
         match anchor.cmp(&head) {
-            Ordering::Less | Ordering::Equal => Ok((
-                anchor_index,
-                selection.anchor.utf8_offset,
-                head_index,
-                selection.head.utf8_offset,
-            )),
-            Ordering::Greater => Ok((
-                head_index,
-                selection.head.utf8_offset,
-                anchor_index,
-                selection.anchor.utf8_offset,
-            )),
+            Ordering::Less | Ordering::Equal => Ok(SelectionBounds {
+                start_index: anchor_index,
+                start_offset: selection.anchor.utf8_offset,
+                start_affinity: selection.anchor.affinity,
+                end_index: head_index,
+                end_offset: selection.head.utf8_offset,
+                end_affinity: selection.head.affinity,
+            }),
+            Ordering::Greater => Ok(SelectionBounds {
+                start_index: head_index,
+                start_offset: selection.head.utf8_offset,
+                start_affinity: selection.head.affinity,
+                end_index: anchor_index,
+                end_offset: selection.anchor.utf8_offset,
+                end_affinity: selection.anchor.affinity,
+            }),
         }
+    }
+
+    fn editable_selection_bounds(
+        &self,
+        selection: Selection,
+    ) -> Result<SelectionBounds, DocumentError> {
+        let mut bounds = self.selection_bounds_with_affinity(selection)?;
+        if bounds.start_index < bounds.end_index {
+            if !is_text_block(&self.blocks[bounds.start_index])
+                && bounds.start_affinity == Affinity::After
+            {
+                bounds.start_index = bounds.start_index.saturating_add(1);
+                bounds.start_offset = 0;
+                bounds.start_affinity = Affinity::Before;
+            }
+            if bounds.start_index <= bounds.end_index
+                && !is_text_block(&self.blocks[bounds.end_index])
+                && bounds.end_affinity == Affinity::Before
+            {
+                bounds.end_index = bounds.end_index.saturating_sub(1);
+                bounds.end_offset = self.blocks[bounds.end_index]
+                    .content
+                    .as_text()
+                    .map_or(0, str::len);
+                bounds.end_affinity = Affinity::After;
+            }
+        }
+        if bounds.start_index > bounds.end_index {
+            return Err(DocumentError::InvalidOperation(
+                "selection leaves no editable block seam between structural nodes".into(),
+            ));
+        }
+        Ok(bounds)
     }
 
     fn text_range_for_block(
@@ -797,8 +888,13 @@ impl Document {
         selection: Selection,
         text: String,
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
-        let (start_index, start_offset, end_index, end_offset) =
-            self.selection_bounds(selection)?;
+        let bounds = self.editable_selection_bounds(selection)?;
+        let (start_index, start_offset, end_index, end_offset) = (
+            bounds.start_index,
+            bounds.start_offset,
+            bounds.end_index,
+            bounds.end_offset,
+        );
         self.ensure_editable_range(start_index, end_index)?;
 
         if start_index == end_index && !is_text_block(&self.blocks[start_index]) {
@@ -915,8 +1011,13 @@ impl Document {
         &mut self,
         selection: Selection,
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
-        let (start_index, start_offset, end_index, end_offset) =
-            self.selection_bounds(selection)?;
+        let bounds = self.editable_selection_bounds(selection)?;
+        let (start_index, start_offset, end_index, end_offset) = (
+            bounds.start_index,
+            bounds.start_offset,
+            bounds.end_index,
+            bounds.end_offset,
+        );
         self.ensure_editable_range(start_index, end_index)?;
 
         if start_index == end_index && !is_text_block(&self.blocks[start_index]) {
@@ -958,9 +1059,15 @@ impl Document {
 
         let originals = self.blocks[start_index..=end_index].to_vec();
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
-        let result_offset =
-            self.delete_range_mut(start_index, start_offset, end_index, end_offset)?;
+        let raw_offset = self.delete_range_mut(start_index, start_offset, end_index, end_offset)?;
         let node_id = self.blocks[start_index].id;
+        let result_offset = {
+            let text = self.blocks[start_index]
+                .content
+                .as_text()
+                .expect("delete range retains a text block");
+            resolve_grapheme_offset(text, raw_offset, Affinity::After)
+        };
         let mut changed_nodes = SmallVec::new();
         for node_id in original_ids {
             push_unique(&mut changed_nodes, node_id);
@@ -991,12 +1098,11 @@ impl Document {
             let block = &mut self.blocks[start_index];
             let (text, styles) = text_parts(&block.content)?;
             let (new_text, new_styles) = delete_text(text, styles, start_offset, end_offset);
-            let result_offset = resolve_grapheme_offset(&new_text, start_offset, Affinity::After);
             block.content = BlockContent::Text {
                 text: new_text,
                 styles: new_styles,
             };
-            return Ok(result_offset);
+            return Ok(start_offset);
         }
 
         let start_block = self.blocks[start_index].clone();
@@ -1045,13 +1151,8 @@ impl Document {
             },
             revision: start_block.revision,
         };
-        let result_offset = resolve_grapheme_offset(
-            merged.content.as_text().expect("merged block is text"),
-            prefix.len(),
-            Affinity::After,
-        );
         self.blocks.splice(start_index..=end_index, [merged]);
-        Ok(result_offset)
+        Ok(prefix.len())
     }
 
     fn apply_split_block(
@@ -1388,8 +1489,13 @@ impl Document {
                 "an image natural size must be non-zero".into(),
             ));
         }
-        let (start_index, start_offset, end_index, end_offset) =
-            self.selection_bounds(selection)?;
+        let bounds = self.editable_selection_bounds(selection)?;
+        let (start_index, start_offset, end_index, end_offset) = (
+            bounds.start_index,
+            bounds.start_offset,
+            bounds.end_index,
+            bounds.end_offset,
+        );
         self.ensure_editable_range(start_index, end_index)?;
 
         if start_index == end_index && !is_text_block(&self.blocks[start_index]) {
@@ -1779,6 +1885,8 @@ fn affinity_order(affinity: Affinity) -> u8 {
 }
 
 fn resolve_grapheme_offset(text: &str, preferred: usize, affinity: Affinity) -> usize {
+    #[cfg(test)]
+    GRAPHEME_RESOLUTION_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
     let preferred = preferred.min(text.len());
     if is_grapheme_boundary(text, preferred) {
         return preferred;
@@ -1799,6 +1907,19 @@ fn resolve_grapheme_offset(text: &str, preferred: usize, affinity: Affinity) -> 
     }
 }
 
+#[cfg(test)]
+static GRAPHEME_RESOLUTION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_grapheme_resolution_counter() {
+    GRAPHEME_RESOLUTION_CALLS.store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn grapheme_resolution_counter() -> usize {
+    GRAPHEME_RESOLUTION_CALLS.load(AtomicOrdering::Relaxed)
+}
+
 /// Snap style boundaries out of a newly joined grapheme and rebuild the
 /// non-overlapping run list by taking the union of marks per grapheme-safe
 /// segment.  Joining text can make an old byte boundary cease to be a
@@ -1807,37 +1928,53 @@ fn normalize_styles_for_text(text: &str, styles: &mut SmallVec<[StyledRun; 4]>) 
     if styles.is_empty() {
         return;
     }
+    let grapheme_boundaries = grapheme_boundaries(text);
     let mut boundaries = vec![0, text.len()];
+    let mut events = Vec::with_capacity(styles.len().saturating_mul(2));
     for run in styles.iter() {
-        boundaries.push(resolve_grapheme_offset(
-            text,
-            run.range.start,
-            Affinity::Before,
-        ));
-        boundaries.push(resolve_grapheme_offset(
-            text,
-            run.range.end,
-            Affinity::After,
-        ));
+        let start = snap_grapheme_offset(&grapheme_boundaries, run.range.start, Affinity::Before);
+        let end = snap_grapheme_offset(&grapheme_boundaries, run.range.end, Affinity::After);
+        if start >= end {
+            continue;
+        }
+        boundaries.push(start);
+        boundaries.push(end);
+        for mark in &run.marks {
+            events.push((start, true, mark.clone()));
+            events.push((end, false, mark.clone()));
+        }
     }
     boundaries.sort_unstable();
     boundaries.dedup();
-    let source = styles.clone();
+    events.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
     let mut normalized = SmallVec::new();
+    let mut active_marks: BTreeMap<Mark, usize> = BTreeMap::new();
+    // As in donor `build_text_runs`, both sides are sorted and this cursor
+    // only advances; the event sweep additionally unions overlapping marks.
+    let mut event_idx = 0usize;
     for window in boundaries.windows(2) {
         let (start, end) = (window[0], window[1]);
         if start >= end {
             continue;
         }
-        let mut marks: SmallVec<[Mark; 4]> = SmallVec::new();
-        for run in &source {
-            let run_start = resolve_grapheme_offset(text, run.range.start, Affinity::Before);
-            let run_end = resolve_grapheme_offset(text, run.range.end, Affinity::After);
-            if run_start < end && run_end > start {
-                marks.extend(run.marks.iter().cloned());
+        while event_idx < events.len() && events[event_idx].0 <= start {
+            let (_, add, mark) = &events[event_idx];
+            if *add {
+                *active_marks.entry(mark.clone()).or_default() += 1;
+            } else if let Some(count) = active_marks.get_mut(mark) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    active_marks.remove(mark);
+                }
             }
+            event_idx += 1;
         }
-        normalize_marks(&mut marks);
+        let marks: SmallVec<[Mark; 4]> = active_marks.keys().cloned().collect();
         if !marks.is_empty() {
             normalized.push(StyledRun {
                 range: start..end,
@@ -1847,6 +1984,29 @@ fn normalize_styles_for_text(text: &str, styles: &mut SmallVec<[StyledRun; 4]>) 
     }
     normalize_styles(&mut normalized);
     *styles = normalized;
+}
+
+fn grapheme_boundaries(text: &str) -> Vec<usize> {
+    let mut boundaries = Vec::with_capacity(text.len().saturating_add(1));
+    boundaries.push(0);
+    for (start, _) in text.grapheme_indices(true).skip(1) {
+        boundaries.push(start);
+    }
+    if boundaries.last().copied() != Some(text.len()) {
+        boundaries.push(text.len());
+    }
+    boundaries
+}
+
+fn snap_grapheme_offset(boundaries: &[usize], preferred: usize, affinity: Affinity) -> usize {
+    let preferred = preferred.min(*boundaries.last().unwrap_or(&0));
+    match boundaries.binary_search(&preferred) {
+        Ok(offset) => boundaries[offset],
+        Err(index) => match affinity {
+            Affinity::Before => boundaries[index.saturating_sub(1)],
+            Affinity::After => boundaries[index.min(boundaries.len().saturating_sub(1))],
+        },
+    }
 }
 
 fn split_text(

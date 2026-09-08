@@ -3,7 +3,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::model::{
-    Affinity, BlockContent, BlockKind, DocPoint, Document, DocumentError, Mark, Selection,
+    Affinity, BlockContent, BlockKind, DocPoint, Document, DocumentError, Mark, NodeId, Selection,
+    grapheme_resolution_counter, reset_grapheme_resolution_counter,
 };
 use super::transaction::{Transaction, TransactionBatch};
 
@@ -513,5 +514,200 @@ fn small_edit_does_not_allocate_a_full_document_clone() {
         ALLOCATED_BYTES.load(Ordering::Relaxed) < 20_000_000,
         "small edit allocated a full-document-sized candidate: {} bytes",
         ALLOCATED_BYTES.load(Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn structural_affinity_keeps_images_outside_asymmetric_cross_node_ranges() {
+    fn with_image() -> Document {
+        let mut doc = Document::from_paragraph("ab");
+        let paragraph = doc.first_node_id().unwrap();
+        doc.apply(Transaction::InsertImage {
+            selection: Selection::caret(DocPoint::new(paragraph, 1)),
+            resource_id: "boundary-image".into(),
+            natural_size: (100, 100),
+        })
+        .unwrap();
+        doc
+    }
+
+    let mut doc = with_image();
+    let left = doc.blocks()[0].id;
+    let image = doc.blocks()[1].id;
+    doc.apply(Transaction::DeleteRange {
+        selection: Selection::new(
+            DocPoint::new(left, 0),
+            DocPoint::with_affinity(image, 0, Affinity::Before),
+        ),
+    })
+    .unwrap();
+    assert_eq!(doc.blocks()[1].id, image);
+    assert_eq!(doc.text_at_index(0), Some(""));
+
+    let mut doc = with_image();
+    let image = doc.blocks()[1].id;
+    let right = doc.blocks()[2].id;
+    doc.apply(Transaction::DeleteRange {
+        selection: Selection::new(
+            DocPoint::with_affinity(image, 0, Affinity::After),
+            DocPoint::new(right, 1),
+        ),
+    })
+    .unwrap();
+    assert_eq!(doc.blocks()[1].id, image);
+    assert_eq!(doc.text_at_index(2), Some(""));
+
+    let mut doc = with_image();
+    let left = doc.blocks()[0].id;
+    let image = doc.blocks()[1].id;
+    doc.apply(Transaction::InsertText {
+        selection: Selection::new(
+            DocPoint::new(left, 0),
+            DocPoint::with_affinity(image, 0, Affinity::Before),
+        ),
+        text: "x".into(),
+    })
+    .unwrap();
+    assert_eq!(doc.text_at_index(0), Some("x"));
+    assert_eq!(doc.blocks()[1].id, image);
+
+    let mut doc = with_image();
+    let image = doc.blocks()[1].id;
+    let right = doc.blocks()[2].id;
+    doc.apply(Transaction::InsertText {
+        selection: Selection::new(
+            DocPoint::with_affinity(image, 0, Affinity::After),
+            DocPoint::new(right, 1),
+        ),
+        text: "y".into(),
+    })
+    .unwrap();
+    assert_eq!(doc.blocks()[1].id, image);
+    assert_eq!(doc.text_at_index(2), Some("y"));
+
+    let mut doc = with_image();
+    let left = doc.blocks()[0].id;
+    let image = doc.blocks()[1].id;
+    doc.apply(Transaction::InsertImage {
+        selection: Selection::new(
+            DocPoint::new(left, 0),
+            DocPoint::with_affinity(image, 0, Affinity::Before),
+        ),
+        resource_id: "insert-before-image".into(),
+        natural_size: (80, 80),
+    })
+    .unwrap();
+    assert!(doc.blocks().iter().any(|block| block.id == image));
+
+    let mut doc = with_image();
+    let image = doc.blocks()[1].id;
+    let right = doc.blocks()[2].id;
+    doc.apply(Transaction::InsertImage {
+        selection: Selection::new(
+            DocPoint::with_affinity(image, 0, Affinity::After),
+            DocPoint::new(right, 1),
+        ),
+        resource_id: "insert-after-image".into(),
+        natural_size: (80, 80),
+    })
+    .unwrap();
+    assert!(doc.blocks().iter().any(|block| block.id == image));
+}
+
+#[test]
+fn failed_batch_restores_document_revision_and_next_node_id_exactly() {
+    let mut doc = Document::from_paragraph("ab");
+    let original = doc.clone();
+    let node = doc.first_node_id().unwrap();
+    let result = doc.apply_batch(TransactionBatch(vec![
+        Transaction::SplitBlock {
+            at: DocPoint::new(node, 1),
+        },
+        Transaction::InsertText {
+            selection: Selection::caret(DocPoint::new(node, 99)),
+            text: "must-not-commit".into(),
+        },
+    ]));
+    assert!(matches!(
+        result,
+        Err(DocumentError::InvalidUtf8Offset { .. })
+            | Err(DocumentError::InvalidGraphemeOffset { .. })
+    ));
+    assert_eq!(doc, original);
+
+    doc.apply(Transaction::SplitBlock {
+        at: DocPoint::new(node, 1),
+    })
+    .unwrap();
+    assert_eq!(doc.blocks()[1].id, NodeId::new(2));
+}
+
+#[test]
+fn replacement_uses_the_raw_grapheme_seam_before_resolving_the_cursor() {
+    let mut doc = Document::from_paragraph("a\n\u{301}");
+    let node = doc.first_node_id().unwrap();
+    doc.apply(Transaction::InsertText {
+        selection: Selection::new(DocPoint::new(node, 1), DocPoint::new(node, 2)),
+        text: "b".into(),
+    })
+    .unwrap();
+    assert_eq!(doc.text_at_index(0), Some("ab\u{301}"));
+}
+
+#[test]
+fn apply_with_selection_rejects_invalid_before_selection_atomically() {
+    let mut doc = Document::from_paragraphs(["left", "right"]);
+    let original = doc.clone();
+    let left = doc.blocks()[0].id;
+    let right = doc.blocks()[1].id;
+    let mut history = History::new(1_000, 16 * 1024 * 1024);
+    let invalid_before = Selection::caret(DocPoint::new(left, 999));
+
+    let result = history.apply_with_selection(
+        &mut doc,
+        invalid_before,
+        Transaction::MergeBlocks { left, right },
+    );
+    assert!(matches!(
+        result,
+        Err(DocumentError::InvalidUtf8Offset { .. })
+            | Err(DocumentError::InvalidGraphemeOffset { .. })
+    ));
+    assert_eq!(doc, original);
+    assert_eq!(history.undo_depth(), 0);
+    assert_eq!(history.redo_depth(), 0);
+    assert_eq!(history.used_bytes(), 0);
+    assert!(matches!(
+        history.undo(&mut doc),
+        Err(DocumentError::HistoryEmpty)
+    ));
+}
+
+#[test]
+fn style_normalization_uses_near_linear_grapheme_resolution() {
+    let run_count = 256;
+    let mut doc = Document::from_paragraph("a".repeat(run_count));
+    let node = doc.first_node_id().unwrap();
+    for offset in 0..run_count {
+        doc.apply(Transaction::ToggleMark {
+            selection: Selection::new(DocPoint::new(node, offset), DocPoint::new(node, offset + 1)),
+            mark: if offset % 2 == 0 {
+                Mark::Bold
+            } else {
+                Mark::Italic
+            },
+        })
+        .unwrap();
+    }
+    reset_grapheme_resolution_counter();
+    doc.apply(Transaction::InsertText {
+        selection: Selection::caret(DocPoint::new(node, 0)),
+        text: "x".into(),
+    })
+    .unwrap();
+    assert!(
+        grapheme_resolution_counter() < 32,
+        "style normalization repeatedly rescanned graphemes: {} calls",
+        grapheme_resolution_counter()
     );
 }

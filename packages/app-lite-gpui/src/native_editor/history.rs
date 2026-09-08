@@ -60,6 +60,7 @@ impl History {
         before_selection: Selection,
         transaction: Transaction,
     ) -> Result<ApplyOutcome, DocumentError> {
+        document.validate_selection(before_selection)?;
         self.apply_recorded(document, before_selection, transaction)
     }
 

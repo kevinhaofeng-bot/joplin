@@ -137,3 +137,79 @@ git diff --check
 - 旧报告中“候选文档 clone”是初始实现状态；本轮已改为局部 inverse journal，`semantic_snapshot()` 仍仅作为测试语义比较辅助，不进入事务提交路径。
 - 分配回归测试在 20,000 个约 1 KiB block 上执行，20 MiB 阈值留出 invariant 校验和并行测试噪声；旧完整 clone 基线约 32.6 MiB，本轮 focused 与 bin 回归均通过。
 - 结构事务若调用方没有当前选区，应通过 `apply_with_selection` 传入编辑前选区；History 仅在没有显式选区且没有最近选区时保留文档末尾 fallback，未扩展 UI 状态。
+
+## Fix round 2：审查 findings 回归与修复
+
+### 修复内容
+
+- 保留排序后的结构端点 affinity；跨节点编辑将 `image Before` 作为图片前边界、`image After` 作为图片后边界，DeleteRange、InsertText 和 InsertImage 共用同一套有效范围。
+- rollback 改为只应用受影响范围的 `RestoreBlocks` journal，不再回到普通事务入口；同时恢复 block revision、Document revision 和 `next_id`，失败批次逐字段等值。
+- `delete_range_mut` 现在只返回原始 prefix/suffix seam；DeleteRange 在提交后解析 caret，InsertText/InsertImage 在 seam 插入，避免组合符接缝重排。
+- `History::apply_with_selection` 在调用事务前只读验证 before selection 的节点、UTF-8 和 grapheme 边界；失败不改变 Document 或 history。
+- 样式规范化预计算 grapheme boundaries，用排序边界和单向 event cursor 合并 mark 事件；复用了 donor `components/block/element.rs::build_text_runs` 的“排序边界 + 单向 span_idx”扫描思想，并以 event cursor 支持 mark union，不重复扫描每个 run。
+
+### 覆盖测试
+
+`packages/app-lite-gpui/src/native_editor/tests.rs` 新增：
+
+- `structural_affinity_keeps_images_outside_asymmetric_cross_node_ranges`
+- `failed_batch_restores_document_revision_and_next_node_id_exactly`
+- `replacement_uses_the_raw_grapheme_seam_before_resolving_the_cursor`
+- `apply_with_selection_rejects_invalid_before_selection_atomically`
+- `style_normalization_uses_near_linear_grapheme_resolution`
+
+### Fix round 2 RED
+
+在 detached 基线 `222678aec` 的临时 worktree `/tmp/joplin-task3-round2.WZdH8l` 中，只加入上述回归测试和 `cfg(test)` grapheme 计数探针；未改变基线生产行为。命令：
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests
+running 20 tests
+test result: FAILED. 15 passed; 5 failed; 0 ignored; 0 measured; 753 filtered out
+失败：
+  structural_affinity_keeps_images_outside_asymmetric_cross_node_ranges
+  failed_batch_restores_document_revision_and_next_node_id_exactly
+  replacement_uses_the_raw_grapheme_seam_before_resolving_the_cursor
+  apply_with_selection_rejects_invalid_before_selection_atomically
+  style_normalization_uses_near_linear_grapheme_resolution (132097 calls)
+```
+
+关键 RED 断言分别显示旧 image 被消费、`revision=2/next_id=3`、实际 `a\\u{301}b`、非法 selection 被接受，以及旧样式扫描计数 132097。
+
+### Fix round 2 GREEN
+
+```text
+cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml -- --check
+git diff --check
+exit 0
+
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 753 filtered out
+```
+
+### Fix round 2 完整验证与自审
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run
+Finished test profile; all test and bench executables generated; exit 0
+
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- \
+  --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
+test result: ok. 772 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out
+
+cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml -- --check
+git diff --check
+exit 0
+```
+
+本轮 donor binary 仍只跳过简报指定的精确 SIGSEGV 测试；没有修改 donor 代码或扩大 skip。
+
+- 没有使用整篇 `Document` clone 或快照；测试中的 `Document::clone` 仅用于失败后逐字段等值断言。
+- `restore_inverse_batch` 只接受内部生成的 `RestoreBlocks`，并在 rollback 后恢复 allocation cursor；历史仍只保存 forward/inverse operation payload。
+- grapheme 计数器仅在 `cfg(test)` 生效；它观测 `resolve_grapheme_offset` 调用次数，验证规范化不再按 run 重复扫描全文。
+
+### Fix round 2 顾虑
+
+- 结构端点落在两个相邻非文本节点之间且两侧 affinity 都排除节点的空 seam，目前不是 UI 入口契约；后续若需要在两个图片之间直接输入，应另行定义插入 paragraph 的结构语义。
+- 报告中 donor full regression 的 Criterion 参数转发顾虑沿用上文；本轮仍只跳过简报指定的精确 donor SIGSEGV 测试。
