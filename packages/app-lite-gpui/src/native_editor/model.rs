@@ -519,9 +519,10 @@ impl Document {
                 }
             };
             selection = outcome.selection;
-            if outcome.inserted_span.is_some() {
-                inserted_span = outcome.inserted_span;
-            }
+            // The public outcome describes only the final operation in the
+            // batch. A later non-insert operation must clear an earlier span
+            // rather than publishing a range that may have moved or vanished.
+            inserted_span = outcome.inserted_span;
             for node_id in outcome.changed_nodes {
                 push_unique(&mut changed_nodes, node_id);
             }

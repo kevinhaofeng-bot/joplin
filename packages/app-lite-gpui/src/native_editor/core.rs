@@ -1110,8 +1110,9 @@ impl EditorCore {
 
     /// Resolve the platform's candidate range against the actual provisional
     /// bytes. The public marked span may include a preceding grapheme when an
-    /// IME inserts a combining mark, so a range covering that public span is
-    /// intentionally clamped to `actual_utf8_range` before inverse mapping.
+    /// IME inserts a combining mark, so only a platform range exactly equal
+    /// to that expanded public span is mapped to `actual_utf8_range` before
+    /// inverse mapping; every other explicit range stays in document space.
     fn candidate_selection_for_marked_range(
         &self,
         range_utf16: Option<&Range<usize>>,
@@ -1137,10 +1138,7 @@ impl EditorCore {
         // accepts that explicit replacement). Only the exact public span
         // itself is treated as the IME's expanded view of the candidate; an
         // explicit range outside it remains a real document range.
-        if public_range != actual_range
-            && requested_range.start <= public_range.start
-            && requested_range.end >= public_range.end
-        {
+        if public_range != actual_range && requested_range == public_range {
             return actual;
         }
         requested

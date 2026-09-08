@@ -1344,6 +1344,114 @@ async fn entity_input_explicit_replacement_outside_expanded_public_mark(
 }
 
 #[gpui::test]
+async fn entity_input_explicit_replacement_superset_stays_explicit(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("aQ"), cx));
+    let original_selection = cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(1);
+            let original_selection = editor.selection();
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "\u{301}",
+                Some(0..0),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "a\u{301}Q");
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor,
+                Some(0..3),
+                "b",
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "b");
+            assert_eq!(editor.undo_depth(), 1);
+            original_selection
+        })
+    });
+
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "aQ"
+    );
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
+}
+
+#[test]
+fn apply_batch_insert_then_delete_clears_inserted_span() {
+    let mut doc = Document::from_paragraph("a");
+    let node = doc.first_node_id().unwrap();
+    let outcome = doc
+        .apply_batch(TransactionBatch(vec![
+            Transaction::InsertText {
+                selection: Selection::caret(DocPoint::new(node, 0)),
+                text: "x".into(),
+            },
+            Transaction::DeleteRange {
+                selection: Selection::new(
+                    DocPoint::with_affinity(node, 0, Affinity::Before),
+                    DocPoint::with_affinity(node, 2, Affinity::After),
+                ),
+            },
+        ]))
+        .unwrap();
+
+    assert_eq!(doc.text_at_index(0), Some(""));
+    assert_eq!(outcome.inserted_span, None);
+}
+
+#[test]
+fn apply_batch_insert_then_remove_clears_removed_inserted_span() {
+    let mut doc = Document::from_paragraphs(["a", "z"]);
+    let node = doc.first_node_id().unwrap();
+    let outcome = doc
+        .apply_batch(TransactionBatch(vec![
+            Transaction::InsertText {
+                selection: Selection::caret(DocPoint::new(node, 0)),
+                text: "x".into(),
+            },
+            Transaction::RemoveNode { node_id: node },
+        ]))
+        .unwrap();
+
+    assert_eq!(doc.text_at_index(0), Some("z"));
+    assert_eq!(outcome.inserted_span, None);
+}
+
+#[test]
+fn apply_batch_final_insert_reports_final_inserted_span() {
+    let mut doc = Document::from_paragraph("a");
+    let node = doc.first_node_id().unwrap();
+    let outcome = doc
+        .apply_batch(TransactionBatch(vec![
+            Transaction::InsertText {
+                selection: Selection::caret(DocPoint::new(node, 0)),
+                text: "x".into(),
+            },
+            Transaction::InsertText {
+                selection: Selection::caret(DocPoint::new(node, 1)),
+                text: "y".into(),
+            },
+        ]))
+        .unwrap();
+
+    assert_eq!(doc.text_at_index(0), Some("xya"));
+    assert_eq!(
+        outcome.inserted_span.map(|span| (span.node_id, span.range)),
+        Some((node, 1..2))
+    );
+}
+
+#[gpui::test]
 async fn empty_hard_lines_hit_test_by_y(cx: &mut gpui::TestAppContext) {
     let mut cx = cx.add_empty_window();
     let document = Document::from_paragraph("\n\n");

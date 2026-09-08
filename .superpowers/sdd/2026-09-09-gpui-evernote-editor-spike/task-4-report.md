@@ -394,3 +394,57 @@ Round 5 修改范围为 native editor 实现/测试、本报告，以及为直�
 findings、验收矩阵、donor 或既有预算/sum-tree/selection streaming gate。已知限制仍
 与前轮相同：headless GREEN 不能替代真实 macOS IME 候选窗、主题字体、Metal/RSS、
 异步图片解码和真实 UI 外壳集成验收。
+
+## Task 4R fix round 1（2026-09-09）
+
+针对独立审查的两个 Important findings，先在当前 `7e348b48d` 基线上加入生产路径
+回归并运行 RED，再作最小修复；没有修改已批准的 sum-tree、selection streaming、
+allocator/cache budget，也没有开始 Task 5。
+
+### RED -> GREEN
+
+| 测试 | RED 暴露的问题 | GREEN 修复/契约 |
+| --- | --- | --- |
+| `entity_input_explicit_replacement_superset_stays_explicit` | `Some(0..3)` 严格 superset 被 containment 规则误判为 public marked span，结果为 `abQ` 而非 `b` | 只有 explicit range 与 expanded public marked range **精确相等**时才映射到 actual candidate interval；strict superset/subset/overlap/disjoint 均保留真实文档坐标。结果为 `b`，一次 Undo 恢复 `aQ` 与原 selection。 |
+| `apply_batch_insert_then_delete_clears_inserted_span` | insert 后 delete 的 batch 仍发布已删除区间 | `apply_batch` 每一步都覆盖 `inserted_span`，final Delete 的 None 清除 earlier span。 |
+| `apply_batch_insert_then_remove_clears_removed_inserted_span` | insert 后 RemoveNode 的 batch 仍发布已不存在 NodeId | 同一 final-operation 契约；RemoveNode 的 None 不会传播已删除 node 的 span。 |
+| `apply_batch_final_insert_reports_final_inserted_span` | 守住 batch 最终 InsertText 的 exact span 语义 | final InsertText 返回最后一次执行时记录的 node/range，回归确认 `x` 后插入 `y` 返回 `node, 1..2`。 |
+
+RED focused 结果为 superset `1 failed`，batch 套件 `1 passed / 2 failed`；失败均对应
+finding，未以放宽断言或绕过 production path 处理。
+
+修复后的 focused 结果：
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor --offline -- --nocapture
+    84 passed, 0 failed, 752 filtered out
+
+### ApplyOutcome batch contract
+
+`ApplyOutcome.inserted_span` 现在明确表示“仅当 batch 的最后一项 transaction 是
+`InsertText` 时，才描述该最后操作在最终文档中的精确写入区间；否则为 `None`”。
+这样不会尝试把 earlier InsertText 的 span 通过任意后续删除、移除节点或结构替换
+重映射，也不会向 composition caller 发布 stale NodeId/range；单项 `Document::apply`
+继续得到相同的 InsertText exact span。
+
+### Fix round 1 验收命令
+
+    cargo check --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype --offline
+    PASS
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run --offline
+    PASS
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype --offline \
+      --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
+    835 passed, 0 failed, 1 filtered
+
+    cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml --all -- --check
+    PASS
+
+    git diff --check
+    PASS
+
+Donor/GPUI 复用映射和已知 headless 限制沿用 Task 4R 主报告：本轮只收紧
+`candidate_selection_for_marked_range` 的 explicit precedence，并落实
+`apply_batch` 的 final-operation span 契约；没有回退或弱化既有 donor gate、sum-tree、
+selection streaming、预算或测试。
