@@ -12,11 +12,11 @@ use joplin_lite_native::native_editor::LinkSelectionState;
 use joplin_lite_native::native_editor::{
     BlockCommand, EditorCodecError as NativeEditorCodecError, EmptyBlockCarrier, InlineCommand,
     NativeEditorSession, ParagraphCommand, RenderedAttachment, RenderedDocument, SelectionState,
-    apply_block_command, apply_committed_text_delta, apply_inline_command, apply_link,
-    apply_paragraph_command, delete_image_anchor_if_identity, document_from_session,
-    editor_attachment_image, image_paragraph_tail_indent, insert_image_block_anchor,
-    query_block_state, query_clear_state, query_inline_state, query_link_selection,
-    query_paragraph_command_state, render_session, session_from_document,
+    apply_block_command, apply_clear_formatting, apply_committed_text_delta, apply_inline_command,
+    apply_link, apply_paragraph_command, delete_image_anchor_if_identity, document_from_session,
+    editor_attachment_image, effective_typing_format_at, image_paragraph_tail_indent,
+    insert_image_block_anchor, query_block_state, query_clear_state, query_inline_state,
+    query_link_selection, query_paragraph_command_state, render_session, session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
     PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
@@ -41,10 +41,11 @@ use objc2_app_kit::{
     NSImage, NSIndexPathNSCollectionViewAdditions, NSLayoutManager, NSLineBreakMode, NSMenu,
     NSMenuItem, NSModalResponseOK, NSMutableParagraphStyle, NSOpenPanel, NSParagraphStyle,
     NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
-    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField, NSText, NSTextAlignment,
-    NSTextAttachment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextInputClient,
-    NSTextStorage, NSTextView, NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSPasteboardTypeTIFF, NSResponder, NSScrollView, NSSearchField,
+    NSStrikethroughStyleAttributeName, NSText, NSTextAlignment, NSTextAttachment, NSTextDelegate,
+    NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextStorage, NSTextView,
+    NSTextViewDelegate, NSUnderlineStyle, NSUnderlineStyleAttributeName, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
@@ -71,6 +72,7 @@ use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+use text_document::TextFormat as NativeTextFormat;
 
 const RESOURCE_ID_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-id";
 const RESOURCE_ALT_ATTRIBUTE: &str = "com.kevinhao.joplin-lite.resource-alt";
@@ -1386,15 +1388,15 @@ fn semantic_action_presentation(
         }
         EditorAction::AlignLeft => {
             presentation.state = paragraph_state(ParagraphCommand::Align(Alignment::Left));
-            presentation.enabled = presentation.state != SelectionState::Active;
+            presentation.enabled = session.is_some();
         }
         EditorAction::AlignCenter => {
             presentation.state = paragraph_state(ParagraphCommand::Align(Alignment::Center));
-            presentation.enabled = presentation.state != SelectionState::Active;
+            presentation.enabled = session.is_some();
         }
         EditorAction::AlignRight => {
             presentation.state = paragraph_state(ParagraphCommand::Align(Alignment::Right));
-            presentation.enabled = presentation.state != SelectionState::Active;
+            presentation.enabled = session.is_some();
         }
         EditorAction::IncreaseIndent => {
             presentation.state = paragraph_state(ParagraphCommand::IncreaseIndent);
@@ -1506,6 +1508,14 @@ fn should_sync_caret_context_after_delegate(
         body_marked,
         pending_composition,
     ) && !pending_intent
+}
+
+fn command_selection_is_available(
+    current_note_id: Option<&str>,
+    selection_note_id: Option<&str>,
+    non_body_focus: bool,
+) -> bool {
+    !non_body_focus && current_note_id.is_some() && current_note_id == selection_note_id
 }
 
 fn sync_caret_after_editor_event(
@@ -2021,6 +2031,89 @@ fn toolbar_state_title(action: EditorAction, label: &str) -> Option<&str> {
     (action == EditorAction::BlockStyle).then_some(label)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TypingFormatProjection {
+    font_bold: Option<bool>,
+    font_italic: Option<bool>,
+    font_underline: Option<bool>,
+    font_strikeout: Option<bool>,
+    has_background: bool,
+    clear_link: bool,
+}
+
+fn typing_format_projection(format: &NativeTextFormat) -> TypingFormatProjection {
+    TypingFormatProjection {
+        font_bold: format.font_bold,
+        font_italic: format.font_italic,
+        font_underline: format.font_underline,
+        font_strikeout: format.font_strikeout,
+        has_background: format.background_color.is_some_and(|color| color.alpha > 0),
+        clear_link: format.clear_link,
+    }
+}
+
+fn sync_typing_attributes_with_format(body: &NSTextView, format: &NativeTextFormat) {
+    let projection = typing_format_projection(format);
+    let typing = body.typingAttributes();
+    let mutable = typing.mutableCopy();
+    let font_key = unsafe { NSFontAttributeName };
+    if (projection.font_bold.is_some() || projection.font_italic.is_some())
+        && let Some(font) = unsafe { typing.objectForKey_unchecked(font_key) }
+            .and_then(|value| value.downcast_ref::<NSFont>())
+    {
+        let descriptor = font.fontDescriptor();
+        let mut traits = descriptor.symbolicTraits();
+        if projection.font_bold == Some(true) {
+            traits.insert(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitBold);
+        } else if projection.font_bold == Some(false) {
+            traits.remove(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitBold);
+        }
+        if projection.font_italic == Some(true) {
+            traits.insert(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitItalic);
+        } else if projection.font_italic == Some(false) {
+            traits.remove(objc2_app_kit::NSFontDescriptorSymbolicTraits::TraitItalic);
+        }
+        if let Some(font) = NSFont::fontWithDescriptor_size(
+            &descriptor.fontDescriptorWithSymbolicTraits(traits),
+            font.pointSize(),
+        ) {
+            mutable.insert(font_key, &font);
+        }
+    }
+    let underline_key = unsafe { NSUnderlineStyleAttributeName };
+    if projection.font_underline == Some(true) {
+        let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
+        mutable.insert(underline_key, &value);
+    } else if projection.font_underline == Some(false) {
+        mutable.removeObjectForKey(underline_key);
+    }
+    let strike_key = unsafe { NSStrikethroughStyleAttributeName };
+    if projection.font_strikeout == Some(true) {
+        let value = NSNumber::numberWithInteger(NSUnderlineStyle::Single.0);
+        mutable.insert(strike_key, &value);
+    } else if projection.font_strikeout == Some(false) {
+        mutable.removeObjectForKey(strike_key);
+    }
+    if let Some(color) = format.background_color {
+        if color.alpha > 0 {
+            let value = NSColor::colorWithRed_green_blue_alpha(
+                f64::from(color.red) / 255.0,
+                f64::from(color.green) / 255.0,
+                f64::from(color.blue) / 255.0,
+                f64::from(color.alpha) / 255.0,
+            );
+            mutable.insert(unsafe { NSBackgroundColorAttributeName }, &value);
+        } else {
+            mutable.removeObjectForKey(unsafe { NSBackgroundColorAttributeName });
+        }
+    }
+    if projection.clear_link {
+        let link_key = NSAttributedStringKey::from_str("NSLink");
+        mutable.removeObjectForKey(&link_key);
+    }
+    unsafe { body.setTypingAttributes(&mutable) };
+}
+
 fn canonical_marker_ranges(body: &str) -> Vec<(NSRange, String, String)> {
     marker_spans(body)
         .into_iter()
@@ -2330,6 +2423,7 @@ struct AppDelegateIvars {
     shell_visibility: RefCell<ShellVisibility>,
     focus_restore_visibility: RefCell<Option<ShellVisibility>>,
     last_body_selection: RefCell<NSRange>,
+    last_body_selection_note_id: RefCell<Option<String>>,
     selection_sync_guard: RefCell<bool>,
     collection_selection_guard: Cell<bool>,
     editor_session: RefCell<Option<NativeEditorSession>>,
@@ -3063,6 +3157,8 @@ define_class!(
             if let Some(body) = self.ivars().body_view.get() {
                 let selection = body.selectedRange();
                 *self.ivars().last_body_selection.borrow_mut() = selection;
+                *self.ivars().last_body_selection_note_id.borrow_mut() =
+                    self.ivars().current_note_id.borrow().clone();
                 let should_sync = should_sync_caret_context_after_delegate(
                     *self.ivars().selection_sync_guard.borrow(),
                     *self.ivars().loading_guard.borrow(),
@@ -3534,6 +3630,9 @@ define_class!(
 
     #[unsafe(method(undoText:))]
     fn undo_text(&self, _sender: &NSObject) {
+        let Some(selection) = self.command_selection() else {
+            return;
+        };
         let changed = self
             .ivars()
             .editor_session
@@ -3542,12 +3641,24 @@ define_class!(
             .is_some_and(|session| session.can_undo() && session.undo().is_ok());
         if changed {
             self.refresh_body_from_session();
+            let selection = self
+                .ivars()
+                .body_view
+                .get()
+                .map(|body| body.selectedRange())
+                .unwrap_or(selection);
+            self.restore_command_selection(selection);
             self.save_current_note();
+        } else {
+            self.restore_command_selection(selection);
         }
     }
 
     #[unsafe(method(redoText:))]
     fn redo_text(&self, _sender: &NSObject) {
+        let Some(selection) = self.command_selection() else {
+            return;
+        };
         let changed = self
             .ivars()
             .editor_session
@@ -3556,7 +3667,16 @@ define_class!(
             .is_some_and(|session| session.can_redo() && session.redo().is_ok());
         if changed {
             self.refresh_body_from_session();
+            let selection = self
+                .ivars()
+                .body_view
+                .get()
+                .map(|body| body.selectedRange())
+                .unwrap_or(selection);
+            self.restore_command_selection(selection);
             self.save_current_note();
+        } else {
+            self.restore_command_selection(selection);
         }
     }
 
@@ -4097,8 +4217,24 @@ impl AppDelegate {
                 }
             }
         }
+        self.sync_typing_attributes_for_selection(body, NSRange::new(location, length));
         self.set_selected_range_programmatically(body, NSRange::new(location, length));
         self.refresh_search_highlights(body, false);
+    }
+
+    fn sync_typing_attributes_for_selection(&self, body: &NSTextView, selection: NSRange) {
+        if selection.length != 0 {
+            return;
+        }
+        let format = {
+            let session_guard = self.ivars().editor_session.borrow();
+            session_guard
+                .as_ref()
+                .and_then(|session| effective_typing_format_at(session, selection).ok())
+        };
+        if let Some(format) = format {
+            sync_typing_attributes_with_format(body, &format);
+        }
     }
 
     fn refresh_search_highlights(&self, body: &NSTextView, scroll_to_first: bool) {
@@ -4193,6 +4329,7 @@ impl AppDelegate {
                 mutable.insert(NSParagraphStyleAttributeName, &carrier.paragraph);
                 body.setTypingAttributes(&mutable);
             }
+            self.sync_typing_attributes_for_selection(body, selection);
             return;
         }
 
@@ -4219,6 +4356,7 @@ impl AppDelegate {
             mutable.insert(NSParagraphStyleAttributeName, &paragraph);
             body.setTypingAttributes(&mutable);
         }
+        self.sync_typing_attributes_for_selection(body, selection);
     }
 
     #[allow(deprecated)]
@@ -4838,6 +4976,34 @@ impl AppDelegate {
 
     fn command_selection(&self) -> Option<NSRange> {
         let body = self.ivars().body_view.get()?;
+        let current_note_id = self.ivars().current_note_id.borrow().clone();
+        let selection_note_id = self.ivars().last_body_selection_note_id.borrow().clone();
+        let mut non_body_focus = false;
+        if let Some(window) = self.ivars().window.get()
+            && let Some(first_responder) = window.firstResponder()
+        {
+            let first_ptr = Retained::<NSResponder>::as_ptr(&first_responder);
+            let title_focused = self.ivars().title_field.get().is_some_and(|field| {
+                Retained::<NSTextField>::as_ptr(field) as *const NSResponder == first_ptr
+                    || field.currentEditor().is_some_and(|editor| {
+                        Retained::<NSText>::as_ptr(&editor) as *const NSResponder == first_ptr
+                    })
+            });
+            let search_focused = self.ivars().search_field.get().is_some_and(|field| {
+                Retained::<NSSearchField>::as_ptr(field) as *const NSResponder == first_ptr
+                    || field.currentEditor().is_some_and(|editor| {
+                        Retained::<NSText>::as_ptr(&editor) as *const NSResponder == first_ptr
+                    })
+            });
+            non_body_focus = title_focused || search_focused;
+        }
+        if !command_selection_is_available(
+            current_note_id.as_deref(),
+            selection_note_id.as_deref(),
+            non_body_focus,
+        ) {
+            return None;
+        }
         let selection = body.selectedRange();
         if selection.length > 0 {
             *self.ivars().last_body_selection.borrow_mut() = selection;
@@ -4906,12 +5072,16 @@ impl AppDelegate {
     }
 
     fn apply_inline_command(&self, command: InlineCommand) {
-        if self.ivars().current_note_id.borrow().is_none() || !self.save_current_note() {
-            return;
-        }
         let Some(selection) = self.command_selection() else {
             return;
         };
+        if self.ivars().current_note_id.borrow().is_none() {
+            return;
+        }
+        if !self.save_current_note() {
+            self.restore_command_selection(selection);
+            return;
+        }
         let changed = self
             .ivars()
             .editor_session
@@ -4922,16 +5092,22 @@ impl AppDelegate {
             self.refresh_body_from_session();
             self.restore_command_selection(selection);
             self.save_current_note();
+        } else {
+            self.restore_command_selection(selection);
         }
     }
 
     fn apply_block_command(&self, command: BlockCommand) {
-        if self.ivars().current_note_id.borrow().is_none() || !self.save_current_note() {
-            return;
-        }
         let Some(selection) = self.command_selection() else {
             return;
         };
+        if self.ivars().current_note_id.borrow().is_none() {
+            return;
+        }
+        if !self.save_current_note() {
+            self.restore_command_selection(selection);
+            return;
+        }
         let changed = self
             .ivars()
             .editor_session
@@ -4942,16 +5118,22 @@ impl AppDelegate {
             self.refresh_body_from_session();
             self.restore_command_selection(selection);
             self.save_current_note();
+        } else {
+            self.restore_command_selection(selection);
         }
     }
 
     fn apply_paragraph_command(&self, command: ParagraphCommand) {
-        if self.ivars().current_note_id.borrow().is_none() || !self.save_current_note() {
-            return;
-        }
         let Some(selection) = self.command_selection() else {
             return;
         };
+        if self.ivars().current_note_id.borrow().is_none() {
+            return;
+        }
+        if !self.save_current_note() {
+            self.restore_command_selection(selection);
+            return;
+        }
         let changed = self
             .ivars()
             .editor_session
@@ -4962,18 +5144,25 @@ impl AppDelegate {
             self.refresh_body_from_session();
             self.restore_command_selection(selection);
             self.save_current_note();
+        } else {
+            self.restore_command_selection(selection);
         }
     }
 
     fn show_link_editor(&self) {
-        if self.ivars().current_note_id.borrow().is_none() || !self.save_current_note() {
-            return;
-        }
         let Some(selection) = self.command_selection() else {
             return;
         };
+        if self.ivars().current_note_id.borrow().is_none() {
+            return;
+        }
+        if !self.save_current_note() {
+            self.restore_command_selection(selection);
+            return;
+        }
         if selection.length == 0 {
             self.set_save_status("链接未应用：请先选择文字", true);
+            self.restore_command_selection(selection);
             return;
         }
         let alert = NSAlert::new(self.mtm());
@@ -5010,9 +5199,6 @@ impl AppDelegate {
 
     #[allow(deprecated)]
     fn apply_format(&self, format: TextFormat) {
-        if self.ivars().current_note_id.borrow().is_none() || !self.save_current_note() {
-            return;
-        }
         let Some(body) = self.ivars().body_view.get() else {
             return;
         };
@@ -5022,11 +5208,47 @@ impl AppDelegate {
         let Some(range) = self.command_selection() else {
             return;
         };
+        if self.ivars().current_note_id.borrow().is_none() {
+            return;
+        }
+        if !self.save_current_note() {
+            self.restore_command_selection(range);
+            return;
+        }
         let command = match format {
             TextFormat::Bold => InlineCommand::Bold,
             TextFormat::Italic => InlineCommand::Italic,
             TextFormat::Underline => InlineCommand::Underline,
-            TextFormat::Clear => InlineCommand::Clear,
+            TextFormat::Clear => {
+                let before_revision = self
+                    .ivars()
+                    .editor_session
+                    .borrow()
+                    .as_ref()
+                    .map(NativeEditorSession::revision)
+                    .unwrap_or_default();
+                let applied = self
+                    .ivars()
+                    .editor_session
+                    .borrow_mut()
+                    .as_mut()
+                    .is_some_and(|session| apply_clear_formatting(session, range).is_ok());
+                let after_revision = self
+                    .ivars()
+                    .editor_session
+                    .borrow()
+                    .as_ref()
+                    .map(NativeEditorSession::revision)
+                    .unwrap_or(before_revision);
+                if applied && after_revision != before_revision {
+                    self.refresh_body_from_session();
+                    self.restore_command_selection(range);
+                    self.save_current_note();
+                } else {
+                    self.restore_command_selection(range);
+                }
+                return;
+            }
         };
         let before_revision = self
             .ivars()
@@ -5053,6 +5275,8 @@ impl AppDelegate {
             self.restore_command_selection(range);
             self.update_formatting_buttons();
             self.save_current_note();
+        } else {
+            self.restore_command_selection(range);
         }
     }
 
@@ -5404,6 +5628,7 @@ impl AppDelegate {
         self.clear_pending_editor_intent();
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = Some(note.id.clone());
+        *self.ivars().last_body_selection_note_id.borrow_mut() = Some(note.id.clone());
         self.ivars()
             .autosave
             .borrow_mut()
@@ -5473,6 +5698,7 @@ impl AppDelegate {
         self.clear_pending_editor_intent();
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().current_note_id.borrow_mut() = None;
+        *self.ivars().last_body_selection_note_id.borrow_mut() = None;
         self.ivars().autosave.borrow_mut().clear();
         *self.ivars().editor_session.borrow_mut() = None;
         self.ivars().projection_attachments.borrow_mut().clear();
@@ -6453,6 +6679,7 @@ impl AppDelegate {
             shell_visibility: RefCell::new(ShellVisibility::Default),
             focus_restore_visibility: RefCell::new(None),
             last_body_selection: RefCell::new(NSRange::new(0, 0)),
+            last_body_selection_note_id: RefCell::new(None),
             selection_sync_guard: RefCell::new(false),
             collection_selection_guard: Cell::new(false),
             editor_session: RefCell::new(None),
@@ -6537,6 +6764,30 @@ mod tests {
             style: Default::default(),
             inlines,
         }
+    }
+
+    #[test]
+    fn collapsed_typing_projection_carries_all_inline_marks() {
+        let format = text_document::TextFormat {
+            font_bold: Some(true),
+            font_italic: Some(true),
+            font_underline: Some(true),
+            font_strikeout: Some(true),
+            background_color: Some(text_document::Color::rgb(255, 230, 120)),
+            clear_link: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::typing_format_projection(&format),
+            super::TypingFormatProjection {
+                font_bold: Some(true),
+                font_italic: Some(true),
+                font_underline: Some(true),
+                font_strikeout: Some(true),
+                has_background: true,
+                clear_link: true,
+            }
+        );
     }
 
     #[test]
@@ -8400,6 +8651,46 @@ mod tests {
             )
             .enabled
         );
+    }
+
+    #[test]
+    fn active_alignment_remains_enabled_and_is_marked_active() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "正文".into(),
+                marks: Default::default(),
+            }],
+        }]);
+        let session = super::session_from_document(&document).unwrap();
+        let presentation = super::semantic_action_presentation(
+            super::EditorAction::AlignLeft,
+            true,
+            Some(&session),
+            NSRange::new(0, 0),
+        );
+        assert_eq!(presentation.state, super::SelectionState::Active);
+        assert!(presentation.enabled);
+    }
+
+    #[test]
+    fn command_selection_is_rejected_for_non_body_focus_or_stale_note() {
+        assert!(!super::command_selection_is_available(None, None, false));
+        assert!(!super::command_selection_is_available(
+            Some("current"),
+            Some("previous"),
+            false
+        ));
+        assert!(!super::command_selection_is_available(
+            Some("current"),
+            Some("current"),
+            true
+        ));
+        assert!(super::command_selection_is_available(
+            Some("current"),
+            Some("current"),
+            false
+        ));
     }
 
     #[test]

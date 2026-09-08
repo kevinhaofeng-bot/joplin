@@ -1040,6 +1040,22 @@ pub fn apply_committed_text_delta(
     Ok(())
 }
 
+/// Return the semantic typing format at an AppKit UTF-16 caret.  AppKit's
+/// `typingAttributes` is only a view projection; collapsed inline commands
+/// update this format in the native session and the caller must mirror it
+/// before the next keystroke.
+pub fn effective_typing_format_at(
+    session: &NativeEditorSession,
+    selection: NSRange,
+) -> Result<TextFormat, EditorCodecError> {
+    let text = session.text.to_addressable_text().map_err(model_error)?;
+    let (start, end) = utf16_range(&text, selection)?;
+    if start != end {
+        return Ok(TextFormat::default());
+    }
+    Ok(session.effective_typing_format(start))
+}
+
 fn toggled_typing_format(current: &TextFormat, command: InlineCommand) -> TextFormat {
     let mut next = current.clone();
     match command {
@@ -1576,16 +1592,71 @@ pub fn query_clear_state(
 ) -> Result<SelectionState, EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
-    let active = if start == end {
+    let inline_active = if start == end {
         format_needs_clear(&session.effective_typing_format(start))
     } else {
         selection_needs_clear(session, start, end)
     };
+    let block_active = !block_command_is_noop(session, start, end, BlockCommand::Paragraph);
+    let active = inline_active || block_active;
     Ok(if active {
         SelectionState::Active
     } else {
         SelectionState::Inactive
     })
+}
+
+pub fn apply_clear_formatting(
+    session: &mut NativeEditorSession,
+    selection: NSRange,
+) -> Result<(), EditorCodecError> {
+    let text = session.text.to_addressable_text().map_err(model_error)?;
+    let (start, end) = utf16_range(&text, selection)?;
+    let inline_active = if start == end {
+        format_needs_clear(&session.effective_typing_format(start))
+    } else {
+        selection_needs_clear(session, start, end)
+    };
+    let block_active = !block_command_is_noop(session, start, end, BlockCommand::Paragraph);
+    if !inline_active && !block_active {
+        return Ok(());
+    }
+    let cleared_typing_format = TextFormat {
+        font_bold: Some(false),
+        font_italic: Some(false),
+        font_underline: Some(false),
+        font_strikeout: Some(false),
+        background_color: Some(text_document::Color::rgba(0, 0, 0, 0)),
+        clear_link: true,
+        ..Default::default()
+    };
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        if inline_active {
+            clear_highlight_range(session, start, end);
+            must_apply(
+                cursor.merge_char_format(&cleared_typing_format),
+                "clear inline format",
+            );
+        }
+        if block_active {
+            must_apply(
+                cursor.set_block_format(&BlockFormat {
+                    heading_level: Some(0),
+                    marker: Some(MarkerType::NoMarker),
+                    ..Default::default()
+                }),
+                "clear paragraph format",
+            );
+            remove_lists_in_selection(session, start, end);
+        }
+    });
+    if start == end && inline_active {
+        session.typing_format = cleared_typing_format.clone();
+        session.typing_override = Some((start, cleared_typing_format));
+    }
+    Ok(())
 }
 
 pub fn apply_inline_command(
@@ -1595,6 +1666,9 @@ pub fn apply_inline_command(
 ) -> Result<(), EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
+    if start != end && !selection_has_text(session, start, end) {
+        return Ok(());
+    }
     if start == end {
         let current = session.effective_typing_format(start);
         let next = toggled_typing_format(&current, command);
@@ -1669,6 +1743,23 @@ pub fn apply_inline_command(
     Ok(())
 }
 
+fn selection_has_text(session: &NativeEditorSession, start: usize, end: usize) -> bool {
+    session.text.flow().into_iter().any(|element| {
+        let FlowElement::Block(block) = element else {
+            return false;
+        };
+        let snapshot = block.snapshot();
+        snapshot.fragments.into_iter().any(|fragment| {
+            let FragmentContent::Text { offset, length, .. } = fragment else {
+                return false;
+            };
+            let from = snapshot.position + offset;
+            let to = from + length;
+            from < end && to > start
+        })
+    })
+}
+
 pub fn apply_block_command(
     session: &mut NativeEditorSession,
     selection: NSRange,
@@ -1708,6 +1799,7 @@ pub fn apply_block_command(
                     }),
                     "set heading format",
                 );
+                remove_lists_in_selection(session, start, end);
             }
             BlockCommand::UnorderedList | BlockCommand::OrderedList | BlockCommand::Checklist => {
                 if toggle_active {
@@ -1725,6 +1817,7 @@ pub fn apply_block_command(
                     };
                     must_apply(
                         cursor.set_block_format(&BlockFormat {
+                            heading_level: Some(0),
                             marker: Some(marker),
                             ..Default::default()
                         }),
@@ -1785,31 +1878,61 @@ pub fn apply_paragraph_command(
             ..Default::default()
         },
         ParagraphCommand::IncreaseIndent | ParagraphCommand::DecreaseIndent => {
-            let cursor = session.text.cursor_at(start);
-            cursor.set_position(end, MoveMode::KeepAnchor);
-            let current = cursor
-                .block_format()
-                .map_err(model_error)?
-                .indent
-                .unwrap_or(0);
-            let indent = match command {
-                ParagraphCommand::IncreaseIndent => current.saturating_add(1).min(8),
-                ParagraphCommand::DecreaseIndent => current.saturating_sub(1),
-                ParagraphCommand::Align(_) => unreachable!(),
-            };
-            BlockFormat {
-                indent: Some(indent),
-                ..Default::default()
-            }
+            BlockFormat::default()
         }
     };
+    let block_indents = if matches!(
+        command,
+        ParagraphCommand::IncreaseIndent | ParagraphCommand::DecreaseIndent
+    ) {
+        session
+            .text
+            .flow()
+            .into_iter()
+            .filter_map(|element| {
+                let FlowElement::Block(block) = element else {
+                    return None;
+                };
+                let snapshot = block.snapshot();
+                let overlaps = if start == end {
+                    snapshot.position <= start && start <= snapshot.position + snapshot.length
+                } else {
+                    snapshot.position < end && snapshot.position + snapshot.length > start
+                };
+                overlaps.then(|| {
+                    let current = snapshot.block_format.indent.unwrap_or(0);
+                    let indent = match command {
+                        ParagraphCommand::IncreaseIndent => current.saturating_add(1).min(8),
+                        ParagraphCommand::DecreaseIndent => current.saturating_sub(1),
+                        ParagraphCommand::Align(_) => unreachable!(),
+                    };
+                    (snapshot.position, indent)
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     run_edit_command(session, |session| {
-        let cursor = session.text.cursor_at(start);
-        cursor.set_position(end, MoveMode::KeepAnchor);
-        must_apply(
-            cursor.set_block_format(&requested_format),
-            "set paragraph format",
-        );
+        if block_indents.is_empty() {
+            let cursor = session.text.cursor_at(start);
+            cursor.set_position(end, MoveMode::KeepAnchor);
+            must_apply(
+                cursor.set_block_format(&requested_format),
+                "set paragraph format",
+            );
+        } else {
+            for (position, indent) in &block_indents {
+                let cursor = session.text.cursor_at(*position);
+                must_apply(
+                    cursor.set_block_format(&BlockFormat {
+                        indent: Some(*indent),
+                        ..Default::default()
+                    }),
+                    "set paragraph indent",
+                );
+            }
+        }
     });
     Ok(())
 }
@@ -3256,6 +3379,104 @@ mod tests {
     }
 
     #[test]
+    fn inline_commands_on_an_image_only_selection_are_noops() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: Default::default(),
+            inlines: vec![Inline::Image {
+                resource_id: "image-only".into(),
+                alt: "图".into(),
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        let revision = session.revision();
+        let can_undo = session.can_undo();
+        apply_inline_command(&mut session, NSRange::new(0, 1), InlineCommand::Bold).unwrap();
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.can_undo(), can_undo);
+        assert_eq!(document_from_session(&session).unwrap(), document);
+    }
+
+    #[test]
+    fn inline_commands_on_empty_structure_selection_are_noops() {
+        let document = Document::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: Vec::new(),
+            },
+            Block::Heading {
+                level: HeadingLevel::Two,
+                style: BlockStyle::default(),
+                inlines: Vec::new(),
+            },
+        ]);
+        let mut session = session_from_document(&document).unwrap();
+        let revision = session.revision();
+        assert!(!session.can_undo());
+        apply_inline_command(&mut session, NSRange::new(0, 1), InlineCommand::Bold).unwrap();
+        assert_eq!(session.revision(), revision);
+        assert!(!session.can_undo());
+        assert_eq!(document_from_session(&session).unwrap(), document);
+    }
+
+    #[test]
+    fn clear_formatting_removes_block_style_as_well_as_inline_marks() {
+        let document = Document::from_blocks(vec![Block::Heading {
+            level: HeadingLevel::One,
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "加粗标题".into(),
+                marks: Marks {
+                    bold: true,
+                    ..Default::default()
+                },
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        assert_eq!(
+            query_clear_state(&session, NSRange::new(0, 4)).unwrap(),
+            SelectionState::Active
+        );
+        apply_clear_formatting(&mut session, NSRange::new(0, 4)).unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [Block::Paragraph { inlines, .. }]
+                if matches!(inlines.as_slice(), [Inline::Text { marks, .. }] if !marks.bold)
+        ));
+    }
+
+    #[test]
+    fn clear_formatting_at_collapsed_caret_clears_typing_context() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "abc".into(),
+                marks: Marks::default(),
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        apply_inline_command(&mut session, NSRange::new(1, 0), InlineCommand::Bold).unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(1, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Active
+        );
+        apply_clear_formatting(&mut session, NSRange::new(1, 0)).unwrap();
+        assert_eq!(
+            query_inline_state(&session, NSRange::new(1, 0), InlineCommand::Bold).unwrap(),
+            SelectionState::Inactive
+        );
+        apply_committed_text_delta(&mut session, NSRange::new(1, 0), "X").unwrap();
+        let document = document_from_session(&session).unwrap();
+        assert!(matches!(
+            document.blocks.as_slice(),
+            [Block::Paragraph { inlines, .. }]
+                if inlines.iter().any(|inline| matches!(
+                    inline,
+                    Inline::Text { text, marks } if text == "aXbc" && !marks.bold
+                ))
+        ));
+    }
+
+    #[test]
     fn failed_command_preserves_redo_without_resurrecting_text() {
         let mut session = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
             style: Default::default(),
@@ -3570,6 +3791,222 @@ mod tests {
                 [Block::Paragraph { .. }]
             ));
         }
+    }
+
+    #[test]
+    fn heading_and_list_commands_are_mutually_exclusive() {
+        let mut session = session_from_document(&Document::from_blocks(vec![Block::Heading {
+            level: HeadingLevel::One,
+            style: Default::default(),
+            inlines: vec![Inline::Text {
+                text: "标题".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        apply_block_command(
+            &mut session,
+            NSRange::new(0, 2),
+            BlockCommand::UnorderedList,
+        )
+        .unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [Block::List { .. }]
+        ));
+        let listed = document_from_session(&session).unwrap();
+        let reloaded = session_from_document(&listed).unwrap();
+        assert_eq!(
+            query_block_state(&reloaded, NSRange::new(0, 2), BlockCommand::UnorderedList,).unwrap(),
+            SelectionState::Active
+        );
+        apply_block_command(
+            &mut session,
+            NSRange::new(0, 2),
+            BlockCommand::Heading(HeadingLevel::Two),
+        )
+        .unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [Block::Heading {
+                level: HeadingLevel::Two,
+                ..
+            }]
+        ));
+        let headed = document_from_session(&session).unwrap();
+        let reloaded = session_from_document(&headed).unwrap();
+        assert_eq!(
+            query_block_state(
+                &reloaded,
+                NSRange::new(0, 2),
+                BlockCommand::Heading(HeadingLevel::Two),
+            )
+            .unwrap(),
+            SelectionState::Active
+        );
+
+        apply_block_command(
+            &mut session,
+            NSRange::new(0, 2),
+            BlockCommand::UnorderedList,
+        )
+        .unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [Block::List { .. }]
+        ));
+    }
+
+    #[test]
+    fn heading_conversion_removes_list_for_every_selected_item() {
+        let document = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Unordered,
+            items: vec![
+                ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "one".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "two".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+            ],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        let length = session
+            .text
+            .to_addressable_text()
+            .unwrap()
+            .encode_utf16()
+            .count();
+        apply_block_command(
+            &mut session,
+            NSRange::new(0, length),
+            BlockCommand::Heading(HeadingLevel::Two),
+        )
+        .unwrap();
+        let converted = document_from_session(&session).unwrap();
+        assert!(converted.blocks.iter().all(|block| matches!(
+            block,
+            Block::Heading {
+                level: HeadingLevel::Two,
+                ..
+            }
+        )));
+        let reloaded = session_from_document(&converted).unwrap();
+        assert_eq!(document_from_session(&reloaded).unwrap(), converted);
+    }
+
+    #[test]
+    fn mixed_paragraph_indents_change_each_block_independently() {
+        let document = Document::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle {
+                    indent: 1,
+                    ..Default::default()
+                },
+                inlines: vec![Inline::Text {
+                    text: "a".into(),
+                    marks: Default::default(),
+                }],
+            },
+            Block::Paragraph {
+                style: BlockStyle {
+                    indent: 3,
+                    ..Default::default()
+                },
+                inlines: vec![Inline::Text {
+                    text: "b".into(),
+                    marks: Default::default(),
+                }],
+            },
+        ]);
+        let mut session = session_from_document(&document).unwrap();
+        apply_paragraph_command(
+            &mut session,
+            NSRange::new(0, 3),
+            ParagraphCommand::IncreaseIndent,
+        )
+        .unwrap();
+        let increased = document_from_session(&session).unwrap();
+        let indents = increased
+            .blocks
+            .iter()
+            .map(|block| match block {
+                Block::Paragraph { style, .. } => style.indent,
+                _ => panic!("expected paragraphs"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(indents, vec![2, 4]);
+    }
+
+    #[test]
+    fn mixed_list_indents_change_each_item_independently() {
+        let document = Document::from_blocks(vec![Block::List {
+            kind: ListKind::Ordered,
+            items: vec![
+                ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "a".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                ListItem {
+                    checked: None,
+                    style: BlockStyle {
+                        indent: 2,
+                        ..Default::default()
+                    },
+                    inlines: vec![Inline::Text {
+                        text: "b".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                ListItem {
+                    checked: None,
+                    style: BlockStyle {
+                        indent: 8,
+                        ..Default::default()
+                    },
+                    inlines: vec![Inline::Text {
+                        text: "c".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+            ],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        let length = session
+            .text
+            .to_addressable_text()
+            .unwrap()
+            .encode_utf16()
+            .count();
+        apply_paragraph_command(
+            &mut session,
+            NSRange::new(0, length),
+            ParagraphCommand::IncreaseIndent,
+        )
+        .unwrap();
+        let increased = document_from_session(&session).unwrap();
+        let indents = match &increased.blocks[0] {
+            Block::List { items, .. } => items
+                .iter()
+                .map(|item| item.style.indent)
+                .collect::<Vec<_>>(),
+            _ => panic!("expected list"),
+        };
+        assert_eq!(indents, vec![1, 3, 8]);
     }
 
     #[test]
