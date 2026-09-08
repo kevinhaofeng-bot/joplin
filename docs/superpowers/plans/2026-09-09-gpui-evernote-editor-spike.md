@@ -431,7 +431,8 @@ Run:
 
 ```bash
 cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests
-cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets -- \
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- \
   --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
 ```
 
@@ -597,7 +598,8 @@ Run:
 
 ```bash
 cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests
-cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets -- \
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- \
   --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
 ```
 
@@ -833,7 +835,8 @@ Run:
 
 ```bash
 cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor::tests
-cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets -- \
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- \
   --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
 ```
 
@@ -954,7 +957,8 @@ Run:
 ```bash
 cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml -- --check
 cargo clippy --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets -- \
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- \
   --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
 git diff --check
 ```
