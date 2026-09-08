@@ -38,14 +38,18 @@
 
 - `packages/app-lite-gpui/`: exact pinned Velotype donor tree, then the independent GPUI spike.
 - `packages/app-lite-gpui/UPSTREAM.md`: pinned revision, import command, retained donor modules, and replacement map.
+- `packages/app-lite-gpui/src/native_editor/acceptance.rs`: executable Evernote behavior-gate registry.
 - `packages/app-lite-gpui/src/native_editor/model.rs`: compact block/mark document model and stable positions.
 - `packages/app-lite-gpui/src/native_editor/transaction.rs`: validated editor operations and change sets.
 - `packages/app-lite-gpui/src/native_editor/history.rs`: byte-budgeted inverse-operation undo/redo.
+- `packages/app-lite-gpui/src/native_editor/core.rs`: sole focus, selection, IME, command, and transaction owner.
 - `packages/app-lite-gpui/src/native_editor/input.rs`: single GPUI `EntityInputHandler` and UTF-8/UTF-16 conversion.
 - `packages/app-lite-gpui/src/native_editor/layout.rs`: block layout registry, viewport window, hit testing, and caret geometry.
 - `packages/app-lite-gpui/src/native_editor/render.rs`: GPUI rendering for text, selection, caret, lists, and images.
 - `packages/app-lite-gpui/src/native_editor/commands.rs`: shared toolbar/overflow command catalogue and query state.
 - `packages/app-lite-gpui/src/native_editor/images.rs`: image metadata, async thumbnail decode, and LRU budget accounting.
+- `packages/app-lite-gpui/src/native_editor/fixtures.rs`: deterministic empty, typical, and long documents.
+- `packages/app-lite-gpui/src/native_editor/diagnostics.rs`: fixed-size latency histograms and cache/history counters.
 - `packages/app-lite-gpui/src/native_editor/tests.rs`: model, transaction, IME, selection, list, and image regressions.
 - `packages/app-lite-gpui/src/spike_app.rs`: Evernote-parity spike window and deterministic test fixtures.
 - `packages/app-lite-gpui/scripts/measure-memory.sh`: stable RSS and process-count measurement.
@@ -150,16 +154,16 @@ Create `docs/research/evernote-editor-behavior-matrix.md`:
 ```markdown
 # Evernote editor behavior matrix
 
-| ID | Evernote mechanism | User-visible sequence | Required result | Automated gate |
-|---|---|---|---|---|
-| EN-IME-01 | CompositionSafeInput | Type `中华人民共和国` with macOS Pinyin, revise a candidate, commit | no lost, duplicated, or reordered text | `ime_commit_preserves_utf16_selection` |
-| EN-SEL-01 | mapped structured selection | drag from paragraph through image into next paragraph | one continuous selection; copy preserves document order | `cross_block_selection_includes_image_atom` |
-| EN-IMG-01 | resource node | place caret mid-paragraph and paste an image | paragraph splits into text/image/text; both caret boundaries work immediately | `paste_image_splits_paragraph_once` |
-| EN-LIST-01 | transaction commands | select two paragraphs and click bullets, numbered list, checklist | each conversion is immediate and undoable | `list_commands_share_transaction_path` |
-| EN-CMD-01 | shared command catalogue | open More, execute a visible command, undo | command runs once and produces one undo entry | `toolbar_and_overflow_execute_same_command` |
-| EN-CMD-02 | command state derived from selection | traverse every primary and More command on a text selection | every visible command executes a transaction or is visibly disabled; active/mixed state matches the selection | `all_visible_commands_execute_or_are_disabled` |
-| EN-KEY-01 | one document-level input surface | use arrows, Return, Backspace, Delete, Cmd-A, cut, and undo across text/image/list boundaries | no focus island; selection and document order remain valid | `editing_commands_cross_block_boundaries` |
-| EN-VIEW-01 | viewport-bounded work | load 10,000 blocks and edit the last visible block | only the viewport window is laid out | `long_document_layout_is_bounded` |
+| ID | Evernote mechanism | Evidence in reverse-engineering baseline | User-visible sequence | Required result | Automated gate |
+|---|---|---|---|---|---|
+| EN-IME-01 | CompositionSafeInput | `Composition safety`; `CompositionSafeInput/index.tsx` | Type `中华人民共和国` with macOS Pinyin, revise a candidate, commit | no lost, duplicated, or reordered text | `ime_commit_preserves_utf16_selection` |
+| EN-SEL-01 | mapped structured selection | `Editor model, readable format and collaboration state`; ProseMirror model/state/transform/view | drag from paragraph through image into next paragraph | one continuous selection; copy preserves document order | `cross_block_selection_includes_image_atom` |
+| EN-IMG-01 | resource node and rich clipboard priority | `Image nodes and surrounding flow`; resource node view | paste Finder, Preview, and screenshot images mid-paragraph and consecutively | structural images appear immediately; no placeholder text; every caret boundary works without layout flash | `paste_image_splits_paragraph_once`, `clipboard_prefers_image_payload_over_placeholder_text`, `consecutive_images_keep_independent_caret_boundaries` |
+| EN-LIST-01 | transaction commands | `Toolbar command state and focus preservation`; heading/list selection queries | convert paragraphs among bullets, numbered list, and checklist; indent; Backspace out of list | each structural change is immediate and undoable | `list_commands_share_transaction_path`, `list_boundary_editing_preserves_structure` |
+| EN-CMD-01 | shared command catalogue | `Toolbar command state and focus preservation`; single action catalogue | open More, execute a visible command, undo | command runs once and produces one undo entry | `toolbar_and_overflow_execute_same_command` |
+| EN-CMD-02 | command state derived from selection | `Toolbar command state and focus preservation`; active-state queries | traverse every primary and More command on a text selection | every visible command executes a transaction or is visibly disabled; active/mixed state matches the selection | `all_visible_commands_execute_or_are_disabled` |
+| EN-KEY-01 | one document-level input surface | `Composition safety` and `Editor model, readable format and collaboration state` | use arrows, Return, Backspace, Delete, Cmd-A, cut, and undo across text/image/list boundaries | no focus island; selection and document order remain valid | `editing_commands_cross_block_boundaries` |
+| EN-VIEW-01 | viewport-bounded work | `Viewport-bounded work`; `viewportoptimizationplugin.ts` | load 10,000 blocks and edit the last visible block | only the viewport window is laid out | `long_document_layout_is_bounded` |
 ```
 
 - [ ] **Step 2: Write the failing acceptance registry test**
@@ -233,7 +237,7 @@ git commit -m "Define Evernote editor acceptance gates"
 
 **Interfaces:**
 - Consumes: only Rust standard collections, `smallvec`, and `unicode-segmentation`; it must not consume donor Markdown types.
-- Produces: `Document`, `NodeId`, `Block`, `BlockKind`, `DocPoint`, `Selection`, `Mark`, `Transaction`, `ApplyOutcome`, and `History`.
+- Produces: `Document`, `NodeId`, `Block`, `BlockKind`, `TextAlignment`, `Affinity`, `DocPoint`, `Selection`, `Mark`, `Transaction`, `ApplyOutcome`, and `History`.
 
 - [ ] **Step 1: Write failing tests for structural image insertion, list conversion, and undo**
 
@@ -328,6 +332,9 @@ pub enum BlockKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextAlignment { Left, Center, Right }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Affinity { Before, After }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mark { Bold, Italic, Underline, Strike, Highlight, Link(String), InlineCode }
 
@@ -352,7 +359,11 @@ pub struct Block {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DocPoint { pub node_id: NodeId, pub utf8_offset: usize }
+pub struct DocPoint {
+    pub node_id: NodeId,
+    pub utf8_offset: usize,
+    pub affinity: Affinity,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection { pub anchor: DocPoint, pub head: DocPoint }
@@ -370,12 +381,18 @@ Use these interfaces in `transaction.rs` and `history.rs`:
 ```rust
 pub enum Transaction {
     InsertText { selection: Selection, text: String },
-    Delete { selection: Selection },
+    DeleteRange { selection: Selection },
     SplitBlock { at: DocPoint },
+    MergeBlocks { left: NodeId, right: NodeId },
     SetBlockKind { selection: Selection, kind: BlockKind },
     ToggleMark { selection: Selection, mark: Mark },
+    SetLink { selection: Selection, url: Option<String> },
     SetAlignment { selection: Selection, alignment: TextAlignment },
+    IndentList { selection: Selection },
+    OutdentList { selection: Selection },
     InsertImage { selection: Selection, resource_id: String, natural_size: (u32, u32) },
+    RemoveNode { node_id: NodeId },
+    SetImageDisplayWidth { node_id: NodeId, display_width: Option<u32> },
 }
 
 pub struct ApplyOutcome {
@@ -396,7 +413,11 @@ pub struct History {
 }
 ```
 
-`Document::apply` must validate node identity, UTF-8 boundary, selection order, heading level, and list depth before mutating. Apply to a cloned set of affected blocks, then replace those blocks only after every operation succeeds.
+`Document::apply` must validate node identity, UTF-8 and grapheme boundaries, selection order, affinity, heading level, and list depth before mutating. Apply to a cloned set of affected blocks, then replace those blocks only after every operation succeeds. `DeleteRange` owns cross-block deletion, `MergeBlocks` owns Backspace/Delete at adjacent text boundaries, and `InsertImage` owns the atomic text/image/text split; UI code must not synthesize these structures by mutating blocks directly. `History::undo` and `History::redo` return the restored `Selection`.
+
+Add a deterministic operation-sequence test that applies text insertion, split, list conversion, mark toggle, image insertion, cross-block deletion, and undo-to-origin. After every operation, call `Document::validate_invariants()` and assert unique stable node IDs, valid grapheme offsets, normalized non-overlapping mark spans, valid list depth, and exact semantic round-trip after undo.
+
+Add `invalid_transaction_is_atomic`: submit an invalid grapheme offset and an invalid list depth, then assert the error is structured and the document, selection, history depth, and revision remain unchanged.
 
 - [ ] **Step 5: Run focused and donor regressions**
 
@@ -546,12 +567,18 @@ pub struct BlockLayout {
 pub struct LayoutRegistry {
     visible: Vec<BlockLayout>,
     estimated_heights: std::collections::HashMap<NodeId, f32>,
+    cache: std::collections::HashMap<NodeId, CachedBlockLayout>,
+    lru: std::collections::VecDeque<NodeId>,
+    budget_bytes: usize,
+    used_bytes: usize,
     first_visible: usize,
     last_visible: usize,
 }
 ```
 
-Adapt donor `range_bounds`, `closest_index_for_position`, cross-block endpoint ordering, and viewport culling. `point_to_doc` must return an image's `before` or `after` point based on the pointer x/y half, and text positions for shaped lines.
+Adapt donor `range_bounds`, `closest_index_for_position`, cross-block endpoint ordering, and viewport culling. `point_to_doc` must return an image's `before` or `after` point based on the pointer x/y half, and text positions for shaped lines. Set the exact-layout cache budget to 16 MiB and account shaped runs plus selection geometry conservatively. Add `long_document_layout_is_bounded` for a 10,000-block document and `layout_cache_evicts_before_16_mib`; assert the exact cache contains only the viewport plus prefetch window and never exceeds its byte budget.
+
+Route Cmd-A, Left/Right/Up/Down, Home/End, Return, Backspace, Delete, copy, cut, plain-text paste, and undo/redo through `EditorCore`; extend `editing_commands_cross_block_boundaries` so every named action crosses at least one paragraph/list/image boundary without creating a second focus handle.
 
 - [ ] **Step 5: Render selection and caret from the registry**
 
@@ -608,7 +635,9 @@ fn toolbar_and_overflow_execute_same_command(cx: &mut gpui::TestAppContext) {
 }
 ```
 
-Add `all_visible_commands_execute_or_are_disabled` as a table-driven GPUI test. Construct a fresh two-paragraph editor for each descriptor. Assert descriptor keys are unique; enabled formatting, paragraph/list, link, and non-current alignment commands change the document through exactly one history entry; current-state no-op commands report `On`; Undo/Redo report disabled until history permits them. No descriptor may report enabled and then return an unimplemented/no-op result.
+Add `all_visible_commands_execute_or_are_disabled` as a table-driven GPUI test. Construct a fresh two-paragraph editor for each descriptor. Assert descriptor keys are unique; enabled formatting, paragraph/list, link, and non-current alignment commands change the document through exactly one history entry; current-state no-op commands report `On`; Undo/Redo report disabled until history permits them. Run list indent/outdent on a two-item list and assert depth changes through one history entry. No descriptor may report enabled and then return an unimplemented/no-op result.
+
+Add `list_boundary_editing_preserves_structure`: convert three paragraphs to each of bullet, ordered, and checklist forms; indent the middle item; press Backspace at the start of the first item to exit the list; undo every step; assert the original three paragraphs and selection are restored.
 
 - [ ] **Step 2: Run the test to verify commands are absent**
 
@@ -616,6 +645,8 @@ Run:
 
 ```bash
 cargo test --manifest-path packages/app-lite-gpui/Cargo.toml toolbar_and_overflow_execute_same_command
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml all_visible_commands_execute_or_are_disabled
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml list_boundary_editing_preserves_structure
 ```
 
 Expected: compilation FAIL because command types do not exist.
@@ -630,7 +661,7 @@ pub enum EditorCommand {
     Undo, Redo, Paragraph, Heading1, Heading2, Heading3,
     Bold, Italic, Underline, Strike, Highlight,
     BulletList, OrderedList, CheckList, Link,
-    AlignLeft, AlignCenter, AlignRight,
+    AlignLeft, AlignCenter, AlignRight, IndentList, OutdentList,
 }
 
 pub enum ToggleState { Off, On, Mixed }
@@ -645,11 +676,11 @@ pub struct CommandDescriptor {
 }
 ```
 
-Both primary toolbar and More menu iterate the same descriptor slice. `execute` translates commands into Task 3 transactions, including `SetAlignment`; list conversions across multiple blocks are one history entry. Toolbar pointer-down preserves the editor selection and focus, then returns focus after execution.
+Both primary toolbar and More menu iterate the same descriptor slice. `execute` translates commands into Task 3 transactions, including `SetLink`, `SetAlignment`, `IndentList`, and `OutdentList`; list conversions across multiple blocks are one history entry. Toolbar pointer-down preserves the editor selection and focus, then returns focus after execution.
 
 - [ ] **Step 4: Add a deterministic spike launch mode**
 
-Add `--evernote-spike` parsing in `main.rs`. When set, `spike_app::open` must create one window containing the centered 680 pt editor, Evernote-order toolbar, sample text/list/image blocks, and no workspace/update/export UI. The ordinary donor launch remains intact for comparison.
+Add `--evernote-spike` parsing in `main.rs`. When set, `spike_app::open` must create one window containing the centered editor with a maximum content width of 680 pt, narrow-window insets of 32 pt, bottom scroll padding equal to 30% of the viewport, Evernote-order toolbar, sample text/list/image blocks, and no workspace/update/export UI. The ordinary donor launch remains intact for comparison. Add a layout test for the maximum width, narrow-window behavior, and 30% bottom padding.
 
 - [ ] **Step 5: Run tests and launch the spike**
 
@@ -683,7 +714,7 @@ git commit -m "Add working Evernote editor commands"
 
 **Interfaces:**
 - Consumes: donor paste/drop file extraction and image decoding; `Transaction::InsertImage`.
-- Produces: `ImageStore`, `ImageMetadata`, `TextureCache`, and the `EN-IMG-01` behavior.
+- Produces: `ClipboardPayload`, `PasteIntent`, `ImageStore`, `ImageMetadata`, `TextureCache`, `BudgetedImageCache`, and the `EN-IMG-01` behavior.
 
 - [ ] **Step 1: Add failing image layout-stability tests**
 
@@ -707,6 +738,32 @@ fn image_cache_evicts_before_exceeding_budget() {
     assert!(!cache.contains("a"));
     assert!(cache.contains("b"));
 }
+
+#[test]
+fn clipboard_prefers_image_payload_over_placeholder_text() {
+    let payload = ClipboardPayload::fixture_with_png_and_text("图像占位符");
+    assert!(matches!(classify_clipboard(&payload), PasteIntent::Image { .. }));
+}
+
+#[gpui::test]
+fn consecutive_images_keep_independent_caret_boundaries(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    editor.insert_fixture_image("a", (1600, 900)).unwrap();
+    editor.insert_fixture_image("b", (800, 600)).unwrap();
+    editor.type_text("中").unwrap();
+    assert_eq!(editor.copy_all_plain_text(), "前\n\u{fffc}\n\u{fffc}\n中后");
+}
+
+#[test]
+fn image_decode_failure_preserves_structural_node() {
+    let mut store = ImageStore::for_test();
+    let image_id = store.insert_invalid_fixture("broken");
+    store.finish_failed_decode(image_id, "decode failed");
+    assert_eq!(store.node_state(image_id), ImageNodeState::Failed);
+    assert!(store.is_selectable(image_id));
+    assert!(store.can_retry(image_id));
+}
 ```
 
 - [ ] **Step 2: Run tests to verify image services are absent**
@@ -716,13 +773,16 @@ Run:
 ```bash
 cargo test --manifest-path packages/app-lite-gpui/Cargo.toml image_placeholder_and_texture_have_identical_layout_height
 cargo test --manifest-path packages/app-lite-gpui/Cargo.toml image_cache_evicts_before_exceeding_budget
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml clipboard_prefers_image_payload_over_placeholder_text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml consecutive_images_keep_independent_caret_boundaries
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml image_decode_failure_preserves_structural_node
 ```
 
 Expected: compilation FAIL.
 
 - [ ] **Step 3: Adapt the donor image code**
 
-Reuse actual decoding/file-drop code from `components/markdown/image.rs`, `components/block/runtime/image.rs`, and `editor/file_drop.rs`. The new path reads dimensions first, commits `InsertImage` immediately, then decodes a viewport-sized texture asynchronously. Do not keep compressed bytes, CPU bitmap, and full GPU texture simultaneously after upload.
+Reuse actual decoding/file-drop code from `components/markdown/image.rs`, `components/block/runtime/image.rs`, and `editor/file_drop.rs`. Normalize paste and drop into one `PasteIntent` path. Clipboard precedence is native PNG/TIFF image data, image file URLs, HTML image payloads, rich text, then plain text; when an image payload exists, never insert its filename or the clipboard's placeholder text. The new path reads dimensions first, commits `InsertImage` immediately, then decodes a viewport-sized texture asynchronously. Do not keep compressed bytes, CPU bitmap, and full GPU texture simultaneously after upload.
 
 - [ ] **Step 4: Implement byte-budgeted cache accounting**
 
@@ -767,7 +827,7 @@ Expected: all PASS.
 
 - [ ] **Step 6: Manually execute EN-IMG-01**
 
-Run the Release spike. Type Chinese before the caret, paste a Finder/Preview image mid-paragraph, immediately type before and after it, select across it, delete, and undo. Expected: image appears without switching documents, no text disappears, no layout flash occurs, and undo restores text/image/text in one step.
+Run the Release spike. Type Chinese before the caret; paste one image from Finder, one copied from Preview, and one macOS screenshot from the clipboard; immediately type before, between, and after the images; select across them, delete, and undo. Expected: every image appears without switching documents, no placeholder text is inserted, no text disappears, no layout flash occurs, and undo restores document order.
 
 - [ ] **Step 7: Commit image behavior**
 
@@ -783,6 +843,7 @@ git commit -m "Add stable native image block editing"
 **Files:**
 - Create: `packages/app-lite-gpui/scripts/measure-memory.sh`
 - Create: `packages/app-lite-gpui/src/native_editor/fixtures.rs`
+- Create: `packages/app-lite-gpui/src/native_editor/diagnostics.rs`
 - Modify: `packages/app-lite-gpui/src/main.rs`
 - Modify: `docs/research/evernote-editor-behavior-matrix.md`
 
@@ -799,9 +860,10 @@ Support:
 --evernote-spike --fixture typical
 --evernote-spike --fixture long
 --ready-file /absolute/path
+--diagnostics-file /absolute/path
 ```
 
-`empty` contains one empty paragraph. `typical` contains 200 text/list blocks and ten distinct 1600×900 generated image textures. `long` contains 10,000 text blocks. Write the ready file only after the first complete frame and texture queue settle.
+`empty` contains one empty paragraph. `typical` contains 200 text/list blocks and ten distinct 1600×900 generated image textures. `long` contains 10,000 text blocks. Before readiness, run a deterministic workload of 500 visible single-grapheme insert/undo pairs and 120 viewport shifts, then restore the fixture's semantic state. Write the ready file only after the workload, first complete frame, and texture queue settle. Maintain fixed-size latency histograms rather than an unbounded event log. Write diagnostics JSON containing `texture_bytes`, `layout_cache_bytes`, `undo_bytes`, `transaction_p95_us`, and `render_commit_p95_us`; the corresponding gates are 48 MiB, 16 MiB, 16 MiB, 8,000 us, and 16,000 us. Assert each single-character change set names exactly one changed block even in the 10,000-block fixture.
 
 - [ ] **Step 2: Create the memory measurement script**
 
@@ -814,24 +876,36 @@ set -euo pipefail
 binary=${1:?release binary path required}
 fixture=${2:?fixture required}
 ready_file=$(mktemp /tmp/app-lite-gpui-ready.XXXXXX)
+diagnostics_file=$(mktemp /tmp/app-lite-gpui-diagnostics.XXXXXX)
+vmmap_file=$(mktemp /tmp/app-lite-gpui-vmmap.XXXXXX)
+rss_file=$(mktemp /tmp/app-lite-gpui-rss.XXXXXX)
 rm -f "$ready_file"
 
-"$binary" --evernote-spike --fixture "$fixture" --ready-file "$ready_file" &
+"$binary" --evernote-spike --fixture "$fixture" --ready-file "$ready_file" \
+  --diagnostics-file "$diagnostics_file" &
 app_pid=$!
-trap 'kill "$app_pid" 2>/dev/null || true; rm -f "$ready_file"' EXIT
+trap 'kill "$app_pid" 2>/dev/null || true; rm -f "$ready_file" "$rss_file"' EXIT
 
 for _ in $(seq 1 300); do
   [[ -f "$ready_file" ]] && break
   sleep 0.1
 done
 [[ -f "$ready_file" ]]
-sleep 30
 
-rss_kib=$(ps -o rss= -p "$app_pid" | tr -d ' ')
+for _ in $(seq 1 6); do
+  sleep 5
+  ps -o rss= -p "$app_pid" | tr -d ' ' >> "$rss_file"
+done
+
+rss_stable_kib=$(tail -n 1 "$rss_file")
+rss_peak_kib=$(sort -nr "$rss_file" | head -n 1)
 child_count=$(ps -axo ppid= | awk -v pid="$app_pid" '$1 == pid { count++ } END { print count + 0 }')
 webkit_linked=$(otool -L "$binary" | awk '/WebKit\.framework/ { found=1 } END { print found + 0 }')
-printf '{"fixture":"%s","pid":%s,"rss_kib":%s,"child_processes":%s,"webkit_linked":%s}\n' \
-  "$fixture" "$app_pid" "$rss_kib" "$child_count" "$webkit_linked"
+vmmap -summary "$app_pid" > "$vmmap_file"
+internal=$(tr -d '\n' < "$diagnostics_file")
+printf '{"fixture":"%s","pid":%s,"rss_stable_kib":%s,"rss_peak_kib":%s,"child_processes":%s,"webkit_linked":%s,"vmmap_file":"%s","internal":%s}\n' \
+  "$fixture" "$app_pid" "$rss_stable_kib" "$rss_peak_kib" "$child_count" \
+  "$webkit_linked" "$vmmap_file" "$internal"
 ```
 
 - [ ] **Step 3: Build and measure all fixtures**
@@ -849,13 +923,15 @@ Expected gates:
 
 - `child_processes` equals `0` for every fixture;
 - `webkit_linked` equals `0` for every fixture;
-- `empty.rss_kib <= 81920`;
-- `typical.rss_kib <= 122880`;
-- `long.rss_kib - empty.rss_kib <= 40960`.
+- `empty.rss_stable_kib <= 81920`;
+- `typical.rss_stable_kib <= 122880`;
+- `long.rss_stable_kib - empty.rss_stable_kib <= 40960`;
+- internal texture/layout/undo counters and transaction/render P95 values satisfy the limits from Step 1;
+- retain each `vmmap_file` as the heap/VM breakdown evidence for that run.
 
 - [ ] **Step 4: Complete the behavior matrix**
 
-For every matrix row, add the implementing commit, automated test result, manual result, and measured memory record. A failed row remains `FAIL`; do not change the requirement or mark it complete based only on compilation.
+Execute all eight matrix sequences in the Release spike using the macOS Pinyin input method plus Finder, Preview, and screenshot clipboard sources. For every matrix row, add the implementing commit, automated test result, manual result, and measured memory record. A failed row remains `FAIL`; do not change the requirement or mark it complete based only on compilation.
 
 - [ ] **Step 5: Run the complete release gate**
 
@@ -877,4 +953,4 @@ git add packages/app-lite-gpui docs/research/evernote-editor-behavior-matrix.md
 git commit -m "Verify GPUI Evernote editor spike"
 ```
 
-The spike is promotable only if all six Evernote behavior rows pass and all memory/process gates pass. Promotion into the permanent application is a separate implementation plan; the old AppKit editor remains untouched until that plan is approved.
+The spike is promotable only if all eight Evernote behavior rows pass and all memory/process/latency gates pass. Promotion into the permanent application is a separate implementation plan; the old AppKit editor remains untouched until that plan is approved.
