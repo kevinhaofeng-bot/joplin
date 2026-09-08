@@ -26,6 +26,7 @@ mod export;
 #[cfg(any(target_os = "macos", test))]
 mod file_url;
 mod i18n;
+mod native_editor;
 mod net;
 mod theme;
 mod window_chrome;
