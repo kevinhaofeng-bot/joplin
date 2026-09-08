@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "joplin-lite-native"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "dirs",
  "html5ever 0.38.0",
