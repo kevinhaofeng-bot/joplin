@@ -107,6 +107,7 @@ pub struct LayoutRegistry {
     pub(crate) lru: VecDeque<NodeId>,
     pub(crate) budget_bytes: usize,
     pub(crate) used_bytes: usize,
+    peak_accounted_bytes: usize,
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
     document_order: HashMap<NodeId, usize>,
@@ -136,6 +137,7 @@ impl LayoutRegistry {
             lru: VecDeque::new(),
             budget_bytes: LAYOUT_CACHE_BUDGET_BYTES,
             used_bytes: 0,
+            peak_accounted_bytes: 0,
             first_visible: 0,
             last_visible: 0,
             document_order: HashMap::new(),
@@ -163,6 +165,14 @@ impl LayoutRegistry {
 
     pub fn used_bytes(&self) -> usize {
         self.used_bytes
+    }
+
+    /// Highest retained-cache total observed after an admission/eviction
+    /// boundary. This is intentionally post-admission accounting: transient
+    /// allocator activity cannot make the published cache usage exceed the
+    /// hard budget.
+    pub fn peak_accounted_bytes(&self) -> usize {
+        self.peak_accounted_bytes
     }
 
     pub fn cache_bytes(&self) -> usize {
@@ -216,6 +226,16 @@ impl LayoutRegistry {
         let width = width.max(1.0);
         self.refresh_estimates(document, width);
         self.ensure_height_index(document);
+        self.rebuild_visible_window(document, viewport_top, viewport_height, width);
+    }
+
+    fn rebuild_visible_window(
+        &mut self,
+        document: &Document,
+        viewport_top: f32,
+        viewport_height: f32,
+        width: f32,
+    ) {
         let viewport_height = viewport_height.max(1.0);
         let viewport_bottom = viewport_top.max(0.0) + viewport_height;
         let prefetch_top = (viewport_top.max(0.0) - viewport_height * PREFETCH_VIEWPORTS).max(0.0);
@@ -310,75 +330,84 @@ impl LayoutRegistry {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = style.line_height_in_pixels(window.rem_size());
         let font = style.font();
-        let visible_ids: Vec<NodeId> = self.visible.iter().map(|layout| layout.node_id).collect();
-        let mut estimates_changed = false;
-        for node_id in visible_ids {
-            let Some(block) = document.block(node_id) else {
-                continue;
-            };
-            let Some(text) = block.content.as_text() else {
-                self.update_cache_metadata(
-                    node_id,
-                    block.revision,
-                    width,
-                    ShapeKey::new(block.revision, width, font.clone(), font_size, line_height),
-                    line_height,
-                );
-                continue;
-            };
-            let shape_key =
-                ShapeKey::new(block.revision, width, font.clone(), font_size, line_height);
-            let cache_hit = self.cache.get(&node_id).is_some_and(|cached| {
-                cached.shape_key == shape_key && !cached.layout.text_lines.is_empty()
-            });
-            if cache_hit {
-                continue;
+        // A measured height can change which blocks belong to the viewport
+        // and prefetch window. Rebuild membership after each shaping pass so
+        // blocks entering after expansion/contraction are shaped in the same
+        // production call, rather than waiting for a later frame.
+        // A large estimated block can initially push several prefetched
+        // blocks out, while contraction can reveal the same blocks in waves.
+        // Iterate to a fixed point with a bounded guard so a pathological
+        // font backend cannot turn one paint into an unbounded loop.
+        for _ in 0..8 {
+            let visible_ids: Vec<NodeId> =
+                self.visible.iter().map(|layout| layout.node_id).collect();
+            let mut estimates_changed = false;
+            for node_id in visible_ids {
+                let Some(block) = document.block(node_id) else {
+                    continue;
+                };
+                let Some(text) = block.content.as_text() else {
+                    self.update_cache_metadata(
+                        node_id,
+                        block.revision,
+                        width,
+                        ShapeKey::new(block.revision, width, font.clone(), font_size, line_height),
+                        line_height,
+                    );
+                    continue;
+                };
+                let shape_key =
+                    ShapeKey::new(block.revision, width, font.clone(), font_size, line_height);
+                let cache_hit = self.cache.get(&node_id).is_some_and(|cached| {
+                    cached.shape_key == shape_key && !cached.layout.text_lines.is_empty()
+                });
+                if cache_hit {
+                    continue;
+                }
+                self.shape_count = self.shape_count.saturating_add(1);
+                let shared_text = SharedString::from(text.to_owned());
+                let runs = [TextRun {
+                    len: shared_text.len(),
+                    font: font.clone(),
+                    color: gpui::black(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }];
+                let lines = window
+                    .text_system()
+                    .shape_text(shared_text, font_size, &runs, Some(px(width)), None)
+                    .map(|lines| lines.into_vec())
+                    .unwrap_or_default();
+                let measured_height = lines
+                    .iter()
+                    .map(|line| line.size(line_height).height)
+                    .fold(px(0.0), |height, line_height| height + line_height)
+                    .max(line_height);
+                if self
+                    .estimated_heights
+                    .get(&node_id)
+                    .is_none_or(|height| (*height - f32::from(measured_height)).abs() > 0.01)
+                {
+                    self.estimated_heights
+                        .insert(node_id, f32::from(measured_height));
+                    estimates_changed = true;
+                }
+                let Some(geometry) = self.visible.iter().find(|layout| layout.node_id == node_id)
+                else {
+                    continue;
+                };
+                let mut layout = geometry.clone();
+                layout.text_lines = lines;
+                self.insert_shaped(shape_key, layout, false, line_height, 0);
             }
-            self.shape_count = self.shape_count.saturating_add(1);
-            let shared_text = SharedString::from(text.to_owned());
-            let runs = [TextRun {
-                len: shared_text.len(),
-                font: font.clone(),
-                color: gpui::black(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            }];
-            let lines = window
-                .text_system()
-                .shape_text(shared_text, font_size, &runs, Some(px(width)), None)
-                .map(|lines| lines.into_vec())
-                .unwrap_or_default();
-            let measured_height = lines
-                .iter()
-                .map(|line| line.size(line_height).height)
-                .fold(px(0.0), |height, line_height| height + line_height)
-                .max(line_height);
-            if self
-                .estimated_heights
-                .get(&node_id)
-                .is_none_or(|height| (*height - f32::from(measured_height)).abs() > 0.01)
-            {
-                self.estimated_heights
-                    .insert(node_id, f32::from(measured_height));
-                estimates_changed = true;
+            if !estimates_changed {
+                break;
             }
-            let Some(geometry) = self.visible.iter().find(|layout| layout.node_id == node_id)
-            else {
-                continue;
-            };
-            let mut layout = geometry.clone();
-            layout.text_lines = lines;
-            self.insert_shaped(shape_key, layout, false, line_height);
-        }
-        if estimates_changed {
-            // Shaping can replace a fallback estimate without changing the
-            // document revision. Invalidate the prefix index explicitly so
-            // following blocks receive the real wrapped height.
             self.height_signature.clear();
             self.height_document_revision = None;
             self.ensure_height_index(document);
-            self.reflow_visible();
+            self.rebuild_visible_window(document, viewport_top, viewport_height, width);
         }
         self.enforce_budget();
     }
@@ -411,13 +440,8 @@ impl LayoutRegistry {
             layout,
             is_image,
             line_height,
+            selection_geometry_bytes,
         );
-        if let Some(entry) = self.cache.get_mut(&node_id) {
-            entry.selection_geometry_bytes =
-                selection_geometry_reserve(&entry.layout, selection_geometry_bytes);
-            entry.bytes = estimate_cache_bytes(&entry.layout, entry.selection_geometry_bytes);
-        }
-        self.recompute_used_bytes();
         self.enforce_budget();
     }
 
@@ -435,6 +459,9 @@ impl LayoutRegistry {
     /// Structural edits also invalidate the height/order index, while
     /// unaffected shaped lines remain retained for the next viewport pass.
     pub(crate) fn invalidate_nodes(&mut self, changed_nodes: &[NodeId]) {
+        let invalidated: HashSet<NodeId> = changed_nodes.iter().copied().collect();
+        self.visible
+            .retain(|layout| !invalidated.contains(&layout.node_id));
         for node_id in changed_nodes {
             if let Some(entry) = self.cache.remove(node_id) {
                 self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
@@ -982,6 +1009,7 @@ impl LayoutRegistry {
             layout,
             is_image,
             px(DEFAULT_TEXT_HEIGHT),
+            0,
         );
     }
 
@@ -991,6 +1019,7 @@ impl LayoutRegistry {
         layout: BlockLayout,
         is_image: bool,
         default_line_height: Pixels,
+        requested_selection_geometry_bytes: usize,
     ) {
         let node_id = layout.node_id;
         let revision = shape_key.block_revision;
@@ -1000,12 +1029,15 @@ impl LayoutRegistry {
             self.used_bytes = self.used_bytes.saturating_sub(previous.bytes);
         }
         self.lru.retain(|id| *id != node_id);
-        let selection_geometry_bytes =
-            selection_geometry_reserve(&layout, size_of::<Bounds<Pixels>>() * 2);
+        let selection_geometry_bytes = selection_geometry_reserve(
+            &layout,
+            requested_selection_geometry_bytes.max(size_of::<Bounds<Pixels>>() * 2),
+        );
         let bytes = estimate_cache_bytes(&layout, selection_geometry_bytes);
         if bytes > self.budget_bytes {
             return;
         }
+        self.make_room_for(bytes);
         self.used_bytes = self.used_bytes.saturating_add(bytes);
         self.cache.insert(
             node_id,
@@ -1071,6 +1103,17 @@ impl LayoutRegistry {
         self.used_bytes = self.cache.values().map(|entry| entry.bytes).sum();
     }
 
+    fn make_room_for(&mut self, incoming_bytes: usize) {
+        while self.used_bytes.saturating_add(incoming_bytes) > self.budget_bytes {
+            let Some(node_id) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.cache.remove(&node_id) {
+                self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+            }
+        }
+    }
+
     fn evict_outside(&mut self, allowed_ids: &HashSet<NodeId>) {
         let stale: Vec<NodeId> = self
             .cache
@@ -1095,6 +1138,7 @@ impl LayoutRegistry {
                 self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
             }
         }
+        self.peak_accounted_bytes = self.peak_accounted_bytes.max(self.used_bytes);
     }
 }
 
@@ -1122,6 +1166,7 @@ fn estimate_text_height(text: &str, width: f32) -> f32 {
 }
 
 fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -> usize {
+    const ARC_ALLOCATION_OVERHEAD: usize = size_of::<usize>() * 2;
     let shaped_bytes = layout
         .text_lines
         .iter()
@@ -1138,10 +1183,19 @@ fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -
                 .saturating_add(line.runs().len() * size_of::<gpui::ShapedRun>());
             size_of::<WrappedLine>()
                 .saturating_add(size_of::<WrappedLineLayout>())
-                .saturating_add(line.text.len())
-                .saturating_add(line.wrap_boundaries().len() * size_of::<WrapBoundary>())
+                .saturating_add(line.text.len().saturating_add(ARC_ALLOCATION_OVERHEAD))
+                .saturating_add(
+                    line.wrap_boundaries()
+                        .len()
+                        .saturating_mul(size_of::<WrapBoundary>())
+                        .saturating_add(ARC_ALLOCATION_OVERHEAD),
+                )
                 .saturating_add(line_layout)
                 .saturating_add(runs)
+                // `WrappedLine` stores several small vectors inline, but a
+                // backend may spill their capacity. Reserve a conservative
+                // per-line spill allowance instead of counting only lengths.
+                .saturating_add(ARC_ALLOCATION_OVERHEAD * 2)
         })
         .sum::<usize>();
     size_of::<CachedBlockLayout>()
@@ -1157,7 +1211,10 @@ fn selection_geometry_reserve(layout: &BlockLayout, requested: usize) -> usize {
         .iter()
         .map(|line| line.wrap_boundaries().len().saturating_add(1))
         .sum::<usize>();
-    requested.max(visual_rows.saturating_mul(size_of::<Bounds<Pixels>>()))
+    let row_storage = visual_rows
+        .saturating_mul(size_of::<Bounds<Pixels>>())
+        .saturating_add(size_of::<Vec<Bounds<Pixels>>>());
+    requested.max(row_storage)
 }
 
 fn contains(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {

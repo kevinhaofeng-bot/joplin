@@ -991,6 +991,102 @@ fn ime_partial_selection_and_candidate_updates_are_one_undo(cx: &mut gpui::TestA
 }
 
 #[gpui::test]
+async fn entity_input_commit_maps_original_selection_only_once(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("abcd"), cx));
+    let original_selection = cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.select_document_range(1, 3);
+            let original_selection = editor.selection();
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(1..3),
+                "X",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "Y", window, editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "aYd");
+            assert_eq!(editor.undo_depth(), 1);
+            original_selection
+        })
+    });
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "abcd"
+    );
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
+}
+
+#[gpui::test]
+async fn entity_input_candidate_range_is_remapped_before_restore(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("ab"), cx));
+
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(1);
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "候选",
+                Some(2..2),
+                window,
+                editor_cx,
+            );
+            let candidate_selection = editor.selection();
+            assert_eq!(editor.visible_text(), "a候选b");
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(1..3),
+                "更新",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "a更新b");
+            assert_eq!(editor.marked_text(), Some("更新"));
+            assert_eq!(editor.undo_depth(), 1);
+
+            let before_invalid = (
+                editor.visible_text(),
+                editor.selection(),
+                editor.marked_text().map(str::to_owned),
+                editor.undo_depth(),
+            );
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(99..100),
+                "错误",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            assert_eq!(
+                (
+                    editor.visible_text(),
+                    editor.selection(),
+                    editor.marked_text().map(str::to_owned),
+                    editor.undo_depth(),
+                ),
+                before_invalid
+            );
+            assert!(editor.input_error().is_some());
+            assert!(candidate_selection.is_caret());
+        });
+    });
+}
+
+#[gpui::test]
 fn return_replaces_selection_and_splits_as_one_undo(cx: &mut gpui::TestAppContext) {
     let mut editor = EditorCore::for_test("abcd", cx);
     let node = editor.document().first_node_id().expect("paragraph");
@@ -1328,6 +1424,93 @@ async fn nonzero_viewport_reflow_keeps_document_block_index(cx: &mut gpui::TestA
         .sum::<f32>();
     assert!((f32::from(target_layout.bounds.top()) - expected_top).abs() < 0.1);
     assert!(target_layout.bounds.size.height > px(24.0));
+}
+
+#[gpui::test]
+async fn measured_reflow_recomputes_viewport_and_prefetch_membership(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let document = Document::from_paragraphs((0..32).map(|index| format!("row-{index}")));
+    let mut layout = LayoutRegistry::new();
+    let (tall_end, tall_ids, expanded_ids) = cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 120.0, 680.0, window);
+
+        let mut tall = window.text_style();
+        tall.line_height = px(100.0).into();
+        layout.shape_visible_with_style(&document, 0.0, 120.0, 680.0, tall, window);
+        let tall_end = layout.visible_range().end;
+        let tall_ids = layout
+            .exact_cache_ids()
+            .collect::<std::collections::HashSet<_>>();
+
+        layout.shape_visible_with_window(&document, 0.0, 120.0, 680.0, window);
+        assert!(layout.visible_range().end > tall_end);
+        let expanded_ids = layout
+            .exact_cache_ids()
+            .collect::<std::collections::HashSet<_>>();
+        (tall_end, tall_ids, expanded_ids)
+    });
+    let final_range = layout.visible_range();
+    assert!(final_range.end > tall_end);
+    assert!(expanded_ids.difference(&tall_ids).next().is_some());
+    assert!(tall_ids.iter().all(|id| {
+        document
+            .blocks()
+            .get(final_range.clone())
+            .is_some_and(|blocks| blocks.iter().any(|block| block.id == *id))
+    }));
+    assert!(expanded_ids.difference(&tall_ids).all(|id| {
+        layout
+            .block_layout(*id)
+            .is_some_and(|block| !block.text_lines.is_empty())
+    }));
+}
+
+#[gpui::test]
+async fn removing_image_invalidates_old_geometry_before_next_layout(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let editor = EditorCore::fixture_text_image_text("甲", "image", "乙", &mut cx);
+    let entity = cx.new(|_| editor);
+    let (image_id, image_center) = cx.update(|window, cx| {
+        entity.update(cx, |editor, _| {
+            let document = editor.document().clone();
+            editor
+                .layout
+                .shape_visible_with_window(&document, 0.0, 640.0, 680.0, window);
+            let image = editor
+                .layout
+                .visible()
+                .iter()
+                .find(|block| editor.layout.is_image(block.node_id))
+                .expect("image layout")
+                .clone();
+            (
+                image.node_id,
+                point(
+                    image.bounds.left() + image.bounds.size.width / 2.0,
+                    image.bounds.top() + image.bounds.size.height / 2.0,
+                ),
+            )
+        })
+    });
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| {
+            editor
+                .apply(Transaction::RemoveNode { node_id: image_id })
+                .unwrap();
+            let stale_hit = editor.layout.point_to_doc(image_center);
+            assert!(stale_hit.is_none_or(|point| point.node_id != image_id));
+            assert!(!editor.layout.exact_cache_ids().any(|id| id == image_id));
+            assert!(
+                !editor
+                    .layout
+                    .visible()
+                    .iter()
+                    .any(|block| block.node_id == image_id)
+            );
+        });
+    });
 }
 
 #[gpui::test]
@@ -1782,16 +1965,53 @@ fn structural_edges_preserve_caret_after_backspace_downgrade(cx: &mut gpui::Test
 }
 
 #[gpui::test]
+fn first_block_backspace_deletes_text_but_offset_zero_is_noop(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("abc", cx);
+    editor.set_caret_utf8(3);
+    editor.backspace().unwrap();
+    assert_eq!(editor.visible_text(), "ab");
+
+    editor.set_caret_utf8(0);
+    let before = editor.document().semantic_snapshot();
+    let undo_depth = editor.undo_depth();
+    editor.backspace().unwrap();
+    assert_eq!(editor.document().semantic_snapshot(), before);
+    assert_eq!(editor.undo_depth(), undo_depth);
+}
+
+#[gpui::test]
 async fn shaped_cache_budget_is_hard_during_multi_block_shaping(cx: &mut gpui::TestAppContext) {
     let mut cx = cx.add_empty_window();
-    let document =
-        Document::from_paragraphs((0..32).map(|index| format!("{index}-{}", "x".repeat(16_384))));
-    let mut layout = LayoutRegistry::with_budget(8 * 1024);
+    let budget = 64 * 1024;
+    let single_document = Document::from_paragraph("single-".to_owned() + &"x".repeat(512));
+    let mut single_layout = LayoutRegistry::with_budget(budget);
     cx.update(|window, _| {
-        layout.shape_visible_with_window(&document, 0.0, 480.0, 160.0, window);
+        single_layout.shape_visible_with_window(&single_document, 0.0, 480.0, 160.0, window);
     });
+    assert_eq!(single_layout.exact_cache_len(), 1);
+    assert!(single_layout.used_bytes() > 0);
+    assert!(single_layout.peak_accounted_bytes() <= budget);
+
+    let document =
+        Document::from_paragraphs((0..12).map(|index| format!("{index}-{}", "x".repeat(512))));
+    assert!(
+        single_layout
+            .used_bytes()
+            .saturating_mul(document.block_count())
+            > budget
+    );
+    let mut layout = LayoutRegistry::with_budget(budget);
+    let mut peak_used = 0;
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 10_000.0, 160.0, window);
+        peak_used = peak_used.max(layout.used_bytes());
+    });
+    assert!(layout.exact_cache_len() > 0);
+    assert!(layout.exact_cache_len() < document.block_count());
     assert!(layout.cache_bytes() <= layout.budget_bytes());
-    assert!(layout.used_bytes() <= 8 * 1024);
+    assert!(layout.used_bytes() <= budget);
+    assert!(peak_used <= budget);
+    assert!(layout.peak_accounted_bytes() <= budget);
 }
 
 #[gpui::test]

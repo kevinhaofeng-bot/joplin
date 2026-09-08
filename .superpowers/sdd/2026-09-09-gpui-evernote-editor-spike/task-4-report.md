@@ -174,3 +174,40 @@ cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor --off
 | donor grapheme `runtime/mod.rs:2149-2163` | `resolve_grapheme_offset`/`snap_grapheme_offset` 覆盖公开 caret、vertical target、IME selected range 和 fallback hit。 |
 
 Round 2 仍只修改 native editor 文件与本报告；没有修改 donor、plan/spec、验收矩阵、ledger 或 findings。Headless focused/compile gates 通过不等于真机 IME、主题字体和 Metal/RSS 预算已经验收，这些仍保留为后续 UI 集成顾虑。
+
+## Fix round 3（六项复审 findings）
+
+本轮先按 findings 中的真实生产序列追加 RED，再改 `EditorCore`/`LayoutRegistry`。新增回归没有直接调用 `Document::apply` 绕过入口：IME 通过真实 `EntityInputHandler` entity callback，删除图片通过 `EditorCore::apply`，布局通过真实 `shape_visible_with_window`/`shape_visible_with_style` 和 viewport/cache 状态。
+
+### RED → GREEN
+
+- RED focused 首次运行：62 个 native tests 中 57 通过、5 个失败，失败正对应首块 Backspace、IME 原始 selection 二次映射、显式 candidate range、测量后成员重算、删除图片后的旧几何；多块预算用例也先证明了各项可单独 admission。加入峰值观测断言后，缺失的 `peak_accounted_bytes` API 先以编译 RED 暴露，再接入生产 admission。
+- GREEN focused：
+
+```text
+cargo test --manifest-path packages/app-lite-gpui/Cargo.toml \
+  --bin velotype native_editor::tests:: --offline
+62 passed, 0 failed
+```
+
+### Findings 对照
+
+| finding | 生产修复与真实回归 |
+| --- | --- |
+| 1. 首块 Backspace | `backspace` 先处理文本 grapheme 或 image affinity，再仅对首块 offset 0 做 no-op；`first_block_backspace_deletes_text_but_offset_zero_is_noop` 覆盖 `abc@3 → ab` 和首块 `@0` 不变。 |
+| 2. IME 原始 base selection 被二次映射 | `EditorCore` 增加文档级 `composition_base_range`，保存候选插入前的 flat UTF-8 range；候选/commit range 才经过 `remap_candidate_selection_after_undo`，原始 base 不再按候选坐标再减一次。真实 entity 序列 `abcd` 选 `bc`、mark `X`、commit `Y` 得到 `aYd`，一次 undo 恢复 `abcd` 与原 selection。 |
+| 3. 显式 candidate 坐标和失败原子 | candidate UTF-16 range 先在候选文档解析，再按 marked span/base range 映射到 undo 后的 clone；`Document` 与 `History` clone 先完整试运行 undo+replace，成功后才提交，错误不会消费 provisional entry。collapsed 内部 selection 两端共用同一 grapheme boundary；真实 `ab → 候选 → range(1..3) 更新` 与 invalid range 保持状态/marked/history 不变回归通过。 |
+| 4. measured reflow 成员集合 | 从 donor `WrappedLine` 实测高度更新 prefix 后，`rebuild_visible_window` 重新计算 viewport/prefetch、驱逐 moved-out cache/geometry，并以有界 fixed-point pass shape/register newly entering blocks。测试用 100px expansion→26px contraction，校验 final membership、new IDs 的 shaped lines、无 tall 状态外残留。 |
+| 5. invalidated geometry | `invalidate_nodes` 同步从 `visible` 移除 changed/deleted NodeId，再清 cache/LRU；`point_to_doc` 的 before/after fallback 只适用于仍然有效的 unshaped geometry。真实 text-image-text shape→`EditorCore::apply(RemoveNode)`→next layout 前旧图片坐标查询不再返回已删 NodeId。 |
+| 6. hard cache budget | `insert_shaped` 在 cache ownership 前按 `CachedBlockLayout`、`BlockLayout`、WrappedLine 外层 capacity、text/wrap Arc header、runs/glyph capacity、selection per-row reserve 计算 conservative cost，并先 LRU 腾挪空间；`used_bytes` admission 后始终不超 budget，`peak_accounted_bytes` 记录 post-admission high-water。预算回归用一个 64KiB budget：单块可放下，多块总和超过 budget，验证仍有 admission、发生 eviction 且 peak/used 均不超限。 |
+
+### Round 3 donor/GPUI 复用映射
+
+| donor 算法/路径 | native 适配 |
+| --- | --- |
+| `components/block/input.rs:116-179` 与 `runtime/mod.rs:1539-1615,1726-1747` 的 marked/commit provisional composition | `core.rs::composition_base_range`、全文 flat UTF-8 mapping、`remap_candidate_selection_after_undo`；clone 的 native `History` 试运行保持 GPUI callback 的失败原子语义。 |
+| `runtime/mod.rs:2149-2163` 的 grapheme previous-boundary/backspace 入口 | `core.rs::backspace` 将首块 guard 放到 grapheme deletion 之后，继续沿用 `previous_grapheme_boundary`。 |
+| `components/block/element.rs:242-263,279-312,353-512` 的 WrappedLine 实测高度与行几何 | `layout.rs::shape_visible_with_style` 的 bounded fixed-point membership rebuild、prefix reflow、cache eviction；仍使用 GPUI `shape_text(...).into_vec()`/`WrappedLine`。 |
+| donor layout/cache 的可见窗口与保留成本边界 | `LayoutRegistry::rebuild_visible_window`、`make_room_for`、`estimate_cache_bytes`、`selection_geometry_reserve`、`peak_accounted_bytes`；visible 仍只保存 geometry，shaped lines 只在 cache 单一所有权中保留。 |
+
+本轮仍只修改 `packages/app-lite-gpui/src/native_editor/{core.rs,layout.rs,tests.rs}` 与本报告；没有修改 donor、plan/spec、验收矩阵、控制器 ledger 或 findings。headless GREEN 仍不替代真机 IME 候选窗、主题字体和 Metal/RSS 预算验收。

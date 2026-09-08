@@ -33,6 +33,11 @@ pub struct EditorCore {
     preferred_x: Option<Pixels>,
     marked: Option<MarkedText>,
     composition_base: Option<Selection>,
+    /// Document-wide UTF-8 range in the base document before the current
+    /// provisional marked text was inserted.  GPUI may report the next IME
+    /// range in the candidate-containing document, so the original range
+    /// must not be recomputed from those candidate coordinates.
+    composition_base_range: Option<Range<usize>>,
     last_input_error: Option<DocumentError>,
     history: History,
     pub(crate) layout: LayoutRegistry,
@@ -145,6 +150,7 @@ impl EditorCore {
             preferred_x: None,
             marked: None,
             composition_base: None,
+            composition_base_range: None,
             last_input_error: None,
             history: History::new(1_000, 16 * 1024 * 1024),
             layout: LayoutRegistry::new(),
@@ -356,24 +362,47 @@ impl EditorCore {
         }
         let updating_composition = self.marked.is_some();
         let visible_selection = self.selection_for_input_range(range_utf16.as_ref());
-        let composition_base = if range_utf16.is_some() {
-            visible_selection
+        let base_range = if updating_composition {
+            self.composition_base_range.clone().unwrap_or_else(|| {
+                self.selection_flat_range(self.composition_base.unwrap_or(visible_selection))
+            })
         } else {
-            self.composition_base.unwrap_or(visible_selection)
+            self.selection_flat_range(visible_selection)
         };
-        if updating_composition {
-            let outcome = self.history.undo_with_outcome(&mut self.document)?;
+        let outcome = if updating_composition {
+            let marked = self.marked.clone().ok_or(DocumentError::HistoryEmpty)?;
+            let candidate_selection = visible_selection;
+            let mut document = self.document.clone();
+            let mut history = self.history.clone();
+            let undo_outcome = history.undo_with_outcome(&mut document)?;
+            let composition_selection = self.remap_candidate_selection_after_undo(
+                candidate_selection,
+                &marked,
+                &base_range,
+                &document,
+            );
+            let outcome = history.apply_with_selection(
+                &mut document,
+                composition_selection,
+                Transaction::InsertText {
+                    selection: composition_selection,
+                    text: new_text.to_owned(),
+                },
+            )?;
+            let mut changed_nodes = undo_outcome.changed_nodes;
+            changed_nodes.extend(outcome.changed_nodes.iter().copied());
+            self.document = document;
+            self.history = history;
             self.selection = outcome.selection;
-            self.layout.invalidate_nodes(&outcome.changed_nodes);
-        }
-        let outcome = self.apply_with_selection(Transaction::InsertText {
-            selection: if updating_composition {
-                composition_base
-            } else {
-                visible_selection
-            },
-            text: new_text.to_owned(),
-        })?;
+            self.preferred_x = None;
+            self.layout.invalidate_nodes(&changed_nodes);
+            outcome
+        } else {
+            self.apply_with_selection(Transaction::InsertText {
+                selection: visible_selection,
+                text: new_text.to_owned(),
+            })?
+        };
         let node_id = outcome.selection.head.node_id;
         let end = outcome.selection.head.utf8_offset;
         let start = end.saturating_sub(new_text.len());
@@ -383,8 +412,14 @@ impl EditorCore {
             .unwrap_or(new_text.len()..new_text.len());
         let selected_start =
             resolve_grapheme_offset(new_text, selected_relative.start, Affinity::Before);
-        let selected_end =
-            resolve_grapheme_offset(new_text, selected_relative.end, Affinity::After);
+        let selected_end = if new_selected_range_utf16
+            .as_ref()
+            .is_none_or(|range| range.start == range.end)
+        {
+            selected_start
+        } else {
+            resolve_grapheme_offset(new_text, selected_relative.end, Affinity::After)
+        };
         self.selection = if selected_start == selected_end {
             Selection::caret(DocPoint::with_affinity(
                 node_id,
@@ -409,7 +444,9 @@ impl EditorCore {
             node_id,
             utf8_range: start..end,
         });
-        self.composition_base = (!new_text.is_empty()).then_some(composition_base);
+        self.composition_base =
+            (!new_text.is_empty()).then_some(self.composition_base.unwrap_or(visible_selection));
+        self.composition_base_range = (!new_text.is_empty()).then_some(base_range);
         Ok(())
     }
 
@@ -429,76 +466,93 @@ impl EditorCore {
             DocPoint::with_affinity(marked.node_id, marked.utf8_range.start, Affinity::Before),
             DocPoint::with_affinity(marked.node_id, marked.utf8_range.end, Affinity::After),
         );
-        let explicit_selection =
-            range_utf16.map(|range| self.selection_for_input_range(Some(range)));
-        let explicit_is_marked = explicit_selection.is_some_and(|selection| {
-            let (start, end) = self.ordered_points_for(selection);
-            let (marked_start, marked_end) = self.ordered_points_for(marked_selection);
-            self.flat_offset_for_point(start) == self.flat_offset_for_point(marked_start)
-                && self.flat_offset_for_point(end) == self.flat_offset_for_point(marked_end)
+        let candidate_selection = range_utf16
+            .map(|range| self.selection_for_input_range(Some(range)))
+            .unwrap_or(marked_selection);
+        let base_range = self.composition_base_range.clone().unwrap_or_else(|| {
+            self.selection_flat_range(self.composition_base.unwrap_or(marked_selection))
         });
-        let base_selection = if explicit_is_marked {
-            self.composition_base.unwrap_or(marked_selection)
-        } else {
-            explicit_selection
-                .or(self.composition_base)
-                .unwrap_or(marked_selection)
-        };
-        let undo_outcome = self.history.undo_with_outcome(&mut self.document)?;
-        self.selection = undo_outcome.selection;
-        self.layout.invalidate_nodes(&undo_outcome.changed_nodes);
-        let base_selection = self.remap_selection_after_composition_undo(
-            base_selection,
+
+        // Probe the complete undo-and-commit operation on cloned document and
+        // history state first.  This keeps an invalid candidate range from
+        // consuming the provisional history entry before its replacement has
+        // been validated against the restored base document.
+        let mut document = self.document.clone();
+        let mut history = self.history.clone();
+        let undo_outcome = history.undo_with_outcome(&mut document)?;
+        let base_selection = self.remap_candidate_selection_after_undo(
+            candidate_selection,
             &marked,
-            self.composition_base.unwrap_or(marked_selection),
+            &base_range,
+            &document,
         );
-        self.clear_composition();
-        if text.is_empty() {
-            return Ok(());
+        let replacement_outcome = if text.is_empty() {
+            None
+        } else {
+            Some(history.apply_with_selection(
+                &mut document,
+                base_selection,
+                Transaction::InsertText {
+                    selection: base_selection,
+                    text: text.to_owned(),
+                },
+            )?)
+        };
+        let mut changed_nodes = undo_outcome.changed_nodes;
+        if let Some(outcome) = replacement_outcome.as_ref() {
+            changed_nodes.extend(outcome.changed_nodes.iter().copied());
         }
-        let outcome = self.apply_with_selection(Transaction::InsertText {
-            selection: base_selection,
-            text: text.to_owned(),
-        })?;
-        self.selection = outcome.selection;
+        self.document = document;
+        self.history = history;
+        self.selection = replacement_outcome
+            .map(|outcome| outcome.selection)
+            .unwrap_or(undo_outcome.selection);
+        self.preferred_x = None;
+        self.layout.invalidate_nodes(&changed_nodes);
+        self.clear_composition();
         Ok(())
     }
 
-    fn remap_selection_after_composition_undo(
+    fn remap_candidate_selection_after_undo(
         &self,
         selection: Selection,
         marked: &MarkedText,
-        base_selection: Selection,
+        base_range: &Range<usize>,
+        restored_document: &Document,
     ) -> Selection {
-        let marked_start = marked.utf8_range.start;
-        let marked_end = marked.utf8_range.end;
-        let base_start = base_selection
-            .anchor
-            .utf8_offset
-            .min(base_selection.head.utf8_offset);
-        let base_end = base_selection
-            .anchor
-            .utf8_offset
-            .max(base_selection.head.utf8_offset);
-        let map_point = |point: DocPoint| {
-            if point.node_id != marked.node_id {
-                return point;
-            }
-            let offset = if point.utf8_offset <= marked_start {
-                point.utf8_offset
-            } else if point.utf8_offset >= marked_end {
-                point
-                    .utf8_offset
-                    .saturating_sub(marked_end.saturating_sub(marked_start))
-                    .saturating_add(base_end.saturating_sub(base_start))
-            } else if point.affinity == Affinity::Before {
-                base_start
+        let marked_start = self.flat_offset_for_point(DocPoint::with_affinity(
+            marked.node_id,
+            marked.utf8_range.start,
+            Affinity::Before,
+        ));
+        let marked_end = self.flat_offset_for_point(DocPoint::with_affinity(
+            marked.node_id,
+            marked.utf8_range.end,
+            Affinity::After,
+        ));
+        let map_offset = |offset: usize, affinity: Affinity| {
+            let marked_len = marked_end.saturating_sub(marked_start);
+            let base_len = base_range.end.saturating_sub(base_range.start);
+            if offset < marked_start || (offset == marked_start && affinity == Affinity::Before) {
+                offset
+            } else if offset > marked_end || (offset == marked_end && affinity == Affinity::After) {
+                offset.saturating_sub(marked_len).saturating_add(base_len)
+            } else if affinity == Affinity::Before {
+                base_range.start
             } else {
-                base_end
-            };
-            DocPoint::with_affinity(point.node_id, offset, point.affinity)
+                base_range.end
+            }
+        };
+        let map_point = |point: DocPoint| {
+            let offset = map_offset(self.flat_offset_for_point(point), point.affinity);
+            point_for_document_offset_in(restored_document, offset, point.affinity)
         };
         Selection::new(map_point(selection.anchor), map_point(selection.head))
+    }
+
+    fn selection_flat_range(&self, selection: Selection) -> Range<usize> {
+        let (start, end) = self.ordered_points_for(selection);
+        self.flat_offset_for_point(start)..self.flat_offset_for_point(end)
     }
 
     fn ordered_points_for(&self, selection: Selection) -> (DocPoint, DocPoint) {
@@ -784,10 +838,6 @@ impl EditorCore {
         let Some(index) = self.block_index(point.node_id) else {
             return Ok(());
         };
-        if index == 0 {
-            self.clear_composition();
-            return Ok(());
-        }
         if self.document.blocks()[index].kind == BlockKind::Image {
             if point.affinity == Affinity::After {
                 let outcome = self.apply_with_selection(Transaction::RemoveNode {
@@ -809,7 +859,10 @@ impl EditorCore {
             );
             let outcome = self.apply_with_selection(Transaction::DeleteRange { selection })?;
             self.selection = outcome.selection;
-        } else if let Some(previous) = self.document.blocks().get(index.saturating_sub(1)) {
+        } else if index == 0 {
+            self.clear_composition();
+            return Ok(());
+        } else if let Some(previous) = self.document.blocks().get(index - 1) {
             if previous.kind == BlockKind::Image {
                 let outcome = self.apply_with_selection(Transaction::RemoveNode {
                     node_id: previous.id,
@@ -964,6 +1017,7 @@ impl EditorCore {
     fn clear_composition(&mut self) {
         self.marked = None;
         self.composition_base = None;
+        self.composition_base_range = None;
     }
 
     fn active_text(&self) -> Option<(NodeId, &str)> {
@@ -1121,54 +1175,63 @@ impl EditorCore {
         offset: usize,
         affinity: Affinity,
     ) -> DocPoint {
-        if let Some(first) = self.document.blocks().first() {
-            if offset == 0 {
-                return DocPoint::with_affinity(first.id, 0, Affinity::Before);
-            }
+        point_for_document_offset_in(&self.document, offset, affinity)
+    }
+}
+
+fn point_for_document_offset_in(
+    document: &Document,
+    offset: usize,
+    affinity: Affinity,
+) -> DocPoint {
+    if let Some(first) = document.blocks().first()
+        && offset == 0
+    {
+        return DocPoint::with_affinity(first.id, 0, Affinity::Before);
+    }
+    let full_len = document
+        .blocks()
+        .iter()
+        .enumerate()
+        .map(|(index, block)| block_flat_len(block) + usize::from(index > 0))
+        .sum::<usize>();
+    if offset >= full_len {
+        return document
+            .blocks()
+            .last()
+            .map(block_points)
+            .map(|(_, after)| after)
+            .unwrap_or_else(|| DocPoint::new(NodeId::new(0), 0));
+    }
+    let mut cursor = 0;
+    for (index, block) in document.blocks().iter().enumerate() {
+        if index > 0 {
+            cursor += 1;
         }
-        let full_len = self.document_text().len();
-        if offset >= full_len {
-            return self
-                .document
-                .blocks()
-                .last()
-                .map(block_points)
-                .map(|(_, after)| after)
-                .unwrap_or_else(|| DocPoint::new(NodeId::new(0), 0));
-        }
-        let mut cursor = 0;
-        for (index, block) in self.document.blocks().iter().enumerate() {
-            if index > 0 {
-                cursor += 1;
-            }
-            let len = block_flat_len(block);
-            if offset <= cursor + len {
-                match &block.content {
-                    BlockContent::Text { text, .. } => {
-                        let local = resolve_grapheme_offset(
-                            text,
-                            (offset - cursor).min(text.len()),
-                            affinity,
-                        );
-                        return DocPoint::with_affinity(block.id, local, affinity);
-                    }
-                    _ => {
-                        return DocPoint::with_affinity(
-                            block.id,
-                            0,
-                            if offset - cursor < len / 2 {
-                                Affinity::Before
-                            } else {
-                                Affinity::After
-                            },
-                        );
-                    }
+        let len = block_flat_len(block);
+        if offset <= cursor + len {
+            match &block.content {
+                BlockContent::Text { text, .. } => {
+                    let local =
+                        resolve_grapheme_offset(text, (offset - cursor).min(text.len()), affinity);
+                    return DocPoint::with_affinity(block.id, local, affinity);
+                }
+                _ => {
+                    return DocPoint::with_affinity(
+                        block.id,
+                        0,
+                        if offset - cursor < len / 2 {
+                            Affinity::Before
+                        } else {
+                            Affinity::After
+                        },
+                    );
                 }
             }
-            cursor += len;
         }
-        self.document.end_selection().head
+        cursor += len;
     }
+    document.end_selection().head
 }
 
 impl EntityInputHandler for EditorCore {
@@ -1226,6 +1289,7 @@ impl EntityInputHandler for EditorCore {
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         self.marked = None;
         self.composition_base = None;
+        self.composition_base_range = None;
     }
 
     fn replace_text_in_range(
