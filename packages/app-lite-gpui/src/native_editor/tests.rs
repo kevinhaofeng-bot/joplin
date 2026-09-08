@@ -1386,6 +1386,92 @@ async fn entity_input_explicit_replacement_superset_stays_explicit(cx: &mut gpui
     );
 }
 
+#[gpui::test]
+async fn entity_input_explicit_replacement_subset_stays_explicit(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("aQ"), cx));
+    let original_selection = cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(1);
+            let original_selection = editor.selection();
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "\u{301}",
+                Some(0..0),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "a\u{301}Q");
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor,
+                Some(0..1),
+                "b",
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "bQ");
+            assert_eq!(editor.undo_depth(), 1);
+            original_selection
+        })
+    });
+
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "aQ"
+    );
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
+}
+
+#[gpui::test]
+async fn entity_input_explicit_replacement_overlap_stays_explicit(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("aQ"), cx));
+    let original_selection = cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(1);
+            let original_selection = editor.selection();
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "\u{301}",
+                Some(0..0),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "a\u{301}Q");
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor,
+                Some(1..3),
+                "b",
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "ab");
+            assert_eq!(editor.undo_depth(), 1);
+            original_selection
+        })
+    });
+
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "aQ"
+    );
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.selection()),
+        original_selection
+    );
+}
+
 #[test]
 fn apply_batch_insert_then_delete_clears_inserted_span() {
     let mut doc = Document::from_paragraph("a");

@@ -448,3 +448,70 @@ Donor/GPUI 复用映射和已知 headless 限制沿用 Task 4R 主报告：本�
 `candidate_selection_for_marked_range` 的 explicit precedence，并落实
 `apply_batch` 的 final-operation span 契约；没有回退或弱化既有 donor gate、sum-tree、
 selection streaming、预算或测试。
+
+## Task 4R fix round 2（2026-09-09）
+
+针对独立审查指出的 raw UTF-16 endpoint 丢失问题，先补 subset/overlap production
+回归并运行 RED，再按 raw-coordinate 契约修复；没有修改 Task 4R 已批准的
+`inserted_span`、sum-tree、selection streaming、allocator、layout 或 cache-budget 路径，
+也没有开始 Task 5。
+
+### RED -> GREEN
+
+在共同生产前缀（`aQ`、caret byte 1、combining acute）下新增：
+
+| UTF-16 range | 关系 | RED | GREEN |
+| --- | --- | --- | --- |
+| `0..2` | exact expanded public span | 既有 exact seam 回归保留 | `abQ` |
+| `0..3` | strict superset | 既有 round-1 回归保留 | `b` |
+| `0..1` | strict subset | 错误得到 `abQ`，应为 `bQ` | `bQ` |
+| `1..3` | overlap | 错误得到 `b`，应为 `ab` | `ab` |
+| `2..3` | disjoint | 既有 disjoint 回归保留 | `ab` |
+
+RED 结果：`entity_input_explicit_replacement_subset_stays_explicit` 与
+`entity_input_explicit_replacement_overlap_stays_explicit` 各自独立运行均失败，
+分别暴露 `abQ`/`b` 的错误结果。修复后五种关系的生产 EntityInputHandler 回归全部
+通过，且每个 case 的一次 Undo 都恢复原始 `aQ` 与原始 selection。
+
+### Raw endpoint contract
+
+新增 typed `RawDocumentRange`，明确区分平台 raw UTF-8 flat coordinates 与合法模型
+`DocPoint`：
+
+1. UTF-16 range 在 `replace_and_mark_utf16`/commit 入口只转换一次为 raw UTF-8 range，
+   并复用同一值计算可见 selection 与 candidate mapping。
+2. raw range 直接和 raw public marked range 比较；只有 exact expanded-public seam 才
+   使用 actual candidate interval。
+3. subset、overlap、superset、disjoint 等其他 explicit range 保持 raw endpoint/affinity，
+   先经 candidate-to-base inverse mapping，再在恢复的 base document 上构造并吸附合法
+   `DocPoint`。
+4. 新增 `native_editor::core::raw_document_range_tests`，用 CJK 邻接 surrogate pair
+   与 combining endpoint 验证 UTF-16→raw 边界未提前 grapheme-expand；该 pure mapping
+   test 通过。
+
+### Fix round 2 验收命令
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor --offline -- --nocapture
+    87 passed, 0 failed, 752 filtered out
+
+    cargo check --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype --offline
+    PASS
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run --offline
+    PASS
+
+    cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype --offline \
+      --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores
+    838 passed, 0 failed, 1 filtered
+
+    cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml --all -- --check
+    PASS
+
+    git diff --check
+    PASS
+
+本轮 donor/GPUI 复用映射仍是 input UTF-16 conversion、GPUI replacement precedence、
+macOS bridge 真实 replacementRange 与 donor grapheme/hard-line 语义；新增 raw helper
+只守住原始 endpoint 到 inverse mapping 的生命周期，没有更改已批准的 geometry、
+sum-tree、selection streaming、预算或缓存行为。已知限制仍为 headless 测试不能替代
+真实 macOS IME 候选窗、主题字体、Metal/RSS、异步图片解码及真实 UI 外壳集成验收。

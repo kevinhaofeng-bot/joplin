@@ -34,6 +34,62 @@ pub struct MarkedText {
     pub actual_utf8_range: Range<usize>,
 }
 
+/// A document-flat UTF-8 range whose endpoints have not yet been expanded to
+/// model grapheme boundaries. Platform input ranges use this representation
+/// until candidate coordinates have been inverse-mapped to the base document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawDocumentRange {
+    start: usize,
+    end: usize,
+    start_affinity: Affinity,
+    end_affinity: Affinity,
+}
+
+impl RawDocumentRange {
+    fn from_utf16(text: &str, range_utf16: &Range<usize>) -> Self {
+        Self::from_utf8(input::utf16_range_to_utf8_in(text, range_utf16))
+    }
+
+    fn from_utf8(range: Range<usize>) -> Self {
+        let (start_affinity, end_affinity) = if range.start == range.end {
+            (Affinity::After, Affinity::After)
+        } else {
+            (Affinity::Before, Affinity::After)
+        };
+        Self {
+            start: range.start,
+            end: range.end,
+            start_affinity,
+            end_affinity,
+        }
+    }
+
+    fn with_affinities(
+        start: usize,
+        end: usize,
+        start_affinity: Affinity,
+        end_affinity: Affinity,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            start_affinity,
+            end_affinity,
+        }
+    }
+
+    fn offsets(self) -> ((usize, Affinity), (usize, Affinity)) {
+        (
+            (self.start, self.start_affinity),
+            (self.end, self.end_affinity),
+        )
+    }
+
+    fn as_range(self) -> Range<usize> {
+        self.start..self.end
+    }
+}
+
 pub struct EditorCore {
     pub(crate) focus: FocusHandle,
     document: Document,
@@ -376,7 +432,10 @@ impl EditorCore {
             self.validate_input_range(range)?;
         }
         let updating_composition = self.marked.is_some();
-        let visible_selection = self.selection_for_input_range(range_utf16.as_ref());
+        let raw_input_range = self.raw_input_range(range_utf16.as_ref());
+        let visible_selection = raw_input_range
+            .map(|range| self.selection_for_raw_document_range(range))
+            .unwrap_or_else(|| self.selection_for_input_range(None));
         let base_range = if updating_composition {
             self.composition_base_range.clone().unwrap_or_else(|| {
                 self.selection_flat_range(self.composition_base.unwrap_or(visible_selection))
@@ -386,18 +445,9 @@ impl EditorCore {
         };
         let outcome = if updating_composition {
             let marked = self.marked.clone().ok_or(DocumentError::HistoryEmpty)?;
-            let candidate_selection =
-                self.candidate_selection_for_marked_range(range_utf16.as_ref(), &marked);
-            let candidate_offsets = (
-                (
-                    flat_offset_for_point_in(&self.document, candidate_selection.anchor),
-                    candidate_selection.anchor.affinity,
-                ),
-                (
-                    flat_offset_for_point_in(&self.document, candidate_selection.head),
-                    candidate_selection.head.affinity,
-                ),
-            );
+            let candidate_range =
+                self.candidate_raw_range_for_marked_range(raw_input_range, &marked);
+            let candidate_offsets = candidate_range.offsets();
             let marked_range = self.actual_marked_flat_range(&marked);
             let history_before_selection = self.composition_base.unwrap_or(visible_selection);
             let replacement_text = new_text.to_owned();
@@ -525,17 +575,9 @@ impl EditorCore {
             return self.paste_plain_text(text);
         };
         let marked_selection = self.actual_marked_selection(&marked);
-        let candidate_selection = self.candidate_selection_for_marked_range(range_utf16, &marked);
-        let candidate_offsets = (
-            (
-                flat_offset_for_point_in(&self.document, candidate_selection.anchor),
-                candidate_selection.anchor.affinity,
-            ),
-            (
-                flat_offset_for_point_in(&self.document, candidate_selection.head),
-                candidate_selection.head.affinity,
-            ),
-        );
+        let raw_input_range = self.raw_input_range(range_utf16);
+        let candidate_range = self.candidate_raw_range_for_marked_range(raw_input_range, &marked);
+        let candidate_offsets = candidate_range.offsets();
         let marked_range = self.actual_marked_flat_range(&marked);
         let base_range = self.composition_base_range.clone().unwrap_or_else(|| {
             self.selection_flat_range(self.composition_base.unwrap_or(marked_selection))
@@ -1060,10 +1102,8 @@ impl EditorCore {
     }
 
     fn selection_for_input_range(&self, range_utf16: Option<&Range<usize>>) -> Selection {
-        if let Some(range_utf16) = range_utf16 {
-            let document_text = self.document_text();
-            let range = input::utf16_range_to_utf8_in(&document_text, range_utf16);
-            return self.selection_for_document_byte_range(range);
+        if let Some(range) = self.raw_input_range(range_utf16) {
+            return self.selection_for_raw_document_range(range);
         }
         if let Some(marked) = self.marked.as_ref() {
             return Selection::new(
@@ -1072,6 +1112,12 @@ impl EditorCore {
             );
         }
         self.selection
+    }
+
+    fn raw_input_range(&self, range_utf16: Option<&Range<usize>>) -> Option<RawDocumentRange> {
+        let range_utf16 = range_utf16?;
+        let document_text = self.document_text();
+        Some(RawDocumentRange::from_utf16(&document_text, range_utf16))
     }
 
     fn actual_marked_selection(&self, marked: &MarkedText) -> Selection {
@@ -1090,55 +1136,47 @@ impl EditorCore {
     }
 
     fn actual_marked_flat_range(&self, marked: &MarkedText) -> Range<usize> {
-        flat_offset_for_point_in(
-            &self.document,
-            DocPoint::with_affinity(
-                marked.node_id,
-                marked.actual_utf8_range.start,
-                Affinity::Before,
-            ),
-        )
-            ..flat_offset_for_point_in(
+        self.raw_marked_range(marked, &marked.actual_utf8_range)
+            .as_range()
+    }
+
+    fn raw_marked_range(&self, marked: &MarkedText, range: &Range<usize>) -> RawDocumentRange {
+        RawDocumentRange::with_affinities(
+            flat_offset_for_point_in(
                 &self.document,
-                DocPoint::with_affinity(
-                    marked.node_id,
-                    marked.actual_utf8_range.end,
-                    Affinity::After,
-                ),
-            )
+                DocPoint::with_affinity(marked.node_id, range.start, Affinity::Before),
+            ),
+            flat_offset_for_point_in(
+                &self.document,
+                DocPoint::with_affinity(marked.node_id, range.end, Affinity::After),
+            ),
+            Affinity::Before,
+            Affinity::After,
+        )
     }
 
     /// Resolve the platform's candidate range against the actual provisional
-    /// bytes. The public marked span may include a preceding grapheme when an
-    /// IME inserts a combining mark, so only a platform range exactly equal
-    /// to that expanded public span is mapped to `actual_utf8_range` before
-    /// inverse mapping; every other explicit range stays in document space.
-    fn candidate_selection_for_marked_range(
+    /// bytes without expanding raw endpoints to candidate grapheme
+    /// boundaries. The public marked span may include a preceding grapheme
+    /// when an IME inserts a combining mark, so only a platform range exactly
+    /// equal to that expanded public span is mapped to `actual_utf8_range`
+    /// before inverse mapping; every other explicit range stays raw.
+    fn candidate_raw_range_for_marked_range(
         &self,
-        range_utf16: Option<&Range<usize>>,
+        requested: Option<RawDocumentRange>,
         marked: &MarkedText,
-    ) -> Selection {
-        let actual = self.actual_marked_selection(marked);
-        let Some(range_utf16) = range_utf16 else {
+    ) -> RawDocumentRange {
+        let actual = self.raw_marked_range(marked, &marked.actual_utf8_range);
+        let Some(requested) = requested else {
             return actual;
         };
-        let requested = self.selection_for_input_range(Some(range_utf16));
-        let requested_range = self.selection_flat_range(requested);
-        let public_range = flat_offset_for_point_in(
-            &self.document,
-            DocPoint::with_affinity(marked.node_id, marked.utf8_range.start, Affinity::Before),
-        )
-            ..flat_offset_for_point_in(
-                &self.document,
-                DocPoint::with_affinity(marked.node_id, marked.utf8_range.end, Affinity::After),
-            );
-        let actual_range = self.actual_marked_flat_range(marked);
+        let public = self.raw_marked_range(marked, &marked.utf8_range);
         // With an ordinary candidate the platform range may intentionally
         // include text immediately before/after the marked span (the donor
         // accepts that explicit replacement). Only the exact public span
         // itself is treated as the IME's expanded view of the candidate; an
         // explicit range outside it remains a real document range.
-        if public_range != actual_range && requested_range == public_range {
+        if public != actual && requested.start == public.start && requested.end == public.end {
             return actual;
         }
         requested
@@ -1240,14 +1278,18 @@ impl EditorCore {
     }
 
     fn selection_for_document_byte_range(&self, range: Range<usize>) -> Selection {
+        self.selection_for_raw_document_range(RawDocumentRange::from_utf8(range))
+    }
+
+    fn selection_for_raw_document_range(&self, range: RawDocumentRange) -> Selection {
         if range.start == range.end {
             Selection::caret(
-                self.point_for_document_offset_with_affinity(range.start, Affinity::After),
+                self.point_for_document_offset_with_affinity(range.start, range.start_affinity),
             )
         } else {
             Selection::new(
-                self.point_for_document_offset_with_affinity(range.start, Affinity::Before),
-                self.point_for_document_offset_with_affinity(range.end, Affinity::After),
+                self.point_for_document_offset_with_affinity(range.start, range.start_affinity),
+                self.point_for_document_offset_with_affinity(range.end, range.end_affinity),
             )
         }
     }
@@ -1644,5 +1686,26 @@ fn resolve_grapheme_offset(text: &str, preferred: usize, affinity: Affinity) -> 
     match affinity {
         Affinity::Before => previous,
         Affinity::After => text.len(),
+    }
+}
+
+#[cfg(test)]
+mod raw_document_range_tests {
+    use super::RawDocumentRange;
+
+    #[test]
+    fn utf16_to_raw_range_preserves_surrogate_and_combining_endpoints() {
+        let text = "甲😀乙";
+        let surrogate_neighbor = RawDocumentRange::from_utf16(text, &(1..3));
+        assert_eq!(
+            (surrogate_neighbor.start, surrogate_neighbor.end),
+            ("甲".len(), "甲😀".len())
+        );
+
+        let combining = "a\u{301}Q";
+        let subset = RawDocumentRange::from_utf16(combining, &(0..1));
+        assert_eq!((subset.start, subset.end), (0, 1));
+        let overlap = RawDocumentRange::from_utf16(combining, &(1..3));
+        assert_eq!((overlap.start, overlap.end), (1, combining.len()));
     }
 }
