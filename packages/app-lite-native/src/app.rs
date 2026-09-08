@@ -1993,21 +1993,17 @@ fn candidate_with_attachment(
     Some(candidate)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageInsertViewUpdate {
-    InstallSession { selection: NSRange },
-}
-
 fn prepare_image_insert_candidate(
     live: &NativeEditorSession,
     insertion_range: NSRange,
     resource_id: &str,
     alt: &str,
     title: String,
-) -> Result<(NativeEditorSession, PreparedNoteContent), NativeEditorCodecError> {
+) -> Result<(NativeEditorSession, PreparedNoteContent, NSRange), NativeEditorCodecError> {
     let document = document_from_session(live)?;
     let mut candidate = session_from_document(&document)?;
-    insert_image_block_anchor(&mut candidate, insertion_range, resource_id, alt, 1, 1)?;
+    let selection =
+        insert_image_block_anchor(&mut candidate, insertion_range, resource_id, alt, 1, 1)?;
     let candidate_document = document_from_session(&candidate)?;
     Ok((
         candidate,
@@ -2017,16 +2013,8 @@ fn prepare_image_insert_candidate(
                 body: serialize_html(&candidate_document),
             },
         },
+        selection,
     ))
-}
-
-fn image_insert_view_update(
-    persisted: bool,
-    insertion_range: NSRange,
-) -> Option<ImageInsertViewUpdate> {
-    persisted.then(|| ImageInsertViewUpdate::InstallSession {
-        selection: NSRange::new(insertion_range.location.saturating_add(1), 0),
-    })
 }
 
 fn toolbar_state_title(action: EditorAction, label: &str) -> Option<&str> {
@@ -5313,7 +5301,7 @@ impl AppDelegate {
             .get()
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
-        let (_candidate, prepared) = {
+        let (_candidate, prepared, candidate_selection) = {
             let session_guard = self.ivars().editor_session.borrow();
             let Some(session) = session_guard.as_ref() else {
                 self.rollback_imported_resource(&stored.id);
@@ -5340,11 +5328,12 @@ impl AppDelegate {
         let previous_selection_guard = *self.ivars().selection_sync_guard.borrow();
         *self.ivars().loading_guard.borrow_mut() = true;
         *self.ivars().selection_sync_guard.borrow_mut() = true;
+        let candidate_body = prepared.update.body.clone();
         let persisted = self.persist_note_content(&note_id, prepared);
-        let applied = if persisted {
+        let live_result = if persisted {
             let mut session_guard = self.ivars().editor_session.borrow_mut();
             if let Some(session) = session_guard.as_mut() {
-                if let Err(error) = insert_image_block_anchor(
+                match insert_image_block_anchor(
                     session,
                     insertion_range,
                     &stored.id,
@@ -5352,26 +5341,31 @@ impl AppDelegate {
                     1,
                     1,
                 ) {
-                    eprintln!("native image live apply failed: {error}");
-                    false
-                } else {
-                    true
+                    Ok(selection) => match document_from_session(session) {
+                        Ok(document) => Some((selection, serialize_html(&document))),
+                        Err(error) => {
+                            eprintln!("native image live serialization failed: {error}");
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("native image live apply failed: {error}");
+                        None
+                    }
                 }
             } else {
                 eprintln!("native image live apply failed: editor state unavailable");
-                false
+                None
             }
         } else {
-            false
+            None
         };
+        let applied = live_result.as_ref().is_some_and(|(selection, body)| {
+            *selection == candidate_selection && *body == candidate_body
+        });
         let inserted = if applied {
-            match image_insert_view_update(persisted, insertion_range) {
-                Some(ImageInsertViewUpdate::InstallSession { selection }) => {
-                    self.refresh_body_from_session_at(body, selection);
-                    true
-                }
-                None => false,
-            }
+            self.refresh_body_from_session_at(body, candidate_selection);
+            true
         } else {
             false
         };
@@ -8092,7 +8086,7 @@ mod tests {
             marks: Marks::default(),
         }])]);
 
-        let (_candidate, prepared) = super::prepare_image_insert_candidate(
+        let (_candidate, prepared, _candidate_selection) = super::prepare_image_insert_candidate(
             &live,
             NSRange::new(2, 0),
             "0123456789abcdef0123456789abcdef",
@@ -8132,7 +8126,7 @@ mod tests {
         }])]);
         let mut live = super::session_from_document(&document).unwrap();
         let before_revision = live.revision();
-        let (_candidate, _prepared) = super::prepare_image_insert_candidate(
+        let (_candidate, prepared, candidate_selection) = super::prepare_image_insert_candidate(
             &live,
             NSRange::new(2, 0),
             "0123456789abcdef0123456789abcdef",
@@ -8140,7 +8134,8 @@ mod tests {
             "标题".into(),
         )
         .unwrap();
-        super::insert_image_block_anchor(
+        let candidate_body = prepared.update.body.clone();
+        let live_selection = super::insert_image_block_anchor(
             &mut live,
             NSRange::new(2, 0),
             "0123456789abcdef0123456789abcdef",
@@ -8149,6 +8144,11 @@ mod tests {
             1,
         )
         .unwrap();
+        assert_eq!(live_selection, candidate_selection);
+        assert_eq!(
+            super::serialize_html(&super::document_from_session(&live).unwrap()),
+            candidate_body
+        );
         assert_eq!(live.revision(), before_revision + 1);
         let expected = Document::from_blocks(vec![
             paragraph(vec![Inline::Text {
@@ -8159,6 +8159,7 @@ mod tests {
                 resource_id: "0123456789abcdef0123456789abcdef".into(),
                 alt: "图片".into(),
             }]),
+            paragraph(vec![]),
         ]);
         assert_eq!(super::document_from_session(&live).unwrap(), expected);
         assert!(live.can_undo());

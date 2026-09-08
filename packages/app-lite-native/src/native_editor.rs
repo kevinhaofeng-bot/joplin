@@ -812,16 +812,20 @@ pub fn document_from_session(session: &NativeEditorSession) -> Result<Document, 
                 }],
             });
         } else if let Some(level) = snapshot.block_format.heading_level {
-            let level = match level {
-                1 => HeadingLevel::One,
-                2 => HeadingLevel::Two,
-                _ => HeadingLevel::Three,
-            };
-            blocks.push(Block::Heading {
-                level,
-                style,
-                inlines,
-            });
+            if level == 0 {
+                blocks.push(Block::Paragraph { style, inlines });
+            } else {
+                let level = match level {
+                    1 => HeadingLevel::One,
+                    2 => HeadingLevel::Two,
+                    _ => HeadingLevel::Three,
+                };
+                blocks.push(Block::Heading {
+                    level,
+                    style,
+                    inlines,
+                });
+            }
         } else {
             blocks.push(Block::Paragraph { style, inlines });
         }
@@ -910,6 +914,13 @@ fn adjust_highlight_ranges(
         }
     }
     *ranges = adjusted;
+}
+
+fn utf16_offset_at_scalar(text: &str, scalar: usize) -> Result<usize, EditorCodecError> {
+    if scalar > text.chars().count() {
+        return Err(EditorCodecError::InvalidUtf16Range);
+    }
+    Ok(text.chars().take(scalar).map(char::len_utf16).sum())
 }
 
 fn toggle_highlight_range(session: &mut NativeEditorSession, start: usize, end: usize) {
@@ -1105,42 +1116,104 @@ pub fn insert_image_block_anchor(
     alt: &str,
     width: u32,
     height: u32,
-) -> Result<(), EditorCodecError> {
+) -> Result<NSRange, EditorCodecError> {
     let text = session.text.to_addressable_text().map_err(model_error)?;
     let (start, end) = utf16_range(&text, selection)?;
     let old_length = text.chars().count();
-    run_edit_command(session, |session| {
+    let caret = run_edit_command(session, |session| {
         let cursor = session.text.cursor_at(start);
+        let starts_at_block_start = cursor.at_block_start();
+        let current_block_is_empty = cursor.current_block_is_empty();
         cursor.set_position(end, MoveMode::KeepAnchor);
-        if start == 0 {
-            if end != start {
+        if starts_at_block_start {
+            if cursor.has_selection() {
                 must_apply(cursor.remove_selected_text(), "replace image selection");
             }
-            must_apply(
-                cursor.insert_image(resource_id, alt, width.max(1), height.max(1)),
-                "insert block image anchor",
-            );
-            if !cursor.at_end() {
-                must_apply(cursor.insert_block(), "close image block");
-            }
-        } else {
+        } else if !current_block_is_empty {
             must_apply(cursor.insert_block(), "split image block");
-            must_apply(
-                cursor.insert_image(resource_id, alt, width.max(1), height.max(1)),
-                "insert block image anchor",
-            );
-            if !cursor.at_end() {
-                must_apply(cursor.insert_block(), "close image block");
-            }
         }
-        let new_length = must_apply(
+        let image_anchor_position = cursor.position();
+        must_apply(
+            cursor.insert_image(resource_id, alt, width.max(1), height.max(1)),
+            "insert block image anchor",
+        );
+        // Always close the image block. At the document end this creates the
+        // one writable trailing paragraph used by the next insertion; in the
+        // middle it preserves the already-existing suffix block.
+        must_apply(cursor.insert_block(), "close image block");
+        // `insert_block` inherits the surrounding block format. Locate the
+        // actual image block after that edit, then normalize only that block;
+        // this preserves the suffix's heading/list format even if removing a
+        // list item reindexes the flow.
+        let image_block = session.text.flow().iter().find_map(|element| {
+            let FlowElement::Block(block) = element else {
+                return None;
+            };
+            let snapshot = block.snapshot();
+            let has_image = snapshot.fragments.iter().any(|fragment| {
+                matches!(
+                    fragment,
+                    FragmentContent::Image { name, .. } if name == resource_id
+                )
+            });
+            (has_image && snapshot.position == image_anchor_position)
+                .then_some((snapshot.position, snapshot.list_info.is_some()))
+        });
+        let Some((image_position, image_is_list_item)) = image_block else {
+            panic!("inserted image block disappeared from text document")
+        };
+        cursor.set_position(image_position, MoveMode::MoveAnchor);
+        if image_is_list_item {
+            must_apply(
+                cursor.remove_current_block_from_list(),
+                "remove image block from list",
+            );
+        }
+        must_apply(
+            cursor.set_block_format(&BlockFormat {
+                heading_level: Some(0),
+                marker: Some(MarkerType::NoMarker),
+                ..Default::default()
+            }),
+            "normalize image block format",
+        );
+        let new_text = must_apply(
             session.text.to_addressable_text(),
             "read inserted image block",
-        )
-        .chars()
-        .count();
+        );
+        let blocks: Vec<_> = session
+            .text
+            .flow()
+            .iter()
+            .filter_map(|element| match element {
+                FlowElement::Block(block) => Some(block.snapshot()),
+                _ => None,
+            })
+            .collect();
+        let image_index = blocks.iter().position(|snapshot| {
+            snapshot.fragments.iter().any(|fragment| {
+                matches!(
+                    fragment,
+                    FragmentContent::Image { name, .. } if name == resource_id
+                )
+            }) && snapshot.position == image_position
+        });
+        let caret_scalar = image_index
+            .and_then(|index| blocks.get(index + 1))
+            .map(|snapshot| snapshot.position)
+            .unwrap_or_else(|| panic!("inserted image block has no writable following block"));
+        let caret = NSRange::new(
+            must_apply(
+                utf16_offset_at_scalar(&new_text, caret_scalar),
+                "convert image caret to UTF-16",
+            ),
+            0,
+        );
         let replaced_length = end.saturating_sub(start);
-        let replacement_length = new_length.saturating_sub(old_length - replaced_length);
+        let replacement_length = new_text
+            .chars()
+            .count()
+            .saturating_sub(old_length - replaced_length);
         adjust_highlight_ranges(
             &mut session.highlighted_ranges,
             start,
@@ -1150,8 +1223,9 @@ pub fn insert_image_block_anchor(
         session
             .image_dimensions
             .insert(resource_id.to_owned(), (width.max(1), height.max(1)));
+        caret
     });
-    Ok(())
+    Ok(caret)
 }
 
 fn link_command_is_noop(
@@ -2471,7 +2545,7 @@ mod tests {
             }],
         }]))
         .unwrap();
-        insert_image_block_anchor(
+        let end_caret = insert_image_block_anchor(
             &mut at_end,
             NSRange::new(2, 0),
             "0123456789abcdef0123456789abcdef",
@@ -2497,8 +2571,22 @@ mod tests {
                         alt: "A".into(),
                     }],
                 },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![],
+                },
             ])
         );
+        apply_committed_text_delta(&mut at_end, end_caret, "后文").unwrap();
+        assert!(matches!(
+            document_from_session(&at_end).unwrap().blocks.as_slice(),
+            [
+                Block::Paragraph { .. },
+                Block::Paragraph { inlines, .. },
+                Block::Paragraph { inlines: tail, .. },
+            ] if matches!(inlines.as_slice(), [Inline::Image { .. }])
+                && matches!(tail.as_slice(), [Inline::Text { text, .. }] if text == "后文")
+        ));
 
         let mut in_middle = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
             style: BlockStyle::default(),
@@ -2508,7 +2596,7 @@ mod tests {
             }],
         }]))
         .unwrap();
-        insert_image_block_anchor(
+        let middle_caret = insert_image_block_anchor(
             &mut in_middle,
             NSRange::new(1, 0),
             "0123456789abcdef0123456789abcdef",
@@ -2543,12 +2631,22 @@ mod tests {
                 },
             ])
         );
+        apply_committed_text_delta(&mut in_middle, middle_caret, "后文").unwrap();
+        assert!(matches!(
+            document_from_session(&in_middle).unwrap().blocks.as_slice(),
+            [
+                Block::Paragraph { .. },
+                Block::Paragraph { inlines, .. },
+                Block::Paragraph { inlines: tail, .. },
+            ] if matches!(inlines.as_slice(), [Inline::Image { .. }])
+                && matches!(tail.as_slice(), [Inline::Text { text, .. }] if text == "后文b")
+        ));
     }
 
     #[test]
     fn red_block_image_insert_at_empty_and_paragraph_start_has_no_blank_prefix() {
         let mut empty = session_from_document(&Document::from_blocks(vec![])).unwrap();
-        insert_image_block_anchor(
+        let empty_caret = insert_image_block_anchor(
             &mut empty,
             NSRange::new(0, 0),
             "0123456789abcdef0123456789abcdef",
@@ -2559,14 +2657,27 @@ mod tests {
         .unwrap();
         assert_eq!(
             document_from_session(&empty).unwrap(),
-            Document::from_blocks(vec![Block::Paragraph {
-                style: BlockStyle::default(),
-                inlines: vec![Inline::Image {
-                    resource_id: "0123456789abcdef0123456789abcdef".into(),
-                    alt: "空笔记图片".into(),
-                }],
-            }])
+            Document::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Image {
+                        resource_id: "0123456789abcdef0123456789abcdef".into(),
+                        alt: "空笔记图片".into(),
+                    }],
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![],
+                },
+            ])
         );
+        apply_committed_text_delta(&mut empty, empty_caret, "后文").unwrap();
+        assert!(matches!(
+            document_from_session(&empty).unwrap().blocks.as_slice(),
+            [Block::Paragraph { inlines, .. }, Block::Paragraph { inlines: tail, .. }]
+                if matches!(inlines.as_slice(), [Inline::Image { .. }])
+                    && matches!(tail.as_slice(), [Inline::Text { text, .. }] if text == "后文")
+        ));
 
         let mut start = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
             style: BlockStyle::default(),
@@ -2576,7 +2687,7 @@ mod tests {
             }],
         }]))
         .unwrap();
-        insert_image_block_anchor(
+        let start_caret = insert_image_block_anchor(
             &mut start,
             NSRange::new(0, 0),
             "fedcba9876543210fedcba9876543210",
@@ -2604,6 +2715,138 @@ mod tests {
                 },
             ])
         );
+        apply_committed_text_delta(&mut start, start_caret, "后文").unwrap();
+        assert!(matches!(
+            document_from_session(&start).unwrap().blocks.as_slice(),
+            [Block::Paragraph { inlines, .. }, Block::Paragraph { inlines: tail, .. }]
+                if matches!(inlines.as_slice(), [Inline::Image { .. }])
+                    && matches!(tail.as_slice(), [Inline::Text { text, .. }] if text == "后文ab")
+        ));
+    }
+
+    #[test]
+    fn red_block_image_insert_at_later_paragraph_start_preserves_prefix() {
+        let mut session = session_from_document(&Document::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "x".into(),
+                    marks: Default::default(),
+                }],
+            },
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "ab".into(),
+                    marks: Default::default(),
+                }],
+            },
+        ]))
+        .unwrap();
+        let caret = insert_image_block_anchor(
+            &mut session,
+            NSRange::new("x\n".encode_utf16().count(), 0),
+            "later-paragraph-image",
+            "第二段段首",
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [
+                Block::Paragraph { inlines: prefix, .. },
+                Block::Paragraph { inlines: image, .. },
+                Block::Paragraph { inlines: suffix, .. },
+            ] if matches!(prefix.as_slice(), [Inline::Text { text, .. }] if text == "x")
+                && matches!(image.as_slice(), [Inline::Image { resource_id, .. }] if resource_id == "later-paragraph-image")
+                && matches!(suffix.as_slice(), [Inline::Text { text, .. }] if text == "ab")
+        ));
+        apply_committed_text_delta(&mut session, caret, "后文").unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [_, _, Block::Paragraph { inlines, .. }]
+                if matches!(inlines.as_slice(), [Inline::Text { text, .. }] if text == "后文ab")
+        ));
+    }
+
+    #[test]
+    fn red_block_image_insert_normalizes_heading_and_list_image_blocks() {
+        let heading_documents = [
+            (HeadingLevel::One, "h1-image"),
+            (HeadingLevel::Two, "h2-image"),
+            (HeadingLevel::Three, "h3-image"),
+        ];
+        for (level, resource_id) in heading_documents {
+            for location in [0, 1, 2] {
+                let mut session =
+                    session_from_document(&Document::from_blocks(vec![Block::Heading {
+                        level,
+                        style: BlockStyle::default(),
+                        inlines: vec![Inline::Text {
+                            text: "ab".into(),
+                            marks: Default::default(),
+                        }],
+                    }]))
+                    .unwrap();
+                insert_image_block_anchor(
+                    &mut session,
+                    NSRange::new(location, 0),
+                    resource_id,
+                    "标题图片",
+                    1,
+                    1,
+                )
+                .unwrap();
+                let document = document_from_session(&session).unwrap();
+                assert!(document.blocks.iter().any(|block| matches!(
+                    block,
+                    Block::Paragraph {
+                        inlines,
+                        ..
+                    } if matches!(inlines.as_slice(), [Inline::Image { resource_id: found, .. }] if found == resource_id)
+                )));
+            }
+        }
+
+        for (kind, resource_id) in [
+            (ListKind::Unordered, "unordered-image"),
+            (ListKind::Ordered, "ordered-image"),
+            (ListKind::Checklist, "checklist-image"),
+        ] {
+            for location in [0, 1, 2] {
+                let mut session =
+                    session_from_document(&Document::from_blocks(vec![Block::List {
+                        kind,
+                        items: vec![ListItem {
+                            checked: (kind == ListKind::Checklist).then_some(true),
+                            style: BlockStyle::default(),
+                            inlines: vec![Inline::Text {
+                                text: "ab".into(),
+                                marks: Default::default(),
+                            }],
+                        }],
+                    }]))
+                    .unwrap();
+                insert_image_block_anchor(
+                    &mut session,
+                    NSRange::new(location, 0),
+                    resource_id,
+                    "列表图片",
+                    1,
+                    1,
+                )
+                .unwrap();
+                let document = document_from_session(&session).unwrap();
+                assert!(document.blocks.iter().any(|block| matches!(
+                    block,
+                    Block::Paragraph {
+                        inlines,
+                        ..
+                    } if matches!(inlines.as_slice(), [Inline::Image { resource_id: found, .. }] if found == resource_id)
+                )));
+            }
+        }
     }
 
     #[test]
@@ -2617,7 +2860,7 @@ mod tests {
         }]);
         let mut session = session_from_document(&document).unwrap();
         let revision_before = session.revision();
-        insert_image_block_anchor(
+        let caret = insert_image_block_anchor(
             &mut session,
             NSRange::new(1, 3),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -2652,9 +2895,23 @@ mod tests {
                 },
             ])
         );
+        let with_image = document_from_session(&session).unwrap();
         assert_eq!(session.revision(), revision_before + 1);
         session.undo().unwrap();
         assert_eq!(document_from_session(&session).unwrap(), document);
+        assert!(session.can_redo());
+        session.redo().unwrap();
+        assert_eq!(document_from_session(&session).unwrap(), with_image);
+        apply_committed_text_delta(&mut session, caret, "后文").unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [
+                Block::Paragraph { .. },
+                Block::Paragraph { inlines, .. },
+                Block::Paragraph { inlines: tail, .. },
+            ] if matches!(inlines.as_slice(), [Inline::Image { .. }])
+                && matches!(tail.as_slice(), [Inline::Text { text, .. }] if text == "后文尾")
+        ));
     }
 
     #[test]
@@ -2710,6 +2967,50 @@ mod tests {
                 "fedcba9876543210fedcba9876543210".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn red_block_image_insert_same_resource_twice_uses_new_anchor_and_one_tail() {
+        let resource_id = "0123456789abcdef0123456789abcdef";
+        let mut session = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "ab".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        let first_caret =
+            insert_image_block_anchor(&mut session, NSRange::new(2, 0), resource_id, "A", 1, 1)
+                .unwrap();
+        let second_caret =
+            insert_image_block_anchor(&mut session, first_caret, resource_id, "B", 1, 1).unwrap();
+        let document = document_from_session(&session).unwrap();
+        assert_eq!(
+            crate::html_body::resource_ids(&document),
+            vec![resource_id.to_string(), resource_id.to_string()]
+        );
+        assert_eq!(
+            document.blocks.last(),
+            Some(&Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![],
+            })
+        );
+        assert_eq!(
+            document
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Paragraph { inlines, .. } if matches!(inlines.as_slice(), [Inline::Image { .. }])))
+                .count(),
+            2
+        );
+        apply_committed_text_delta(&mut session, second_caret, "后文").unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.last(),
+            Some(Block::Paragraph { inlines, .. })
+                if matches!(inlines.as_slice(), [Inline::Text { text, .. }] if text == "后文")
+        ));
     }
 
     #[test]
@@ -3161,6 +3462,41 @@ mod tests {
         }]);
         let session = session_from_document(&document).unwrap();
         assert_eq!(document_from_session(&session).unwrap(), document);
+    }
+
+    #[test]
+    fn red_block_image_insert_selection_from_block_start_has_no_blank_prefix() {
+        let mut session = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "A😀B".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        let caret = insert_image_block_anchor(
+            &mut session,
+            NSRange::new(0, "A😀".encode_utf16().count()),
+            "selection-from-start-image",
+            "选择图片",
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [
+                Block::Paragraph { inlines: image, .. },
+                Block::Paragraph { inlines: suffix, .. },
+            ] if matches!(image.as_slice(), [Inline::Image { .. }])
+                && matches!(suffix.as_slice(), [Inline::Text { text, .. }] if text == "B")
+        ));
+        apply_committed_text_delta(&mut session, caret, "后文").unwrap();
+        assert!(matches!(
+            document_from_session(&session).unwrap().blocks.as_slice(),
+            [_, Block::Paragraph { inlines, .. }]
+                if matches!(inlines.as_slice(), [Inline::Text { text, .. }] if text == "后文B")
+        ));
     }
 
     #[test]
