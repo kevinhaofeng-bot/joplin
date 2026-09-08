@@ -335,15 +335,18 @@ pub enum TextAlignment { Left, Center, Right }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Affinity { Before, After }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Mark { Bold, Italic, Underline, Strike, Highlight, Link(String), InlineCode }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MarkSpan { pub range: std::ops::Range<usize>, pub mark: Mark }
+pub struct StyledRun {
+    pub range: std::ops::Range<usize>,
+    pub marks: SmallVec<[Mark; 4]>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockContent {
-    Text { text: String, marks: SmallVec<[MarkSpan; 4]> },
+    Text { text: String, styles: SmallVec<[StyledRun; 4]> },
     Image { resource_id: String, natural_size: (u32, u32), display_width: Option<u32> },
     Attachment { resource_id: String, filename: String, media_type: String },
     Empty,
@@ -415,7 +418,9 @@ pub struct History {
 
 `Document::apply` must validate node identity, UTF-8 and grapheme boundaries, selection order, affinity, heading level, and list depth before mutating. Apply to a cloned set of affected blocks, then replace those blocks only after every operation succeeds. `DeleteRange` owns cross-block deletion, `MergeBlocks` owns Backspace/Delete at adjacent text boundaries, and `InsertImage` owns the atomic text/image/text split; UI code must not synthesize these structures by mutating blocks directly. `History::undo` and `History::redo` return the restored `Selection`.
 
-Add a deterministic operation-sequence test that applies text insertion, split, list conversion, mark toggle, image insertion, cross-block deletion, and undo-to-origin. After every operation, call `Document::validate_invariants()` and assert unique stable node IDs, valid grapheme offsets, normalized non-overlapping mark spans, valid list depth, and exact semantic round-trip after undo.
+`StyledRun` ranges are non-overlapping; a run's mark set allows combinations such as bold plus italic plus highlight without overlapping range records. Mark transactions split runs at selection boundaries, sort/deduplicate each mark set, and merge adjacent runs whose mark sets are equal.
+
+Add a deterministic operation-sequence test that applies text insertion, split, list conversion, combined mark toggles, image insertion, cross-block deletion, and undo-to-origin. After every operation, call `Document::validate_invariants()` and assert unique stable node IDs, valid grapheme offsets, normalized non-overlapping styled runs, sorted/deduplicated mark sets, valid list depth, and exact semantic round-trip after undo.
 
 Add `invalid_transaction_is_atomic`: submit an invalid grapheme offset and an invalid list depth, then assert the error is structured and the document, selection, history depth, and revision remain unchanged.
 
@@ -615,7 +620,7 @@ git commit -m "Add unified GPUI editor input surface"
 
 **Interfaces:**
 - Consumes: `EditorCore::apply(Transaction)`, `EditorCore::undo`, `EditorCore::redo`, and donor keybinding/action patterns.
-- Produces: `EditorCommand`, `CommandDescriptor`, `CommandState`, and a visible `--evernote-spike` window.
+- Produces: `EditorCommand`, `CommandArgument`, `CommandDescriptor`, `CommandState`, and a visible `--evernote-spike` window.
 
 - [ ] **Step 1: Add a failing shared-command test**
 
@@ -627,15 +632,15 @@ fn toolbar_and_overflow_execute_same_command(cx: &mut gpui::TestAppContext) {
     let mut editor = EditorCore::for_test("第一行\n第二行", cx);
     editor.select_all();
     let catalogue = CommandCatalogue::default();
-    catalogue.execute(EditorCommand::BulletList, &mut editor).unwrap();
+    catalogue.execute(EditorCommand::BulletList, CommandArgument::None, &mut editor).unwrap();
     assert!(editor.document().block_kinds().iter().all(|kind| matches!(kind, BlockKind::BulletItem { .. })));
     assert_eq!(editor.undo_depth(), 1);
-    catalogue.execute(EditorCommand::Undo, &mut editor).unwrap();
+    catalogue.execute(EditorCommand::Undo, CommandArgument::None, &mut editor).unwrap();
     assert_eq!(editor.document().block_kinds(), [BlockKind::Paragraph, BlockKind::Paragraph]);
 }
 ```
 
-Add `all_visible_commands_execute_or_are_disabled` as a table-driven GPUI test. Construct a fresh two-paragraph editor for each descriptor. Assert descriptor keys are unique; enabled formatting, paragraph/list, link, and non-current alignment commands change the document through exactly one history entry; current-state no-op commands report `On`; Undo/Redo report disabled until history permits them. Run list indent/outdent on a two-item list and assert depth changes through one history entry. No descriptor may report enabled and then return an unimplemented/no-op result.
+Add `all_visible_commands_execute_or_are_disabled` as a table-driven GPUI test. Construct a fresh two-paragraph editor for each descriptor. Pass `CommandArgument::LinkUrl("https://example.com")` only for `Link` and `CommandArgument::None` for the rest. Assert descriptor keys are unique; enabled formatting, paragraph/list, link, and non-current alignment commands change the document through exactly one history entry; current-state no-op commands report `On`; Undo/Redo report disabled until history permits them. Run list indent/outdent on a two-item list and assert depth changes through one history entry. No descriptor may report enabled and then return an unimplemented/no-op result.
 
 Add `list_boundary_editing_preserves_structure`: convert three paragraphs to each of bullet, ordered, and checklist forms; indent the middle item; press Backspace at the start of the first item to exit the list; undo every step; assert the original three paragraphs and selection are restored.
 
@@ -664,6 +669,11 @@ pub enum EditorCommand {
     AlignLeft, AlignCenter, AlignRight, IndentList, OutdentList,
 }
 
+pub enum CommandArgument {
+    None,
+    LinkUrl(String),
+}
+
 pub enum ToggleState { Off, On, Mixed }
 
 pub struct CommandState { pub enabled: bool, pub toggle: ToggleState }
@@ -676,7 +686,7 @@ pub struct CommandDescriptor {
 }
 ```
 
-Both primary toolbar and More menu iterate the same descriptor slice. `execute` translates commands into Task 3 transactions, including `SetLink`, `SetAlignment`, `IndentList`, and `OutdentList`; list conversions across multiple blocks are one history entry. Toolbar pointer-down preserves the editor selection and focus, then returns focus after execution.
+Both primary toolbar and More menu iterate the same descriptor slice. `execute(command, argument, editor)` translates commands into Task 3 transactions, including `SetLink`, `SetAlignment`, `IndentList`, and `OutdentList`; only `Link` accepts `CommandArgument::LinkUrl`, and missing or mismatched arguments return a structured error without changing history. List conversions across multiple blocks are one history entry. Toolbar pointer-down preserves the editor selection and focus; the link popover is the sole focusable exception, and submitting it restores editor focus after execution.
 
 - [ ] **Step 4: Add a deterministic spike launch mode**
 
