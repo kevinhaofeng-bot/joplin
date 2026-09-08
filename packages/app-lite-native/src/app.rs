@@ -14,9 +14,9 @@ use joplin_lite_native::native_editor::{
     NativeEditorSession, ParagraphCommand, RenderedAttachment, RenderedDocument, SelectionState,
     apply_block_command, apply_committed_text_delta, apply_inline_command, apply_link,
     apply_paragraph_command, delete_image_anchor_if_identity, document_from_session,
-    editor_attachment_image, image_paragraph_tail_indent, insert_image_anchor, query_block_state,
-    query_clear_state, query_inline_state, query_link_selection, query_paragraph_command_state,
-    render_session, session_from_document,
+    editor_attachment_image, image_paragraph_tail_indent, insert_image_block_anchor,
+    query_block_state, query_clear_state, query_inline_state, query_link_selection,
+    query_paragraph_command_state, render_session, session_from_document,
 };
 use joplin_lite_native::native_note_browser::{
     PreviewListUpdate, ThumbnailCache, ThumbnailKey, ThumbnailRequest, ThumbnailRequestLedger,
@@ -2007,7 +2007,7 @@ fn prepare_image_insert_candidate(
 ) -> Result<(NativeEditorSession, PreparedNoteContent), NativeEditorCodecError> {
     let document = document_from_session(live)?;
     let mut candidate = session_from_document(&document)?;
-    insert_image_anchor(&mut candidate, insertion_range, resource_id, alt, 1, 1)?;
+    insert_image_block_anchor(&mut candidate, insertion_range, resource_id, alt, 1, 1)?;
     let candidate_document = document_from_session(&candidate)?;
     Ok((
         candidate,
@@ -5344,9 +5344,14 @@ impl AppDelegate {
         let applied = if persisted {
             let mut session_guard = self.ivars().editor_session.borrow_mut();
             if let Some(session) = session_guard.as_mut() {
-                if let Err(error) =
-                    insert_image_anchor(session, insertion_range, &stored.id, &stored.title, 1, 1)
-                {
+                if let Err(error) = insert_image_block_anchor(
+                    session,
+                    insertion_range,
+                    &stored.id,
+                    &stored.title,
+                    1,
+                    1,
+                ) {
                     eprintln!("native image live apply failed: {error}");
                     false
                 } else {
@@ -8135,7 +8140,7 @@ mod tests {
             "标题".into(),
         )
         .unwrap();
-        super::insert_image_anchor(
+        super::insert_image_block_anchor(
             &mut live,
             NSRange::new(2, 0),
             "0123456789abcdef0123456789abcdef",
@@ -8145,19 +8150,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(live.revision(), before_revision + 1);
-        assert_eq!(
-            live.text_document().to_addressable_text().unwrap(),
-            "ab\u{fffc}"
-        );
+        let expected = Document::from_blocks(vec![
+            paragraph(vec![Inline::Text {
+                text: "ab".into(),
+                marks: Marks::default(),
+            }]),
+            paragraph(vec![Inline::Image {
+                resource_id: "0123456789abcdef0123456789abcdef".into(),
+                alt: "图片".into(),
+            }]),
+        ]);
+        assert_eq!(super::document_from_session(&live).unwrap(), expected);
         assert!(live.can_undo());
         live.undo().unwrap();
-        assert_eq!(live.text_document().to_addressable_text().unwrap(), "ab");
+        assert_eq!(super::document_from_session(&live).unwrap(), document);
         assert!(live.can_redo());
         live.redo().unwrap();
-        assert_eq!(
-            live.text_document().to_addressable_text().unwrap(),
-            "ab\u{fffc}"
-        );
+        assert_eq!(super::document_from_session(&live).unwrap(), expected);
     }
 
     #[test]

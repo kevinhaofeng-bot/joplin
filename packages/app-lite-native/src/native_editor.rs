@@ -1094,6 +1094,53 @@ pub fn insert_image_anchor(
     Ok(())
 }
 
+/// Insert a resource-backed image as its own paragraph. The selection is
+/// replaced by a block break, the image is inserted into that new block, and
+/// a second block break restores the following text. All three native edits
+/// are owned by the surrounding edit block and therefore undo as one command.
+pub fn insert_image_block_anchor(
+    session: &mut NativeEditorSession,
+    selection: NSRange,
+    resource_id: &str,
+    alt: &str,
+    width: u32,
+    height: u32,
+) -> Result<(), EditorCodecError> {
+    let text = session.text.to_addressable_text().map_err(model_error)?;
+    let (start, end) = utf16_range(&text, selection)?;
+    let old_length = text.chars().count();
+    run_edit_command(session, |session| {
+        let cursor = session.text.cursor_at(start);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        must_apply(cursor.insert_block(), "split image block");
+        must_apply(
+            cursor.insert_image(resource_id, alt, width.max(1), height.max(1)),
+            "insert block image anchor",
+        );
+        if !cursor.at_end() {
+            must_apply(cursor.insert_block(), "close image block");
+        }
+        let new_length = must_apply(
+            session.text.to_addressable_text(),
+            "read inserted image block",
+        )
+        .chars()
+        .count();
+        let replaced_length = end.saturating_sub(start);
+        let replacement_length = new_length.saturating_sub(old_length - replaced_length);
+        adjust_highlight_ranges(
+            &mut session.highlighted_ranges,
+            start,
+            end,
+            replacement_length,
+        );
+        session
+            .image_dimensions
+            .insert(resource_id.to_owned(), (width.max(1), height.max(1)));
+    });
+    Ok(())
+}
+
 fn link_command_is_noop(
     session: &NativeEditorSession,
     start: usize,
@@ -2398,6 +2445,196 @@ mod tests {
         assert_eq!(
             session.text.to_addressable_text().unwrap(),
             "标题😀\n\u{fffc} item"
+        );
+    }
+
+    #[test]
+    fn red_block_image_insert_splits_paragraph_at_end_and_middle() {
+        let mut at_end = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "ab".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        insert_image_block_anchor(
+            &mut at_end,
+            NSRange::new(2, 0),
+            "0123456789abcdef0123456789abcdef",
+            "A",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            document_from_session(&at_end).unwrap(),
+            Document::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "ab".into(),
+                        marks: Default::default(),
+                    }],
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Image {
+                        resource_id: "0123456789abcdef0123456789abcdef".into(),
+                        alt: "A".into(),
+                    }],
+                },
+            ])
+        );
+
+        let mut in_middle = session_from_document(&Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "ab".into(),
+                marks: Default::default(),
+            }],
+        }]))
+        .unwrap();
+        insert_image_block_anchor(
+            &mut in_middle,
+            NSRange::new(1, 0),
+            "0123456789abcdef0123456789abcdef",
+            "A",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            document_from_session(&in_middle).unwrap(),
+            Document::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "a".into(),
+                        marks: Default::default(),
+                    }],
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Image {
+                        resource_id: "0123456789abcdef0123456789abcdef".into(),
+                        alt: "A".into(),
+                    }],
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "b".into(),
+                        marks: Default::default(),
+                    }],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn red_block_image_insert_replaces_utf16_selection_and_undoes_as_one_command() {
+        let document = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "A😀B尾".into(),
+                marks: Default::default(),
+            }],
+        }]);
+        let mut session = session_from_document(&document).unwrap();
+        let revision_before = session.revision();
+        insert_image_block_anchor(
+            &mut session,
+            NSRange::new(1, 3),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "替换",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            document_from_session(&session).unwrap(),
+            Document::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "A".into(),
+                        marks: Default::default(),
+                    }],
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Image {
+                        resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                        alt: "替换".into(),
+                    }],
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "尾".into(),
+                        marks: Default::default(),
+                    }],
+                },
+            ])
+        );
+        assert_eq!(session.revision(), revision_before + 1);
+        session.undo().unwrap();
+        assert_eq!(document_from_session(&session).unwrap(), document);
+    }
+
+    #[test]
+    fn red_block_image_insert_keeps_contiguous_order_after_reload() {
+        let base = Document::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: "ab".into(),
+                marks: Default::default(),
+            }],
+        }]);
+        let mut live = session_from_document(&base).unwrap();
+        insert_image_block_anchor(
+            &mut live,
+            NSRange::new(2, 0),
+            "0123456789abcdef0123456789abcdef",
+            "A",
+            1,
+            1,
+        )
+        .unwrap();
+        let image_b_location = live.text.to_addressable_text().unwrap().chars().count();
+        let mut candidate = session_from_document(&document_from_session(&live).unwrap()).unwrap();
+        insert_image_block_anchor(
+            &mut candidate,
+            NSRange::new(image_b_location, 0),
+            "fedcba9876543210fedcba9876543210",
+            "B",
+            1,
+            1,
+        )
+        .unwrap();
+        insert_image_block_anchor(
+            &mut live,
+            NSRange::new(image_b_location, 0),
+            "fedcba9876543210fedcba9876543210",
+            "B",
+            1,
+            1,
+        )
+        .unwrap();
+        let persisted = document_from_session(&live).unwrap();
+        assert_eq!(
+            crate::html_body::serialize_html(&document_from_session(&candidate).unwrap()),
+            crate::html_body::serialize_html(&persisted)
+        );
+        let reloaded = session_from_document(&persisted).unwrap();
+        assert_eq!(document_from_session(&reloaded).unwrap(), persisted);
+        assert_eq!(
+            crate::html_body::resource_ids(&persisted),
+            vec![
+                "0123456789abcdef0123456789abcdef".to_string(),
+                "fedcba9876543210fedcba9876543210".to_string(),
+            ]
         );
     }
 
