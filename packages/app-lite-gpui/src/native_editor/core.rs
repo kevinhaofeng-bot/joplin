@@ -20,6 +20,7 @@ use super::model::{
 };
 use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
 
+#[derive(Clone)]
 pub struct MarkedText {
     pub node_id: NodeId,
     pub utf8_range: Range<usize>,
@@ -302,7 +303,7 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
-        self.layout.clear_exact_cache();
+        self.layout.invalidate_nodes(&outcome.changed_nodes);
         Ok(outcome)
     }
 
@@ -314,23 +315,25 @@ impl EditorCore {
             self.history
                 .apply_with_selection(&mut self.document, self.selection, transaction)?;
         self.preferred_x = None;
-        self.layout.clear_exact_cache();
+        self.layout.invalidate_nodes(&outcome.changed_nodes);
         Ok(outcome)
     }
 
     pub fn undo(&mut self) -> Result<(), DocumentError> {
-        self.selection = self.history.undo(&mut self.document)?;
+        let outcome = self.history.undo_with_outcome(&mut self.document)?;
+        self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
-        self.layout.clear_exact_cache();
+        self.layout.invalidate_nodes(&outcome.changed_nodes);
         Ok(())
     }
 
     pub fn redo(&mut self) -> Result<(), DocumentError> {
-        self.selection = self.history.redo(&mut self.document)?;
+        let outcome = self.history.redo_with_outcome(&mut self.document)?;
+        self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
-        self.layout.clear_exact_cache();
+        self.layout.invalidate_nodes(&outcome.changed_nodes);
         Ok(())
     }
 
@@ -353,10 +356,15 @@ impl EditorCore {
         }
         let updating_composition = self.marked.is_some();
         let visible_selection = self.selection_for_input_range(range_utf16.as_ref());
-        let composition_base = self.composition_base.unwrap_or(visible_selection);
+        let composition_base = if range_utf16.is_some() {
+            visible_selection
+        } else {
+            self.composition_base.unwrap_or(visible_selection)
+        };
         if updating_composition {
-            self.selection = self.history.undo(&mut self.document)?;
-            self.layout.clear_exact_cache();
+            let outcome = self.history.undo_with_outcome(&mut self.document)?;
+            self.selection = outcome.selection;
+            self.layout.invalidate_nodes(&outcome.changed_nodes);
         }
         let outcome = self.apply_with_selection(Transaction::InsertText {
             selection: if updating_composition {
@@ -373,18 +381,30 @@ impl EditorCore {
             .as_ref()
             .map(|range| input::utf16_range_to_utf8_in(new_text, range))
             .unwrap_or(new_text.len()..new_text.len());
-        self.selection = Selection::new(
-            DocPoint::with_affinity(
+        let selected_start =
+            resolve_grapheme_offset(new_text, selected_relative.start, Affinity::Before);
+        let selected_end =
+            resolve_grapheme_offset(new_text, selected_relative.end, Affinity::After);
+        self.selection = if selected_start == selected_end {
+            Selection::caret(DocPoint::with_affinity(
                 node_id,
-                start.saturating_add(selected_relative.start),
-                Affinity::Before,
-            ),
-            DocPoint::with_affinity(
-                node_id,
-                start.saturating_add(selected_relative.end),
+                start.saturating_add(selected_start),
                 Affinity::After,
-            ),
-        );
+            ))
+        } else {
+            Selection::new(
+                DocPoint::with_affinity(
+                    node_id,
+                    start.saturating_add(selected_start),
+                    Affinity::Before,
+                ),
+                DocPoint::with_affinity(
+                    node_id,
+                    start.saturating_add(selected_end),
+                    Affinity::After,
+                ),
+            )
+        };
         self.marked = (!new_text.is_empty()).then_some(MarkedText {
             node_id,
             utf8_range: start..end,
@@ -394,17 +414,44 @@ impl EditorCore {
     }
 
     pub fn commit_marked_text(&mut self, text: &str) -> Result<(), DocumentError> {
-        let Some(marked) = self.marked.as_ref() else {
+        self.commit_marked_text_with_range(None, text)
+    }
+
+    fn commit_marked_text_with_range(
+        &mut self,
+        range_utf16: Option<&Range<usize>>,
+        text: &str,
+    ) -> Result<(), DocumentError> {
+        let Some(marked) = self.marked.clone() else {
             return self.paste_plain_text(text);
         };
-        let base_selection = self.composition_base.unwrap_or_else(|| {
-            Selection::new(
-                DocPoint::with_affinity(marked.node_id, marked.utf8_range.start, Affinity::Before),
-                DocPoint::with_affinity(marked.node_id, marked.utf8_range.end, Affinity::After),
-            )
+        let marked_selection = Selection::new(
+            DocPoint::with_affinity(marked.node_id, marked.utf8_range.start, Affinity::Before),
+            DocPoint::with_affinity(marked.node_id, marked.utf8_range.end, Affinity::After),
+        );
+        let explicit_selection =
+            range_utf16.map(|range| self.selection_for_input_range(Some(range)));
+        let explicit_is_marked = explicit_selection.is_some_and(|selection| {
+            let (start, end) = self.ordered_points_for(selection);
+            let (marked_start, marked_end) = self.ordered_points_for(marked_selection);
+            self.flat_offset_for_point(start) == self.flat_offset_for_point(marked_start)
+                && self.flat_offset_for_point(end) == self.flat_offset_for_point(marked_end)
         });
-        self.selection = self.history.undo(&mut self.document)?;
-        self.layout.clear_exact_cache();
+        let base_selection = if explicit_is_marked {
+            self.composition_base.unwrap_or(marked_selection)
+        } else {
+            explicit_selection
+                .or(self.composition_base)
+                .unwrap_or(marked_selection)
+        };
+        let undo_outcome = self.history.undo_with_outcome(&mut self.document)?;
+        self.selection = undo_outcome.selection;
+        self.layout.invalidate_nodes(&undo_outcome.changed_nodes);
+        let base_selection = self.remap_selection_after_composition_undo(
+            base_selection,
+            &marked,
+            self.composition_base.unwrap_or(marked_selection),
+        );
         self.clear_composition();
         if text.is_empty() {
             return Ok(());
@@ -417,6 +464,64 @@ impl EditorCore {
         Ok(())
     }
 
+    fn remap_selection_after_composition_undo(
+        &self,
+        selection: Selection,
+        marked: &MarkedText,
+        base_selection: Selection,
+    ) -> Selection {
+        let marked_start = marked.utf8_range.start;
+        let marked_end = marked.utf8_range.end;
+        let base_start = base_selection
+            .anchor
+            .utf8_offset
+            .min(base_selection.head.utf8_offset);
+        let base_end = base_selection
+            .anchor
+            .utf8_offset
+            .max(base_selection.head.utf8_offset);
+        let map_point = |point: DocPoint| {
+            if point.node_id != marked.node_id {
+                return point;
+            }
+            let offset = if point.utf8_offset <= marked_start {
+                point.utf8_offset
+            } else if point.utf8_offset >= marked_end {
+                point
+                    .utf8_offset
+                    .saturating_sub(marked_end.saturating_sub(marked_start))
+                    .saturating_add(base_end.saturating_sub(base_start))
+            } else if point.affinity == Affinity::Before {
+                base_start
+            } else {
+                base_end
+            };
+            DocPoint::with_affinity(point.node_id, offset, point.affinity)
+        };
+        Selection::new(map_point(selection.anchor), map_point(selection.head))
+    }
+
+    fn ordered_points_for(&self, selection: Selection) -> (DocPoint, DocPoint) {
+        let anchor_key = self.doc_point_key(selection.anchor);
+        let head_key = self.doc_point_key(selection.head);
+        if anchor_key <= head_key {
+            (selection.anchor, selection.head)
+        } else {
+            (selection.head, selection.anchor)
+        }
+    }
+
+    fn doc_point_key(&self, point: DocPoint) -> (usize, usize, u8) {
+        (
+            self.block_index(point.node_id).unwrap_or(usize::MAX),
+            point.utf8_offset,
+            match point.affinity {
+                Affinity::Before => 0,
+                Affinity::After => 1,
+            },
+        )
+    }
+
     pub fn move_to_image_before(&mut self) {
         if let Some(block) = self
             .document
@@ -426,7 +531,7 @@ impl EditorCore {
         {
             self.selection =
                 Selection::caret(DocPoint::with_affinity(block.id, 0, Affinity::Before));
-            self.marked = None;
+            self.clear_composition();
         }
     }
 
@@ -439,7 +544,7 @@ impl EditorCore {
         {
             self.selection =
                 Selection::caret(DocPoint::with_affinity(block.id, 0, Affinity::After));
-            self.marked = None;
+            self.clear_composition();
         }
     }
 
@@ -455,6 +560,7 @@ impl EditorCore {
         if !self.selection.is_caret() {
             self.selection = Selection::caret(self.ordered_selection().0);
             self.preferred_x = None;
+            self.clear_composition();
             return;
         }
         let point = self.selection.head;
@@ -479,12 +585,14 @@ impl EditorCore {
         };
         self.selection = Selection::caret(next);
         self.preferred_x = None;
+        self.clear_composition();
     }
 
     pub fn move_right(&mut self) {
         if !self.selection.is_caret() {
             self.selection = Selection::caret(self.ordered_selection().1);
             self.preferred_x = None;
+            self.clear_composition();
             return;
         }
         let point = self.selection.head;
@@ -512,6 +620,7 @@ impl EditorCore {
         };
         self.selection = Selection::caret(next);
         self.preferred_x = None;
+        self.clear_composition();
     }
 
     pub fn move_home(&mut self) {
@@ -534,7 +643,7 @@ impl EditorCore {
             }
         }
         self.preferred_x = None;
-        self.marked = None;
+        self.clear_composition();
     }
 
     pub fn move_end(&mut self) {
@@ -557,7 +666,7 @@ impl EditorCore {
             }
         }
         self.preferred_x = None;
-        self.marked = None;
+        self.clear_composition();
     }
 
     pub fn home(&mut self) {
@@ -584,6 +693,7 @@ impl EditorCore {
                 self.ordered_selection().1
             });
             self.preferred_x = None;
+            self.clear_composition();
             return;
         }
         let point = self.selection.head;
@@ -592,6 +702,7 @@ impl EditorCore {
             let x = self.preferred_x.or_else(|| self.layout.caret_x(point));
             self.selection = Selection::caret(target);
             self.preferred_x = x;
+            self.clear_composition();
             return;
         }
         let Some(index) = self.block_index(point.node_id) else {
@@ -615,6 +726,7 @@ impl EditorCore {
         if let Some(target) = target {
             self.selection = Selection::caret(target);
             self.preferred_x = preferred_x;
+            self.clear_composition();
         }
     }
 
@@ -660,7 +772,7 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
-        self.layout.clear_exact_cache();
+        self.layout.invalidate_nodes(&outcome.changed_nodes);
         Ok(())
     }
 
@@ -672,6 +784,10 @@ impl EditorCore {
         let Some(index) = self.block_index(point.node_id) else {
             return Ok(());
         };
+        if index == 0 {
+            self.clear_composition();
+            return Ok(());
+        }
         if self.document.blocks()[index].kind == BlockKind::Image {
             if point.affinity == Affinity::After {
                 let outcome = self.apply_with_selection(Transaction::RemoveNode {
@@ -705,7 +821,7 @@ impl EditorCore {
                     // Match the donor's list/heading boundary behavior:
                     // Backspace at the start downgrades the current structural
                     // block instead of silently stalling.
-                    let selection = self.full_block_selection(index);
+                    let selection = self.selection;
                     let mut transactions = vec![Transaction::SetBlockKind {
                         selection,
                         kind: BlockKind::Paragraph,
@@ -723,7 +839,8 @@ impl EditorCore {
                     )?;
                     self.selection = outcome.selection;
                     self.preferred_x = None;
-                    self.layout.clear_exact_cache();
+                    self.clear_composition();
+                    self.layout.invalidate_nodes(&outcome.changed_nodes);
                 } else {
                     let selection = self.full_block_selection(index);
                     let mut transactions = Vec::new();
@@ -750,7 +867,8 @@ impl EditorCore {
                     )?;
                     self.selection = outcome.selection;
                     self.preferred_x = None;
-                    self.layout.clear_exact_cache();
+                    self.clear_composition();
+                    self.layout.invalidate_nodes(&outcome.changed_nodes);
                 }
             }
         }
@@ -771,6 +889,7 @@ impl EditorCore {
                     node_id: point.node_id,
                 })?;
                 self.selection = outcome.selection;
+                self.clear_composition();
             }
             return Ok(());
         }
@@ -791,6 +910,7 @@ impl EditorCore {
                 let outcome =
                     self.apply_with_selection(Transaction::RemoveNode { node_id: next.id })?;
                 self.selection = outcome.selection;
+                self.clear_composition();
             } else if next.content.as_text().is_some() {
                 let current = &self.document.blocks()[index];
                 let selection = self.full_block_selection(index + 1);
@@ -818,7 +938,8 @@ impl EditorCore {
                 )?;
                 self.selection = outcome.selection;
                 self.preferred_x = None;
-                self.layout.clear_exact_cache();
+                self.clear_composition();
+                self.layout.invalidate_nodes(&outcome.changed_nodes);
             }
         }
         Ok(())
@@ -884,11 +1005,7 @@ impl EditorCore {
     }
 
     fn ordered_selection(&self) -> (DocPoint, DocPoint) {
-        let anchor_index = self.block_index(self.selection.anchor.node_id).unwrap_or(0);
-        let head_index = self.block_index(self.selection.head.node_id).unwrap_or(0);
-        let anchor = (anchor_index, self.selection.anchor.utf8_offset);
-        let head = (head_index, self.selection.head.utf8_offset);
-        if anchor <= head {
+        if self.doc_point_key(self.selection.anchor) <= self.doc_point_key(self.selection.head) {
             (self.selection.anchor, self.selection.head)
         } else {
             (self.selection.head, self.selection.anchor)
@@ -1125,6 +1242,19 @@ impl EntityInputHandler for EditorCore {
             cx.notify();
             return;
         }
+        if self.marked.is_some() {
+            match self.commit_marked_text_with_range(range_utf16.as_ref(), new_text) {
+                Ok(()) => {
+                    self.last_input_error = None;
+                    cx.notify();
+                }
+                Err(error) => {
+                    self.last_input_error = Some(error);
+                    cx.notify();
+                }
+            }
+            return;
+        }
         let selection = self.selection_for_input_range(range_utf16.as_ref());
         match self.apply_with_selection(Transaction::InsertText {
             selection,
@@ -1173,6 +1303,9 @@ impl EntityInputHandler for EditorCore {
         let document_text = self.document_text();
         let range = input::utf16_range_to_utf8_in(&document_text, &range_utf16);
         let selection = self.selection_for_document_byte_range(range);
+        if selection.is_caret() {
+            return self.layout.caret_bounds_for_point(selection.head);
+        }
         self.layout
             .selection_rects(selection)
             .into_iter()

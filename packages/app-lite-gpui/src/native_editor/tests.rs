@@ -5,7 +5,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use gpui::{AppContext, Bounds, EntityInputHandler, point, px};
+use gpui::{AppContext, Bounds, EntityInputHandler, FontStyle, FontWeight, TextStyle, point, px};
 use smallvec::SmallVec;
 
 use super::model::{
@@ -1199,6 +1199,211 @@ async fn entity_input_uses_document_wide_utf16_coordinates(cx: &mut gpui::TestAp
 }
 
 #[gpui::test]
+async fn entity_input_platform_commit_replaces_candidate_as_one_undo(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("前后"), cx));
+
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8("前".len());
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "候选",
+                Some(2..2),
+                window,
+                editor_cx,
+            );
+            assert!(
+                editor.selection().is_caret(),
+                "internal IME caret must be collapsed"
+            );
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "最终", window, editor_cx,
+            );
+        });
+    });
+
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "前最终后"
+    );
+    assert_eq!(entity.read_with(cx, |editor, _| editor.undo_depth()), 1);
+    cx.update(|_, cx| {
+        entity.update(cx, |editor, _| editor.undo().unwrap());
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "前后"
+    );
+}
+
+#[gpui::test]
+async fn entity_input_explicit_commit_range_and_navigation_cancel_composition(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("abcd"), cx));
+
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            editor.set_caret_utf8(2);
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "候选",
+                Some(2..2),
+                window,
+                editor_cx,
+            );
+            editor.move_home();
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "新",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            assert_eq!(editor.visible_text(), "新ab候选cd");
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor,
+                Some(0..1),
+                "首",
+                window,
+                editor_cx,
+            );
+        });
+    });
+    assert_eq!(
+        entity.read_with(cx, |editor, _| editor.visible_text()),
+        "首ab候选cd"
+    );
+}
+
+#[gpui::test]
+async fn nonzero_viewport_reflow_keeps_document_block_index(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let paragraphs = (0..240)
+        .map(|index| {
+            if index == 140 {
+                "甲".repeat(600)
+            } else {
+                format!("block-{index}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let document = Document::from_paragraphs(paragraphs);
+    let target = document.blocks()[140].id;
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 120.0, 32.0);
+    let target_top_estimate = document.blocks()[..140]
+        .iter()
+        .map(|block| {
+            layout
+                .estimated_heights
+                .get(&block.id)
+                .copied()
+                .unwrap_or(24.0)
+        })
+        .sum::<f32>();
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, target_top_estimate + 1.0, 120.0, 32.0, window);
+    });
+    assert!(layout.visible_range().start > 0);
+    let target_layout = layout
+        .block_layout(target)
+        .expect("target must be prefetched");
+    let expected_top = document.blocks()[..140]
+        .iter()
+        .map(|block| {
+            layout
+                .estimated_heights
+                .get(&block.id)
+                .copied()
+                .unwrap_or(24.0)
+        })
+        .sum::<f32>();
+    assert!((f32::from(target_layout.bounds.top()) - expected_top).abs() < 0.1);
+    assert!(target_layout.bounds.size.height > px(24.0));
+}
+
+#[gpui::test]
+async fn hard_line_selection_uses_accumulated_y_and_entity_caret_bounds(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new(Document::from_paragraph("abc\ndef"), cx));
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            let document = editor.document().clone();
+            editor
+                .layout
+                .shape_visible_with_window(&document, 0.0, 240.0, 680.0, window);
+            let node = document.first_node_id().unwrap();
+            let line_height = editor.layout.line_height(node).unwrap();
+            let rects = editor.layout.selection_rects(Selection::new(
+                DocPoint::with_affinity(node, 4, Affinity::Before),
+                DocPoint::with_affinity(node, 7, Affinity::After),
+            ));
+            assert!(!rects.is_empty());
+            assert!(rects.iter().all(|rect| rect.top() >= px(0.0) + line_height));
+            let bounds = <EditorCore as EntityInputHandler>::bounds_for_range(
+                editor,
+                4..4,
+                Bounds::default(),
+                window,
+                editor_cx,
+            )
+            .expect("collapsed range must expose caret bounds to IME");
+            assert!(bounds.size.height >= line_height);
+        });
+    });
+}
+
+#[gpui::test]
+async fn editor_core_invalidates_only_changed_shaped_node(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let entity =
+        cx.new(|cx| EditorCore::new(Document::from_paragraphs(["first", "second", "third"]), cx));
+    let (changed, unchanged, initial_shapes) = cx.update(|window, cx| {
+        entity.update(cx, |editor, _| {
+            let document = editor.document().clone();
+            editor
+                .layout
+                .shape_visible_with_window(&document, 0.0, 240.0, 680.0, window);
+            (
+                document.blocks()[1].id,
+                document.blocks()[0].id,
+                editor.layout.shape_count(),
+            )
+        })
+    });
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, _| {
+            editor
+                .apply(Transaction::InsertText {
+                    selection: Selection::caret(DocPoint::with_affinity(
+                        changed,
+                        "second".len(),
+                        Affinity::After,
+                    )),
+                    text: "!".into(),
+                })
+                .unwrap();
+            let document = editor.document().clone();
+            editor
+                .layout
+                .shape_visible_with_window(&document, 0.0, 240.0, 680.0, window);
+            assert!(editor.layout.block_layout(unchanged).is_some());
+            assert_eq!(editor.layout.shape_count(), initial_shapes + 1);
+        });
+    });
+}
+
+#[gpui::test]
 fn editor_core_keeps_one_stable_focus_owner(cx: &mut gpui::TestAppContext) {
     let editor = EditorCore::for_test("唯一焦点", cx);
     let first = editor.focus_handle() as *const _;
@@ -1360,9 +1565,35 @@ fn register_exact_updates_visible_geometry_and_image_metadata() {
         after,
     };
     let mut registry = LayoutRegistry::new();
-    registry.register_exact(1, 100.0, layout, 64);
+    registry.register_exact(1, 100.0, layout, 64, false, px(36.0));
     assert_eq!(registry.visible().len(), 1);
-    assert_eq!(registry.line_height(block.id), Some(px(24.0)));
+    assert_eq!(registry.line_height(block.id), Some(px(36.0)));
+
+    let mut image_document = Document::from_paragraph("text");
+    image_document
+        .apply(Transaction::InsertImage {
+            selection: image_document.end_selection(),
+            resource_id: "measured-image".into(),
+            natural_size: (100, 80),
+        })
+        .unwrap();
+    let image = image_document.blocks()[1].clone();
+    registry.register_exact(
+        image.revision,
+        100.0,
+        super::layout::BlockLayout {
+            node_id: image.id,
+            bounds: Bounds::new(point(px(0.0), px(36.0)), gpui::size(px(100.0), px(88.0))),
+            text_lines: Vec::new(),
+            before: DocPoint::with_affinity(image.id, 0, Affinity::Before),
+            after: DocPoint::with_affinity(image.id, 0, Affinity::After),
+        },
+        128,
+        true,
+        px(42.0),
+    );
+    assert!(registry.is_image(image.id));
+    assert_eq!(registry.line_height(image.id), Some(px(42.0)));
 }
 
 #[gpui::test]
@@ -1406,6 +1637,7 @@ fn image_home_end_stay_on_the_image_atom(cx: &mut gpui::TestAppContext) {
 fn heterogeneous_backspace_downgrades_list_boundary(cx: &mut gpui::TestAppContext) {
     let mut editor = EditorCore::for_test("ab", cx);
     editor.insert_paragraph_break().unwrap();
+    editor.insert_text("tail").unwrap();
     let second = editor.selection().head.node_id;
     let second_len = editor.document().text_at_index(1).unwrap().len();
     editor
@@ -1471,9 +1703,122 @@ fn public_and_fallback_positions_snap_to_graphemes(cx: &mut gpui::TestAppContext
             after: DocPoint::with_affinity(block.id, "a\u{301}b".len(), Affinity::After),
         },
         64,
+        false,
+        px(26.0),
     );
     let hit = layout
         .point_to_doc(point(px(8.0), px(4.0)))
         .expect("fallback hit should remain document-valid");
     assert_ne!(hit.utf8_offset, 1);
+}
+
+#[gpui::test]
+fn editor_core_orders_same_image_affinity_for_contraction(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::fixture_text_image_text("甲", "image", "乙", cx);
+    let image = editor.document().blocks()[1].id;
+    let before_offset = "甲\n".len();
+    let after_offset = before_offset + "\u{fffc}".len();
+    editor.select_document_range(after_offset, before_offset);
+    assert!(!editor.selection().is_caret());
+    editor.move_left();
+    assert_eq!(
+        editor.selection().head,
+        DocPoint::with_affinity(image, 0, Affinity::Before)
+    );
+    editor.select_document_range(after_offset, before_offset);
+    editor.move_right();
+    assert_eq!(
+        editor.selection().head,
+        DocPoint::with_affinity(image, 0, Affinity::After)
+    );
+}
+
+#[gpui::test]
+async fn visual_down_preserves_empty_hard_line_as_one_row(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let mut editor = EditorCore::for_test("abc\n\ndef", &mut cx);
+    let document = editor.document().clone();
+    cx.update(|window, _| {
+        editor
+            .layout
+            .shape_visible_with_window(&document, 0.0, 240.0, 680.0, window);
+    });
+    editor.set_caret_utf8(2);
+    editor.move_down();
+    assert_eq!(editor.selection().head.utf8_offset, "abc\n".len());
+    editor.move_down();
+    assert!(editor.selection().head.utf8_offset >= "abc\n\n".len());
+}
+
+#[gpui::test]
+fn structural_edges_preserve_caret_after_backspace_downgrade(cx: &mut gpui::TestAppContext) {
+    let mut first = EditorCore::for_test("first", cx);
+    first.set_caret_utf8(0);
+    let before = first.document().semantic_snapshot();
+    let undo_depth = first.undo_depth();
+    first.backspace().unwrap();
+    assert_eq!(first.document().semantic_snapshot(), before);
+    assert_eq!(first.undo_depth(), undo_depth);
+
+    let mut editor = EditorCore::for_test("ab", cx);
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_text("tail").unwrap();
+    let second = editor.selection().head.node_id;
+    let second_len = editor.document().text_at_index(1).unwrap().len();
+    editor
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(second, 0, Affinity::Before),
+                DocPoint::with_affinity(second, second_len, Affinity::After),
+            ),
+            kind: BlockKind::BulletItem { depth: 0 },
+        })
+        .unwrap();
+    editor.set_caret_utf8(0);
+    editor.backspace().unwrap();
+    assert_eq!(editor.document().text_at_index(1), Some("tail"));
+    editor.insert_text("X").unwrap();
+    assert_eq!(editor.document().text_at_index(1), Some("Xtail"));
+}
+
+#[gpui::test]
+async fn shaped_cache_budget_is_hard_during_multi_block_shaping(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let document =
+        Document::from_paragraphs((0..32).map(|index| format!("{index}-{}", "x".repeat(16_384))));
+    let mut layout = LayoutRegistry::with_budget(8 * 1024);
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 480.0, 160.0, window);
+    });
+    assert!(layout.cache_bytes() <= layout.budget_bytes());
+    assert!(layout.used_bytes() <= 8 * 1024);
+}
+
+#[gpui::test]
+async fn shaped_cache_invalidates_font_family_weight_style_and_size(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let document = Document::from_paragraph("cache-key");
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 240.0, 680.0, window);
+    });
+    let first_shape_count = layout.shape_count();
+    cx.update(|window, _| {
+        let mut style: TextStyle = window.text_style();
+        style.font_family = "Menlo".into();
+        layout.shape_visible_with_style(&document, 0.0, 240.0, 680.0, style.clone(), window);
+        assert_eq!(layout.shape_count(), first_shape_count + 1);
+
+        style.font_weight = FontWeight::BOLD;
+        layout.shape_visible_with_style(&document, 0.0, 240.0, 680.0, style.clone(), window);
+        assert_eq!(layout.shape_count(), first_shape_count + 2);
+
+        style.font_style = FontStyle::Italic;
+        layout.shape_visible_with_style(&document, 0.0, 240.0, 680.0, style.clone(), window);
+        assert_eq!(layout.shape_count(), first_shape_count + 3);
+
+        style.font_size = px(28.0).into();
+        layout.shape_visible_with_style(&document, 0.0, 240.0, 680.0, style, window);
+    });
+    assert_eq!(layout.shape_count(), first_shape_count + 4);
 }

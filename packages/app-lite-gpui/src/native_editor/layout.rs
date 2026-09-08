@@ -9,8 +9,8 @@ use std::mem::size_of;
 use std::ops::Range;
 
 use gpui::{
-    Bounds, Pixels, Point, ShapedGlyph, SharedString, TextRun, WrapBoundary, WrappedLine,
-    WrappedLineLayout, point, px, size,
+    Bounds, Font, Pixels, Point, ShapedGlyph, SharedString, TextRun, TextStyle, WrapBoundary,
+    WrappedLine, WrappedLineLayout, point, px, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -37,6 +37,52 @@ pub struct BlockLayout {
     pub after: DocPoint,
 }
 
+/// All inputs that can change the shaped geometry of a block. Keep the full
+/// GPUI `Font` rather than a short numeric style revision: family, OpenType
+/// features, fallbacks, weight, and italic/oblique style are all part of the
+/// shaping identity.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ShapeKey {
+    block_revision: u64,
+    width_bits: u32,
+    font: Font,
+    font_size_bits: u64,
+    line_height_bits: u64,
+    wrap_mode: u8,
+}
+
+impl ShapeKey {
+    fn new(
+        block_revision: u64,
+        width: f32,
+        font: Font,
+        font_size: Pixels,
+        line_height: Pixels,
+    ) -> Self {
+        Self {
+            block_revision,
+            width_bits: width.to_bits(),
+            font,
+            font_size_bits: font_size.to_f64().to_bits(),
+            line_height_bits: line_height.to_f64().to_bits(),
+            // The native editor currently uses GPUI's normal wrapping mode;
+            // keep the discriminator so a future wrap-policy change cannot
+            // accidentally reuse old shaped lines.
+            wrap_mode: 0,
+        }
+    }
+
+    fn geometry(block_revision: u64, width: f32, line_height: Pixels) -> Self {
+        Self::new(
+            block_revision,
+            width,
+            gpui::font(".SystemUIFont"),
+            px(0.0),
+            line_height,
+        )
+    }
+}
+
 /// Bounded exact-layout cache entry. Shaped runs, glyphs and selection
 /// geometry are counted in `bytes`; no shaped line is retained in `visible`.
 #[derive(Clone, Debug)]
@@ -45,10 +91,10 @@ pub struct CachedBlockLayout {
     pub bytes: usize,
     pub revision: u64,
     pub width: f32,
-    pub style_revision: u64,
     pub selection_geometry_bytes: usize,
     pub(crate) is_image: bool,
     pub(crate) line_height: Pixels,
+    shape_key: ShapeKey,
 }
 
 /// One document-wide layout registry. Blocks do not own focus or input
@@ -64,9 +110,12 @@ pub struct LayoutRegistry {
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
     document_order: HashMap<NodeId, usize>,
+    document_order_revision: Option<u64>,
     estimate_revisions: HashMap<NodeId, u64>,
     estimate_width: f32,
+    estimate_document_revision: Option<u64>,
     height_signature: Vec<(NodeId, u64)>,
+    height_document_revision: Option<u64>,
     prefix_heights: Vec<f32>,
     shape_count: usize,
     layout_scan_count: usize,
@@ -90,9 +139,12 @@ impl LayoutRegistry {
             first_visible: 0,
             last_visible: 0,
             document_order: HashMap::new(),
+            document_order_revision: None,
             estimate_revisions: HashMap::new(),
             estimate_width: 0.0,
+            estimate_document_revision: None,
             height_signature: Vec::new(),
+            height_document_revision: None,
             prefix_heights: Vec::new(),
             shape_count: 0,
             layout_scan_count: 0,
@@ -173,14 +225,17 @@ impl LayoutRegistry {
         self.first_visible = first.min(end);
         self.last_visible = end.max(self.first_visible).min(document.block_count());
 
-        self.document_order.clear();
-        self.document_order.extend(
-            document
-                .blocks()
-                .iter()
-                .enumerate()
-                .map(|(index, block)| (block.id, index)),
-        );
+        if self.document_order_revision != Some(document.revision()) {
+            self.document_order.clear();
+            self.document_order.extend(
+                document
+                    .blocks()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, block)| (block.id, index)),
+            );
+            self.document_order_revision = Some(document.revision());
+        }
 
         let allowed_ids: HashSet<NodeId> = document
             .blocks()
@@ -217,8 +272,7 @@ impl LayoutRegistry {
     }
 
     /// Shape only the already-capped viewport window with the donor's
-    /// `shape_text`/`WrappedLine` path. Stable `(revision, width,
-    /// style_revision, line_height)` entries are reused without reshaping.
+    /// `shape_text`/`WrappedLine` path using the active window style.
     pub fn shape_visible_with_window(
         &mut self,
         document: &Document,
@@ -227,12 +281,35 @@ impl LayoutRegistry {
         width: f32,
         window: &mut gpui::Window,
     ) {
+        let style = window.text_style();
+        self.shape_visible_with_style(
+            document,
+            viewport_top,
+            viewport_height,
+            width,
+            style,
+            window,
+        );
+    }
+
+    /// Production shaping entry point with an explicit, complete GPUI text
+    /// style. Keeping this separate from `Window::with_text_style` also makes
+    /// prepaint/layout callers able to pass the exact style they used for
+    /// measurement without mutating window phase state.
+    pub fn shape_visible_with_style(
+        &mut self,
+        document: &Document,
+        viewport_top: f32,
+        viewport_height: f32,
+        width: f32,
+        style: TextStyle,
+        window: &mut gpui::Window,
+    ) {
         let width = width.max(1.0);
         self.layout_document(document, viewport_top, viewport_height, width);
-        let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_height = window.line_height();
-        let style_revision = style_revision(font_size, line_height);
+        let line_height = style.line_height_in_pixels(window.rem_size());
+        let font = style.font();
         let visible_ids: Vec<NodeId> = self.visible.iter().map(|layout| layout.node_id).collect();
         let mut estimates_changed = false;
         for node_id in visible_ids {
@@ -244,17 +321,15 @@ impl LayoutRegistry {
                     node_id,
                     block.revision,
                     width,
-                    style_revision,
+                    ShapeKey::new(block.revision, width, font.clone(), font_size, line_height),
                     line_height,
                 );
                 continue;
             };
+            let shape_key =
+                ShapeKey::new(block.revision, width, font.clone(), font_size, line_height);
             let cache_hit = self.cache.get(&node_id).is_some_and(|cached| {
-                cached.revision == block.revision
-                    && cached.width.to_bits() == width.to_bits()
-                    && cached.style_revision == style_revision
-                    && cached.line_height == line_height
-                    && !cached.layout.text_lines.is_empty()
+                cached.shape_key == shape_key && !cached.layout.text_lines.is_empty()
             });
             if cache_hit {
                 continue;
@@ -263,7 +338,7 @@ impl LayoutRegistry {
             let shared_text = SharedString::from(text.to_owned());
             let runs = [TextRun {
                 len: shared_text.len(),
-                font: style.font(),
+                font: font.clone(),
                 color: gpui::black(),
                 background_color: None,
                 underline: None,
@@ -294,21 +369,14 @@ impl LayoutRegistry {
             };
             let mut layout = geometry.clone();
             layout.text_lines = lines;
-            self.insert_shaped(
-                block.revision,
-                width,
-                style_revision,
-                line_height,
-                layout,
-                false,
-                line_height,
-            );
+            self.insert_shaped(shape_key, layout, false, line_height);
         }
         if estimates_changed {
             // Shaping can replace a fallback estimate without changing the
             // document revision. Invalidate the prefix index explicitly so
             // following blocks receive the real wrapped height.
             self.height_signature.clear();
+            self.height_document_revision = None;
             self.ensure_height_index(document);
             self.reflow_visible();
         }
@@ -323,8 +391,9 @@ impl LayoutRegistry {
         width: f32,
         layout: BlockLayout,
         selection_geometry_bytes: usize,
+        is_image: bool,
+        line_height: Pixels,
     ) {
-        let is_image = layout.before == layout.after;
         let node_id = layout.node_id;
         if let Some(visible) = self.visible.iter_mut().find(|item| item.node_id == node_id) {
             *visible = BlockLayout {
@@ -338,17 +407,15 @@ impl LayoutRegistry {
             });
         }
         self.insert_shaped(
-            revision,
-            width,
-            0,
-            px(DEFAULT_TEXT_HEIGHT),
+            ShapeKey::geometry(revision, width, line_height),
             layout,
             is_image,
-            px(DEFAULT_TEXT_HEIGHT),
+            line_height,
         );
         if let Some(entry) = self.cache.get_mut(&node_id) {
-            entry.selection_geometry_bytes = selection_geometry_bytes;
-            entry.bytes = estimate_cache_bytes(&entry.layout, selection_geometry_bytes);
+            entry.selection_geometry_bytes =
+                selection_geometry_reserve(&entry.layout, selection_geometry_bytes);
+            entry.bytes = estimate_cache_bytes(&entry.layout, entry.selection_geometry_bytes);
         }
         self.recompute_used_bytes();
         self.enforce_budget();
@@ -359,6 +426,28 @@ impl LayoutRegistry {
         self.cache.clear();
         self.lru.clear();
         self.used_bytes = 0;
+        self.estimate_document_revision = None;
+        self.height_document_revision = None;
+        self.document_order_revision = None;
+    }
+
+    /// Invalidate only the model nodes reported by the transaction layer.
+    /// Structural edits also invalidate the height/order index, while
+    /// unaffected shaped lines remain retained for the next viewport pass.
+    pub(crate) fn invalidate_nodes(&mut self, changed_nodes: &[NodeId]) {
+        for node_id in changed_nodes {
+            if let Some(entry) = self.cache.remove(node_id) {
+                self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+            }
+            self.lru.retain(|cached| cached != node_id);
+        }
+        if !changed_nodes.is_empty() {
+            self.height_signature.clear();
+            self.height_document_revision = None;
+            self.document_order.clear();
+            self.document_order_revision = None;
+        }
+        self.enforce_budget();
     }
 
     pub fn block_layout(&self, node_id: NodeId) -> Option<&BlockLayout> {
@@ -660,9 +749,18 @@ impl LayoutRegistry {
             } else {
                 hard_range.len()
             };
+            let line_top = cached.layout.bounds.top()
+                + cached
+                    .layout
+                    .text_lines
+                    .iter()
+                    .take(line_index)
+                    .map(|line| line.size(cached.line_height).height)
+                    .fold(px(0.0), |top, height| top + height);
             segments.extend(range_segment_bounds_for_line(
                 line,
-                cached.layout.bounds,
+                line_top,
+                cached.layout.bounds.left(),
                 cached.line_height,
                 line_start,
                 line_end,
@@ -792,8 +890,13 @@ impl LayoutRegistry {
 
     fn refresh_estimates(&mut self, document: &Document, width: f32) {
         let width_changed = self.estimate_width.to_bits() != width.to_bits();
+        if !width_changed && self.estimate_document_revision == Some(document.revision()) {
+            return;
+        }
         if width_changed {
             self.estimate_revisions.clear();
+            self.height_signature.clear();
+            self.height_document_revision = None;
         }
         self.estimate_width = width;
         let ids: HashSet<NodeId> = document.blocks().iter().map(|block| block.id).collect();
@@ -820,9 +923,15 @@ impl LayoutRegistry {
             self.estimated_heights.insert(block.id, height.max(1.0));
             self.estimate_revisions.insert(block.id, block.revision);
         }
+        self.estimate_document_revision = Some(document.revision());
     }
 
     fn ensure_height_index(&mut self, document: &Document) {
+        if self.height_document_revision == Some(document.revision())
+            && !self.prefix_heights.is_empty()
+        {
+            return;
+        }
         let signature = document
             .blocks()
             .iter()
@@ -839,6 +948,7 @@ impl LayoutRegistry {
                 self.prefix_heights.last().copied().unwrap_or_default() + self.height_for(block.id);
             self.prefix_heights.push(next);
         }
+        self.height_document_revision = Some(document.revision());
     }
 
     fn height_for(&self, node_id: NodeId) -> f32 {
@@ -868,10 +978,7 @@ impl LayoutRegistry {
             return;
         }
         self.insert_shaped(
-            revision,
-            width,
-            0,
-            px(DEFAULT_TEXT_HEIGHT),
+            ShapeKey::geometry(revision, width, px(DEFAULT_TEXT_HEIGHT)),
             layout,
             is_image,
             px(DEFAULT_TEXT_HEIGHT),
@@ -880,20 +987,22 @@ impl LayoutRegistry {
 
     fn insert_shaped(
         &mut self,
-        revision: u64,
-        width: f32,
-        style_revision: u64,
-        line_height: Pixels,
+        shape_key: ShapeKey,
         layout: BlockLayout,
         is_image: bool,
         default_line_height: Pixels,
     ) {
         let node_id = layout.node_id;
+        let revision = shape_key.block_revision;
+        let width = f32::from_bits(shape_key.width_bits);
+        let line_height = px(f64::from_bits(shape_key.line_height_bits) as f32);
         if let Some(previous) = self.cache.remove(&node_id) {
             self.used_bytes = self.used_bytes.saturating_sub(previous.bytes);
         }
         self.lru.retain(|id| *id != node_id);
-        let bytes = estimate_cache_bytes(&layout, size_of::<Bounds<Pixels>>() * 2);
+        let selection_geometry_bytes =
+            selection_geometry_reserve(&layout, size_of::<Bounds<Pixels>>() * 2);
+        let bytes = estimate_cache_bytes(&layout, selection_geometry_bytes);
         if bytes > self.budget_bytes {
             return;
         }
@@ -905,17 +1014,18 @@ impl LayoutRegistry {
                 bytes,
                 revision,
                 width,
-                style_revision,
-                selection_geometry_bytes: size_of::<Bounds<Pixels>>() * 2,
+                selection_geometry_bytes,
                 is_image,
                 line_height: if line_height == px(0.0) {
                     default_line_height
                 } else {
                     line_height
                 },
+                shape_key,
             },
         );
         self.lru.push_back(node_id);
+        self.enforce_budget();
     }
 
     fn update_cache_metadata(
@@ -923,13 +1033,13 @@ impl LayoutRegistry {
         node_id: NodeId,
         revision: u64,
         width: f32,
-        style_revision: u64,
+        shape_key: ShapeKey,
         line_height: Pixels,
     ) {
         if let Some(entry) = self.cache.get_mut(&node_id) {
             entry.revision = revision;
             entry.width = width;
-            entry.style_revision = style_revision;
+            entry.shape_key = shape_key;
             entry.line_height = line_height;
             self.touch(node_id);
         }
@@ -941,7 +1051,12 @@ impl LayoutRegistry {
     }
 
     fn reflow_visible(&mut self) {
-        for (index, visible) in self.visible.iter_mut().enumerate() {
+        for visible in &mut self.visible {
+            let index = self
+                .document_order
+                .get(&visible.node_id)
+                .copied()
+                .unwrap_or_default();
             let y = self.prefix_heights.get(index).copied().unwrap_or_default();
             let height = self.prefix_heights.get(index + 1).copied().unwrap_or(y) - y;
             visible.bounds.origin.y = px(y);
@@ -1006,10 +1121,6 @@ fn estimate_text_height(text: &str, width: f32) -> f32 {
         * DEFAULT_TEXT_HEIGHT
 }
 
-fn style_revision(font_size: Pixels, line_height: Pixels) -> u64 {
-    (font_size.to_f64().to_bits() << 32) ^ line_height.to_f64().to_bits()
-}
-
 fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -> usize {
     let shaped_bytes = layout
         .text_lines
@@ -1018,18 +1129,35 @@ fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -
             let runs = line
                 .runs()
                 .iter()
-                .map(|run| size_of_val(run) + run.glyphs.len() * size_of::<ShapedGlyph>())
+                .map(|run| {
+                    size_of_val(run)
+                        .saturating_add(run.glyphs.capacity() * size_of::<ShapedGlyph>())
+                })
                 .sum::<usize>();
+            let line_layout = size_of::<gpui::LineLayout>()
+                .saturating_add(line.runs().len() * size_of::<gpui::ShapedRun>());
             size_of::<WrappedLine>()
                 .saturating_add(size_of::<WrappedLineLayout>())
                 .saturating_add(line.text.len())
                 .saturating_add(line.wrap_boundaries().len() * size_of::<WrapBoundary>())
+                .saturating_add(line_layout)
                 .saturating_add(runs)
         })
         .sum::<usize>();
     size_of::<CachedBlockLayout>()
+        .saturating_add(size_of::<BlockLayout>())
+        .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
         .saturating_add(shaped_bytes)
-        .saturating_add(selection_geometry_bytes.max(size_of::<Bounds<Pixels>>() * 2))
+        .saturating_add(selection_geometry_bytes)
+}
+
+fn selection_geometry_reserve(layout: &BlockLayout, requested: usize) -> usize {
+    let visual_rows = layout
+        .text_lines
+        .iter()
+        .map(|line| line.wrap_boundaries().len().saturating_add(1))
+        .sum::<usize>();
+    requested.max(visual_rows.saturating_mul(size_of::<Bounds<Pixels>>()))
 }
 
 fn contains(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {
@@ -1103,6 +1231,11 @@ fn wrap_boundary_offset(line: &WrappedLine, wrap_index: usize) -> Option<usize> 
 }
 
 fn wrapped_row_offsets(line: &WrappedLine) -> Vec<usize> {
+    if line.len() == 0 {
+        // An empty hard line still occupies one visual row. Keep two equal
+        // endpoints so row-count arithmetic does not erase it.
+        return vec![0, 0];
+    }
     let mut offsets = Vec::with_capacity(line.wrap_boundaries().len() + 2);
     offsets.push(0);
     for index in 0..line.wrap_boundaries().len() {
@@ -1136,7 +1269,8 @@ fn row_index_for_offset(offsets: &[usize], offset: usize, affinity: Affinity) ->
 
 fn range_segment_bounds_for_line(
     line: &WrappedLine,
-    bounds: Bounds<Pixels>,
+    line_top: Pixels,
+    line_left: Pixels,
     line_height: Pixels,
     start_offset: usize,
     end_offset: usize,
@@ -1154,11 +1288,11 @@ fn range_segment_bounds_for_line(
         let row_start_x = line.unwrapped_layout.x_for_index(row_start);
         let start_x = line.unwrapped_layout.x_for_index(segment_start) - row_start_x;
         let end_x = line.unwrapped_layout.x_for_index(segment_end) - row_start_x;
-        let row_top = bounds.top() + line_height * row_index as f32;
+        let row_top = line_top + line_height * row_index as f32;
         segments.push(Bounds::from_corners(
-            point(bounds.left() + start_x, row_top),
+            point(line_left + start_x, row_top),
             point(
-                bounds.left() + end_x.max(start_x + px(CARET_WIDTH)),
+                line_left + end_x.max(start_x + px(CARET_WIDTH)),
                 row_top + line_height,
             ),
         ));

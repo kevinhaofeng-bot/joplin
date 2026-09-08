@@ -140,3 +140,37 @@ cargo test --manifest-path packages/app-lite-gpui/Cargo.toml native_editor --off
 | donor `components/block/runtime/mod.rs:2149-2163` 的 `previous_boundary`/`next_boundary` grapheme 语义 | native `resolve_grapheme_offset`、`snap_grapheme_offset` 及所有公开位置/fallback/vertical 入口。 |
 
 本轮只改 native editor 实现与测试（另因历史原子边界需要扩展 native `history.rs`），没有修改 donor、计划/spec、验收矩阵或控制器 ledger。剩余顾虑仍是 headless 测试不能替代真机 IME 候选窗、主题字体/Metal/RSS 和异步图片解码验收。
+
+## Fix round 2（合并 findings 闭环）
+
+本轮先把审查要求转成生产入口回归，再修实现；没有以测试 helper 或直接 `Document::apply` 绕过 `EditorCore`。初始 RED 为 54/58（平台 IME 内部 caret、composition undo 粒度、硬换行 selection/caret bounds、changed-node 缓存失效与非零 viewport reflow）；结构边界 fixture、空硬行、16 MiB/selection reserve、图片 affinity、`register_exact` 和完整字体 key 也随后各自加入 RED。最终 focused native suite 为 63/63 GREEN。
+
+### Round 2 findings 与实现/证据
+
+| finding | 生产修复与回归 |
+| --- | --- |
+| 1. 平台 IME composition 与 undo | `EntityInputHandler::replace_and_mark_text_in_range`、`replace_text_in_range` 经过 `EditorCore` 的 provisional `History::undo_with_outcome`/最终事务；marked range 与内部 selected range 分离，commit 只产生一个 undo entry。`entity_input_platform_commit_replaces_candidate_as_one_undo`、`entity_input_explicit_commit_range_and_navigation_cancel_composition` 通过。 |
+| 2. 非零 viewport reflow | `LayoutRegistry::reflow_visible` 以 `document_order[node_id]` 定位，而不是把 visible slice index 当全篇 index；`nonzero_viewport_reflow_keeps_document_block_index` 真实 `shape_text` 后通过。 |
+| 3. hard-line selection/caret geometry | `range_segment_bounds` 累加此前 `WrappedLine` 的真实高度；IME collapsed range 走 `caret_bounds_for_point`；硬换行 selection y 与 caret height 回归通过。 |
+| 4. image affinity contraction | `EditorCore::doc_point_key` 与 `LayoutRegistry::point_key` 都保留 `Before < After`；纯 caret 不绘制 atom selection，反向 affinity range 才绘制 image outline。`editor_core_orders_same_image_affinity_for_contraction` 通过。 |
+| 5. changed-node cache invalidation/扫描 | 事务 outcome 的 `changed_nodes` 只删除受影响 shaped entry；`Document::revision()`、宽度和 order revision 复用估算/高度/order 索引，静态 viewport 不重复扫描全文。`editor_core_invalidates_only_changed_shaped_node` 与 10,000 块边界回归通过。 |
+| 6. 真实 hard cache budget | `estimate_cache_bytes` 计入 `CachedBlockLayout`/`BlockLayout`、`WrappedLine`、`Arc` 所属 layout payload、text、runs/glyph capacity、wrap boundaries、外层 line capacity 和 selection row reserve；每次插入/精确注册后立即 enforce LRU，超 budget entry 不保留。`shaped_cache_budget_is_hard_during_multi_block_shaping`、16 MiB 和 10,000 块回归通过。 |
+| 7. 空 hard line visual navigation | `wrapped_row_offsets` 对空 `WrappedLine` 返回 `[0, 0]`，保留一个视觉行；`visual_down_preserves_empty_hard_line_as_one_row` 通过。 |
+| 8. structural edge semantics | 首块 Backspace 是 clean no-op；非空 list 起点 Backspace 经 `SetBlockKind` transaction 降级且保留 caret；异构 forward Delete 仍经 metadata transaction + merge。`structural_edges_preserve_caret_after_backspace_downgrade` 及原异构边界回归通过。 |
+| 9. measured `register_exact` | API 要求调用方显式传入 `is_image` 与 measured `line_height`，不再从 `before == after` 猜图片；文本 36px、图片 42px 非默认高度回归通过。 |
+| 10. complete shaping key | 新增生产 `LayoutRegistry::shape_visible_with_style(TextStyle, Window)`；`shape_visible_with_window` 委托该入口。`ShapeKey` 包含 block revision、width、完整 GPUI `Font`（family/features/fallbacks/weight/style）、font size、line height 和 wrap discriminator。字体 family/weight/style/size 分项改变均触发真实 reshaping 回归。 |
+
+### Round 2 donor 复用映射
+
+| donor 位置/算法 | round 2 native 适配 |
+| --- | --- |
+| `components/block/input.rs:116-179`、`runtime/mod.rs:1539-1615,1726-1747` 的 marked/composition/commit 协议 | `core.rs` 的 `MarkedText`、`composition_base`、`replace_and_mark_utf16`、`commit_marked_text_with_range`；事务与 `History` 保持单一撤销边界。 |
+| `editor/history.rs:77-137` 与 `editor/tests.rs:2566-2668` 的 provisional undo/reapply 原子性 | `history.rs::undo_with_outcome`/`redo_with_outcome` 将 changed nodes 与 selection 一起返回，core 精确失效 layout。 |
+| `components/block/element.rs:242-263,279-312,353-512,938-985` 的 `WrappedLine` 行高、range segment、closest-index | `layout.rs::ShapeKey`、`range_segment_bounds`、`wrapped_row_offsets`、`visual_move`/`visual_edge_point`；硬换行与空行共用真实 shaped line。 |
+| `editor/selection.rs:364-493` 的全文端点/跨 viewport selection ordering | `core.rs::doc_point_key` 与 `layout.rs::point_key`；image Before/After affinity 和 offscreen anchor 均按全文顺序求交。 |
+| donor image affinity/caret geometry | `layout.rs::image_side`、`caret_bounds_for_point`、`selection_rects`；register_exact 不再猜测 image kind。 |
+| donor visual navigation `runtime/mod.rs:1879-2020`、`interactions.rs:663-704`、`events.rs:2167-2228` | `LayoutRegistry` 保留 preferred-x、空 hard row、跨 block edge row 的统一入口。 |
+| donor structural boundary `interactions.rs:433-564`、`events.rs:1775-1817,2260-2335` | `core.rs` 通过 `TransactionBatch` 完成首块 no-op、list downgrade、异构 metadata merge，不直接改 `Document.blocks`。 |
+| donor grapheme `runtime/mod.rs:2149-2163` | `resolve_grapheme_offset`/`snap_grapheme_offset` 覆盖公开 caret、vertical target、IME selected range 和 fallback hit。 |
+
+Round 2 仍只修改 native editor 文件与本报告；没有修改 donor、plan/spec、验收矩阵、ledger 或 findings。Headless focused/compile gates 通过不等于真机 IME、主题字体和 Metal/RSS 预算已经验收，这些仍保留为后续 UI 集成顾虑。

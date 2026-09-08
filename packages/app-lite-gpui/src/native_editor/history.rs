@@ -118,10 +118,20 @@ impl History {
     }
 
     pub fn undo(&mut self, document: &mut Document) -> Result<Selection, DocumentError> {
+        Ok(self.undo_with_outcome(document)?.selection)
+    }
+
+    pub fn undo_with_outcome(
+        &mut self,
+        document: &mut Document,
+    ) -> Result<ApplyOutcome, DocumentError> {
         let Some(entry) = self.undo.back().cloned() else {
             return Err(DocumentError::HistoryEmpty);
         };
         let inverse_outcome = document.apply_batch(entry.inverse.clone())?;
+        let changed_nodes = inverse_outcome.changed_nodes.clone();
+        let inverse = inverse_outcome.inverse.clone();
+        let estimated_bytes = inverse_outcome.estimated_bytes;
         let entry = self.undo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
         let mut entry = entry;
         // The inverse application returns the exact post-edit block range,
@@ -133,14 +143,29 @@ impl History {
         self.current_selection = Some(entry.before_selection);
         self.redo.push_back(entry.clone());
         self.trim_to_budget();
-        Ok(entry.before_selection)
+        Ok(ApplyOutcome {
+            selection: entry.before_selection,
+            changed_nodes,
+            inverse,
+            estimated_bytes,
+        })
     }
 
     pub fn redo(&mut self, document: &mut Document) -> Result<Selection, DocumentError> {
+        Ok(self.redo_with_outcome(document)?.selection)
+    }
+
+    pub fn redo_with_outcome(
+        &mut self,
+        document: &mut Document,
+    ) -> Result<ApplyOutcome, DocumentError> {
         let Some(entry) = self.redo.back().cloned() else {
             return Err(DocumentError::HistoryEmpty);
         };
         let redo_outcome = document.apply_batch(entry.forward.clone())?;
+        let changed_nodes = redo_outcome.changed_nodes.clone();
+        let inverse = redo_outcome.inverse.clone();
+        let estimated_bytes = redo_outcome.estimated_bytes;
         let entry = self.redo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
         let mut entry = entry;
         entry.inverse = redo_outcome.inverse;
@@ -148,7 +173,12 @@ impl History {
         self.current_selection = Some(entry.after_selection);
         self.undo.push_back(entry.clone());
         self.trim_to_budget();
-        Ok(entry.after_selection)
+        Ok(ApplyOutcome {
+            selection: entry.after_selection,
+            changed_nodes,
+            inverse,
+            estimated_bytes,
+        })
     }
 
     pub fn undo_depth(&self) -> usize {
