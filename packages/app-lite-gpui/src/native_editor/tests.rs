@@ -31,6 +31,7 @@ thread_local! {
     // selection call. A process-global counter lets another concurrently
     // running gpui test contaminate the observed scratch peak.
     static MEASURING_ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    static MEASURING_RETAINED: Cell<Option<isize>> = const { Cell::new(None) };
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -40,10 +41,20 @@ unsafe impl GlobalAlloc for CountingAllocator {
                 measuring.set(Some(bytes.saturating_add(layout.size())));
             }
         });
+        MEASURING_RETAINED.with(|measuring| {
+            if let Some(bytes) = measuring.get() {
+                measuring.set(Some(bytes.saturating_add(layout.size() as isize)));
+            }
+        });
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        MEASURING_RETAINED.with(|measuring| {
+            if let Some(bytes) = measuring.get() {
+                measuring.set(Some(bytes.saturating_sub(layout.size() as isize)));
+            }
+        });
         unsafe { System.dealloc(ptr, layout) };
     }
 }
@@ -67,6 +78,25 @@ impl AllocationMeasurement {
 impl Drop for AllocationMeasurement {
     fn drop(&mut self) {
         MEASURING_ALLOCATIONS.with(|measuring| measuring.set(None));
+    }
+}
+
+struct RetainedAllocationMeasurement;
+
+impl RetainedAllocationMeasurement {
+    fn begin() -> Self {
+        MEASURING_RETAINED.with(|measuring| measuring.set(Some(0)));
+        Self
+    }
+
+    fn bytes(&self) -> usize {
+        MEASURING_RETAINED.with(|measuring| measuring.get().unwrap_or(0).max(0) as usize)
+    }
+}
+
+impl Drop for RetainedAllocationMeasurement {
+    fn drop(&mut self) {
+        MEASURING_RETAINED.with(|measuring| measuring.set(None));
     }
 }
 
@@ -1115,10 +1145,11 @@ fn repeated_local_splices_stay_valid_without_order_buffer_capacity() {
 #[test]
 fn block_sequence_index_lookup_uses_right_boundary() {
     let document = Document::from_paragraphs(["zero", "one", "last"]);
-    assert_eq!(
-        super::model::BlockSequence::item_overhead_bytes_for_test(),
-        size_of::<Arc<Block>>(),
-        "SumTree items retain one Arc pointer; Block payload stays shared"
+    let item_overhead = super::model::BlockSequence::item_overhead_bytes_for_test();
+    println!("BlockItem inline overhead: {item_overhead} bytes");
+    assert!(
+        item_overhead < size_of::<Block>(),
+        "SumTree item stores a cheap Arc/key handle instead of an inline Block payload"
     );
     assert_eq!(document.blocks()[0].content.as_text(), Some("zero"));
     assert_eq!(document.blocks()[1].content.as_text(), Some("one"));
@@ -1127,6 +1158,79 @@ fn block_sequence_index_lookup_uses_right_boundary() {
             .content
             .as_text(),
         Some("last")
+    );
+}
+
+#[test]
+fn block_sequence_range_edges_use_right_boundary() {
+    let mut document = Document::from_paragraphs(["zero", "one", "last"]);
+    let blocks = document.blocks();
+    let block = |id, text| Block {
+        id: NodeId::new(id),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text(text),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    };
+    assert!(blocks.iter_range(0..0).next().is_none());
+    assert_eq!(
+        blocks
+            .iter_range(0..blocks.len())
+            .filter_map(|block| block.content.as_text())
+            .collect::<Vec<_>>(),
+        vec!["zero", "one", "last"]
+    );
+    assert_eq!(
+        blocks
+            .iter_range(0..1)
+            .next()
+            .and_then(|block| block.content.as_text()),
+        Some("zero")
+    );
+    assert_eq!(
+        blocks
+            .iter_range(1..2)
+            .next()
+            .and_then(|block| block.content.as_text()),
+        Some("one")
+    );
+    assert_eq!(
+        blocks
+            .iter_range(2..3)
+            .next()
+            .and_then(|block| block.content.as_text()),
+        Some("last")
+    );
+    assert!(blocks.iter_range(3..3).next().is_none());
+
+    document
+        .blocks_mut_for_test()
+        .splice(0..0, [block(90, "head")]);
+    assert_eq!(document.blocks()[0].content.as_text(), Some("head"));
+    let tail_index = document.block_count();
+    document
+        .blocks_mut_for_test()
+        .splice(tail_index..tail_index, [block(91, "tail")]);
+    assert_eq!(
+        document
+            .blocks()
+            .last()
+            .and_then(|block| block.content.as_text()),
+        Some("tail")
+    );
+    let tail_index = document.block_count() - 1;
+    let removed = document.blocks_mut_for_test().remove(tail_index);
+    assert_eq!(removed.content.as_text(), Some("tail"));
+    let last = document.block_count() - 1;
+    document
+        .blocks_mut_for_test()
+        .replace(last, block(92, "replaced"));
+    assert_eq!(
+        document
+            .blocks()
+            .last()
+            .and_then(|block| block.content.as_text()),
+        Some("replaced")
     );
 }
 
@@ -1219,7 +1323,10 @@ fn run_mixed_sum_tree_fixture(block_count: usize) -> (usize, usize) {
 
     let mut max_allocation = 0usize;
     let mut max_number_work = 0usize;
-    for cycle in 0..5 {
+    // Twenty mixed cycles per fixture exercise middle and tail split/merge,
+    // followed by undo/redo, while the oracle checks order, content,
+    // selection, history depth, numbering and unique IDs after every edge.
+    for cycle in 0..20 {
         let split_id = if cycle % 2 == 0 {
             oracle[block_count / 2].id
         } else {
@@ -1447,6 +1554,80 @@ fn mixed_sum_tree_paths_scale_on_10k_and_100k_fixtures() {
     assert!(
         large_work <= small_work.saturating_add(256),
         "100k numbering work grew with document size: 10k={small_work}, 100k={large_work}"
+    );
+}
+
+fn retained_document_fixture(block_count: usize) -> (Document, usize) {
+    let measurement = RetainedAllocationMeasurement::begin();
+    let document =
+        Document::from_paragraphs((0..block_count).map(|index| format!("retained-row-{index}")));
+    (document, measurement.bytes())
+}
+
+fn retained_edit_probe(mut document: Document, structural: bool) -> usize {
+    let node = document.blocks()[document.block_count() / 2].id;
+    let measurement = RetainedAllocationMeasurement::begin();
+    if structural {
+        document
+            .apply(Transaction::SplitBlock {
+                at: DocPoint::with_affinity(node, 2, Affinity::After),
+            })
+            .expect("retained structural edit");
+    } else {
+        document
+            .apply(Transaction::InsertText {
+                selection: Selection::caret(DocPoint::with_affinity(node, 2, Affinity::After)),
+                text: "x".into(),
+            })
+            .expect("retained inline edit");
+    }
+    measurement.bytes()
+}
+
+#[test]
+fn retained_sum_tree_allocations_scale_for_10k_and_100k_documents() {
+    let (small, small_construct) = retained_document_fixture(10_000);
+    let (large, large_construct) = retained_document_fixture(100_000);
+    assert!(small_construct > 0 && large_construct > small_construct);
+
+    let small_clone = {
+        let measurement = RetainedAllocationMeasurement::begin();
+        let _clone = small.clone();
+        measurement.bytes()
+    };
+    let large_clone = {
+        let measurement = RetainedAllocationMeasurement::begin();
+        let _clone = large.clone();
+        measurement.bytes()
+    };
+    assert!(
+        large_clone <= small_clone.saturating_add(128 * 1024),
+        "cheap document clone scaled with N: 10k={small_clone}, 100k={large_clone}"
+    );
+
+    let small_inline = retained_edit_probe(small, false);
+    let large_inline = retained_edit_probe(large, false);
+    let small_structural = retained_edit_probe(
+        Document::from_paragraphs((0..10_000).map(|index| format!("retained-row-{index}"))),
+        true,
+    );
+    let large_structural = retained_edit_probe(
+        Document::from_paragraphs((0..100_000).map(|index| format!("retained-row-{index}"))),
+        true,
+    );
+    println!(
+        "retained SumTree: construct 10k={small_construct} 100k={large_construct}; clone 10k={small_clone} 100k={large_clone}; inline 10k={small_inline} 100k={large_inline}; structural 10k={small_structural} 100k={large_structural}"
+    );
+    assert!(
+        large_inline <= small_inline.saturating_mul(4).saturating_add(256 * 1024),
+        "inline retained allocation scaled with N: 10k={small_inline}, 100k={large_inline}"
+    );
+    assert!(
+        large_structural
+            <= small_structural
+                .saturating_mul(4)
+                .saturating_add(256 * 1024),
+        "structural retained allocation scaled with N: 10k={small_structural}, 100k={large_structural}"
     );
 }
 
@@ -3752,6 +3933,118 @@ async fn entity_input_uses_document_wide_utf16_coordinates(cx: &mut gpui::TestAp
             assert_eq!(editor.document().block_kinds(), [BlockKind::Paragraph]);
         });
     });
+}
+
+#[test]
+fn inline_layout_delta_does_not_rebuild_the_100k_height_index() {
+    fn measure(block_count: usize) -> usize {
+        let mut document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        let node = document.blocks()[block_count / 2].id;
+        document
+            .apply(Transaction::InsertText {
+                selection: Selection::caret(DocPoint::with_affinity(node, 1, Affinity::After)),
+                text: "x".into(),
+            })
+            .expect("inline edit");
+        let before = layout.height_index_work_count();
+        layout.invalidate_nodes_with_delta(&document, &[node], false, &[], &[]);
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        layout.height_index_work_count().saturating_sub(before)
+    }
+
+    let work_10k = measure(10_000);
+    let work_100k = measure(100_000);
+    println!("inline height-index work: 10k={work_10k} 100k={work_100k}");
+    assert!(
+        work_10k < 512,
+        "10k inline delta did too much work: {work_10k}"
+    );
+    assert!(
+        work_100k <= work_10k.saturating_add(512),
+        "inline delta rebuilt work proportional to N: 10k={work_10k}, 100k={work_100k}"
+    );
+}
+
+#[test]
+fn structural_layout_delta_consumes_removed_ids_without_full_refresh() {
+    fn measure(block_count: usize) -> (usize, usize) {
+        let mut document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        let node = document.blocks()[block_count / 2].id;
+        let before_work = layout.height_index_work_count();
+        let before_scan = layout.layout_scan_count();
+        let outcome = document
+            .apply(Transaction::RemoveNode { node_id: node })
+            .expect("remove middle block");
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        (
+            layout.height_index_work_count().saturating_sub(before_work),
+            layout.layout_scan_count().saturating_sub(before_scan),
+        )
+    }
+
+    let (work_10k, scan_10k) = measure(10_000);
+    let (work_100k, scan_100k) = measure(100_000);
+    println!(
+        "structural height-index work/scan: 10k={work_10k}/{scan_10k} 100k={work_100k}/{scan_100k}"
+    );
+    assert!(work_10k < 512 && work_100k <= work_10k + 512);
+    assert!(scan_10k < 512 && scan_100k <= scan_10k + 512);
+}
+
+#[gpui::test]
+async fn short_entity_input_query_does_not_allocate_full_document(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let document = Document::from_paragraphs((0..100_000).map(|index| format!("row-{index}")));
+    let entity = cx.new(|cx| EditorCore::new(document, cx));
+
+    // Warm the callback and GPUI plumbing outside the measured interval. The
+    // request itself is one UTF-16 code unit in the middle of the document.
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            let mut actual_range = None;
+            let _ = <EditorCore as EntityInputHandler>::text_for_range(
+                editor,
+                100_000..100_001,
+                &mut actual_range,
+                window,
+                editor_cx,
+            );
+        });
+    });
+    let measurement = AllocationMeasurement::begin();
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            let mut actual_range = None;
+            let text = <EditorCore as EntityInputHandler>::text_for_range(
+                editor,
+                100_000..100_001,
+                &mut actual_range,
+                window,
+                editor_cx,
+            )
+            .expect("one UTF-16 code unit");
+            assert_eq!(text.chars().count(), 1);
+        });
+    });
+    let allocated = measurement.bytes();
+    println!("short entity input retained allocation: {allocated} bytes");
+    assert!(
+        allocated < 64 * 1024,
+        "short input query allocated the whole document: {allocated} bytes"
+    );
 }
 
 #[gpui::test]

@@ -46,10 +46,6 @@ struct RawDocumentRange {
 }
 
 impl RawDocumentRange {
-    fn from_utf16(text: &str, range_utf16: &Range<usize>) -> Self {
-        Self::from_utf8(input::utf16_range_to_utf8_in(text, range_utf16))
-    }
-
     fn from_utf8(range: Range<usize>) -> Self {
         let (start_affinity, end_affinity) = if range.start == range.end {
             (Affinity::After, Affinity::After)
@@ -62,6 +58,11 @@ impl RawDocumentRange {
             start_affinity,
             end_affinity,
         }
+    }
+
+    #[cfg(test)]
+    fn from_utf16(text: &str, range: &Range<usize>) -> Self {
+        Self::from_utf8(input::utf16_range_to_utf8_in(text, range))
     }
 
     fn with_affinities(
@@ -398,7 +399,7 @@ impl EditorCore {
     }
 
     pub fn document_len(&self) -> usize {
-        self.document_text().len()
+        self.document.flat_utf8_len()
     }
 
     pub fn marked_text(&self) -> Option<&str> {
@@ -477,7 +478,6 @@ impl EditorCore {
         if self.selection.is_caret() {
             return String::new();
         }
-        let text = self.document_text();
         let start = self.flat_offset_for_point(self.selection.anchor);
         let end = self.flat_offset_for_point(self.selection.head);
         let (start, end) = if start <= end {
@@ -485,9 +485,9 @@ impl EditorCore {
         } else {
             (end, start)
         };
-        text.get(start.min(text.len())..end.min(text.len()))
+        self.document
+            .text_for_utf8_range(start..end)
             .unwrap_or_default()
-            .to_owned()
     }
 
     pub fn cut_selection(&mut self) -> Result<String, DocumentError> {
@@ -1541,8 +1541,9 @@ impl EditorCore {
 
     fn raw_input_range(&self, range_utf16: Option<&Range<usize>>) -> Option<RawDocumentRange> {
         let range_utf16 = range_utf16?;
-        let document_text = self.document_text();
-        Some(RawDocumentRange::from_utf16(&document_text, range_utf16))
+        Some(RawDocumentRange::from_utf8(
+            self.document.utf16_range_to_utf8(range_utf16.clone()),
+        ))
     }
 
     fn actual_marked_selection(&self, marked: &MarkedText) -> Selection {
@@ -1608,8 +1609,7 @@ impl EditorCore {
     }
 
     fn validate_input_range(&self, range_utf16: &Range<usize>) -> Result<(), DocumentError> {
-        let text = self.document_text();
-        let document_len = input::utf8_range_to_utf16_in(&text, &(0..text.len())).end;
+        let document_len = self.document.flat_utf16_len();
         if range_utf16.start > range_utf16.end || range_utf16.end > document_len {
             return Err(DocumentError::InvalidOperation(
                 "input UTF-16 range is outside the document".into(),
@@ -1627,10 +1627,7 @@ impl EditorCore {
     }
 
     fn block_index(&self, node_id: NodeId) -> Option<usize> {
-        self.document
-            .blocks()
-            .iter()
-            .position(|block| block.id == node_id)
+        self.document.node_index(node_id).ok()
     }
 
     fn full_block_selection(&self, index: usize) -> Selection {
@@ -1769,73 +1766,15 @@ fn point_for_document_offset_in(
     offset: usize,
     affinity: Affinity,
 ) -> DocPoint {
-    if let Some(first) = document.blocks().first()
-        && offset == 0
-    {
-        return DocPoint::with_affinity(first.id, 0, Affinity::Before);
-    }
-    let full_len = document
-        .blocks()
-        .iter()
-        .enumerate()
-        .map(|(index, block)| block_flat_len(block) + usize::from(index > 0))
-        .sum::<usize>();
-    if offset >= full_len {
-        return document
-            .blocks()
-            .last()
-            .map(block_points)
-            .map(|(_, after)| after)
-            .unwrap_or_else(|| DocPoint::new(NodeId::new(0), 0));
-    }
-    let mut cursor = 0;
-    for (index, block) in document.blocks().iter().enumerate() {
-        if index > 0 {
-            cursor += 1;
-        }
-        let len = block_flat_len(block);
-        if offset <= cursor + len {
-            match &block.content {
-                BlockContent::Text { text, .. } => {
-                    let local =
-                        resolve_grapheme_offset(text, (offset - cursor).min(text.len()), affinity);
-                    return DocPoint::with_affinity(block.id, local, affinity);
-                }
-                _ => {
-                    return DocPoint::with_affinity(
-                        block.id,
-                        0,
-                        if offset - cursor < len / 2 {
-                            Affinity::Before
-                        } else {
-                            Affinity::After
-                        },
-                    );
-                }
-            }
-        }
-        cursor += len;
-    }
-    document.end_selection().head
+    document
+        .point_for_flat_utf8_offset(offset, affinity)
+        .unwrap_or_else(|| document.end_selection().head)
 }
 
 fn flat_offset_for_point_in(document: &Document, point: DocPoint) -> usize {
-    let mut offset = 0;
-    for (index, block) in document.blocks().iter().enumerate() {
-        if index > 0 {
-            offset += 1;
-        }
-        if block.id != point.node_id {
-            offset += block_flat_len(block);
-            continue;
-        }
-        return offset
-            + match &block.content {
-                BlockContent::Text { text, .. } => point.utf8_offset.min(text.len()),
-                _ => usize::from(point.affinity == Affinity::After) * block_flat_len(block),
-            };
-    }
-    offset
+    document
+        .flat_offset_for_point(point)
+        .unwrap_or_else(|| document.flat_utf8_len())
 }
 
 fn remap_candidate_selection_after_inverse(
@@ -1891,10 +1830,9 @@ impl EntityInputHandler for EditorCore {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let document_text = self.document_text();
-        let range = input::utf16_range_to_utf8_in(&document_text, &range_utf16);
-        actual_range.replace(input::utf8_range_to_utf16_in(&document_text, &range));
-        Some(document_text.get(range)?.to_owned())
+        let range = self.document.utf16_range_to_utf8(range_utf16);
+        actual_range.replace(self.document.utf8_range_to_utf16(range.clone()));
+        self.document.text_for_utf8_range(range)
     }
 
     fn selected_text_range(
@@ -1903,7 +1841,6 @@ impl EntityInputHandler for EditorCore {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let document_text = self.document_text();
         let anchor = self.flat_offset_for_point(self.selection.anchor);
         let head = self.flat_offset_for_point(self.selection.head);
         let (start, end, reversed) = if anchor <= head {
@@ -1911,7 +1848,7 @@ impl EntityInputHandler for EditorCore {
         } else {
             (head, anchor, true)
         };
-        let range = input::utf8_range_to_utf16_in(&document_text, &(start..end));
+        let range = self.document.utf8_range_to_utf16(start..end);
         Some(UTF16Selection { range, reversed })
     }
 
@@ -1921,7 +1858,6 @@ impl EntityInputHandler for EditorCore {
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
         let marked = self.marked.as_ref()?;
-        let document_text = self.document_text();
         let start = self.flat_offset_for_point(DocPoint::with_affinity(
             marked.node_id,
             marked.utf8_range.start,
@@ -1932,7 +1868,7 @@ impl EntityInputHandler for EditorCore {
             marked.utf8_range.end,
             Affinity::After,
         ));
-        Some(input::utf8_range_to_utf16_in(&document_text, &(start..end)))
+        Some(self.document.utf8_range_to_utf16(start..end))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -2013,8 +1949,7 @@ impl EntityInputHandler for EditorCore {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let document_text = self.document_text();
-        let range = input::utf16_range_to_utf8_in(&document_text, &range_utf16);
+        let range = self.document.utf16_range_to_utf8(range_utf16);
         let selection = self.selection_for_document_byte_range(range);
         if selection.is_caret() {
             return self.layout.caret_bounds_for_point(selection.head);
@@ -2033,11 +1968,10 @@ impl EntityInputHandler for EditorCore {
     ) -> Option<usize> {
         let point = self.layout.point_to_doc(point)?;
         let point = self.snap_layout_point(point);
-        let document_text = self.document_text();
-        Some(input::utf8_to_utf16_in(
-            &document_text,
-            self.flat_offset_for_point(point),
-        ))
+        Some(
+            self.document
+                .utf8_to_utf16_offset(self.flat_offset_for_point(point)),
+        )
     }
 }
 
@@ -2089,13 +2023,6 @@ fn contains_mark(marks: &[super::model::Mark], mark: &super::model::Mark) -> boo
         (super::model::Mark::Link(_), super::model::Mark::Link(_)) => true,
         (candidate, mark) => candidate == mark,
     })
-}
-
-fn block_flat_len(block: &Block) -> usize {
-    match &block.content {
-        BlockContent::Text { text, .. } => text.len(),
-        _ => '\u{fffc}'.len_utf8(),
-    }
 }
 
 fn union_bounds(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Bounds<Pixels> {

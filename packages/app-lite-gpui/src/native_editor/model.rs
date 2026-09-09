@@ -15,10 +15,12 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+use loro_fractional_index::FractionalIndex;
 use smallvec::SmallVec;
-use sum_tree::{Bias, ContextLessSummary, Dimension, Item, SumTree};
+use sum_tree::{Bias, ContextLessSummary, Dimension, Item, KeyedItem, SumTree, TreeMap};
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::input;
 use super::transaction::{
     ApplyOutcome, InsertedTextSpan, StructuralSplice, Transaction, TransactionBatch,
 };
@@ -346,9 +348,12 @@ pub struct SemanticSnapshot {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct BlockCount(usize);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct BlockSummary {
     count: usize,
+    utf8_len: usize,
+    utf16_len: usize,
+    last_key: Option<BlockKey>,
 }
 
 impl ContextLessSummary for BlockSummary {
@@ -357,7 +362,17 @@ impl ContextLessSummary for BlockSummary {
     }
 
     fn add_summary(&mut self, summary: &Self) {
+        let had_items = self.count > 0;
         self.count = self.count.saturating_add(summary.count);
+        if had_items && summary.count > 0 {
+            self.utf8_len = self.utf8_len.saturating_add(1);
+            self.utf16_len = self.utf16_len.saturating_add(1);
+        }
+        self.utf8_len = self.utf8_len.saturating_add(summary.utf8_len);
+        self.utf16_len = self.utf16_len.saturating_add(summary.utf16_len);
+        if summary.count > 0 {
+            self.last_key = summary.last_key.clone();
+        }
     }
 }
 
@@ -371,6 +386,75 @@ impl<'a> Dimension<'a, BlockSummary> for BlockCount {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BlockPosition {
+    count: usize,
+    utf8: usize,
+    utf16: usize,
+    key: Option<BlockKey>,
+}
+
+impl<'a> Dimension<'a, BlockSummary> for BlockPosition {
+    fn zero(_: ()) -> Self {
+        Self::default()
+    }
+
+    fn add_summary(&mut self, summary: &'a BlockSummary, _: ()) {
+        if self.count > 0 && summary.count > 0 {
+            self.utf8 = self.utf8.saturating_add(1);
+            self.utf16 = self.utf16.saturating_add(1);
+        }
+        self.count = self.count.saturating_add(summary.count);
+        self.utf8 = self.utf8.saturating_add(summary.utf8_len);
+        self.utf16 = self.utf16.saturating_add(summary.utf16_len);
+        if summary.count > 0 {
+            self.key = summary.last_key.clone();
+        }
+    }
+}
+
+struct BlockKeyTarget(BlockKey);
+
+impl<'a> sum_tree::SeekTarget<'a, BlockSummary, BlockPosition> for BlockKeyTarget {
+    fn cmp(&self, cursor_location: &BlockPosition, _: ()) -> Ordering {
+        cursor_location
+            .key
+            .as_ref()
+            .map_or(Ordering::Greater, |key| std::cmp::Ord::cmp(&self.0, key))
+    }
+}
+
+struct FlatUtf8Target(usize);
+
+impl<'a> sum_tree::SeekTarget<'a, BlockSummary, BlockPosition> for FlatUtf8Target {
+    fn cmp(&self, cursor_location: &BlockPosition, _: ()) -> Ordering {
+        std::cmp::Ord::cmp(&self.0, &cursor_location.utf8)
+    }
+}
+
+struct FlatUtf16Target(usize);
+
+impl<'a> sum_tree::SeekTarget<'a, BlockSummary, BlockPosition> for FlatUtf16Target {
+    fn cmp(&self, cursor_location: &BlockPosition, _: ()) -> Ordering {
+        std::cmp::Ord::cmp(&self.0, &cursor_location.utf16)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct BlockKey(FractionalIndex);
+
+impl<'a> Dimension<'a, BlockSummary> for BlockKey {
+    fn zero(_: ()) -> Self {
+        Self::default()
+    }
+
+    fn add_summary(&mut self, summary: &'a BlockSummary, _: ()) {
+        if let Some(key) = &summary.last_key {
+            *self = key.clone();
+        }
+    }
+}
+
 /// A cheap-clone item stored in the document-order sequence.
 ///
 /// GPUI's `SumTree` copies items while constructing persistent prefix/suffix
@@ -379,12 +463,14 @@ impl<'a> Dimension<'a, BlockSummary> for BlockCount {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BlockItem {
     block: Arc<Block>,
+    key: BlockKey,
 }
 
 impl BlockItem {
-    fn new(block: Block) -> Self {
+    fn new(block: Block, key: BlockKey) -> Self {
         Self {
             block: Arc::new(block),
+            key,
         }
     }
 }
@@ -393,17 +479,40 @@ impl Item for BlockItem {
     type Summary = BlockSummary;
 
     fn summary(&self, _: ()) -> Self::Summary {
-        BlockSummary { count: 1 }
+        let (utf8_len, utf16_len) = block_flat_lengths(&self.block);
+        BlockSummary {
+            count: 1,
+            utf8_len,
+            utf16_len,
+            last_key: Some(self.key.clone()),
+        }
+    }
+}
+
+impl KeyedItem for BlockItem {
+    type Key = BlockKey;
+
+    fn key(&self) -> Self::Key {
+        self.key.clone()
     }
 }
 
 /// Compact document-order read surface backed directly by GPUI's persistent
 /// B+ tree. Range collection is intentionally explicit and local; callers do
 /// not receive a hidden full-document materialization.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct BlockSequence {
     tree: SumTree<BlockItem>,
+    node_keys: TreeMap<NodeId, FractionalIndex>,
 }
+
+impl PartialEq for BlockSequence {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for BlockSequence {}
 
 pub struct BlockSequenceIter<'a> {
     inner: sum_tree::Iter<'a, BlockItem>,
@@ -449,8 +558,17 @@ impl<'a> IntoIterator for &'a BlockSequence {
 
 impl BlockSequence {
     fn from_blocks(blocks: Vec<Block>) -> Self {
+        let keys = FractionalIndex::generate_n_evenly(None, None, blocks.len())
+            .expect("initial document keys have unbounded space");
+        let mut items = Vec::with_capacity(blocks.len());
+        let mut node_keys = TreeMap::default();
+        for (block, key) in blocks.into_iter().zip(keys) {
+            node_keys.insert(block.id, key.clone());
+            items.push(BlockItem::new(block, BlockKey(key)));
+        }
         Self {
-            tree: SumTree::from_iter(blocks.into_iter().map(BlockItem::new), ()),
+            tree: SumTree::from_iter(items, ()),
+            node_keys,
         }
     }
 
@@ -479,10 +597,7 @@ impl BlockSequence {
     }
 
     pub fn get(&self, index: usize) -> Option<&Block> {
-        let (_, _, item) = self
-            .tree
-            .find::<BlockCount, _>((), &BlockCount(index), Bias::Right);
-        item.map(|item| item.block.as_ref())
+        self.item_at(index).map(|item| item.block.as_ref())
     }
 
     pub fn first(&self) -> Option<&Block> {
@@ -491,6 +606,253 @@ impl BlockSequence {
 
     pub fn last(&self) -> Option<&Block> {
         self.tree.last().map(|item| item.block.as_ref())
+    }
+
+    fn item_at(&self, index: usize) -> Option<&BlockItem> {
+        let (_, _, item) = self
+            .tree
+            .find::<BlockCount, _>((), &BlockCount(index), Bias::Right);
+        item
+    }
+
+    fn key_at(&self, index: usize) -> Option<BlockKey> {
+        self.item_at(index).map(|item| item.key.clone())
+    }
+
+    fn key_for_node(&self, node_id: NodeId) -> Option<FractionalIndex> {
+        self.node_keys.get(&node_id).cloned()
+    }
+
+    fn block_by_node_id(&self, node_id: NodeId) -> Option<&Block> {
+        let key = self.node_keys.get(&node_id)?;
+        let key = BlockKey(key.clone());
+        let (_, _, item) = self
+            .tree
+            .find::<BlockPosition, _>((), &BlockKeyTarget(key), Bias::Left);
+        item.filter(|item| item.block.id == node_id)
+            .map(|item| item.block.as_ref())
+    }
+
+    fn contains_node(&self, node_id: NodeId) -> bool {
+        self.node_keys.get(&node_id).is_some()
+    }
+
+    fn index_of_node(&self, node_id: NodeId) -> Option<usize> {
+        let key = self.node_keys.get(&node_id)?;
+        let key = BlockKey(key.clone());
+        let (position, _, item) =
+            self.tree
+                .find::<BlockPosition, _>((), &BlockKeyTarget(key), Bias::Left);
+        item.filter(|item| item.block.id == node_id)
+            .map(|_| position.count)
+    }
+
+    fn position_of_node(&self, node_id: NodeId) -> Option<(BlockPosition, &Block)> {
+        let key = self.node_keys.get(&node_id)?;
+        let key = BlockKey(key.clone());
+        let (position, _, item) =
+            self.tree
+                .find::<BlockPosition, _>((), &BlockKeyTarget(key), Bias::Left);
+        item.filter(|item| item.block.id == node_id)
+            .map(|item| (position, item.block.as_ref()))
+    }
+
+    fn position_for_utf8(&self, offset: usize) -> Option<(BlockPosition, &Block)> {
+        let total = self.tree.summary().utf8_len;
+        if self.is_empty() || offset >= total {
+            return None;
+        }
+        let (position, _, item) =
+            self.tree
+                .find::<BlockPosition, _>((), &FlatUtf8Target(offset), Bias::Left);
+        item.map(|item| (position, item.block.as_ref()))
+    }
+
+    fn position_for_utf16(&self, offset: usize) -> Option<(BlockPosition, &Block)> {
+        let total = self.tree.summary().utf16_len;
+        if self.is_empty() || offset >= total {
+            return None;
+        }
+        let (position, _, item) =
+            self.tree
+                .find::<BlockPosition, _>((), &FlatUtf16Target(offset), Bias::Left);
+        item.map(|item| (position, item.block.as_ref()))
+    }
+
+    fn flat_utf8_len(&self) -> usize {
+        self.tree.summary().utf8_len
+    }
+
+    fn flat_utf16_len(&self) -> usize {
+        self.tree.summary().utf16_len
+    }
+
+    fn position_start_utf8(position: &BlockPosition) -> usize {
+        position
+            .utf8
+            .saturating_add(usize::from(position.count > 0))
+    }
+
+    fn position_start_utf16(position: &BlockPosition) -> usize {
+        position
+            .utf16
+            .saturating_add(usize::from(position.count > 0))
+    }
+
+    fn flat_utf8_offset_for_node(
+        &self,
+        node_id: NodeId,
+        local_offset: usize,
+        affinity: Affinity,
+    ) -> Option<usize> {
+        let (position, block) = self.position_of_node(node_id)?;
+        let local_offset = match &block.content {
+            BlockContent::Text { text, .. } => local_offset.min(text.len()),
+            _ => usize::from(affinity == Affinity::After) * block_flat_lengths(block).0,
+        };
+        Some(Self::position_start_utf8(&position).saturating_add(local_offset))
+    }
+
+    fn flat_utf8_point(&self, offset: usize, affinity: Affinity) -> Option<DocPoint> {
+        let total = self.flat_utf8_len();
+        if self.is_empty() {
+            return None;
+        }
+        if offset == 0 {
+            return self
+                .first()
+                .map(|block| DocPoint::with_affinity(block.id, 0, Affinity::Before));
+        }
+        if offset >= total {
+            return self.last().map(|block| match &block.content {
+                BlockContent::Text { text, .. } => {
+                    DocPoint::with_affinity(block.id, text.len(), Affinity::After)
+                }
+                _ => DocPoint::with_affinity(block.id, 0, Affinity::After),
+            });
+        }
+        let (position, block) = self.position_for_utf8(offset)?;
+        let local = offset
+            .saturating_sub(Self::position_start_utf8(&position))
+            .min(block_flat_lengths(block).0);
+        Some(match &block.content {
+            BlockContent::Text { text, .. } => DocPoint::with_affinity(
+                block.id,
+                resolve_grapheme_offset(text, local, affinity),
+                affinity,
+            ),
+            _ => DocPoint::with_affinity(
+                block.id,
+                0,
+                if local < block_flat_lengths(block).0 / 2 {
+                    Affinity::Before
+                } else {
+                    Affinity::After
+                },
+            ),
+        })
+    }
+
+    fn flat_utf16_offset(&self, offset: usize) -> usize {
+        let total = self.flat_utf16_len();
+        if self.is_empty() {
+            return 0;
+        }
+        if offset >= total {
+            return self.flat_utf8_len();
+        }
+        let Some((position, block)) = self.position_for_utf16(offset) else {
+            return self.flat_utf8_len();
+        };
+        let local = offset
+            .saturating_sub(Self::position_start_utf16(&position))
+            .min(block_flat_lengths(block).1);
+        let local_utf8 = match &block.content {
+            BlockContent::Text { text, .. } => input::utf16_to_utf8_in(text, local),
+            _ => input::utf16_to_utf8_in("\u{fffc}", local),
+        };
+        Self::position_start_utf8(&position).saturating_add(local_utf8)
+    }
+
+    fn flat_utf8_utf16_offset(&self, offset: usize) -> usize {
+        let total = self.flat_utf8_len();
+        if self.is_empty() {
+            return 0;
+        }
+        if offset >= total {
+            return self.flat_utf16_len();
+        }
+        let Some((position, block)) = self.position_for_utf8(offset) else {
+            return self.flat_utf16_len();
+        };
+        let local = offset
+            .saturating_sub(Self::position_start_utf8(&position))
+            .min(block_flat_lengths(block).0);
+        let local_utf16 = match &block.content {
+            BlockContent::Text { text, .. } => input::utf8_to_utf16_in(text, local),
+            _ => input::utf8_to_utf16_in("\u{fffc}", local),
+        };
+        Self::position_start_utf16(&position).saturating_add(local_utf16)
+    }
+
+    fn text_for_utf8_range(&self, range: Range<usize>) -> Option<String> {
+        let total = self.flat_utf8_len();
+        let start = range.start.min(total);
+        let end = range.end.min(total);
+        if start > end {
+            return None;
+        }
+        if start == end {
+            return Some(String::new());
+        }
+        let (start_position, start_block) = self.position_for_utf8(start).or_else(|| {
+            self.last()
+                .and_then(|block| self.position_of_node(block.id))
+        })?;
+        let (end_position, end_block) = if end < total {
+            self.position_for_utf8(end)?
+        } else {
+            let block = self.last()?;
+            self.position_of_node(block.id)?
+        };
+        let start_index = start_position.count;
+        let end_index = end_position.count;
+        let mut result = String::new();
+        for index in start_index..=end_index {
+            let block = self.get(index)?;
+            let position = self.position_of_node(block.id)?.0;
+            let block_start = Self::position_start_utf8(&position);
+            let block_len = block_flat_lengths(block).0;
+            let local_start = if index == start_index {
+                start.saturating_sub(block_start).min(block_len)
+            } else {
+                0
+            };
+            let local_end = if index == end_index {
+                end.saturating_sub(block_start).min(block_len)
+            } else {
+                block_len
+            };
+            if local_start < local_end {
+                match &block.content {
+                    BlockContent::Text { text, .. } => {
+                        result.push_str(text.get(local_start..local_end)?);
+                    }
+                    _ => result.push('\u{fffc}'),
+                }
+            }
+            if index < end_index {
+                let separator = block_start.saturating_add(block_len);
+                if start <= separator && separator < end {
+                    result.push('\n');
+                }
+            }
+        }
+        // Keep the variables meaningful in debug builds and make the range
+        // boundary contract explicit: both endpoints must resolve to the
+        // blocks traversed above.
+        let _ = (start_block.id, end_block.id);
+        Some(result)
     }
 
     /// Materialize only the requested local range for a transaction inverse
@@ -507,7 +869,46 @@ impl BlockSequence {
     {
         assert!(range.start <= range.end && range.end <= self.len());
         let removed = self.collect_range(range.clone());
-        let replacement = SumTree::from_iter(replacement.into_iter().map(BlockItem::new), ());
+        let replacement = replacement.into_iter().collect::<Vec<_>>();
+        let old_items = (range.start..range.end)
+            .map(|index| self.item_at(index).expect("splice range item").key.clone())
+            .collect::<Vec<_>>();
+        let preserve_keys = replacement.len() == old_items.len()
+            && replacement
+                .iter()
+                .zip(&removed)
+                .all(|(replacement, removed)| replacement.id == removed.id);
+        let keys = if preserve_keys {
+            old_items
+        } else {
+            let lower = if range.start == 0 {
+                None
+            } else {
+                self.key_at(range.start - 1)
+            };
+            let upper = self.key_at(range.end);
+            FractionalIndex::generate_n_evenly(
+                lower.as_ref().map(|key| &key.0),
+                upper.as_ref().map(|key| &key.0),
+                replacement.len(),
+            )
+            .expect("fractional index space exhausted between adjacent blocks")
+            .into_iter()
+            .map(BlockKey)
+            .collect()
+        };
+        let replacement_items = replacement
+            .into_iter()
+            .zip(keys)
+            .map(|(block, key)| BlockItem::new(block, key))
+            .collect::<Vec<_>>();
+        for block in &removed {
+            self.node_keys.remove(&block.id);
+        }
+        for item in &replacement_items {
+            self.node_keys.insert(item.block.id, item.key.0.clone());
+        }
+        let replacement = SumTree::from_iter(replacement_items, ());
         let mut cursor = self.tree.cursor::<BlockCount>(());
         let mut new_tree = cursor.slice(&BlockCount(range.start), Bias::Right);
         cursor.seek_forward(&BlockCount(range.end), Bias::Right);
@@ -661,8 +1062,13 @@ impl Document {
         &self.blocks
     }
 
+    #[cfg(test)]
+    pub(crate) fn blocks_mut_for_test(&mut self) -> &mut BlockSequence {
+        &mut self.blocks
+    }
+
     pub fn block(&self, node_id: NodeId) -> Option<&Block> {
-        self.blocks.iter().find(|block| block.id == node_id)
+        self.blocks.block_by_node_id(node_id)
     }
 
     pub fn block_at_index(&self, index: usize) -> Option<&Block> {
@@ -671,6 +1077,51 @@ impl Document {
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    pub(crate) fn order_key(&self, node_id: NodeId) -> Option<FractionalIndex> {
+        self.blocks.key_for_node(node_id)
+    }
+
+    pub(crate) fn flat_utf8_len(&self) -> usize {
+        self.blocks.flat_utf8_len()
+    }
+
+    pub(crate) fn flat_utf16_len(&self) -> usize {
+        self.blocks.flat_utf16_len()
+    }
+
+    pub(crate) fn flat_offset_for_point(&self, point: DocPoint) -> Option<usize> {
+        self.blocks
+            .flat_utf8_offset_for_node(point.node_id, point.utf8_offset, point.affinity)
+    }
+
+    pub(crate) fn point_for_flat_utf8_offset(
+        &self,
+        offset: usize,
+        affinity: Affinity,
+    ) -> Option<DocPoint> {
+        self.blocks.flat_utf8_point(offset, affinity)
+    }
+
+    pub(crate) fn utf8_to_utf16_offset(&self, offset: usize) -> usize {
+        self.blocks.flat_utf8_utf16_offset(offset)
+    }
+
+    pub(crate) fn utf16_to_utf8_offset(&self, offset: usize) -> usize {
+        self.blocks.flat_utf16_offset(offset)
+    }
+
+    pub(crate) fn utf8_range_to_utf16(&self, range: Range<usize>) -> Range<usize> {
+        self.utf8_to_utf16_offset(range.start)..self.utf8_to_utf16_offset(range.end)
+    }
+
+    pub(crate) fn utf16_range_to_utf8(&self, range: Range<usize>) -> Range<usize> {
+        self.utf16_to_utf8_offset(range.start)..self.utf16_to_utf8_offset(range.end)
+    }
+
+    pub(crate) fn text_for_utf8_range(&self, range: Range<usize>) -> Option<String> {
+        self.blocks.text_for_utf8_range(range)
     }
 
     pub fn revision(&self) -> u64 {
@@ -946,17 +1397,16 @@ impl Document {
         for node_id in changed_nodes {
             // A removed block is retained in changed_nodes so layout can
             // evict stale geometry; it has no live content left to validate.
-            if let Some(block) = self.blocks.iter().find(|block| block.id == *node_id) {
+            if let Some(block) = self.blocks.block_by_node_id(*node_id) {
                 validate_block_invariants(block)?;
             }
         }
         Ok(())
     }
 
-    fn node_index(&self, node_id: NodeId) -> Result<usize, DocumentError> {
+    pub(crate) fn node_index(&self, node_id: NodeId) -> Result<usize, DocumentError> {
         self.blocks
-            .iter()
-            .position(|block| block.id == node_id)
+            .index_of_node(node_id)
             .ok_or(DocumentError::NodeNotFound(node_id))
     }
 
@@ -968,7 +1418,7 @@ impl Document {
             ));
         }
         let id = NodeId::new_internal(raw);
-        if self.block(id).is_some() {
+        if self.blocks.contains_node(id) {
             return Err(DocumentError::InvalidOperation(
                 "node id allocator collided with a retained node".into(),
             ));
@@ -1258,7 +1708,7 @@ impl Document {
         }
         self.revision = self.revision.saturating_add(1);
         for node_id in &changed_nodes {
-            let index = self.blocks.iter().position(|block| block.id == *node_id);
+            let index = self.blocks.index_of_node(*node_id);
             if let Some(index) = index {
                 let mut block = self.blocks[index].clone();
                 block.revision = self.revision;
@@ -2505,10 +2955,10 @@ impl Document {
         });
         if !all_ids_are_replaced
             && blocks.iter().any(|replacement| {
-                self.blocks.iter().enumerate().any(|(position, current)| {
-                    (position < index || position >= index.saturating_add(remove_count))
-                        && current.id == replacement.id
-                })
+                self.blocks.contains_node(replacement.id)
+                    && !current_range
+                        .iter()
+                        .any(|current| current.id == replacement.id)
             })
         {
             return Err(DocumentError::InvalidOperation(
@@ -2582,6 +3032,13 @@ fn is_text_kind(kind: &BlockKind) -> bool {
 
 fn is_text_block(block: &Block) -> bool {
     matches!(block.content, BlockContent::Text { .. }) && is_text_kind(&block.kind)
+}
+
+fn block_flat_lengths(block: &Block) -> (usize, usize) {
+    match &block.content {
+        BlockContent::Text { text, .. } => (text.len(), text.chars().map(char::len_utf16).sum()),
+        _ => ('\u{fffc}'.len_utf8(), 1),
+    }
 }
 
 fn is_structural_block(block: &Block) -> bool {

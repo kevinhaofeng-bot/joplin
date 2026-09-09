@@ -14,8 +14,9 @@ use gpui::{
     StrikethroughStyle, TextAlign, TextRun, TextStyle, UnderlineStyle, WrapBoundary, WrappedLine,
     WrappedLineLayout, point, px, rgba, size,
 };
+use loro_fractional_index::FractionalIndex;
 use smallvec::SmallVec;
-use sum_tree::{Bias, ContextLessSummary, Dimension, Item, KeyedItem, SeekTarget, SumTree};
+use sum_tree::{Bias, ContextLessSummary, Dimension, Item, SeekTarget, SumTree, TreeMap};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::model::{
@@ -453,7 +454,6 @@ fn numbering_kind(kind: &BlockKind) -> NumberingKind {
 struct HeightSummary {
     count: usize,
     height: f32,
-    max_index: usize,
 }
 
 impl ContextLessSummary for HeightSummary {
@@ -464,13 +464,11 @@ impl ContextLessSummary for HeightSummary {
     fn add_summary(&mut self, summary: &Self) {
         self.count = self.count.saturating_add(summary.count);
         self.height += summary.height;
-        self.max_index = self.max_index.max(summary.max_index);
     }
 }
 
 #[derive(Clone, Debug)]
 struct HeightItem {
-    index: usize,
     node_id: NodeId,
     revision: u64,
     height: f32,
@@ -483,29 +481,20 @@ impl Item for HeightItem {
         HeightSummary {
             count: 1,
             height: self.height.max(1.0),
-            max_index: self.index,
         }
     }
 }
 
-impl KeyedItem for HeightItem {
-    type Key = Count;
-
-    fn key(&self) -> Self::Key {
-        Count(self.index)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct Count(usize);
+struct HeightCount(usize);
 
-impl<'a> Dimension<'a, HeightSummary> for Count {
+impl<'a> Dimension<'a, HeightSummary> for HeightCount {
     fn zero(_: ()) -> Self {
         Self(0)
     }
 
     fn add_summary(&mut self, summary: &'a HeightSummary, _: ()) {
-        self.0 = summary.max_index;
+        self.0 = self.0.saturating_add(summary.count);
     }
 }
 
@@ -542,8 +531,11 @@ pub struct LayoutRegistry {
     peak_accounted_bytes: usize,
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
-    document_order: HashMap<NodeId, usize>,
-    document_order_revision: Option<u64>,
+    /// Stable fractional keys mirror the document sequence without keeping a
+    /// second ordinal Vec/HashMap.  Structural invalidation updates only the
+    /// removed/inserted keys; selection comparisons use these keys directly.
+    order_keys: TreeMap<NodeId, FractionalIndex>,
+    order_keys_revision: Option<u64>,
     /// Document-order numbering summary. Inline revisions retain these maps;
     /// only list structure changes trigger a suffix update.
     ordered_numbers: HashMap<NodeId, usize>,
@@ -558,6 +550,7 @@ pub struct LayoutRegistry {
     #[cfg(test)]
     ordered_splice_operation_count: usize,
     estimate_revisions: HashMap<NodeId, u64>,
+    estimate_dirty: SmallVec<[NodeId; 8]>,
     estimate_width: f32,
     estimate_document_revision: Option<u64>,
     height_tree: SumTree<HeightItem>,
@@ -585,8 +578,8 @@ impl LayoutRegistry {
             peak_accounted_bytes: 0,
             first_visible: 0,
             last_visible: 0,
-            document_order: HashMap::new(),
-            document_order_revision: None,
+            order_keys: TreeMap::default(),
+            order_keys_revision: None,
             ordered_numbers: HashMap::new(),
             ordered_kinds: HashMap::new(),
             ordered_tree: SumTree::new(()),
@@ -599,6 +592,7 @@ impl LayoutRegistry {
             #[cfg(test)]
             ordered_splice_operation_count: 0,
             estimate_revisions: HashMap::new(),
+            estimate_dirty: SmallVec::new(),
             estimate_width: 0.0,
             estimate_document_revision: None,
             height_tree: SumTree::new(()),
@@ -710,6 +704,7 @@ impl LayoutRegistry {
         width: f32,
     ) {
         let width = width.max(1.0);
+        self.ensure_order_keys(document);
         self.ensure_ordered_numbers(document);
         self.refresh_estimates(document, width);
         self.ensure_height_index(document);
@@ -735,18 +730,6 @@ impl LayoutRegistry {
             .min(document.block_count());
         self.first_visible = first.min(end);
         self.last_visible = end.max(self.first_visible).min(document.block_count());
-
-        if self.document_order_revision != Some(document.revision()) {
-            self.document_order.clear();
-            self.document_order.extend(
-                document
-                    .blocks()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, block)| (block.id, index)),
-            );
-            self.document_order_revision = Some(document.revision());
-        }
 
         let allowed_ids: HashSet<NodeId> = document
             .blocks()
@@ -781,6 +764,21 @@ impl LayoutRegistry {
             self.register_geometry(block.revision, width, layout, is_image);
         }
         self.enforce_budget();
+    }
+
+    fn ensure_order_keys(&mut self, document: &Document) {
+        if self.order_keys_revision == Some(document.revision()) {
+            return;
+        }
+        if self.order_keys.is_empty() {
+            self.order_keys = TreeMap::from_ordered_entries(
+                document
+                    .blocks()
+                    .iter()
+                    .filter_map(|block| document.order_key(block.id).map(|key| (block.id, key))),
+            );
+        }
+        self.order_keys_revision = Some(document.revision());
     }
 
     /// Shape only the already-capped viewport window with the donor's
@@ -899,7 +897,7 @@ impl LayoutRegistry {
                 {
                     let measured_height = f32::from(measured_height);
                     self.estimated_heights.insert(node_id, measured_height);
-                    self.update_height_index(node_id, measured_height, block.revision);
+                    self.update_height_index(document, node_id, measured_height, block.revision);
                     estimates_changed = true;
                 }
                 let Some(geometry) = self.visible.iter().find(|layout| layout.node_id == node_id)
@@ -972,7 +970,8 @@ impl LayoutRegistry {
         self.used_bytes = 0;
         self.estimate_document_revision = None;
         self.height_document_revision = None;
-        self.document_order_revision = None;
+        self.order_keys.clear();
+        self.order_keys_revision = None;
         self.ordered_numbers.clear();
         self.ordered_kinds.clear();
         self.ordered_tree = SumTree::new(());
@@ -992,7 +991,7 @@ impl LayoutRegistry {
         structural_splices: &[StructuralSplice],
         numbering_ranges: &[Range<usize>],
     ) {
-        let invalidated: HashSet<NodeId> = changed_nodes.iter().copied().collect();
+        let invalidated: SmallVec<[NodeId; 8]> = changed_nodes.iter().copied().collect();
         self.visible
             .retain(|layout| !invalidated.contains(&layout.node_id));
         for node_id in changed_nodes {
@@ -1002,9 +1001,37 @@ impl LayoutRegistry {
             self.lru.retain(|cached| cached != node_id);
         }
         if !changed_nodes.is_empty() {
-            self.height_document_revision = None;
-            self.document_order.clear();
-            self.document_order_revision = None;
+            for node_id in changed_nodes {
+                self.estimate_revisions.remove(node_id);
+                self.estimate_dirty.push(*node_id);
+                if document.block(*node_id).is_none() {
+                    self.estimated_heights.remove(node_id);
+                }
+            }
+            if !structural_splices.is_empty() && self.order_keys_revision.is_some() {
+                for splice in structural_splices {
+                    for node_id in &splice.removed {
+                        self.order_keys.remove(node_id);
+                    }
+                    for node_id in &splice.inserted {
+                        if let Some(key) = document.order_key(*node_id) {
+                            self.order_keys.insert(*node_id, key);
+                        }
+                    }
+                }
+                self.order_keys_revision = Some(document.revision());
+            }
+            let height_ready = self.height_tree.summary().count > 0;
+            if height_ready {
+                if structural_splices.is_empty() {
+                    self.height_document_revision = None;
+                } else {
+                    for splice in structural_splices {
+                        self.splice_height_index(document, splice);
+                    }
+                    self.height_document_revision = Some(document.revision());
+                }
+            }
             if structural && self.ordered_summary_valid {
                 self.update_ordered_structure(
                     document,
@@ -1473,12 +1500,9 @@ impl LayoutRegistry {
         rects
     }
 
-    fn point_key(&self, point: DocPoint) -> (usize, usize, u8) {
+    fn point_key(&self, point: DocPoint) -> (Option<FractionalIndex>, usize, u8) {
         (
-            self.document_order
-                .get(&point.node_id)
-                .copied()
-                .unwrap_or(usize::MAX),
+            self.order_keys.get(&point.node_id).cloned(),
             point.utf8_offset,
             match point.affinity {
                 Affinity::Before => 0,
@@ -1488,18 +1512,23 @@ impl LayoutRegistry {
     }
 
     fn adjacent_text_line_height(&self, node_id: NodeId) -> Option<Pixels> {
-        let index = self.document_order.get(&node_id).copied()?;
-        self.document_order
+        let visible_index = self
+            .visible
             .iter()
-            .find_map(|(candidate, candidate_index)| {
-                (candidate_index.abs_diff(index) == 1)
-                    .then(|| {
-                        self.cache
-                            .get(candidate)
-                            .and_then(|entry| (!entry.is_image).then_some(entry.line_height))
-                    })
-                    .flatten()
+            .position(|layout| layout.node_id == node_id)?;
+        [
+            visible_index.checked_sub(1),
+            Some(visible_index.saturating_add(1)),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|index| {
+            self.visible.get(index).and_then(|layout| {
+                self.cache
+                    .get(&layout.node_id)
+                    .and_then(|entry| (!entry.is_image).then_some(entry.line_height))
             })
+        })
     }
 
     fn refresh_estimates(&mut self, document: &Document, width: f32) {
@@ -1509,17 +1538,18 @@ impl LayoutRegistry {
         }
         if width_changed {
             self.estimate_revisions.clear();
+            self.estimated_heights.clear();
+            self.estimate_dirty.clear();
             self.height_document_revision = None;
         }
         self.estimate_width = width;
-        let ids: HashSet<NodeId> = document.blocks().iter().map(|block| block.id).collect();
-        self.estimated_heights.retain(|id, _| ids.contains(id));
-        self.estimate_revisions.retain(|id, _| ids.contains(id));
-        for block in document.blocks() {
-            if !width_changed && self.estimate_revisions.get(&block.id) == Some(&block.revision) {
-                continue;
-            }
-            self.layout_scan_count = self.layout_scan_count.saturating_add(1);
+        let full_scan = width_changed
+            || (self.estimate_document_revision.is_none() && self.estimated_heights.is_empty())
+            || (self.estimate_document_revision.is_some()
+                && self.estimate_document_revision != Some(document.revision())
+                && self.estimate_dirty.is_empty());
+        let update = |block: &super::model::Block, this: &mut Self| {
+            this.layout_scan_count = this.layout_scan_count.saturating_add(1);
             let height = match &block.content {
                 BlockContent::Text { text, .. } => estimate_text_height(text, width, &block.kind),
                 BlockContent::Image {
@@ -1533,10 +1563,32 @@ impl LayoutRegistry {
                     .unwrap_or(DEFAULT_IMAGE_HEIGHT),
                 _ => DEFAULT_TEXT_HEIGHT,
             };
-            self.estimated_heights.insert(block.id, height.max(1.0));
-            self.estimate_revisions.insert(block.id, block.revision);
+            this.estimated_heights.insert(block.id, height.max(1.0));
+            this.estimate_revisions.insert(block.id, block.revision);
+            if (this.height_document_revision.is_some() || !this.height_tree.is_empty())
+                && this.height_tree.summary().count == document.block_count()
+            {
+                this.update_height_index(document, block.id, height.max(1.0), block.revision);
+            }
+        };
+        if full_scan {
+            for block in document.blocks() {
+                update(block, self);
+            }
+        } else {
+            let dirty = std::mem::take(&mut self.estimate_dirty);
+            for node_id in dirty {
+                if let Some(block) = document.block(node_id) {
+                    update(block, self);
+                }
+            }
         }
         self.estimate_document_revision = Some(document.revision());
+        if self.height_tree.summary().count == document.block_count()
+            && !self.height_tree.is_empty()
+        {
+            self.height_document_revision = Some(document.revision());
+        }
     }
 
     fn ensure_ordered_numbers(&mut self, document: &Document) {
@@ -1782,16 +1834,11 @@ impl LayoutRegistry {
         {
             return;
         }
-        let items = document
-            .blocks()
-            .iter()
-            .enumerate()
-            .map(|(index, block)| HeightItem {
-                index,
-                node_id: block.id,
-                revision: block.revision,
-                height: self.height_for(block.id),
-            });
+        let items = document.blocks().iter().map(|block| HeightItem {
+            node_id: block.id,
+            revision: block.revision,
+            height: self.height_for(block.id),
+        });
         self.height_tree = SumTree::from_iter(items, ());
         self.height_index_work = self
             .height_index_work
@@ -1799,23 +1846,64 @@ impl LayoutRegistry {
         self.height_document_revision = Some(document.revision());
     }
 
-    fn update_height_index(&mut self, node_id: NodeId, height: f32, revision: u64) {
-        let Some(&index) = self.document_order.get(&node_id) else {
+    fn update_height_index(
+        &mut self,
+        document: &Document,
+        node_id: NodeId,
+        height: f32,
+        revision: u64,
+    ) {
+        let Some(index) = document.node_index(node_id).ok() else {
             return;
         };
-        self.height_tree.insert_or_replace(
+        if index >= self.height_tree.summary().count {
+            return;
+        }
+        let mut cursor = self.height_tree.cursor::<HeightCount>(());
+        let mut new_tree = cursor.slice(&HeightCount(index), Bias::Right);
+        cursor.seek_forward(&HeightCount(index + 1), Bias::Right);
+        new_tree.push(
             HeightItem {
-                index,
                 node_id,
                 revision,
                 height: height.max(1.0),
             },
             (),
         );
+        new_tree.append(cursor.suffix(), ());
+        drop(cursor);
+        self.height_tree = new_tree;
         // This is a logical localized tree replacement, not a document scan.
         // Keep the observable counter conservative and independent of the
         // implementation's internal node fan-out.
         self.height_index_work = self.height_index_work.saturating_add(1);
+    }
+
+    fn splice_height_index(&mut self, document: &Document, splice: &StructuralSplice) {
+        let count = self.height_tree.summary().count;
+        let start = splice.start_index.min(count);
+        let end = start.saturating_add(splice.removed.len()).min(count);
+        let replacement_end = start
+            .saturating_add(splice.inserted.len())
+            .min(document.block_count());
+        let replacement = document
+            .blocks()
+            .iter_range(start..replacement_end)
+            .map(|block| HeightItem {
+                node_id: block.id,
+                revision: block.revision,
+                height: self.height_for(block.id),
+            });
+        let mut cursor = self.height_tree.cursor::<HeightCount>(());
+        let mut new_tree = cursor.slice(&HeightCount(start), Bias::Right);
+        cursor.seek_forward(&HeightCount(end), Bias::Right);
+        new_tree.extend(replacement, ());
+        new_tree.append(cursor.suffix(), ());
+        drop(cursor);
+        self.height_tree = new_tree;
+        self.height_index_work = self
+            .height_index_work
+            .saturating_add(splice.removed.len().saturating_add(splice.inserted.len()));
     }
 
     fn height_prefix(&self, index: usize) -> f32 {
@@ -1978,40 +2066,6 @@ impl LayoutRegistry {
     fn touch(&mut self, node_id: NodeId) {
         self.lru.retain(|id| *id != node_id);
         self.lru.push_back(node_id);
-    }
-
-    fn reflow_visible(&mut self) {
-        let positions = self
-            .visible
-            .iter()
-            .map(|visible| {
-                let index = self
-                    .document_order
-                    .get(&visible.node_id)
-                    .copied()
-                    .unwrap_or_default();
-                (
-                    visible.node_id,
-                    self.height_prefix(index),
-                    self.height_prefix(index + 1),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (node_id, y, next_y) in positions {
-            let height = next_y - y;
-            let Some(visible) = self
-                .visible
-                .iter_mut()
-                .find(|visible| visible.node_id == node_id)
-            else {
-                continue;
-            };
-            visible.bounds.origin.y = px(y);
-            visible.bounds.size.height = px(height.max(1.0));
-            if let Some(cached) = self.cache.get_mut(&node_id) {
-                cached.layout.bounds = visible.bounds;
-            }
-        }
     }
 
     fn recompute_used_bytes(&mut self) {

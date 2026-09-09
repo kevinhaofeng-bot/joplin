@@ -59,6 +59,7 @@ base64 = "0.23"
 uuid = "1.23"
 gpui = { version = "0.2", features = ["runtime_shaders"] }
 sum_tree = { package = "gpui_sum_tree", version = "0.2.2" }
+loro_fractional_index = "1.13.0"
 smallvec = "1.15.2"
 unicode-segmentation = "1.13"
 serde = { version = "1", features = ["derive"] }

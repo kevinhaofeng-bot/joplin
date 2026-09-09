@@ -3484,6 +3484,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "loro_fractional_index"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aca7180674d0273ddf37049a5efcde4547fd5330d24abb7519bb9d9eb6780d5b"
+dependencies = [
+ "once_cell",
+ "rand 0.8.7",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7048,6 +7058,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_sum_tree",
+ "loro_fractional_index",
  "mermaid-rs-renderer",
  "pulldown-cmark",
  "ratex-layout",
