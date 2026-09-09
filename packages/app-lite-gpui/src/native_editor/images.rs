@@ -26,6 +26,8 @@ const MACOS_PROXY_MAX_EDGE: u32 = 1600;
 /// the image node's natural metadata.
 pub const VIEWPORT_IMAGE_PROXY_MAX_EDGE: u32 = 800;
 const CONSERVATIVE_PROXY_RESERVATION: usize = 4 * 1024 * 1024;
+const VIEWPORT_PROXY_MAX_BYTES: usize =
+    (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize) * (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize) * 4;
 
 #[cfg(target_os = "macos")]
 mod mac_pressure {
@@ -1182,12 +1184,7 @@ impl BudgetedImageCache {
             .and_then(|bytes| bytes.checked_div(4))
             .ok_or_else(|| ImageCacheError::from(anyhow!("decoded image budget is too small")))?;
         let budget_edge = (max_pixels_per_frame as f64).sqrt().floor() as u32;
-        let configured_max_edge = if budget_bytes >= DECODED_IMAGE_CACHE_BUDGET {
-            VIEWPORT_IMAGE_PROXY_MAX_EDGE
-        } else {
-            MACOS_PROXY_MAX_EDGE
-        };
-        let max_edge = configured_max_edge.min(budget_edge.max(1));
+        let max_edge = VIEWPORT_IMAGE_PROXY_MAX_EDGE.min(budget_edge.max(1));
         let create_thumbnail = CFBoolean::new(true);
         let transform = CFBoolean::new(true);
         let should_cache = CFBoolean::new(false);
@@ -1465,7 +1462,7 @@ impl ImageCache for BudgetedImageCache {
         // A fixed proxy floor is only a scheduling hint. If visible retained
         // images leave less than that floor, reserve the exact remaining
         // bytes instead of permanently deferring a proxy that can fit.
-        let reservation = remaining;
+        let reservation = remaining.min(VIEWPORT_PROXY_MAX_BYTES);
         // A RenderImage must contain at least one complete RGBA pixel. A
         // smaller remainder is still capacity pressure, not a decoder error;
         // leave it deferred until the visible set/capacity changes.
@@ -2098,7 +2095,7 @@ mod tests {
         std::fs::write(&source_b, fixture_png_bytes()).expect("small fixture should write");
         let resource_a = Resource::from(source_a.clone());
         let resource_b = Resource::from(source_b.clone());
-        let budget = 8 * 1024 * 1024;
+        let budget = 4 * 1024 * 1024;
         let cache = cx.update(|app| BudgetedImageCache::new_entity(app, budget));
         let mut window = cx.add_empty_window();
 

@@ -2179,6 +2179,8 @@ mod tests {
         let expected_minimum = VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize
             * (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize * 900 / 1600)
             * 4;
+        let expected_proxy_upper_bound =
+            (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize) * (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize) * 4;
         for path in &paths {
             let resource = Resource::from(path.clone());
             window.update(|window, app| {
@@ -2222,7 +2224,7 @@ mod tests {
                 assert_eq!(cache.used_bytes(), 0);
                 assert_eq!(cache.len(), 0);
                 assert!(cache.peak_accounted_bytes() > 0);
-                assert!(cache.peak_accounted_bytes() <= DECODED_IMAGE_CACHE_BUDGET);
+                assert!(cache.peak_accounted_bytes() <= expected_proxy_upper_bound);
                 assert!(cache.is_settled());
             });
         });
