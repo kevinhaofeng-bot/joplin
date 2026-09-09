@@ -19,6 +19,7 @@ use smallvec::SmallVec;
 use sum_tree::{Bias, ContextLessSummary, Dimension, Item, SeekTarget, SumTree, TreeMap};
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::images::image_layout_size;
 use super::model::{
     Affinity, BlockContent, BlockKind, DocPoint, Document, Mark, NodeId, Selection, TextAlignment,
 };
@@ -26,7 +27,6 @@ use super::transaction::StructuralSplice;
 
 pub const LAYOUT_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TEXT_HEIGHT: f32 = 24.0;
-const DEFAULT_IMAGE_HEIGHT: f32 = 180.0;
 const PREFETCH_VIEWPORTS: f32 = 1.0;
 const FALLBACK_GLYPH_WIDTH: f32 = 8.0;
 const CARET_WIDTH: f32 = 1.0;
@@ -102,9 +102,18 @@ fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
     let left = list_depth(&block.kind)
         .map(|depth| depth as f32 * LIST_DEPTH_INDENT)
         .unwrap_or(0.0);
+    let available_width = (width - left).max(1.0);
+    let (block_width, block_height) = match &block.content {
+        BlockContent::Image {
+            natural_size,
+            display_width,
+            ..
+        } => image_layout_size(available_width, *natural_size, *display_width),
+        _ => (available_width, DEFAULT_TEXT_HEIGHT),
+    };
     Bounds::new(
         point(px(left), px(0.0)),
-        size(px((width - left).max(1.0)), px(DEFAULT_TEXT_HEIGHT)),
+        size(px(block_width), px(block_height)),
     )
 }
 
@@ -1550,14 +1559,21 @@ impl LayoutRegistry {
             let height = match &block.content {
                 BlockContent::Text { text, .. } => estimate_text_height(text, width, &block.kind),
                 BlockContent::Image {
-                    natural_size: (image_width, image_height),
+                    natural_size,
                     display_width,
                     ..
-                } => display_width
-                    .map(|display_width| {
-                        (display_width as f32 * *image_height as f32 / *image_width as f32).max(1.0)
-                    })
-                    .unwrap_or(DEFAULT_IMAGE_HEIGHT),
+                } => {
+                    image_layout_size(
+                        (width
+                            - list_depth(&block.kind)
+                                .map(|depth| depth as f32 * LIST_DEPTH_INDENT)
+                                .unwrap_or(0.0))
+                        .max(1.0),
+                        *natural_size,
+                        *display_width,
+                    )
+                    .1
+                }
                 _ => DEFAULT_TEXT_HEIGHT,
             };
             this.estimated_heights.insert(block.id, height.max(1.0));

@@ -3118,6 +3118,61 @@ fn image_hit_testing_exposes_before_and_after_document_points() {
 }
 
 #[test]
+fn image_layout_preserves_natural_aspect_ratio_at_wide_and_narrow_widths() {
+    fn bounds_for(
+        natural_size: (u32, u32),
+        display_width: Option<u32>,
+        available_width: f32,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        let mut document = Document::from_paragraph("前");
+        document
+            .apply(Transaction::InsertImage {
+                selection: document.end_selection(),
+                resource_id: format!("image-{}x{}", natural_size.0, natural_size.1),
+                natural_size,
+            })
+            .unwrap();
+        let image_id = document.blocks()[1].id;
+        if let Some(display_width) = display_width {
+            document
+                .apply(Transaction::SetImageDisplayWidth {
+                    node_id: image_id,
+                    display_width: Some(display_width),
+                })
+                .unwrap();
+        }
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 4_000.0, available_width);
+        layout
+            .visible()
+            .iter()
+            .find(|block| block.node_id == image_id)
+            .map(|block| block.bounds)
+            .expect("image should have visible bounds")
+    }
+
+    let wide_4_3 = bounds_for((1600, 1200), None, 680.0);
+    assert!((f32::from(wide_4_3.size.width) - 680.0).abs() < 0.1);
+    assert!((f32::from(wide_4_3.size.height) - 510.0).abs() < 0.1);
+
+    let wide_16_9 = bounds_for((1600, 900), None, 680.0);
+    assert!((f32::from(wide_16_9.size.width) - 680.0).abs() < 0.1);
+    assert!((f32::from(wide_16_9.size.height) - 382.5).abs() < 0.1);
+
+    let wide_portrait = bounds_for((600, 1200), None, 680.0);
+    assert!((f32::from(wide_portrait.size.width) - 600.0).abs() < 0.1);
+    assert!((f32::from(wide_portrait.size.height) - 1200.0).abs() < 0.1);
+
+    let narrow_16_9 = bounds_for((1600, 900), None, 300.0);
+    assert!((f32::from(narrow_16_9.size.width) - 300.0).abs() < 0.1);
+    assert!((f32::from(narrow_16_9.size.height) - 168.75).abs() < 0.1);
+
+    let explicit_overwide = bounds_for((1600, 1200), Some(1200), 680.0);
+    assert!((f32::from(explicit_overwide.size.width) - 680.0).abs() < 0.1);
+    assert!((f32::from(explicit_overwide.size.height) - 510.0).abs() < 0.1);
+}
+
+#[test]
 fn image_placeholder_and_texture_have_identical_layout_height() {
     let metadata = ImageMetadata::new("fixture", 1600, 900);
     let width = 680.0;
@@ -3126,6 +3181,8 @@ fn image_placeholder_and_texture_have_identical_layout_height() {
         metadata.placeholder_height(width),
         metadata.display_height(width)
     );
+    let constrained = ImageMetadata::new("constrained", 1600, 1200).with_display_width(1200);
+    assert!((constrained.display_height(width) - 510.0).abs() < 0.1);
 }
 
 #[test]

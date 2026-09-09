@@ -217,20 +217,34 @@ impl ImageMetadata {
     }
 
     pub fn display_height(&self, available_width: f32) -> f32 {
-        let width = self
-            .display_width
-            .map_or(available_width, |width| width as f32)
-            .max(1.0);
-        if self.natural_width == 0 {
-            return width;
-        }
-        (width * self.natural_height as f32 / self.natural_width as f32).max(1.0)
+        image_layout_size(
+            available_width,
+            (self.natural_width, self.natural_height),
+            self.display_width,
+        )
+        .1
     }
 
     /// Loading, loaded, and failed nodes deliberately share this geometry.
     pub fn placeholder_height(&self, available_width: f32) -> f32 {
         self.display_height(available_width)
     }
+}
+
+/// Shared image geometry for layout estimates, placeholders, hit testing, and
+/// the loaded image. The natural aspect ratio is preserved without cropping.
+pub(crate) fn image_layout_size(
+    available_width: f32,
+    natural_size: (u32, u32),
+    display_width: Option<u32>,
+) -> (f32, f32) {
+    let available_width = available_width.max(1.0);
+    let natural_width = natural_size.0.max(1) as f32;
+    let natural_height = natural_size.1.max(1) as f32;
+    let requested_width = display_width.map_or(natural_width, |width| width as f32);
+    let width = requested_width.min(available_width).max(1.0);
+    let height = (width * natural_height / natural_width).max(1.0);
+    (width, height)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
