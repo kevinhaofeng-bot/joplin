@@ -432,6 +432,16 @@ impl EditorCore {
         &self.layout
     }
 
+    pub fn history_used_bytes(&self) -> usize {
+        self.history.used_bytes()
+    }
+
+    pub(crate) fn select_for_workload(&mut self, point: DocPoint) {
+        self.selection = Selection::caret(point);
+        self.preferred_x = None;
+        self.clear_composition();
+    }
+
     /// Shape the actual document through the donor-backed LayoutRegistry for
     /// the native spike window. Keeping this adapter on EditorCore preserves
     /// one document owner while allowing the GPUI view to remain a thin

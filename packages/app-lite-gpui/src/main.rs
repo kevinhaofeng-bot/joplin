@@ -94,6 +94,23 @@ impl AssetSource for VelotypeAssets {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let help_or_version_requested = args
+        .iter()
+        .skip(1)
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-v"));
+    let measurement_requested =
+        !help_or_version_requested && spike_app::measurement_options_requested(&args[1..]);
+    let spike_options = if measurement_requested {
+        match spike_app::parse_spike_options(&args[1..]) {
+            Ok(options) => Some(options),
+            Err(error) => {
+                eprintln!("invalid Task 7 spike options: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     // Parse command-line arguments
     let mut detach = false;
@@ -121,6 +138,9 @@ fn main() {
                 println!("    -h, --help       Print this help message");
                 println!("    -d, --detach     Launch in background (non-blocking)");
                 println!("        --evernote-spike  Launch the native editor spike");
+                println!("        --fixture empty|typical|long  Task 7 deterministic fixture");
+                println!("        --ready-file PATH  Task 7 readiness marker (absolute)");
+                println!("        --diagnostics-file PATH  Task 7 JSON diagnostics (absolute)");
                 println!();
                 println!("FILES:");
                 println!("    One or more markdown files to open. If no files are specified,");
@@ -132,6 +152,9 @@ fn main() {
             }
             "--evernote-spike" => {
                 evernote_spike = true;
+            }
+            "--fixture" | "--ready-file" | "--diagnostics-file" => {
+                i += 1;
             }
             option if option.starts_with('-') => {
                 eprintln!("Unknown option: {}", option);
@@ -196,7 +219,7 @@ fn main() {
             // it needs the donor key/action table, but not donor workspace,
             // menu, network, updater, exporter, sync, or web runtimes.
             components::init(cx);
-            spike_app::open(cx);
+            spike_app::open_with_options(cx, spike_options.clone());
             cx.refresh_windows();
             return;
         }

@@ -666,6 +666,7 @@ impl TextureCache {
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
     }
+
     pub fn used_bytes(&self) -> usize {
         self.used_bytes
     }
@@ -784,6 +785,12 @@ impl BudgetedImageCache {
     }
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
+    }
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes
+    }
+    pub fn is_settled(&self) -> bool {
+        self.in_flight == 0 && self.reserved_bytes == 0
     }
     pub fn len(&self) -> usize {
         self.entries.len()

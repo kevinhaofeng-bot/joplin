@@ -8,14 +8,15 @@
 
 use std::ops::Range;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, ElementInputHandler, Entity,
     EntityInputHandler, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
     Render, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun,
-    UTF16Selection, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div, point, px,
-    rgba, size,
+    UTF16Selection, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div,
+    point, px, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -29,6 +30,10 @@ use crate::native_editor::commands::{
     CommandArgument, CommandCatalogue, CommandDescriptor, EditorCommand,
 };
 use crate::native_editor::core::EditorCore;
+use crate::native_editor::diagnostics::{Diagnostics, FixedHistogram};
+use crate::native_editor::fixtures::{
+    FixtureKind, build_document, populate_typical_images, typical_image_count,
+};
 use crate::native_editor::images::{
     BudgetedImageCache, ClipboardPayload, DECODED_IMAGE_CACHE_BUDGET, PasteIntent,
     classify_clipboard, classify_drop, read_native_pasteboard, resolve_clipboard_payload,
@@ -59,6 +64,83 @@ pub const fn route_contract() -> SpikeRouteContract {
         initializes_donor_services: false,
         initializes_web_runtime: false,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpikeLaunchOptions {
+    pub fixture: FixtureKind,
+    pub ready_file: PathBuf,
+    pub diagnostics_file: PathBuf,
+}
+
+pub fn measurement_options_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--fixture" | "--ready-file" | "--diagnostics-file"
+        )
+    })
+}
+
+pub fn parse_spike_options(args: &[String]) -> Result<SpikeLaunchOptions, String> {
+    let mut spike = false;
+    let mut fixture = None;
+    let mut ready_file = None;
+    let mut diagnostics_file = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--evernote-spike" if !spike => spike = true,
+            "--evernote-spike" => return Err("duplicate --evernote-spike".into()),
+            "--fixture" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--fixture requires empty|typical|long".to_owned())?;
+                if fixture.is_some() {
+                    return Err("duplicate --fixture".into());
+                }
+                fixture = Some(FixtureKind::parse(value)?);
+            }
+            "--ready-file" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--ready-file requires an absolute path".to_owned())?;
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err("--ready-file must be absolute".into());
+                }
+                if ready_file.replace(path).is_some() {
+                    return Err("duplicate --ready-file".into());
+                }
+            }
+            "--diagnostics-file" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--diagnostics-file requires an absolute path".to_owned())?;
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err("--diagnostics-file must be absolute".into());
+                }
+                if diagnostics_file.replace(path).is_some() {
+                    return Err("duplicate --diagnostics-file".into());
+                }
+            }
+            option => return Err(format!("unknown Task 7 option '{option}'")),
+        }
+        index += 1;
+    }
+    if !spike {
+        return Err("--evernote-spike is required".into());
+    }
+    Ok(SpikeLaunchOptions {
+        fixture: fixture.ok_or_else(|| "--fixture is required".to_owned())?,
+        ready_file: ready_file.ok_or_else(|| "--ready-file is required".to_owned())?,
+        diagnostics_file: diagnostics_file
+            .ok_or_else(|| "--diagnostics-file is required".to_owned())?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -92,7 +174,16 @@ fn surface_viewport(surface: Bounds<Pixels>, content_mask: Bounds<Pixels>) -> (f
 /// Open exactly one native GPUI window for the spike. The caller is expected
 /// to have installed only `components::init`, not the ordinary app services.
 pub(crate) fn open(cx: &mut App) -> WindowHandle<SpikeView> {
+    open_with_options(cx, None)
+}
+
+pub(crate) fn open_with_options(
+    cx: &mut App,
+    options: Option<SpikeLaunchOptions>,
+) -> WindowHandle<SpikeView> {
     let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
+    let fixture = options.as_ref().map(|options| options.fixture);
+    let options_for_window = options.clone();
     let handle = cx
         .open_window(
             WindowOptions {
@@ -100,7 +191,14 @@ pub(crate) fn open(cx: &mut App) -> WindowHandle<SpikeView> {
                 ..WindowOptions::default()
             },
             move |_window, cx| {
-                let editor = cx.new(|cx| EditorCore::new(sample_document(), cx));
+                let document = fixture.map_or_else(sample_document, build_document);
+                let editor = cx.new(|cx| EditorCore::new(document, cx));
+                if fixture == Some(FixtureKind::Typical) {
+                    editor
+                        .update(cx, |editor, _| populate_typical_images(editor))
+                        .expect("typical fixture image insertion");
+                    debug_assert_eq!(typical_image_count(), 10);
+                }
                 let image_cache = BudgetedImageCache::new_entity(cx, DECODED_IMAGE_CACHE_BUDGET);
                 cx.new(|_| SpikeView {
                     editor,
@@ -112,6 +210,7 @@ pub(crate) fn open(cx: &mut App) -> WindowHandle<SpikeView> {
                     pointer_anchor: None,
                     drop_point: None,
                     more_trigger_bounds: None,
+                    measurement: options_for_window.map(MeasurementRuntime::new),
                 })
             },
         )
@@ -124,6 +223,39 @@ pub(crate) fn open(cx: &mut App) -> WindowHandle<SpikeView> {
         })
         .expect("native Evernote spike window should be updateable");
     handle
+}
+
+#[derive(Clone)]
+struct MeasurementRuntime {
+    options: SpikeLaunchOptions,
+    first_frame_painted: bool,
+    workload_started: bool,
+    workload_complete: bool,
+    viewport_shift_index: usize,
+    viewport_reset_requested: bool,
+    viewport_complete: bool,
+    ready_written: bool,
+    render_start: Option<Instant>,
+    transaction_histogram: FixedHistogram,
+    render_histogram: FixedHistogram,
+}
+
+impl MeasurementRuntime {
+    fn new(options: SpikeLaunchOptions) -> Self {
+        Self {
+            options,
+            first_frame_painted: false,
+            workload_started: false,
+            workload_complete: false,
+            viewport_shift_index: 0,
+            viewport_reset_requested: false,
+            viewport_complete: false,
+            ready_written: false,
+            render_start: None,
+            transaction_histogram: FixedHistogram::default(),
+            render_histogram: FixedHistogram::default(),
+        }
+    }
 }
 
 /// Small real text-input owner for the link popover.  The editor selection
@@ -407,9 +539,92 @@ pub(crate) struct SpikeView {
     pointer_anchor: Option<DocPoint>,
     drop_point: Option<DocPoint>,
     more_trigger_bounds: Option<Bounds<Pixels>>,
+    measurement: Option<MeasurementRuntime>,
 }
 
 impl SpikeView {
+    fn start_measurement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(runtime) = self.measurement.as_mut() else {
+            return;
+        };
+        if runtime.workload_started {
+            return;
+        }
+        runtime.workload_started = true;
+        let options = runtime.options.clone();
+        let editor = self.editor.clone();
+        let weak_view: WeakEntity<Self> = cx.entity().downgrade();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |_this, cx| {
+            let result = cx
+                .update_window(window_handle, |_view, window, app| {
+                    run_measurement_workload(&editor, options.fixture, window, app)
+                })
+                .ok()
+                .flatten();
+            if let Some(result) = result {
+                let _ = weak_view.update(cx, |view, view_cx| {
+                    view.measurement_workload_finished(result);
+                    view_cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn measurement_workload_finished(&mut self, report: WorkloadReport) {
+        let Some(runtime) = self.measurement.as_mut() else {
+            return;
+        };
+        runtime.transaction_histogram = report.transaction_histogram;
+        debug_assert_eq!(report.full_document_verifications, 1);
+        runtime.workload_complete = true;
+    }
+
+    /// Drive each viewport shift through a separate GPUI animation frame. A
+    /// synchronous loop of `ScrollHandle::set_offset` calls would be coalesced
+    /// by GPUI and would not measure the production layout+paint lifecycle.
+    fn advance_measurement_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(runtime) = self.measurement.as_ref() else {
+            return;
+        };
+        if !runtime.workload_complete || runtime.viewport_complete {
+            return;
+        }
+        let shift_index = runtime.viewport_shift_index;
+        let reset_requested = runtime.viewport_reset_requested;
+        if shift_index < 120 {
+            let total_height = self.editor.read(cx).layout().total_height();
+            let max_top = (total_height - 520.0).max(0.0);
+            let fraction = shift_index as f32 / 119.0;
+            let top = max_top * fraction;
+            if let Some(runtime) = self.measurement.as_mut() {
+                runtime.render_start = Some(Instant::now());
+            }
+            self.scroll_handle.set_offset(point(px(0.0), px(-top)));
+            if let Some(runtime) = self.measurement.as_mut() {
+                runtime.viewport_shift_index += 1;
+            }
+            window.request_animation_frame();
+            cx.notify();
+        } else if !reset_requested {
+            if let Some(runtime) = self.measurement.as_mut() {
+                runtime.render_start = Some(Instant::now());
+            }
+            self.scroll_handle.set_offset(point(px(0.0), px(0.0)));
+            if let Some(runtime) = self.measurement.as_mut() {
+                runtime.viewport_reset_requested = true;
+            }
+            window.request_animation_frame();
+            cx.notify();
+        } else {
+            if let Some(runtime) = self.measurement.as_mut() {
+                runtime.viewport_complete = true;
+            }
+            cx.notify();
+        }
+    }
+
     fn on_external_paths_drop(
         &mut self,
         paths: &ExternalPaths,
@@ -1057,6 +1272,8 @@ impl SpikeView {
         let image_cache = self.image_cache.clone();
         let width = layout.content_width;
         let canvas_editor = editor.clone();
+        let measurement_view = cx.entity();
+        let paint_measurement_view = measurement_view.clone();
         let surface = div()
             .id("spike-editor-surface")
             .debug_selector(|| "spike-editor-surface".to_owned())
@@ -1077,6 +1294,13 @@ impl SpikeView {
 
         let canvas = canvas(
             move |bounds, window, cx| {
+                let _ = measurement_view.update(cx, |view, _| {
+                    if let Some(runtime) = view.measurement.as_mut() {
+                        if runtime.render_start.is_none() {
+                            runtime.render_start = Some(Instant::now());
+                        }
+                    }
+                });
                 let _ = canvas_editor.update(cx, |editor, editor_cx| {
                     let previous_height = editor.layout().total_height();
                     let mask = window.content_mask().bounds;
@@ -1103,6 +1327,77 @@ impl SpikeView {
                     window,
                     cx,
                 );
+                let fallback_started = Instant::now();
+                let _ = paint_measurement_view.update(cx, |view, view_cx| {
+                    let (first_frame, render_started) = {
+                        let Some(runtime) = view.measurement.as_mut() else {
+                            return;
+                        };
+                        let render_started = runtime.render_start.take();
+                        let first_frame = !runtime.first_frame_painted;
+                        runtime.first_frame_painted = true;
+                        (first_frame, render_started)
+                    };
+                    let elapsed = render_started
+                        .unwrap_or(fallback_started)
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64;
+                    if let Some(runtime) = view.measurement.as_mut() {
+                        runtime.render_histogram.observe_us(elapsed);
+                    }
+                    if first_frame {
+                        view.start_measurement(window, view_cx);
+                    }
+                    view.advance_measurement_frame(window, view_cx);
+                    let (workload_complete, ready_written, viewport_complete) = view
+                        .measurement
+                        .as_ref()
+                        .map_or((false, false, false), |runtime| {
+                            (
+                                runtime.workload_complete,
+                                runtime.ready_written,
+                                runtime.viewport_complete,
+                            )
+                        });
+                    if workload_complete
+                        && viewport_complete
+                        && !ready_written
+                        && view
+                            .image_cache
+                            .as_ref()
+                            .is_none_or(|cache| cache.read(view_cx).is_settled())
+                    {
+                        let Some(runtime) = view.measurement.as_ref() else {
+                            return;
+                        };
+                        let transaction_p95 = runtime.transaction_histogram.p95_us();
+                        let render_p95 = runtime.render_histogram.p95_us();
+                        let diagnostics_path = runtime.options.diagnostics_file.clone();
+                        let ready_path = runtime.options.ready_file.clone();
+                        let diagnostics = Diagnostics::from_values(
+                            view.image_cache
+                                .as_ref()
+                                .map_or(0, |cache| cache.read(view_cx).used_bytes()),
+                            view.editor.read(view_cx).layout().used_bytes(),
+                            view.editor.read(view_cx).history_used_bytes(),
+                            transaction_p95,
+                            render_p95,
+                        );
+                        if let Err(error) = diagnostics.write_atomic(&diagnostics_path) {
+                            eprintln!("failed to write Task 7 diagnostics: {error}");
+                            return;
+                        }
+                        if let Err(error) = std::fs::write(&ready_path, b"ready\n") {
+                            eprintln!("failed to write Task 7 ready marker: {error}");
+                            return;
+                        }
+                        if let Some(runtime) = view.measurement.as_mut() {
+                            runtime.ready_written = true;
+                        }
+                        view_cx.notify();
+                    }
+                });
             },
         )
         .w(px(width))
@@ -1208,6 +1503,88 @@ impl Render for SpikeView {
         }
         root
     }
+}
+
+struct WorkloadReport {
+    transaction_histogram: FixedHistogram,
+    full_document_verifications: u32,
+}
+
+fn run_measurement_workload(
+    editor: &Entity<EditorCore>,
+    _fixture: FixtureKind,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<WorkloadReport> {
+    const VIEWPORT_HEIGHT: f32 = 520.0;
+    const CONTENT_WIDTH: f32 = 680.0;
+    editor.update(cx, |editor, _| {
+        editor.shape_visible_with_window(0.0, VIEWPORT_HEIGHT, CONTENT_WIDTH, window);
+    });
+    let baseline = editor.read(cx).document().semantic_snapshot();
+    let baseline_block_count = editor.read(cx).document().block_count();
+    let mut transaction_histogram = FixedHistogram::default();
+
+    for _ in 0..500 {
+        let outcome = editor.update(cx, |editor, _| {
+            let point = editor
+                .layout()
+                .visible()
+                .iter()
+                .find_map(|layout| {
+                    editor
+                        .document()
+                        .block(layout.node_id)
+                        .and_then(|block| block.content.as_text().map(|_| block.id))
+                })
+                .or_else(|| {
+                    editor
+                        .document()
+                        .blocks()
+                        .iter()
+                        .find_map(|block| block.content.as_text().map(|_| block.id))
+                })?;
+            editor.select_for_workload(DocPoint::with_affinity(point, 0, Affinity::After));
+            let selection = editor.selection();
+            let before_content = editor
+                .document()
+                .block(point)
+                .map(|block| block.content.clone())?;
+            let started = Instant::now();
+            let outcome = editor
+                .apply(Transaction::InsertText {
+                    selection,
+                    text: "x".into(),
+                })
+                .ok()?;
+            let elapsed = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            transaction_histogram.observe_us(elapsed);
+            if outcome.changed_nodes.len() != 1 {
+                return None;
+            }
+            editor.undo().ok()?;
+            let restored_content = editor
+                .document()
+                .block(point)
+                .map(|block| block.content.clone());
+            if restored_content.as_ref() != Some(&before_content)
+                || editor.document().block_count() != baseline_block_count
+                || editor.selection() != selection
+            {
+                return None;
+            }
+            Some(())
+        });
+        outcome?;
+    }
+
+    if editor.read(cx).document().semantic_snapshot() != baseline {
+        return None;
+    }
+    Some(WorkloadReport {
+        transaction_histogram,
+        full_document_verifications: 1,
+    })
 }
 
 fn sample_document() -> Document {
@@ -1518,6 +1895,85 @@ mod tests {
     use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext, point};
     use std::mem::size_of;
 
+    #[test]
+    fn task7_cli_requires_strict_fixture_and_absolute_output_paths() {
+        assert!(!measurement_options_requested(&["--evernote-spike".into()]));
+        assert!(measurement_options_requested(&[
+            "--evernote-spike".into(),
+            "--fixture".into(),
+        ]));
+        let options = parse_spike_options(&[
+            "--evernote-spike".into(),
+            "--fixture".into(),
+            "typical".into(),
+            "--ready-file".into(),
+            "/tmp/task7-ready".into(),
+            "--diagnostics-file".into(),
+            "/tmp/task7-diagnostics".into(),
+        ])
+        .expect("complete Task 7 CLI should parse");
+        assert_eq!(options.fixture, FixtureKind::Typical);
+        assert!(parse_spike_options(&["--evernote-spike".into()]).is_err());
+        assert!(
+            parse_spike_options(&[
+                "--evernote-spike".into(),
+                "--fixture".into(),
+                "nope".into(),
+                "--ready-file".into(),
+                "/tmp/r".into(),
+                "--diagnostics-file".into(),
+                "/tmp/d".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_spike_options(&[
+                "--evernote-spike".into(),
+                "--fixture".into(),
+                "empty".into(),
+                "--ready-file".into(),
+                "relative-ready".into(),
+                "--diagnostics-file".into(),
+                "/tmp/d".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[gpui::test]
+    fn typical_fixture_populates_two_hundred_text_or_list_blocks_and_ten_images(
+        cx: &mut TestAppContext,
+    ) {
+        let editor = cx.new(|cx| EditorCore::new(build_document(FixtureKind::Typical), cx));
+        editor
+            .update(cx, |editor, _| populate_typical_images(editor))
+            .expect("typical fixture images should insert through production path");
+        let (text_or_list_count, image_count, resources) = editor.update(cx, |editor, _| {
+            let document = editor.document();
+            let text_or_list_count = document
+                .blocks()
+                .into_iter()
+                .filter(|block| block.content.as_text().is_some_and(|text| !text.is_empty()))
+                .count();
+            let mut resources = std::collections::BTreeSet::new();
+            let image_count = document
+                .blocks()
+                .into_iter()
+                .filter_map(|block| match &block.content {
+                    crate::native_editor::model::BlockContent::Image { resource_id, .. } => {
+                        resources.insert(resource_id.clone());
+                        Some(())
+                    }
+                    _ => None,
+                })
+                .count();
+            (text_or_list_count, image_count, resources)
+        });
+        assert_eq!(text_or_list_count, 200);
+        assert_eq!(image_count, typical_image_count());
+        assert_eq!(resources.len(), typical_image_count());
+    }
+
     fn redraw(cx: &mut VisualTestContext) {
         cx.update(|window, app| window.draw(app).clear());
         cx.run_until_parked();
@@ -1563,6 +2019,7 @@ mod tests {
             pointer_anchor: None,
             drop_point: None,
             more_trigger_bounds: None,
+            measurement: None,
         }
     }
 
@@ -1876,6 +2333,7 @@ mod tests {
             pointer_anchor: None,
             drop_point: None,
             more_trigger_bounds: None,
+            measurement: None,
         }
     }
 
@@ -1900,6 +2358,7 @@ mod tests {
             pointer_anchor: None,
             drop_point: None,
             more_trigger_bounds: None,
+            measurement: None,
         }
     }
 
@@ -1933,6 +2392,7 @@ mod tests {
             pointer_anchor: None,
             drop_point: None,
             more_trigger_bounds: None,
+            measurement: None,
         }
     }
 
@@ -1969,6 +2429,7 @@ mod tests {
             pointer_anchor: None,
             drop_point: None,
             more_trigger_bounds: None,
+            measurement: None,
         }
     }
 
@@ -1990,6 +2451,7 @@ mod tests {
             pointer_anchor: None,
             drop_point: None,
             more_trigger_bounds: None,
+            measurement: None,
         }
     }
 
@@ -2026,6 +2488,7 @@ mod tests {
             pointer_anchor: None,
             drop_point: None,
             more_trigger_bounds: None,
+            measurement: None,
         }
     }
 
