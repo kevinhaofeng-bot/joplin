@@ -16,6 +16,10 @@ use super::images::{BudgetedImageCache, proxy_max_edge_for_viewport};
 use super::layout::{BlockLayout, ordered_number_summary};
 use super::model::{BlockKind, Document, NodeId, Selection};
 
+pub(crate) fn image_proxy_max_edge_for_bounds(width: f32, height: f32, scale_factor: f32) -> u32 {
+    proxy_max_edge_for_viewport(width.max(height), scale_factor)
+}
+
 #[derive(Clone)]
 struct RenderBlock {
     layout: BlockLayout,
@@ -184,8 +188,9 @@ fn paint_snapshot(
             cache.set_visible_resources(visible_resources.iter().copied());
             for block in snapshot.blocks.iter().filter(|block| block.is_image) {
                 if let Some(resource) = block.image_resource.as_ref() {
-                    let max_edge = proxy_max_edge_for_viewport(
+                    let max_edge = image_proxy_max_edge_for_bounds(
                         f32::from(block.layout.bounds.size.width),
+                        f32::from(block.layout.bounds.size.height),
                         window.scale_factor(),
                     );
                     cache.request_edge(resource, max_edge);
@@ -412,6 +417,16 @@ mod tests {
         Affinity, BlockKind, DocPoint, Mark, Selection, TextAlignment,
     };
     use crate::native_editor::transaction::Transaction;
+
+    #[test]
+    fn portrait_image_proxy_covers_rendered_device_height() {
+        let portrait_height = 680.0 * 1600.0 / 900.0;
+        assert_eq!(
+            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0),
+            2418
+        );
+        assert_eq!(image_proxy_max_edge_for_bounds(680.0, 400.0, 2.0), 1360);
+    }
 
     #[gpui::test]
     fn nested_ordered_items_continue_the_parent_sequence(cx: &mut gpui::TestAppContext) {

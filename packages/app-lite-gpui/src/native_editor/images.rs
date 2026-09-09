@@ -774,6 +774,7 @@ pub struct BudgetedImageCache {
     pending_retries: HashMap<u64, (u64, Resource)>,
     promotions: HashMap<u64, PendingPromotion>,
     promotion_failures: HashSet<(u64, u32)>,
+    promotion_deferred: HashSet<u64>,
     requested_edges: HashMap<u64, u32>,
     harvested_generations: HashSet<(u64, u64)>,
     next_generation: u64,
@@ -798,6 +799,7 @@ impl BudgetedImageCache {
             pending_retries: HashMap::new(),
             promotions: HashMap::new(),
             promotion_failures: HashSet::new(),
+            promotion_deferred: HashSet::new(),
             requested_edges: HashMap::new(),
             harvested_generations: HashSet::new(),
             next_generation: 0,
@@ -830,6 +832,7 @@ impl BudgetedImageCache {
             cache.pending_retries.clear();
             cache.promotions.clear();
             cache.promotion_failures.clear();
+            cache.promotion_deferred.clear();
             cache.requested_edges.clear();
             cache.harvested_generations.clear();
             #[cfg(test)]
@@ -904,6 +907,7 @@ impl BudgetedImageCache {
         if next != self.visible {
             self.visible = next;
             self.deferred.clear();
+            self.promotion_deferred.clear();
             self.promotion_failures
                 .retain(|(key, _)| self.visible.contains(key));
             self.requested_edges
@@ -917,10 +921,16 @@ impl BudgetedImageCache {
     pub fn request_edge(&mut self, resource: &Resource, max_edge: u32) {
         let key = hash(resource);
         let max_edge = quantize_proxy_edge(max_edge);
-        self.requested_edges.insert(key, max_edge);
-        // A materially larger request is an explicit opportunity to retry a
-        // promotion that previously failed, while repeated paint requests for
-        // the same edge remain quiet until the caller changes the request.
+        let previous = self.requested_edges.insert(key, max_edge);
+        if previous != Some(max_edge) {
+            self.deferred.remove(&key);
+            self.promotion_deferred.remove(&key);
+            self.promotion_failures
+                .retain(|(failed_key, _)| *failed_key != key);
+        }
+        // An edge change is an explicit opportunity to retry a deferred
+        // admission/promotion, while repeated paint requests for the same
+        // edge remain quiet.
         self.promotion_failures
             .retain(|(failed_key, failed_edge)| *failed_key != key || *failed_edge >= max_edge);
     }
@@ -944,6 +954,7 @@ impl BudgetedImageCache {
             };
             self.lru.retain(|candidate| *candidate != key);
             self.requested_edges.remove(&key);
+            self.promotion_deferred.remove(&key);
             self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
             dropped_bytes = dropped_bytes.saturating_add(entry.decoded_bytes);
             if let Some(Ok(image)) = entry.item.get() {
@@ -973,6 +984,9 @@ impl BudgetedImageCache {
     pub fn invalidate(&mut self, resource: &Resource, window: &mut Window, cx: &mut App) {
         let key = hash(resource);
         self.deferred.remove(&key);
+        self.promotion_deferred.remove(&key);
+        self.promotion_failures
+            .retain(|(failed_key, _)| *failed_key != key);
         if let Some(entry) = self.entries.remove(&key) {
             if matches!(&entry.item, ImageCacheItem::Loading(_)) {
                 // Paint may have already attempted the retry while the shared
@@ -1097,8 +1111,14 @@ impl BudgetedImageCache {
                                         .used_bytes
                                         .saturating_sub(old_bytes)
                                         .saturating_add(decoded_bytes);
+                                    let actual_edge = Self::image_max_edge(&image);
                                     entry.decoded_bytes = decoded_bytes;
-                                    entry.proxy_max_edge = promotion.proxy_max_edge;
+                                    entry.proxy_max_edge = actual_edge;
+                                    if promotion.proxy_max_edge > actual_edge {
+                                        cache.promotion_deferred.insert(key);
+                                    } else {
+                                        cache.promotion_deferred.remove(&key);
+                                    }
                                     entry.item = ImageCacheItem::Loaded(Ok(image));
                                     cache.entries.insert(key, entry);
                                     cache.lru.push_back(key);
@@ -1141,6 +1161,16 @@ impl BudgetedImageCache {
             })
             .collect::<Vec<_>>();
         checked_decoded_bytes(&frames)
+    }
+
+    fn image_max_edge(image: &RenderImage) -> u32 {
+        (0..image.frame_count())
+            .map(|index| {
+                let size = image.size(index);
+                u32::from(size.width).max(u32::from(size.height))
+            })
+            .max()
+            .unwrap_or(1)
     }
 
     fn bounded_svg_dimensions(
@@ -1532,6 +1562,7 @@ impl BudgetedImageCache {
                 return false;
             };
             if let Some(mut entry) = self.entries.remove(&oldest) {
+                self.promotion_deferred.remove(&oldest);
                 self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
                 if let Some(Ok(image)) = entry.item.get() {
                     self.record_drop_image();
@@ -1623,6 +1654,15 @@ impl ImageCache for BudgetedImageCache {
                 .get_mut(&key)
                 .and_then(|entry| entry.item.get());
         }
+        if self.promotion_deferred.contains(&key) {
+            // The last decode was bounded by available capacity. Keep the
+            // actual proxy drawable without retrying it on every paint; a
+            // visible-set/capacity change clears this gate.
+            return self
+                .entries
+                .get_mut(&key)
+                .and_then(|entry| entry.item.get());
+        }
         let should_promote = self.entries.get(&key).is_some_and(|entry| {
             max_edge > entry.proxy_max_edge && matches!(entry.item, ImageCacheItem::Loaded(Ok(_)))
         });
@@ -1666,6 +1706,13 @@ impl ImageCache for BudgetedImageCache {
                     self.lru.push_back(key);
                     return Some(Err(error));
                 }
+                let actual_edge = Self::image_max_edge(image);
+                entry.proxy_max_edge = actual_edge;
+                if max_edge > actual_edge {
+                    self.promotion_deferred.insert(key);
+                } else {
+                    self.promotion_deferred.remove(&key);
+                }
                 self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
                 if !self.evict_until_fit(bytes, cx, window) {
                     self.record_drop_image();
@@ -1673,6 +1720,7 @@ impl ImageCache for BudgetedImageCache {
                     // Capacity pressure is a deferred admission, not a
                     // decode failure. Drop the proxy and retry only after a
                     // visible-set or capacity change.
+                    self.promotion_deferred.remove(&key);
                     self.deferred.insert(key);
                     return None;
                 }
@@ -1805,6 +1853,18 @@ impl ImageCache for BudgetedImageCache {
                                     }
                                     entity_cx.notify();
                                     return;
+                                }
+                                let requested_edge = cache
+                                    .requested_edges
+                                    .get(&key)
+                                    .copied()
+                                    .unwrap_or(entry.proxy_max_edge);
+                                let actual_edge = Self::image_max_edge(&image);
+                                entry.proxy_max_edge = actual_edge;
+                                if requested_edge > actual_edge {
+                                    cache.promotion_deferred.insert(key);
+                                } else {
+                                    cache.promotion_deferred.remove(&key);
                                 }
                                 cache.used_bytes = cache.used_bytes.saturating_add(decoded_bytes);
                                 cache.update_peak_accounted_bytes();
@@ -2057,6 +2117,28 @@ mod tests {
         assert_eq!(proxy_max_edge_for_viewport(0.0, 2.0), 1);
         assert_eq!(proxy_max_edge_for_viewport(680.0, 0.0), 1);
         assert_eq!(proxy_max_edge_for_viewport(f32::NAN, 2.0), 1);
+    }
+
+    #[test]
+    fn request_edge_change_clears_deferred_retry_gates() {
+        let resource = Resource::from(PathBuf::from("/tmp/request-edge-change.png"));
+        let key = hash(&resource);
+        let mut cache = BudgetedImageCache::new(1024);
+        cache.request_edge(&resource, 1360);
+        cache.deferred.insert(key);
+        cache.promotion_deferred.insert(key);
+        cache.promotion_failures.insert((key, 1360));
+
+        cache.request_edge(&resource, 680);
+
+        assert!(!cache.deferred.contains(&key));
+        assert!(!cache.promotion_deferred.contains(&key));
+        assert!(
+            !cache
+                .promotion_failures
+                .iter()
+                .any(|(failed_key, _)| *failed_key == key)
+        );
     }
 
     #[test]
@@ -2505,6 +2587,103 @@ mod tests {
                 let size = image.size(0);
                 assert!(u32::from(size.width).max(u32::from(size.height)) > old_edge);
                 assert_eq!(cache.in_flight_for_test(), 0);
+            });
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn production_cache_retries_same_edge_after_budget_is_freed(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "joplin-lite-cache-promotion-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("promotion budget fixture directory");
+        let filler_path = root.join("filler.png");
+        let target_path = root.join("target.png");
+        let mut filler = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            1600,
+            1600,
+            Rgba([0x11, 0x22, 0x33, 0xff]),
+        ))
+        .write_to(&mut filler, image::ImageFormat::Png)
+        .expect("filler fixture should encode");
+        let mut target = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            4096,
+            4096,
+            Rgba([0x44, 0x55, 0x66, 0xff]),
+        ))
+        .write_to(&mut target, image::ImageFormat::Png)
+        .expect("target fixture should encode");
+        std::fs::write(&filler_path, filler.into_inner()).expect("filler fixture should write");
+        std::fs::write(&target_path, target.into_inner()).expect("target fixture should write");
+        let filler_resource = Resource::from(filler_path.clone());
+        let target_resource = Resource::from(target_path.clone());
+        let budget = 16 * 1024 * 1024;
+        let cache = cx.update(|app| BudgetedImageCache::new_entity(app, budget));
+        let window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&filler_resource, &target_resource]);
+                cache.request_edge(&filler_resource, 1600);
+                assert!(cache.load(&filler_resource, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                assert!(cache.load(&filler_resource, window, entity_cx).is_some());
+                cache.request_edge(&target_resource, 3000);
+                assert!(cache.load(&target_resource, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        let first_edge = window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let image = cache
+                    .load(&target_resource, window, entity_cx)
+                    .expect("budgeted target should settle")
+                    .expect("budgeted target should decode");
+                let size = image.size(0);
+                u32::from(size.width).max(u32::from(size.height))
+            })
+        });
+        assert!(
+            first_edge < 3000,
+            "target should be budget-limited initially"
+        );
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&target_resource]);
+                cache.evict_offscreen(window, entity_cx);
+                assert!(cache.used_bytes() < budget);
+                let image = cache
+                    .load(&target_resource, window, entity_cx)
+                    .expect("target should stay drawable while retry is scheduled")
+                    .expect("target proxy should remain valid");
+                let size = image.size(0);
+                assert_eq!(
+                    u32::from(size.width).max(u32::from(size.height)),
+                    first_edge
+                );
+                assert_eq!(cache.in_flight_for_test(), 1);
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let image = cache
+                    .load(&target_resource, window, entity_cx)
+                    .expect("same edge promotion should settle")
+                    .expect("same edge promotion should decode");
+                let size = image.size(0);
+                assert!(u32::from(size.width).max(u32::from(size.height)) > first_edge);
+                assert_eq!(cache.in_flight_for_test(), 0);
+                assert!(cache.peak_accounted_bytes() <= budget);
             });
         });
         let _ = std::fs::remove_dir_all(root);
