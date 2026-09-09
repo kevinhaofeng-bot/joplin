@@ -2020,7 +2020,7 @@ mod tests {
     use super::*;
     use crate::components::{self, Copy, Cut};
     use crate::native_editor::fixtures::typical_image_payload;
-    use crate::native_editor::images::ImagePayload;
+    use crate::native_editor::images::{ImagePayload, VIEWPORT_IMAGE_PROXY_MAX_EDGE};
     use gpui::{
         AppContext, ImageCache, Modifiers, Resource, TestAppContext, VisualTestContext, point,
     };
@@ -2176,7 +2176,9 @@ mod tests {
         let cache =
             cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
         let mut window = cx.add_empty_window();
-        let expected_minimum = 1600usize * 900 * 4;
+        let expected_minimum = VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize
+            * (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize * 900 / 1600)
+            * 4;
         for path in &paths {
             let resource = Resource::from(path.clone());
             window.update(|window, app| {

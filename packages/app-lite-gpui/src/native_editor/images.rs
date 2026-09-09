@@ -21,6 +21,9 @@ use smallvec::SmallVec;
 
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
 const MACOS_PROXY_MAX_EDGE: u32 = 1600;
+/// The editor surface is 680pt wide in the spike. Keep the retained native
+/// proxy viewport-sized while preserving the image node's natural metadata.
+pub const VIEWPORT_IMAGE_PROXY_MAX_EDGE: u32 = 1024;
 const CONSERVATIVE_PROXY_RESERVATION: usize = 4 * 1024 * 1024;
 
 #[cfg(target_os = "macos")]
@@ -1146,7 +1149,7 @@ impl BudgetedImageCache {
             .and_then(|bytes| bytes.checked_div(4))
             .ok_or_else(|| ImageCacheError::from(anyhow!("decoded image budget is too small")))?;
         let budget_edge = (max_pixels_per_frame as f64).sqrt().floor() as u32;
-        let max_edge = MACOS_PROXY_MAX_EDGE.min(budget_edge.max(1));
+        let max_edge = VIEWPORT_IMAGE_PROXY_MAX_EDGE.min(budget_edge.max(1));
         let create_thumbnail = CFBoolean::new(true);
         let transform = CFBoolean::new(true);
         let should_cache = CFBoolean::new(false);
