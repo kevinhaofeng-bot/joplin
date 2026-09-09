@@ -38,7 +38,7 @@ use crate::native_editor::model::{
 };
 use crate::native_editor::transaction::Transaction;
 
-gpui::actions!(evernote_spike, [SubmitLink, CancelLink, RetryImages]);
+gpui::actions!(evernote_spike, [SubmitLink, CancelLink]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpikeRouteContract {
@@ -439,40 +439,24 @@ impl SpikeView {
         }
     }
 
-    fn on_retry_images(
+    fn retry_image_by_id(
         &mut self,
-        _action: &RetryImages,
+        resource_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let retry_paths = self.editor.update(cx, |editor, _| {
-            let paths = editor
-                .document()
-                .blocks()
-                .into_iter()
-                .filter_map(|block| match &block.content {
-                    crate::native_editor::model::BlockContent::Image { resource_id, .. } => editor
-                        .image_source_path(&resource_id)
-                        .map(|path| (resource_id.clone(), path.to_path_buf())),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            paths
-                .into_iter()
-                .filter_map(|(resource_id, path)| {
-                    editor.retry_image_resource(&resource_id).then_some(path)
-                })
-                .collect::<Vec<_>>()
+        let retry_path = self.editor.update(cx, |editor, _| {
+            editor
+                .retry_image_resource(resource_id)
+                .then(|| editor.image_source_path(resource_id).map(PathBuf::from))
+                .flatten()
         });
-        if let Some(cache) = self.image_cache.as_ref() {
-            cache.update(cx, |cache, cache_cx| {
-                for path in &retry_paths {
-                    let resource = gpui::Resource::from(path.clone());
-                    cache.invalidate(&resource, window, cache_cx);
-                }
-            });
-        }
-        if !retry_paths.is_empty() {
+        if let Some(path) = retry_path {
+            if let Some(cache) = self.image_cache.as_ref() {
+                cache.update(cx, |cache, cache_cx| {
+                    cache.invalidate(&gpui::Resource::from(path), window, cache_cx);
+                });
+            }
             cx.notify();
         }
     }
@@ -953,6 +937,20 @@ impl SpikeView {
             cx.propagate();
             return;
         }
+        if !event.modifiers.shift {
+            let failed_resource = self.editor.update(cx, |editor, _| {
+                let resource_id = editor.image_resource_at_layout(event.position)?;
+                (editor.image_state(&resource_id)
+                    == Some(crate::native_editor::images::ImageNodeState::Failed))
+                .then_some(resource_id)
+            });
+            if let Some(resource_id) = failed_resource {
+                self.retry_image_by_id(&resource_id, window, cx);
+                focus_editor(&self.editor, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         let extend = event.modifiers.shift;
         self.pointer_anchor = self.editor.update(cx, |editor, editor_cx| {
             let anchor = editor.begin_pointer_selection(event.position, extend);
@@ -1073,7 +1071,6 @@ impl SpikeView {
             .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
             .capture_any_mouse_down(cx.listener(Self::on_surface_mouse_down))
             .on_key_down(cx.listener(Self::on_surface_key_down))
-            .on_action(cx.listener(Self::on_retry_images))
             .on_mouse_move(cx.listener(Self::on_surface_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_surface_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_surface_mouse_up));
@@ -1264,18 +1261,12 @@ fn apply_paste_intent_at(
                 editor.insert_image_payload(payload)
             }
         }
-        PasteIntent::File { path, cleanup } => {
+        PasteIntent::File { path, cleanup: _ } => {
             let result = if let Some(point) = drop_point {
                 editor.insert_image_path_at(&path, Selection::caret(point))
             } else {
                 editor.insert_image_path(&path)
             };
-            if cleanup
-                && let Err(error) = std::fs::remove_file(&path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                eprintln!("failed to remove temporary pasteboard image {path:?}: {error}");
-            }
             result
         }
         PasteIntent::Text { text } => editor.paste_plain_text(&text),
@@ -1287,7 +1278,20 @@ fn apply_clipboard_payload(
     editor: &mut EditorCore,
     payload: ClipboardPayload,
 ) -> Result<(), DocumentError> {
-    apply_paste_intent(editor, classify_clipboard(payload))
+    let owned_temporary_files = payload.temporary_files.clone();
+    let result = apply_paste_intent(editor, classify_clipboard(payload));
+    cleanup_owned_temporary_files(&owned_temporary_files);
+    result
+}
+
+fn cleanup_owned_temporary_files(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("failed to remove owned temporary pasteboard image {path:?}: {error}");
+        }
+    }
 }
 
 fn apply_drop_paths(editor: &mut EditorCore, paths: &[PathBuf]) -> Result<(), DocumentError> {
@@ -1510,12 +1514,22 @@ fn bind_donor_actions(
 mod tests {
     use super::*;
     use crate::components::{self, Copy, Cut};
+    use crate::native_editor::images::ImagePayload;
     use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext, point};
     use std::mem::size_of;
 
     fn redraw(cx: &mut VisualTestContext) {
         cx.update(|window, app| window.draw(app).clear());
         cx.run_until_parked();
+    }
+
+    fn valid_png_bytes() -> Vec<u8> {
+        ClipboardPayload::fixture_with_png_and_text("")
+            .images
+            .into_iter()
+            .next()
+            .expect("fixture image")
+            .bytes
     }
 
     fn build_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
@@ -1583,6 +1597,48 @@ mod tests {
         assert_eq!(image_count, 2);
         let _ = std::fs::remove_file(path);
 
+        let unselected_native_temp = std::env::temp_dir().join(format!(
+            "joplin-lite-task6-unselected-temp-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&unselected_native_temp, valid_png_bytes())
+            .expect("owned native temporary should be writable");
+        let merged_mixed_payload = resolve_clipboard_payload(
+            Some(ClipboardPayload {
+                temporary_files: vec![unselected_native_temp.clone()],
+                ..Default::default()
+            }),
+            Some(ClipboardPayload {
+                images: vec![ImagePayload::new(gpui::ImageFormat::Png, valid_png_bytes())],
+                text: Some("图像占位符".into()),
+                ..Default::default()
+            }),
+        )
+        .expect("mixed native and GPUI clipboard payload should resolve");
+        apply_clipboard_payload(&mut editor, merged_mixed_payload)
+            .expect("image representation should be selected");
+        assert!(
+            !unselected_native_temp.exists(),
+            "unselected owned temporary must be collected after image selection"
+        );
+
+        let rejected_native_temp = std::env::temp_dir().join(format!(
+            "joplin-lite-task6-rejected-temp-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&rejected_native_temp, valid_png_bytes())
+            .expect("owned rejected temporary should be writable");
+        apply_clipboard_payload(
+            &mut editor,
+            ClipboardPayload {
+                temporary_files: vec![rejected_native_temp.clone()],
+                html: Some("<img src=\"https://example.invalid/not-owned.png\">".into()),
+                ..Default::default()
+            },
+        )
+        .expect("unsupported HTML should be a non-error fallback");
+        assert!(!rejected_native_temp.exists());
+
         let pasteboard_path = std::env::temp_dir().join(format!(
             "joplin-lite-task6-pasteboard-{}.png",
             std::process::id()
@@ -1608,6 +1664,56 @@ mod tests {
             !pasteboard_path.exists(),
             "temporary pasteboard file is cleaned up"
         );
+    }
+
+    #[gpui::test]
+    fn failed_image_click_retries_only_the_target_resource(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(build_view);
+        let resource_ids = view.update(cx, |view, view_cx| {
+            view.editor.update(view_cx, |editor, _| {
+                for _ in 0..2 {
+                    editor
+                        .insert_image_payload(ImagePayload::new(
+                            gpui::ImageFormat::Png,
+                            valid_png_bytes(),
+                        ))
+                        .expect("fixture image should insert");
+                }
+                let ids = editor
+                    .document()
+                    .blocks()
+                    .into_iter()
+                    .filter_map(|block| match &block.content {
+                        crate::native_editor::model::BlockContent::Image {
+                            resource_id, ..
+                        } => Some(resource_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                for id in &ids {
+                    assert!(editor.mark_image_failed(id));
+                }
+                ids
+            })
+        });
+        let target = resource_ids.first().expect("target image").clone();
+        cx.update(|window, app| {
+            view.update(app, |view, view_cx| {
+                view.retry_image_by_id(&target, window, view_cx);
+            });
+        });
+        view.read_with(cx, |view, app| {
+            assert_eq!(
+                view.editor.read(app).image_state(&target),
+                Some(crate::native_editor::images::ImageNodeState::Loading)
+            );
+            assert_eq!(
+                view.editor
+                    .read(app)
+                    .image_state(resource_ids.get(1).expect("second image")),
+                Some(crate::native_editor::images::ImageNodeState::Failed)
+            );
+        });
     }
 
     fn build_long_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {

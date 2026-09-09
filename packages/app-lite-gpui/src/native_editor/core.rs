@@ -1306,6 +1306,19 @@ impl EditorCore {
         Some(self.snap_layout_point(point))
     }
 
+    /// Return the stable resource id when a layout hit lands on an image
+    /// block. The caller can use this for targeted retry actions without
+    /// scanning every image in the document.
+    pub(crate) fn image_resource_at_layout(&mut self, position: Point<Pixels>) -> Option<String> {
+        let point = self.point_from_layout(position)?;
+        self.document
+            .block(point.node_id)
+            .and_then(|block| match &block.content {
+                BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            })
+    }
+
     pub(crate) fn begin_pointer_selection(
         &mut self,
         position: Point<Pixels>,

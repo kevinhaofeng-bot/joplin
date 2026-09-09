@@ -235,11 +235,11 @@ pub fn resolve_clipboard_payload(
         } else {
             native.file_urls
         },
-        temporary_files: if native.temporary_files.is_empty() {
-            gpui.temporary_files
-        } else {
-            native.temporary_files
-        },
+        temporary_files: native
+            .temporary_files
+            .into_iter()
+            .chain(gpui.temporary_files)
+            .collect(),
         html: native.html.or(gpui.html),
         rich_text: native.rich_text.or(gpui.rich_text),
         text: native.text.or(gpui.text),
