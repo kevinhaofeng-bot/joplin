@@ -571,19 +571,34 @@ impl BlockSequence {
         let keys = FractionalIndex::generate_n_evenly(None, None, blocks.len())
             .expect("initial document keys have unbounded space");
         let mut items = Vec::with_capacity(blocks.len());
-        let mut node_keys = TreeMap::default();
-        let mut editable_keys = TreeMap::default();
-        let mut text_keys = TreeMap::default();
+        let mut node_entries = Vec::with_capacity(blocks.len());
+        let mut editable_entries = Vec::new();
+        let mut text_entries = Vec::new();
         for (block, key) in blocks.into_iter().zip(keys) {
-            node_keys.insert(block.id, key.clone());
+            node_entries.push((block.id, key.clone()));
             if is_navigation_block(&block) {
-                editable_keys.insert(key.clone(), block.id);
+                editable_entries.push((key.clone(), block.id));
             }
             if block.content.as_text().is_some() {
-                text_keys.insert(key.clone(), block.id);
+                text_entries.push((key.clone(), block.id));
             }
             items.push(BlockItem::new(block, BlockKey(key)));
         }
+        // Document order is not a valid ordering for this identity map: a
+        // restored document may legally contain non-monotonic NodeIds. Sort
+        // the entries by the map key before using GPUI's ordered bulk
+        // constructor, preserving lookup semantics without persistent
+        // one-entry-at-a-time construction.
+        node_entries.sort_unstable_by_key(|(node_id, _)| *node_id);
+        let node_keys = TreeMap::from_ordered_entries(node_entries);
+        let pure_text =
+            items.len() == editable_entries.len() && editable_entries.len() == text_entries.len();
+        let editable_keys = TreeMap::from_ordered_entries(editable_entries);
+        let text_keys = if pure_text {
+            editable_keys.clone()
+        } else {
+            TreeMap::from_ordered_entries(text_entries)
+        };
         Self {
             tree: SumTree::from_iter(items, ()),
             node_keys,

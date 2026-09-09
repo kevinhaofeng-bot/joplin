@@ -1845,6 +1845,18 @@ fn retained_sum_tree_allocations_scale_for_10k_and_100k_documents() {
         small_construct as f64 / 10_000.0,
         large_construct as f64 / 100_000.0,
     );
+    // These limits are intentionally below the pre-bulk-build construction
+    // measurements. They cover the complete Document construction interval,
+    // while peak retained remains a separate diagnostic for transient input
+    // and persistent-tree paths.
+    assert!(
+        small_construct < 8_500_000 && large_construct < 84_000_000,
+        "whole-document retained construction regressed: 10k={small_construct} 100k={large_construct}"
+    );
+    assert!(
+        small_allocated < 50_000_000 && large_allocated < 400_000_000,
+        "whole-document cumulative construction allocation regressed: 10k={small_allocated} 100k={large_allocated}"
+    );
     assert!(
         large_inline <= small_inline.saturating_mul(4).saturating_add(256 * 1024),
         "inline retained allocation scaled with N: 10k={small_inline}, 100k={large_inline}"
@@ -4310,6 +4322,7 @@ async fn editor_core_edit_next_layout_and_directional_navigation_scale(
         });
         let node = entity.read_with(cx, |editor, _| editor.document().blocks()[middle].id);
         reset_block_sequence_visit_counter();
+        let measurement = AllocationMeasurement::begin();
         let (visits, layout_scan, height_work, left_index, right_index) = cx.update(|_, app| {
             entity.update(app, |editor, _| {
                 let before_scan = editor.layout.layout_scan_count();
@@ -4379,17 +4392,21 @@ async fn editor_core_edit_next_layout_and_directional_navigation_scale(
                 )
             })
         });
+        let allocated = measurement.bytes();
+        drop(measurement);
         assert_eq!(left_index, middle - 1);
         assert_eq!(right_index, middle + 1);
-        (visits, layout_scan, height_work)
+        (allocated, visits, layout_scan, height_work)
     };
 
     let small = measure(10_000, &mut cx);
     let large = measure(100_000, &mut cx);
     println!("editor core edit/layout/navigation work: 10k={small:?} 100k={large:?}");
-    assert!(small.0 < 512 && large.0 < 512);
-    assert!(small.1 < 16 && large.1 < 16);
+    assert!(small.0 < 4 * 1024 * 1024 && large.0 < 4 * 1024 * 1024);
+    assert!(small.1 < 512 && large.1 < 512);
     assert!(small.2 < 16 && large.2 < 16);
+    assert!(small.3 < 16 && large.3 < 16);
+    assert!(large.0 <= small.0.saturating_mul(4).saturating_add(512 * 1024));
 }
 
 #[gpui::test]
@@ -4408,6 +4425,7 @@ async fn entity_input_callbacks_keep_large_document_ranges_local(cx: &mut gpui::
         });
 
         reset_block_sequence_visit_counter();
+        let measurement = AllocationMeasurement::begin();
         let (actual_range, selected, marked, bounds, point_index, visits) =
             cx.update(|window, app| {
                 entity.update(app, |editor, editor_cx| {
@@ -4473,6 +4491,8 @@ async fn entity_input_callbacks_keep_large_document_ranges_local(cx: &mut gpui::
                     )
                 })
             });
+        let allocated = measurement.bytes();
+        drop(measurement);
 
         assert_eq!(actual_range, Some(query_start..query_start + 1));
         assert_eq!(selected.range, query_start..query_start);
@@ -4485,13 +4505,306 @@ async fn entity_input_callbacks_keep_large_document_ranges_local(cx: &mut gpui::
             assert!(bounds.size.width >= px(0.0) && bounds.size.height >= px(0.0));
         }
         assert!(point_index.is_some());
-        (visits, selected.range, marked)
+        (allocated, visits, selected.range, marked)
     };
 
     let small = measure(10_000, &mut cx);
     let large = measure(100_000, &mut cx);
     println!("entity input callback work: 10k={small:?} 100k={large:?}");
-    assert!(small.0 < 512 && large.0 < 512);
+    assert!(small.0 < 4 * 1024 * 1024 && large.0 < 4 * 1024 * 1024);
+    assert!(small.1 < 512 && large.1 < 512);
+    assert!(large.0 <= small.0.saturating_mul(4).saturating_add(512 * 1024));
+}
+
+#[gpui::test]
+async fn entity_input_full_composition_frame_stays_local_for_large_documents(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let measure = |block_count: usize, cx: &mut gpui::VisualTestContext| {
+        let document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let left_index = block_count / 2;
+        let left = document
+            .block_at_index(left_index)
+            .expect("left composition block");
+        let right = document
+            .block_at_index(left_index + 1)
+            .expect("right composition block");
+        let left_len = left.content.as_text().expect("left text").len();
+        let start_utf8 = document
+            .flat_offset_for_point(DocPoint::with_affinity(
+                left.id,
+                left_len.saturating_sub(1),
+                Affinity::Before,
+            ))
+            .expect("cross-block start");
+        let end_utf8 = document
+            .flat_offset_for_point(DocPoint::with_affinity(right.id, 1, Affinity::After))
+            .expect("cross-block end");
+        let start_utf16 = document.utf8_to_utf16_offset(start_utf8);
+        let end_utf16 = document.utf8_to_utf16_offset(end_utf8);
+        let entity = cx.new(|cx| EditorCore::new(document, cx));
+        cx.update(|_, app| {
+            entity.update(app, |editor, _| {
+                editor.select_document_range(start_utf8, end_utf8);
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+            });
+        });
+
+        reset_block_sequence_visit_counter();
+        let before_scan = entity.read_with(cx, |editor, _| editor.layout.layout_scan_count());
+        let before_height =
+            entity.read_with(cx, |editor, _| editor.layout.height_index_work_count());
+        let measurement = AllocationMeasurement::begin();
+        let (
+            visits,
+            layout_scan,
+            height_work,
+            candidate_blocks,
+            committed_blocks,
+            undo_blocks,
+            redo_blocks,
+            cancelled_blocks,
+        ) = cx.update(|window, app| {
+            entity.update(app, |editor, editor_cx| {
+                editor
+                    .replace_and_mark_utf16(Some(start_utf16..end_utf16), "候选", Some(0..2))
+                    .expect("first cross-block candidate");
+                assert!(editor.marked_text().is_some());
+                assert_eq!(editor.undo_depth(), 1);
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+                let candidate_blocks = editor.document().block_count();
+
+                let candidate_end = start_utf16 + "候选".encode_utf16().count();
+                editor
+                    .replace_and_mark_utf16(Some(start_utf16..candidate_end), "更新", Some(0..2))
+                    .expect("second explicit-range candidate");
+                assert!(editor.marked_text().is_some());
+                assert_eq!(editor.undo_depth(), 1);
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+
+                editor.commit_marked_text("提交").expect("commit candidate");
+                assert!(editor.marked_text().is_none());
+                assert_eq!(editor.undo_depth(), 1);
+                assert_eq!(editor.redo_depth(), 0);
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+                let committed_blocks = editor.document().block_count();
+
+                editor.undo().expect("undo committed composition");
+                assert_eq!(editor.undo_depth(), 0);
+                assert_eq!(editor.redo_depth(), 1);
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+                let undo_blocks = editor.document().block_count();
+
+                editor.redo().expect("redo committed composition");
+                assert_eq!(editor.undo_depth(), 1);
+                assert_eq!(editor.redo_depth(), 0);
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+                let redo_blocks = editor.document().block_count();
+
+                // A fresh provisional candidate followed by an empty commit
+                // exercises the platform cancellation path: it must undo the
+                // provisional history entry without disturbing the committed
+                // composition or its structural block map.
+                editor
+                    .replace_and_mark_utf16(None, "取消", Some(0..2))
+                    .expect("cancellation candidate");
+                assert!(editor.marked_text().is_some());
+                assert_eq!(editor.undo_depth(), 2);
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+                editor
+                    .commit_marked_text("")
+                    .expect("cancel provisional candidate");
+                assert!(editor.marked_text().is_none());
+                assert_eq!(editor.undo_depth(), 1);
+                assert_eq!(editor.redo_depth(), 1);
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+                let cancelled_blocks = editor.document().block_count();
+
+                let _ = window;
+                let _ = editor_cx;
+                (
+                    block_sequence_visit_counter(),
+                    editor
+                        .layout
+                        .layout_scan_count()
+                        .saturating_sub(before_scan),
+                    editor
+                        .layout
+                        .height_index_work_count()
+                        .saturating_sub(before_height),
+                    candidate_blocks,
+                    committed_blocks,
+                    undo_blocks,
+                    redo_blocks,
+                    cancelled_blocks,
+                )
+            })
+        });
+        let allocated = measurement.bytes();
+        drop(measurement);
+        (
+            allocated,
+            visits,
+            layout_scan,
+            height_work,
+            candidate_blocks,
+            committed_blocks,
+            undo_blocks,
+            redo_blocks,
+            cancelled_blocks,
+        )
+    };
+
+    let small = measure(10_000, &mut cx);
+    let large = measure(100_000, &mut cx);
+    println!("full composition frame work: 10k={small:?} 100k={large:?}");
+    assert_eq!(small.4, 9_999);
+    assert_eq!(large.4, 99_999);
+    assert_eq!(small.5, small.4);
+    assert_eq!(large.5, large.4);
+    assert_eq!(small.6, 10_000);
+    assert_eq!(large.6, 100_000);
+    assert_eq!(small.7, small.5);
+    assert_eq!(large.7, large.5);
+    assert_eq!(small.8, small.7);
+    assert_eq!(large.8, large.7);
+    assert!(small.1 < 2_048 && large.1 < 2_048);
+    assert!(small.2 < 64 && large.2 < 64);
+    assert!(small.3 < 128 && large.3 < 128);
+    assert!(
+        large.0 <= small.0.saturating_mul(4).saturating_add(512 * 1024),
+        "full composition allocation scaled with the document: 10k={} 100k={}",
+        small.0,
+        large.0
+    );
+}
+
+#[test]
+fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
+    let pure = Document::from_paragraphs((0..1_024).map(|index| format!("pure-{index}")));
+    assert_eq!(
+        pure.first_text_block().map(|block| block.id),
+        Some(NodeId::new(1))
+    );
+    assert_eq!(
+        pure.last_text_block().map(|block| block.id),
+        Some(NodeId::new(1_024))
+    );
+
+    let mixed = [
+        Block {
+            id: NodeId::new(9),
+            kind: BlockKind::Paragraph,
+            content: BlockContent::text("nine"),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        },
+        Block {
+            id: NodeId::new(1),
+            kind: BlockKind::Image,
+            content: BlockContent::Image {
+                resource_id: "one".into(),
+                natural_size: (100, 100),
+                display_width: None,
+            },
+            alignment: TextAlignment::Left,
+            revision: 0,
+        },
+        Block {
+            id: NodeId::new(7),
+            kind: BlockKind::Divider,
+            content: BlockContent::Empty,
+            alignment: TextAlignment::Left,
+            revision: 0,
+        },
+        Block {
+            id: NodeId::new(3),
+            kind: BlockKind::Paragraph,
+            content: BlockContent::text("three"),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        },
+        Block {
+            id: NodeId::new(5),
+            kind: BlockKind::Image,
+            content: BlockContent::Image {
+                resource_id: "five".into(),
+                natural_size: (100, 100),
+                display_width: None,
+            },
+            alignment: TextAlignment::Left,
+            revision: 0,
+        },
+    ];
+    let mut document = Document::from_blocks(mixed.to_vec()).expect("mixed IDs are valid");
+    assert_eq!(
+        document
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>(),
+        mixed.iter().map(|block| block.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        document
+            .next_navigation_block(NodeId::new(9))
+            .map(|block| block.id),
+        Some(NodeId::new(1))
+    );
+    assert_eq!(
+        document
+            .next_navigation_block(NodeId::new(1))
+            .map(|block| block.id),
+        Some(NodeId::new(3))
+    );
+    assert_eq!(
+        document
+            .previous_text_block(NodeId::new(5))
+            .map(|block| block.id),
+        Some(NodeId::new(3))
+    );
+    assert_eq!(
+        document
+            .next_text_block(NodeId::new(9))
+            .map(|block| block.id),
+        Some(NodeId::new(3))
+    );
+
+    document
+        .apply(Transaction::RemoveNode {
+            node_id: NodeId::new(1),
+        })
+        .expect("remove image");
+    assert_eq!(
+        document
+            .next_navigation_block(NodeId::new(9))
+            .map(|block| block.id),
+        Some(NodeId::new(3))
+    );
+    document
+        .apply(Transaction::InsertImage {
+            selection: document.end_selection(),
+            resource_id: "new-image".into(),
+            natural_size: (100, 100),
+        })
+        .expect("insert image after classification divergence");
+    let last_id = document.blocks().last().expect("new image split tail").id;
+    assert_eq!(
+        document.blocks().last().map(|block| block.id),
+        Some(last_id)
+    );
+    assert!(document.previous_navigation_block(last_id).is_some());
+    assert!(document.previous_text_block(last_id).is_some());
 }
 
 #[gpui::test]
