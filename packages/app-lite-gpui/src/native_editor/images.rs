@@ -873,6 +873,54 @@ impl BudgetedImageCache {
         checked_decoded_bytes(&frames)
     }
 
+    fn bounded_svg_dimensions(
+        source_width: f32,
+        source_height: f32,
+        budget_bytes: usize,
+        max_edge: u32,
+    ) -> anyhow::Result<(u32, u32)> {
+        if !source_width.is_finite()
+            || !source_height.is_finite()
+            || source_width <= 0.0
+            || source_height <= 0.0
+            || max_edge == 0
+        {
+            return Err(anyhow!("SVG has invalid dimensions"));
+        }
+        let max_pixels = budget_bytes / 4;
+        if max_pixels == 0 {
+            return Err(anyhow!("decoded image budget is too small"));
+        }
+        let source_width = f64::from(source_width);
+        let source_height = f64::from(source_height);
+        let source_width_px = source_width.ceil() as u64;
+        let source_height_px = source_height.ceil() as u64;
+        let source_pixels = source_width_px
+            .checked_mul(source_height_px)
+            .ok_or_else(|| anyhow!("SVG dimensions overflow"))?;
+        if source_pixels == 0 {
+            return Err(anyhow!("SVG dimensions overflow"));
+        }
+        let edge_scale = (f64::from(max_edge) / source_width.max(source_height)).min(1.0);
+        let budget_scale = ((max_pixels as f64) / source_pixels as f64).sqrt().min(1.0);
+        let scale = edge_scale.min(budget_scale);
+        let mut width = (source_width * scale).floor().max(1.0) as u32;
+        let mut height = (source_height * scale).floor().max(1.0) as u32;
+        while (width as usize)
+            .checked_mul(height as usize)
+            .map_or(true, |pixels| pixels > max_pixels)
+        {
+            if width >= height && width > 1 {
+                width -= 1;
+            } else if height > 1 {
+                height -= 1;
+            } else {
+                return Err(anyhow!("SVG dimensions cannot fit decoded budget"));
+            }
+        }
+        Ok((width, height))
+    }
+
     /// Adapted from GPUI 0.2.2 `Image::to_image_data`: decode each format,
     /// resize while still in image buffers, convert RGBA to GPUI BGRA, and
     /// construct exactly one bounded `RenderImage`.
@@ -901,16 +949,21 @@ impl BudgetedImageCache {
             let tree = usvg::Tree::from_data(bytes, &usvg::Options::default())
                 .map_err(|error| anyhow!(error.to_string()))?;
             let svg_size = tree.size();
-            let mut pixmap = resvg::tiny_skia::Pixmap::new(
-                svg_size.width().ceil() as u32,
-                svg_size.height().ceil() as u32,
-            )
-            .ok_or_else(|| anyhow!("SVG renderer returned invalid size"))?;
-            resvg::render(
-                &tree,
-                resvg::tiny_skia::Transform::identity(),
-                &mut pixmap.as_mut(),
+            let (target_width, target_height) = Self::bounded_svg_dimensions(
+                svg_size.width(),
+                svg_size.height(),
+                budget_bytes,
+                MACOS_PROXY_MAX_EDGE,
+            )?;
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(target_width, target_height)
+                .ok_or_else(|| anyhow!("SVG renderer returned invalid size"))?;
+            let transform = resvg::tiny_skia::Transform::from_scale(
+                (target_width as f32 / svg_size.width())
+                    .min(target_height as f32 / svg_size.height()),
+                (target_width as f32 / svg_size.width())
+                    .min(target_height as f32 / svg_size.height()),
             );
+            resvg::render(&tree, transform, &mut pixmap.as_mut());
             vec![image::Frame::new(
                 ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())
                     .ok_or_else(|| anyhow!("SVG renderer returned invalid pixels"))?,
@@ -1321,14 +1374,22 @@ impl ImageCache for BudgetedImageCache {
         } else {
             (self.budget_bytes / 2).max(1)
         };
-        if !self.evict_until_fit(reservation_floor, cx, window) {
+        let floor_fits = self.evict_until_fit(reservation_floor, cx, window);
+        let remaining = self
+            .budget_bytes
+            .saturating_sub(self.used_bytes.saturating_add(self.reserved_bytes));
+        if !floor_fits && remaining == 0 {
             self.deferred.insert(key);
             return None;
         }
-        let reservation = self
-            .budget_bytes
-            .saturating_sub(self.used_bytes.saturating_add(self.reserved_bytes));
-        if reservation == 0 {
+        // A fixed proxy floor is only a scheduling hint. If visible retained
+        // images leave less than that floor, reserve the exact remaining
+        // bytes instead of permanently deferring a proxy that can fit.
+        let reservation = remaining;
+        // A RenderImage must contain at least one complete RGBA pixel. A
+        // smaller remainder is still capacity pressure, not a decoder error;
+        // leave it deferred until the visible set/capacity changes.
+        if reservation < 4 {
             self.deferred.insert(key);
             return None;
         }
@@ -1519,7 +1580,9 @@ unsafe fn native_rtf_string_value(data: cocoa::base::id) -> Option<String> {
         documentAttributes: nil_id
     ];
     if attributed == nil {
-        let _: () = msg_send![allocated, release];
+        // `initWithRTF:documentAttributes:` consumes the alloc/init receiver
+        // even when Foundation rejects malformed bytes. Releasing it again
+        // here is a double-release and can abort the paste action under MRC.
         return None;
     }
     let string: cocoa::base::id = msg_send![attributed, string];
@@ -1648,6 +1711,46 @@ mod tests {
         let size = image.size(0);
         assert!(u64::from(size.width) * u64::from(size.height) * 4 <= 1024 * 1024);
         assert!(u32::from(size.width) < 4096 || u32::from(size.height) < 4096);
+    }
+
+    #[test]
+    fn bounded_svg_uses_target_pixmap_for_huge_source_and_preserves_ratio() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000" height="10000"><rect width="10000" height="10000" fill="#123456"/></svg>"##;
+        let image = BudgetedImageCache::decode_bounded(svg, DECODED_IMAGE_CACHE_BUDGET)
+            .expect("SVG proxy should render without allocating the source canvas");
+        let size = image.size(0);
+        let width = u32::from(size.width);
+        let height = u32::from(size.height);
+        assert!(width.max(height) <= MACOS_PROXY_MAX_EDGE);
+        assert!(u64::from(width) * u64::from(height) * 4 <= DECODED_IMAGE_CACHE_BUDGET as u64);
+        assert_eq!((width, height), (1600, 1600));
+        let ratio = width as f64 / height as f64;
+        assert!((ratio - 1.0).abs() < 0.001);
+        assert_eq!(
+            BudgetedImageCache::bounded_svg_dimensions(
+                10_000.0,
+                10_000.0,
+                DECODED_IMAGE_CACHE_BUDGET,
+                MACOS_PROXY_MAX_EDGE,
+            )
+            .expect("bounded SVG geometry"),
+            (1600, 1600)
+        );
+    }
+
+    #[test]
+    fn bounded_svg_target_geometry_keeps_wide_aspect_ratio() {
+        let (width, height) = BudgetedImageCache::bounded_svg_dimensions(
+            10_000.0,
+            5_000.0,
+            DECODED_IMAGE_CACHE_BUDGET,
+            MACOS_PROXY_MAX_EDGE,
+        )
+        .expect("wide SVG geometry");
+        let ratio = width as f64 / height as f64;
+        assert!((ratio - 2.0).abs() < 0.002);
+        assert!(width.max(height) <= MACOS_PROXY_MAX_EDGE);
+        assert!(u64::from(width) * u64::from(height) * 4 <= DECODED_IMAGE_CACHE_BUDGET as u64);
     }
 
     #[test]
@@ -1851,6 +1954,97 @@ mod tests {
                 assert!(cache.load(&resource_b, window, entity_cx).is_some());
                 assert_eq!(cache.used_bytes(), 8);
                 assert_eq!(cache.reserved_bytes_for_test(), 0);
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
+            });
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn production_cache_admits_small_proxy_with_less_than_four_mib_remaining(
+        cx: &mut TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "joplin-lite-cache-adaptive-floor-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("adaptive floor fixture directory");
+        let source_a = root.join("large.png");
+        let source_b = root.join("small.png");
+        let large = ImageBuffer::from_pixel(1320, 1321, Rgba([0x11, 0x22, 0x33, 0xff]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(large)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("large fixture should encode");
+        std::fs::write(&source_a, encoded.into_inner()).expect("large fixture should write");
+        std::fs::write(&source_b, fixture_png_bytes()).expect("small fixture should write");
+        let resource_a = Resource::from(source_a.clone());
+        let resource_b = Resource::from(source_b.clone());
+        let budget = 8 * 1024 * 1024;
+        let cache = cx.update(|app| BudgetedImageCache::new_entity(app, budget));
+        let mut window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&resource_a]);
+                assert!(cache.load(&resource_a, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                assert!(cache.load(&resource_a, window, entity_cx).is_some());
+                let remaining = budget.saturating_sub(cache.used_bytes());
+                assert!(remaining >= 4);
+                assert!(remaining < CONSERVATIVE_PROXY_RESERVATION);
+                cache.set_visible_resources([&resource_a, &resource_b]);
+                assert!(cache.load(&resource_b, window, entity_cx).is_none());
+                assert!(cache.reserved_bytes_for_test() >= 4);
+                assert!(cache.accounted_bytes_for_test() <= budget);
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                assert!(cache.load(&resource_b, window, entity_cx).is_some());
+                assert_eq!(cache.reserved_bytes_for_test(), 0);
+                assert!(cache.used_bytes() <= budget);
+            });
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn production_cache_defers_when_remainder_cannot_hold_one_rgba_pixel(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "joplin-lite-cache-subpixel-remainder-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("subpixel fixture directory");
+        let source_a = root.join("a.png");
+        let source_b = root.join("b.png");
+        std::fs::write(&source_a, fixture_png_bytes()).expect("fixture a");
+        std::fs::write(&source_b, fixture_png_bytes()).expect("fixture b");
+        let resource_a = Resource::from(source_a.clone());
+        let resource_b = Resource::from(source_b.clone());
+        let cache = cx.update(|app| BudgetedImageCache::new_entity(app, 7));
+        let mut window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&resource_a, &resource_b]);
+                assert!(cache.load(&resource_a, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                assert!(cache.load(&resource_a, window, entity_cx).is_some());
+                assert_eq!(cache.used_bytes(), 4);
+                assert!(cache.load(&resource_b, window, entity_cx).is_none());
+                assert_eq!(cache.in_flight_for_test(), 0);
+                assert_eq!(cache.reserved_bytes_for_test(), 0);
+                assert_eq!(cache.deferred_len_for_test(), 1);
                 assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
             });
         });
@@ -2074,6 +2268,44 @@ mod tests {
                 Some(ClipboardPayload::fixture_with_png_and_text("fallback")),
             )
             .expect("native snapshot should merge with GPUI image payload");
+            assert!(matches!(
+                classify_clipboard(merged),
+                PasteIntent::Image { .. }
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn malformed_native_rtf_returns_none_without_breaking_following_image_paste() {
+        use cocoa::base::{id, nil};
+        use cocoa::foundation::NSAutoreleasePool;
+        use objc::{class, msg_send, sel, sel_impl};
+
+        let malformed = [0xff_u8, 0x00, 0x7f, 0x01];
+        unsafe {
+            let _pool = NSAutoreleasePool::new(nil);
+            let data: id = msg_send![
+                class!(NSData),
+                dataWithBytes: malformed.as_ptr()
+                length: malformed.len()
+            ];
+            assert!(
+                native_rtf_string_value(data).is_none(),
+                "Foundation should reject malformed RTF without an MRC double-release"
+            );
+
+            let native = native_payload_from_snapshot(NativePasteboardSnapshot {
+                html: Some("<img src=\"file:///tmp/photo.png\">".into()),
+                text: Some("图像占位符".into()),
+                ..Default::default()
+            })
+            .expect("valid HTML payload should remain usable after malformed RTF");
+            let merged = resolve_clipboard_payload(
+                Some(native),
+                Some(ClipboardPayload::fixture_with_png_and_text("fallback")),
+            )
+            .expect("following image paste should resolve");
             assert!(matches!(
                 classify_clipboard(merged),
                 PasteIntent::Image { .. }
