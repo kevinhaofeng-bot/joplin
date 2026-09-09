@@ -12,8 +12,9 @@ use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, TextRun, UTF16Selection,
-    Window, WindowBounds, WindowHandle, WindowOptions, canvas, div, px, rgba, size,
+    ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun,
+    UTF16Selection, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div, point, px,
+    rgba, size,
 };
 
 use crate::components::{
@@ -32,12 +33,6 @@ use crate::native_editor::model::{
 use crate::native_editor::transaction::Transaction;
 
 gpui::actions!(evernote_spike, [SubmitLink, CancelLink]);
-
-// The heading and two-row primary strip occupy this fixed leading region of
-// the scroll column.  The editor still gets the live scroll offset and the
-// remaining window height below it; keeping the offset explicit prevents the
-// layout registry from shaping the whole document on every scroll tick.
-const SPIKE_EDITOR_TOP: f32 = 118.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpikeRouteContract {
@@ -77,6 +72,24 @@ pub fn layout_for_viewport(width: f32, height: f32) -> SpikeLayout {
         right_inset: horizontal_space / 2.0,
         bottom_padding: height.max(0.0) * 0.30,
     }
+}
+
+fn estimate_toolbar_height(width: f32, item_count: usize) -> f32 {
+    let available = width.max(1.0);
+    let approximate_item_width = 72.0;
+    let rows = ((item_count.max(1) as f32 * approximate_item_width) / available)
+        .ceil()
+        .max(1.0);
+    rows * 31.0
+}
+
+fn surface_viewport(surface: Bounds<Pixels>, content_mask: Bounds<Pixels>) -> (f32, f32) {
+    let top = surface.top().max(content_mask.top());
+    let bottom = surface.bottom().min(content_mask.bottom());
+    (
+        f32::from((top - surface.top()).max(px(0.0))),
+        f32::from((bottom - top).max(px(1.0))),
+    )
 }
 
 /// Open exactly one native GPUI window for the spike. The caller is expected
@@ -121,7 +134,9 @@ struct LinkPopover {
     text: String,
     selection: Range<usize>,
     reversed: bool,
+    marked: Option<Range<usize>>,
     last_bounds: Option<Bounds<Pixels>>,
+    last_layout: Option<ShapedLine>,
 }
 
 impl LinkPopover {
@@ -132,12 +147,16 @@ impl LinkPopover {
             text: initial,
             selection: end..end,
             reversed: false,
+            marked: None,
             last_bounds: None,
+            last_layout: None,
         }
     }
 
     fn replace_range(&mut self, range: Option<Range<usize>>, text: &str) {
-        let byte_range = range.unwrap_or_else(|| self.selection.clone());
+        let byte_range = range
+            .or_else(|| self.marked.clone())
+            .unwrap_or_else(|| self.selection.clone());
         let start = byte_range.start.min(self.text.len());
         let end = byte_range.end.min(self.text.len()).max(start);
         if !self.text.is_char_boundary(start) || !self.text.is_char_boundary(end) {
@@ -148,6 +167,107 @@ impl LinkPopover {
         self.selection = caret..caret;
         self.reversed = false;
     }
+
+    fn ordered_selection(&self) -> (usize, usize) {
+        if self.reversed {
+            (self.selection.end, self.selection.start)
+        } else {
+            (self.selection.start, self.selection.end)
+        }
+    }
+
+    fn set_selection(&mut self, start: usize, end: usize, reversed: bool) {
+        self.selection = start.min(end)..start.max(end);
+        self.reversed = !self.selection.is_empty() && reversed;
+    }
+
+    fn collapse(&mut self, offset: usize) {
+        self.selection = offset..offset;
+        self.reversed = false;
+    }
+
+    fn move_horizontal(&mut self, right: bool, extend: bool) {
+        let (start, end) = self.ordered_selection();
+        let head = if self.reversed { start } else { end };
+        if !extend && start != end {
+            self.collapse(if right { end } else { start });
+            return;
+        }
+        let target = if right {
+            next_char_boundary(&self.text, head)
+        } else {
+            previous_char_boundary(&self.text, head)
+        };
+        if extend {
+            let anchor = if self.reversed { end } else { start };
+            self.set_selection(anchor, target, target < anchor);
+        } else {
+            self.collapse(target);
+        }
+    }
+
+    fn move_to_edge(&mut self, end: bool, extend: bool) {
+        let (start, old_end) = self.ordered_selection();
+        let head = if self.reversed { start } else { old_end };
+        let target = if end { self.text.len() } else { 0 };
+        if extend {
+            let anchor = if self.reversed { old_end } else { start };
+            self.set_selection(anchor, target, target < anchor);
+        } else if head != target {
+            self.collapse(target);
+        }
+    }
+
+    fn delete_backward(&mut self) {
+        let (start, end) = self.ordered_selection();
+        if start != end {
+            self.replace_range(Some(start..end), "");
+        } else if start > 0 {
+            self.replace_range(Some(previous_char_boundary(&self.text, start)..start), "");
+        }
+        self.marked = None;
+    }
+
+    fn delete_forward(&mut self) {
+        let (start, end) = self.ordered_selection();
+        if start != end {
+            self.replace_range(Some(start..end), "");
+        } else if start < self.text.len() {
+            self.replace_range(Some(start..next_char_boundary(&self.text, start)), "");
+        }
+        self.marked = None;
+    }
+
+    fn select_all(&mut self) {
+        self.set_selection(0, self.text.len(), false);
+    }
+
+    fn selected_text(&self) -> String {
+        let (start, end) = self.ordered_selection();
+        self.text.get(start..end).unwrap_or_default().to_owned()
+    }
+
+    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.replace_range(None, &text);
+            self.marked = None;
+            cx.notify();
+        }
+    }
+}
+
+fn previous_char_boundary(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, offset: usize) -> usize {
+    text.char_indices()
+        .find_map(|(index, _)| (index > offset).then_some(index))
+        .unwrap_or(text.len())
 }
 
 impl EntityInputHandler for LinkPopover {
@@ -182,10 +302,14 @@ impl EntityInputHandler for LinkPopover {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        None
+        self.marked
+            .as_ref()
+            .map(|range| crate::native_editor::input::utf8_range_to_utf16_in(&self.text, range))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked = None;
+    }
 
     fn replace_text_in_range(
         &mut self,
@@ -197,6 +321,7 @@ impl EntityInputHandler for LinkPopover {
         let range = range
             .map(|range| crate::native_editor::input::utf16_range_to_utf8_in(&self.text, &range));
         self.replace_range(range, text);
+        self.marked = None;
         cx.notify();
     }
 
@@ -211,27 +336,36 @@ impl EntityInputHandler for LinkPopover {
         let range_utf8 = range
             .as_ref()
             .map(|range| crate::native_editor::input::utf16_range_to_utf8_in(&self.text, range));
-        let start = range_utf8
+        let replacement = range_utf8.clone().or_else(|| self.marked.clone());
+        let start = replacement
             .as_ref()
             .map(|range| range.start)
             .unwrap_or(self.selection.start);
-        self.replace_range(range_utf8, new_text);
+        self.replace_range(replacement, new_text);
         if let Some(selected_range) = new_selected_range {
             let selected_range =
                 crate::native_editor::input::utf16_range_to_utf8_in(new_text, &selected_range);
             self.selection = start + selected_range.start..start + selected_range.end;
+            self.reversed = false;
         }
+        self.marked = (!new_text.is_empty()).then_some(start..start + new_text.len());
         cx.notify();
     }
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        range_utf16: Range<usize>,
         _element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        self.last_bounds
+        let bounds = self.last_bounds?;
+        let line = self.last_layout.as_ref()?;
+        let range = crate::native_editor::input::utf16_range_to_utf8_in(&self.text, &range_utf16);
+        Some(Bounds::from_corners(
+            point(bounds.left() + line.x_for_index(range.start), bounds.top()),
+            point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
+        ))
     }
 
     fn character_index_for_point(
@@ -241,19 +375,11 @@ impl EntityInputHandler for LinkPopover {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let bounds = self.last_bounds?;
-        let x = (point.x - bounds.left()).max(px(0.0));
-        let font_size = px(14.0);
-        // The bridge only needs a stable UTF-16 index.  The next platform
-        // replacement will still be converted against the exact field text.
-        let approx = (f32::from(x) / f32::from(font_size)).floor().max(0.0) as usize;
+        let line = self.last_layout.as_ref()?;
+        let x = (point.x - bounds.left()).max(px(0.0)).min(line.width);
+        let index = line.closest_index_for_x(x).min(self.text.len());
         Some(crate::native_editor::input::utf8_to_utf16_in(
-            &self.text,
-            self.text
-                .char_indices()
-                .map(|(index, _)| index)
-                .chain([self.text.len()])
-                .nth(approx)
-                .unwrap_or(self.text.len()),
+            &self.text, index,
         ))
     }
 }
@@ -337,16 +463,118 @@ impl SpikeView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event.keystroke.key.as_str() {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        let secondary = modifiers.secondary();
+        let handled = match key {
             "enter" => {
-                cx.stop_propagation();
                 self.submit_link(&SubmitLink, window, cx);
+                true
             }
             "escape" => {
-                cx.stop_propagation();
                 self.cancel_link(&CancelLink, window, cx);
+                true
             }
-            _ => {}
+            "backspace" if secondary => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, _| popover.delete_backward());
+                }
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, _| popover.delete_backward());
+                }
+                cx.notify();
+                true
+            }
+            "delete" => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, _| popover.delete_forward());
+                }
+                cx.notify();
+                true
+            }
+            "left" => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, _| {
+                        popover.move_horizontal(false, modifiers.shift)
+                    });
+                }
+                cx.notify();
+                true
+            }
+            "right" => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, _| {
+                        popover.move_horizontal(true, modifiers.shift)
+                    });
+                }
+                cx.notify();
+                true
+            }
+            "home" => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, _| {
+                        popover.move_to_edge(false, modifiers.shift)
+                    });
+                }
+                cx.notify();
+                true
+            }
+            "end" => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, _| popover.move_to_edge(true, modifiers.shift));
+                }
+                cx.notify();
+                true
+            }
+            "a" if secondary => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, _| popover.select_all());
+                }
+                cx.notify();
+                true
+            }
+            "c" if secondary => {
+                let text = self
+                    .link_popover
+                    .as_ref()
+                    .map(|popover| popover.read(cx).selected_text())
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                true
+            }
+            "x" if secondary => {
+                let text = self
+                    .link_popover
+                    .as_ref()
+                    .map(|popover| popover.read(cx).selected_text())
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    if let Some(popover) = self.link_popover.clone() {
+                        popover.update(cx, |popover, _| popover.delete_backward());
+                    }
+                    cx.notify();
+                }
+                true
+            }
+            "v" if secondary => {
+                if let Some(popover) = self.link_popover.clone() {
+                    popover.update(cx, |popover, popover_cx| {
+                        popover.paste_from_clipboard(popover_cx)
+                    });
+                }
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            cx.stop_propagation();
         }
     }
 
@@ -358,6 +586,7 @@ impl SpikeView {
         let focus = popover.read(cx).focus.clone();
         let canvas_popover = popover.clone();
         let paint_popover = popover.clone();
+        let click_popover = popover.clone();
         let input_canvas = canvas(
             move |bounds, _window, cx| {
                 let _ = canvas_popover.update(cx, |popover, _cx| {
@@ -387,6 +616,9 @@ impl SpikeView {
                     }],
                     None,
                 );
+                entity.update(cx, |popover, _| {
+                    popover.last_layout = Some(line.clone());
+                });
                 if focused && !selection.is_empty() {
                     let start = line.x_for_index(selection.start);
                     let end = line.x_for_index(selection.end);
@@ -435,7 +667,21 @@ impl SpikeView {
             .border_color(rgba(0xc7d0ddff))
             .key_context("EvernoteLinkPopover")
             .track_focus(&focus)
-            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                let _ = click_popover.update(cx, |popover, popover_cx| {
+                    if let Some(index) =
+                        popover.character_index_for_point(event.position, window, popover_cx)
+                    {
+                        let index = crate::native_editor::input::utf16_range_to_utf8_in(
+                            &popover.text,
+                            &(index..index),
+                        )
+                        .start;
+                        popover.collapse(index);
+                        popover.focus.focus(window);
+                        popover_cx.notify();
+                    }
+                });
                 cx.stop_propagation();
             })
             .on_key_down(cx.listener(Self::on_link_key_down))
@@ -552,7 +798,13 @@ impl SpikeView {
             .into_any_element()
     }
 
-    fn render_more_menu(&self, left: f32, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_more_menu(
+        &self,
+        left: f32,
+        top: f32,
+        available_width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         if !self.more_open {
             return None;
         }
@@ -567,9 +819,9 @@ impl SpikeView {
                 .id("evernote-native-spike-more-menu")
                 .debug_selector(|| "evernote-native-spike-more-menu".to_owned())
                 .absolute()
-                .top(px(SPIKE_EDITOR_TOP))
+                .top(px(top.max(0.0)))
                 .left(px(left))
-                .w(px(680.0))
+                .w(px(available_width.max(1.0)))
                 .p(px(8.0))
                 .rounded(px(6.0))
                 .bg(rgba(0xffffffff))
@@ -592,10 +844,44 @@ impl SpikeView {
             cx.propagate();
             return;
         }
-        self.pointer_anchor = self.editor.update(cx, |editor, _cx| {
-            editor.begin_pointer_selection(event.position)
+        let extend = event.modifiers.shift;
+        self.pointer_anchor = self.editor.update(cx, |editor, editor_cx| {
+            let anchor = editor.begin_pointer_selection(event.position, extend);
+            editor_cx.notify();
+            anchor
         });
+        if self.more_open {
+            self.more_open = false;
+        }
+        if self.link_popover.is_some() {
+            self.link_popover = None;
+        }
         focus_editor(&self.editor, window, cx);
+        cx.stop_propagation();
+    }
+
+    fn on_surface_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.keystroke.modifiers.shift {
+            return;
+        }
+        let operation = match event.keystroke.key.as_str() {
+            "up" => Some(EditorCore::select_up as fn(&mut EditorCore)),
+            "down" => Some(EditorCore::select_down as fn(&mut EditorCore)),
+            _ => None,
+        };
+        let Some(operation) = operation else {
+            return;
+        };
+        let editor = self.editor.clone();
+        let _ = editor.update(cx, |editor, editor_cx| {
+            operation(editor);
+            editor_cx.notify();
+        });
         cx.stop_propagation();
     }
 
@@ -621,14 +907,15 @@ impl SpikeView {
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.pointer_anchor = None;
+        cx.notify();
     }
 
     fn on_root_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -638,6 +925,14 @@ impl SpikeView {
         }
         if self.link_popover.is_some() {
             self.link_popover = None;
+        }
+        if event.button == MouseButton::Left && event.modifiers.shift {
+            self.pointer_anchor = self.editor.update(cx, |editor, editor_cx| {
+                let anchor = editor.begin_pointer_selection(event.position, true);
+                editor_cx.notify();
+                anchor
+            });
+            focus_editor(&self.editor, window, cx);
         }
         if dismissed {
             focus_editor(&self.editor, window, cx);
@@ -649,8 +944,6 @@ impl SpikeView {
         &self,
         layout: SpikeLayout,
         content_height: f32,
-        viewport_top: f32,
-        viewport_height: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let editor = self.editor.clone();
@@ -658,6 +951,7 @@ impl SpikeView {
         let canvas_editor = editor.clone();
         let surface = div()
             .id("spike-editor-surface")
+            .debug_selector(|| "spike-editor-surface".to_owned())
             .key_context("BlockEditor")
             .track_focus(editor.read(cx).focus_handle())
             .w(px(width))
@@ -665,6 +959,7 @@ impl SpikeView {
             .rounded(px(7.0))
             .bg(rgba(0xffffffff))
             .capture_any_mouse_down(cx.listener(Self::on_surface_mouse_down))
+            .on_key_down(cx.listener(Self::on_surface_key_down))
             .on_mouse_move(cx.listener(Self::on_surface_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_surface_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_surface_mouse_up));
@@ -673,7 +968,14 @@ impl SpikeView {
             move |bounds, window, cx| {
                 let _ = canvas_editor.update(cx, |editor, editor_cx| {
                     let previous_height = editor.layout().total_height();
-                    editor.shape_visible_with_window(viewport_top, viewport_height, width, window);
+                    let mask = window.content_mask().bounds;
+                    let (viewport_top, viewport_height) = surface_viewport(bounds, mask);
+                    editor.shape_visible_with_window(
+                        f32::from(viewport_top),
+                        f32::from(viewport_height),
+                        width,
+                        window,
+                    );
                     editor.translate_layout(f32::from(bounds.origin.x), f32::from(bounds.origin.y));
                     let measured_height = editor.layout().total_height();
                     if (measured_height - previous_height).abs() > 0.01 {
@@ -701,10 +1003,9 @@ impl Render for SpikeView {
         let viewport_height = f32::from(window_size.height.max(px(1.0)));
         let layout = layout_for_viewport(viewport_width, viewport_height);
         let scroll_top = (-f32::from(self.scroll_handle.offset().y)).max(0.0);
-        let surface_viewport_height = (viewport_height - SPIKE_EDITOR_TOP).max(1.0);
         let measured_height = self.editor.read(cx).layout().total_height();
-        let content_height = measured_height.max(surface_viewport_height * 0.65);
-        let viewport_top = (scroll_top - SPIKE_EDITOR_TOP).max(0.0);
+        let content_mask = window.content_mask().bounds;
+        let content_height = measured_height.max(f32::from(content_mask.size.height) * 0.65);
 
         let primary_buttons = self
             .catalogue
@@ -713,17 +1014,22 @@ impl Render for SpikeView {
             .map(|descriptor| self.render_command_button(descriptor, false, cx))
             .collect::<Vec<_>>();
         let more_trigger = self.render_more_trigger(cx);
-        let more_menu = self.render_more_menu(layout.left_inset, cx);
-        let editor_surface = self.render_editor_surface(
-            layout,
-            content_height,
-            viewport_top,
-            surface_viewport_height,
+        let title_height = f32::from(window.line_height()) + 28.0;
+        let toolbar_height = estimate_toolbar_height(
+            layout.content_width,
+            self.catalogue.primary_descriptors().len() + 1,
+        );
+        let more_menu = self.render_more_menu(
+            layout.left_inset,
+            title_height + toolbar_height - scroll_top,
+            layout.content_width,
             cx,
         );
+        let editor_surface = self.render_editor_surface(layout, content_height, cx);
 
         let toolbar = div()
             .id("evernote-native-spike-primary-toolbar")
+            .debug_selector(|| "evernote-native-spike-primary-toolbar".to_owned())
             .relative()
             .w(px(layout.content_width))
             .flex()
@@ -757,6 +1063,13 @@ impl Render for SpikeView {
             .relative()
             .bg(rgba(0xf1f3f6ff))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_root_mouse_down))
+            // The root hitbox remains active while a drag leaves the editor
+            // surface. This is GPUI's practical pointer-capture fallback for
+            // the canvas, whose own hitbox no longer receives move events
+            // once the pointer crosses its bounds.
+            .on_mouse_move(cx.listener(Self::on_surface_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_surface_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_surface_mouse_up))
             .child(scroll);
         if let Some(menu) = more_menu {
             root = root.child(menu);
@@ -1085,6 +1398,14 @@ mod tests {
         });
         cx.simulate_keystrokes("up");
 
+        cx.simulate_keystrokes("home up shift-down");
+        view.read_with(cx, |view, cx| {
+            assert!(
+                !view.editor.read(cx).selection().is_caret(),
+                "production Shift+Down must extend the document selection"
+            );
+        });
+
         let bounds = view.read_with(cx, |view, cx| {
             let editor = view.editor.read(cx);
             let first = editor.document().blocks()[0].id;
@@ -1107,6 +1428,57 @@ mod tests {
             assert!(
                 !dragged.is_caret(),
                 "pointer drag must update one document selection"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_pointer_capture_clamps_outside_surface_and_shift_clicks(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        let bounds = view.read_with(cx, |view, cx| {
+            let first = view.editor.read(cx).document().blocks()[0].id;
+            view.editor
+                .read(cx)
+                .layout()
+                .block_layout(first)
+                .expect("first block geometry")
+                .bounds
+        });
+        let start = point(bounds.left() + px(2.0), bounds.top() + px(8.0));
+        let outside = point(bounds.right() + px(120.0), bounds.top() + px(96.0));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::default());
+        view.read_with(cx, |view, cx| {
+            assert!(!view.editor.read(cx).selection().is_caret());
+        });
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_down(
+            outside,
+            MouseButton::Left,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        cx.simulate_mouse_up(
+            outside,
+            MouseButton::Left,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        view.read_with(cx, |view, cx| {
+            assert!(
+                !view.editor.read(cx).selection().is_caret(),
+                "Shift-click must extend from the prior anchor"
             );
         });
     }
@@ -1227,6 +1599,43 @@ mod tests {
             );
             assert_eq!(view.editor.read(cx).undo_depth(), before_cancel.1);
             assert_eq!(view.editor.read(cx).selection(), before_cancel.2);
+        });
+    }
+
+    #[gpui::test]
+    fn link_popover_ime_candidate_updates_replace_the_marked_range(cx: &mut TestAppContext) {
+        let mut cx = cx.add_empty_window();
+        let field = cx.new(|cx| LinkPopover::new(String::new(), cx));
+        cx.update(|window, app| {
+            field.update(app, |field, field_cx| {
+                <LinkPopover as EntityInputHandler>::replace_and_mark_text_in_range(
+                    field,
+                    None,
+                    "n",
+                    Some(1..1),
+                    window,
+                    field_cx,
+                );
+                assert_eq!(field.text, "n");
+                assert_eq!(
+                    <LinkPopover as EntityInputHandler>::marked_text_range(field, window, field_cx),
+                    Some(0..1)
+                );
+                <LinkPopover as EntityInputHandler>::replace_and_mark_text_in_range(
+                    field,
+                    None,
+                    "ni",
+                    Some(2..2),
+                    window,
+                    field_cx,
+                );
+                assert_eq!(field.text, "ni");
+                assert_eq!(field.selection, 2..2);
+                <LinkPopover as EntityInputHandler>::replace_text_in_range(
+                    field, None, "你", window, field_cx,
+                );
+                assert_eq!(field.text, "你");
+            });
         });
     }
 
@@ -1375,6 +1784,73 @@ mod tests {
             assert!(
                 after_top < before_top,
                 "shaping must follow the live scroll origin instead of always starting at document y=0"
+            );
+        });
+    }
+
+    #[test]
+    fn surface_viewport_is_the_intersection_with_the_content_mask() {
+        let surface = Bounds::new(point(px(24.0), px(96.0)), size(px(336.0), px(900.0)));
+        let mask = Bounds::new(point(px(0.0), px(12.0)), size(px(400.0), px(260.0)));
+        assert_eq!(surface_viewport(surface, mask), (0.0, 176.0));
+
+        let scrolled_surface = Bounds::new(point(px(24.0), px(-180.0)), size(px(336.0), px(900.0)));
+        assert_eq!(surface_viewport(scrolled_surface, mask), (192.0, 260.0));
+    }
+
+    #[gpui::test]
+    async fn shell_narrow_wrapped_toolbar_and_scrolled_title_keep_live_membership(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_long_view);
+        cx.simulate_resize(size(px(400.0), px(260.0)));
+        redraw(cx);
+
+        let toolbar = cx
+            .debug_bounds("evernote-native-spike-primary-toolbar")
+            .expect("narrow toolbar should be mounted");
+        let surface = cx
+            .debug_bounds("spike-editor-surface")
+            .expect("editor surface should be mounted");
+        assert!(
+            toolbar.size.height > px(31.0),
+            "narrow width must wrap the primary command strip"
+        );
+        assert!(
+            surface.top() > px(118.0),
+            "surface origin must include the wrapped toolbar rather than a fixed 118pt shell offset"
+        );
+        let before_top = view.read_with(cx, |view, cx| {
+            view.editor
+                .read(cx)
+                .layout()
+                .visible()
+                .first()
+                .map(|layout| layout.bounds.top())
+                .expect("narrow surface should shape a visible first block")
+        });
+        assert!(before_top >= surface.top() - px(1.0));
+
+        let max_offset = view.read_with(cx, |view, _| view.scroll_handle.max_offset());
+        view.update(cx, |view, cx| {
+            view.scroll_handle
+                .set_offset(point(px(0.0), -max_offset.height.min(px(220.0))));
+            cx.notify();
+        });
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            let after_top = view
+                .editor
+                .read(cx)
+                .layout()
+                .visible()
+                .first()
+                .map(|layout| layout.bounds.top())
+                .expect("scrolled surface should retain visible tail content");
+            assert!(
+                after_top < before_top,
+                "title/toolbar scroll must move layout membership with the live scroll origin"
             );
         });
     }

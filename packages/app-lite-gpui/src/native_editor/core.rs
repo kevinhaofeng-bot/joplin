@@ -968,11 +968,11 @@ impl EditorCore {
     }
 
     pub fn select_up(&mut self) {
-        self.extend_with(|editor| editor.move_up());
+        self.extend_vertical(-1);
     }
 
     pub fn select_down(&mut self) {
-        self.extend_with(|editor| editor.move_down());
+        self.extend_vertical(1);
     }
 
     pub fn select_home(&mut self) {
@@ -986,10 +986,15 @@ impl EditorCore {
     pub fn select_word_left(&mut self) {
         let anchor = self.selection.anchor;
         let head = self.selection.head;
-        let head_offset = self.flat_offset_for_point(head);
-        let text = self.document_text();
-        let target_offset = previous_word_boundary(&text, head_offset);
-        let target = self.point_for_document_offset_with_affinity(target_offset, Affinity::Before);
+        let Some(text) = self
+            .document
+            .block(head.node_id)
+            .and_then(|block| block.content.as_text())
+        else {
+            return;
+        };
+        let target_offset = previous_word_boundary(text, head.utf8_offset);
+        let target = DocPoint::with_affinity(head.node_id, target_offset, Affinity::Before);
         self.selection = Selection::new(anchor, target);
         self.preferred_x = None;
         self.clear_composition();
@@ -998,10 +1003,15 @@ impl EditorCore {
     pub fn select_word_right(&mut self) {
         let anchor = self.selection.anchor;
         let head = self.selection.head;
-        let head_offset = self.flat_offset_for_point(head);
-        let text = self.document_text();
-        let target_offset = next_word_boundary(&text, head_offset);
-        let target = self.point_for_document_offset_with_affinity(target_offset, Affinity::After);
+        let Some(text) = self
+            .document
+            .block(head.node_id)
+            .and_then(|block| block.content.as_text())
+        else {
+            return;
+        };
+        let target_offset = next_word_boundary(text, head.utf8_offset);
+        let target = DocPoint::with_affinity(head.node_id, target_offset, Affinity::After);
         self.selection = Selection::new(anchor, target);
         self.preferred_x = None;
         self.clear_composition();
@@ -1015,9 +1025,18 @@ impl EditorCore {
         Some(self.snap_layout_point(point))
     }
 
-    pub(crate) fn begin_pointer_selection(&mut self, position: Point<Pixels>) -> Option<DocPoint> {
+    pub(crate) fn begin_pointer_selection(
+        &mut self,
+        position: Point<Pixels>,
+        extend: bool,
+    ) -> Option<DocPoint> {
         let point = self.point_from_layout(position)?;
-        self.selection = Selection::caret(point);
+        let anchor = if extend { self.selection.anchor } else { point };
+        self.selection = if extend {
+            Selection::new(anchor, point)
+        } else {
+            Selection::caret(point)
+        };
         self.preferred_x = None;
         self.clear_composition();
         Some(point)
@@ -1046,6 +1065,16 @@ impl EditorCore {
         self.clear_composition();
     }
 
+    fn extend_vertical(&mut self, direction: isize) {
+        let anchor = self.selection.anchor;
+        let head = self.selection.head;
+        self.selection = Selection::caret(head);
+        self.move_vertical(direction);
+        let target = self.selection.head;
+        self.selection = Selection::new(anchor, target);
+        self.clear_composition();
+    }
+
     fn move_vertical(&mut self, direction: isize) {
         if !self.selection.is_caret() {
             self.selection = Selection::caret(if direction < 0 {
@@ -1059,8 +1088,8 @@ impl EditorCore {
         }
         let point = self.selection.head;
         let preferred_x = self.preferred_x.or_else(|| self.layout.caret_x(point));
-        if let Some(target) = self.layout.visual_move(point, direction, self.preferred_x) {
-            let x = self.preferred_x.or_else(|| self.layout.caret_x(point));
+        if let Some(target) = self.layout.visual_move(point, direction, preferred_x) {
+            let x = preferred_x.or_else(|| self.layout.caret_x(point));
             self.selection = Selection::caret(self.snap_layout_point(target));
             self.preferred_x = x;
             self.clear_composition();

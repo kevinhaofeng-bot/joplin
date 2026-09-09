@@ -5,13 +5,13 @@
 //! selection geometry, glyphs/images, then the caret.
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, Pixels, SharedString,
-    TextAlign, TextRun, Window, WrappedLine, fill, outline, point, px, rgba,
+    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, Pixels, SharedString, TextRun,
+    Window, WrappedLine, fill, outline, point, px, rgba,
 };
 
 use super::core::EditorCore;
 use super::layout::BlockLayout;
-use super::model::{BlockKind, Selection};
+use super::model::{BlockKind, Document, NodeId, Selection};
 
 #[derive(Clone)]
 struct RenderBlock {
@@ -30,8 +30,19 @@ struct RenderSnapshot {
     caret_bounds: Option<Bounds<Pixels>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextPaintPass {
+    Background,
+    Glyphs,
+}
+
+const fn text_paint_passes() -> [TextPaintPass; 2] {
+    [TextPaintPass::Background, TextPaintPass::Glyphs]
+}
+
 fn snapshot(editor: &EditorCore) -> RenderSnapshot {
     let layout = editor.layout();
+    let ordered_numbers = ordered_list_numbers(editor.document());
     let blocks = layout
         .visible()
         .iter()
@@ -49,7 +60,7 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                     .unwrap_or_default(),
                 is_image: layout.is_image(block.node_id),
                 line_height: layout.line_height(block.node_id),
-                marker: list_marker(&kind, editor, block.node_id),
+                marker: list_marker(&kind, &ordered_numbers, block.node_id),
             }
         })
         .collect();
@@ -113,36 +124,47 @@ fn paint_snapshot(
             continue;
         }
         let line_height = block.line_height.unwrap_or_else(|| window.line_height());
+        let text_bounds = Bounds::new(
+            point(
+                block.layout.bounds.left() + block.layout.text_inset,
+                block.layout.bounds.top(),
+            ),
+            gpui::size(
+                (block.layout.bounds.size.width - block.layout.text_inset).max(px(1.0)),
+                block.layout.bounds.size.height,
+            ),
+        );
         for (line_index, line) in block.text_lines.iter().enumerate() {
-            let text_left = block.layout.bounds.left() + block.layout.text_inset;
-            let text_width =
-                (block.layout.bounds.size.width - block.layout.text_inset).max(px(1.0));
-            let slack = (text_width - line.width()).max(px(0.0));
-            let line_left = match block.layout.text_align {
-                TextAlign::Left => text_left,
-                TextAlign::Center => text_left + slack / 2.0,
-                TextAlign::Right => text_left + slack,
-            };
-            line.paint(
-                point(
-                    line_left,
-                    block.layout.bounds.top()
-                        + block
-                            .text_lines
-                            .iter()
-                            .take(line_index)
-                            .map(|line| line.size(line_height).height)
-                            .fold(px(0.0), |top, height| top + height),
-                ),
-                line_height,
-                TextAlign::Left,
-                Some(Bounds::new(
-                    point(text_left, block.layout.bounds.top()),
-                    gpui::size(text_width, block.layout.bounds.size.height),
-                )),
-                window,
-                cx,
-            )?;
+            let origin = point(
+                text_bounds.left(),
+                block.layout.bounds.top()
+                    + block
+                        .text_lines
+                        .iter()
+                        .take(line_index)
+                        .map(|line| line.size(line_height).height)
+                        .fold(px(0.0), |top, height| top + height),
+            );
+            for pass in text_paint_passes() {
+                match pass {
+                    TextPaintPass::Background => line.paint_background(
+                        origin,
+                        line_height,
+                        block.layout.text_align,
+                        Some(text_bounds),
+                        window,
+                        cx,
+                    )?,
+                    TextPaintPass::Glyphs => line.paint(
+                        origin,
+                        line_height,
+                        block.layout.text_align,
+                        Some(text_bounds),
+                        window,
+                        cx,
+                    )?,
+                }
+            }
         }
         if let Some(marker) = block.marker.as_deref() {
             let style = window.text_style();
@@ -181,34 +203,40 @@ fn paint_snapshot(
 
 fn list_marker(
     kind: &BlockKind,
-    editor: &EditorCore,
-    node_id: super::model::NodeId,
+    ordered_numbers: &std::collections::HashMap<NodeId, usize>,
+    node_id: NodeId,
 ) -> Option<String> {
     match kind {
         BlockKind::BulletItem { .. } => Some("•".to_owned()),
         BlockKind::CheckItem { checked, .. } => Some(if *checked { "☑" } else { "☐" }.to_owned()),
-        BlockKind::OrderedItem { depth } => {
-            let Some(index) = editor
-                .document()
-                .blocks()
-                .iter()
-                .position(|block| block.id == node_id)
-            else {
-                return Some("1.".to_owned());
-            };
-            let mut number = 1usize;
-            for block in editor.document().blocks()[..index].iter().rev() {
-                match &block.kind {
-                    BlockKind::OrderedItem {
-                        depth: previous_depth,
-                    } if *previous_depth == *depth => number += 1,
-                    _ => break,
-                }
-            }
-            Some(format!("{number}."))
-        }
+        BlockKind::OrderedItem { .. } => Some(format!(
+            "{}.",
+            ordered_numbers.get(&node_id).copied().unwrap_or(1)
+        )),
         _ => None,
     }
+}
+
+/// Compute ordered markers once in document order. A child sequence only
+/// advances its own depth; returning to a parent keeps the parent's counter,
+/// so `[0, 1, 0]` renders `1., 1., 2.` instead of resetting the parent.
+fn ordered_list_numbers(document: &Document) -> std::collections::HashMap<NodeId, usize> {
+    let mut numbers = std::collections::HashMap::new();
+    let mut counters: Vec<usize> = Vec::new();
+    for block in document.blocks() {
+        let BlockKind::OrderedItem { depth } = block.kind else {
+            counters.clear();
+            continue;
+        };
+        let depth = depth as usize;
+        counters.truncate(depth + 1);
+        while counters.len() <= depth {
+            counters.push(0);
+        }
+        counters[depth] = counters[depth].saturating_add(1).max(1);
+        numbers.insert(block.id, counters[depth]);
+    }
+    numbers
 }
 
 /// Paint an editor entity and install GPUI's real input bridge for the same
@@ -256,4 +284,54 @@ pub(crate) fn image_selection_outline(bounds: Bounds<gpui::Pixels>) -> Bounds<gp
         point(bounds.left() - px(2.0), bounds.top() - px(2.0)),
         point(bounds.right() + px(2.0), bounds.bottom() + px(2.0)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_editor::model::{Affinity, BlockKind, DocPoint, Selection};
+    use crate::native_editor::transaction::Transaction;
+
+    #[gpui::test]
+    fn nested_ordered_items_continue_the_parent_sequence(cx: &mut gpui::TestAppContext) {
+        let mut editor = EditorCore::for_test_paragraphs(["parent one", "child", "parent two"], cx);
+        let blocks = editor.document().blocks().to_vec();
+        for (block, kind) in blocks.iter().zip([
+            BlockKind::OrderedItem { depth: 0 },
+            BlockKind::OrderedItem { depth: 1 },
+            BlockKind::OrderedItem { depth: 0 },
+        ]) {
+            let text_len = block.content.as_text().map_or(0, str::len);
+            editor
+                .apply(Transaction::SetBlockKind {
+                    selection: Selection::new(
+                        DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                        DocPoint::with_affinity(block.id, text_len, Affinity::After),
+                    ),
+                    kind,
+                })
+                .expect("ordered item conversion should succeed");
+        }
+        let numbers = ordered_list_numbers(editor.document());
+        assert_eq!(
+            list_marker(&BlockKind::OrderedItem { depth: 0 }, &numbers, blocks[0].id),
+            Some("1.".into())
+        );
+        assert_eq!(
+            list_marker(&BlockKind::OrderedItem { depth: 1 }, &numbers, blocks[1].id),
+            Some("1.".into())
+        );
+        assert_eq!(
+            list_marker(&BlockKind::OrderedItem { depth: 0 }, &numbers, blocks[2].id),
+            Some("2.".into())
+        );
+    }
+
+    #[test]
+    fn highlight_background_paint_precedes_glyphs() {
+        assert_eq!(
+            text_paint_passes(),
+            [TextPaintPass::Background, TextPaintPass::Glyphs]
+        );
+    }
 }

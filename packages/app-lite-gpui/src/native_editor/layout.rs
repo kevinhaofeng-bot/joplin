@@ -128,15 +128,19 @@ fn styled_text_runs(
     boundaries.dedup();
     let underline_thickness = px(1.0);
     let mut shaped = Vec::new();
+    let mut style_index = 0usize;
     for window in boundaries.windows(2) {
         let start = window[0];
         let end = window[1];
         if start >= end {
             continue;
         }
+        while style_index + 1 < styles.len() && styles[style_index].range.end <= start {
+            style_index += 1;
+        }
         let marks = styles
-            .iter()
-            .find(|run| run.range.start <= start && start < run.range.end)
+            .get(style_index)
+            .filter(|run| run.range.start <= start && start < run.range.end)
             .map(|run| run.marks.as_slice())
             .unwrap_or(&[]);
         let mut font = base_font.clone();
@@ -256,6 +260,10 @@ pub struct CachedBlockLayout {
     pub revision: u64,
     pub width: f32,
     pub selection_geometry_bytes: usize,
+    /// Upper bound for the GPUI decoration runs retained by the wrapped
+    /// lines. `WrappedLine` keeps these in a private SmallVec, so retain the
+    /// source run count alongside the public shaped geometry for budgeting.
+    pub(crate) decoration_run_count: usize,
     pub(crate) is_image: bool,
     pub(crate) line_height: Pixels,
     shape_key: ShapeKey,
@@ -641,7 +649,9 @@ impl LayoutRegistry {
                 self.shape_count = self.shape_count.saturating_add(1);
                 let shared_text = SharedString::from(text.to_owned());
                 let runs = styled_text_runs(block, &shared_text, &visual.font);
-                let text_width = (width - f32::from(visual.text_inset)).max(1.0);
+                let decoration_run_count = runs.len();
+                let block_width = block_bounds(width, block).size.width;
+                let text_width = (f32::from(block_width) - f32::from(visual.text_inset)).max(1.0);
                 let lines = window
                     .text_system()
                     .shape_text(
@@ -676,7 +686,14 @@ impl LayoutRegistry {
                 layout.text_inset = visual.text_inset;
                 layout.text_align = visual.text_align;
                 layout.text_lines = lines;
-                self.insert_shaped(shape_key, layout, false, visual.line_height, 0);
+                self.insert_shaped(
+                    shape_key,
+                    layout,
+                    false,
+                    visual.line_height,
+                    0,
+                    decoration_run_count,
+                );
             }
             if !estimates_changed {
                 break;
@@ -715,6 +732,7 @@ impl LayoutRegistry {
             is_image,
             line_height,
             selection_geometry_bytes,
+            0,
         );
         self.enforce_budget();
     }
@@ -768,7 +786,14 @@ impl LayoutRegistry {
         let layout = self
             .visible
             .iter()
-            .find(|layout| contains(layout.bounds, position))?
+            .find(|layout| contains(layout.bounds, position))
+            .or_else(|| {
+                self.visible.iter().min_by(|left, right| {
+                    vertical_distance(left.bounds, position.y)
+                        .partial_cmp(&vertical_distance(right.bounds, position.y))
+                        .unwrap_or(Ordering::Equal)
+                })
+            })?
             .clone();
         let Some(cached) = self.cache.get(&layout.node_id) else {
             // A shaped block may be rejected by the byte budget.  The
@@ -787,17 +812,32 @@ impl LayoutRegistry {
             return Some(image_side(layout.bounds, position, layout.node_id));
         }
         let line_height = cached.line_height;
-        let relative_y = (position.y - layout.bounds.top()).max(px(0.0));
+        let clamped_x = position
+            .x
+            .max(layout.bounds.left())
+            .min(layout.bounds.right());
+        let clamped_y = position
+            .y
+            .max(layout.bounds.top())
+            .min(layout.bounds.bottom());
+        let relative_y = (clamped_y - layout.bounds.top()).max(px(0.0));
         let mut line_top = px(0.0);
         let mut hard_start = 0;
         for (line_index, line) in cached.layout.text_lines.iter().enumerate() {
             let height = line.size(line_height).height;
             if relative_y < line_top + height || line_index + 1 == cached.layout.text_lines.len() {
                 let local_y = (relative_y - line_top).max(px(0.0));
-                let line_left = aligned_line_left(&cached.layout, line);
-                let local_x = (position.x - line_left).max(px(0.0));
+                let offsets = wrapped_row_offsets(line);
+                let row = row_index_for_y(offsets.len().saturating_sub(1), local_y, line_height);
+                let row_start = offsets.get(row).copied().unwrap_or(0);
+                let row_end = offsets.get(row + 1).copied().unwrap_or(line.len());
+                let row_origin = wrapped_row_origin_x(&cached.layout, line, row_start, row_end);
+                let local_x = (clamped_x - row_origin).max(px(0.0));
                 let local = line
-                    .closest_index_for_position(point(local_x, local_y), line_height)
+                    .closest_index_for_position(
+                        point(local_x, line_height * row as f32 + local_y),
+                        line_height,
+                    )
                     .unwrap_or_else(|offset| offset);
                 let end = hard_start + line.len();
                 return Some(DocPoint::with_affinity(
@@ -838,6 +878,12 @@ impl LayoutRegistry {
         let line_height = cached.line_height;
         let current_position =
             line.position_for_index(offset_in_line.min(line.len()), line_height)?;
+        let current_x = preferred_x
+            .or_else(|| {
+                self.caret_bounds_for_point(caret)
+                    .map(|bounds| bounds.left())
+            })
+            .unwrap_or(current_position.x);
         let row_offsets = wrapped_row_offsets(line);
         let current_row = row_index_for_offset(&row_offsets, offset_in_line, caret.affinity);
 
@@ -860,7 +906,14 @@ impl LayoutRegistry {
             if target_visual_row < row_cursor.saturating_add(row_count) {
                 let target_row = target_visual_row.saturating_sub(row_cursor);
                 let target_y = line_height * (target_row as f32 + 0.5);
-                let x = preferred_x.unwrap_or(current_position.x);
+                let row_start = target_offsets.get(target_row).copied().unwrap_or(0);
+                let row_end = target_offsets
+                    .get(target_row + 1)
+                    .copied()
+                    .unwrap_or(target_line.len());
+                let row_origin =
+                    wrapped_row_origin_x(&cached.layout, target_line, row_start, row_end);
+                let x = (preferred_x.unwrap_or(current_x) - row_origin).max(px(0.0));
                 let local = target_line
                     .closest_index_for_position(point(x, target_y), line_height)
                     .unwrap_or_else(|offset| offset)
@@ -958,11 +1011,13 @@ impl LayoutRegistry {
             0
         };
         let y = cached.line_height * (row as f32 + 0.5);
+        let offsets = wrapped_row_offsets(line);
+        let row_start = offsets.get(row).copied().unwrap_or(0);
+        let row_end = offsets.get(row + 1).copied().unwrap_or(line.len());
+        let row_origin = wrapped_row_origin_x(&cached.layout, line, row_start, row_end);
+        let x = (preferred_x.unwrap_or(row_origin) - row_origin).max(px(0.0));
         let local = line
-            .closest_index_for_position(
-                point(preferred_x.unwrap_or(px(0.0)), y),
-                cached.line_height,
-            )
+            .closest_index_for_position(point(x, y), cached.line_height)
             .unwrap_or_else(|offset| offset)
             .min(line.len());
         let start = line_start_offset(&cached.layout.text_lines, line_index);
@@ -1003,9 +1058,9 @@ impl LayoutRegistry {
     }
 
     pub fn caret_x(&self, caret: DocPoint) -> Option<Pixels> {
-        let block_left = self.cache.get(&caret.node_id)?.layout.bounds.left();
+        self.cache.get(&caret.node_id)?;
         self.caret_bounds_for_point(caret)
-            .map(|bounds| bounds.left() - block_left)
+            .map(|bounds| bounds.left())
     }
 
     pub fn caret_bounds_for_point(&self, caret: DocPoint) -> Option<Bounds<Pixels>> {
@@ -1039,9 +1094,14 @@ impl LayoutRegistry {
         )
         .min(line.len());
         let position = line.position_for_index(offset_in_line, cached.line_height)?;
+        let offsets = wrapped_row_offsets(line);
+        let row = row_index_for_offset(&offsets, offset_in_line, caret.affinity);
+        let row_start = offsets.get(row).copied().unwrap_or(0);
+        let row_end = offsets.get(row + 1).copied().unwrap_or(line.len());
+        let row_origin = wrapped_row_origin_x(layout, line, row_start, row_end);
         Some(Bounds::new(
             point(
-                aligned_line_left(layout, line) + position.x,
+                row_origin + position.x,
                 layout.bounds.top() + line_top + position.y,
             ),
             size(px(CARET_WIDTH), cached.line_height),
@@ -1304,6 +1364,7 @@ impl LayoutRegistry {
             is_image,
             px(DEFAULT_TEXT_HEIGHT),
             0,
+            0,
         );
     }
 
@@ -1314,6 +1375,7 @@ impl LayoutRegistry {
         is_image: bool,
         default_line_height: Pixels,
         requested_selection_geometry_bytes: usize,
+        decoration_run_count: usize,
     ) {
         let node_id = layout.node_id;
         let revision = shape_key.block_revision;
@@ -1327,7 +1389,7 @@ impl LayoutRegistry {
             &layout,
             requested_selection_geometry_bytes.max(size_of::<Bounds<Pixels>>() * 2),
         );
-        let bytes = estimate_cache_bytes(&layout, selection_geometry_bytes);
+        let bytes = estimate_cache_bytes(&layout, selection_geometry_bytes, decoration_run_count);
         if bytes > self.budget_bytes {
             return;
         }
@@ -1344,6 +1406,7 @@ impl LayoutRegistry {
                 revision,
                 width,
                 selection_geometry_bytes,
+                decoration_run_count,
                 is_image,
                 line_height: if line_height == px(0.0) {
                     default_line_height
@@ -1491,8 +1554,17 @@ fn estimate_text_height(text: &str, width: f32, kind: &BlockKind) -> f32 {
         * line_height
 }
 
-fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -> usize {
+fn estimate_cache_bytes(
+    layout: &BlockLayout,
+    selection_geometry_bytes: usize,
+    decoration_run_count: usize,
+) -> usize {
     const ARC_ALLOCATION_OVERHEAD: usize = size_of::<usize>() * 2;
+    // GPUI keeps decoration runs in `SmallVec<[DecorationRun; 32]>`. The
+    // native renderer clones wrapped lines into its frame snapshot, so the
+    // admission estimate must include both the retained line and that
+    // transient clone (including a possible spill capacity).
+    const DECORATION_RUN_BYTES: usize = size_of::<TextRun>() * 2;
     let shaped_bytes = layout
         .text_lines
         .iter()
@@ -1520,16 +1592,27 @@ fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -
                 )
                 .saturating_add(line_layout)
                 .saturating_add(runs)
-                // `WrappedLine` stores several small vectors inline, but a
-                // backend may spill their capacity. Reserve a conservative
-                // per-line spill allowance instead of counting only lengths.
-                .saturating_add(ARC_ALLOCATION_OVERHEAD * 2)
         })
         .sum::<usize>();
+    // The public `WrappedLine` API exposes shaped glyph runs but not its
+    // private decoration SmallVec. The source `TextRun` count is a safe upper
+    // bound for the decoration runs GPUI retains per hard line; account for
+    // the spill capacity once across the block (which is conservative when
+    // there are multiple hard lines).
+    let decoration_spill = decoration_run_count
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .saturating_sub(32)
+        .saturating_mul(DECORATION_RUN_BYTES);
+    let shaped_bytes = shaped_bytes.saturating_add(decoration_spill);
+    let transient_clone = shaped_bytes
+        .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
+        .saturating_add(ARC_ALLOCATION_OVERHEAD * 2);
     size_of::<CachedBlockLayout>()
         .saturating_add(size_of::<BlockLayout>())
         .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
         .saturating_add(shaped_bytes)
+        .saturating_add(transient_clone)
         .saturating_add(selection_geometry_bytes)
 }
 
@@ -1555,6 +1638,26 @@ fn contains(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {
         && position.x <= bounds.right()
         && position.y >= bounds.top()
         && position.y <= bounds.bottom()
+}
+
+fn vertical_distance(bounds: Bounds<Pixels>, y: Pixels) -> f32 {
+    if y < bounds.top() {
+        f32::from(bounds.top() - y)
+    } else if y > bounds.bottom() {
+        f32::from(y - bounds.bottom())
+    } else {
+        0.0
+    }
+}
+
+fn row_index_for_y(row_count: usize, y: Pixels, line_height: Pixels) -> usize {
+    if row_count == 0 {
+        return 0;
+    }
+    ((f32::from(y) / f32::from(line_height.max(px(1.0))))
+        .floor()
+        .max(0.0) as usize)
+        .min(row_count.saturating_sub(1))
 }
 
 fn image_side(bounds: Bounds<Pixels>, position: Point<Pixels>, node_id: NodeId) -> DocPoint {
@@ -1751,7 +1854,7 @@ fn append_range_segment_bounds(
         range_segment_bounds_for_line(
             line,
             line_top,
-            aligned_line_left(layout, line),
+            layout,
             line_height,
             line_start,
             line_end,
@@ -1761,21 +1864,49 @@ fn append_range_segment_bounds(
     }
 }
 
-fn aligned_line_left(layout: &BlockLayout, line: &WrappedLine) -> Pixels {
-    let text_left = layout.bounds.left() + layout.text_inset;
-    let text_width = (layout.bounds.size.width - layout.text_inset).max(px(1.0));
-    let slack = (text_width - line.width()).max(px(0.0));
+fn text_bounds(layout: &BlockLayout) -> Bounds<Pixels> {
+    Bounds::new(
+        point(
+            layout.bounds.left() + layout.text_inset,
+            layout.bounds.top(),
+        ),
+        size(
+            (layout.bounds.size.width - layout.text_inset).max(px(1.0)),
+            layout.bounds.size.height,
+        ),
+    )
+}
+
+fn wrapped_row_origin_x(
+    layout: &BlockLayout,
+    line: &WrappedLine,
+    row_start: usize,
+    row_end: usize,
+) -> Pixels {
+    let text_bounds = text_bounds(layout);
+    let row_width =
+        line.unwrapped_layout.x_for_index(row_end) - line.unwrapped_layout.x_for_index(row_start);
+    let slack = (line.width() - row_width).max(px(0.0));
+    let line_left = match layout.text_align {
+        TextAlign::Left => text_bounds.left(),
+        TextAlign::Center => {
+            text_bounds.left() + (text_bounds.size.width - line.width()).max(px(0.0)) / 2.0
+        }
+        TextAlign::Right => {
+            text_bounds.left() + (text_bounds.size.width - line.width()).max(px(0.0))
+        }
+    };
     match layout.text_align {
-        TextAlign::Left => text_left,
-        TextAlign::Center => text_left + slack / 2.0,
-        TextAlign::Right => text_left + slack,
+        TextAlign::Left => line_left,
+        TextAlign::Center => line_left + slack / 2.0,
+        TextAlign::Right => line_left + slack,
     }
 }
 
 fn range_segment_bounds_for_line(
     line: &WrappedLine,
     line_top: Pixels,
-    line_left: Pixels,
+    layout: &BlockLayout,
     line_height: Pixels,
     start_offset: usize,
     end_offset: usize,
@@ -1793,10 +1924,11 @@ fn range_segment_bounds_for_line(
         let start_x = line.unwrapped_layout.x_for_index(segment_start) - row_start_x;
         let end_x = line.unwrapped_layout.x_for_index(segment_end) - row_start_x;
         let row_top = line_top + line_height * row_index as f32;
+        let row_origin = wrapped_row_origin_x(layout, line, row_start, row_end);
         segments.push(Bounds::from_corners(
-            point(line_left + start_x, row_top),
+            point(row_origin + start_x, row_top),
             point(
-                line_left + end_x.max(start_x + px(CARET_WIDTH)),
+                row_origin + end_x.max(start_x + px(CARET_WIDTH)),
                 row_top + line_height,
             ),
         ));

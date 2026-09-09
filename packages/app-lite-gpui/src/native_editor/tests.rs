@@ -2770,6 +2770,49 @@ async fn shaped_cache_budget_is_hard_during_multi_block_shaping(cx: &mut gpui::T
 }
 
 #[gpui::test]
+async fn alternating_decorations_account_for_wrapped_line_clone_peak(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let text = "x".repeat(768);
+    let mut document = Document::from_paragraph(text.clone());
+    let node = document.first_node_id().expect("decorated paragraph");
+    let transactions = (0..text.len())
+        .map(|offset| {
+            let mark = match offset % 4 {
+                0 => Mark::Bold,
+                1 => Mark::Italic,
+                2 => Mark::Underline,
+                _ => Mark::Highlight,
+            };
+            Transaction::ToggleMark {
+                selection: Selection::new(
+                    DocPoint::with_affinity(node, offset, Affinity::Before),
+                    DocPoint::with_affinity(node, offset + 1, Affinity::After),
+                ),
+                mark,
+            }
+        })
+        .collect();
+    document
+        .apply_batch(TransactionBatch(transactions))
+        .expect("alternating decorations should validate");
+
+    let budget = 2 * 1024 * 1024;
+    let mut layout = LayoutRegistry::with_budget(budget);
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 4_000.0, 680.0, window);
+    });
+    assert!(layout.used_bytes() <= budget);
+    assert!(layout.peak_accounted_bytes() <= budget);
+    let cached = layout.cache.get(&node).expect("decorated paragraph cache");
+    assert!(
+        cached.decoration_run_count > 32,
+        "the fixture must exercise SmallVec decoration spill capacity"
+    );
+}
+
+#[gpui::test]
 async fn shaped_cache_invalidates_font_family_weight_style_and_size(cx: &mut gpui::TestAppContext) {
     let mut cx = cx.add_empty_window();
     let document = Document::from_paragraph("cache-key");
@@ -3340,5 +3383,113 @@ async fn measured_total_height_includes_a_single_wrapped_block(cx: &mut gpui::Te
     assert!(
         layout.total_height() > 240.0,
         "measured wrap height must expose a scrollable extent rather than one guessed row"
+    );
+}
+
+#[gpui::test]
+async fn nested_list_wrapping_uses_one_inset_alignment_geometry(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let mut document = Document::from_paragraph("nested ".repeat(80));
+    let node = document.first_node_id().expect("paragraph");
+    let text_len = document.text_at_index(0).expect("text").len();
+    document
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(node, 0, Affinity::Before),
+                DocPoint::with_affinity(node, text_len, Affinity::After),
+            ),
+            kind: BlockKind::OrderedItem { depth: 2 },
+        })
+        .expect("nested ordered item conversion");
+    document
+        .apply(Transaction::SetAlignment {
+            selection: Selection::new(
+                DocPoint::with_affinity(node, 0, Affinity::Before),
+                DocPoint::with_affinity(node, text_len, Affinity::After),
+            ),
+            alignment: TextAlignment::Center,
+        })
+        .expect("center alignment");
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 4_000.0, 120.0, window);
+    });
+    let block = layout.block_layout(node).expect("nested block geometry");
+    let text_width = (block.bounds.size.width - block.text_inset).max(px(1.0));
+    assert!(
+        block
+            .text_lines
+            .iter()
+            .all(|line| line.width() <= text_width),
+        "shaped rows must not spill into the list marker inset"
+    );
+    let rects = layout.selection_rects(Selection::new(block.before, block.after));
+    assert!(!rects.is_empty());
+    assert!(rects.iter().all(|rect| {
+        rect.left() >= block.bounds.left() + block.text_inset - px(0.5)
+            && rect.right() <= block.bounds.right() + px(0.5)
+    }));
+}
+
+#[gpui::test]
+async fn vertical_navigation_preserves_screen_x_across_list_inset_and_alignment(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let mut editor = EditorCore::for_test_paragraphs(
+        [
+            "0123456789",
+            "abcdefghijklmnopqrstuvwxabcdefghijklmnopqrstuvwx",
+        ],
+        &mut cx,
+    );
+    let first = editor.document().blocks()[0].id;
+    let second = editor.document().blocks()[1].id;
+    let first_len = editor.document().text_at_index(0).unwrap().len();
+    let second_len = editor.document().text_at_index(1).unwrap().len();
+    editor
+        .apply(Transaction::SetAlignment {
+            selection: Selection::new(
+                DocPoint::with_affinity(first, 0, Affinity::Before),
+                DocPoint::with_affinity(first, first_len, Affinity::After),
+            ),
+            alignment: TextAlignment::Right,
+        })
+        .expect("right-align first block");
+    editor
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(second, 0, Affinity::Before),
+                DocPoint::with_affinity(second, second_len, Affinity::After),
+            ),
+            kind: BlockKind::OrderedItem { depth: 2 },
+        })
+        .expect("nested list conversion");
+    editor
+        .apply(Transaction::SetAlignment {
+            selection: Selection::new(
+                DocPoint::with_affinity(second, 0, Affinity::Before),
+                DocPoint::with_affinity(second, second_len, Affinity::After),
+            ),
+            alignment: TextAlignment::Center,
+        })
+        .expect("center-align nested list");
+
+    let document = editor.document().clone();
+    cx.update(|window, _| {
+        editor
+            .layout
+            .shape_visible_with_window(&document, 0.0, 800.0, 180.0, window);
+    });
+    let origin = DocPoint::with_affinity(first, first_len, Affinity::After);
+    editor.set_selection_for_test(Selection::caret(origin));
+    let before_x = editor.layout().caret_x(origin).expect("first caret x");
+    editor.move_down();
+    let moved = editor.selection().head;
+    assert_eq!(moved.node_id, second, "down must enter the next block");
+    let after_x = editor.layout().caret_x(moved).expect("nested caret x");
+    assert!(
+        f32::from(after_x - before_x).abs() <= 12.0,
+        "vertical navigation must preserve screen x across inset/alignment: {before_x:?} -> {after_x:?}"
     );
 }
