@@ -1451,7 +1451,7 @@ mod tests {
     fn build_multiblock_list_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
         let mut document =
             Document::from_paragraphs(["bullet one", "bullet two", "ordered one", "ordered two"]);
-        let blocks = document.blocks().to_vec();
+        let blocks = document.blocks().collect_range(0..document.block_count());
         for (index, block) in blocks.iter().enumerate() {
             let text_len = block.content.as_text().map_or(0, str::len);
             let kind = if index < 2 {
@@ -1890,9 +1890,11 @@ mod tests {
             let editor = view.editor.read(cx);
             assert_eq!(editor.undo_depth(), before_bullet_outdent + 1);
             assert!(
-                editor.document().blocks()[0..2]
-                    .iter()
-                    .all(|block| { matches!(block.kind, BlockKind::BulletItem { depth: 0 }) })
+                editor
+                    .document()
+                    .blocks()
+                    .iter_range(0..2)
+                    .all(|block| matches!(block.kind, BlockKind::BulletItem { depth: 0 }))
             );
         });
 
@@ -1922,9 +1924,11 @@ mod tests {
             let editor = view.editor.read(cx);
             assert_eq!(editor.undo_depth(), before_ordered_outdent + 1);
             assert!(
-                editor.document().blocks()[2..4]
-                    .iter()
-                    .all(|block| { matches!(block.kind, BlockKind::OrderedItem { depth: 0 }) })
+                editor
+                    .document()
+                    .blocks()
+                    .iter_range(2..4)
+                    .all(|block| matches!(block.kind, BlockKind::OrderedItem { depth: 0 }))
             );
         });
     }

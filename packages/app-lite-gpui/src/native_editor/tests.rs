@@ -728,7 +728,7 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     let work_before = layout.ordered_number_work_count();
     let tail = document.blocks().last().expect("tail paragraph").clone();
     let before_selection = document.end_selection();
-    let splice_work_before = layout.ordered_splice_work_count();
+    let splice_work_before = layout.ordered_splice_operation_count();
     let measurement = AllocationMeasurement::begin();
     let outcome = history
         .apply_with_selection(
@@ -760,12 +760,9 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
         "tail Return rebuilt numbering for the whole document"
     );
     let splice_work = layout
-        .ordered_splice_work_count()
+        .ordered_splice_operation_count()
         .saturating_sub(splice_work_before);
-    assert!(
-        splice_work >= 1 + 2 + 3 && splice_work <= 16,
-        "tail Return tree delta work was not bounded: {splice_work}"
-    );
+    assert_eq!(splice_work, 1, "tail Return uses one local tree splice");
     assert!(
         scratch < 512 * 1024,
         "tail Return splice scratch grew with the 100k-block suffix: {scratch} bytes"
@@ -774,7 +771,7 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     let right = document.blocks().last().expect("split tail").id;
     let work_before = layout.ordered_number_work_count();
     let before_selection = document.end_selection();
-    let splice_work_before = layout.ordered_splice_work_count();
+    let splice_work_before = layout.ordered_splice_operation_count();
     let measurement = AllocationMeasurement::begin();
     let outcome = history
         .apply_with_selection(
@@ -807,19 +804,16 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
         "tail Backspace merge rebuilt numbering for the whole document"
     );
     let splice_work = layout
-        .ordered_splice_work_count()
+        .ordered_splice_operation_count()
         .saturating_sub(splice_work_before);
-    assert!(
-        splice_work >= 2 + 1 + 3 && splice_work <= 16,
-        "tail Backspace tree delta work was not bounded: {splice_work}"
-    );
+    assert_eq!(splice_work, 1, "tail Backspace uses one local tree splice");
     assert!(
         scratch < 512 * 1024,
         "tail Backspace splice scratch grew with the 100k-block suffix: {scratch} bytes"
     );
 
     let work_before = layout.ordered_number_work_count();
-    let splice_work_before = layout.ordered_splice_work_count();
+    let splice_work_before = layout.ordered_splice_operation_count();
     let measurement = AllocationMeasurement::begin();
     let outcome = history
         .undo_with_outcome(&mut document)
@@ -845,19 +839,16 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
         "undo merge rebuilt numbering for the whole document"
     );
     let splice_work = layout
-        .ordered_splice_work_count()
+        .ordered_splice_operation_count()
         .saturating_sub(splice_work_before);
-    assert!(
-        splice_work >= 1 + 2 + 3 && splice_work <= 16,
-        "undo merge tree delta work was not bounded: {splice_work}"
-    );
+    assert_eq!(splice_work, 1, "undo merge uses one local tree splice");
     assert!(
         scratch < 512 * 1024,
         "undo merge splice scratch grew with the 100k-block suffix: {scratch} bytes"
     );
 
     let work_before = layout.ordered_number_work_count();
-    let splice_work_before = layout.ordered_splice_work_count();
+    let splice_work_before = layout.ordered_splice_operation_count();
     let measurement = AllocationMeasurement::begin();
     let outcome = history
         .redo_with_outcome(&mut document)
@@ -883,12 +874,9 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
         "redo merge rebuilt numbering for the whole document"
     );
     let splice_work = layout
-        .ordered_splice_work_count()
+        .ordered_splice_operation_count()
         .saturating_sub(splice_work_before);
-    assert!(
-        splice_work >= 2 + 1 + 3 && splice_work <= 16,
-        "redo merge tree delta work was not bounded: {splice_work}"
-    );
+    assert_eq!(splice_work, 1, "redo merge uses one local tree splice");
     assert!(
         scratch < 512 * 1024,
         "redo merge splice scratch grew with the 100k-block suffix: {scratch} bytes"
@@ -1029,23 +1017,84 @@ fn restore_blocks_rejects_a_range_external_node_id_collision_atomically() {
 }
 
 #[test]
-fn structural_spare_capacity_is_exact_and_repeated_insertions_stay_valid() {
-    let mut document = Document::from_paragraph("seed");
-    let initial_capacity = document.block_capacity();
-    assert!(
-        initial_capacity <= document.block_count() + 4,
-        "from_paragraphs retained a geometric Vec cushion: capacity={initial_capacity}, len={}",
-        document.block_count()
-    );
-    assert!(
-        initial_capacity.saturating_mul(size_of::<Block>())
-            <= (document.block_count() + 4).saturating_mul(size_of::<Block>()),
-        "persistent block storage exceeded the four-slot cushion"
-    );
+fn restore_blocks_rejects_zero_and_internal_duplicate_ids_atomically() {
+    let mut document = Document::from_paragraphs(["left", "right"]);
+    let original = document.clone();
+    let zero = Block {
+        id: NodeId::new(0),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text("zero"),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    };
+    let result = document.apply(Transaction::RestoreBlocks {
+        index: 1,
+        remove_count: 1,
+        blocks: vec![zero],
+    });
+    assert!(matches!(
+        result,
+        Err(DocumentError::InvalidOperation(message))
+            if message.contains("duplicate or zero")
+    ));
+    assert_eq!(document, original);
 
-    let capacity_before_exhaustion = document.block_capacity();
-    let spare_before_exhaustion = capacity_before_exhaustion - document.block_count();
-    for _ in 0..spare_before_exhaustion {
+    let duplicate = document.blocks()[0].clone();
+    let result = document.apply(Transaction::RestoreBlocks {
+        index: 1,
+        remove_count: 1,
+        blocks: vec![duplicate.clone(), duplicate],
+    });
+    assert!(matches!(
+        result,
+        Err(DocumentError::InvalidOperation(message))
+            if message.contains("duplicate or zero")
+    ));
+    assert_eq!(document, original);
+    document.validate_invariants().expect("restore validation");
+}
+
+#[test]
+fn failed_history_batch_restores_selection_and_allocator_exactly() {
+    let mut document = Document::from_paragraph("ab");
+    let mut history = History::new(32, 4 * 1024 * 1024);
+    let original = document.clone();
+    let original_selection = document.end_selection();
+    let node = document.first_node_id().expect("batch node");
+    let result = history.apply_batch_with_selection(
+        &mut document,
+        original_selection,
+        TransactionBatch(vec![
+            Transaction::SplitBlock {
+                at: DocPoint::new(node, 1),
+            },
+            Transaction::InsertText {
+                selection: Selection::caret(DocPoint::new(node, 99)),
+                text: "must-not-commit".into(),
+            },
+        ]),
+    );
+    assert!(matches!(
+        result,
+        Err(DocumentError::InvalidUtf8Offset { .. })
+            | Err(DocumentError::InvalidGraphemeOffset { .. })
+    ));
+    assert_eq!(document, original);
+    assert_eq!(document.end_selection(), original_selection);
+    assert_eq!(history.undo_depth(), 0);
+    assert_eq!(history.redo_depth(), 0);
+    document
+        .apply(Transaction::SplitBlock {
+            at: DocPoint::new(node, 1),
+        })
+        .expect("allocator cursor remains reusable");
+    assert_eq!(document.blocks()[1].id, NodeId::new(2));
+}
+
+#[test]
+fn repeated_local_splices_stay_valid_without_order_buffer_capacity() {
+    let mut document = Document::from_paragraph("seed");
+    for _ in 0..8 {
         let tail = document.blocks().last().expect("tail block").clone();
         document
             .apply(Transaction::SplitBlock {
@@ -1057,17 +1106,45 @@ fn structural_spare_capacity_is_exact_and_repeated_insertions_stay_valid() {
             })
             .expect("consume structural spare slot");
     }
-    assert_eq!(document.block_capacity(), capacity_before_exhaustion);
-    assert_eq!(document.block_capacity(), document.block_count());
+    assert_eq!(document.block_count(), 9);
+    document
+        .validate_invariants()
+        .expect("repeated structural insertions remain valid");
+}
 
-    // The next splice has no spare slot and the following two edits exercise
-    // the grown buffer rather than only proving that the first edit worked.
-    for _ in 0..3 {
-        let tail = document
-            .blocks()
-            .last()
-            .expect("tail after exhaustion")
-            .clone();
+#[test]
+fn block_sequence_index_lookup_uses_right_boundary() {
+    let document = Document::from_paragraphs(["zero", "one", "last"]);
+    assert_eq!(
+        super::model::BlockSequence::item_overhead_bytes_for_test(),
+        size_of::<Arc<Block>>(),
+        "SumTree items retain one Arc pointer; Block payload stays shared"
+    );
+    assert_eq!(document.blocks()[0].content.as_text(), Some("zero"));
+    assert_eq!(document.blocks()[1].content.as_text(), Some("one"));
+    assert_eq!(
+        document.blocks()[document.block_count() - 1]
+            .content
+            .as_text(),
+        Some("last")
+    );
+}
+
+#[test]
+fn capacity_exhaustion_does_not_copy_a_100k_block_order_buffer() {
+    let blocks = (0..100_000)
+        .map(|index| Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: BlockKind::Paragraph,
+            content: BlockContent::text(format!("paragraph-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        })
+        .collect();
+    let mut document = Document::from_blocks(blocks).expect("large fixture");
+    let measurement = AllocationMeasurement::begin();
+    for _ in 0..5 {
+        let tail = document.blocks().last().expect("tail block").clone();
         document
             .apply(Transaction::SplitBlock {
                 at: DocPoint::with_affinity(
@@ -1076,13 +1153,436 @@ fn structural_spare_capacity_is_exact_and_repeated_insertions_stay_valid() {
                     Affinity::After,
                 ),
             })
-            .expect("repeat structural insertion after exhaustion");
+            .expect("tail split");
     }
-    assert_eq!(document.block_count(), capacity_before_exhaustion + 3);
-    assert!(document.block_capacity() >= document.block_count());
+    assert_eq!(document.block_count(), 100_005);
+    let allocated = measurement.bytes();
+    assert!(
+        allocated < 2 * 1024 * 1024,
+        "five tail splits allocated document-proportional order storage: {allocated} bytes"
+    );
+    document.validate_invariants().expect("100k tail splits");
+}
+
+#[derive(Clone)]
+struct OracleMergeState {
+    index: usize,
+    left: Block,
+    right: Block,
+}
+
+fn assert_sum_tree_matches_oracle(
+    document: &Document,
+    oracle: &[Block],
+    layout: &LayoutRegistry,
+    context: &str,
+) {
+    assert_eq!(document.block_count(), oracle.len(), "{context}: count");
+    let mut ids = std::collections::HashSet::with_capacity(oracle.len());
+    for (actual, expected) in document.blocks().iter().zip(oracle) {
+        assert_eq!(actual.id, expected.id, "{context}: order");
+        assert_eq!(actual.kind, expected.kind, "{context}: kind");
+        assert_eq!(actual.content, expected.content, "{context}: content");
+        assert_eq!(actual.alignment, expected.alignment, "{context}: alignment");
+        assert!(
+            ids.insert(actual.id),
+            "{context}: duplicate {:?}",
+            actual.id
+        );
+    }
     document
         .validate_invariants()
-        .expect("repeated structural insertions remain valid");
+        .unwrap_or_else(|error| panic!("{context}: invariant {error}"));
+    assert_ordered_numbers_match(document, layout, context);
+}
+
+fn run_mixed_sum_tree_fixture(block_count: usize) -> (usize, usize) {
+    let blocks = (0..block_count)
+        .map(|index| Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: if index < 128 {
+                BlockKind::OrderedItem { depth: 0 }
+            } else {
+                BlockKind::Paragraph
+            },
+            content: BlockContent::text(format!("row-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        })
+        .collect::<Vec<_>>();
+    let mut oracle = blocks.clone();
+    let mut document = Document::from_blocks(blocks).expect("mixed SumTree fixture");
+    let mut history = History::new(64, 8 * 1024 * 1024);
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    assert_sum_tree_matches_oracle(&document, &oracle, &layout, "mixed initial");
+
+    let mut max_allocation = 0usize;
+    let mut max_number_work = 0usize;
+    for cycle in 0..5 {
+        let split_id = if cycle % 2 == 0 {
+            oracle[block_count / 2].id
+        } else {
+            oracle.last().expect("tail fixture").id
+        };
+        let split_index = oracle
+            .iter()
+            .position(|block| block.id == split_id)
+            .expect("split id in oracle");
+        let before_undo = history.undo_depth();
+        let before_work = layout.ordered_number_work_count();
+        let before_operations = layout.ordered_splice_operation_count();
+        let split_point = DocPoint::with_affinity(split_id, 1, Affinity::After);
+        let (split_outcome, allocation) = apply_history_and_measure(
+            &mut document,
+            &mut history,
+            &mut layout,
+            Selection::caret(split_point),
+            Transaction::SplitBlock { at: split_point },
+        );
+        max_allocation = max_allocation.max(allocation);
+        max_number_work = max_number_work.max(
+            layout
+                .ordered_number_work_count()
+                .saturating_sub(before_work),
+        );
+        assert_eq!(
+            layout
+                .ordered_splice_operation_count()
+                .saturating_sub(before_operations),
+            1,
+            "split uses one SumTree splice"
+        );
+        assert_eq!(history.undo_depth(), before_undo + 1);
+        assert_eq!(history.redo_depth(), 0);
+        document
+            .validate_selection(split_outcome.selection)
+            .expect("split selection remains valid");
+        assert_eq!(split_outcome.structural_splices.len(), 1);
+        let split_splice = &split_outcome.structural_splices[0];
+        assert_eq!(split_splice.start_index, split_index);
+        let old = oracle.remove(split_index);
+        let text = old.content.as_text().expect("plain fixture").to_owned();
+        let (left_text, right_text) = text.split_at(1);
+        let mut left = old.clone();
+        left.content = BlockContent::text(left_text);
+        let mut right = old;
+        right.id = split_splice.inserted[1];
+        right.content = BlockContent::text(right_text);
+        oracle.splice(split_index..split_index, [left, right]);
+        assert_sum_tree_matches_oracle(&document, &oracle, &layout, "after split");
+
+        let right_id = split_splice.inserted[1];
+        let merge_index = oracle
+            .iter()
+            .position(|block| block.id == split_id)
+            .expect("merged left id in oracle");
+        assert_eq!(oracle[merge_index + 1].id, right_id);
+        let merge_state = OracleMergeState {
+            index: merge_index,
+            left: oracle[merge_index].clone(),
+            right: oracle[merge_index + 1].clone(),
+        };
+        let before_undo = history.undo_depth();
+        let before_work = layout.ordered_number_work_count();
+        let before_operations = layout.ordered_splice_operation_count();
+        let merge_selection = document.end_selection();
+        let (merge_outcome, allocation) = apply_history_and_measure(
+            &mut document,
+            &mut history,
+            &mut layout,
+            merge_selection,
+            Transaction::MergeBlocks {
+                left: split_id,
+                right: right_id,
+            },
+        );
+        max_allocation = max_allocation.max(allocation);
+        max_number_work = max_number_work.max(
+            layout
+                .ordered_number_work_count()
+                .saturating_sub(before_work),
+        );
+        assert_eq!(
+            layout
+                .ordered_splice_operation_count()
+                .saturating_sub(before_operations),
+            1,
+            "merge uses one SumTree splice"
+        );
+        assert_eq!(history.undo_depth(), before_undo + 1);
+        assert_eq!(history.redo_depth(), 0);
+        document
+            .validate_selection(merge_outcome.selection)
+            .expect("merge selection remains valid");
+        let mut merged = merge_state.left.clone();
+        let mut merged_text = merge_state
+            .left
+            .content
+            .as_text()
+            .expect("left plain fixture")
+            .to_owned();
+        merged_text.push_str(
+            merge_state
+                .right
+                .content
+                .as_text()
+                .expect("right plain fixture"),
+        );
+        merged.content = BlockContent::text(merged_text);
+        oracle.splice(merge_state.index..merge_state.index + 2, [merged]);
+        assert_sum_tree_matches_oracle(&document, &oracle, &layout, "after merge");
+
+        let before_undo = history.undo_depth();
+        let before_work = layout.ordered_number_work_count();
+        let before_operations = layout.ordered_splice_operation_count();
+        let measurement = AllocationMeasurement::begin();
+        let undo_outcome = history
+            .undo_with_outcome(&mut document)
+            .expect("undo merge");
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &undo_outcome.changed_nodes,
+            undo_outcome.structural,
+            &undo_outcome.structural_splices,
+            &undo_outcome.numbering_ranges,
+        );
+        max_allocation = max_allocation.max(measurement.bytes());
+        max_number_work = max_number_work.max(
+            layout
+                .ordered_number_work_count()
+                .saturating_sub(before_work),
+        );
+        assert_eq!(
+            layout
+                .ordered_splice_operation_count()
+                .saturating_sub(before_operations),
+            1,
+            "undo uses one SumTree splice"
+        );
+        assert_eq!(history.undo_depth(), before_undo - 1);
+        assert_eq!(history.redo_depth(), 1);
+        document
+            .validate_selection(undo_outcome.selection)
+            .expect("undo selection remains valid");
+        oracle.splice(
+            merge_state.index..merge_state.index + 1,
+            [merge_state.left.clone(), merge_state.right.clone()],
+        );
+        assert_sum_tree_matches_oracle(&document, &oracle, &layout, "after undo");
+
+        let before_undo = history.undo_depth();
+        let before_work = layout.ordered_number_work_count();
+        let before_operations = layout.ordered_splice_operation_count();
+        let measurement = AllocationMeasurement::begin();
+        let redo_outcome = history
+            .redo_with_outcome(&mut document)
+            .expect("redo merge");
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &redo_outcome.changed_nodes,
+            redo_outcome.structural,
+            &redo_outcome.structural_splices,
+            &redo_outcome.numbering_ranges,
+        );
+        max_allocation = max_allocation.max(measurement.bytes());
+        max_number_work = max_number_work.max(
+            layout
+                .ordered_number_work_count()
+                .saturating_sub(before_work),
+        );
+        assert_eq!(
+            layout
+                .ordered_splice_operation_count()
+                .saturating_sub(before_operations),
+            1,
+            "redo uses one SumTree splice"
+        );
+        assert_eq!(history.undo_depth(), before_undo + 1);
+        assert_eq!(history.redo_depth(), 0);
+        document
+            .validate_selection(redo_outcome.selection)
+            .expect("redo selection remains valid");
+        let mut merged = merge_state.left.clone();
+        let mut merged_text = merge_state
+            .left
+            .content
+            .as_text()
+            .expect("left plain fixture")
+            .to_owned();
+        merged_text.push_str(
+            merge_state
+                .right
+                .content
+                .as_text()
+                .expect("right plain fixture"),
+        );
+        merged.content = BlockContent::text(merged_text);
+        oracle.splice(merge_state.index..merge_state.index + 2, [merged]);
+        assert_sum_tree_matches_oracle(&document, &oracle, &layout, "after redo");
+    }
+
+    println!(
+        "mixed SumTree fixture {block_count}: max_path_allocation={max_allocation} max_number_work={max_number_work}"
+    );
+    assert!(
+        max_allocation < 4 * 1024 * 1024,
+        "mixed {block_count}-block paths allocated document-proportional storage: {max_allocation}"
+    );
+    assert!(
+        max_number_work <= 512,
+        "mixed {block_count}-block paths scanned too far: {max_number_work}"
+    );
+    (max_allocation, max_number_work)
+}
+
+#[test]
+fn mixed_sum_tree_paths_scale_on_10k_and_100k_fixtures() {
+    let (small_allocation, small_work) = run_mixed_sum_tree_fixture(10_000);
+    let (large_allocation, large_work) = run_mixed_sum_tree_fixture(100_000);
+    assert!(
+        large_allocation <= 2 * small_allocation.max(1) + 512 * 1024,
+        "100k path allocation grew with document size: 10k={small_allocation}, 100k={large_allocation}"
+    );
+    assert!(
+        large_work <= small_work.saturating_add(256),
+        "100k numbering work grew with document size: 10k={small_work}, 100k={large_work}"
+    );
+}
+
+#[test]
+fn max_node_id_cannot_be_allocated_again() {
+    let block = Block {
+        id: NodeId::new(u64::MAX),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text("max"),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    };
+    let mut document = Document::from_blocks(vec![block.clone()]).expect("max id is readable");
+    let original = document.clone();
+    let result = document.apply(Transaction::SplitBlock {
+        at: DocPoint::with_affinity(block.id, 1, Affinity::After),
+    });
+    assert!(
+        result.is_err(),
+        "fresh id exhaustion must fail before mutation"
+    );
+    assert_eq!(document, original);
+
+    // The image insertion path needs two fresh identities.  Starting after
+    // this block makes the first allocation valid and the second exhausted;
+    // that failure must happen before deleting or splitting the paragraph.
+    let paragraph_block = Block {
+        id: NodeId::new(u64::MAX - 2),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text("before"),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    };
+    let mut document = Document::from_blocks(vec![paragraph_block]).expect("near-max id is valid");
+    let original = document.clone();
+    let paragraph = document.blocks()[0].clone();
+    let result = document.apply(Transaction::InsertImage {
+        selection: Selection::caret(DocPoint::with_affinity(paragraph.id, 3, Affinity::After)),
+        resource_id: "exhausted-image".into(),
+        natural_size: (100, 100),
+    });
+    assert!(
+        result.is_err(),
+        "image insertion must preflight both fresh ids"
+    );
+    assert_eq!(document, original);
+}
+
+#[test]
+fn same_id_restore_reports_non_structural_metadata() {
+    let mut document = Document::from_paragraph("before");
+    let original = document.blocks()[0].clone();
+    let replacement = Block {
+        id: original.id,
+        kind: original.kind.clone(),
+        content: BlockContent::text("after"),
+        alignment: original.alignment,
+        revision: original.revision,
+    };
+    let outcome = document
+        .apply(Transaction::RestoreBlocks {
+            index: 0,
+            remove_count: 1,
+            blocks: vec![replacement],
+        })
+        .expect("same-id content restore");
+    assert!(!outcome.structural);
+    assert!(outcome.structural_splices.is_empty());
+}
+
+#[test]
+fn restore_at_checkpoint_boundary_round_trips_numbering() {
+    restore_checkpoint_boundary_fixture(65, 64);
+    restore_checkpoint_boundary_fixture(129, 128);
+}
+
+fn restore_checkpoint_boundary_fixture(block_count: usize, index: usize) {
+    let mut oracle = ordered_fixture(block_count);
+    let mut document = Document::from_blocks(oracle.clone()).expect("checkpoint fixture");
+    let mut history = History::new(32, 4 * 1024 * 1024);
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    assert_sum_tree_matches_oracle(&document, &oracle, &layout, "initial restore fixture");
+
+    let removed = oracle[index].clone();
+    let before_selection = document.end_selection();
+    let remove = history
+        .apply_with_selection(
+            &mut document,
+            before_selection,
+            Transaction::RestoreBlocks {
+                index,
+                remove_count: 1,
+                blocks: Vec::new(),
+            },
+        )
+        .expect("remove checkpoint item");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &remove.changed_nodes,
+        remove.structural,
+        &remove.structural_splices,
+        &remove.numbering_ranges,
+    );
+    oracle.remove(index);
+    assert_eq!(document.block_count(), block_count - 1);
+    assert_sum_tree_matches_oracle(&document, &oracle, &layout, "after restore remove");
+
+    let undone = history
+        .undo_with_outcome(&mut document)
+        .expect("undo remove to 65");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &undone.changed_nodes,
+        undone.structural,
+        &undone.structural_splices,
+        &undone.numbering_ranges,
+    );
+    oracle.insert(index, removed.clone());
+    assert_eq!(document.blocks()[index].id, removed.id);
+    assert_eq!(layout.ordered_number(removed.id), Some(index + 1));
+    assert_sum_tree_matches_oracle(&document, &oracle, &layout, "after restore undo");
+
+    let redone = history
+        .redo_with_outcome(&mut document)
+        .expect("redo restore remove");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &redone.changed_nodes,
+        redone.structural,
+        &redone.structural_splices,
+        &redone.numbering_ranges,
+    );
+    oracle.remove(index);
+    assert_eq!(document.block_count(), block_count - 1);
+    assert_sum_tree_matches_oracle(&document, &oracle, &layout, "after restore redo");
 }
 
 #[test]
@@ -1121,34 +1621,10 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
         });
     }
     let mut document = Document::from_blocks(blocks).expect("plain middle fixture");
-    assert!(
-        document.block_capacity() <= document.block_count() + 4,
-        "middle fixture retained a geometric Vec cushion: capacity={}, len={}",
-        document.block_capacity(),
-        document.block_count()
-    );
-    assert!(
-        document.block_capacity().saturating_mul(size_of::<Block>())
-            <= (document.block_count() + 4).saturating_mul(size_of::<Block>()),
-        "middle fixture persistent block storage exceeded the four-slot cushion"
-    );
-    let assert_compact_capacity = |document: &Document| {
-        assert!(
-            document.block_capacity() <= document.block_count() + 4,
-            "structural splice grew persistent block capacity geometrically: capacity={}, len={}",
-            document.block_capacity(),
-            document.block_count()
-        );
-        assert!(
-            document.block_capacity().saturating_mul(size_of::<Block>())
-                <= (document.block_count() + 4).saturating_mul(size_of::<Block>()),
-            "structural splice grew persistent block storage beyond the four-slot cushion"
-        );
-    };
-    assert_compact_capacity(&document);
     let middle = document.blocks()[MIDDLE_INDEX].id;
-    let suffix_ids = document.blocks()[PREFIX_COUNT + MIDDLE_COUNT..]
-        .iter()
+    let suffix_ids = document
+        .blocks()
+        .iter_range(PREFIX_COUNT + MIDDLE_COUNT..document.block_count())
         .map(|block| block.id)
         .collect::<Vec<_>>();
     let mut history = History::new(32, 4 * 1024 * 1024);
@@ -1189,7 +1665,6 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
         "plain middle Return transaction/delta/layout allocation grew with the document: {allocation}"
     );
     assert_suffix(&document, &layout);
-    assert_compact_capacity(&document);
 
     let right = document.blocks()[MIDDLE_INDEX + 1].id;
     let merge_selection = Selection::caret(DocPoint::with_affinity(right, 0, Affinity::Before));
@@ -1217,7 +1692,6 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
         "plain middle Backspace transaction/delta/layout allocation grew with the document: {allocation}"
     );
     assert_suffix(&document, &layout);
-    assert_compact_capacity(&document);
 
     let work_before = layout.ordered_number_work_count();
     let measurement = AllocationMeasurement::begin();
@@ -1245,7 +1719,6 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
         "plain middle undo transaction/delta/layout allocation grew with the document: {allocation}"
     );
     assert_suffix(&document, &layout);
-    assert_compact_capacity(&document);
 
     let work_before = layout.ordered_number_work_count();
     let measurement = AllocationMeasurement::begin();
@@ -1273,7 +1746,6 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
         "plain middle redo transaction/delta/layout allocation grew with the document: {allocation}"
     );
     assert_suffix(&document, &layout);
-    assert_compact_capacity(&document);
 
     let inline_selection = Selection::new(
         DocPoint::with_affinity(middle, 0, Affinity::Before),
@@ -2863,11 +3335,8 @@ async fn measured_reflow_shapes_every_final_member_without_fixed_pass_hole(
         );
     });
     let final_range = layout.visible_range();
-    let final_blocks = document
-        .blocks()
-        .get(final_range)
-        .expect("final viewport range");
-    assert!(!final_blocks.is_empty());
+    let final_blocks = document.blocks().iter_range(final_range.clone());
+    assert!(final_range.start < final_range.end);
     for block in final_blocks {
         let cached = layout
             .cache
@@ -2910,11 +3379,7 @@ async fn measured_reflow_uses_incremental_height_sum_tree_for_large_document(
         "height index work scaled with full-document convergence waves: {index_work}"
     );
     let final_range = layout.visible_range();
-    for block in document
-        .blocks()
-        .get(final_range)
-        .expect("final viewport range")
-    {
+    for block in document.blocks().iter_range(final_range.clone()) {
         assert!(
             layout
                 .cache
@@ -3390,8 +3855,9 @@ async fn nonzero_viewport_reflow_keeps_document_block_index(cx: &mut gpui::TestA
     let target = document.blocks()[140].id;
     let mut layout = LayoutRegistry::new();
     layout.layout_document(&document, 0.0, 120.0, 32.0);
-    let target_top_estimate = document.blocks()[..140]
-        .iter()
+    let target_top_estimate = document
+        .blocks()
+        .iter_range(0..140)
         .map(|block| {
             layout
                 .estimated_heights
@@ -3407,8 +3873,9 @@ async fn nonzero_viewport_reflow_keeps_document_block_index(cx: &mut gpui::TestA
     let target_layout = layout
         .block_layout(target)
         .expect("target must be prefetched");
-    let expected_top = document.blocks()[..140]
-        .iter()
+    let expected_top = document
+        .blocks()
+        .iter_range(0..140)
         .map(|block| {
             layout
                 .estimated_heights
@@ -3452,8 +3919,8 @@ async fn measured_reflow_recomputes_viewport_and_prefetch_membership(
     assert!(tall_ids.iter().all(|id| {
         document
             .blocks()
-            .get(final_range.clone())
-            .is_some_and(|blocks| blocks.iter().any(|block| block.id == *id))
+            .iter_range(final_range.clone())
+            .any(|block| block.id == *id)
     }));
     assert!(expanded_ids.difference(&tall_ids).all(|id| {
         layout

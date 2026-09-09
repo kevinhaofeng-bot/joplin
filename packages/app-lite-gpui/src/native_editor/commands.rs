@@ -267,8 +267,10 @@ impl CommandCatalogue {
                 let text_only_selection = editor
                     .selected_block_indices()
                     .map(|(start, end)| {
-                        editor.document().blocks()[start..=end]
-                            .iter()
+                        editor
+                            .document()
+                            .blocks()
+                            .iter_range(start..end.saturating_add(1))
                             .all(|block| block.content.as_text().is_some())
                     })
                     .unwrap_or(false);
@@ -287,59 +289,89 @@ impl CommandCatalogue {
                 let Some((start, end)) = editor.selected_block_indices() else {
                     return disabled();
                 };
-                let blocks = &editor.document().blocks()[start..=end];
-                if blocks.is_empty() || blocks.iter().any(|block| block.content.as_text().is_none())
-                {
+                if start > end {
                     return disabled();
                 }
-                let type_matching = blocks
-                    .iter()
-                    .filter(|block| block_kind_matches_command(&block.kind, command))
-                    .count();
-                let exact = block_kind_for_command(command);
-                let exact_matching = blocks.iter().filter(|block| block.kind == exact).count();
+                let (count, text_only, type_matching, exact_matching) = editor
+                    .document()
+                    .blocks()
+                    .iter_range(start..end.saturating_add(1))
+                    .fold(
+                        (0usize, true, 0usize, 0usize),
+                        |(count, text_only, type_matching, exact_matching), block| {
+                            (
+                                count.saturating_add(1),
+                                text_only && block.content.as_text().is_some(),
+                                type_matching.saturating_add(usize::from(
+                                    block_kind_matches_command(&block.kind, command),
+                                )),
+                                exact_matching.saturating_add(usize::from(
+                                    block.kind == block_kind_for_command(command),
+                                )),
+                            )
+                        },
+                    );
+                if count == 0 || !text_only {
+                    return disabled();
+                }
                 return CommandState {
-                    enabled: exact_matching != blocks.len(),
-                    toggle: toggle_state(type_matching > 0, type_matching == blocks.len()),
+                    enabled: exact_matching != count,
+                    toggle: toggle_state(type_matching > 0, type_matching == count),
                 };
             }
             EditorCommand::AlignLeft | EditorCommand::AlignCenter | EditorCommand::AlignRight => {
                 let Some((start, end)) = editor.selected_block_indices() else {
                     return disabled();
                 };
-                let blocks = &editor.document().blocks()[start..=end];
-                if blocks.is_empty() || blocks.iter().any(|block| block.content.as_text().is_none())
-                {
+                if start > end {
                     return disabled();
                 }
                 let expected = alignment_for_command(command);
-                let matching = blocks
-                    .iter()
-                    .filter(|block| block.alignment == expected)
-                    .count();
+                let (count, text_only, matching) = editor
+                    .document()
+                    .blocks()
+                    .iter_range(start..end.saturating_add(1))
+                    .fold(
+                        (0usize, true, 0usize),
+                        |(count, text_only, matching), block| {
+                            (
+                                count.saturating_add(1),
+                                text_only && block.content.as_text().is_some(),
+                                matching.saturating_add(usize::from(block.alignment == expected)),
+                            )
+                        },
+                    );
+                if count == 0 || !text_only {
+                    return disabled();
+                }
                 return CommandState {
-                    enabled: matching != blocks.len(),
-                    toggle: toggle_state(matching > 0, matching == blocks.len()),
+                    enabled: matching != count,
+                    toggle: toggle_state(matching > 0, matching == count),
                 };
             }
             EditorCommand::IndentList | EditorCommand::OutdentList => {
                 let Some((start, end)) = editor.selected_block_indices() else {
                     return disabled();
                 };
-                let blocks = &editor.document().blocks()[start..=end];
+                if start > end {
+                    return disabled();
+                }
+                let mut blocks = editor
+                    .document()
+                    .blocks()
+                    .iter_range(start..end.saturating_add(1));
                 // List-depth transactions are intentionally atomic across the
                 // whole block selection.  A mixed selection must therefore be
                 // disabled whenever one item cannot take the same operation;
                 // reporting enabled for only the applicable subset would make
                 // a toolbar click deterministically return a transaction error.
-                let enabled = !blocks.is_empty()
-                    && blocks.iter().all(|block| {
-                        list_depth(&block.kind).is_some_and(|depth| match command {
-                            EditorCommand::IndentList => depth < super::model::MAX_LIST_DEPTH,
-                            EditorCommand::OutdentList => depth > 0,
-                            _ => false,
-                        })
-                    });
+                let enabled = blocks.all(|block| {
+                    list_depth(&block.kind).is_some_and(|depth| match command {
+                        EditorCommand::IndentList => depth < super::model::MAX_LIST_DEPTH,
+                        EditorCommand::OutdentList => depth > 0,
+                        _ => false,
+                    })
+                });
                 return CommandState {
                     enabled,
                     toggle: ToggleState::Off,

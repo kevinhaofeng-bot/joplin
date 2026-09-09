@@ -349,7 +349,10 @@ mod tests {
     #[gpui::test]
     fn nested_ordered_items_continue_the_parent_sequence(cx: &mut gpui::TestAppContext) {
         let mut editor = EditorCore::for_test_paragraphs(["parent one", "child", "parent two"], cx);
-        let blocks = editor.document().blocks().to_vec();
+        let blocks = editor
+            .document()
+            .blocks()
+            .collect_range(0..editor.document().block_count());
         for (block, kind) in blocks.iter().zip([
             BlockKind::OrderedItem { depth: 0 },
             BlockKind::OrderedItem { depth: 1 },
@@ -402,7 +405,10 @@ mod tests {
             ],
             cx,
         );
-        let blocks = editor.document().blocks().to_vec();
+        let blocks = editor
+            .document()
+            .blocks()
+            .collect_range(0..editor.document().block_count());
         for (block, kind) in blocks.iter().zip([
             BlockKind::OrderedItem { depth: 0 },
             BlockKind::BulletItem { depth: 1 },
@@ -437,7 +443,10 @@ mod tests {
         let cx = cx.add_empty_window();
         let mut editor =
             EditorCore::for_test_paragraphs((0..256).map(|index| format!("ordered-{index}")), cx);
-        let blocks = editor.document().blocks().to_vec();
+        let blocks = editor
+            .document()
+            .blocks()
+            .collect_range(0..editor.document().block_count());
         for block in blocks {
             let text_len = block.content.as_text().map_or(0, str::len);
             editor

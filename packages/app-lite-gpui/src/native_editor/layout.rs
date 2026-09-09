@@ -388,6 +388,10 @@ struct NumberingCursor {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct NumberingCheckpoint {
     cursor: NumberingCursor,
+    /// A slot added after a splice has no trustworthy prefix state until the
+    /// incremental scan reaches its boundary. Keeping this explicit prevents
+    /// a default cursor from being mistaken for a valid seed.
+    valid: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -552,7 +556,7 @@ pub struct LayoutRegistry {
     #[cfg(test)]
     ordered_number_work_count: usize,
     #[cfg(test)]
-    ordered_splice_work_count: usize,
+    ordered_splice_operation_count: usize,
     estimate_revisions: HashMap<NodeId, u64>,
     estimate_width: f32,
     estimate_document_revision: Option<u64>,
@@ -593,7 +597,7 @@ impl LayoutRegistry {
             #[cfg(test)]
             ordered_number_work_count: 0,
             #[cfg(test)]
-            ordered_splice_work_count: 0,
+            ordered_splice_operation_count: 0,
             estimate_revisions: HashMap::new(),
             estimate_width: 0.0,
             estimate_document_revision: None,
@@ -691,8 +695,8 @@ impl LayoutRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn ordered_splice_work_count(&self) -> usize {
-        self.ordered_splice_work_count
+    pub(crate) fn ordered_splice_operation_count(&self) -> usize {
+        self.ordered_splice_operation_count
     }
 
     /// Build exact geometry for the viewport plus one viewport of prefetch on
@@ -746,9 +750,9 @@ impl LayoutRegistry {
 
         let allowed_ids: HashSet<NodeId> = document
             .blocks()
-            .get(self.first_visible..self.last_visible)
-            .unwrap_or_default()
             .iter()
+            .skip(self.first_visible)
+            .take(self.last_visible.saturating_sub(self.first_visible))
             .map(|block| block.id)
             .collect();
         self.evict_outside(&allowed_ids);
@@ -1560,6 +1564,7 @@ impl LayoutRegistry {
             if index % NUMBERING_CHECKPOINT_STRIDE == 0 {
                 self.ordered_checkpoints.push(NumberingCheckpoint {
                     cursor: cursor.clone(),
+                    valid: true,
                 });
             }
             let kind = numbering_kind(&block.kind);
@@ -1616,6 +1621,7 @@ impl LayoutRegistry {
                     .saturating_add(affected_len)
                     .min(document.block_count());
                 affected_ranges.push(affected_start..affected_end);
+                self.invalidate_ordered_checkpoint(splice.start_index);
                 self.splice_order_tree(splice);
                 for node_id in &splice.removed {
                     self.ordered_kinds.remove(node_id);
@@ -1627,9 +1633,17 @@ impl LayoutRegistry {
             first = first.min(range.start);
             last = last.max(range.end.saturating_sub(1));
             affected_ranges.push(range.clone());
+            self.invalidate_ordered_checkpoint(range.start);
         }
         if first != usize::MAX {
             self.update_ordered_numbers(document, first, last, &affected_ranges);
+        }
+    }
+
+    fn invalidate_ordered_checkpoint(&mut self, index: usize) {
+        let checkpoint_index = index.saturating_add(1) / NUMBERING_CHECKPOINT_STRIDE;
+        if let Some(checkpoint) = self.ordered_checkpoints.get_mut(checkpoint_index) {
+            checkpoint.valid = false;
         }
     }
 
@@ -1641,20 +1655,10 @@ impl LayoutRegistry {
     /// until the affected wave rewrites them.
     fn repair_ordered_checkpoints(&mut self, block_count: usize) {
         let checkpoint_count = block_count.div_ceil(NUMBERING_CHECKPOINT_STRIDE);
-        #[cfg(test)]
-        let previous_count = self.ordered_checkpoints.len();
         self.ordered_checkpoints.truncate(checkpoint_count);
         while self.ordered_checkpoints.len() < checkpoint_count {
             self.ordered_checkpoints
                 .push(NumberingCheckpoint::default());
-        }
-        #[cfg(test)]
-        {
-            // Count checkpoint repair as delta work rather than hiding it
-            // behind removed/inserted identity counts.
-            self.ordered_splice_work_count = self
-                .ordered_splice_work_count
-                .saturating_add(previous_count.abs_diff(checkpoint_count));
         }
     }
 
@@ -1677,17 +1681,10 @@ impl LayoutRegistry {
         self.ordered_tree = new_tree;
         #[cfg(test)]
         {
-            // Count the bounded sequence operations as well as the identities
-            // written. `slice`, `seek_forward`, and `suffix` each traverse
-            // the balanced tree; the counter is deliberately not just
-            // removed.len() + inserted.len().
-            self.ordered_splice_work_count = self.ordered_splice_work_count.saturating_add(
-                splice
-                    .removed
-                    .len()
-                    .saturating_add(splice.inserted.len())
-                    .saturating_add(3),
-            );
+            // This is deliberately an operation counter, not a claim about
+            // internal node visits. GPUI owns the tree traversal details.
+            self.ordered_splice_operation_count =
+                self.ordered_splice_operation_count.saturating_add(1);
         }
     }
 
@@ -1698,17 +1695,32 @@ impl LayoutRegistry {
         last_changed: usize,
         affected_ranges: &[Range<usize>],
     ) {
-        let checkpoint_start =
-            (start / NUMBERING_CHECKPOINT_STRIDE).saturating_mul(NUMBERING_CHECKPOINT_STRIDE);
+        let requested_checkpoint = start / NUMBERING_CHECKPOINT_STRIDE;
+        let mut checkpoint_index = requested_checkpoint;
+        while checkpoint_index > 0
+            && !self
+                .ordered_checkpoints
+                .get(checkpoint_index)
+                .is_some_and(|checkpoint| checkpoint.valid)
+        {
+            checkpoint_index -= 1;
+        }
+        let checkpoint_start = checkpoint_index.saturating_mul(NUMBERING_CHECKPOINT_STRIDE);
         let mut cursor = self
             .ordered_checkpoints
-            .get(checkpoint_start / NUMBERING_CHECKPOINT_STRIDE)
+            .get(checkpoint_index)
+            .filter(|checkpoint| checkpoint.valid)
             .map(|checkpoint| checkpoint.cursor.clone())
             .unwrap_or_default();
         let mut processed = 0usize;
         let mut changed_since_checkpoint = false;
         let mut checkpoint_changed_before = false;
-        for (index, block) in document.blocks().iter().enumerate().skip(checkpoint_start) {
+        for (offset, block) in document
+            .blocks()
+            .iter_range(checkpoint_start..document.block_count())
+            .enumerate()
+        {
+            let index = checkpoint_start.saturating_add(offset);
             let kind = numbering_kind(&block.kind);
             let old_kind = self.ordered_kinds.get(&block.id).copied();
             let old_number = self.ordered_numbers.get(&block.id).copied();
@@ -1741,9 +1753,12 @@ impl LayoutRegistry {
                     && self
                         .ordered_checkpoints
                         .get(checkpoint_index)
-                        .is_some_and(|checkpoint| checkpoint.cursor == cursor);
+                        .is_some_and(|checkpoint| {
+                            checkpoint.valid && checkpoint.cursor == cursor
+                        });
                 if let Some(checkpoint) = self.ordered_checkpoints.get_mut(checkpoint_index) {
                     checkpoint.cursor = cursor.clone();
+                    checkpoint.valid = true;
                 }
                 if stable {
                     break;

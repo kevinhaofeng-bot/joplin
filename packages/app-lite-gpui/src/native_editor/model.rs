@@ -1,7 +1,7 @@
 //! Compact, structured document model for the native editor spike.
 //!
 //! The model is intentionally independent from the donor Markdown editor.
-//! Blocks are kept in a contiguous vector for the spike while positions use
+//! Blocks are kept in a persistent GPUI `SumTree` sequence while positions use
 //! stable node identities, allowing the transaction layer to own structural
 //! edits and history to store inverse operations.
 
@@ -10,11 +10,13 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::Range;
+use std::ops::{Index, Range};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use smallvec::SmallVec;
+use sum_tree::{Bias, ContextLessSummary, Dimension, Item, SumTree};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::transaction::{
@@ -23,11 +25,6 @@ use super::transaction::{
 
 /// Maximum nesting depth accepted by list transactions.
 pub const MAX_LIST_DEPTH: u8 = 64;
-
-// A structural edit needs room for its small replacement span. Keep this
-// explicit and exact: `Vec::reserve` is allowed to grow geometrically and
-// would turn a four-block cushion into a document-sized hidden allocation.
-const STRUCTURAL_SPARE_CAPACITY: usize = 4;
 
 /// Stable identity for a block in a document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -346,10 +343,214 @@ pub struct SemanticSnapshot {
     pub blocks: Vec<Block>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct BlockCount(usize);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BlockSummary {
+    count: usize,
+}
+
+impl ContextLessSummary for BlockSummary {
+    fn zero() -> Self {
+        Self::default()
+    }
+
+    fn add_summary(&mut self, summary: &Self) {
+        self.count = self.count.saturating_add(summary.count);
+    }
+}
+
+impl<'a> Dimension<'a, BlockSummary> for BlockCount {
+    fn zero(_: ()) -> Self {
+        Self(0)
+    }
+
+    fn add_summary(&mut self, summary: &'a BlockSummary, _: ()) {
+        self.0 = self.0.saturating_add(summary.count);
+    }
+}
+
+/// A cheap-clone item stored in the document-order sequence.
+///
+/// GPUI's `SumTree` copies items while constructing persistent prefix/suffix
+/// trees. Keeping the payload behind `Arc` makes those copies retain only one
+/// block reference; a mutation clones just the affected block payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockItem {
+    block: Arc<Block>,
+}
+
+impl BlockItem {
+    fn new(block: Block) -> Self {
+        Self {
+            block: Arc::new(block),
+        }
+    }
+}
+
+impl Item for BlockItem {
+    type Summary = BlockSummary;
+
+    fn summary(&self, _: ()) -> Self::Summary {
+        BlockSummary { count: 1 }
+    }
+}
+
+/// Compact document-order read surface backed directly by GPUI's persistent
+/// B+ tree. Range collection is intentionally explicit and local; callers do
+/// not receive a hidden full-document materialization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSequence {
+    tree: SumTree<BlockItem>,
+}
+
+pub struct BlockSequenceIter<'a> {
+    inner: sum_tree::Iter<'a, BlockItem>,
+}
+
+impl<'a> Iterator for BlockSequenceIter<'a> {
+    type Item = &'a Block;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|item| item.block.as_ref())
+    }
+}
+
+/// Borrowing iterator over one indexed range. The cursor seeks to the range
+/// boundary in the SumTree; callers can fold command/layout state without
+/// cloning the selected blocks.
+pub struct BlockSequenceRangeIter<'a, 'cx> {
+    cursor: sum_tree::Cursor<'a, 'cx, BlockItem, BlockCount>,
+    end: usize,
+}
+
+impl<'a, 'cx> Iterator for BlockSequenceRangeIter<'a, 'cx> {
+    type Item = &'a Block;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor.start().0 >= self.end {
+            return None;
+        }
+        let item = self.cursor.item().map(|item| item.block.as_ref());
+        self.cursor.next();
+        item
+    }
+}
+
+impl<'a> IntoIterator for &'a BlockSequence {
+    type Item = &'a Block;
+    type IntoIter = BlockSequenceIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl BlockSequence {
+    fn from_blocks(blocks: Vec<Block>) -> Self {
+        Self {
+            tree: SumTree::from_iter(blocks.into_iter().map(BlockItem::new), ()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tree.summary().count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tree.is_empty()
+    }
+
+    pub fn iter(&self) -> BlockSequenceIter<'_> {
+        BlockSequenceIter {
+            inner: self.tree.iter(),
+        }
+    }
+
+    pub fn iter_range(&self, range: Range<usize>) -> BlockSequenceRangeIter<'_, '_> {
+        assert!(range.start <= range.end && range.end <= self.len());
+        let mut cursor = self.tree.cursor::<BlockCount>(());
+        cursor.seek(&BlockCount(range.start), Bias::Right);
+        BlockSequenceRangeIter {
+            cursor,
+            end: range.end,
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Block> {
+        let (_, _, item) = self
+            .tree
+            .find::<BlockCount, _>((), &BlockCount(index), Bias::Right);
+        item.map(|item| item.block.as_ref())
+    }
+
+    pub fn first(&self) -> Option<&Block> {
+        self.tree.first().map(|item| item.block.as_ref())
+    }
+
+    pub fn last(&self) -> Option<&Block> {
+        self.tree.last().map(|item| item.block.as_ref())
+    }
+
+    /// Materialize only the requested local range for a transaction inverse
+    /// or a neighboring-block calculation.
+    pub fn collect_range(&self, range: Range<usize>) -> Vec<Block> {
+        self.iter_range(range).cloned().collect()
+    }
+
+    /// Replace one local range using GPUI's production cursor splice path:
+    /// persistent prefix + local replacement tree + persistent suffix.
+    pub fn splice<I>(&mut self, range: Range<usize>, replacement: I) -> Vec<Block>
+    where
+        I: IntoIterator<Item = Block>,
+    {
+        assert!(range.start <= range.end && range.end <= self.len());
+        let removed = self.collect_range(range.clone());
+        let replacement = SumTree::from_iter(replacement.into_iter().map(BlockItem::new), ());
+        let mut cursor = self.tree.cursor::<BlockCount>(());
+        let mut new_tree = cursor.slice(&BlockCount(range.start), Bias::Right);
+        cursor.seek_forward(&BlockCount(range.end), Bias::Right);
+        new_tree.append(replacement, ());
+        new_tree.append(cursor.suffix(), ());
+        drop(cursor);
+        self.tree = new_tree;
+        removed
+    }
+
+    pub fn insert(&mut self, index: usize, block: Block) {
+        self.splice(index..index, [block]);
+    }
+
+    pub fn remove(&mut self, index: usize) -> Block {
+        self.splice(index..index.saturating_add(1), std::iter::empty())
+            .into_iter()
+            .next()
+            .expect("remove index is valid")
+    }
+
+    pub fn replace(&mut self, index: usize, block: Block) {
+        self.splice(index..index.saturating_add(1), [block]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn item_overhead_bytes_for_test() -> usize {
+        std::mem::size_of::<BlockItem>()
+    }
+}
+
+impl Index<usize> for BlockSequence {
+    type Output = Block;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("block index is in range")
+    }
+}
+
 /// Compact structured document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
-    blocks: Vec<Block>,
+    blocks: BlockSequence,
     next_id: u64,
     revision: u64,
 }
@@ -375,10 +576,13 @@ struct StructuralPlan {
 }
 
 impl StructuralPlan {
-    fn finish(self, blocks: &[Block]) -> Option<StructuralSplice> {
+    fn finish(self, blocks: &BlockSequence) -> Option<StructuralSplice> {
+        let end = self.start_index.saturating_add(self.inserted_count);
+        if end > blocks.len() {
+            return None;
+        }
         let inserted = blocks
-            .get(self.start_index..self.start_index.saturating_add(self.inserted_count))?
-            .iter()
+            .iter_range(self.start_index..end)
             .map(|block| block.id)
             .collect();
         // A RestoreBlocks inverse is also used for inline edits and for
@@ -426,13 +630,8 @@ impl Document {
             ));
             next_id = next_id.saturating_add(1);
         }
-        // Paragraph construction may have grown the temporary Vec
-        // geometrically; compact it before adding the explicit structural
-        // cushion so the model's retained capacity remains measurable.
-        blocks.shrink_to_fit();
-        blocks.reserve_exact(STRUCTURAL_SPARE_CAPACITY);
         let document = Self {
-            blocks,
+            blocks: BlockSequence::from_blocks(blocks),
             next_id,
             revision: 0,
         };
@@ -441,21 +640,16 @@ impl Document {
     }
 
     pub fn from_blocks(blocks: Vec<Block>) -> Result<Self, DocumentError> {
-        // Keep a small, measured local insertion cushion so the first
-        // structural edit does not make Vec::splice reallocate and copy the
-        // complete document buffer. `reserve_exact` is intentional: the
-        // persistent capacity overhead is at most four Block slots, rather
-        // than the geometric growth permitted by `reserve`.
-        let mut blocks = blocks;
-        blocks.reserve_exact(STRUCTURAL_SPARE_CAPACITY);
+        validate_block_slice(&blocks)?;
         let next_id = blocks
             .iter()
             .map(|block| block.id.raw())
             .max()
             .unwrap_or(0)
-            .saturating_add(1);
+            .checked_add(1)
+            .unwrap_or(u64::MAX);
         let document = Self {
-            blocks,
+            blocks: BlockSequence::from_blocks(blocks),
             next_id: next_id.max(1),
             revision: 0,
         };
@@ -463,7 +657,7 @@ impl Document {
         Ok(document)
     }
 
-    pub fn blocks(&self) -> &[Block] {
+    pub fn blocks(&self) -> &BlockSequence {
         &self.blocks
     }
 
@@ -477,11 +671,6 @@ impl Document {
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn block_capacity(&self) -> usize {
-        self.blocks.capacity()
     }
 
     pub fn revision(&self) -> u64 {
@@ -510,8 +699,8 @@ impl Document {
         let last = self
             .blocks
             .iter()
-            .rev()
-            .find(|block| matches!(block.content, BlockContent::Text { .. }));
+            .filter(|block| matches!(block.content, BlockContent::Text { .. }))
+            .last();
         match (first, last) {
             (Some(first), Some(last)) => {
                 let first_point = DocPoint::with_affinity(first.id, 0, Affinity::Before);
@@ -527,8 +716,8 @@ impl Document {
         if let Some(block) = self
             .blocks
             .iter()
-            .rev()
-            .find(|block| matches!(block.content, BlockContent::Text { .. }))
+            .filter(|block| matches!(block.content, BlockContent::Text { .. }))
+            .last()
         {
             return Selection::caret(DocPoint::with_affinity(
                 block.id,
@@ -540,7 +729,7 @@ impl Document {
     }
 
     pub fn semantic_snapshot(&self) -> SemanticSnapshot {
-        let mut blocks = self.blocks.clone();
+        let mut blocks: Vec<Block> = self.blocks.iter().cloned().collect();
         for block in &mut blocks {
             block.revision = 0;
         }
@@ -771,10 +960,27 @@ impl Document {
             .ok_or(DocumentError::NodeNotFound(node_id))
     }
 
-    fn new_node_id(&mut self) -> NodeId {
-        let id = NodeId::new_internal(self.next_id.max(1));
-        self.next_id = self.next_id.saturating_add(1).max(1);
-        id
+    fn new_node_id(&mut self) -> Result<NodeId, DocumentError> {
+        let raw = self.next_id.max(1);
+        if raw == u64::MAX {
+            return Err(DocumentError::InvalidOperation(
+                "node id allocator exhausted".into(),
+            ));
+        }
+        let id = NodeId::new_internal(raw);
+        if self.block(id).is_some() {
+            return Err(DocumentError::InvalidOperation(
+                "node id allocator collided with a retained node".into(),
+            ));
+        }
+        self.next_id = raw.saturating_add(1);
+        Ok(id)
+    }
+
+    fn advance_next_id_for_blocks(&mut self, blocks: &[Block]) {
+        if let Some(max_id) = blocks.iter().map(|block| block.id.raw()).max() {
+            self.next_id = self.next_id.max(max_id.checked_add(1).unwrap_or(u64::MAX));
+        }
     }
 
     fn structural_plan_for(&self, transaction: &Transaction) -> Option<StructuralPlan> {
@@ -818,8 +1024,8 @@ impl Document {
                 }
                 plan.start_index = bounds.start_index;
                 plan.removed.extend(
-                    self.blocks[bounds.start_index..=bounds.end_index]
-                        .iter()
+                    self.blocks
+                        .iter_range(bounds.start_index..bounds.end_index.saturating_add(1))
                         .map(|block| block.id),
                 );
                 plan.inserted_count = 1;
@@ -840,8 +1046,8 @@ impl Document {
                 }
                 plan.start_index = bounds.start_index;
                 plan.removed.extend(
-                    self.blocks[bounds.start_index..=bounds.end_index]
-                        .iter()
+                    self.blocks
+                        .iter_range(bounds.start_index..bounds.end_index.saturating_add(1))
                         .map(|block| block.id),
                 );
                 plan.inserted_count = 1;
@@ -869,8 +1075,8 @@ impl Document {
                 }
                 plan.start_index = bounds.start_index;
                 plan.removed.extend(
-                    self.blocks[bounds.start_index..=bounds.end_index]
-                        .iter()
+                    self.blocks
+                        .iter_range(bounds.start_index..bounds.end_index.saturating_add(1))
                         .map(|block| block.id),
                 );
                 plan.inserted_count = 3;
@@ -894,8 +1100,8 @@ impl Document {
                 }
                 plan.start_index = *index;
                 plan.removed.extend(
-                    self.blocks[*index..index.saturating_add(*remove_count)]
-                        .iter()
+                    self.blocks
+                        .iter_range(*index..index.saturating_add(*remove_count))
                         .map(|block| block.id),
                 );
                 plan.inserted_count = blocks.len();
@@ -918,26 +1124,27 @@ impl Document {
                 remove_count,
                 blocks,
             } => {
-                let old_blocks = self
-                    .blocks
-                    .get(*index..index.saturating_add(*remove_count))?;
+                let end = index.saturating_add(*remove_count);
+                if end > self.blocks.len() {
+                    return None;
+                }
                 // Same-ID restores are not order edits, but a kind/depth
                 // change still invalidates the local numbering sequence.
                 // Compare only the supplied range; this keeps inline undo and
                 // IME provisional restore O(changed_nodes).
-                if old_blocks.len() != blocks.len()
-                    || !old_blocks
-                        .iter()
-                        .zip(blocks)
-                        .all(|(old, replacement)| old.id == replacement.id)
-                {
+                if *remove_count != blocks.len() {
                     return None;
                 }
-                old_blocks
-                    .iter()
-                    .zip(blocks)
-                    .any(|(old, replacement)| old.kind != replacement.kind)
-                    .then_some(*index..index.saturating_add(blocks.len()))
+                let mut kind_changed = false;
+                let mut old_blocks = self.blocks.iter_range(*index..end);
+                for replacement in blocks {
+                    let old = old_blocks.next()?;
+                    if old.id != replacement.id {
+                        return None;
+                    }
+                    kind_changed |= old.kind != replacement.kind;
+                }
+                kind_changed.then_some(*index..index.saturating_add(blocks.len()))
             }
             _ => None,
         }
@@ -950,7 +1157,6 @@ impl Document {
         let original_revision = self.revision;
         let original_next_id = self.next_id;
         let block_count_before = self.blocks.len();
-        let structural_hint = transaction_changes_list_structure(&transaction);
         let structural_plan = self.structural_plan_for(&transaction);
         let numbering_range = self.numbering_range_for(&transaction);
         let (selection, changed_nodes, inverse, inserted_span) = match transaction {
@@ -1052,8 +1258,11 @@ impl Document {
         }
         self.revision = self.revision.saturating_add(1);
         for node_id in &changed_nodes {
-            if let Some(block) = self.blocks.iter_mut().find(|block| block.id == *node_id) {
+            let index = self.blocks.iter().position(|block| block.id == *node_id);
+            if let Some(index) = index {
+                let mut block = self.blocks[index].clone();
                 block.revision = self.revision;
+                self.blocks.replace(index, block);
             }
         }
         // The IME replacement path calls this primitive repeatedly while
@@ -1078,8 +1287,8 @@ impl Document {
                 }
                 unique
             },
-            structural: structural_hint
-                || !structural_splices.is_empty()
+            structural: !structural_splices.is_empty()
+                || !numbering_ranges.is_empty()
                 || self.blocks.len() != block_count_before,
             structural_splices,
             numbering_ranges,
@@ -1264,7 +1473,10 @@ impl Document {
         start_index: usize,
         end_index: usize,
     ) -> Result<(), DocumentError> {
-        for block in &self.blocks[start_index..=end_index] {
+        for block in self
+            .blocks
+            .iter_range(start_index..end_index.saturating_add(1))
+        {
             if !matches!(block.content, BlockContent::Text { .. }) {
                 return Err(DocumentError::InvalidBlockContent(block.id));
             }
@@ -1314,7 +1526,7 @@ impl Document {
                     None,
                 ));
             }
-            let inserted = Block::text(self.new_node_id(), BlockKind::Paragraph, text.clone());
+            let inserted = Block::text(self.new_node_id()?, BlockKind::Paragraph, text.clone());
             let inserted_id = inserted.id;
             self.blocks.insert(insert_at, inserted);
             let mut changed_nodes = SmallVec::new();
@@ -1357,7 +1569,7 @@ impl Document {
                         None,
                     ));
                 }
-                let inserted = Block::text(self.new_node_id(), BlockKind::Paragraph, text.clone());
+                let inserted = Block::text(self.new_node_id()?, BlockKind::Paragraph, text.clone());
                 let inserted_id = inserted.id;
                 let insert_at = match selection.anchor.affinity {
                     Affinity::Before => start_index,
@@ -1388,7 +1600,7 @@ impl Document {
 
             let block_id = original.id;
             let replacement = Block::text(block_id, BlockKind::Paragraph, text.clone());
-            self.blocks[start_index] = replacement;
+            self.blocks.replace(start_index, replacement);
             let mut changed_nodes = SmallVec::new();
             push_unique(&mut changed_nodes, block_id);
             let after = Selection::caret(DocPoint::with_affinity(
@@ -1411,7 +1623,9 @@ impl Document {
             ));
         }
 
-        let originals = self.blocks[start_index..=end_index].to_vec();
+        let originals = self
+            .blocks
+            .collect_range(start_index..end_index.saturating_add(1));
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
         let is_empty = start_index == end_index && start_offset == end_offset;
 
@@ -1438,7 +1652,7 @@ impl Document {
 
         let block_id = self.blocks[start_index].id;
         let inserted_len = text.len();
-        let block = &mut self.blocks[start_index];
+        let mut block = self.blocks[start_index].clone();
         let (old_text, old_styles) = text_parts(&block.content)?;
         let mut new_text = String::with_capacity(old_text.len() + inserted_len);
         new_text.push_str(&old_text[..insertion_offset]);
@@ -1460,6 +1674,7 @@ impl Document {
             text: new_text,
             styles: new_styles,
         };
+        self.blocks.replace(start_index, block);
 
         let mut changed_nodes = SmallVec::new();
         for node_id in original_ids {
@@ -1555,7 +1770,9 @@ impl Document {
             ));
         }
 
-        let originals = self.blocks[start_index..=end_index].to_vec();
+        let originals = self
+            .blocks
+            .collect_range(start_index..end_index.saturating_add(1));
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
         let raw_offset =
             self.delete_range_mut(start_index, start_offset, end_index, end_offset, false)?;
@@ -1595,7 +1812,7 @@ impl Document {
         preserve_style_seam: bool,
     ) -> Result<usize, DocumentError> {
         if start_index == end_index {
-            let block = &mut self.blocks[start_index];
+            let mut block = self.blocks[start_index].clone();
             let (text, styles) = text_parts(&block.content)?;
             let (new_text, new_styles) =
                 delete_text(text, styles, start_offset, end_offset, preserve_style_seam);
@@ -1603,6 +1820,7 @@ impl Document {
                 text: new_text,
                 styles: new_styles,
             };
+            self.blocks.replace(start_index, block);
             return Ok(start_offset);
         }
 
@@ -1654,7 +1872,8 @@ impl Document {
             },
             revision: start_block.revision,
         };
-        self.blocks.splice(start_index..=end_index, [merged]);
+        self.blocks
+            .splice(start_index..end_index.saturating_add(1), [merged]);
         Ok(prefix.len())
     }
 
@@ -1667,7 +1886,7 @@ impl Document {
         let (text, styles) = text_parts(&original.content)?;
         let (left_text, left_styles, right_text, right_styles) =
             split_text(text, styles, at.utf8_offset);
-        let right_id = self.new_node_id();
+        let right_id = self.new_node_id()?;
         let left = Block {
             id: original.id,
             kind: original.kind.clone(),
@@ -1688,7 +1907,8 @@ impl Document {
             alignment: original.alignment,
             revision: original.revision,
         };
-        self.blocks.splice(index..=index, [left, right]);
+        self.blocks
+            .splice(index..index.saturating_add(1), [left, right]);
         let mut changed_nodes = SmallVec::new();
         push_unique(&mut changed_nodes, original.id);
         push_unique(&mut changed_nodes, right_id);
@@ -1739,11 +1959,13 @@ impl Document {
         merged_text.push_str(left_text);
         merged_text.push_str(right_text);
         normalize_styles_for_text(&merged_text, &mut merged_styles);
-        self.blocks[left_index].content = BlockContent::Text {
+        let mut merged_block = self.blocks[left_index].clone();
+        merged_block.content = BlockContent::Text {
             text: merged_text,
             styles: merged_styles,
         };
-        self.blocks.remove(right_index);
+        self.blocks
+            .splice(left_index..right_index.saturating_add(1), [merged_block]);
         let mut changed_nodes = SmallVec::new();
         push_unique(&mut changed_nodes, left_id);
         push_unique(&mut changed_nodes, right_id);
@@ -1778,9 +2000,12 @@ impl Document {
         }
         let (start_index, _, end_index, _) = self.selection_bounds(selection)?;
         self.ensure_text_blocks(start_index, end_index)?;
-        let originals = self.blocks[start_index..=end_index].to_vec();
+        let originals = self
+            .blocks
+            .collect_range(start_index..end_index.saturating_add(1));
         let mut changed_nodes = SmallVec::new();
-        for block in &mut self.blocks[start_index..=end_index] {
+        let mut replacements = originals.clone();
+        for block in &mut replacements {
             if block.kind != kind {
                 block.kind = kind.clone();
                 push_unique(&mut changed_nodes, block.id);
@@ -1789,6 +2014,8 @@ impl Document {
         if changed_nodes.is_empty() {
             return Ok((selection, changed_nodes, TransactionBatch::default()));
         }
+        self.blocks
+            .splice(start_index..end_index.saturating_add(1), replacements);
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
             index: start_index,
             remove_count: end_index - start_index + 1,
@@ -1809,9 +2036,13 @@ impl Document {
         if start_index == end_index && start_offset == end_offset {
             return Ok((selection, SmallVec::new(), TransactionBatch::default()));
         }
-        let originals = self.blocks[start_index..=end_index].to_vec();
+        let originals = self
+            .blocks
+            .collect_range(start_index..end_index.saturating_add(1));
+        let mut replacements = originals.clone();
         let mut changed_nodes = SmallVec::new();
-        for index in start_index..=end_index {
+        for (offset, block) in replacements.iter_mut().enumerate() {
+            let index = start_index.saturating_add(offset);
             let Some((range_start, range_end)) =
                 self.text_range_for_block(index, start_index, start_offset, end_index, end_offset)
             else {
@@ -1820,7 +2051,6 @@ impl Document {
             if range_start == range_end {
                 continue;
             }
-            let block = &mut self.blocks[index];
             let (text, styles) = text_parts(&block.content)?;
             let updated = toggle_style_range(text, styles, range_start, range_end, &mark);
             if updated.as_slice() != styles {
@@ -1834,6 +2064,8 @@ impl Document {
         if changed_nodes.is_empty() {
             return Ok((selection, changed_nodes, TransactionBatch::default()));
         }
+        self.blocks
+            .splice(start_index..end_index.saturating_add(1), replacements);
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
             index: start_index,
             remove_count: end_index - start_index + 1,
@@ -1854,9 +2086,13 @@ impl Document {
         if start_index == end_index && start_offset == end_offset {
             return Ok((selection, SmallVec::new(), TransactionBatch::default()));
         }
-        let originals = self.blocks[start_index..=end_index].to_vec();
+        let originals = self
+            .blocks
+            .collect_range(start_index..end_index.saturating_add(1));
+        let mut replacements = originals.clone();
         let mut changed_nodes = SmallVec::new();
-        for index in start_index..=end_index {
+        for (offset, block) in replacements.iter_mut().enumerate() {
+            let index = start_index.saturating_add(offset);
             let Some((range_start, range_end)) =
                 self.text_range_for_block(index, start_index, start_offset, end_index, end_offset)
             else {
@@ -1865,7 +2101,6 @@ impl Document {
             if range_start == range_end {
                 continue;
             }
-            let block = &mut self.blocks[index];
             let (text, styles) = text_parts(&block.content)?;
             let updated = set_link_range(text, styles, range_start, range_end, url.as_deref());
             if updated.as_slice() != styles {
@@ -1879,6 +2114,8 @@ impl Document {
         if changed_nodes.is_empty() {
             return Ok((selection, changed_nodes, TransactionBatch::default()));
         }
+        self.blocks
+            .splice(start_index..end_index.saturating_add(1), replacements);
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
             index: start_index,
             remove_count: end_index - start_index + 1,
@@ -1894,9 +2131,12 @@ impl Document {
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         self.validate_selection(selection)?;
         let (start_index, _, end_index, _) = self.selection_bounds(selection)?;
-        let originals = self.blocks[start_index..=end_index].to_vec();
+        let originals = self
+            .blocks
+            .collect_range(start_index..end_index.saturating_add(1));
+        let mut replacements = originals.clone();
         let mut changed_nodes = SmallVec::new();
-        for block in &mut self.blocks[start_index..=end_index] {
+        for block in &mut replacements {
             if block.alignment != alignment {
                 block.alignment = alignment;
                 push_unique(&mut changed_nodes, block.id);
@@ -1905,6 +2145,8 @@ impl Document {
         if changed_nodes.is_empty() {
             return Ok((selection, changed_nodes, TransactionBatch::default()));
         }
+        self.blocks
+            .splice(start_index..end_index.saturating_add(1), replacements);
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
             index: start_index,
             remove_count: end_index - start_index + 1,
@@ -1935,7 +2177,10 @@ impl Document {
         self.validate_selection(selection)?;
         let (start_index, _, end_index, _) = self.selection_bounds(selection)?;
         if indent {
-            for block in &self.blocks[start_index..=end_index] {
+            for block in self
+                .blocks
+                .iter_range(start_index..end_index.saturating_add(1))
+            {
                 match block.kind {
                     BlockKind::BulletItem { depth }
                     | BlockKind::OrderedItem { depth }
@@ -1948,9 +2193,12 @@ impl Document {
                 }
             }
         }
-        let originals = self.blocks[start_index..=end_index].to_vec();
+        let originals = self
+            .blocks
+            .collect_range(start_index..end_index.saturating_add(1));
+        let mut replacements = originals.clone();
         let mut changed_nodes = SmallVec::new();
-        for block in &mut self.blocks[start_index..=end_index] {
+        for block in &mut replacements {
             let depth = match &mut block.kind {
                 BlockKind::BulletItem { depth }
                 | BlockKind::OrderedItem { depth }
@@ -1968,6 +2216,8 @@ impl Document {
         if changed_nodes.is_empty() {
             return Ok((selection, changed_nodes, TransactionBatch::default()));
         }
+        self.blocks
+            .splice(start_index..end_index.saturating_add(1), replacements);
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
             index: start_index,
             remove_count: end_index - start_index + 1,
@@ -1994,7 +2244,7 @@ impl Document {
         }
         if let Some(insert_at) = self.adjacent_structural_seam(selection)? {
             let image = Block {
-                id: self.new_node_id(),
+                id: self.new_node_id()?,
                 kind: BlockKind::Image,
                 content: BlockContent::Image {
                     resource_id,
@@ -2031,7 +2281,7 @@ impl Document {
             let original = self.blocks[start_index].clone();
             if selection.is_caret() {
                 let image = Block {
-                    id: self.new_node_id(),
+                    id: self.new_node_id()?,
                     kind: BlockKind::Image,
                     content: BlockContent::Image {
                         resource_id,
@@ -2061,17 +2311,20 @@ impl Document {
             }
 
             let image_id = original.id;
-            self.blocks[start_index] = Block {
-                id: image_id,
-                kind: BlockKind::Image,
-                content: BlockContent::Image {
-                    resource_id,
-                    natural_size,
-                    display_width: None,
+            self.blocks.replace(
+                start_index,
+                Block {
+                    id: image_id,
+                    kind: BlockKind::Image,
+                    content: BlockContent::Image {
+                        resource_id,
+                        natural_size,
+                        display_width: None,
+                    },
+                    alignment: original.alignment,
+                    revision: original.revision,
                 },
-                alignment: original.alignment,
-                revision: original.revision,
-            };
+            );
             let mut changed_nodes = SmallVec::new();
             push_unique(&mut changed_nodes, image_id);
             return Ok((
@@ -2085,9 +2338,16 @@ impl Document {
             ));
         }
 
-        let originals = self.blocks[start_index..=end_index].to_vec();
+        let originals = self
+            .blocks
+            .collect_range(start_index..end_index.saturating_add(1));
         let original_ids = originals.iter().map(|block| block.id).collect::<Vec<_>>();
         let is_empty = start_index == end_index && start_offset == end_offset;
+        // Reserve every fresh identity before deleting the selected range.
+        // If the second allocation is exhausted, this operation must leave
+        // the document unchanged rather than publishing a partial deletion.
+        let image_id = self.new_node_id()?;
+        let right_id = self.new_node_id()?;
         let insertion_offset = if !is_empty {
             self.delete_range_mut(start_index, start_offset, end_index, end_offset, true)?
         } else {
@@ -2098,8 +2358,6 @@ impl Document {
         let (text, styles) = text_parts(&original_block.content)?;
         let (left_text, left_styles, right_text, right_styles) =
             split_text(text, styles, insertion_offset);
-        let image_id = self.new_node_id();
-        let right_id = self.new_node_id();
         let left = Block {
             id: original_block.id,
             kind: original_block.kind.clone(),
@@ -2131,8 +2389,10 @@ impl Document {
             alignment: original_block.alignment,
             revision: original_block.revision,
         };
-        self.blocks
-            .splice(start_index..=start_index, [left, image, right]);
+        self.blocks.splice(
+            start_index..start_index.saturating_add(1),
+            [left, image, right],
+        );
         let mut changed_nodes = SmallVec::new();
         for node_id in original_ids {
             push_unique(&mut changed_nodes, node_id);
@@ -2181,10 +2441,11 @@ impl Document {
         }
         let index = self.node_index(node_id)?;
         let original = self.blocks[index].clone();
+        let mut updated = original.clone();
         let BlockContent::Image {
             display_width: current,
             ..
-        } = &mut self.blocks[index].content
+        } = &mut updated.content
         else {
             return Err(DocumentError::InvalidBlockContent(node_id));
         };
@@ -2196,6 +2457,7 @@ impl Document {
             ));
         }
         *current = display_width;
+        self.blocks.replace(index, updated);
         let mut changed_nodes = SmallVec::new();
         push_unique(&mut changed_nodes, node_id);
         let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
@@ -2233,8 +2495,11 @@ impl Document {
             }
             replacement_ids.push(block.id);
         }
+        let current_range = self
+            .blocks
+            .collect_range(index..index.saturating_add(remove_count));
         let all_ids_are_replaced = blocks.iter().all(|replacement| {
-            self.blocks[index..index + remove_count]
+            current_range
                 .iter()
                 .any(|current| current.id == replacement.id)
         });
@@ -2251,8 +2516,10 @@ impl Document {
             ));
         }
         let replacement_count = blocks.len();
-        let old_blocks = self.blocks[index..index + remove_count].to_vec();
-        self.blocks.splice(index..index + remove_count, blocks);
+        let old_blocks = current_range;
+        self.advance_next_id_for_blocks(&blocks);
+        self.blocks
+            .splice(index..index.saturating_add(remove_count), blocks);
         let mut changed_nodes = SmallVec::new();
         for block in &old_blocks {
             push_unique(&mut changed_nodes, block.id);
@@ -2901,20 +3168,6 @@ fn normalize_styles(styles: &mut SmallVec<[StyledRun; 4]>) {
         }
     }
     *styles = merged;
-}
-
-fn transaction_changes_list_structure(transaction: &Transaction) -> bool {
-    matches!(
-        transaction,
-        Transaction::SplitBlock { .. }
-            | Transaction::MergeBlocks { .. }
-            | Transaction::SetBlockKind { .. }
-            | Transaction::IndentList { .. }
-            | Transaction::OutdentList { .. }
-            | Transaction::InsertImage { .. }
-            | Transaction::RemoveNode { .. }
-            | Transaction::RestoreBlocks { .. }
-    )
 }
 
 fn push_unique(nodes: &mut SmallVec<[NodeId; 4]>, node_id: NodeId) {

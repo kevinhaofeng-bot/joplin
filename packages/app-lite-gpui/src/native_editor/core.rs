@@ -835,27 +835,29 @@ impl EditorCore {
     }
 
     pub fn move_to_image_before(&mut self) {
-        if let Some(block) = self
+        let image_id = self
             .document
             .blocks()
             .iter()
             .find(|block| block.kind == BlockKind::Image)
-        {
+            .map(|block| block.id);
+        if let Some(image_id) = image_id {
             self.selection =
-                Selection::caret(DocPoint::with_affinity(block.id, 0, Affinity::Before));
+                Selection::caret(DocPoint::with_affinity(image_id, 0, Affinity::Before));
             self.clear_composition();
         }
     }
 
     pub fn move_to_image_after(&mut self) {
-        if let Some(block) = self
+        let image_id = self
             .document
             .blocks()
             .iter()
             .find(|block| block.kind == BlockKind::Image)
-        {
+            .map(|block| block.id);
+        if let Some(image_id) = image_id {
             self.selection =
-                Selection::caret(DocPoint::with_affinity(block.id, 0, Affinity::After));
+                Selection::caret(DocPoint::with_affinity(image_id, 0, Affinity::After));
             self.clear_composition();
         }
     }
@@ -1646,15 +1648,21 @@ impl EditorCore {
     }
 
     fn previous_block_point(&self, index: usize) -> DocPoint {
-        for candidate in self.document.blocks()[..index].iter().rev() {
-            if candidate.kind == BlockKind::Image {
-                return DocPoint::with_affinity(candidate.id, 0, Affinity::After);
-            }
-            if let Some(text) = candidate.content.as_text() {
-                return DocPoint::with_affinity(candidate.id, text.len(), Affinity::After);
-            }
-        }
-        self.selection.head
+        self.document
+            .blocks()
+            .iter()
+            .take(index)
+            .filter_map(|candidate| {
+                if candidate.kind == BlockKind::Image {
+                    Some(DocPoint::with_affinity(candidate.id, 0, Affinity::After))
+                } else {
+                    candidate.content.as_text().map(|text| {
+                        DocPoint::with_affinity(candidate.id, text.len(), Affinity::After)
+                    })
+                }
+            })
+            .last()
+            .unwrap_or(self.selection.head)
     }
 
     fn next_block_point(&self, index: usize) -> DocPoint {
@@ -1670,15 +1678,17 @@ impl EditorCore {
     }
 
     fn previous_text_point(&self, index: usize) -> DocPoint {
-        self.document.blocks()[..index]
+        self.document
+            .blocks()
             .iter()
-            .rev()
-            .find_map(|block| {
+            .take(index)
+            .filter_map(|block| {
                 block
                     .content
                     .as_text()
                     .map(|text| DocPoint::with_affinity(block.id, text.len(), Affinity::After))
             })
+            .last()
             .unwrap_or(self.selection.head)
     }
 
