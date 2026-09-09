@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The integration test replaces sampler sleeps through PATH. The fake app
+# calls /bin/sleep explicitly, so its lifetime and child process remain real.
+exit 0

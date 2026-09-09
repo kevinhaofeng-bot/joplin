@@ -2146,7 +2146,7 @@ mod tests {
 
     #[gpui::test]
     fn long_fixture_runs_exactly_five_hundred_real_edit_undo_pairs(cx: &mut TestAppContext) {
-        let mut cx = cx.add_empty_window();
+        let cx = cx.add_empty_window();
         let editor = cx.new(|cx| EditorCore::new(build_document(FixtureKind::Long), cx));
         let report = cx
             .update(|_, app| run_edit_undo_pairs(&editor, 500, false, app))
@@ -2175,7 +2175,7 @@ mod tests {
             .collect::<Vec<_>>();
         let cache =
             cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
-        let mut window = cx.add_empty_window();
+        let window = cx.add_empty_window();
         let expected_minimum = VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize
             * (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize * 900 / 1600)
             * 4;

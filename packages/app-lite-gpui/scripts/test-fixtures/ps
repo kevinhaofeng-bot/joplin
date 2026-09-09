@@ -7,7 +7,11 @@ if [[ "${1:-}" == "-o" ]]; then
   printf '%s\n' "$((count + 1))" > "$counter"
   printf '%s\n' "${TASK7_FAKE_RSS_KIB:-1000}"
 elif [[ "${1:-}" == "-axo" ]]; then
-  :
+  # Mirror the real `ps -axo ppid=` shape for a spawned child. The sampler's
+  # awk filter counts rows whose PPID equals the app PID.
+  if [[ -s "${TASK7_FAKE_MARKER:?}.child" && -s "$TASK7_FAKE_MARKER.parent" ]]; then
+    cat "$TASK7_FAKE_MARKER.parent"
+  fi
 else
   exit 2
 fi

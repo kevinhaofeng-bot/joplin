@@ -53,9 +53,12 @@ pathlib.Path(path).write_text(json.dumps({
 PY
 fi
 expected_ready="task7-ready|${run_id}|${binary_sha256}"
-ready_poll_attempts=${TASK7_READY_POLL_ATTEMPTS:-60}
-ready_poll_seconds=${TASK7_READY_POLL_SECONDS:-0.5}
-sample_interval_seconds=${TASK7_SAMPLE_INTERVAL_SECONDS:-5}
+# Keep the release sampler contract explicit: readiness is bounded by 30 s,
+# followed by exactly six five-second RSS samples. Tests replace `sleep` via
+# PATH; these production constants must not be silently overridden by env.
+readonly ready_poll_attempts=60
+readonly ready_poll_seconds=0.5
+readonly sample_interval_seconds=5
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/velotype-task7.XXXXXX")
 ready_file="$run_dir/ready"
 diagnostics_file="$run_dir/diagnostics.json"
