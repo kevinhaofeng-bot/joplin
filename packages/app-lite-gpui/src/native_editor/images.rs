@@ -836,6 +836,32 @@ impl BudgetedImageCache {
         }
     }
 
+    /// Drop completed entries that have left the current viewport. This uses
+    /// the same GPUI image-drop lifecycle as budget eviction, but does not
+    /// wait for a later decode admission to create memory pressure.
+    pub fn evict_offscreen(&mut self, window: &mut Window, cx: &mut App) {
+        let stale = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                (!self.visible.contains(key)
+                    && !matches!(entry.item, ImageCacheItem::Loading(_)))
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        for key in stale {
+            let Some(mut entry) = self.entries.remove(&key) else {
+                continue;
+            };
+            self.lru.retain(|candidate| *candidate != key);
+            self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
+            if let Some(Ok(image)) = entry.item.get() {
+                self.record_drop_image();
+                cx.drop_image(image, Some(window));
+            }
+        }
+    }
+
     #[cfg(test)]
     fn in_flight_for_test(&self) -> usize {
         self.in_flight
@@ -1918,6 +1944,43 @@ mod tests {
             });
         });
         window.run_until_parked();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn production_cache_drops_loaded_offscreen_entries_before_settle(
+        cx: &mut TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "joplin-lite-cache-offscreen-loaded-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("offscreen cache fixture directory");
+        let source = root.join("image.png");
+        std::fs::write(&source, fixture_png_bytes()).expect("offscreen fixture");
+        let resource = Resource::from(source.clone());
+        let cache = cx.update(|app| BudgetedImageCache::new_entity(app, 48 * 1024 * 1024));
+        let mut window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&resource]);
+                assert!(cache.load(&resource, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                assert!(cache.load(&resource, window, entity_cx).is_some());
+                assert!(cache.used_bytes() > 0);
+                cache.set_visible_resources(std::iter::empty());
+                cache.evict_offscreen(window, entity_cx);
+                assert_eq!(cache.used_bytes(), 0);
+                assert_eq!(cache.len(), 0);
+                assert!(cache.drop_image_calls_for_test() > 0);
+                assert!(cache.is_settled());
+            });
+        });
         let _ = std::fs::remove_dir_all(root);
     }
 

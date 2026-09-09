@@ -180,8 +180,9 @@ fn paint_snapshot(
             .iter()
             .filter_map(|block| block.image_resource.as_ref())
             .collect::<Vec<_>>();
-        cache.update(cx, |cache, _| {
-            cache.set_visible_resources(visible_resources.iter().copied())
+        cache.update(cx, |cache, cache_cx| {
+            cache.set_visible_resources(visible_resources.iter().copied());
+            cache.evict_offscreen(window, cache_cx);
         });
     }
     // 1. Block surfaces.
