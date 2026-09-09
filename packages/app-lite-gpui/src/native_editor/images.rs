@@ -22,8 +22,9 @@ use smallvec::SmallVec;
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
 const MACOS_PROXY_MAX_EDGE: u32 = 1600;
 /// The editor surface is 680pt wide in the spike. Keep the retained native
-/// proxy viewport-sized while preserving the image node's natural metadata.
-pub const VIEWPORT_IMAGE_PROXY_MAX_EDGE: u32 = 1024;
+/// proxy viewport-sized with a small interpolation margin while preserving
+/// the image node's natural metadata.
+pub const VIEWPORT_IMAGE_PROXY_MAX_EDGE: u32 = 800;
 const CONSERVATIVE_PROXY_RESERVATION: usize = 4 * 1024 * 1024;
 
 #[cfg(target_os = "macos")]
