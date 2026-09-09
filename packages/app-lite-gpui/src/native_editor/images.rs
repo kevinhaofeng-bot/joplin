@@ -1266,36 +1266,120 @@ impl ImageCache for BudgetedImageCache {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Default)]
+struct NativePasteboardSnapshot {
+    html: Option<String>,
+    rich_text: Option<String>,
+    text: Option<String>,
+    image_path: Option<PathBuf>,
+    file_urls: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+fn native_payload_from_snapshot(snapshot: NativePasteboardSnapshot) -> Option<ClipboardPayload> {
+    let NativePasteboardSnapshot {
+        html,
+        rich_text,
+        text,
+        image_path,
+        file_urls,
+    } = snapshot;
+    if let Some(path) = image_path {
+        return Some(ClipboardPayload {
+            file_urls: vec![path.clone()],
+            temporary_files: vec![path],
+            html,
+            rich_text,
+            text,
+            ..Default::default()
+        });
+    }
+    if !file_urls.is_empty() {
+        return Some(ClipboardPayload {
+            file_urls,
+            html,
+            rich_text,
+            text,
+            ..Default::default()
+        });
+    }
+    if html.is_some() || rich_text.is_some() || text.is_some() {
+        Some(ClipboardPayload {
+            html,
+            rich_text,
+            text,
+            ..Default::default()
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn native_string_value(value: cocoa::base::id) -> Option<String> {
+    use cocoa::base::nil;
+    use cocoa::foundation::NSString;
+    if value == nil {
+        return None;
+    }
+    let bytes = unsafe { value.UTF8String() as *const u8 };
+    if bytes.is_null() {
+        return Some(String::new());
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(bytes as *const std::ffi::c_char).to_bytes() };
+    std::str::from_utf8(bytes).map(str::to_owned).ok()
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn native_rtf_string_value(data: cocoa::base::id) -> Option<String> {
+    use cocoa::base::nil;
+    use objc::{class, msg_send, sel, sel_impl};
+    if data == nil {
+        return None;
+    }
+    let allocated: cocoa::base::id = msg_send![class!(NSAttributedString), alloc];
+    if allocated == nil {
+        return None;
+    }
+    let nil_id: cocoa::base::id = nil;
+    let attributed: cocoa::base::id = msg_send![
+        allocated,
+        initWithRTF: data
+        documentAttributes: nil_id
+    ];
+    if attributed == nil {
+        let _: () = msg_send![allocated, release];
+        return None;
+    }
+    let string: cocoa::base::id = msg_send![attributed, string];
+    let result = unsafe { native_string_value(string) };
+    let _: () = msg_send![attributed, release];
+    result
+}
+
+#[cfg(target_os = "macos")]
 pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
-    // Narrow bridge adapted from GPUI 0.2.2 `try_clipboard_image`: AppKit is
-    // used only to extract pasteboard payloads, never for editing or layout.
+    // Narrow AppKit bridge: only pasteboard extraction happens here. The
+    // editor model, layout, and rendering remain GPUI/native-editor owned.
     use cocoa::appkit::{
         NSFilenamesPboardType, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString,
         NSPasteboardTypeTIFF,
     };
-    use cocoa::base::YES;
-    use cocoa::base::{id, nil};
+    use cocoa::base::{YES, nil};
     use cocoa::foundation::{NSArray, NSAutoreleasePool, NSData, NSString};
-    unsafe fn string_value(value: id) -> Option<String> {
-        if value == nil {
-            return None;
-        }
-        let bytes = unsafe { value.UTF8String() as *const u8 };
-        if bytes.is_null() {
-            return Some(String::new());
-        }
-        let bytes =
-            unsafe { std::ffi::CStr::from_ptr(bytes as *const std::ffi::c_char).to_bytes() };
-        std::str::from_utf8(bytes).map(str::to_owned).ok()
-    }
+
     unsafe {
         let _pool = NSAutoreleasePool::new(nil);
         let pasteboard = NSPasteboard::generalPasteboard(nil);
         let html_type = NSString::alloc(nil).init_str("public.html").autorelease();
         let rtf_type = NSString::alloc(nil).init_str("public.rtf").autorelease();
-        let html = string_value(pasteboard.stringForType(html_type));
-        let rich_text = string_value(pasteboard.stringForType(rtf_type));
-        let text = string_value(pasteboard.stringForType(NSPasteboardTypeString));
+        let base = NativePasteboardSnapshot {
+            html: native_string_value(pasteboard.stringForType(html_type)),
+            rich_text: native_rtf_string_value(pasteboard.dataForType(rtf_type)),
+            text: native_string_value(pasteboard.stringForType(NSPasteboardTypeString)),
+            image_path: None,
+            file_urls: Vec::new(),
+        };
         let image_types = [
             (ImageFormat::Png, NSPasteboardTypePNG),
             (ImageFormat::Tiff, NSPasteboardTypeTIFF),
@@ -1345,44 +1429,22 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
-                return Some(ClipboardPayload {
-                    file_urls: vec![path.clone()],
-                    temporary_files: vec![path],
-                    html: html.clone(),
-                    rich_text: rich_text.clone(),
-                    text,
-                    ..Default::default()
-                });
+                let mut snapshot = base.clone();
+                snapshot.image_path = Some(path);
+                return native_payload_from_snapshot(snapshot);
             }
         }
         let files = pasteboard.propertyListForType(NSFilenamesPboardType);
         if files != nil {
-            let mut file_urls = Vec::new();
+            let mut snapshot = base;
             for index in 0..files.count() {
-                if let Some(path) = string_value(files.objectAtIndex(index)) {
-                    file_urls.push(PathBuf::from(path));
+                if let Some(path) = native_string_value(files.objectAtIndex(index)) {
+                    snapshot.file_urls.push(PathBuf::from(path));
                 }
             }
-            if !file_urls.is_empty() {
-                return Some(ClipboardPayload {
-                    file_urls,
-                    html,
-                    rich_text,
-                    text,
-                    ..Default::default()
-                });
-            }
+            return native_payload_from_snapshot(snapshot);
         }
-        if html.is_some() || rich_text.is_some() || text.is_some() {
-            Some(ClipboardPayload {
-                html,
-                rich_text,
-                text,
-                ..Default::default()
-            })
-        } else {
-            None
-        }
+        native_payload_from_snapshot(base)
     }
 }
 
@@ -1640,6 +1702,51 @@ mod tests {
         assert_eq!(std::fs::read(managed).expect("managed image"), original);
         assert_eq!(store.compressed_len(id), None);
         let _ = std::fs::remove_file(source_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_pasteboard_snapshot_seam_imports_rtf_and_preserves_html() {
+        use cocoa::base::{id, nil};
+        use cocoa::foundation::NSAutoreleasePool;
+        use objc::{class, msg_send, sel, sel_impl};
+
+        let rtf = br"{\rtf1\ansi\deff0 {\fonttbl {\f0 Helvetica;}} Hello}";
+        unsafe {
+            let _pool = NSAutoreleasePool::new(nil);
+            let data: id = msg_send![
+                class!(NSData),
+                dataWithBytes: rtf.as_ptr()
+                length: rtf.len()
+            ];
+            let rich_text = native_rtf_string_value(data).expect("Foundation should import RTF");
+            assert_eq!(rich_text.trim(), "Hello");
+
+            let native = native_payload_from_snapshot(NativePasteboardSnapshot {
+                html: Some("<img src=\"file:///tmp/photo.png\">".into()),
+                rich_text: Some(rich_text),
+                text: Some("图像占位符".into()),
+                ..Default::default()
+            })
+            .expect("snapshot with HTML/RTF should produce a payload");
+            assert!(
+                native
+                    .html
+                    .as_deref()
+                    .is_some_and(|html| html.contains("photo.png"))
+            );
+            assert_eq!(native.text.as_deref(), Some("图像占位符"));
+
+            let merged = resolve_clipboard_payload(
+                Some(native),
+                Some(ClipboardPayload::fixture_with_png_and_text("fallback")),
+            )
+            .expect("native snapshot should merge with GPUI image payload");
+            assert!(matches!(
+                classify_clipboard(merged),
+                PasteIntent::Image { .. }
+            ));
+        }
     }
 
     #[cfg(target_os = "macos")]

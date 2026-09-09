@@ -1685,6 +1685,69 @@ mod tests {
     }
 
     #[gpui::test]
+    fn production_external_paths_drop_handler_consumes_prospective_point(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(build_view);
+        view.update(cx, |view, view_cx| {
+            let first = view.editor.read(view_cx).document().blocks()[0].id;
+            view.editor.update(view_cx, |editor, editor_cx| {
+                editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                    first,
+                    0,
+                    Affinity::Before,
+                )));
+                editor_cx.notify();
+            });
+        });
+        let (target, old_caret) = view.read_with(cx, |view, app| {
+            let target = view.editor.read(app).document().blocks()[1].id;
+            let old_caret = view.editor.read(app).selection().head;
+            (target, old_caret)
+        });
+        let prospective = DocPoint::new(target, 0);
+        assert_ne!(old_caret.node_id, prospective.node_id);
+
+        // GPUI 0.2.2 has no public constructor for a non-empty ExternalPaths
+        // and no test-platform file-drag injection API. Exercise the real
+        // production handler with the real ExternalPaths event payload type;
+        // the path action below uses the same prospective point with a real
+        // managed PNG fixture.
+        cx.update(|window, app| {
+            view.update(app, |view, view_cx| {
+                view.drop_point = Some(prospective);
+                view.on_external_paths_drop(&ExternalPaths::default(), window, view_cx);
+                assert!(view.drop_point.is_none());
+            });
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "joplin-lite-task6-round2b-drop-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, valid_png_bytes()).expect("real drop fixture");
+        view.update(cx, |view, view_cx| {
+            view.editor.update(view_cx, |editor, _| {
+                apply_drop_paths_at(editor, std::slice::from_ref(&path), Some(prospective))
+                    .expect("production drop action should insert at prospective point");
+            });
+        });
+        let has_image = view.read_with(cx, |view, app| {
+            view.editor
+                .read(app)
+                .document()
+                .blocks()
+                .iter()
+                .any(|block| {
+                    matches!(
+                        block.content,
+                        crate::native_editor::model::BlockContent::Image { .. }
+                    )
+                })
+        });
+        assert!(has_image);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[gpui::test]
     fn production_clipboard_prefers_native_exif_paths_and_decodes_transformed_geometry(
         cx: &mut TestAppContext,
     ) {
