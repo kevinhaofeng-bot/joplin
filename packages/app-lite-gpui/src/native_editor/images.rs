@@ -54,6 +54,13 @@ fn quantize_proxy_edge(max_edge: u32) -> u32 {
     tiers.saturating_mul(PROXY_EDGE_TIER)
 }
 
+fn quantize_proxy_edge_with_natural_max(max_edge: u32, natural_max_edge: Option<u32>) -> u32 {
+    let natural_max_edge = natural_max_edge.filter(|edge| *edge > 0);
+    let capped_edge = natural_max_edge.map_or(max_edge, |natural| max_edge.min(natural));
+    let quantized_edge = quantize_proxy_edge(capped_edge);
+    natural_max_edge.map_or(quantized_edge, |natural| quantized_edge.min(natural))
+}
+
 #[cfg(target_os = "macos")]
 mod mac_pressure {
     #[cfg(test)]
@@ -917,12 +924,25 @@ impl BudgetedImageCache {
         }
     }
 
-    /// Record the device-pixel requirement for a visible image before its
-    /// `ImageCache::load` call. A larger request promotes the proxy; a smaller
-    /// request does not churn an already-promoted texture.
+    /// Record the device-pixel requirement for a visible image without source
+    /// metadata before its `ImageCache::load` call. A larger request promotes
+    /// the proxy; a smaller request does not churn an already-promoted texture.
     pub fn request_edge(&mut self, resource: &Resource, max_edge: u32) {
+        self.request_edge_with_natural_max(resource, max_edge, None);
+    }
+
+    /// Record a device-pixel requirement together with the source's natural
+    /// maximum edge. Quantization may round a viewport request upward, but the
+    /// final request must never exceed a valid natural edge or it will create
+    /// an impossible promotion after the visible set changes.
+    pub fn request_edge_with_natural_max(
+        &mut self,
+        resource: &Resource,
+        max_edge: u32,
+        natural_max_edge: Option<u32>,
+    ) {
         let key = hash(resource);
-        let max_edge = quantize_proxy_edge(max_edge);
+        let max_edge = quantize_proxy_edge_with_natural_max(max_edge, natural_max_edge);
         let previous = self.requested_edges.insert(key, max_edge);
         if previous != Some(max_edge) {
             self.deferred.remove(&key);
@@ -2125,6 +2145,8 @@ mod tests {
     fn quantized_proxy_edge_saturates_at_u32_max() {
         assert_eq!(quantize_proxy_edge(u32::MAX - 63), u32::MAX - 63);
         assert_eq!(quantize_proxy_edge(u32::MAX), u32::MAX);
+        assert_eq!(quantize_proxy_edge_with_natural_max(3025, Some(3025)), 3025);
+        assert_eq!(quantize_proxy_edge_with_natural_max(3025, Some(0)), 3072);
     }
 
     #[test]
@@ -2498,6 +2520,60 @@ mod tests {
                 );
                 assert_eq!(cache.in_flight_for_test(), 0);
                 assert!(cache.peak_accounted_bytes() <= cache.budget_bytes());
+            });
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn production_cache_natural_edge_cap_avoids_non_multiple_promotion(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "joplin-lite-cache-natural-edge-cap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("natural edge fixture directory");
+        let source = root.join("image.png");
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            3025,
+            1,
+            Rgba([0x11, 0x22, 0x33, 0xff]),
+        ))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("natural edge fixture should encode");
+        std::fs::write(&source, encoded.into_inner()).expect("natural edge fixture should write");
+        let resource = Resource::from(source.clone());
+        let cache =
+            cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
+        let window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&resource]);
+                cache.request_edge_with_natural_max(&resource, 4096, Some(3025));
+                assert!(cache.load(&resource, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("natural-edge proxy should settle")
+                    .expect("natural-edge proxy should decode");
+                let size = image.size(0);
+                assert_eq!(u32::from(size.width).max(u32::from(size.height)), 3025);
+                assert_eq!(cache.in_flight_for_test(), 0);
+                cache.set_visible_resources(std::iter::empty());
+                cache.set_visible_resources([&resource]);
+                cache.request_edge_with_natural_max(&resource, 4096, Some(3025));
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("natural-edge proxy should remain drawable")
+                    .expect("natural-edge proxy should remain successful");
+                let size = image.size(0);
+                assert_eq!(u32::from(size.width).max(u32::from(size.height)), 3025);
+                assert_eq!(cache.in_flight_for_test(), 0);
             });
         });
         let _ = std::fs::remove_dir_all(root);

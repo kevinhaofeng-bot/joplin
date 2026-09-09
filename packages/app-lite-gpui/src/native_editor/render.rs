@@ -16,16 +16,8 @@ use super::images::{BudgetedImageCache, proxy_max_edge_for_viewport};
 use super::layout::{BlockLayout, ordered_number_summary};
 use super::model::{BlockKind, Document, NodeId, Selection};
 
-pub(crate) fn image_proxy_max_edge_for_bounds(
-    width: f32,
-    height: f32,
-    scale_factor: f32,
-    natural_max_edge: Option<u32>,
-) -> u32 {
-    let requested = proxy_max_edge_for_viewport(width.max(height), scale_factor);
-    natural_max_edge
-        .filter(|edge| *edge > 0)
-        .map_or(requested, |edge| requested.min(edge))
+pub(crate) fn image_proxy_max_edge_for_bounds(width: f32, height: f32, scale_factor: f32) -> u32 {
+    proxy_max_edge_for_viewport(width.max(height), scale_factor)
 }
 
 fn natural_max_edge(natural_size: (u32, u32)) -> Option<u32> {
@@ -212,9 +204,12 @@ fn paint_snapshot(
                         f32::from(block.layout.bounds.size.width),
                         f32::from(block.layout.bounds.size.height),
                         window.scale_factor(),
+                    );
+                    cache.request_edge_with_natural_max(
+                        resource,
+                        max_edge,
                         block.image_natural_max_edge,
                     );
-                    cache.request_edge(resource, max_edge);
                 }
             }
             cache.evict_offscreen(window, cache_cx);
@@ -440,24 +435,13 @@ mod tests {
     use crate::native_editor::transaction::Transaction;
 
     #[test]
-    fn image_proxy_uses_rendered_bounds_and_natural_edge_cap() {
+    fn image_proxy_uses_rendered_bounds_and_validates_natural_edge() {
         let portrait_height = 680.0 * 1600.0 / 900.0;
         assert_eq!(
-            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0, Some(1600)),
-            1600
-        );
-        assert_eq!(
-            image_proxy_max_edge_for_bounds(680.0, 400.0, 2.0, Some(1600)),
-            1360
-        );
-        assert_eq!(
-            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0, None),
+            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0),
             2418
         );
-        assert_eq!(
-            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0, Some(0)),
-            2418
-        );
+        assert_eq!(image_proxy_max_edge_for_bounds(680.0, 400.0, 2.0), 1360);
         assert_eq!(natural_max_edge((0, 1600)), None);
         assert_eq!(natural_max_edge((900, 1600)), Some(1600));
     }
