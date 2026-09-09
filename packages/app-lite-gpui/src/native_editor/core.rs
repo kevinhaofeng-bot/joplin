@@ -529,7 +529,8 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
-        self.layout.invalidate_nodes(&outcome.changed_nodes);
+        self.layout
+            .invalidate_nodes(&self.document, &outcome.changed_nodes);
         Ok(outcome)
     }
 
@@ -541,7 +542,8 @@ impl EditorCore {
             self.history
                 .apply_with_selection(&mut self.document, self.selection, transaction)?;
         self.preferred_x = None;
-        self.layout.invalidate_nodes(&outcome.changed_nodes);
+        self.layout
+            .invalidate_nodes(&self.document, &outcome.changed_nodes);
         Ok(outcome)
     }
 
@@ -550,7 +552,8 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
-        self.layout.invalidate_nodes(&outcome.changed_nodes);
+        self.layout
+            .invalidate_nodes(&self.document, &outcome.changed_nodes);
         Ok(())
     }
 
@@ -559,7 +562,8 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
-        self.layout.invalidate_nodes(&outcome.changed_nodes);
+        self.layout
+            .invalidate_nodes(&self.document, &outcome.changed_nodes);
         Ok(())
     }
 
@@ -620,7 +624,8 @@ impl EditorCore {
             )?;
             self.selection = outcome.selection;
             self.preferred_x = None;
-            self.layout.invalidate_nodes(&outcome.changed_nodes);
+            self.layout
+                .invalidate_nodes(&self.document, &outcome.changed_nodes);
             self.composition_base_range = actual_base_range.or(Some(base_range.clone()));
             outcome
         } else {
@@ -736,7 +741,8 @@ impl EditorCore {
             let outcome = self.history.undo_with_outcome(&mut self.document)?;
             self.selection = outcome.selection;
             self.preferred_x = None;
-            self.layout.invalidate_nodes(&outcome.changed_nodes);
+            self.layout
+                .invalidate_nodes(&self.document, &outcome.changed_nodes);
             self.clear_composition();
             return Ok(());
         }
@@ -761,7 +767,8 @@ impl EditorCore {
         )?;
         self.selection = outcome.selection;
         self.preferred_x = None;
-        self.layout.invalidate_nodes(&outcome.changed_nodes);
+        self.layout
+            .invalidate_nodes(&self.document, &outcome.changed_nodes);
         self.clear_composition();
         Ok(())
     }
@@ -1213,7 +1220,8 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
-        self.layout.invalidate_nodes(&outcome.changed_nodes);
+        self.layout
+            .invalidate_nodes(&self.document, &outcome.changed_nodes);
         Ok(())
     }
 
@@ -1277,7 +1285,8 @@ impl EditorCore {
                 self.selection = outcome.selection;
                 self.preferred_x = None;
                 self.clear_composition();
-                self.layout.invalidate_nodes(&outcome.changed_nodes);
+                self.layout
+                    .invalidate_nodes(&self.document, &outcome.changed_nodes);
             } else {
                 self.clear_composition();
             }
@@ -1313,7 +1322,8 @@ impl EditorCore {
                     self.selection = outcome.selection;
                     self.preferred_x = None;
                     self.clear_composition();
-                    self.layout.invalidate_nodes(&outcome.changed_nodes);
+                    self.layout
+                        .invalidate_nodes(&self.document, &outcome.changed_nodes);
                 } else {
                     let selection = self.full_block_selection(index);
                     let mut transactions = Vec::new();
@@ -1341,7 +1351,8 @@ impl EditorCore {
                     self.selection = outcome.selection;
                     self.preferred_x = None;
                     self.clear_composition();
-                    self.layout.invalidate_nodes(&outcome.changed_nodes);
+                    self.layout
+                        .invalidate_nodes(&self.document, &outcome.changed_nodes);
                 }
             }
         }
@@ -1412,7 +1423,8 @@ impl EditorCore {
                 self.selection = outcome.selection;
                 self.preferred_x = None;
                 self.clear_composition();
-                self.layout.invalidate_nodes(&outcome.changed_nodes);
+                self.layout
+                    .invalidate_nodes(&self.document, &outcome.changed_nodes);
             }
         }
         Ok(())

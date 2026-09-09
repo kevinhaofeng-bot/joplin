@@ -2558,6 +2558,100 @@ async fn visual_navigation_uses_wrapped_rows_and_preserves_home_end_scope(
 }
 
 #[gpui::test]
+async fn wrapped_click_home_end_keep_row_affinity_for_all_alignments(
+    cx: &mut gpui::TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    for alignment in [
+        TextAlignment::Left,
+        TextAlignment::Center,
+        TextAlignment::Right,
+    ] {
+        let mut editor = EditorCore::for_test(&"0123456789".repeat(16), cx);
+        let node = editor.document().first_node_id().expect("text block");
+        let text_len = editor.document().text_at_index(0).unwrap().len();
+        editor
+            .apply(Transaction::SetAlignment {
+                selection: Selection::new(
+                    DocPoint::with_affinity(node, 0, Affinity::Before),
+                    DocPoint::with_affinity(node, text_len, Affinity::After),
+                ),
+                alignment,
+            })
+            .expect("alignment transaction");
+        let document = editor.document().clone();
+        cx.update(|window, _| {
+            editor
+                .layout
+                .shape_visible_with_window(&document, 0.0, 800.0, 96.0, window);
+        });
+        let block_bounds = editor
+            .layout()
+            .block_layout(node)
+            .expect("wrapped block")
+            .bounds;
+        let line = editor
+            .layout()
+            .block_layout(node)
+            .expect("wrapped block")
+            .text_lines
+            .first()
+            .expect("hard line");
+        let seam = line
+            .wrap_boundaries()
+            .first()
+            .map(|boundary| line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+            .expect("soft-wrap seam");
+        let line_height = editor.layout().line_height(node).expect("line height");
+
+        let click = point(
+            block_bounds.right() - px(1.0),
+            block_bounds.top() + line_height / 2.0,
+        );
+        let clicked = editor
+            .point_from_layout(click)
+            .expect("production hit-test point");
+        assert_eq!(clicked.utf8_offset, seam);
+        assert_eq!(
+            clicked.affinity,
+            Affinity::Before,
+            "clicking a non-final row's end must stay on that row"
+        );
+        editor.set_selection_for_test(Selection::caret(clicked));
+        let clicked_bounds = editor
+            .layout()
+            .caret_bounds_for_point(clicked)
+            .expect("clicked caret geometry");
+        assert_eq!(clicked_bounds.top(), block_bounds.top());
+
+        editor.move_home();
+        let home = editor.selection().head;
+        assert_eq!(home.utf8_offset, 0);
+        assert_eq!(home.affinity, Affinity::After);
+        assert_eq!(
+            editor.layout().caret_bounds_for_point(home).unwrap().top(),
+            block_bounds.top()
+        );
+
+        editor.set_selection_for_test(Selection::caret(clicked));
+        editor.move_end();
+        let end = editor.selection().head;
+        assert_eq!(end.utf8_offset, seam);
+        assert_eq!(
+            end.affinity,
+            Affinity::Before,
+            "End on a non-final wrapped row must use Before affinity"
+        );
+        editor.move_down();
+        let next = editor.selection().head;
+        assert!(next.utf8_offset > seam);
+        editor.move_up();
+        assert_eq!(editor.selection().head.utf8_offset, seam);
+        assert_eq!(editor.selection().head.affinity, Affinity::Before);
+    }
+}
+
+#[gpui::test]
 fn image_home_end_stay_on_the_image_atom(cx: &mut gpui::TestAppContext) {
     let mut editor = EditorCore::fixture_text_image_text("甲", "image", "乙", cx);
     let image = editor.document().blocks()[1].id;

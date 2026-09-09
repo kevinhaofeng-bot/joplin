@@ -1425,6 +1425,93 @@ mod tests {
         }
     }
 
+    fn build_multiblock_list_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
+        let mut document =
+            Document::from_paragraphs(["bullet one", "bullet two", "ordered one", "ordered two"]);
+        let blocks = document.blocks().to_vec();
+        for (index, block) in blocks.iter().enumerate() {
+            let text_len = block.content.as_text().map_or(0, str::len);
+            let kind = if index < 2 {
+                BlockKind::BulletItem { depth: 1 }
+            } else {
+                BlockKind::OrderedItem { depth: 1 }
+            };
+            document
+                .apply(Transaction::SetBlockKind {
+                    selection: Selection::new(
+                        DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                        DocPoint::with_affinity(block.id, text_len, Affinity::After),
+                    ),
+                    kind,
+                })
+                .expect("list fixture conversion");
+        }
+        let editor = cx.new(|cx| EditorCore::new(document, cx));
+        editor.read(cx).focus_handle().focus(window);
+        SpikeView {
+            editor,
+            catalogue: CommandCatalogue::default(),
+            scroll_handle: ScrollHandle::new(),
+            more_open: false,
+            link_popover: None,
+            pointer_anchor: None,
+            more_trigger_bounds: None,
+        }
+    }
+
+    fn build_wrapped_blocks_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
+        let document = Document::from_paragraphs([
+            "0123456789".repeat(48),
+            "short middle line".to_string(),
+            "abcdefghij".repeat(48),
+        ]);
+        let editor = cx.new(|cx| EditorCore::new(document, cx));
+        editor.read(cx).focus_handle().focus(window);
+        SpikeView {
+            editor,
+            catalogue: CommandCatalogue::default(),
+            scroll_handle: ScrollHandle::new(),
+            more_open: false,
+            link_popover: None,
+            pointer_anchor: None,
+            more_trigger_bounds: None,
+        }
+    }
+
+    fn build_decorated_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
+        let text = "x".repeat(768);
+        let mut document = Document::from_paragraph(text.clone());
+        let node = document.first_node_id().expect("decorated paragraph");
+        for offset in 0..text.len() {
+            let mark = match offset % 4 {
+                0 => Mark::Bold,
+                1 => Mark::Italic,
+                2 => Mark::Underline,
+                _ => Mark::Highlight,
+            };
+            document
+                .apply(Transaction::ToggleMark {
+                    selection: Selection::new(
+                        DocPoint::with_affinity(node, offset, Affinity::Before),
+                        DocPoint::with_affinity(node, offset + 1, Affinity::After),
+                    ),
+                    mark,
+                })
+                .expect("decorated fixture");
+        }
+        let editor = cx.new(|cx| EditorCore::new(document, cx));
+        editor.read(cx).focus_handle().focus(window);
+        SpikeView {
+            editor,
+            catalogue: CommandCatalogue::default(),
+            scroll_handle: ScrollHandle::new(),
+            more_open: false,
+            link_popover: None,
+            pointer_anchor: None,
+            more_trigger_bounds: None,
+        }
+    }
+
     #[gpui::test]
     async fn shell_event_path_routes_selection_clipboard_and_pointer_drag(cx: &mut TestAppContext) {
         cx.update(|cx| components::init(cx));
@@ -1645,7 +1732,15 @@ mod tests {
         });
         let a = point(first.left() + px(2.0), first.top() + px(8.0));
         let b = point(second.right() - px(2.0), second.top() + px(8.0));
-        let c = point(second.left() + px(2.0), second.top() + px(8.0));
+        let c = point(second.left() + px(20.0), second.top() + px(8.0));
+        let (expected_a, expected_c) = view.update(cx, |view, cx| {
+            view.editor.update(cx, |editor, _| {
+                (
+                    editor.point_from_layout(a).expect("A hit point"),
+                    editor.point_from_layout(c).expect("C hit point"),
+                )
+            })
+        });
         cx.simulate_mouse_down(a, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_up(a, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_down(
@@ -1667,6 +1762,148 @@ mod tests {
             assert_eq!(
                 editor.selection().head.node_id,
                 editor.document().blocks()[1].id
+            );
+            assert_eq!(editor.selection().anchor, expected_a);
+            assert_eq!(editor.selection().head, expected_c);
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_link_field_key_sequence_copies_and_deletes_graphemes(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                view.editor.read(app).focus_handle().focus(window)
+            });
+        });
+        cx.simulate_keystrokes("home up shift-right");
+        cx.update(|window, app| {
+            view.update(app, |view, view_cx| view.open_link_popover(window, view_cx));
+        });
+        redraw(cx);
+
+        cx.simulate_input("a🙂bc");
+        cx.simulate_keystrokes("shift-left shift-left");
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("bc".into())
+        );
+        cx.simulate_keystrokes("backspace");
+        view.read_with(cx, |view, cx| {
+            let popover = view.link_popover.as_ref().expect("URL field remains open");
+            assert_eq!(popover.read(cx).text, "a🙂");
+            assert_eq!(popover.read(cx).selected_text(), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_multiblock_toolbar_and_outdent_use_one_history_entry(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_multiblock_list_view);
+        redraw(cx);
+        let ids = view.read_with(cx, |view, cx| {
+            view.editor
+                .read(cx)
+                .document()
+                .blocks()
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>()
+        });
+        let first_selection = view.update(cx, |view, cx| {
+            view.editor.update(cx, |editor, editor_cx| {
+                let end = editor.document().text_at_index(1).unwrap().len();
+                editor.set_selection_for_test(Selection::new(
+                    DocPoint::with_affinity(ids[0], 0, Affinity::Before),
+                    DocPoint::with_affinity(ids[1], end, Affinity::After),
+                ));
+                editor_cx.notify();
+                editor.selection()
+            })
+        });
+        let before_bold = view.read_with(cx, |view, cx| view.editor.read(cx).undo_depth());
+        let bold = cx.debug_bounds("Bold").expect("Bold toolbar button");
+        cx.simulate_click(bold.center(), Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            assert_eq!(editor.selection(), first_selection);
+            assert_eq!(editor.undo_depth(), before_bold + 1);
+            for id in &ids[..2] {
+                assert!(
+                    editor
+                        .document()
+                        .block(*id)
+                        .unwrap()
+                        .content
+                        .styles()
+                        .unwrap()
+                        .iter()
+                        .any(|run| run.marks.contains(&Mark::Bold))
+                );
+            }
+        });
+
+        let before_bullet_outdent =
+            view.read_with(cx, |view, cx| view.editor.read(cx).undo_depth());
+        // Open the actual measured More menu through its trigger, then use the
+        // rendered Outdent command rather than calling the catalogue directly.
+        view.update(cx, |view, cx| {
+            view.editor.update(cx, |editor, editor_cx| {
+                editor.set_selection_for_test(first_selection);
+                editor_cx.notify();
+            });
+        });
+        let trigger = cx
+            .debug_bounds("evernote-native-spike-more-trigger")
+            .expect("More trigger");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        redraw(cx);
+        let outdent = cx.debug_bounds("Outdent list").expect("Outdent command");
+        cx.simulate_click(outdent.center(), Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            assert_eq!(editor.undo_depth(), before_bullet_outdent + 1);
+            assert!(
+                editor.document().blocks()[0..2]
+                    .iter()
+                    .all(|block| { matches!(block.kind, BlockKind::BulletItem { depth: 0 }) })
+            );
+        });
+
+        let before_ordered_outdent =
+            view.read_with(cx, |view, cx| view.editor.read(cx).undo_depth());
+        view.update(cx, |view, cx| {
+            view.editor.update(cx, |editor, editor_cx| {
+                let end = editor.document().text_at_index(3).unwrap().len();
+                editor.set_selection_for_test(Selection::new(
+                    DocPoint::with_affinity(ids[2], 0, Affinity::Before),
+                    DocPoint::with_affinity(ids[3], end, Affinity::After),
+                ));
+                editor_cx.notify();
+            });
+        });
+        let trigger = cx
+            .debug_bounds("evernote-native-spike-more-trigger")
+            .expect("More trigger remains mounted");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        redraw(cx);
+        let outdent = cx
+            .debug_bounds("Outdent list")
+            .expect("Outdent command remains available");
+        cx.simulate_click(outdent.center(), Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            assert_eq!(editor.undo_depth(), before_ordered_outdent + 1);
+            assert!(
+                editor.document().blocks()[2..4]
+                    .iter()
+                    .all(|block| { matches!(block.kind, BlockKind::OrderedItem { depth: 0 }) })
             );
         });
     }
@@ -2015,6 +2252,132 @@ mod tests {
             assert!(
                 after_top < before_top,
                 "shaping must follow the live scroll origin instead of always starting at document y=0"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_render_observes_highlight_paint_and_snapshot_clone_peak(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        crate::native_editor::render::reset_test_render_observations();
+        let (view, cx) = cx.add_window_view(build_decorated_view);
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            let node = editor.document().first_node_id().expect("decorated node");
+            let cached = editor
+                .layout()
+                .cache
+                .get(&node)
+                .expect("decorated block must be retained for the production paint");
+            assert!(
+                cached.decoration_run_count > 32,
+                "fixture must exercise alternating decoration runs"
+            );
+            assert!(editor.layout().used_bytes() <= editor.layout().budget_bytes());
+        });
+        assert!(
+            crate::native_editor::render::test_highlight_background_paints() > 0,
+            "production paint_entity must invoke background painting for Highlight runs"
+        );
+        assert!(
+            crate::native_editor::render::test_snapshot_clone_peak() > 0,
+            "production render snapshot must observe a non-empty retained-line clone"
+        );
+    }
+
+    #[gpui::test]
+    async fn shell_live_viewport_membership_reaches_exact_tail_line_click(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_long_view);
+        redraw(cx);
+        let max_offset = view.read_with(cx, |view, _| view.scroll_handle.max_offset());
+        view.update(cx, |view, cx| {
+            view.scroll_handle
+                .set_offset(point(px(0.0), -max_offset.height));
+            cx.notify();
+        });
+        redraw(cx);
+
+        let (target, target_bounds, line_height, visible_ids) = view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            let target = editor.document().first_node_id().expect("long paragraph");
+            let target_bounds = editor
+                .layout()
+                .block_layout(target)
+                .expect("scrolled tail block remains shaped")
+                .bounds;
+            let line_height = editor
+                .layout()
+                .line_height(target)
+                .expect("tail line height");
+            let visible_ids = editor
+                .layout()
+                .visible()
+                .iter()
+                .map(|layout| layout.node_id)
+                .collect::<Vec<_>>();
+            (target, target_bounds, line_height, visible_ids)
+        });
+        assert!(
+            visible_ids.contains(&target),
+            "the actual viewport membership must include the block containing the tail line"
+        );
+        let tail_click = point(
+            target_bounds.right() - px(2.0),
+            target_bounds.bottom() - line_height / 2.0,
+        );
+        cx.simulate_click(tail_click, Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            let selection = editor.selection();
+            assert_eq!(selection.head.node_id, target);
+            assert_eq!(
+                selection.head.utf8_offset,
+                editor.document().text_at_index(0).unwrap().len(),
+                "a click in the exact tail row must reach the document end"
+            );
+            assert_eq!(selection.head.affinity, Affinity::After);
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_consecutive_shift_vertical_moves_preserve_preferred_x(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_wrapped_blocks_view);
+        redraw(cx);
+        let origin = view.update(cx, |view, cx| {
+            let node = view.editor.read(cx).document().blocks()[0].id;
+            let origin = DocPoint::with_affinity(node, 120, Affinity::After);
+            view.editor.update(cx, |editor, editor_cx| {
+                editor.set_selection_for_test(Selection::caret(origin));
+                editor_cx.notify();
+            });
+            origin
+        });
+        let origin_x = view.read_with(cx, |view, cx| {
+            view.editor
+                .read(cx)
+                .layout()
+                .caret_x(origin)
+                .expect("origin caret geometry")
+        });
+        cx.simulate_keystrokes("shift-down shift-down shift-up shift-up");
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            let selection = editor.selection();
+            assert_eq!(selection.anchor, origin);
+            assert_eq!(selection.head, origin);
+            let returned_x = editor
+                .layout()
+                .caret_x(selection.head)
+                .expect("returned caret geometry");
+            assert!(
+                f32::from(returned_x - origin_x).abs() <= 0.5,
+                "consecutive Shift+Down/Up must preserve preferred screen x: {origin_x:?} -> {returned_x:?}"
             );
         });
     }

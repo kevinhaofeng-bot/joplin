@@ -8,6 +8,10 @@ use gpui::{
     App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, Pixels, SharedString, TextRun,
     Window, WrappedLine, fill, outline, point, px, rgba,
 };
+#[cfg(test)]
+use std::mem::size_of;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::core::EditorCore;
 use super::layout::{BlockLayout, ordered_number_summary};
@@ -18,6 +22,8 @@ struct RenderBlock {
     layout: BlockLayout,
     text_lines: Vec<WrappedLine>,
     is_image: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    has_highlight: bool,
     line_height: Option<Pixels>,
     marker: Option<String>,
 }
@@ -36,6 +42,59 @@ enum TextPaintPass {
     Glyphs,
 }
 
+#[cfg(test)]
+static SNAPSHOT_CLONE_PEAK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static HIGHLIGHT_BACKGROUND_PAINTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_test_render_observations() {
+    SNAPSHOT_CLONE_PEAK.store(0, Ordering::Relaxed);
+    HIGHLIGHT_BACKGROUND_PAINTS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn test_snapshot_clone_peak() -> usize {
+    SNAPSHOT_CLONE_PEAK.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn test_highlight_background_paints() -> usize {
+    HIGHLIGHT_BACKGROUND_PAINTS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn observe_snapshot_clone(cached: &super::layout::CachedBlockLayout) {
+    // This is the payload cloned by the production `snapshot` path: the
+    // block layout/vector plus each WrappedLine's text and shaped glyph
+    // buffers. It deliberately excludes unrelated cache entries.
+    let bytes = size_of::<BlockLayout>()
+        .saturating_add(size_of::<Vec<WrappedLine>>())
+        .saturating_add(cached.layout.text_lines.capacity() * size_of::<WrappedLine>())
+        .saturating_add(
+            cached
+                .layout
+                .text_lines
+                .iter()
+                .map(|line| {
+                    size_of::<WrappedLine>()
+                        .saturating_add(line.text.len())
+                        .saturating_add(
+                            line.runs()
+                                .iter()
+                                .map(|run| {
+                                    size_of_val(run).saturating_add(
+                                        run.glyphs.capacity() * size_of::<gpui::ShapedGlyph>(),
+                                    )
+                                })
+                                .sum::<usize>(),
+                        )
+                })
+                .sum::<usize>(),
+        );
+    SNAPSHOT_CLONE_PEAK.fetch_max(bytes, Ordering::Relaxed);
+}
+
 const fn text_paint_passes() -> [TextPaintPass; 2] {
     [TextPaintPass::Background, TextPaintPass::Glyphs]
 }
@@ -46,11 +105,23 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
         .visible()
         .iter()
         .map(|block| {
-            let kind = editor
-                .document()
-                .block(block.node_id)
+            let model_block = editor.document().block(block.node_id);
+            let kind = model_block
                 .map(|block| block.kind.clone())
                 .unwrap_or(BlockKind::Paragraph);
+            let has_highlight = model_block
+                .and_then(|block| block.content.styles())
+                .is_some_and(|styles| {
+                    styles.iter().any(|run| {
+                        run.marks
+                            .iter()
+                            .any(|mark| matches!(mark, super::model::Mark::Highlight))
+                    })
+                });
+            #[cfg(test)]
+            if let Some(cached) = layout.cache.get(&block.node_id) {
+                observe_snapshot_clone(cached);
+            }
             RenderBlock {
                 layout: block.clone(),
                 text_lines: layout
@@ -58,6 +129,7 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                     .map(|cached| cached.text_lines.clone())
                     .unwrap_or_default(),
                 is_image: layout.is_image(block.node_id),
+                has_highlight,
                 line_height: layout.line_height(block.node_id),
                 marker: list_marker(&kind, layout.ordered_number(block.node_id)),
             }
@@ -138,14 +210,21 @@ fn paint_snapshot(
             let origin = point(text_bounds.left(), line_top);
             for pass in text_paint_passes() {
                 match pass {
-                    TextPaintPass::Background => line.paint_background(
-                        origin,
-                        line_height,
-                        block.layout.text_align,
-                        Some(text_bounds),
-                        window,
-                        cx,
-                    )?,
+                    TextPaintPass::Background => {
+                        let result = line.paint_background(
+                            origin,
+                            line_height,
+                            block.layout.text_align,
+                            Some(text_bounds),
+                            window,
+                            cx,
+                        );
+                        #[cfg(test)]
+                        if block.has_highlight && result.is_ok() {
+                            HIGHLIGHT_BACKGROUND_PAINTS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        result?;
+                    }
                     TextPaintPass::Glyphs => line.paint(
                         origin,
                         line_height,
@@ -259,7 +338,9 @@ pub(crate) fn image_selection_outline(bounds: Bounds<gpui::Pixels>) -> Bounds<gp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_editor::model::{Affinity, BlockKind, DocPoint, Selection};
+    use crate::native_editor::model::{
+        Affinity, BlockKind, DocPoint, Mark, Selection, TextAlignment,
+    };
     use crate::native_editor::transaction::Transaction;
 
     #[gpui::test]
@@ -397,6 +478,94 @@ mod tests {
             editor.shape_visible_with_window(0.0, 32.0, 120.0, window);
         });
         assert_eq!(editor.layout().ordered_number_scan_count(), scan_count);
+
+        let inline_target = editor.document().blocks()[128].clone();
+        editor
+            .apply(Transaction::InsertText {
+                selection: Selection::caret(DocPoint::with_affinity(
+                    inline_target.id,
+                    inline_target.content.as_text().unwrap().len(),
+                    Affinity::After,
+                )),
+                text: "!".into(),
+            })
+            .expect("inline edit should succeed");
+        cx.update(|window, _| {
+            editor.shape_visible_with_window(0.0, 32.0, 120.0, window);
+        });
+        assert_eq!(
+            editor.layout().ordered_number_scan_count(),
+            scan_count,
+            "text edits must reuse the structural numbering summary"
+        );
+
+        for mark in [
+            Mark::Bold,
+            Mark::Link("https://example.com".into()),
+            Mark::Highlight,
+        ] {
+            editor
+                .apply(Transaction::ToggleMark {
+                    selection: Selection::new(
+                        DocPoint::with_affinity(inline_target.id, 0, Affinity::Before),
+                        DocPoint::with_affinity(inline_target.id, 1, Affinity::After),
+                    ),
+                    mark,
+                })
+                .expect("inline mark edit should succeed");
+            cx.update(|window, _| {
+                editor.shape_visible_with_window(0.0, 32.0, 120.0, window);
+            });
+            assert_eq!(
+                editor.layout().ordered_number_scan_count(),
+                scan_count,
+                "mark and link edits must reuse the structural numbering summary"
+            );
+        }
+
+        let marked = editor.document().blocks()[128].clone();
+        editor
+            .apply(Transaction::SetAlignment {
+                selection: Selection::new(
+                    DocPoint::with_affinity(marked.id, 0, Affinity::Before),
+                    DocPoint::with_affinity(
+                        marked.id,
+                        marked.content.as_text().unwrap().len(),
+                        Affinity::After,
+                    ),
+                ),
+                alignment: TextAlignment::Center,
+            })
+            .expect("alignment edit should succeed");
+        cx.update(|window, _| {
+            editor.shape_visible_with_window(0.0, 32.0, 120.0, window);
+        });
+        assert_eq!(
+            editor.layout().ordered_number_scan_count(),
+            scan_count,
+            "alignment edits must reuse the structural numbering summary"
+        );
+
+        let first = editor.document().blocks()[0].clone();
+        let first_len = first.content.as_text().unwrap().len();
+        editor
+            .apply(Transaction::SetBlockKind {
+                selection: Selection::new(
+                    DocPoint::with_affinity(first.id, 0, Affinity::Before),
+                    DocPoint::with_affinity(first.id, first_len, Affinity::After),
+                ),
+                kind: BlockKind::Paragraph,
+            })
+            .expect("structural kind edit should succeed");
+        let last_id = editor.document().blocks().last().unwrap().id;
+        cx.update(|window, _| {
+            editor.shape_visible_with_window(0.0, 32.0, 120.0, window);
+        });
+        assert_eq!(
+            editor.layout().ordered_number(last_id),
+            Some(255),
+            "a structural list boundary must update later ordered markers"
+        );
     }
 
     #[test]
