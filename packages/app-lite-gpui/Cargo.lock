@@ -3985,6 +3985,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-graphics"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
+dependencies = [
+ "bitflags 2.13.1",
+ "dispatch2",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-io-surface",
+]
+
+[[package]]
 name = "objc2-encode"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3995,6 +4008,28 @@ name = "objc2-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags 2.13.1",
+ "objc2",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-image-io"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32b0446e98cf4a784cc7a0177715ff317eeaa8463841c616cfc78aa4f953c4ea"
+dependencies = [
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+]
+
+[[package]]
+name = "objc2-io-surface"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
 dependencies = [
  "bitflags 2.13.1",
  "objc2",
@@ -7076,6 +7111,9 @@ dependencies = [
  "loro_fractional_index",
  "mermaid-rs-renderer",
  "objc",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-image-io",
  "pulldown-cmark",
  "ratex-layout",
  "ratex-parser",

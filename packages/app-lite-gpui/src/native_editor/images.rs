@@ -20,6 +20,7 @@ use image::{AnimationDecoder, ImageBuffer, codecs::gif::GifDecoder, imageops::Fi
 use smallvec::SmallVec;
 
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
+const MACOS_PROXY_MAX_EDGE: u32 = 1600;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImagePayload {
@@ -714,6 +715,165 @@ impl BudgetedImageCache {
         Ok(Arc::new(RenderImage::new(frames)))
     }
 
+    fn decode_resource_bounded(
+        resource: &Resource,
+        budget_bytes: usize,
+    ) -> Result<Arc<RenderImage>, ImageCacheError> {
+        match resource {
+            Resource::Path(path) => {
+                #[cfg(target_os = "macos")]
+                {
+                    if path.extension().is_some_and(|extension| {
+                        extension.to_string_lossy().eq_ignore_ascii_case("svg")
+                    }) {
+                        let bytes = std::fs::read(path.as_ref()).map_err(ImageCacheError::from)?;
+                        return Self::decode_bounded(&bytes, budget_bytes);
+                    }
+                    return Self::decode_macos_path(path, budget_bytes);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let bytes = std::fs::read(path.as_ref()).map_err(ImageCacheError::from)?;
+                    Self::decode_bounded(&bytes, budget_bytes)
+                }
+            }
+            _ => Err(ImageCacheError::from(anyhow!(
+                "native images require a managed path resource"
+            ))),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn decode_macos_path(
+        path: &Path,
+        budget_bytes: usize,
+    ) -> Result<Arc<RenderImage>, ImageCacheError> {
+        use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType, CFURL};
+        use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+        use objc2_core_graphics::{
+            CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
+            CGImageByteOrderInfo,
+        };
+        use objc2_image_io::{
+            CGImageSource, kCGImageSourceCreateThumbnailFromImageAlways,
+            kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceShouldCache,
+            kCGImageSourceThumbnailMaxPixelSize,
+        };
+
+        let url = CFURL::from_file_path(path).ok_or_else(|| {
+            ImageCacheError::from(anyhow!("managed image path cannot become a file URL"))
+        })?;
+        let source = unsafe { CGImageSource::with_url(&url, None) }.ok_or_else(|| {
+            ImageCacheError::from(anyhow!("ImageIO could not open managed image resource"))
+        })?;
+        let frame_count = unsafe { source.count() }.max(1);
+        let max_pixels_per_frame = budget_bytes
+            .checked_div(frame_count)
+            .and_then(|bytes| bytes.checked_div(4))
+            .ok_or_else(|| ImageCacheError::from(anyhow!("decoded image budget is too small")))?;
+        let budget_edge = (max_pixels_per_frame as f64).sqrt().floor() as u32;
+        let max_edge = MACOS_PROXY_MAX_EDGE.min(budget_edge.max(1));
+        let create_thumbnail = CFBoolean::new(true);
+        let transform = CFBoolean::new(true);
+        let should_cache = CFBoolean::new(false);
+        let max_pixel_size = CFNumber::new_i32(max_edge as i32);
+        let keys: [&CFString; 4] = unsafe {
+            [
+                kCGImageSourceCreateThumbnailFromImageAlways,
+                kCGImageSourceCreateThumbnailWithTransform,
+                kCGImageSourceShouldCache,
+                kCGImageSourceThumbnailMaxPixelSize,
+            ]
+        };
+        let values: [&CFType; 4] = [
+            create_thumbnail.as_ref(),
+            transform.as_ref(),
+            should_cache.as_ref(),
+            max_pixel_size.as_ref(),
+        ];
+        let options =
+            CFDictionary::<CFType, CFType>::from_slices(&keys.map(|key| key as &CFType), &values);
+
+        let mut frames = SmallVec::<[image::Frame; 1]>::new();
+        for index in 0..frame_count {
+            let image = unsafe { source.thumbnail_at_index(index, Some(options.as_ref())) }
+                .ok_or_else(|| {
+                    ImageCacheError::from(anyhow!("ImageIO could not create bounded thumbnail"))
+                })?;
+            let width = CGImage::width(Some(&image));
+            let height = CGImage::height(Some(&image));
+            if width == 0 || height == 0 {
+                return Err(ImageCacheError::from(anyhow!(
+                    "ImageIO returned an empty thumbnail bitmap"
+                )));
+            }
+            let output_len = width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| ImageCacheError::from(anyhow!("thumbnail dimensions overflow")))?;
+            let mut pixels = vec![0u8; output_len];
+            let color_space = CGColorSpace::new_device_rgb().ok_or_else(|| {
+                ImageCacheError::from(anyhow!("CoreGraphics could not create RGB color space"))
+            })?;
+            let bytes_per_row = width
+                .checked_mul(4)
+                .ok_or_else(|| ImageCacheError::from(anyhow!("thumbnail row overflows")))?;
+            let bitmap_info =
+                CGImageAlphaInfo::PremultipliedFirst.0 | CGImageByteOrderInfo::Order32Little.0;
+            {
+                let context = unsafe {
+                    CGBitmapContextCreate(
+                        pixels.as_mut_ptr().cast(),
+                        width,
+                        height,
+                        8,
+                        bytes_per_row,
+                        Some(&color_space),
+                        bitmap_info,
+                    )
+                }
+                .ok_or_else(|| {
+                    ImageCacheError::from(anyhow!("CoreGraphics could not create bitmap context"))
+                })?;
+                CGContext::translate_ctm(Some(&context), 0.0, height as f64);
+                CGContext::scale_ctm(Some(&context), 1.0, -1.0);
+                CGContext::draw_image(
+                    Some(&context),
+                    CGRect::new(
+                        CGPoint::new(0.0, 0.0),
+                        CGSize::new(width as f64, height as f64),
+                    ),
+                    Some(&image),
+                );
+            }
+            let buffer = ImageBuffer::from_raw(width as u32, height as u32, pixels)
+                .ok_or_else(|| ImageCacheError::from(anyhow!("thumbnail pixels invalid")))?;
+            frames.push(image::Frame::new(buffer));
+            drop(image);
+            // The thumbnail is the only decoded representation retained by
+            // this cache. Explicitly remove ImageIO's source-side cache as
+            // well, so a large managed original cannot stay resident after
+            // the bounded proxy has been copied into the GPUI frame.
+            unsafe { source.remove_cache_at_index(index) };
+        }
+
+        let decoded_bytes = frames
+            .iter()
+            .map(|frame| {
+                let (width, height) = frame.buffer().dimensions();
+                (width as usize)
+                    .saturating_mul(height as usize)
+                    .saturating_mul(4)
+            })
+            .sum::<usize>();
+        if decoded_bytes > budget_bytes {
+            return Err(ImageCacheError::from(anyhow!(
+                "ImageIO bounded proxy exceeds decoded-image budget"
+            )));
+        }
+        Ok(Arc::new(RenderImage::new(frames)))
+    }
+
     fn evict_until_fit(&mut self, needed: usize, cx: &mut App, window: &mut Window) {
         while self.used_bytes.saturating_add(needed) > self.budget_bytes {
             let Some(oldest) = self.lru.pop_front() else {
@@ -777,19 +937,7 @@ impl ImageCache for BudgetedImageCache {
 
         let budget = self.budget_bytes;
         let source = resource.clone();
-        let load_future = async move {
-            let bytes = match source {
-                Resource::Path(path) => {
-                    std::fs::read(path.as_ref()).map_err(ImageCacheError::from)?
-                }
-                _ => {
-                    return Err(ImageCacheError::from(anyhow!(
-                        "native images require a managed path resource"
-                    )));
-                }
-            };
-            Self::decode_bounded(&bytes, budget)
-        };
+        let load_future = async move { Self::decode_resource_bounded(&source, budget) };
         let task = cx.background_executor().spawn(load_future).shared();
         self.entries.insert(
             key,
@@ -994,5 +1142,45 @@ mod tests {
         assert_eq!(store.node_state(id), ImageNodeState::Failed);
         assert_eq!(store.compressed_len(id), Some(3));
         assert!(store.can_retry(id));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_resource_load_uses_bounded_imageio_proxy_without_mutating_original() {
+        let source = ImageBuffer::from_pixel(4031, 3023, Rgba([0x11, 0x22, 0x33, 0xff]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("fixture PNG should encode");
+        let original = encoded.get_ref().clone();
+        let mut store = ImageStore::for_test();
+        let id = store.insert_with_format(
+            ImageMetadata::new("imageio-proxy", 4031, 3023),
+            original.clone(),
+            ImageFormat::Png,
+        );
+        let path = store
+            .source_path_for_resource("imageio-proxy")
+            .expect("managed source path")
+            .to_owned();
+
+        let proxy = BudgetedImageCache::decode_resource_bounded(
+            &Resource::from(path.clone()),
+            DECODED_IMAGE_CACHE_BUDGET,
+        )
+        .expect("ImageIO should create a bounded proxy");
+        let size = proxy.size(0);
+        let width = u32::from(size.width);
+        let height = u32::from(size.height);
+        assert!(width.max(height) <= 1600, "proxy is {width}x{height}");
+        let ratio = width as f32 / height as f32;
+        assert!((ratio - 4031.0 / 3023.0).abs() < 0.01);
+        assert_eq!(
+            &proxy.as_bytes(0).expect("proxy pixels")[..4],
+            &[0x33, 0x22, 0x11, 0xff]
+        );
+        assert_eq!(store.metadata(id).unwrap().natural_width, 4031);
+        assert_eq!(store.metadata(id).unwrap().natural_height, 3023);
+        assert_eq!(std::fs::read(&path).expect("managed source"), original);
     }
 }
