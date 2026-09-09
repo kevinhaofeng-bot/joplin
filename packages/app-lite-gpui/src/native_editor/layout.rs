@@ -387,7 +387,6 @@ struct NumberingCursor {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct NumberingCheckpoint {
-    index: usize,
     cursor: NumberingCursor,
 }
 
@@ -1560,7 +1559,6 @@ impl LayoutRegistry {
         for (index, block) in document.blocks().iter().enumerate() {
             if index % NUMBERING_CHECKPOINT_STRIDE == 0 {
                 self.ordered_checkpoints.push(NumberingCheckpoint {
-                    index,
                     cursor: cursor.clone(),
                 });
             }
@@ -1590,12 +1588,14 @@ impl LayoutRegistry {
     fn update_ordered_structure(
         &mut self,
         document: &Document,
-        changed_nodes: &[NodeId],
+        _changed_nodes: &[NodeId],
         structural_splices: &[StructuralSplice],
         numbering_ranges: &[Range<usize>],
     ) {
+        self.repair_ordered_checkpoints(document.block_count());
         let mut first = usize::MAX;
         let mut last = 0usize;
+        let mut affected_ranges = SmallVec::<[Range<usize>; 4]>::new();
         if !structural_splices.is_empty() {
             for splice in structural_splices {
                 first = first.min(splice.start_index);
@@ -1605,31 +1605,56 @@ impl LayoutRegistry {
                         .saturating_add(splice.inserted.len())
                         .max(splice.start_index.saturating_add(splice.removed.len())),
                 );
+                // The splice itself is the explicit invalidation boundary.
+                // Mark only the resulting replacement span (or its start for
+                // a pure removal); do not infer structural change from the
+                // final order tree, whose shifted IDs would force a suffix
+                // scan even when numbering state is unchanged.
+                let affected_len = splice.inserted.len().max(1);
+                let affected_start = splice.start_index.min(document.block_count());
+                let affected_end = affected_start
+                    .saturating_add(affected_len)
+                    .min(document.block_count());
+                affected_ranges.push(affected_start..affected_end);
                 self.splice_order_tree(splice);
                 for node_id in &splice.removed {
                     self.ordered_kinds.remove(node_id);
                     self.ordered_numbers.remove(node_id);
-                }
-                for node_id in &splice.inserted {
-                    if let Some(block) = document.block(*node_id) {
-                        self.ordered_kinds
-                            .insert(*node_id, numbering_kind(&block.kind));
-                    }
-                }
-            }
-            for node_id in changed_nodes {
-                if let Some(block) = document.block(*node_id) {
-                    self.ordered_kinds
-                        .insert(*node_id, numbering_kind(&block.kind));
                 }
             }
         }
         for range in numbering_ranges {
             first = first.min(range.start);
             last = last.max(range.end.saturating_sub(1));
+            affected_ranges.push(range.clone());
         }
         if first != usize::MAX {
-            self.update_ordered_numbers(document, first, last);
+            self.update_ordered_numbers(document, first, last, &affected_ranges);
+        }
+    }
+
+    /// Keep the sparse checkpoint vector aligned with the final document
+    /// length after an order splice. New slots start empty and are populated
+    /// by the incremental scan when it reaches that boundary; removed tail
+    /// slots are discarded so a later update cannot resume from an invalid
+    /// cursor. Existing cursor values remain available for convergence checks
+    /// until the affected wave rewrites them.
+    fn repair_ordered_checkpoints(&mut self, block_count: usize) {
+        let checkpoint_count = block_count.div_ceil(NUMBERING_CHECKPOINT_STRIDE);
+        #[cfg(test)]
+        let previous_count = self.ordered_checkpoints.len();
+        self.ordered_checkpoints.truncate(checkpoint_count);
+        while self.ordered_checkpoints.len() < checkpoint_count {
+            self.ordered_checkpoints
+                .push(NumberingCheckpoint::default());
+        }
+        #[cfg(test)]
+        {
+            // Count checkpoint repair as delta work rather than hiding it
+            // behind removed/inserted identity counts.
+            self.ordered_splice_work_count = self
+                .ordered_splice_work_count
+                .saturating_add(previous_count.abs_diff(checkpoint_count));
         }
     }
 
@@ -1652,19 +1677,27 @@ impl LayoutRegistry {
         self.ordered_tree = new_tree;
         #[cfg(test)]
         {
-            self.ordered_splice_work_count = self
-                .ordered_splice_work_count
-                .saturating_add(splice.removed.len().saturating_add(splice.inserted.len()));
+            // Count the bounded sequence operations as well as the identities
+            // written. `slice`, `seek_forward`, and `suffix` each traverse
+            // the balanced tree; the counter is deliberately not just
+            // removed.len() + inserted.len().
+            self.ordered_splice_work_count = self.ordered_splice_work_count.saturating_add(
+                splice
+                    .removed
+                    .len()
+                    .saturating_add(splice.inserted.len())
+                    .saturating_add(3),
+            );
         }
     }
 
-    fn ordered_id_at(&self, index: usize) -> Option<NodeId> {
-        let mut cursor = self.ordered_tree.cursor::<OrderCount>(());
-        cursor.seek(&OrderCount(index), Bias::Right);
-        cursor.item().map(|item| item.node_id)
-    }
-
-    fn update_ordered_numbers(&mut self, document: &Document, start: usize, last_changed: usize) {
+    fn update_ordered_numbers(
+        &mut self,
+        document: &Document,
+        start: usize,
+        last_changed: usize,
+        affected_ranges: &[Range<usize>],
+    ) {
         let checkpoint_start =
             (start / NUMBERING_CHECKPOINT_STRIDE).saturating_mul(NUMBERING_CHECKPOINT_STRIDE);
         let mut cursor = self
@@ -1688,7 +1721,7 @@ impl LayoutRegistry {
             self.ordered_kinds.insert(block.id, kind);
             processed = processed.saturating_add(1);
 
-            if self.ordered_id_at(index) != Some(block.id)
+            if affected_ranges.iter().any(|range| range.contains(&index))
                 || old_kind != Some(kind)
                 || old_number != number
             {

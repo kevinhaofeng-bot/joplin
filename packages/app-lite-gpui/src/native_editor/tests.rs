@@ -3,7 +3,7 @@ use super::commands::{
 };
 use super::core::EditorCore;
 use super::history::History;
-use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry};
+use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry, ordered_number_summary};
 use super::render;
 use crate::spike_app::{SpikeRouteContract, layout_for_viewport, route_contract};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -22,7 +22,7 @@ use super::model::{
     reset_grapheme_resolution_counter, reset_validation_grapheme_counter,
     validation_grapheme_counter,
 };
-use super::transaction::{Transaction, TransactionBatch};
+use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
 
 struct CountingAllocator;
 
@@ -67,6 +67,51 @@ impl AllocationMeasurement {
 impl Drop for AllocationMeasurement {
     fn drop(&mut self) {
         MEASURING_ALLOCATIONS.with(|measuring| measuring.set(None));
+    }
+}
+
+fn apply_history_and_measure(
+    document: &mut Document,
+    history: &mut History,
+    layout: &mut LayoutRegistry,
+    before_selection: Selection,
+    transaction: Transaction,
+) -> (ApplyOutcome, usize) {
+    let measurement = AllocationMeasurement::begin();
+    let outcome = history
+        .apply_with_selection(document, before_selection, transaction)
+        .expect("history transaction");
+    layout.invalidate_nodes_with_delta(
+        document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    (outcome, measurement.bytes())
+}
+
+fn ordered_fixture(count: usize) -> Vec<Block> {
+    (0..count)
+        .map(|index| Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: BlockKind::OrderedItem { depth: 0 },
+            content: BlockContent::text(format!("item-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        })
+        .collect()
+}
+
+fn assert_ordered_numbers_match(document: &Document, layout: &LayoutRegistry, context: &str) {
+    let oracle = ordered_number_summary(document);
+    for block in document.blocks() {
+        assert_eq!(
+            layout.ordered_number(block.id),
+            oracle.get(&block.id).copied(),
+            "{context}: stale number for {:?}",
+            block.id
+        );
     }
 }
 
@@ -683,6 +728,8 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     let work_before = layout.ordered_number_work_count();
     let tail = document.blocks().last().expect("tail paragraph").clone();
     let before_selection = document.end_selection();
+    let splice_work_before = layout.ordered_splice_work_count();
+    let measurement = AllocationMeasurement::begin();
     let outcome = history
         .apply_with_selection(
             &mut document,
@@ -696,18 +743,14 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     assert_eq!(outcome.structural_splices[0].start_index, 99_999);
     assert_eq!(outcome.structural_splices[0].removed.len(), 1);
     assert_eq!(outcome.structural_splices[0].inserted.len(), 2);
-    let splice_work_before = layout.ordered_splice_work_count();
-    let scratch = {
-        let measurement = AllocationMeasurement::begin();
-        layout.invalidate_nodes_with_delta(
-            &document,
-            &outcome.changed_nodes,
-            outcome.structural,
-            &outcome.structural_splices,
-            &outcome.numbering_ranges,
-        );
-        measurement.bytes()
-    };
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let scratch = measurement.bytes();
     assert_eq!(document.block_count(), 100_001);
     assert!(
         layout
@@ -716,12 +759,12 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
             <= 256,
         "tail Return rebuilt numbering for the whole document"
     );
-    assert_eq!(
-        layout
-            .ordered_splice_work_count()
-            .saturating_sub(splice_work_before),
-        3,
-        "tail Return must splice only its removed/inserted identities"
+    let splice_work = layout
+        .ordered_splice_work_count()
+        .saturating_sub(splice_work_before);
+    assert!(
+        splice_work >= 1 + 2 + 3 && splice_work <= 16,
+        "tail Return tree delta work was not bounded: {splice_work}"
     );
     assert!(
         scratch < 512 * 1024,
@@ -731,6 +774,8 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     let right = document.blocks().last().expect("split tail").id;
     let work_before = layout.ordered_number_work_count();
     let before_selection = document.end_selection();
+    let splice_work_before = layout.ordered_splice_work_count();
+    let measurement = AllocationMeasurement::begin();
     let outcome = history
         .apply_with_selection(
             &mut document,
@@ -745,18 +790,14 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     assert_eq!(outcome.structural_splices[0].start_index, 99_999);
     assert_eq!(outcome.structural_splices[0].removed.len(), 2);
     assert_eq!(outcome.structural_splices[0].inserted.len(), 1);
-    let splice_work_before = layout.ordered_splice_work_count();
-    let scratch = {
-        let measurement = AllocationMeasurement::begin();
-        layout.invalidate_nodes_with_delta(
-            &document,
-            &outcome.changed_nodes,
-            outcome.structural,
-            &outcome.structural_splices,
-            &outcome.numbering_ranges,
-        );
-        measurement.bytes()
-    };
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let scratch = measurement.bytes();
     assert_eq!(document.block_count(), 100_000);
     assert!(
         layout
@@ -765,12 +806,12 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
             <= 256,
         "tail Backspace merge rebuilt numbering for the whole document"
     );
-    assert_eq!(
-        layout
-            .ordered_splice_work_count()
-            .saturating_sub(splice_work_before),
-        3,
-        "tail Backspace merge must splice only its removed/inserted identities"
+    let splice_work = layout
+        .ordered_splice_work_count()
+        .saturating_sub(splice_work_before);
+    assert!(
+        splice_work >= 2 + 1 + 3 && splice_work <= 16,
+        "tail Backspace tree delta work was not bounded: {splice_work}"
     );
     assert!(
         scratch < 512 * 1024,
@@ -778,6 +819,8 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     );
 
     let work_before = layout.ordered_number_work_count();
+    let splice_work_before = layout.ordered_splice_work_count();
+    let measurement = AllocationMeasurement::begin();
     let outcome = history
         .undo_with_outcome(&mut document)
         .expect("undo merge");
@@ -785,18 +828,14 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     assert_eq!(outcome.structural_splices[0].start_index, 99_999);
     assert_eq!(outcome.structural_splices[0].removed.len(), 1);
     assert_eq!(outcome.structural_splices[0].inserted.len(), 2);
-    let splice_work_before = layout.ordered_splice_work_count();
-    let scratch = {
-        let measurement = AllocationMeasurement::begin();
-        layout.invalidate_nodes_with_delta(
-            &document,
-            &outcome.changed_nodes,
-            outcome.structural,
-            &outcome.structural_splices,
-            &outcome.numbering_ranges,
-        );
-        measurement.bytes()
-    };
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let scratch = measurement.bytes();
     assert_eq!(document.block_count(), 100_001);
     assert!(
         layout
@@ -805,12 +844,12 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
             <= 256,
         "undo merge rebuilt numbering for the whole document"
     );
-    assert_eq!(
-        layout
-            .ordered_splice_work_count()
-            .saturating_sub(splice_work_before),
-        3,
-        "undo merge must splice only its removed/inserted identities"
+    let splice_work = layout
+        .ordered_splice_work_count()
+        .saturating_sub(splice_work_before);
+    assert!(
+        splice_work >= 1 + 2 + 3 && splice_work <= 16,
+        "undo merge tree delta work was not bounded: {splice_work}"
     );
     assert!(
         scratch < 512 * 1024,
@@ -818,6 +857,8 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     );
 
     let work_before = layout.ordered_number_work_count();
+    let splice_work_before = layout.ordered_splice_work_count();
+    let measurement = AllocationMeasurement::begin();
     let outcome = history
         .redo_with_outcome(&mut document)
         .expect("redo merge");
@@ -825,18 +866,14 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
     assert_eq!(outcome.structural_splices[0].start_index, 99_999);
     assert_eq!(outcome.structural_splices[0].removed.len(), 2);
     assert_eq!(outcome.structural_splices[0].inserted.len(), 1);
-    let splice_work_before = layout.ordered_splice_work_count();
-    let scratch = {
-        let measurement = AllocationMeasurement::begin();
-        layout.invalidate_nodes_with_delta(
-            &document,
-            &outcome.changed_nodes,
-            outcome.structural,
-            &outcome.structural_splices,
-            &outcome.numbering_ranges,
-        );
-        measurement.bytes()
-    };
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let scratch = measurement.bytes();
     assert_eq!(document.block_count(), 100_000);
     assert!(
         layout
@@ -845,12 +882,12 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
             <= 256,
         "redo merge rebuilt numbering for the whole document"
     );
-    assert_eq!(
-        layout
-            .ordered_splice_work_count()
-            .saturating_sub(splice_work_before),
-        3,
-        "redo merge must splice only its removed/inserted identities"
+    let splice_work = layout
+        .ordered_splice_work_count()
+        .saturating_sub(splice_work_before);
+    assert!(
+        splice_work >= 2 + 1 + 3 && splice_work <= 16,
+        "redo merge tree delta work was not bounded: {splice_work}"
     );
     assert!(
         scratch < 512 * 1024,
@@ -968,6 +1005,673 @@ fn batched_splices_and_restore_blocks_replay_in_order_through_history() {
         &outcome.numbering_ranges,
     );
     assert_eq!(document.blocks()[1].id, replacement.id);
+}
+
+#[test]
+fn restore_blocks_rejects_a_range_external_node_id_collision_atomically() {
+    let mut document = Document::from_paragraphs(["left", "middle", "right"]);
+    let original = document.clone();
+    let outside = document.blocks()[0].clone();
+
+    let result = document.apply(Transaction::RestoreBlocks {
+        index: 1,
+        remove_count: 1,
+        blocks: vec![outside],
+    });
+
+    assert!(matches!(
+        result,
+        Err(DocumentError::InvalidOperation(message))
+            if message.contains("duplicate a node id")
+    ));
+    assert_eq!(document, original);
+    document.validate_invariants().expect("collision rollback");
+}
+
+#[test]
+fn structural_spare_capacity_is_exact_and_repeated_insertions_stay_valid() {
+    let mut document = Document::from_paragraph("seed");
+    let initial_capacity = document.block_capacity();
+    assert!(
+        initial_capacity <= document.block_count() + 4,
+        "from_paragraphs retained a geometric Vec cushion: capacity={initial_capacity}, len={}",
+        document.block_count()
+    );
+    assert!(
+        initial_capacity.saturating_mul(size_of::<Block>())
+            <= (document.block_count() + 4).saturating_mul(size_of::<Block>()),
+        "persistent block storage exceeded the four-slot cushion"
+    );
+
+    let capacity_before_exhaustion = document.block_capacity();
+    let spare_before_exhaustion = capacity_before_exhaustion - document.block_count();
+    for _ in 0..spare_before_exhaustion {
+        let tail = document.blocks().last().expect("tail block").clone();
+        document
+            .apply(Transaction::SplitBlock {
+                at: DocPoint::with_affinity(
+                    tail.id,
+                    tail.content.as_text().expect("tail text").len(),
+                    Affinity::After,
+                ),
+            })
+            .expect("consume structural spare slot");
+    }
+    assert_eq!(document.block_capacity(), capacity_before_exhaustion);
+    assert_eq!(document.block_capacity(), document.block_count());
+
+    // The next splice has no spare slot and the following two edits exercise
+    // the grown buffer rather than only proving that the first edit worked.
+    for _ in 0..3 {
+        let tail = document
+            .blocks()
+            .last()
+            .expect("tail after exhaustion")
+            .clone();
+        document
+            .apply(Transaction::SplitBlock {
+                at: DocPoint::with_affinity(
+                    tail.id,
+                    tail.content.as_text().expect("tail text").len(),
+                    Affinity::After,
+                ),
+            })
+            .expect("repeat structural insertion after exhaustion");
+    }
+    assert_eq!(document.block_count(), capacity_before_exhaustion + 3);
+    assert!(document.block_capacity() >= document.block_count());
+    document
+        .validate_invariants()
+        .expect("repeated structural insertions remain valid");
+}
+
+#[test]
+fn plain_middle_splice_and_same_id_restore_stay_local() {
+    const PREFIX_COUNT: usize = 64;
+    const MIDDLE_COUNT: usize = 100_000;
+    const SUFFIX_COUNT: usize = 64;
+    const MIDDLE_INDEX: usize = PREFIX_COUNT + MIDDLE_COUNT / 2;
+
+    let mut blocks = Vec::with_capacity(PREFIX_COUNT + MIDDLE_COUNT + SUFFIX_COUNT);
+    for index in 0..PREFIX_COUNT {
+        blocks.push(Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: BlockKind::OrderedItem { depth: 0 },
+            content: BlockContent::text(format!("prefix-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        });
+    }
+    for index in 0..MIDDLE_COUNT {
+        blocks.push(Block {
+            id: NodeId::new((PREFIX_COUNT + index + 1) as u64),
+            kind: BlockKind::Paragraph,
+            content: BlockContent::text(format!("middle-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        });
+    }
+    for index in 0..SUFFIX_COUNT {
+        blocks.push(Block {
+            id: NodeId::new((PREFIX_COUNT + MIDDLE_COUNT + index + 1) as u64),
+            kind: BlockKind::OrderedItem { depth: 0 },
+            content: BlockContent::text(format!("suffix-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        });
+    }
+    let mut document = Document::from_blocks(blocks).expect("plain middle fixture");
+    assert!(
+        document.block_capacity() <= document.block_count() + 4,
+        "middle fixture retained a geometric Vec cushion: capacity={}, len={}",
+        document.block_capacity(),
+        document.block_count()
+    );
+    assert!(
+        document.block_capacity().saturating_mul(size_of::<Block>())
+            <= (document.block_count() + 4).saturating_mul(size_of::<Block>()),
+        "middle fixture persistent block storage exceeded the four-slot cushion"
+    );
+    let assert_compact_capacity = |document: &Document| {
+        assert!(
+            document.block_capacity() <= document.block_count() + 4,
+            "structural splice grew persistent block capacity geometrically: capacity={}, len={}",
+            document.block_capacity(),
+            document.block_count()
+        );
+        assert!(
+            document.block_capacity().saturating_mul(size_of::<Block>())
+                <= (document.block_count() + 4).saturating_mul(size_of::<Block>()),
+            "structural splice grew persistent block storage beyond the four-slot cushion"
+        );
+    };
+    assert_compact_capacity(&document);
+    let middle = document.blocks()[MIDDLE_INDEX].id;
+    let suffix_ids = document.blocks()[PREFIX_COUNT + MIDDLE_COUNT..]
+        .iter()
+        .map(|block| block.id)
+        .collect::<Vec<_>>();
+    let mut history = History::new(32, 4 * 1024 * 1024);
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+
+    let assert_suffix = |document: &Document, layout: &LayoutRegistry| {
+        let oracle = ordered_number_summary(document);
+        for node_id in &suffix_ids {
+            assert_eq!(
+                layout.ordered_number(*node_id),
+                oracle.get(node_id).copied(),
+                "suffix numbering changed for {node_id:?}"
+            );
+        }
+    };
+    assert_suffix(&document, &layout);
+
+    let split_point = DocPoint::with_affinity(middle, 1, Affinity::After);
+    let work_before = layout.ordered_number_work_count();
+    let (outcome, allocation) = apply_history_and_measure(
+        &mut document,
+        &mut history,
+        &mut layout,
+        Selection::caret(split_point),
+        Transaction::SplitBlock { at: split_point },
+    );
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 256,
+        "plain middle Return scanned the distant suffix"
+    );
+    assert!(
+        allocation < 24 * 1024 * 1024,
+        "plain middle Return transaction/delta/layout allocation grew with the document: {allocation}"
+    );
+    assert_suffix(&document, &layout);
+    assert_compact_capacity(&document);
+
+    let right = document.blocks()[MIDDLE_INDEX + 1].id;
+    let merge_selection = Selection::caret(DocPoint::with_affinity(right, 0, Affinity::Before));
+    let work_before = layout.ordered_number_work_count();
+    let (outcome, allocation) = apply_history_and_measure(
+        &mut document,
+        &mut history,
+        &mut layout,
+        merge_selection,
+        Transaction::MergeBlocks {
+            left: middle,
+            right,
+        },
+    );
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 256,
+        "plain middle Backspace merge scanned the distant suffix"
+    );
+    assert!(
+        allocation < 24 * 1024 * 1024,
+        "plain middle Backspace transaction/delta/layout allocation grew with the document: {allocation}"
+    );
+    assert_suffix(&document, &layout);
+    assert_compact_capacity(&document);
+
+    let work_before = layout.ordered_number_work_count();
+    let measurement = AllocationMeasurement::begin();
+    let outcome = history
+        .undo_with_outcome(&mut document)
+        .expect("undo middle merge");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let allocation = measurement.bytes();
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 256,
+        "plain middle undo scanned the distant suffix"
+    );
+    assert!(
+        allocation < 24 * 1024 * 1024,
+        "plain middle undo transaction/delta/layout allocation grew with the document: {allocation}"
+    );
+    assert_suffix(&document, &layout);
+    assert_compact_capacity(&document);
+
+    let work_before = layout.ordered_number_work_count();
+    let measurement = AllocationMeasurement::begin();
+    let outcome = history
+        .redo_with_outcome(&mut document)
+        .expect("redo middle merge");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let allocation = measurement.bytes();
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 256,
+        "plain middle redo scanned the distant suffix"
+    );
+    assert!(
+        allocation < 24 * 1024 * 1024,
+        "plain middle redo transaction/delta/layout allocation grew with the document: {allocation}"
+    );
+    assert_suffix(&document, &layout);
+    assert_compact_capacity(&document);
+
+    let inline_selection = Selection::new(
+        DocPoint::with_affinity(middle, 0, Affinity::Before),
+        DocPoint::with_affinity(middle, 1, Affinity::After),
+    );
+    let (outcome, _) = apply_history_and_measure(
+        &mut document,
+        &mut history,
+        &mut layout,
+        inline_selection,
+        Transaction::ToggleMark {
+            selection: inline_selection,
+            mark: Mark::Bold,
+        },
+    );
+    assert!(outcome.structural_splices.is_empty());
+    let work_before = layout.ordered_number_work_count();
+    let measurement = AllocationMeasurement::begin();
+    let outcome = history
+        .undo_with_outcome(&mut document)
+        .expect("undo inline mark");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let allocation = measurement.bytes();
+    assert!(outcome.structural_splices.is_empty());
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 4,
+        "same-ID inline undo scanned the distant suffix"
+    );
+    assert!(
+        allocation < 24 * 1024 * 1024,
+        "same-ID inline undo transaction/delta/layout allocation grew with the document: {allocation}"
+    );
+    assert_suffix(&document, &layout);
+
+    let (outcome, _) = apply_history_and_measure(
+        &mut document,
+        &mut history,
+        &mut layout,
+        inline_selection,
+        Transaction::SetLink {
+            selection: inline_selection,
+            url: Some("https://example.test".into()),
+        },
+    );
+    assert!(outcome.structural_splices.is_empty());
+    let work_before = layout.ordered_number_work_count();
+    let measurement = AllocationMeasurement::begin();
+    let outcome = history
+        .undo_with_outcome(&mut document)
+        .expect("undo inline link");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let allocation = measurement.bytes();
+    assert!(outcome.structural_splices.is_empty());
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 4,
+        "same-ID link undo scanned the distant suffix"
+    );
+    assert!(
+        allocation < 24 * 1024 * 1024,
+        "same-ID link undo transaction/delta/layout allocation grew with the document: {allocation}"
+    );
+    assert_suffix(&document, &layout);
+
+    let (outcome, _) = apply_history_and_measure(
+        &mut document,
+        &mut history,
+        &mut layout,
+        inline_selection,
+        Transaction::SetAlignment {
+            selection: inline_selection,
+            alignment: TextAlignment::Center,
+        },
+    );
+    assert!(outcome.structural_splices.is_empty());
+    let work_before = layout.ordered_number_work_count();
+    let measurement = AllocationMeasurement::begin();
+    let outcome = history
+        .undo_with_outcome(&mut document)
+        .expect("undo inline alignment");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let allocation = measurement.bytes();
+    assert!(outcome.structural_splices.is_empty());
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 4,
+        "same-ID alignment undo scanned the distant suffix"
+    );
+    assert!(
+        allocation < 24 * 1024 * 1024,
+        "same-ID alignment undo transaction/delta/layout allocation grew with the document: {allocation}"
+    );
+    assert_suffix(&document, &layout);
+
+    let composition_selection =
+        Selection::caret(DocPoint::with_affinity(middle, 1, Affinity::After));
+    let (outcome, _) = apply_history_and_measure(
+        &mut document,
+        &mut history,
+        &mut layout,
+        composition_selection,
+        Transaction::InsertText {
+            selection: composition_selection,
+            text: "provisional".into(),
+        },
+    );
+    assert!(outcome.structural_splices.is_empty());
+    let work_before = layout.ordered_number_work_count();
+    let measurement = AllocationMeasurement::begin();
+    let outcome = history
+        .replace_last_with(&mut document, composition_selection, |_restored| {
+            Ok(Transaction::InsertText {
+                selection: composition_selection,
+                text: "replacement".into(),
+            })
+        })
+        .expect("replace provisional composition");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    let allocation = measurement.bytes();
+    assert!(outcome.structural_splices.is_empty());
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 4,
+        "same-ID IME restore scanned the distant suffix"
+    );
+    assert!(
+        allocation < 24 * 1024 * 1024,
+        "same-ID IME restore transaction/delta/layout allocation grew with the document: {allocation}"
+    );
+    assert_suffix(&document, &layout);
+}
+
+#[test]
+fn checkpoint_vec_repairs_63_64_65_boundaries() {
+    let mut document =
+        Document::from_blocks(ordered_fixture(63)).expect("63-item checkpoint fixture");
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    assert_ordered_numbers_match(&document, &layout, "initial 63-item checkpoint");
+
+    for expected_count in [64, 65] {
+        let tail = document.blocks().last().expect("boundary tail").clone();
+        let outcome = document
+            .apply(Transaction::SplitBlock {
+                at: DocPoint::with_affinity(
+                    tail.id,
+                    tail.content.as_text().expect("boundary text").len(),
+                    Affinity::After,
+                ),
+            })
+            .expect("boundary split");
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        assert_eq!(document.block_count(), expected_count);
+        assert_ordered_numbers_match(&document, &layout, "63/64/65 checkpoint boundary");
+    }
+}
+
+#[test]
+fn checkpoint_vec_repairs_new_stride_before_kind_updates() {
+    let mut document =
+        Document::from_blocks(ordered_fixture(64)).expect("checkpoint growth fixture");
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    let tail = document.blocks().last().expect("ordered tail").clone();
+    let split = document
+        .apply(Transaction::SplitBlock {
+            at: DocPoint::with_affinity(
+                tail.id,
+                tail.content.as_text().unwrap().len(),
+                Affinity::After,
+            ),
+        })
+        .expect("split at the 64 boundary");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &split.changed_nodes,
+        split.structural,
+        &split.structural_splices,
+        &split.numbering_ranges,
+    );
+    let new_tail = document.blocks().last().expect("new ordered tail").clone();
+    assert_eq!(layout.ordered_number(new_tail.id), Some(65));
+
+    let selection = Selection::new(
+        DocPoint::with_affinity(new_tail.id, 0, Affinity::Before),
+        DocPoint::with_affinity(
+            new_tail.id,
+            new_tail.content.as_text().unwrap().len(),
+            Affinity::After,
+        ),
+    );
+    let indented = document
+        .apply(Transaction::IndentList { selection })
+        .expect("indent new checkpoint tail");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &indented.changed_nodes,
+        indented.structural,
+        &indented.structural_splices,
+        &indented.numbering_ranges,
+    );
+    assert_ordered_numbers_match(&document, &layout, "indent after 64/65 growth");
+
+    let outdented = document
+        .apply(Transaction::OutdentList { selection })
+        .expect("outdent new checkpoint tail");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outdented.changed_nodes,
+        outdented.structural,
+        &outdented.structural_splices,
+        &outdented.numbering_ranges,
+    );
+    assert_ordered_numbers_match(&document, &layout, "outdent after 64/65 growth");
+}
+
+#[test]
+fn checkpoint_vec_grows_and_truncates_across_multiple_strides() {
+    let mut document = Document::from_blocks(ordered_fixture(127)).expect("multi-stride fixture");
+    let mut history = History::new(32, 4 * 1024 * 1024);
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+
+    assert_ordered_numbers_match(&document, &layout, "initial multi-stride fixture");
+
+    // 127 -> 128 keeps the existing two checkpoints; 128 -> 129 creates a
+    // new checkpoint at index 128 and must seed it before the next kind edit.
+    let first_tail = document.blocks().last().expect("first tail").clone();
+    let before_selection = document.end_selection();
+    let split = history
+        .apply_with_selection(
+            &mut document,
+            before_selection,
+            Transaction::SplitBlock {
+                at: DocPoint::with_affinity(
+                    first_tail.id,
+                    first_tail.content.as_text().unwrap().len(),
+                    Affinity::After,
+                ),
+            },
+        )
+        .expect("Return at 128");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &split.changed_nodes,
+        split.structural,
+        &split.structural_splices,
+        &split.numbering_ranges,
+    );
+    assert_eq!(document.block_count(), 128);
+    assert_ordered_numbers_match(&document, &layout, "127 to 128");
+
+    let second_tail = document.blocks().last().expect("second tail").clone();
+    let before_selection = document.end_selection();
+    let split = history
+        .apply_with_selection(
+            &mut document,
+            before_selection,
+            Transaction::SplitBlock {
+                at: DocPoint::with_affinity(
+                    second_tail.id,
+                    second_tail.content.as_text().unwrap().len(),
+                    Affinity::After,
+                ),
+            },
+        )
+        .expect("Return across the second stride");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &split.changed_nodes,
+        split.structural,
+        &split.structural_splices,
+        &split.numbering_ranges,
+    );
+    assert_eq!(document.block_count(), 129);
+    assert_ordered_numbers_match(&document, &layout, "128 to 129");
+
+    let tail = document.blocks().last().expect("numbered tail").clone();
+    let tail_selection = Selection::new(
+        DocPoint::with_affinity(tail.id, 0, Affinity::Before),
+        DocPoint::with_affinity(
+            tail.id,
+            tail.content.as_text().unwrap().len(),
+            Affinity::After,
+        ),
+    );
+    let indented = document
+        .apply(Transaction::IndentList {
+            selection: tail_selection,
+        })
+        .expect("indent after checkpoint growth");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &indented.changed_nodes,
+        indented.structural,
+        &indented.structural_splices,
+        &indented.numbering_ranges,
+    );
+    assert_ordered_numbers_match(&document, &layout, "indent after second stride");
+
+    let outdented = document
+        .apply(Transaction::OutdentList {
+            selection: tail_selection,
+        })
+        .expect("outdent after checkpoint growth");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outdented.changed_nodes,
+        outdented.structural,
+        &outdented.structural_splices,
+        &outdented.numbering_ranges,
+    );
+    assert_ordered_numbers_match(&document, &layout, "outdent after second stride");
+
+    let left = document.blocks()[127].id;
+    let right = document.blocks()[128].id;
+    let before_selection = document.end_selection();
+    let merged = history
+        .apply_with_selection(
+            &mut document,
+            before_selection,
+            Transaction::MergeBlocks { left, right },
+        )
+        .expect("merge truncates the last checkpoint");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &merged.changed_nodes,
+        merged.structural,
+        &merged.structural_splices,
+        &merged.numbering_ranges,
+    );
+    assert_eq!(document.block_count(), 128);
+    assert_ordered_numbers_match(&document, &layout, "truncate to 128");
+
+    let undone = history
+        .undo_with_outcome(&mut document)
+        .expect("undo merge");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &undone.changed_nodes,
+        undone.structural,
+        &undone.structural_splices,
+        &undone.numbering_ranges,
+    );
+    assert_eq!(document.block_count(), 129);
+    assert_ordered_numbers_match(&document, &layout, "undo to 129");
+
+    let redone = history
+        .redo_with_outcome(&mut document)
+        .expect("redo merge");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &redone.changed_nodes,
+        redone.structural,
+        &redone.structural_splices,
+        &redone.numbering_ranges,
+    );
+    assert_eq!(document.block_count(), 128);
+    assert_ordered_numbers_match(&document, &layout, "redo to 128");
 }
 
 #[test]

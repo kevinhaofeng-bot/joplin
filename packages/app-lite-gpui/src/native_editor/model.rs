@@ -24,6 +24,11 @@ use super::transaction::{
 /// Maximum nesting depth accepted by list transactions.
 pub const MAX_LIST_DEPTH: u8 = 64;
 
+// A structural edit needs room for its small replacement span. Keep this
+// explicit and exact: `Vec::reserve` is allowed to grow geometrically and
+// would turn a four-block cushion into a document-sized hidden allocation.
+const STRUCTURAL_SPARE_CAPACITY: usize = 4;
+
 /// Stable identity for a block in a document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(u64);
@@ -376,6 +381,14 @@ impl StructuralPlan {
             .iter()
             .map(|block| block.id)
             .collect();
+        // A RestoreBlocks inverse is also used for inline edits and for
+        // IME replacement. When it puts the exact same identities back in
+        // the exact same order, the document order did not change. Keep the
+        // operation on the local changed-node path so layout does not treat a
+        // content-only restore as an order splice.
+        if self.removed == inserted {
+            return None;
+        }
         Some(StructuralSplice {
             start_index: self.start_index,
             removed: self.removed,
@@ -413,6 +426,11 @@ impl Document {
             ));
             next_id = next_id.saturating_add(1);
         }
+        // Paragraph construction may have grown the temporary Vec
+        // geometrically; compact it before adding the explicit structural
+        // cushion so the model's retained capacity remains measurable.
+        blocks.shrink_to_fit();
+        blocks.reserve_exact(STRUCTURAL_SPARE_CAPACITY);
         let document = Self {
             blocks,
             next_id,
@@ -423,6 +441,13 @@ impl Document {
     }
 
     pub fn from_blocks(blocks: Vec<Block>) -> Result<Self, DocumentError> {
+        // Keep a small, measured local insertion cushion so the first
+        // structural edit does not make Vec::splice reallocate and copy the
+        // complete document buffer. `reserve_exact` is intentional: the
+        // persistent capacity overhead is at most four Block slots, rather
+        // than the geometric growth permitted by `reserve`.
+        let mut blocks = blocks;
+        blocks.reserve_exact(STRUCTURAL_SPARE_CAPACITY);
         let next_id = blocks
             .iter()
             .map(|block| block.id.raw())
@@ -452,6 +477,11 @@ impl Document {
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_capacity(&self) -> usize {
+        self.blocks.capacity()
     }
 
     pub fn revision(&self) -> u64 {
@@ -571,7 +601,13 @@ impl Document {
             inverse.extend(batch.0);
         }
 
-        if let Err(error) = self.validate_invariants() {
+        // Every primitive validates the blocks it changes before publishing
+        // its outcome, and structural RestoreBlocks validates the replacement
+        // range plus any outside-range identity collision. Re-running a
+        // document-wide HashSet/grapheme audit here would turn an otherwise
+        // local batch into an allocation proportional to every block. The
+        // rollback journal still covers the local validation failure path.
+        if let Err(error) = self.validate_changed_nodes(&changed_nodes) {
             self.rollback_journal(rollback_batches, initial_revision, initial_next_id);
             return Err(error);
         }
@@ -870,14 +906,41 @@ impl Document {
     }
 
     fn numbering_range_for(&self, transaction: &Transaction) -> Option<Range<usize>> {
-        let selection = match transaction {
+        match transaction {
             Transaction::SetBlockKind { selection, .. }
             | Transaction::IndentList { selection }
-            | Transaction::OutdentList { selection } => *selection,
-            _ => return None,
-        };
-        let bounds = self.selection_bounds(selection).ok()?;
-        Some(bounds.0..bounds.2.saturating_add(1))
+            | Transaction::OutdentList { selection } => {
+                let bounds = self.selection_bounds(*selection).ok()?;
+                Some(bounds.0..bounds.2.saturating_add(1))
+            }
+            Transaction::RestoreBlocks {
+                index,
+                remove_count,
+                blocks,
+            } => {
+                let old_blocks = self
+                    .blocks
+                    .get(*index..index.saturating_add(*remove_count))?;
+                // Same-ID restores are not order edits, but a kind/depth
+                // change still invalidates the local numbering sequence.
+                // Compare only the supplied range; this keeps inline undo and
+                // IME provisional restore O(changed_nodes).
+                if old_blocks.len() != blocks.len()
+                    || !old_blocks
+                        .iter()
+                        .zip(blocks)
+                        .all(|(old, replacement)| old.id == replacement.id)
+                {
+                    return None;
+                }
+                old_blocks
+                    .iter()
+                    .zip(blocks)
+                    .any(|(old, replacement)| old.kind != replacement.kind)
+                    .then_some(*index..index.saturating_add(blocks.len()))
+            }
+            _ => None,
+        }
     }
 
     fn apply_transaction(
@@ -995,10 +1058,10 @@ impl Document {
         }
         // The IME replacement path calls this primitive repeatedly while
         // restoring and reapplying one provisional block. Validate only the
-        // blocks it touched here; ordinary multi-operation edits retain the
-        // full document audit at the batch boundary above. Structural
-        // operations (including RestoreBlocks) perform their own complete
-        // node-id collision checks before reaching this point.
+        // blocks it touched here. Structural operations (including
+        // RestoreBlocks) perform their range and node-id collision checks
+        // before reaching this point; the batch boundary repeats only the
+        // changed-node invariant checks needed for a multi-operation batch.
         if let Err(error) = self.validate_changed_nodes(&changed_nodes) {
             self.rollback_journal(vec![inverse], original_revision, original_next_id);
             return Err(error);
