@@ -21,6 +21,7 @@ use smallvec::SmallVec;
 
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
 const MACOS_PROXY_MAX_EDGE: u32 = 1600;
+const CONSERVATIVE_PROXY_RESERVATION: usize = 4 * 1024 * 1024;
 
 #[cfg(target_os = "macos")]
 mod mac_pressure {
@@ -701,6 +702,7 @@ impl TextureCache {
 struct CachedTexture {
     item: ImageCacheItem,
     decoded_bytes: usize,
+    generation: u64,
 }
 
 /// GPUI 0.2.2 image-cache adapter.  It preserves the donor's shared loading
@@ -714,6 +716,13 @@ pub struct BudgetedImageCache {
     visible: HashSet<u64>,
     deferred: HashSet<u64>,
     in_flight: usize,
+    reserved_bytes: usize,
+    reservations: HashMap<u64, (u64, usize)>,
+    pending_retries: HashMap<u64, (u64, Resource)>,
+    harvested_generations: HashSet<(u64, u64)>,
+    next_generation: u64,
+    #[cfg(test)]
+    drop_image_calls: usize,
     weak_entity: Option<WeakEntity<Self>>,
 }
 
@@ -727,6 +736,13 @@ impl BudgetedImageCache {
             visible: HashSet::new(),
             deferred: HashSet::new(),
             in_flight: 0,
+            reserved_bytes: 0,
+            reservations: HashMap::new(),
+            pending_retries: HashMap::new(),
+            harvested_generations: HashSet::new(),
+            next_generation: 0,
+            #[cfg(test)]
+            drop_image_calls: 0,
             weak_entity: None,
         }
     }
@@ -741,6 +757,7 @@ impl BudgetedImageCache {
         cx.observe_release(&entity, |cache, cx| {
             for (_, mut entry) in std::mem::take(&mut cache.entries) {
                 if let Some(Ok(image)) = entry.item.get() {
+                    cache.record_drop_image();
                     cx.drop_image(image, None);
                 }
             }
@@ -748,6 +765,14 @@ impl BudgetedImageCache {
             cache.visible.clear();
             cache.deferred.clear();
             cache.in_flight = 0;
+            cache.reserved_bytes = 0;
+            cache.reservations.clear();
+            cache.pending_retries.clear();
+            cache.harvested_generations.clear();
+            #[cfg(test)]
+            {
+                cache.drop_image_calls = 0;
+            }
             cache.used_bytes = 0;
         })
         .detach();
@@ -762,6 +787,28 @@ impl BudgetedImageCache {
     }
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn reserved_bytes_for_test(&self) -> usize {
+        self.reserved_bytes
+    }
+
+    #[cfg(test)]
+    fn accounted_bytes_for_test(&self) -> usize {
+        self.used_bytes.saturating_add(self.reserved_bytes)
+    }
+
+    #[cfg(test)]
+    fn drop_image_calls_for_test(&self) -> usize {
+        self.drop_image_calls
+    }
+
+    fn record_drop_image(&mut self) {
+        #[cfg(test)]
+        {
+            self.drop_image_calls = self.drop_image_calls.saturating_add(1);
+        }
     }
 
     pub fn begin_frame(&mut self) {
@@ -798,10 +845,19 @@ impl BudgetedImageCache {
     pub fn invalidate(&mut self, resource: &Resource, window: &mut Window, cx: &mut App) {
         let key = hash(resource);
         self.deferred.remove(&key);
-        if let Some(mut entry) = self.entries.remove(&key) {
+        if let Some(entry) = self.entries.remove(&key) {
+            if matches!(&entry.item, ImageCacheItem::Loading(_)) {
+                // Paint may have already attempted the retry while the shared
+                // task still owns the reservation. Keep the target resource
+                // until completion releases that slot, then restart it from
+                // the same GPUI cache lifecycle.
+                self.pending_retries
+                    .insert(key, (entry.generation, resource.clone()));
+            }
             self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
-            if let Some(Ok(image)) = entry.item.get() {
-                cx.drop_image(image, Some(window));
+            if let ImageCacheItem::Loaded(Ok(image)) = &entry.item {
+                self.record_drop_image();
+                cx.drop_image(image.clone(), Some(window));
             }
         }
         self.lru.retain(|candidate| *candidate != key);
@@ -1100,7 +1156,12 @@ impl BudgetedImageCache {
     }
 
     fn evict_until_fit(&mut self, needed: usize, cx: &mut App, window: &mut Window) -> bool {
-        while self.used_bytes.saturating_add(needed) > self.budget_bytes {
+        while self
+            .used_bytes
+            .saturating_add(self.reserved_bytes)
+            .saturating_add(needed)
+            > self.budget_bytes
+        {
             let Some(index) = self.lru.iter().position(|key| {
                 !self.visible.contains(key)
                     && self
@@ -1116,12 +1177,71 @@ impl BudgetedImageCache {
             if let Some(mut entry) = self.entries.remove(&oldest) {
                 self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
                 if let Some(Ok(image)) = entry.item.get() {
+                    self.record_drop_image();
                     cx.drop_image(image, Some(window));
                 }
             }
         }
         true
     }
+
+    fn release_reservation(&mut self, key: u64, generation: u64) -> usize {
+        let Some((reservation_generation, reservation)) = self.reservations.get(&key).copied()
+        else {
+            return 0;
+        };
+        if reservation_generation != generation {
+            return 0;
+        }
+        self.reservations.remove(&key);
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(reservation);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        reservation
+    }
+
+    fn completion_is_current(&self, key: u64, generation: u64) -> bool {
+        self.reservations
+            .get(&key)
+            .is_some_and(|(active_generation, _)| *active_generation == generation)
+            || self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.generation == generation)
+    }
+
+    fn finalize_completion(&mut self, key: u64, generation: u64) -> CompletionState {
+        if !self.completion_is_current(key, generation) {
+            return CompletionState::Stale {
+                harvested: self.harvested_generations.remove(&(key, generation)),
+            };
+        }
+        self.release_reservation(key, generation);
+        let Some(entry) = self.entries.remove(&key) else {
+            let pending_retry = self
+                .pending_retries
+                .get(&key)
+                .filter(|(pending_generation, _)| *pending_generation == generation)
+                .map(|(_, resource)| resource.clone());
+            if pending_retry.is_some() {
+                self.pending_retries.remove(&key);
+            }
+            return CompletionState::Missing { pending_retry };
+        };
+        self.lru.retain(|value| *value != key);
+        if matches!(&entry.item, ImageCacheItem::Loading(_)) {
+            CompletionState::Loading(entry)
+        } else {
+            self.harvested_generations.remove(&(key, generation));
+            CompletionState::Harvested(entry)
+        }
+    }
+}
+
+enum CompletionState {
+    Stale { harvested: bool },
+    Missing { pending_retry: Option<Resource> },
+    Harvested(CachedTexture),
+    Loading(CachedTexture),
 }
 
 impl ImageCache for BudgetedImageCache {
@@ -1134,7 +1254,12 @@ impl ImageCache for BudgetedImageCache {
         let key = hash(resource);
         if let Some(mut entry) = self.entries.remove(&key) {
             self.lru.retain(|value| *value != key);
+            let was_loading = matches!(&entry.item, ImageCacheItem::Loading(_));
             let result = entry.item.get();
+            if was_loading && result.is_some() {
+                self.release_reservation(key, entry.generation);
+                self.harvested_generations.insert((key, entry.generation));
+            }
             if let Some(Ok(ref image)) = result {
                 let bytes = match Self::image_bytes(image) {
                     Ok(bytes) => bytes,
@@ -1151,6 +1276,7 @@ impl ImageCache for BudgetedImageCache {
                     let error = ImageCacheError::from(anyhow!(
                         "cached image exceeds the hard decoded-image budget"
                     ));
+                    self.record_drop_image();
                     cx.drop_image(image.clone(), Some(window));
                     self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
                     entry.decoded_bytes = 0;
@@ -1161,6 +1287,7 @@ impl ImageCache for BudgetedImageCache {
                 }
                 self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
                 if !self.evict_until_fit(bytes, cx, window) {
+                    self.record_drop_image();
                     cx.drop_image(image.clone(), Some(window));
                     // Capacity pressure is a deferred admission, not a
                     // decode failure. Drop the proxy and retry only after a
@@ -1186,7 +1313,30 @@ impl ImageCache for BudgetedImageCache {
         if self.in_flight >= 1 {
             return None;
         }
-        let budget = self.budget_bytes;
+        // Keep a meaningful proxy allowance for production-sized caches, but
+        // let tiny lifecycle fixtures reserve their remaining half-budget.
+        // The eviction pass still uses this as a floor before admission.
+        let reservation_floor = if self.budget_bytes > CONSERVATIVE_PROXY_RESERVATION {
+            CONSERVATIVE_PROXY_RESERVATION
+        } else {
+            (self.budget_bytes / 2).max(1)
+        };
+        if !self.evict_until_fit(reservation_floor, cx, window) {
+            self.deferred.insert(key);
+            return None;
+        }
+        let reservation = self
+            .budget_bytes
+            .saturating_sub(self.used_bytes.saturating_add(self.reserved_bytes));
+        if reservation == 0 {
+            self.deferred.insert(key);
+            return None;
+        }
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        self.reserved_bytes = self.reserved_bytes.saturating_add(reservation);
+        self.reservations.insert(key, (generation, reservation));
+        let budget = reservation;
         let source = resource.clone();
         let load_future = async move { Self::decode_resource_bounded(&source, budget) };
         let task = cx.background_executor().spawn(load_future).shared();
@@ -1195,6 +1345,7 @@ impl ImageCache for BudgetedImageCache {
             CachedTexture {
                 item: ImageCacheItem::Loading(task.clone()),
                 decoded_bytes: 0,
+                generation,
             },
         );
         self.in_flight = self.in_flight.saturating_add(1);
@@ -1205,27 +1356,46 @@ impl ImageCache for BudgetedImageCache {
                 let result = task.await;
                 if let Some(cache) = weak_cache {
                     let _ = cache.update_in(cx, |cache, window, entity_cx| {
-                        cache.in_flight = cache.in_flight.saturating_sub(1);
-                        let Some(mut entry) = cache.entries.remove(&key) else {
-                            return;
+                        let mut entry = match cache.finalize_completion(key, generation) {
+                            CompletionState::Stale { harvested } => {
+                                if !harvested && let Ok(image) = result.clone() {
+                                    cache.record_drop_image();
+                                    entity_cx.drop_image(image, Some(window));
+                                }
+                                return;
+                            }
+                            CompletionState::Missing { pending_retry } => {
+                                if let Ok(image) = result.clone() {
+                                    cache.record_drop_image();
+                                    entity_cx.drop_image(image, Some(window));
+                                }
+                                if let Some(retry_resource) = pending_retry
+                                    && cache.visible.contains(&key)
+                                {
+                                    // The retry was requested while the old
+                                    // shared task still occupied the only
+                                    // scheduler slot. Restart it now, from the
+                                    // same ImageCache lifecycle, and notify the
+                                    // editor even if the entry was invalidated.
+                                    let _ = cache.load(&retry_resource, window, entity_cx);
+                                }
+                                entity_cx.notify();
+                                return;
+                            }
+                            CompletionState::Harvested(entry) => {
+                                cache.entries.insert(key, entry);
+                                cache.lru.push_back(key);
+                                return;
+                            }
+                            CompletionState::Loading(entry) => entry,
                         };
-                        cache.lru.retain(|value| *value != key);
-
-                        // A paint may have harvested this shared task before the
-                        // completion callback ran. In that case the item has
-                        // already been admitted (or deferred) and there is no
-                        // second ownership transition to perform here.
-                        if !matches!(&entry.item, ImageCacheItem::Loading(_)) {
-                            cache.entries.insert(key, entry);
-                            cache.lru.push_back(key);
-                            return;
-                        }
 
                         match result {
                             Ok(image) => {
                                 let decoded_bytes = match Self::image_bytes(&image) {
                                     Ok(bytes) => bytes,
                                     Err(_) => {
+                                        cache.record_drop_image();
                                         entity_cx.drop_image(image, Some(window));
                                         entity_cx.notify();
                                         return;
@@ -1235,6 +1405,7 @@ impl ImageCache for BudgetedImageCache {
                                     || decoded_bytes > cache.budget_bytes
                                     || !cache.evict_until_fit(decoded_bytes, entity_cx, window)
                                 {
+                                    cache.record_drop_image();
                                     entity_cx.drop_image(image, Some(window));
                                     if cache.visible.contains(&key) {
                                         cache.deferred.insert(key);
@@ -1607,6 +1778,8 @@ mod tests {
             cache.update(app, |cache, entity_cx| {
                 cache.set_visible_resources([&resource_a]);
                 assert!(cache.load(&resource_a, window, entity_cx).is_none());
+                assert!(cache.reserved_bytes_for_test() > 0);
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
                 // The image leaves the viewport before its background task
                 // completes. Completion must still reclaim the in-flight slot.
                 cache.set_visible_resources(std::iter::empty());
@@ -1618,6 +1791,14 @@ mod tests {
             0,
             "offscreen completion must release its admission slot"
         );
+        assert_eq!(
+            window.read(|app| cache.read(app).reserved_bytes_for_test()),
+            0
+        );
+        assert!(
+            window.read(|app| cache.read(app).drop_image_calls_for_test()) > 0,
+            "offscreen completion must release the RenderImage through drop_image"
+        );
 
         window.update(|window, app| {
             cache.update(app, |cache, entity_cx| {
@@ -1627,6 +1808,52 @@ mod tests {
             });
         });
         window.run_until_parked();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn production_cache_reserves_remaining_budget_with_retained_image(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "joplin-lite-cache-reservation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("reservation fixture directory");
+        let source_a = root.join("a.png");
+        let source_b = root.join("b.png");
+        std::fs::write(&source_a, fixture_png_bytes()).expect("fixture a");
+        std::fs::write(&source_b, fixture_png_bytes()).expect("fixture b");
+        let resource_a = Resource::from(source_a.clone());
+        let resource_b = Resource::from(source_b.clone());
+        let cache = cx.update(|app| BudgetedImageCache::new_entity(app, 8));
+        let mut window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&resource_a]);
+                assert!(cache.load(&resource_a, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                assert!(cache.load(&resource_a, window, entity_cx).is_some());
+                assert_eq!(cache.used_bytes(), 4);
+                cache.set_visible_resources([&resource_a, &resource_b]);
+                assert!(cache.load(&resource_b, window, entity_cx).is_none());
+                assert_eq!(cache.reserved_bytes_for_test(), 4);
+                assert_eq!(cache.accounted_bytes_for_test(), 8);
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                assert!(cache.load(&resource_b, window, entity_cx).is_some());
+                assert_eq!(cache.used_bytes(), 8);
+                assert_eq!(cache.reserved_bytes_for_test(), 0);
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
+            });
+        });
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1652,6 +1879,7 @@ mod tests {
             cache.update(app, |cache, entity_cx| {
                 cache.set_visible_resources([&resource_a]);
                 assert!(cache.load(&resource_a, window, entity_cx).is_none());
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
             });
         });
         window.run_until_parked();
@@ -1673,10 +1901,114 @@ mod tests {
                 // exactly one bounded retry instead of a permanent error.
                 assert!(cache.load(&resource_b, window, entity_cx).is_none());
                 assert_eq!(cache.in_flight_for_test(), 1);
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
             });
         });
         window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let loaded = cache.load(&resource_b, window, entity_cx);
+                assert!(loaded.is_some(), "deferred resource should be admitted");
+                assert_eq!(cache.used_bytes(), 4);
+                assert_eq!(cache.reserved_bytes_for_test(), 0);
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
+            });
+        });
+        assert!(
+            window.read(|app| cache.read(app).drop_image_calls_for_test()) > 0,
+            "visible-set change must evict the offscreen RenderImage through drop_image"
+        );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_completion_cannot_mutate_new_retry_generation() {
+        let resource = Resource::from(PathBuf::from("/tmp/task6-generation.png"));
+        let key = hash(&resource);
+        let mut cache = BudgetedImageCache::new(16);
+        let error = ImageCacheError::from(anyhow!("old decode failed"));
+
+        // Paint harvested generation one and released its reservation. The
+        // user then invalidated that result and immediately started generation
+        // two for the same resource key.
+        cache.next_generation = 1;
+        cache.entries.insert(
+            key,
+            CachedTexture {
+                item: ImageCacheItem::Loaded(Err(error.clone())),
+                decoded_bytes: 0,
+                generation: 1,
+            },
+        );
+        cache.entries.remove(&key);
+        cache.next_generation = 2;
+        cache.reservations.insert(key, (2, 16));
+        cache.reserved_bytes = 16;
+        cache.in_flight = 1;
+        cache.entries.insert(
+            key,
+            CachedTexture {
+                item: ImageCacheItem::Loaded(Err(error)),
+                decoded_bytes: 0,
+                generation: 2,
+            },
+        );
+
+        // The late generation-one callback must fail the production finalize
+        // path and leave generation two's entry and reservation untouched.
+        assert!(matches!(
+            cache.finalize_completion(key, 1),
+            CompletionState::Stale { harvested: false }
+        ));
+        assert_eq!(cache.entries.get(&key).unwrap().generation, 2);
+        assert_eq!(cache.reserved_bytes, 16);
+        assert_eq!(cache.in_flight, 1);
+        assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
+
+        assert!(matches!(
+            cache.finalize_completion(key, 2),
+            CompletionState::Harvested(_)
+        ));
+        assert!(!cache.entries.contains_key(&key));
+        assert_eq!(cache.reserved_bytes, 0);
+        assert_eq!(cache.in_flight, 0);
+    }
+
+    #[gpui::test]
+    fn pending_retry_restarts_when_invalidated_task_releases_last_slot(cx: &mut TestAppContext) {
+        let resource = Resource::from(std::env::temp_dir().join(format!(
+            "joplin-lite-missing-retry-{}.png",
+            uuid::Uuid::new_v4()
+        )));
+        let cache = cx.update(|app| BudgetedImageCache::new_entity(app, 4 * 1024 * 1024));
+        let mut window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&resource]);
+                assert!(cache.load(&resource, window, entity_cx).is_none());
+                assert_eq!(cache.in_flight_for_test(), 1);
+                cache.invalidate(&resource, window, entity_cx);
+                // The immediate retry is intentionally still blocked by the
+                // old shared task. Its completion owns the pending restart.
+                assert!(cache.load(&resource, window, entity_cx).is_none());
+                assert_eq!(cache.in_flight_for_test(), 1);
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let result = cache.load(&resource, window, entity_cx);
+                assert!(
+                    matches!(result, Some(Err(_))),
+                    "pending retry must reach Failed"
+                );
+                assert_eq!(cache.in_flight_for_test(), 0);
+                assert_eq!(cache.reserved_bytes_for_test(), 0);
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
+            });
+        });
     }
 
     #[test]
