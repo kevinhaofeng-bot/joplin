@@ -7,12 +7,13 @@
 //! focus, transactions, and platform input remain owned by `EditorCore`.
 
 use std::ops::Range;
+use std::path::PathBuf;
 
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun,
+    EntityInputHandler, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    Render, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun,
     UTF16Selection, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div, point, px,
     rgba, size,
 };
@@ -28,6 +29,11 @@ use crate::native_editor::commands::{
     CommandArgument, CommandCatalogue, CommandDescriptor, EditorCommand,
 };
 use crate::native_editor::core::EditorCore;
+use crate::native_editor::images::{
+    BudgetedImageCache, ClipboardPayload, DECODED_IMAGE_CACHE_BUDGET, PasteIntent,
+    classify_clipboard, classify_drop, image_payload_from_file, read_native_pasteboard,
+    resolve_clipboard_payload,
+};
 use crate::native_editor::model::{
     Affinity, BlockKind, DocPoint, Document, DocumentError, Mark, Selection,
 };
@@ -96,8 +102,10 @@ pub(crate) fn open(cx: &mut App) -> WindowHandle<SpikeView> {
             },
             move |_window, cx| {
                 let editor = cx.new(|cx| EditorCore::new(sample_document(), cx));
+                let image_cache = BudgetedImageCache::new_entity(cx, DECODED_IMAGE_CACHE_BUDGET);
                 cx.new(|_| SpikeView {
                     editor,
+                    image_cache: Some(image_cache),
                     catalogue: CommandCatalogue::default(),
                     scroll_handle: ScrollHandle::new(),
                     more_open: false,
@@ -391,6 +399,7 @@ impl EntityInputHandler for LinkPopover {
 
 pub(crate) struct SpikeView {
     editor: Entity<EditorCore>,
+    image_cache: Option<Entity<BudgetedImageCache>>,
     catalogue: CommandCatalogue,
     scroll_handle: ScrollHandle,
     more_open: bool,
@@ -400,6 +409,19 @@ pub(crate) struct SpikeView {
 }
 
 impl SpikeView {
+    fn on_external_paths_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = paths.paths().to_vec();
+        run_editor_result(&self.editor, window, cx, |editor| {
+            apply_drop_paths(editor, &paths)
+        });
+        focus_editor(&self.editor, window, cx);
+    }
+
     fn open_link_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.link_popover.is_some() {
             return;
@@ -979,6 +1001,7 @@ impl SpikeView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let editor = self.editor.clone();
+        let image_cache = self.image_cache.clone();
         let width = layout.content_width;
         let canvas_editor = editor.clone();
         let surface = div()
@@ -990,6 +1013,8 @@ impl SpikeView {
             .h(px(content_height))
             .rounded(px(7.0))
             .bg(rgba(0xffffffff))
+            .can_drop(|dragged, _window, _cx| dragged.is::<ExternalPaths>())
+            .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
             .capture_any_mouse_down(cx.listener(Self::on_surface_mouse_down))
             .on_key_down(cx.listener(Self::on_surface_key_down))
             .on_mouse_move(cx.listener(Self::on_surface_mouse_move))
@@ -1017,7 +1042,13 @@ impl SpikeView {
                 canvas_editor.clone()
             },
             move |bounds, entity, window, cx| {
-                let _ = crate::native_editor::render::paint_entity(entity, bounds, window, cx);
+                let _ = crate::native_editor::render::paint_entity(
+                    entity,
+                    bounds,
+                    image_cache.clone(),
+                    window,
+                    cx,
+                );
             },
         )
         .w(px(width))
@@ -1154,6 +1185,30 @@ fn sample_document() -> Document {
 fn focus_editor(editor: &Entity<EditorCore>, window: &mut Window, cx: &mut App) {
     let focus_handle = editor.read(cx).focus_handle().clone();
     focus_handle.focus(window);
+}
+
+/// Shared production action seam for paste and Finder drops. The UI handlers
+/// only provide platform payloads; image-first classification and structural
+/// insertion happen here so both paths commit the same real image node.
+fn apply_paste_intent(editor: &mut EditorCore, intent: PasteIntent) -> Result<(), DocumentError> {
+    match intent {
+        PasteIntent::Image { payload } => editor.insert_image_payload(payload),
+        PasteIntent::File { path } => image_payload_from_file(&path)
+            .map_or(Ok(()), |payload| editor.insert_image_payload(payload)),
+        PasteIntent::Text { text } => editor.paste_plain_text(&text),
+        PasteIntent::Unsupported => Ok(()),
+    }
+}
+
+fn apply_clipboard_payload(
+    editor: &mut EditorCore,
+    payload: ClipboardPayload,
+) -> Result<(), DocumentError> {
+    apply_paste_intent(editor, classify_clipboard(&payload))
+}
+
+fn apply_drop_paths(editor: &mut EditorCore, paths: &[PathBuf]) -> Result<(), DocumentError> {
+    apply_paste_intent(editor, classify_drop(paths))
 }
 
 fn run_command(
@@ -1293,13 +1348,19 @@ fn bind_donor_actions(
     });
     let paste_editor = editor.clone();
     surface = surface.on_action(move |_action: &Paste, window, cx| {
-        // Clipboard images are deliberately ignored until Task 6; text is
-        // routed through the same transaction/history path as platform input.
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        // GPUI 0.2.2 reads plain text before image UTTypes on macOS. The
+        // narrow native bridge is therefore consulted first; non-macOS and
+        // test platforms retain GPUI ClipboardItem extraction.
+        let payload = resolve_clipboard_payload(
+            read_native_pasteboard(),
+            cx.read_from_clipboard().map(ClipboardPayload::from_gpui),
+        );
+        if let Some(payload) = payload {
             run_editor_result(&paste_editor, window, cx, |editor| {
-                editor.paste_plain_text(&text)
+                apply_clipboard_payload(editor, payload)
             });
         }
+        focus_editor(&paste_editor, window, cx);
     });
 
     bind_command_action!(
@@ -1371,6 +1432,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
             more_open: false,
@@ -1380,12 +1442,53 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn production_paste_and_finder_drop_actions_insert_real_images(cx: &mut TestAppContext) {
+        let mut editor = EditorCore::for_test("前后", cx);
+        editor.set_caret_utf8("前".len());
+        let payload = ClipboardPayload::fixture_with_png_and_text("图像占位符");
+        apply_clipboard_payload(&mut editor, payload).expect("paste action should insert image");
+        assert!(editor.copy_all_plain_text().contains('\u{fffc}'));
+        assert!(!editor.copy_all_plain_text().contains("图像占位符"));
+        assert!(editor.document().blocks().iter().any(|block| matches!(
+            block.content,
+            crate::native_editor::model::BlockContent::Image { .. }
+        )));
+
+        let path =
+            std::env::temp_dir().join(format!("joplin-lite-task6-drop-{}.png", std::process::id()));
+        let bytes = ClipboardPayload::fixture_with_png_and_text("drop")
+            .images
+            .into_iter()
+            .next()
+            .expect("fixture image")
+            .bytes;
+        std::fs::write(&path, bytes).expect("temporary PNG should be writable");
+        editor.set_caret_utf8(0);
+        apply_drop_paths(&mut editor, std::slice::from_ref(&path))
+            .expect("drop action should insert image");
+        let image_count = editor
+            .document()
+            .blocks()
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.content,
+                    crate::native_editor::model::BlockContent::Image { .. }
+                )
+            })
+            .count();
+        assert_eq!(image_count, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
     fn build_long_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
         let editor =
             cx.new(|cx| EditorCore::new(Document::from_paragraph("wrap ".repeat(360)), cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
             more_open: false,
@@ -1408,6 +1511,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
             more_open: false,
@@ -1439,6 +1543,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
             more_open: false,
@@ -1473,6 +1578,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
             more_open: false,
@@ -1492,6 +1598,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
             more_open: false,
@@ -1526,6 +1633,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
             more_open: false,

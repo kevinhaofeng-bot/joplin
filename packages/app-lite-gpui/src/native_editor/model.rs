@@ -2849,6 +2849,49 @@ impl Document {
         );
         self.ensure_editable_range(start_index, end_index)?;
 
+        // The first image leaves the caret at offset zero of the following
+        // paragraph. Inserting another image there is a structural seam: do
+        // not manufacture an empty left paragraph between the two image
+        // atoms. Keep the existing paragraph as the post-image caret
+        // boundary and insert directly before it.
+        if start_index == end_index
+            && start_offset == 0
+            && end_offset == 0
+            && selection.is_caret()
+            && start_index > 0
+            && self.blocks[start_index - 1].kind == BlockKind::Image
+            && is_text_block(&self.blocks[start_index])
+        {
+            let image = Block {
+                id: self.new_node_id()?,
+                kind: BlockKind::Image,
+                content: BlockContent::Image {
+                    resource_id,
+                    natural_size,
+                    display_width: None,
+                },
+                alignment: TextAlignment::Left,
+                revision: 0,
+            };
+            let image_id = image.id;
+            self.blocks.insert(start_index, image);
+            let mut changed_nodes = SmallVec::new();
+            push_unique(&mut changed_nodes, image_id);
+            return Ok((
+                Selection::caret(DocPoint::with_affinity(
+                    self.blocks[start_index + 1].id,
+                    0,
+                    Affinity::Before,
+                )),
+                changed_nodes,
+                TransactionBatch(vec![Transaction::RestoreBlocks {
+                    index: start_index,
+                    remove_count: 1,
+                    blocks: Vec::new(),
+                }]),
+            ));
+        }
+
         if start_index == end_index && !is_text_block(&self.blocks[start_index]) {
             let original = self.blocks[start_index].clone();
             if selection.is_caret() {

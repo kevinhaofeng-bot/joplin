@@ -2,6 +2,7 @@ pub mod acceptance;
 pub mod commands;
 pub mod core;
 pub mod history;
+pub mod images;
 pub mod input;
 pub mod layout;
 pub mod model;

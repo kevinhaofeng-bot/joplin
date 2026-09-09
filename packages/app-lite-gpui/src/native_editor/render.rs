@@ -5,13 +5,14 @@
 //! selection geometry, glyphs/images, then the caret.
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, Pixels, SharedString, TextRun,
-    Window, WrappedLine, fill, outline, point, px, rgba,
+    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, ImageCache, Pixels, Resource,
+    SharedString, TextRun, Window, WrappedLine, fill, outline, point, px, rgba,
 };
 #[cfg(test)]
 use std::cell::RefCell;
 
 use super::core::EditorCore;
+use super::images::BudgetedImageCache;
 use super::layout::{BlockLayout, ordered_number_summary};
 use super::model::{BlockKind, Document, NodeId, Selection};
 
@@ -23,6 +24,8 @@ struct RenderBlock {
     shaped_background_run_count: usize,
     line_height: Option<Pixels>,
     marker: Option<String>,
+    image_resource: Option<Resource>,
+    image_resource_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -114,6 +117,16 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
             let kind = model_block
                 .map(|block| block.kind.clone())
                 .unwrap_or(BlockKind::Paragraph);
+            let image_resource = model_block.and_then(|block| match &block.content {
+                super::model::BlockContent::Image { resource_id, .. } => editor
+                    .image_source_path(resource_id)
+                    .map(|path| Resource::from(path.to_path_buf())),
+                _ => None,
+            });
+            let image_resource_id = model_block.and_then(|block| match &block.content {
+                super::model::BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            });
             let shaped_background_run_count = layout
                 .cache
                 .get(&block.node_id)
@@ -132,6 +145,8 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 shaped_background_run_count,
                 line_height: layout.line_height(block.node_id),
                 marker: list_marker(&kind, layout.ordered_number(block.node_id)),
+                image_resource,
+                image_resource_id,
             }
         })
         .collect();
@@ -149,11 +164,13 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
 
 pub fn paint(editor: &EditorCore, window: &mut Window, cx: &mut App) -> gpui::Result<()> {
     let snapshot = snapshot(editor);
-    paint_snapshot(&snapshot, window, cx)
+    paint_snapshot(&snapshot, None, None, window, cx)
 }
 
 fn paint_snapshot(
     snapshot: &RenderSnapshot,
+    image_cache: Option<Entity<BudgetedImageCache>>,
+    editor: Option<Entity<EditorCore>>,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Result<()> {
@@ -189,9 +206,38 @@ fn paint_snapshot(
     // 3. Glyphs/images.
     for block in &snapshot.blocks {
         if block.is_image {
-            let mut quad = fill(block.layout.bounds, rgba(0x9aa4b233));
-            quad.corner_radii = Corners::all(px(6.0));
-            window.paint_quad(quad);
+            let image = block.image_resource.as_ref().and_then(|resource| {
+                image_cache.as_ref().and_then(|cache| {
+                    cache.update(cx, |cache, cx| cache.load(resource, window, cx))
+                })
+            });
+            if let Some(Ok(image)) = image {
+                if let (Some(editor), Some(resource_id)) =
+                    (editor.as_ref(), block.image_resource_id.as_deref())
+                {
+                    let _ = editor.update(cx, |editor, editor_cx| {
+                        if editor.mark_image_loaded(resource_id) {
+                            editor_cx.notify();
+                        }
+                    });
+                }
+                window.paint_image(block.layout.bounds, Corners::all(px(6.0)), image, 0, false)?;
+            } else {
+                if let (Some(editor), Some(resource_id), Some(Err(_))) = (
+                    editor.as_ref(),
+                    block.image_resource_id.as_deref(),
+                    image.as_ref(),
+                ) {
+                    let _ = editor.update(cx, |editor, editor_cx| {
+                        if editor.mark_image_failed(resource_id) {
+                            editor_cx.notify();
+                        }
+                    });
+                }
+                let mut quad = fill(block.layout.bounds, rgba(0x9aa4b233));
+                quad.corner_radii = Corners::all(px(6.0));
+                window.paint_quad(quad);
+            }
             continue;
         }
         let line_height = block.line_height.unwrap_or_else(|| window.line_height());
@@ -297,6 +343,7 @@ fn ordered_list_numbers(document: &Document) -> std::collections::HashMap<NodeId
 pub fn paint_entity(
     entity: Entity<EditorCore>,
     bounds: Bounds<Pixels>,
+    image_cache: Option<Entity<BudgetedImageCache>>,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Result<()> {
@@ -309,7 +356,7 @@ pub fn paint_entity(
         );
     }
     let snapshot = entity.read_with(cx, |editor, _cx| snapshot(editor));
-    paint_snapshot(&snapshot, window, cx)
+    paint_snapshot(&snapshot, image_cache, Some(entity), window, cx)
 }
 
 /// A small pure description useful to tests and to a future measured-layout

@@ -3,6 +3,10 @@ use super::commands::{
 };
 use super::core::EditorCore;
 use super::history::History;
+use super::images::{
+    ClipboardPayload, ImageMetadata, ImageNodeState, ImagePayload, ImageStore, PasteIntent,
+    TextureCache, classify_clipboard, resolve_clipboard_payload,
+};
 use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry, ordered_number_summary};
 use super::render;
 use crate::spike_app::{SpikeRouteContract, layout_for_viewport, route_contract};
@@ -3111,6 +3115,113 @@ fn image_hit_testing_exposes_before_and_after_document_points() {
     assert_eq!(before.affinity, Affinity::Before);
     assert_eq!(after.node_id, image_id);
     assert_eq!(after.affinity, Affinity::After);
+}
+
+#[test]
+fn image_placeholder_and_texture_have_identical_layout_height() {
+    let metadata = ImageMetadata::new("fixture", 1600, 900);
+    let width = 680.0;
+    assert_eq!(metadata.display_height(width), 382.5);
+    assert_eq!(
+        metadata.placeholder_height(width),
+        metadata.display_height(width)
+    );
+}
+
+#[test]
+fn image_cache_evicts_before_exceeding_budget() {
+    let mut cache = TextureCache::new(48 * 1024 * 1024);
+    cache.insert_for_test("a", 32 * 1024 * 1024);
+    cache.insert_for_test("b", 32 * 1024 * 1024);
+    assert!(cache.used_bytes() <= cache.budget_bytes());
+    assert!(!cache.contains("a"));
+    assert!(cache.contains("b"));
+}
+
+#[test]
+fn clipboard_prefers_image_payload_over_placeholder_text() {
+    let payload = ClipboardPayload::fixture_with_png_and_text("图像占位符");
+    assert!(matches!(
+        classify_clipboard(&payload),
+        PasteIntent::Image { .. }
+    ));
+}
+
+#[test]
+fn clipboard_resolution_uses_injected_native_payload_first() {
+    let native = ClipboardPayload::fixture_with_png_and_text("native");
+    let gpui = ClipboardPayload {
+        text: Some("gpui".into()),
+        ..Default::default()
+    };
+    let resolved = resolve_clipboard_payload(Some(native.clone()), Some(gpui));
+    assert_eq!(resolved, Some(native));
+}
+
+#[test]
+fn image_decode_failure_preserves_structural_node() {
+    let mut store = ImageStore::for_test();
+    let image_id = store.insert_invalid_fixture("broken");
+    store.finish_failed_decode(image_id, "decode failed");
+    assert_eq!(store.node_state(image_id), ImageNodeState::Failed);
+    assert!(store.is_selectable(image_id));
+    assert!(store.can_retry(image_id));
+}
+
+#[gpui::test]
+fn production_image_insert_uses_uuid_resource_and_managed_path(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor
+        .insert_image_payload(ImagePayload::new(
+            gpui::ImageFormat::Png,
+            ClipboardPayload::fixture_with_png_and_text("ignored")
+                .images
+                .into_iter()
+                .next()
+                .expect("fixture image")
+                .bytes,
+        ))
+        .expect("valid PNG should commit immediately");
+    let resource_id = editor
+        .document()
+        .blocks()
+        .iter()
+        .find_map(|block| match &block.content {
+            BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+            _ => None,
+        })
+        .expect("structural image node");
+    assert!(uuid::Uuid::parse_str(&resource_id).is_ok());
+    let path = editor
+        .image_source_path(&resource_id)
+        .expect("managed path");
+    assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("png"));
+    assert!(editor.image_bytes(&resource_id).is_none());
+    assert_eq!(
+        editor.image_state(&resource_id),
+        Some(ImageNodeState::Loading)
+    );
+    assert!(editor.mark_image_loaded(&resource_id));
+    assert!(!editor.mark_image_loaded(&resource_id));
+    assert!(editor.mark_image_failed(&resource_id));
+    assert!(!editor.mark_image_failed(&resource_id));
+}
+
+#[gpui::test]
+fn consecutive_images_keep_independent_caret_boundaries(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    editor.insert_fixture_image("a", (1600, 900)).unwrap();
+    editor.insert_fixture_image("b", (800, 600)).unwrap();
+    editor.type_text("中").unwrap();
+    assert_eq!(editor.copy_all_plain_text(), "前\n\u{fffc}\n\u{fffc}\n中后");
+    editor.undo().unwrap();
+    assert_eq!(editor.copy_all_plain_text(), "前\n\u{fffc}\n\u{fffc}\n后");
+    editor.undo().unwrap();
+    assert_eq!(editor.copy_all_plain_text(), "前\n\u{fffc}\n后");
+    editor.redo().unwrap();
+    editor.redo().unwrap();
+    assert_eq!(editor.copy_all_plain_text(), "前\n\u{fffc}\n\u{fffc}\n中后");
 }
 
 #[gpui::test]

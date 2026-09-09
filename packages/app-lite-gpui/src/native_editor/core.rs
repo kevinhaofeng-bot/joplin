@@ -1,17 +1,22 @@
 //! The single owner of native-editor focus, selection, IME composition,
 //! transactions, history, and document-wide commands.
 
+use std::io::Cursor;
 use std::ops::Range;
 
 use gpui::{
     Bounds, Context, EntityInputHandler, FocusHandle, Pixels, Point, UTF16Selection, Window,
 };
+use image::ImageReader;
 use unicode_segmentation::UnicodeSegmentation;
+use usvg::{Options, Tree};
+use uuid::Uuid;
 
 #[cfg(test)]
 use gpui::TestAppContext;
 
 use super::history::History;
+use super::images::{ImageMetadata, ImagePayload, ImageStore};
 use super::input;
 use super::layout::LayoutRegistry;
 use super::model::{
@@ -19,6 +24,19 @@ use super::model::{
     TextAlignment, insertion_marks,
 };
 use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
+
+fn image_dimensions(payload: &ImagePayload) -> Option<(u32, u32)> {
+    if payload.format == gpui::ImageFormat::Svg {
+        let tree = Tree::from_data(&payload.bytes, &Options::default()).ok()?;
+        let size = tree.size();
+        return Some((size.width().ceil() as u32, size.height().ceil() as u32));
+    }
+    let reader = ImageReader::new(Cursor::new(&payload.bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+    Some((width, height))
+}
 
 #[derive(Clone)]
 pub struct MarkedText {
@@ -105,6 +123,7 @@ pub struct EditorCore {
     composition_base_range: Option<Range<usize>>,
     last_input_error: Option<DocumentError>,
     history: History,
+    image_store: ImageStore,
     pub(crate) layout: LayoutRegistry,
     layout_offset: (f32, f32),
 }
@@ -228,6 +247,7 @@ impl EditorCore {
             composition_base_range: None,
             last_input_error: None,
             history: History::new(1_000, 16 * 1024 * 1024),
+            image_store: ImageStore::default(),
             layout: LayoutRegistry::new(),
             layout_offset: (0.0, 0.0),
         }
@@ -243,6 +263,36 @@ impl EditorCore {
 
     pub fn selection(&self) -> Selection {
         self.selection
+    }
+
+    pub fn image_metadata(&self, resource_id: &str) -> Option<&ImageMetadata> {
+        self.image_store.metadata_for_resource(resource_id)
+    }
+
+    pub fn image_bytes(&self, resource_id: &str) -> Option<&[u8]> {
+        self.image_store.compressed_for_resource(resource_id)
+    }
+
+    pub fn image_state(&self, resource_id: &str) -> Option<super::images::ImageNodeState> {
+        self.image_store
+            .id_for_resource(resource_id)
+            .map(|id| self.image_store.node_state(id))
+    }
+
+    pub fn retry_image_resource(&mut self, resource_id: &str) -> bool {
+        self.image_store.retry_resource(resource_id)
+    }
+
+    pub fn image_source_path(&self, resource_id: &str) -> Option<&std::path::Path> {
+        self.image_store.source_path_for_resource(resource_id)
+    }
+
+    pub fn mark_image_loaded(&mut self, resource_id: &str) -> bool {
+        self.image_store.finish_loaded_resource(resource_id)
+    }
+
+    pub fn mark_image_failed(&mut self, resource_id: &str) -> bool {
+        self.image_store.finish_failed_resource(resource_id)
     }
 
     /// Return the document-order block interval covered by the active
@@ -490,6 +540,28 @@ impl EditorCore {
             .unwrap_or_default()
     }
 
+    pub fn copy_all_plain_text(&self) -> String {
+        self.document_text()
+    }
+
+    pub fn type_text(&mut self, text: &str) -> Result<(), DocumentError> {
+        self.insert_text(text)
+    }
+
+    #[cfg(test)]
+    pub fn insert_fixture_image(
+        &mut self,
+        resource_id: &str,
+        natural_size: (u32, u32),
+    ) -> Result<(), DocumentError> {
+        self.apply(Transaction::InsertImage {
+            selection: self.selection,
+            resource_id: resource_id.to_owned(),
+            natural_size,
+        })
+        .map(|_| ())
+    }
+
     pub fn cut_selection(&mut self) -> Result<String, DocumentError> {
         let copied = self.copy_plain_text();
         self.delete_selection()?;
@@ -511,6 +583,26 @@ impl EditorCore {
         })?;
         self.selection = outcome.selection;
         self.clear_composition();
+        Ok(())
+    }
+
+    /// Commit an image node before any decode work. The compressed payload is
+    /// handed to the shared ImageStore; the existing Transaction::InsertImage
+    /// path owns selection, history, and structural paragraph splitting.
+    pub fn insert_image_payload(&mut self, payload: ImagePayload) -> Result<(), DocumentError> {
+        let resource_id = Uuid::new_v4().to_string();
+        let (width, height) = image_dimensions(&payload).ok_or_else(|| {
+            DocumentError::InvalidOperation("unsupported or invalid image payload".into())
+        })?;
+        let metadata = ImageMetadata::new(resource_id.clone(), width, height);
+        self.image_store
+            .insert_with_format(metadata, payload.bytes, payload.format);
+        let outcome = self.apply_with_selection(Transaction::InsertImage {
+            selection: self.selection,
+            resource_id,
+            natural_size: (width, height),
+        })?;
+        self.selection = outcome.selection;
         Ok(())
     }
 
