@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, ElementInputHandler, Entity,
     EntityInputHandler, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
     Render, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun,
@@ -38,7 +38,7 @@ use crate::native_editor::model::{
 };
 use crate::native_editor::transaction::Transaction;
 
-gpui::actions!(evernote_spike, [SubmitLink, CancelLink]);
+gpui::actions!(evernote_spike, [SubmitLink, CancelLink, RetryImages]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpikeRouteContract {
@@ -110,6 +110,7 @@ pub(crate) fn open(cx: &mut App) -> WindowHandle<SpikeView> {
                     more_open: false,
                     link_popover: None,
                     pointer_anchor: None,
+                    drop_point: None,
                     more_trigger_bounds: None,
                 })
             },
@@ -404,6 +405,7 @@ pub(crate) struct SpikeView {
     more_open: bool,
     link_popover: Option<Entity<LinkPopover>>,
     pointer_anchor: Option<DocPoint>,
+    drop_point: Option<DocPoint>,
     more_trigger_bounds: Option<Bounds<Pixels>>,
 }
 
@@ -415,10 +417,64 @@ impl SpikeView {
         cx: &mut Context<Self>,
     ) {
         let paths = paths.paths().to_vec();
+        let drop_point = self.drop_point.take();
         run_editor_result(&self.editor, window, cx, |editor| {
-            apply_drop_paths(editor, &paths)
+            apply_drop_paths_at(editor, &paths, drop_point)
         });
         focus_editor(&self.editor, window, cx);
+    }
+
+    fn on_external_paths_drag_move(
+        &mut self,
+        event: &DragMoveEvent<ExternalPaths>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let point = self.editor.update(cx, |editor, _| {
+            editor.point_from_layout(event.event.position)
+        });
+        if self.drop_point != point {
+            self.drop_point = point;
+            cx.notify();
+        }
+    }
+
+    fn on_retry_images(
+        &mut self,
+        _action: &RetryImages,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let retry_paths = self.editor.update(cx, |editor, _| {
+            let paths = editor
+                .document()
+                .blocks()
+                .into_iter()
+                .filter_map(|block| match &block.content {
+                    crate::native_editor::model::BlockContent::Image { resource_id, .. } => editor
+                        .image_source_path(&resource_id)
+                        .map(|path| (resource_id.clone(), path.to_path_buf())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            paths
+                .into_iter()
+                .filter_map(|(resource_id, path)| {
+                    editor.retry_image_resource(&resource_id).then_some(path)
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Some(cache) = self.image_cache.as_ref() {
+            cache.update(cx, |cache, cache_cx| {
+                for path in &retry_paths {
+                    let resource = gpui::Resource::from(path.clone());
+                    cache.invalidate(&resource, window, cache_cx);
+                }
+            });
+        }
+        if !retry_paths.is_empty() {
+            cx.notify();
+        }
     }
 
     fn open_link_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1013,9 +1069,11 @@ impl SpikeView {
             .rounded(px(7.0))
             .bg(rgba(0xffffffff))
             .can_drop(|dragged, _window, _cx| dragged.is::<ExternalPaths>())
+            .on_drag_move::<ExternalPaths>(cx.listener(Self::on_external_paths_drag_move))
             .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
             .capture_any_mouse_down(cx.listener(Self::on_surface_mouse_down))
             .on_key_down(cx.listener(Self::on_surface_key_down))
+            .on_action(cx.listener(Self::on_retry_images))
             .on_mouse_move(cx.listener(Self::on_surface_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_surface_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_surface_mouse_up));
@@ -1190,10 +1248,28 @@ fn focus_editor(editor: &Entity<EditorCore>, window: &mut Window, cx: &mut App) 
 /// only provide platform payloads; image-first classification and structural
 /// insertion happen here so both paths commit the same real image node.
 fn apply_paste_intent(editor: &mut EditorCore, intent: PasteIntent) -> Result<(), DocumentError> {
+    apply_paste_intent_at(editor, intent, None)
+}
+
+fn apply_paste_intent_at(
+    editor: &mut EditorCore,
+    intent: PasteIntent,
+    drop_point: Option<DocPoint>,
+) -> Result<(), DocumentError> {
     match intent {
-        PasteIntent::Image { payload } => editor.insert_image_payload(payload),
+        PasteIntent::Image { payload } => {
+            if let Some(point) = drop_point {
+                editor.insert_image_payload_at(payload, Selection::caret(point))
+            } else {
+                editor.insert_image_payload(payload)
+            }
+        }
         PasteIntent::File { path, cleanup } => {
-            let result = editor.insert_image_path(&path);
+            let result = if let Some(point) = drop_point {
+                editor.insert_image_path_at(&path, Selection::caret(point))
+            } else {
+                editor.insert_image_path(&path)
+            };
             if cleanup
                 && let Err(error) = std::fs::remove_file(&path)
                 && error.kind() != std::io::ErrorKind::NotFound
@@ -1216,6 +1292,14 @@ fn apply_clipboard_payload(
 
 fn apply_drop_paths(editor: &mut EditorCore, paths: &[PathBuf]) -> Result<(), DocumentError> {
     apply_paste_intent(editor, classify_drop(paths))
+}
+
+fn apply_drop_paths_at(
+    editor: &mut EditorCore,
+    paths: &[PathBuf],
+    drop_point: Option<DocPoint>,
+) -> Result<(), DocumentError> {
+    apply_paste_intent_at(editor, classify_drop(paths), drop_point)
 }
 
 fn run_command(
@@ -1445,6 +1529,7 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            drop_point: None,
             more_trigger_bounds: None,
         }
     }
@@ -1471,9 +1556,19 @@ mod tests {
             .expect("fixture image")
             .bytes;
         std::fs::write(&path, bytes).expect("temporary PNG should be writable");
-        editor.set_caret_utf8(0);
-        apply_drop_paths(&mut editor, std::slice::from_ref(&path))
-            .expect("drop action should insert image");
+        let drop_target = editor
+            .document()
+            .blocks()
+            .first()
+            .expect("drop target block")
+            .id;
+        editor.set_caret_utf8(editor.copy_all_plain_text().len());
+        apply_drop_paths_at(
+            &mut editor,
+            std::slice::from_ref(&path),
+            Some(DocPoint::new(drop_target, 0)),
+        )
+        .expect("drop action should honor prospective drag point");
         let image_count = editor
             .document()
             .blocks()
@@ -1527,6 +1622,7 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            drop_point: None,
             more_trigger_bounds: None,
         }
     }
@@ -1550,6 +1646,7 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            drop_point: None,
             more_trigger_bounds: None,
         }
     }
@@ -1582,6 +1679,7 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            drop_point: None,
             more_trigger_bounds: None,
         }
     }
@@ -1617,6 +1715,7 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            drop_point: None,
             more_trigger_bounds: None,
         }
     }
@@ -1637,6 +1736,7 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            drop_point: None,
             more_trigger_bounds: None,
         }
     }
@@ -1672,6 +1772,7 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            drop_point: None,
             more_trigger_bounds: None,
         }
     }

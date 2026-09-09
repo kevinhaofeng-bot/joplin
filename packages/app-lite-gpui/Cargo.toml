@@ -111,7 +111,7 @@ cocoa = "0.26"
 objc = "0.2.7"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFData", "CFDictionary", "CFNumber", "CFURL", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage", "objc2"] }
-objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "objc2-core-graphics", "objc2"] }
+objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "CGImageProperties", "objc2-core-graphics", "objc2"] }
 
 [dev-dependencies]
 gpui = { version = "0.2", features = ["test-support"] }

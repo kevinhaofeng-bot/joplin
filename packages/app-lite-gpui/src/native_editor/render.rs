@@ -174,6 +174,9 @@ fn paint_snapshot(
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Result<()> {
+    if let Some(cache) = image_cache.as_ref() {
+        cache.update(cx, |cache, _| cache.begin_frame());
+    }
     // 1. Block surfaces.
     for block in &snapshot.blocks {
         let mut quad = fill(block.layout.bounds, rgba(0x00000000));
@@ -208,7 +211,10 @@ fn paint_snapshot(
         if block.is_image {
             let image = block.image_resource.as_ref().and_then(|resource| {
                 image_cache.as_ref().and_then(|cache| {
-                    cache.update(cx, |cache, cx| cache.load(resource, window, cx))
+                    cache.update(cx, |cache, cx| {
+                        cache.mark_visible(resource);
+                        cache.load(resource, window, cx)
+                    })
                 })
             });
             if let Some(Ok(image)) = image {

@@ -5,7 +5,7 @@
 //! GPUI 0.2.2 `RetainAllImageCache` loading protocol; only the document model
 //! decides when a structural `InsertImage` transaction is committed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -214,7 +214,36 @@ pub fn resolve_clipboard_payload(
     native: Option<ClipboardPayload>,
     gpui: Option<ClipboardPayload>,
 ) -> Option<ClipboardPayload> {
-    native.or(gpui)
+    let Some(native) = native else {
+        return gpui;
+    };
+    let Some(gpui) = gpui else {
+        return Some(native);
+    };
+    // A pasteboard can expose a plain-text representation alongside a GPUI
+    // image entry. Merge representations before classification so the
+    // image-first policy is preserved instead of letting native plain text
+    // suppress the image returned by GPUI.
+    Some(ClipboardPayload {
+        images: if native.images.is_empty() {
+            gpui.images
+        } else {
+            native.images
+        },
+        file_urls: if native.file_urls.is_empty() {
+            gpui.file_urls
+        } else {
+            native.file_urls
+        },
+        temporary_files: if native.temporary_files.is_empty() {
+            gpui.temporary_files
+        } else {
+            native.temporary_files
+        },
+        html: native.html.or(gpui.html),
+        rich_text: native.rich_text.or(gpui.rich_text),
+        text: native.text.or(gpui.text),
+    })
 }
 
 pub fn classify_drop(paths: &[PathBuf]) -> PasteIntent {
@@ -452,16 +481,28 @@ impl ImageStore {
         let Some(id) = self.id_for_resource(resource_id) else {
             return false;
         };
+        if !self
+            .images
+            .get(&id)
+            .is_some_and(|image| image.state == ImageNodeState::Failed)
+        {
+            return false;
+        }
         let Some((source_path, bytes)) = self.images.get(&id).and_then(|image| {
             image
                 .compressed
                 .as_ref()
                 .map(|bytes| (image.source_path.clone(), bytes.clone()))
         }) else {
-            return self
+            let ready = self
                 .images
                 .get(&id)
                 .is_some_and(|image| image.source_path.is_file());
+            if ready && let Some(image) = self.images.get_mut(&id) {
+                image.state = ImageNodeState::Loading;
+                image.retryable = false;
+            }
+            return ready;
         };
         let written =
             std::fs::create_dir_all(source_path.parent().unwrap_or_else(|| Path::new(".")))
@@ -486,6 +527,20 @@ impl ImageStore {
     /// into the document model or renderer.
     pub fn id_for_resource(&self, resource_id: &str) -> Option<u64> {
         self.by_resource_id.get(resource_id).copied()
+    }
+
+    /// Roll back a resource that was materialized before its document
+    /// transaction failed. The managed file is removed together with the
+    /// store entry so failed insertions cannot orphan durable resources.
+    pub fn remove_resource(&mut self, resource_id: &str) -> bool {
+        let Some(id) = self.by_resource_id.remove(resource_id) else {
+            return false;
+        };
+        let Some(image) = self.images.remove(&id) else {
+            return false;
+        };
+        let _ = std::fs::remove_file(image.source_path);
+        true
     }
 
     pub fn metadata_for_resource(&self, resource_id: &str) -> Option<&ImageMetadata> {
@@ -648,6 +703,8 @@ pub struct BudgetedImageCache {
     used_bytes: usize,
     entries: HashMap<u64, CachedTexture>,
     lru: VecDeque<u64>,
+    visible: HashSet<u64>,
+    in_flight: usize,
 }
 
 impl BudgetedImageCache {
@@ -657,6 +714,8 @@ impl BudgetedImageCache {
             used_bytes: 0,
             entries: HashMap::new(),
             lru: VecDeque::new(),
+            visible: HashSet::new(),
+            in_flight: 0,
         }
     }
 
@@ -672,6 +731,8 @@ impl BudgetedImageCache {
                 }
             }
             cache.lru.clear();
+            cache.visible.clear();
+            cache.in_flight = 0;
             cache.used_bytes = 0;
         })
         .detach();
@@ -686,6 +747,28 @@ impl BudgetedImageCache {
     }
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.visible.clear();
+    }
+
+    pub fn mark_visible(&mut self, resource: &Resource) {
+        self.visible.insert(hash(resource));
+    }
+
+    /// Remove a failed cache result before retrying the corresponding store
+    /// resource. This is deliberately separate from paint so a retry action
+    /// cannot leave a permanent cached `Loaded(Err(_))` entry behind.
+    pub fn invalidate(&mut self, resource: &Resource, window: &mut Window, cx: &mut App) {
+        let key = hash(resource);
+        if let Some(mut entry) = self.entries.remove(&key) {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
+            if let Some(Ok(image)) = entry.item.get() {
+                cx.drop_image(image, Some(window));
+            }
+        }
+        self.lru.retain(|candidate| *candidate != key);
     }
 
     fn image_bytes(image: &RenderImage) -> Result<usize, ImageDecodeError> {
@@ -709,9 +792,14 @@ impl BudgetedImageCache {
         let is_svg = guessed_format.is_err();
         let mut frames = if let Ok(format) = guessed_format {
             if format == image::ImageFormat::Gif {
-                GifDecoder::new(std::io::Cursor::new(bytes))?
+                // Animated GIF playback is intentionally deferred for this
+                // spike. Retain one stable first frame instead of decoding
+                // and holding every unused frame in the editor cache.
+                let frame = GifDecoder::new(std::io::Cursor::new(bytes))?
                     .into_frames()
-                    .collect::<Result<Vec<_>, _>>()?
+                    .next()
+                    .ok_or_else(|| anyhow!("GIF contains no frames"))??;
+                vec![frame]
             } else {
                 vec![image::Frame::new(
                     image::load_from_memory_with_format(bytes, format)?.into_rgba8(),
@@ -866,7 +954,14 @@ impl BudgetedImageCache {
         let source = unsafe { CGImageSource::with_url(&url, None) }.ok_or_else(|| {
             ImageCacheError::from(anyhow!("ImageIO could not open managed image resource"))
         })?;
-        let frame_count = unsafe { source.count() }.max(1);
+        let is_gif = path
+            .extension()
+            .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("gif"));
+        let frame_count = if is_gif {
+            1
+        } else {
+            unsafe { source.count() }.max(1)
+        };
         let max_pixels_per_frame = budget_bytes
             .checked_div(frame_count)
             .and_then(|bytes| bytes.checked_div(4))
@@ -972,10 +1067,19 @@ impl BudgetedImageCache {
         Ok(Arc::new(RenderImage::new(frames)))
     }
 
-    fn evict_until_fit(&mut self, needed: usize, cx: &mut App, window: &mut Window) {
+    fn evict_until_fit(&mut self, needed: usize, cx: &mut App, window: &mut Window) -> bool {
         while self.used_bytes.saturating_add(needed) > self.budget_bytes {
-            let Some(oldest) = self.lru.pop_front() else {
-                break;
+            let Some(index) = self.lru.iter().position(|key| {
+                !self.visible.contains(key)
+                    && self
+                        .entries
+                        .get(key)
+                        .is_some_and(|entry| !matches!(entry.item, ImageCacheItem::Loading(_)))
+            }) else {
+                return false;
+            };
+            let Some(oldest) = self.lru.remove(index) else {
+                return false;
             };
             if let Some(mut entry) = self.entries.remove(&oldest) {
                 self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
@@ -984,6 +1088,7 @@ impl BudgetedImageCache {
                 }
             }
         }
+        true
     }
 }
 
@@ -997,7 +1102,11 @@ impl ImageCache for BudgetedImageCache {
         let key = hash(resource);
         if let Some(mut entry) = self.entries.remove(&key) {
             self.lru.retain(|value| *value != key);
+            let was_loading = matches!(entry.item, ImageCacheItem::Loading(_));
             let result = entry.item.get();
+            if was_loading && result.is_some() {
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
             if let Some(Ok(ref image)) = result {
                 let bytes = match Self::image_bytes(image) {
                     Ok(bytes) => bytes,
@@ -1015,13 +1124,31 @@ impl ImageCache for BudgetedImageCache {
                         "cached image exceeds the hard decoded-image budget"
                     ));
                     cx.drop_image(image.clone(), Some(window));
+                    self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
+                    entry.decoded_bytes = 0;
                     entry.item = ImageCacheItem::Loaded(Err(error.clone()));
                     self.entries.insert(key, entry);
                     self.lru.push_back(key);
                     return Some(Err(error));
                 }
                 self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
-                self.evict_until_fit(bytes, cx, window);
+                if !self.evict_until_fit(bytes, cx, window) {
+                    // The current visible working set owns the entire
+                    // decoded budget. Preserve it and keep this image a
+                    // stable failure until an explicit retry/visibility
+                    // change, rather than evicting a visible image and
+                    // spinning decode/paint forever.
+                    let error = ImageCacheError::from(anyhow!(
+                        "decoded image budget is occupied by visible images"
+                    ));
+                    cx.drop_image(image.clone(), Some(window));
+                    self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
+                    entry.item = ImageCacheItem::Loaded(Err(error.clone()));
+                    entry.decoded_bytes = 0;
+                    self.entries.insert(key, entry);
+                    self.lru.push_back(key);
+                    return Some(Err(error));
+                }
                 self.used_bytes = self.used_bytes.saturating_add(bytes);
                 entry.decoded_bytes = bytes;
             }
@@ -1033,6 +1160,9 @@ impl ImageCache for BudgetedImageCache {
             return result;
         }
 
+        if self.in_flight >= 1 {
+            return None;
+        }
         let budget = self.budget_bytes;
         let source = resource.clone();
         let load_future = async move { Self::decode_resource_bounded(&source, budget) };
@@ -1044,6 +1174,7 @@ impl ImageCache for BudgetedImageCache {
                 decoded_bytes: 0,
             },
         );
+        self.in_flight = self.in_flight.saturating_add(1);
         self.lru.push_back(key);
         let entity = window.current_view();
         window
@@ -1082,6 +1213,11 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     unsafe {
         let _pool = NSAutoreleasePool::new(nil);
         let pasteboard = NSPasteboard::generalPasteboard(nil);
+        let html_type = NSString::alloc(nil).init_str("public.html").autorelease();
+        let rtf_type = NSString::alloc(nil).init_str("public.rtf").autorelease();
+        let html = string_value(pasteboard.stringForType(html_type));
+        let rich_text = string_value(pasteboard.stringForType(rtf_type));
+        let text = string_value(pasteboard.stringForType(NSPasteboardTypeString));
         let image_types = [
             (ImageFormat::Png, NSPasteboardTypePNG),
             (ImageFormat::Tiff, NSPasteboardTypeTIFF),
@@ -1131,10 +1267,11 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
-                let text = string_value(pasteboard.stringForType(NSPasteboardTypeString));
                 return Some(ClipboardPayload {
                     file_urls: vec![path.clone()],
                     temporary_files: vec![path],
+                    html: html.clone(),
+                    rich_text: rich_text.clone(),
                     text,
                     ..Default::default()
                 });
@@ -1151,15 +1288,23 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
             if !file_urls.is_empty() {
                 return Some(ClipboardPayload {
                     file_urls,
+                    html,
+                    rich_text,
+                    text,
                     ..Default::default()
                 });
             }
         }
-        let text = string_value(pasteboard.stringForType(NSPasteboardTypeString));
-        text.map(|text| ClipboardPayload {
-            text: Some(text),
-            ..Default::default()
-        })
+        if html.is_some() || rich_text.is_some() || text.is_some() {
+            Some(ClipboardPayload {
+                html,
+                rich_text,
+                text,
+                ..Default::default()
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -1216,6 +1361,41 @@ mod tests {
             })
             .sum::<u64>();
         assert!(decoded_bytes <= 17 * 4);
+        assert_eq!(
+            image.frame_count(),
+            1,
+            "MVP does not retain unused GIF frames"
+        );
+    }
+
+    #[test]
+    fn merged_clipboard_representations_keep_gpui_image_over_native_html_text() {
+        let native = ClipboardPayload {
+            html: Some("<img src=\"https://example.invalid/photo.png\">".into()),
+            text: Some("图像占位符".into()),
+            ..Default::default()
+        };
+        let gpui = ClipboardPayload::fixture_with_png_and_text("fallback");
+        let merged = resolve_clipboard_payload(Some(native), Some(gpui)).expect("merged payload");
+        assert!(matches!(
+            classify_clipboard(merged),
+            PasteIntent::Image { .. }
+        ));
+    }
+
+    #[test]
+    fn retry_failed_resource_transitions_back_to_loading() {
+        let mut store = ImageStore::for_test();
+        let id = store.insert_with_format(
+            ImageMetadata::new("retryable", 1, 1),
+            fixture_png_bytes(),
+            ImageFormat::Png,
+        );
+        assert!(store.finish_failed_decode(id, "test"));
+        assert_eq!(store.node_state(id), ImageNodeState::Failed);
+        assert!(store.retry_resource("retryable"));
+        assert_eq!(store.node_state(id), ImageNodeState::Loading);
+        assert!(!store.retry_resource("retryable"));
     }
 
     #[test]

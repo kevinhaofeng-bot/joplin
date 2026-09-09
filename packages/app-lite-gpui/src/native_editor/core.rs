@@ -48,7 +48,36 @@ fn image_dimensions_from_path(path: &Path, format: ImageFormat) -> Option<(u32, 
         return Some((size.width().ceil() as u32, size.height().ceil() as u32));
     }
     let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
-    reader.into_dimensions().ok()
+    let dimensions = reader.into_dimensions().ok()?;
+    #[cfg(target_os = "macos")]
+    let orientation = image_orientation_from_path(path).unwrap_or(1);
+    #[cfg(not(target_os = "macos"))]
+    let orientation = 1;
+    Some(oriented_dimensions(dimensions, orientation))
+}
+
+fn oriented_dimensions((width, height): (u32, u32), orientation: u32) -> (u32, u32) {
+    if (5..=8).contains(&orientation) {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn image_orientation_from_path(path: &Path) -> Option<u32> {
+    use objc2_core_foundation::{CFDictionary, CFNumber, CFString, CFType, CFURL};
+    use objc2_image_io::{CGImageSource, kCGImagePropertyOrientation};
+    let url = CFURL::from_file_path(path)?;
+    let source = unsafe { CGImageSource::with_url(&url, None) }?;
+    let properties = unsafe { source.properties_at_index(0, None) }?;
+    let properties: &CFDictionary<CFString, CFType> = unsafe {
+        &*(properties.as_ref() as *const CFDictionary as *const CFDictionary<CFString, CFType>)
+    };
+    properties
+        .get(unsafe { kCGImagePropertyOrientation })
+        .and_then(|value| value.downcast_ref::<CFNumber>().and_then(CFNumber::as_i32))
+        .map(|value| value as u32)
 }
 
 #[derive(Clone)]
@@ -603,6 +632,14 @@ impl EditorCore {
     /// handed to the shared ImageStore; the existing Transaction::InsertImage
     /// path owns selection, history, and structural paragraph splitting.
     pub fn insert_image_payload(&mut self, payload: ImagePayload) -> Result<(), DocumentError> {
+        self.insert_image_payload_at(payload, self.selection)
+    }
+
+    pub fn insert_image_payload_at(
+        &mut self,
+        payload: ImagePayload,
+        selection: Selection,
+    ) -> Result<(), DocumentError> {
         let resource_id = Uuid::new_v4().to_string();
         let (width, height) = image_dimensions(&payload).ok_or_else(|| {
             DocumentError::InvalidOperation("unsupported or invalid image payload".into())
@@ -611,10 +648,17 @@ impl EditorCore {
         self.image_store
             .insert_with_format(metadata, payload.bytes, payload.format);
         let outcome = self.apply_with_selection(Transaction::InsertImage {
-            selection: self.selection,
-            resource_id,
+            selection,
+            resource_id: resource_id.clone(),
             natural_size: (width, height),
-        })?;
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.image_store.remove_resource(&resource_id);
+                return Err(error);
+            }
+        };
         self.selection = outcome.selection;
         Ok(())
     }
@@ -624,6 +668,14 @@ impl EditorCore {
     /// source is copied by the filesystem and never materialized as a Rust
     /// `Vec` in the editor process.
     pub fn insert_image_path(&mut self, path: &Path) -> Result<(), DocumentError> {
+        self.insert_image_path_at(path, self.selection)
+    }
+
+    pub fn insert_image_path_at(
+        &mut self,
+        path: &Path,
+        selection: Selection,
+    ) -> Result<(), DocumentError> {
         let format = image_format_from_path(path).ok_or_else(|| {
             DocumentError::InvalidOperation("unsupported or invalid image path".into())
         })?;
@@ -638,10 +690,17 @@ impl EditorCore {
                 DocumentError::InvalidOperation(format!("image resource copy failed: {error}"))
             })?;
         let outcome = self.apply_with_selection(Transaction::InsertImage {
-            selection: self.selection,
-            resource_id,
+            selection,
+            resource_id: resource_id.clone(),
             natural_size: (width, height),
-        })?;
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.image_store.remove_resource(&resource_id);
+                return Err(error);
+            }
+        };
         self.selection = outcome.selection;
         Ok(())
     }
@@ -2249,5 +2308,17 @@ mod raw_document_range_tests {
         assert_eq!((subset.start, subset.end), (0, 1));
         let overlap = RawDocumentRange::from_utf16(combining, &(1..3));
         assert_eq!((overlap.start, overlap.end), (1, combining.len()));
+    }
+}
+
+#[cfg(test)]
+mod image_orientation_tests {
+    use super::oriented_dimensions;
+
+    #[test]
+    fn exif_rotated_dimensions_swap_for_both_orientation_directions() {
+        assert_eq!(oriented_dimensions((4031, 3023), 6), (3023, 4031));
+        assert_eq!(oriented_dimensions((3023, 4031), 8), (4031, 3023));
+        assert_eq!(oriented_dimensions((4031, 3023), 1), (4031, 3023));
     }
 }
