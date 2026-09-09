@@ -72,6 +72,14 @@ mod mac_pressure {
         }
     }
 
+    /// Return allocator pages after the cache has dropped decoded proxies.
+    /// This is deliberately tied to an eviction boundary, not every paint.
+    pub fn relieve_unused() {
+        unsafe {
+            let _ = malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+
     #[cfg(test)]
     pub fn set_test_hook(hook: Option<TestHook>) {
         *TEST_HOOK.get_or_init(|| Mutex::new(None)).lock().unwrap() = hook;
@@ -847,21 +855,26 @@ impl BudgetedImageCache {
             .entries
             .iter()
             .filter_map(|(key, entry)| {
-                (!self.visible.contains(key)
-                    && !matches!(entry.item, ImageCacheItem::Loading(_)))
+                (!self.visible.contains(key) && !matches!(entry.item, ImageCacheItem::Loading(_)))
                     .then_some(*key)
             })
             .collect::<Vec<_>>();
+        let mut dropped_bytes = 0usize;
         for key in stale {
             let Some(mut entry) = self.entries.remove(&key) else {
                 continue;
             };
             self.lru.retain(|candidate| *candidate != key);
             self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
+            dropped_bytes = dropped_bytes.saturating_add(entry.decoded_bytes);
             if let Some(Ok(image)) = entry.item.get() {
                 self.record_drop_image();
                 cx.drop_image(image, Some(window));
             }
+        }
+        #[cfg(target_os = "macos")]
+        if dropped_bytes >= 4 * 1024 * 1024 {
+            mac_pressure::relieve_unused();
         }
     }
 
@@ -1956,9 +1969,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn production_cache_drops_loaded_offscreen_entries_before_settle(
-        cx: &mut TestAppContext,
-    ) {
+    fn production_cache_drops_loaded_offscreen_entries_before_settle(cx: &mut TestAppContext) {
         let root = std::env::temp_dir().join(format!(
             "joplin-lite-cache-offscreen-loaded-{}",
             uuid::Uuid::new_v4()
