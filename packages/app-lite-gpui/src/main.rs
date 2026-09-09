@@ -94,12 +94,17 @@ impl AssetSource for VelotypeAssets {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let help_or_version_requested = args
-        .iter()
-        .skip(1)
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-v"));
-    let measurement_requested =
-        !help_or_version_requested && spike_app::measurement_options_requested(&args[1..]);
+    if let Some(request) = spike_app::global_help_or_version(&args[1..]) {
+        match request {
+            "version" => {
+                println!("velotype {}", env!("CARGO_PKG_VERSION"));
+            }
+            "help" => print_help(),
+            _ => unreachable!("global help/version parser returned unknown request"),
+        }
+        return;
+    }
+    let measurement_requested = spike_app::measurement_options_requested(&args[1..]);
     let spike_options = if measurement_requested {
         match spike_app::parse_spike_options(&args[1..]) {
             Ok(options) => Some(options),
@@ -120,32 +125,8 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--version" | "-v" => {
-                println!("velotype {}", env!("CARGO_PKG_VERSION"));
-                return;
-            }
-            "--help" | "-h" => {
-                println!(
-                    "velotype {} - A block-based Markdown editor",
-                    env!("CARGO_PKG_VERSION")
-                );
-                println!();
-                println!("USAGE:");
-                println!("    velotype [OPTIONS] [FILES...]");
-                println!();
-                println!("OPTIONS:");
-                println!("    -v, --version    Print version information");
-                println!("    -h, --help       Print this help message");
-                println!("    -d, --detach     Launch in background (non-blocking)");
-                println!("        --evernote-spike  Launch the native editor spike");
-                println!("        --fixture empty|typical|long  Task 7 deterministic fixture");
-                println!("        --ready-file PATH  Task 7 readiness marker (absolute)");
-                println!("        --diagnostics-file PATH  Task 7 JSON diagnostics (absolute)");
-                println!();
-                println!("FILES:");
-                println!("    One or more markdown files to open. If no files are specified,");
-                println!("    opens an empty document.");
-                return;
+            "--version" | "-v" | "-V" | "--help" | "-h" => {
+                unreachable!("global help/version options are handled before value parsing")
             }
             "--detach" | "-d" => {
                 detach = true;
@@ -299,4 +280,28 @@ fn main() {
         app_menu::install_menus(cx);
         cx.refresh_windows();
     });
+}
+
+fn print_help() {
+    println!(
+        "velotype {} - A block-based Markdown editor",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!();
+    println!("USAGE:");
+    println!("    velotype [OPTIONS] [FILES...]");
+    println!();
+    println!("OPTIONS:");
+    println!("    -v, --version    Print version information");
+    println!("    -V               Print version information");
+    println!("    -h, --help       Print this help message");
+    println!("    -d, --detach     Launch in background (non-blocking)");
+    println!("        --evernote-spike  Launch the native editor spike");
+    println!("        --fixture empty|typical|long  Task 7 deterministic fixture");
+    println!("        --ready-file PATH  Task 7 readiness marker (absolute)");
+    println!("        --diagnostics-file PATH  Task 7 JSON diagnostics (absolute)");
+    println!();
+    println!("FILES:");
+    println!("    One or more markdown files to open. If no files are specified,");
+    println!("    opens an empty document.");
 }

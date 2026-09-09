@@ -16,6 +16,46 @@ esac
 [[ -x "$binary" ]] || { echo "binary is not executable: $binary" >&2; exit 2; }
 mkdir -p "$output_dir"
 output_dir=$(cd "$output_dir" && pwd)
+script_dir=$(cd "$(dirname "$0")" && pwd)
+repo_root=$(cd "$script_dir/../../.." && pwd)
+binary_sha256=$(shasum -a 256 "$binary" | awk '{print $1}')
+git_commit=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)
+manifest_file="$output_dir/task-7-run.json"
+if [[ -s "$manifest_file" ]]; then
+  run_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$manifest_file")
+  manifest_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["binary_sha256"])' "$manifest_file")
+  manifest_commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git_commit"])' "$manifest_file")
+  [[ "$manifest_sha" == "$binary_sha256" ]] || {
+    echo "binary digest differs from this run set" >&2
+    exit 1
+  }
+  [[ "$manifest_commit" == "$git_commit" ]] || {
+    echo "git commit differs from this run set" >&2
+    exit 1
+  }
+  created_at=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["created_at"])' "$manifest_file")
+else
+  run_id="task7-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  python3 - "$manifest_file" "$run_id" "$binary" "$binary_sha256" "$git_commit" "$created_at" <<'PY'
+import json
+import pathlib
+import sys
+
+path, run_id, binary, digest, commit, created_at = sys.argv[1:]
+pathlib.Path(path).write_text(json.dumps({
+    "run_id": run_id,
+    "binary_path": binary,
+    "binary_sha256": digest,
+    "git_commit": commit,
+    "created_at": created_at,
+}, sort_keys=True) + "\n", encoding="utf-8")
+PY
+fi
+expected_ready="task7-ready|${run_id}|${binary_sha256}"
+ready_poll_attempts=${TASK7_READY_POLL_ATTEMPTS:-60}
+ready_poll_seconds=${TASK7_READY_POLL_SECONDS:-0.5}
+sample_interval_seconds=${TASK7_SAMPLE_INTERVAL_SECONDS:-5}
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/velotype-task7.XXXXXX")
 ready_file="$run_dir/ready"
 diagnostics_file="$run_dir/diagnostics.json"
@@ -35,23 +75,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$binary" --evernote-spike --fixture "$fixture" \
+TASK7_RUN_ID="$run_id" TASK7_BINARY_SHA256="$binary_sha256" "$binary" --evernote-spike --fixture "$fixture" \
   --ready-file "$ready_file" --diagnostics-file "$diagnostics_file" \
   >"$log_file" 2>&1 &
 pid=$!
 
-for _ in $(seq 1 60); do
-  [[ -f "$ready_file" && -s "$diagnostics_file" ]] && break
-  sleep 0.5
+ready_value=""
+for _ in $(seq 1 "$ready_poll_attempts"); do
+  if [[ -s "$ready_file" ]]; then
+    ready_value=$(tr -d '\n' < "$ready_file")
+    [[ "$ready_value" == "$expected_ready" && -s "$diagnostics_file" ]] && break
+  fi
+  sleep "$ready_poll_seconds"
 done
-if [[ ! -f "$ready_file" || ! -s "$diagnostics_file" ]]; then
+if [[ "$ready_value" != "$expected_ready" || ! -s "$diagnostics_file" ]]; then
   echo "Task 7 did not reach first-frame/cache-settle readiness; see $log_file" >&2
   exit 1
 fi
 
 : > "$rss_file"
 for _ in $(seq 1 6); do
-  sleep 5
+  sleep "$sample_interval_seconds"
   ps -o rss= -p "$pid" | tr -d ' ' >> "$rss_file"
 done
 child_processes=$(ps -axo ppid= | awk -v pid="$pid" '$1 == pid {n++} END {print n+0}')
@@ -66,12 +110,16 @@ if otool -L "$binary" 2>/dev/null | grep -q 'WebKit'; then
 fi
 cp "$diagnostics_file" "$retained_diagnostics_file"
 
-python3 - "$retained_diagnostics_file" "$rss_file" "$result_file" "$fixture" "$pid" "$child_processes" "$webkit_linked" "$vmmap_file" <<'PY'
+python3 - "$retained_diagnostics_file" "$rss_file" "$result_file" "$fixture" "$pid" "$child_processes" "$webkit_linked" "$vmmap_file" "$binary" "$binary_sha256" "$git_commit" "$run_id" "$created_at" "$expected_ready" <<'PY'
 import json
 import pathlib
 import sys
 
-diagnostics_path, rss_path, result_path, fixture, pid, child_processes, webkit, vmmap_file = sys.argv[1:]
+(
+    diagnostics_path, rss_path, result_path, fixture, pid, child_processes,
+    webkit, vmmap_file, binary, binary_sha256, git_commit, run_id, created_at,
+    expected_ready,
+) = sys.argv[1:]
 with open(diagnostics_path, encoding="utf-8") as handle:
     diagnostics = json.load(handle)
 required = {
@@ -93,6 +141,12 @@ if len(rss) != 6:
 result = {
     "fixture": fixture,
     "pid": int(pid),
+    "binary_path": binary,
+    "binary_sha256": binary_sha256,
+    "git_commit": git_commit,
+    "run_id": run_id,
+    "created_at": created_at,
+    "ready_marker": expected_ready,
     "child_processes": int(child_processes),
     "webkit_linked": int(webkit),
     "rss_kib": rss,
@@ -100,6 +154,7 @@ result = {
     "rss_peak_kib": max(rss),
     "internal": diagnostics,
     "gates": gates,
+    "pass": False,
     "diagnostics_file": diagnostics_path,
     "vmmap_file": vmmap_file,
 }
@@ -114,10 +169,25 @@ if fixture == "long":
     if not empty_path.is_file():
         raise SystemExit("run the empty fixture first so long RSS delta is measurable")
     empty = json.loads(empty_path.read_text())
+    identity = ("binary_path", "binary_sha256", "git_commit", "run_id")
+    if empty.get("fixture") != "empty" or not empty.get("pass"):
+        raise SystemExit("sibling empty result is not a successful run-set result")
+    if any(empty.get(key) != result[key] for key in identity):
+        raise SystemExit("sibling empty result does not match this binary/run set")
     if stable - int(empty["rss_stable_kib"]) > 40_960:
         raise SystemExit("long RSS delta exceeds 40960 KiB")
-if not all(gates.values()) or int(child_processes) != 0 or int(webkit) != 0:
-    raise SystemExit("Task 7 fixed-capacity or isolation gate failed")
+all_pass = all(gates.values()) and int(child_processes) == 0 and int(webkit) == 0
+if fixture == "empty":
+    all_pass = all_pass and stable <= 81_920
+if fixture == "typical":
+    all_pass = all_pass and stable <= 122_880
+if fixture == "long":
+    empty = json.loads(pathlib.Path(result_path).with_name("task-7-empty.json").read_text())
+    all_pass = all_pass and stable - int(empty["rss_stable_kib"]) <= 40_960
+result["pass"] = bool(all_pass)
+pathlib.Path(result_path).write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+if not all_pass:
+    raise SystemExit("Task 7 fixed-capacity, provenance, RSS, or isolation gate failed")
 PY
 
 echo "$result_file"

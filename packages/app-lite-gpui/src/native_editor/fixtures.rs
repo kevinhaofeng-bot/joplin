@@ -82,10 +82,10 @@ pub fn typical_image_payload(index: usize) -> ImagePayload {
         (index as u8).wrapping_mul(67).wrapping_add(43),
         0xff,
     ];
-    // Ten real image resources exercise the production cache and paint path;
-    // keep the deterministic benchmark fixture representative without making
-    // the fixed-capacity RSS gate depend on ten full-size photo proxies.
-    let frame = ImageBuffer::from_pixel(320, 180, Rgba(color));
+    // The Task 7 authority is ten real 1600x900 image resources. The encoded
+    // source remains a single-color PNG so the compressed fixture is bounded,
+    // while the production cache still admits the required decoded texture.
+    let frame = ImageBuffer::from_pixel(1600, 900, Rgba(color));
     let mut encoded = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(frame)
         .write_to(&mut encoded, image::ImageFormat::Png)
@@ -103,6 +103,7 @@ pub fn populate_typical_images(editor: &mut EditorCore) -> Result<(), super::mod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
     #[test]
     fn fixture_modes_are_strict_and_have_contract_counts() {
@@ -115,5 +116,10 @@ mod tests {
         assert_eq!(build_document(FixtureKind::Long).block_count(), 10_000);
         assert_eq!(typical_image_count(), 10);
         assert!(typical_image_payload(0).bytes != typical_image_payload(1).bytes);
+        for index in 0..typical_image_count() {
+            let payload = typical_image_payload(index);
+            let image = image::load_from_memory(&payload.bytes).expect("fixture decodes");
+            assert_eq!(image.dimensions(), (1600, 900));
+        }
     }
 }

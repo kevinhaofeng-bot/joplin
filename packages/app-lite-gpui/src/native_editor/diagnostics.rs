@@ -56,6 +56,10 @@ impl FixedHistogram {
         0
     }
 
+    pub fn sample_count(&self) -> u64 {
+        self.count
+    }
+
     pub const fn bucket_count(&self) -> usize {
         FIXED_HISTOGRAM_BUCKETS
     }
@@ -101,9 +105,20 @@ impl Diagnostics {
 
     pub fn write_atomic(&self, path: &Path) -> std::io::Result<()> {
         let bytes = self.to_json().map_err(std::io::Error::other)?.into_bytes();
+        Self::write_atomic_bytes(path, &bytes)
+    }
+
+    pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&temporary, bytes)?;
-        std::fs::rename(temporary, path)
+        let result = (|| {
+            std::fs::write(&temporary, bytes)?;
+            std::fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+            let _ = std::fs::remove_file(path);
+        }
+        result
     }
 }
 

@@ -436,6 +436,10 @@ impl EditorCore {
         self.history.used_bytes()
     }
 
+    pub fn layout_peak_accounted_bytes(&self) -> usize {
+        self.layout.peak_accounted_bytes()
+    }
+
     pub(crate) fn select_for_workload(&mut self, point: DocPoint) {
         self.selection = Selection::caret(point);
         self.preferred_x = None;

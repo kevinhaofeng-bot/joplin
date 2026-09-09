@@ -71,6 +71,14 @@ pub struct SpikeLaunchOptions {
     pub fixture: FixtureKind,
     pub ready_file: PathBuf,
     pub diagnostics_file: PathBuf,
+    pub run_id: String,
+    pub binary_sha256: String,
+}
+
+impl SpikeLaunchOptions {
+    fn ready_marker(&self) -> String {
+        format!("task7-ready|{}|{}\n", self.run_id, self.binary_sha256)
+    }
 }
 
 pub fn measurement_options_requested(args: &[String]) -> bool {
@@ -79,6 +87,17 @@ pub fn measurement_options_requested(args: &[String]) -> bool {
             arg.as_str(),
             "--fixture" | "--ready-file" | "--diagnostics-file"
         )
+    })
+}
+
+/// Help/version are global options. They must be recognized before the main
+/// parser consumes a following token as the value of `--fixture` or one of
+/// the measurement paths.
+pub fn global_help_or_version(args: &[String]) -> Option<&'static str> {
+    args.iter().find_map(|arg| match arg.as_str() {
+        "--help" | "-h" => Some("help"),
+        "--version" | "-v" | "-V" => Some("version"),
+        _ => None,
     })
 }
 
@@ -140,6 +159,9 @@ pub fn parse_spike_options(args: &[String]) -> Result<SpikeLaunchOptions, String
         ready_file: ready_file.ok_or_else(|| "--ready-file is required".to_owned())?,
         diagnostics_file: diagnostics_file
             .ok_or_else(|| "--diagnostics-file is required".to_owned())?,
+        run_id: std::env::var("TASK7_RUN_ID").unwrap_or_else(|_| "unbound-test".into()),
+        binary_sha256: std::env::var("TASK7_BINARY_SHA256")
+            .unwrap_or_else(|_| "unbound-test".into()),
     })
 }
 
@@ -210,7 +232,9 @@ pub(crate) fn open_with_options(
                     pointer_anchor: None,
                     drop_point: None,
                     more_trigger_bounds: None,
-                    measurement: options_for_window.map(MeasurementRuntime::new),
+                    measurement: options_for_window
+                        .map(MeasurementRuntime::new)
+                        .map(Box::new),
                 })
             },
         )
@@ -233,7 +257,16 @@ struct MeasurementRuntime {
     workload_complete: bool,
     viewport_shift_index: usize,
     viewport_reset_requested: bool,
+    viewport_reset_completed: bool,
     viewport_complete: bool,
+    viewport_frames_requested: u32,
+    viewport_frames_completed: u32,
+    viewport_frame_pending: bool,
+    viewport_reset_frames_requested: u32,
+    viewport_reset_frames_completed: u32,
+    viewport_reset_frame_pending: bool,
+    render_sample_count: u32,
+    viewport_reset_paint_count: u32,
     ready_written: bool,
     render_start: Option<Instant>,
     transaction_histogram: FixedHistogram,
@@ -249,11 +282,70 @@ impl MeasurementRuntime {
             workload_complete: false,
             viewport_shift_index: 0,
             viewport_reset_requested: false,
+            viewport_reset_completed: false,
             viewport_complete: false,
+            viewport_frames_requested: 0,
+            viewport_frames_completed: 0,
+            viewport_frame_pending: false,
+            viewport_reset_frames_requested: 0,
+            viewport_reset_frames_completed: 0,
+            viewport_reset_frame_pending: false,
+            render_sample_count: 0,
+            viewport_reset_paint_count: 0,
             ready_written: false,
             render_start: None,
             transaction_histogram: FixedHistogram::default(),
             render_histogram: FixedHistogram::default(),
+        }
+    }
+
+    fn ready_prerequisites(&self, cache_settled: bool) -> bool {
+        self.workload_complete
+            && self.viewport_complete
+            && self.viewport_frames_requested == 120
+            && self.viewport_frames_completed == 120
+            && self.viewport_reset_frames_requested == 1
+            && self.viewport_reset_frames_completed == 1
+            && self.viewport_reset_completed
+            && self.render_sample_count == 120
+            && self.viewport_reset_paint_count == 1
+            && cache_settled
+    }
+
+    fn request_viewport_frame(&mut self) {
+        self.viewport_frames_requested = self.viewport_frames_requested.saturating_add(1);
+        self.viewport_frame_pending = true;
+    }
+
+    fn request_viewport_reset_frame(&mut self) {
+        self.viewport_reset_frames_requested =
+            self.viewport_reset_frames_requested.saturating_add(1);
+        self.viewport_reset_frame_pending = true;
+    }
+
+    fn complete_viewport_frame(&mut self) -> (bool, bool) {
+        let shift_frame = self.viewport_frame_pending;
+        let reset_frame = self.viewport_reset_frame_pending;
+        if self.viewport_frame_pending {
+            self.viewport_frames_completed = self.viewport_frames_completed.saturating_add(1);
+            self.viewport_frame_pending = false;
+        }
+        if self.viewport_reset_frame_pending {
+            self.viewport_reset_frames_completed =
+                self.viewport_reset_frames_completed.saturating_add(1);
+            self.viewport_reset_frame_pending = false;
+            self.viewport_reset_completed = true;
+        }
+        (shift_frame, reset_frame)
+    }
+
+    fn record_paint(&mut self, shift_frame: bool, reset_frame: bool, elapsed_us: u64) {
+        if shift_frame {
+            self.render_histogram.observe_us(elapsed_us);
+            self.render_sample_count = self.render_sample_count.saturating_add(1);
+        }
+        if reset_frame {
+            self.viewport_reset_paint_count = self.viewport_reset_paint_count.saturating_add(1);
         }
     }
 }
@@ -539,7 +631,7 @@ pub(crate) struct SpikeView {
     pointer_anchor: Option<DocPoint>,
     drop_point: Option<DocPoint>,
     more_trigger_bounds: Option<Bounds<Pixels>>,
-    measurement: Option<MeasurementRuntime>,
+    measurement: Option<Box<MeasurementRuntime>>,
 }
 
 impl SpikeView {
@@ -576,8 +668,14 @@ impl SpikeView {
         let Some(runtime) = self.measurement.as_mut() else {
             return;
         };
+        if report.apply_undo_pairs != 500
+            || report.changed_node_assertions != 500
+            || report.local_restoration_assertions != 500
+            || report.full_document_verifications != 1
+        {
+            return;
+        }
         runtime.transaction_histogram = report.transaction_histogram;
-        debug_assert_eq!(report.full_document_verifications, 1);
         runtime.workload_complete = true;
     }
 
@@ -604,6 +702,7 @@ impl SpikeView {
             self.scroll_handle.set_offset(point(px(0.0), px(-top)));
             if let Some(runtime) = self.measurement.as_mut() {
                 runtime.viewport_shift_index += 1;
+                runtime.request_viewport_frame();
             }
             window.request_animation_frame();
             cx.notify();
@@ -614,11 +713,14 @@ impl SpikeView {
             self.scroll_handle.set_offset(point(px(0.0), px(0.0)));
             if let Some(runtime) = self.measurement.as_mut() {
                 runtime.viewport_reset_requested = true;
+                runtime.request_viewport_reset_frame();
             }
             window.request_animation_frame();
             cx.notify();
         } else {
-            if let Some(runtime) = self.measurement.as_mut() {
+            if let Some(runtime) = self.measurement.as_mut()
+                && runtime.viewport_reset_completed
+            {
                 runtime.viewport_complete = true;
             }
             cx.notify();
@@ -1329,14 +1431,18 @@ impl SpikeView {
                 );
                 let fallback_started = Instant::now();
                 let _ = paint_measurement_view.update(cx, |view, view_cx| {
-                    let (first_frame, render_started) = {
+                    let (first_frame, render_started, shift_frame, reset_frame) = {
                         let Some(runtime) = view.measurement.as_mut() else {
                             return;
                         };
+                        let (shift_frame, reset_frame) = runtime.complete_viewport_frame();
+                        if reset_frame {
+                            runtime.viewport_reset_completed = true;
+                        }
                         let render_started = runtime.render_start.take();
                         let first_frame = !runtime.first_frame_painted;
                         runtime.first_frame_painted = true;
-                        (first_frame, render_started)
+                        (first_frame, render_started, shift_frame, reset_frame)
                     };
                     let elapsed = render_started
                         .unwrap_or(fallback_started)
@@ -1344,30 +1450,25 @@ impl SpikeView {
                         .as_micros()
                         .min(u128::from(u64::MAX)) as u64;
                     if let Some(runtime) = view.measurement.as_mut() {
-                        runtime.render_histogram.observe_us(elapsed);
+                        runtime.record_paint(shift_frame, reset_frame, elapsed);
                     }
                     if first_frame {
                         view.start_measurement(window, view_cx);
                     }
                     view.advance_measurement_frame(window, view_cx);
-                    let (workload_complete, ready_written, viewport_complete) = view
+                    let cache_settled = view
+                        .image_cache
+                        .as_ref()
+                        .is_none_or(|cache| cache.read(view_cx).is_settled());
+                    let ready_prerequisites = view
                         .measurement
                         .as_ref()
-                        .map_or((false, false, false), |runtime| {
-                            (
-                                runtime.workload_complete,
-                                runtime.ready_written,
-                                runtime.viewport_complete,
-                            )
-                        });
-                    if workload_complete
-                        && viewport_complete
-                        && !ready_written
-                        && view
-                            .image_cache
-                            .as_ref()
-                            .is_none_or(|cache| cache.read(view_cx).is_settled())
-                    {
+                        .is_some_and(|runtime| runtime.ready_prerequisites(cache_settled));
+                    let ready_written = view
+                        .measurement
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.ready_written);
+                    if ready_prerequisites && !ready_written {
                         let Some(runtime) = view.measurement.as_ref() else {
                             return;
                         };
@@ -1379,7 +1480,7 @@ impl SpikeView {
                             view.image_cache
                                 .as_ref()
                                 .map_or(0, |cache| cache.read(view_cx).used_bytes()),
-                            view.editor.read(view_cx).layout().used_bytes(),
+                            view.editor.read(view_cx).layout_peak_accounted_bytes(),
                             view.editor.read(view_cx).history_used_bytes(),
                             transaction_p95,
                             render_p95,
@@ -1388,8 +1489,12 @@ impl SpikeView {
                             eprintln!("failed to write Task 7 diagnostics: {error}");
                             return;
                         }
-                        if let Err(error) = std::fs::write(&ready_path, b"ready\n") {
+                        let marker = runtime.options.ready_marker();
+                        if let Err(error) =
+                            Diagnostics::write_atomic_bytes(&ready_path, marker.as_bytes())
+                        {
                             eprintln!("failed to write Task 7 ready marker: {error}");
+                            let _ = std::fs::remove_file(&ready_path);
                             return;
                         }
                         if let Some(runtime) = view.measurement.as_mut() {
@@ -1507,6 +1612,9 @@ impl Render for SpikeView {
 
 struct WorkloadReport {
     transaction_histogram: FixedHistogram,
+    apply_undo_pairs: u32,
+    changed_node_assertions: u32,
+    local_restoration_assertions: u32,
     full_document_verifications: u32,
 }
 
@@ -1521,29 +1629,44 @@ fn run_measurement_workload(
     editor.update(cx, |editor, _| {
         editor.shape_visible_with_window(0.0, VIEWPORT_HEIGHT, CONTENT_WIDTH, window);
     });
+    run_edit_undo_pairs(editor, 500, true, cx)
+}
+
+fn run_edit_undo_pairs(
+    editor: &Entity<EditorCore>,
+    iterations: u32,
+    visible_only: bool,
+    cx: &mut App,
+) -> Option<WorkloadReport> {
     let baseline = editor.read(cx).document().semantic_snapshot();
     let baseline_block_count = editor.read(cx).document().block_count();
-    let mut transaction_histogram = FixedHistogram::default();
+    let mut report = WorkloadReport {
+        transaction_histogram: FixedHistogram::default(),
+        apply_undo_pairs: 0,
+        changed_node_assertions: 0,
+        local_restoration_assertions: 0,
+        full_document_verifications: 0,
+    };
 
-    for _ in 0..500 {
+    for _ in 0..iterations {
         let outcome = editor.update(cx, |editor, _| {
-            let point = editor
-                .layout()
-                .visible()
-                .iter()
-                .find_map(|layout| {
-                    editor
-                        .document()
-                        .block(layout.node_id)
-                        .and_then(|block| block.content.as_text().map(|_| block.id))
+            let point = visible_only
+                .then(|| {
+                    editor.layout().visible().iter().find_map(|layout| {
+                        editor
+                            .document()
+                            .block(layout.node_id)
+                            .and_then(|block| block.content.as_text().map(|_| block.id))
+                    })
                 })
-                .or_else(|| {
-                    editor
-                        .document()
-                        .blocks()
-                        .iter()
-                        .find_map(|block| block.content.as_text().map(|_| block.id))
-                })?;
+                .flatten();
+            let point = point.or_else(|| {
+                editor
+                    .document()
+                    .blocks()
+                    .iter()
+                    .find_map(|block| block.content.as_text().map(|_| block.id))
+            })?;
             editor.select_for_workload(DocPoint::with_affinity(point, 0, Affinity::After));
             let selection = editor.selection();
             let before_content = editor
@@ -1558,10 +1681,14 @@ fn run_measurement_workload(
                 })
                 .ok()?;
             let elapsed = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            transaction_histogram.observe_us(elapsed);
+            report.transaction_histogram.observe_us(elapsed);
             if outcome.changed_nodes.len() != 1 {
                 return None;
             }
+            if outcome.changed_nodes[0] != point {
+                return None;
+            }
+            report.changed_node_assertions = report.changed_node_assertions.saturating_add(1);
             editor.undo().ok()?;
             let restored_content = editor
                 .document()
@@ -1573,18 +1700,19 @@ fn run_measurement_workload(
             {
                 return None;
             }
+            report.local_restoration_assertions =
+                report.local_restoration_assertions.saturating_add(1);
             Some(())
         });
         outcome?;
+        report.apply_undo_pairs = report.apply_undo_pairs.saturating_add(1);
     }
 
     if editor.read(cx).document().semantic_snapshot() != baseline {
         return None;
     }
-    Some(WorkloadReport {
-        transaction_histogram,
-        full_document_verifications: 1,
-    })
+    report.full_document_verifications = report.full_document_verifications.saturating_add(1);
+    Some(report)
 }
 
 fn sample_document() -> Document {
@@ -1891,8 +2019,11 @@ fn bind_donor_actions(
 mod tests {
     use super::*;
     use crate::components::{self, Copy, Cut};
+    use crate::native_editor::fixtures::typical_image_payload;
     use crate::native_editor::images::ImagePayload;
-    use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext, point};
+    use gpui::{
+        AppContext, ImageCache, Modifiers, Resource, TestAppContext, VisualTestContext, point,
+    };
     use std::mem::size_of;
 
     #[test]
@@ -1938,6 +2069,27 @@ mod tests {
             ])
             .is_err()
         );
+        for token in ["--help", "-h", "--version", "-v", "-V"] {
+            let args = vec!["--evernote-spike".into(), "--fixture".into(), token.into()];
+            assert_eq!(
+                global_help_or_version(&args),
+                Some(if token == "--help" || token == "-h" {
+                    "help"
+                } else {
+                    "version"
+                }),
+                "global option must win over fixture value parsing: {token}"
+            );
+        }
+        assert_eq!(
+            global_help_or_version(&[
+                "--ready-file".into(),
+                "/tmp/ready".into(),
+                "--diagnostics-file".into(),
+                "--version".into(),
+            ]),
+            Some("version")
+        );
     }
 
     #[gpui::test]
@@ -1948,30 +2100,165 @@ mod tests {
         editor
             .update(cx, |editor, _| populate_typical_images(editor))
             .expect("typical fixture images should insert through production path");
-        let (text_or_list_count, image_count, resources) = editor.update(cx, |editor, _| {
-            let document = editor.document();
-            let text_or_list_count = document
-                .blocks()
-                .into_iter()
-                .filter(|block| block.content.as_text().is_some_and(|text| !text.is_empty()))
-                .count();
-            let mut resources = std::collections::BTreeSet::new();
-            let image_count = document
-                .blocks()
-                .into_iter()
-                .filter_map(|block| match &block.content {
-                    crate::native_editor::model::BlockContent::Image { resource_id, .. } => {
-                        resources.insert(resource_id.clone());
-                        Some(())
-                    }
-                    _ => None,
-                })
-                .count();
-            (text_or_list_count, image_count, resources)
-        });
+        let (text_or_list_count, image_count, resources, dimensions) =
+            editor.update(cx, |editor, _| {
+                let document = editor.document();
+                let text_or_list_count = document
+                    .blocks()
+                    .into_iter()
+                    .filter(|block| block.content.as_text().is_some_and(|text| !text.is_empty()))
+                    .count();
+                let mut resources = std::collections::BTreeSet::new();
+                let image_count = document
+                    .blocks()
+                    .into_iter()
+                    .filter_map(|block| match &block.content {
+                        crate::native_editor::model::BlockContent::Image {
+                            resource_id, ..
+                        } => {
+                            resources.insert(resource_id.clone());
+                            Some(())
+                        }
+                        _ => None,
+                    })
+                    .count();
+                let dimensions = resources
+                    .iter()
+                    .map(|resource_id| {
+                        let metadata = editor
+                            .image_metadata(resource_id)
+                            .expect("production ImageStore metadata");
+                        (metadata.natural_width, metadata.natural_height)
+                    })
+                    .collect::<Vec<_>>();
+                (text_or_list_count, image_count, resources, dimensions)
+            });
         assert_eq!(text_or_list_count, 200);
         assert_eq!(image_count, typical_image_count());
         assert_eq!(resources.len(), typical_image_count());
+        assert!(dimensions.iter().all(|size| *size == (1600, 900)));
+        assert_eq!(
+            dimensions.len() * 1600 * 900 * 4,
+            typical_image_count() * 1600 * 900 * 4,
+            "production texture authority input dimensions"
+        );
+    }
+
+    #[gpui::test]
+    fn long_fixture_runs_exactly_five_hundred_real_edit_undo_pairs(cx: &mut TestAppContext) {
+        let mut cx = cx.add_empty_window();
+        let editor = cx.new(|cx| EditorCore::new(build_document(FixtureKind::Long), cx));
+        let report = cx
+            .update(|_, app| run_edit_undo_pairs(&editor, 500, false, app))
+            .expect("long fixture workload should restore its baseline");
+        assert_eq!(report.apply_undo_pairs, 500);
+        assert_eq!(report.changed_node_assertions, 500);
+        assert_eq!(report.local_restoration_assertions, 500);
+        assert_eq!(report.full_document_verifications, 1);
+        assert_eq!(report.transaction_histogram.sample_count(), 500);
+    }
+
+    #[gpui::test]
+    fn typical_fixture_loads_each_1600x900_resource_through_production_cache(
+        cx: &mut TestAppContext,
+    ) {
+        let root =
+            std::env::temp_dir().join(format!("task7-typical-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("typical cache fixture directory");
+        let paths = (0..typical_image_count())
+            .map(|index| {
+                let path = root.join(format!("fixture-{index}.png"));
+                std::fs::write(&path, typical_image_payload(index).bytes)
+                    .expect("typical fixture PNG");
+                path
+            })
+            .collect::<Vec<_>>();
+        let cache =
+            cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
+        let mut window = cx.add_empty_window();
+        let expected_minimum = 1600usize * 900 * 4;
+        for path in &paths {
+            let resource = Resource::from(path.clone());
+            window.update(|window, app| {
+                cache.update(app, |cache, entity_cx| {
+                    cache.set_visible_resources([&resource]);
+                    assert!(cache.load(&resource, window, entity_cx).is_none());
+                });
+            });
+            window.run_until_parked();
+            window.update(|window, app| {
+                cache.update(app, |cache, entity_cx| {
+                    assert!(cache.load(&resource, window, entity_cx).is_some());
+                    assert!(cache.used_bytes() >= expected_minimum);
+                    assert!(cache.used_bytes() <= DECODED_IMAGE_CACHE_BUDGET);
+                    assert!(cache.is_settled());
+                });
+            });
+        }
+        assert!(window.read(|app| cache.read(app).used_bytes()) >= expected_minimum);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn viewport_readiness_requires_all_one_hundred_twenty_commits_and_reset() {
+        let options = SpikeLaunchOptions {
+            fixture: FixtureKind::Empty,
+            ready_file: PathBuf::from("/tmp/task7-ready"),
+            diagnostics_file: PathBuf::from("/tmp/task7-diagnostics"),
+            run_id: "test-run".into(),
+            binary_sha256: "test-sha".into(),
+        };
+        let mut runtime = MeasurementRuntime::new(options);
+        runtime.workload_complete = true;
+        runtime.render_sample_count = 120;
+        runtime.viewport_complete = true;
+        assert!(!runtime.ready_prerequisites(true));
+        for _ in 0..120 {
+            runtime.request_viewport_frame();
+            runtime.complete_viewport_frame();
+        }
+        runtime.request_viewport_reset_frame();
+        runtime.complete_viewport_frame();
+        runtime.record_paint(false, true, 1);
+        assert!(runtime.ready_prerequisites(true));
+        assert_eq!(runtime.viewport_frames_requested, 120);
+        assert_eq!(runtime.viewport_frames_completed, 120);
+        assert_eq!(runtime.viewport_reset_frames_requested, 1);
+        assert_eq!(runtime.viewport_reset_frames_completed, 1);
+        runtime.viewport_frames_completed -= 1;
+        assert!(!runtime.ready_prerequisites(true));
+
+        // The final restored-state paint is separate from the 120 viewport
+        // shift paints.  A runtime that accepts 121 shift samples has not
+        // proved the exact lifecycle contract and must stay unready.
+        runtime.viewport_frames_completed = 120;
+        runtime.render_sample_count = 121;
+        assert!(!runtime.ready_prerequisites(true));
+
+        // A reset paint cannot satisfy the shift-sample contract by itself.
+        runtime.render_sample_count = 120;
+        runtime.viewport_reset_paint_count = 2;
+        assert!(!runtime.ready_prerequisites(true));
+    }
+
+    #[test]
+    fn viewport_paint_accounting_records_only_shift_samples_in_render_histogram() {
+        let options = SpikeLaunchOptions {
+            fixture: FixtureKind::Empty,
+            ready_file: PathBuf::from("/tmp/task7-ready"),
+            diagnostics_file: PathBuf::from("/tmp/task7-diagnostics"),
+            run_id: "test-run".into(),
+            binary_sha256: "test-sha".into(),
+        };
+        let mut runtime = MeasurementRuntime::new(options);
+        for _ in 0..120 {
+            runtime.record_paint(true, false, 10);
+        }
+        runtime.record_paint(false, true, 20);
+        assert_eq!(runtime.render_sample_count, 120);
+        assert_eq!(runtime.render_histogram.sample_count(), 120);
+        assert_eq!(runtime.viewport_reset_paint_count, 1);
+        assert!(!runtime.ready_prerequisites(true));
     }
 
     fn redraw(cx: &mut VisualTestContext) {
