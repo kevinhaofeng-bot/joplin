@@ -12,7 +12,7 @@ use gpui::{
 use std::cell::RefCell;
 
 use super::core::EditorCore;
-use super::images::BudgetedImageCache;
+use super::images::{BudgetedImageCache, proxy_max_edge_for_viewport};
 use super::layout::{BlockLayout, ordered_number_summary};
 use super::model::{BlockKind, Document, NodeId, Selection};
 
@@ -182,6 +182,15 @@ fn paint_snapshot(
             .collect::<Vec<_>>();
         cache.update(cx, |cache, cache_cx| {
             cache.set_visible_resources(visible_resources.iter().copied());
+            for block in snapshot.blocks.iter().filter(|block| block.is_image) {
+                if let Some(resource) = block.image_resource.as_ref() {
+                    let max_edge = proxy_max_edge_for_viewport(
+                        f32::from(block.layout.bounds.size.width),
+                        window.scale_factor(),
+                    );
+                    cache.request_edge(resource, max_edge);
+                }
+            }
             cache.evict_offscreen(window, cache_cx);
         });
     }

@@ -20,14 +20,37 @@ use image::{AnimationDecoder, ImageBuffer, codecs::gif::GifDecoder, imageops::Fi
 use smallvec::SmallVec;
 
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
-const MACOS_PROXY_MAX_EDGE: u32 = 1600;
-/// The editor surface is 680pt wide in the spike. Keep the retained native
-/// proxy viewport-sized with a small interpolation margin while preserving
-/// the image node's natural metadata.
-pub const VIEWPORT_IMAGE_PROXY_MAX_EDGE: u32 = 800;
+const DEFAULT_PROXY_MAX_EDGE: u32 = 1600;
+const PROXY_EDGE_TIER: u32 = 64;
 const CONSERVATIVE_PROXY_RESERVATION: usize = 4 * 1024 * 1024;
-const VIEWPORT_PROXY_MAX_BYTES: usize =
-    (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize) * (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize) * 4;
+
+/// Return the minimum proxy edge that can cover a viewport-sized image at the
+/// display's device-pixel density.  GPUI dimensions are logical pixels, while
+/// `RenderImage` stores device pixels, so using a fixed edge here would blur
+/// images on Retina displays.
+pub(crate) fn proxy_max_edge_for_viewport(viewport_width: f32, scale_factor: f32) -> u32 {
+    if !viewport_width.is_finite()
+        || viewport_width <= 0.0
+        || !scale_factor.is_finite()
+        || scale_factor <= 0.0
+    {
+        return 1;
+    }
+    (f64::from(viewport_width) * f64::from(scale_factor))
+        .ceil()
+        .clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
+fn proxy_reservation_bytes(max_edge: u32) -> usize {
+    (max_edge as usize)
+        .checked_mul(max_edge as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .unwrap_or(usize::MAX)
+}
+
+fn quantize_proxy_edge(max_edge: u32) -> u32 {
+    max_edge.max(1).saturating_add(PROXY_EDGE_TIER - 1) / PROXY_EDGE_TIER * PROXY_EDGE_TIER
+}
 
 #[cfg(target_os = "macos")]
 mod mac_pressure {
@@ -726,6 +749,7 @@ struct CachedTexture {
     item: ImageCacheItem,
     decoded_bytes: usize,
     generation: u64,
+    proxy_max_edge: u32,
 }
 
 /// GPUI 0.2.2 image-cache adapter.  It preserves the donor's shared loading
@@ -743,6 +767,7 @@ pub struct BudgetedImageCache {
     reserved_bytes: usize,
     reservations: HashMap<u64, (u64, usize)>,
     pending_retries: HashMap<u64, (u64, Resource)>,
+    requested_edges: HashMap<u64, u32>,
     harvested_generations: HashSet<(u64, u64)>,
     next_generation: u64,
     #[cfg(test)]
@@ -764,6 +789,7 @@ impl BudgetedImageCache {
             reserved_bytes: 0,
             reservations: HashMap::new(),
             pending_retries: HashMap::new(),
+            requested_edges: HashMap::new(),
             harvested_generations: HashSet::new(),
             next_generation: 0,
             #[cfg(test)]
@@ -793,6 +819,7 @@ impl BudgetedImageCache {
             cache.reserved_bytes = 0;
             cache.reservations.clear();
             cache.pending_retries.clear();
+            cache.requested_edges.clear();
             cache.harvested_generations.clear();
             #[cfg(test)]
             {
@@ -866,7 +893,17 @@ impl BudgetedImageCache {
         if next != self.visible {
             self.visible = next;
             self.deferred.clear();
+            self.requested_edges
+                .retain(|key, _| self.visible.contains(key));
         }
+    }
+
+    /// Record the device-pixel requirement for a visible image before its
+    /// `ImageCache::load` call. A larger request promotes the proxy; a smaller
+    /// request does not churn an already-promoted texture.
+    pub fn request_edge(&mut self, resource: &Resource, max_edge: u32) {
+        self.requested_edges
+            .insert(hash(resource), quantize_proxy_edge(max_edge));
     }
 
     /// Drop completed entries that have left the current viewport. This uses
@@ -887,6 +924,7 @@ impl BudgetedImageCache {
                 continue;
             };
             self.lru.retain(|candidate| *candidate != key);
+            self.requested_edges.remove(&key);
             self.used_bytes = self.used_bytes.saturating_sub(entry.decoded_bytes);
             dropped_bytes = dropped_bytes.saturating_add(entry.decoded_bytes);
             if let Some(Ok(image)) = entry.item.get() {
@@ -999,6 +1037,14 @@ impl BudgetedImageCache {
         bytes: &[u8],
         budget_bytes: usize,
     ) -> Result<Arc<RenderImage>, ImageCacheError> {
+        Self::decode_bounded_with_max_edge(bytes, budget_bytes, DEFAULT_PROXY_MAX_EDGE)
+    }
+
+    fn decode_bounded_with_max_edge(
+        bytes: &[u8],
+        budget_bytes: usize,
+        max_edge: u32,
+    ) -> Result<Arc<RenderImage>, ImageCacheError> {
         let guessed_format = image::guess_format(bytes);
         let is_svg = guessed_format.is_err();
         let mut frames = if let Ok(format) = guessed_format {
@@ -1024,7 +1070,7 @@ impl BudgetedImageCache {
                 svg_size.width(),
                 svg_size.height(),
                 budget_bytes,
-                MACOS_PROXY_MAX_EDGE,
+                max_edge,
             )?;
             let mut pixmap = resvg::tiny_skia::Pixmap::new(target_width, target_height)
                 .ok_or_else(|| anyhow!("SVG renderer returned invalid size"))?;
@@ -1053,14 +1099,26 @@ impl BudgetedImageCache {
                     )
                     .ok_or_else(|| anyhow!("decoded image budget overflow"))
                 })?;
-        if decoded_bytes > budget_bytes {
-            let max_pixels = budget_bytes / 4;
-            if max_pixels < frames.len() {
-                return Err(ImageCacheError::from(anyhow!(
-                    "decoded animation exceeds minimum budget"
-                )));
-            }
-            let scale = (max_pixels as f64 / (decoded_bytes / 4) as f64).sqrt();
+        let max_pixels = budget_bytes / 4;
+        if max_pixels < frames.len() {
+            return Err(ImageCacheError::from(anyhow!(
+                "decoded animation exceeds minimum budget"
+            )));
+        }
+        let source_max_edge = frames
+            .iter()
+            .map(|frame| {
+                let (width, height) = frame.buffer().dimensions();
+                width.max(height)
+            })
+            .max()
+            .unwrap_or(1);
+        let edge_scale = (f64::from(max_edge.max(1)) / f64::from(source_max_edge)).min(1.0);
+        let budget_scale = ((max_pixels as f64 * frames.len() as f64) / (decoded_bytes / 4) as f64)
+            .sqrt()
+            .min(1.0);
+        let scale = edge_scale.min(budget_scale);
+        if scale < 1.0 {
             frames = frames
                 .into_iter()
                 .map(|frame| {
@@ -1115,6 +1173,14 @@ impl BudgetedImageCache {
         resource: &Resource,
         budget_bytes: usize,
     ) -> Result<Arc<RenderImage>, ImageCacheError> {
+        Self::decode_resource_bounded_with_max_edge(resource, budget_bytes, DEFAULT_PROXY_MAX_EDGE)
+    }
+
+    fn decode_resource_bounded_with_max_edge(
+        resource: &Resource,
+        budget_bytes: usize,
+        max_edge: u32,
+    ) -> Result<Arc<RenderImage>, ImageCacheError> {
         let result = match resource {
             Resource::Path(path) => {
                 #[cfg(target_os = "macos")]
@@ -1123,15 +1189,15 @@ impl BudgetedImageCache {
                         extension.to_string_lossy().eq_ignore_ascii_case("svg")
                     }) {
                         let bytes = std::fs::read(path.as_ref()).map_err(ImageCacheError::from)?;
-                        Self::decode_bounded(&bytes, budget_bytes)
+                        Self::decode_bounded_with_max_edge(&bytes, budget_bytes, max_edge)
                     } else {
-                        Self::decode_macos_path(path, budget_bytes)
+                        Self::decode_macos_path(path, budget_bytes, max_edge)
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
                     let bytes = std::fs::read(path.as_ref()).map_err(ImageCacheError::from)?;
-                    Self::decode_bounded(&bytes, budget_bytes)
+                    Self::decode_bounded_with_max_edge(&bytes, budget_bytes, max_edge)
                 }
             }
             _ => Err(ImageCacheError::from(anyhow!(
@@ -1156,6 +1222,7 @@ impl BudgetedImageCache {
     fn decode_macos_path(
         path: &Path,
         budget_bytes: usize,
+        max_edge: u32,
     ) -> Result<Arc<RenderImage>, ImageCacheError> {
         use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType, CFURL};
         use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -1184,7 +1251,7 @@ impl BudgetedImageCache {
             .and_then(|bytes| bytes.checked_div(4))
             .ok_or_else(|| ImageCacheError::from(anyhow!("decoded image budget is too small")))?;
         let budget_edge = (max_pixels_per_frame as f64).sqrt().floor() as u32;
-        let max_edge = VIEWPORT_IMAGE_PROXY_MAX_EDGE.min(budget_edge.max(1));
+        let max_edge = max_edge.min(budget_edge.max(1));
         let create_thumbnail = CFBoolean::new(true);
         let transform = CFBoolean::new(true);
         let should_cache = CFBoolean::new(false);
@@ -1381,6 +1448,25 @@ impl ImageCache for BudgetedImageCache {
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         let key = hash(resource);
+        let max_edge = self.requested_edges.get(&key).copied().unwrap_or_else(|| {
+            quantize_proxy_edge(proxy_max_edge_for_viewport(
+                f32::from(window.viewport_size().width),
+                window.scale_factor(),
+            ))
+        });
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| max_edge > entry.proxy_max_edge)
+        {
+            self.invalidate(resource, window, cx);
+            // An in-flight generation owns the only decode slot. Its
+            // completion callback will restart the pending retry at the
+            // promoted edge once the old proxy has been dropped.
+            if self.in_flight > 0 {
+                return None;
+            }
+        }
         if let Some(mut entry) = self.entries.remove(&key) {
             self.lru.retain(|value| *value != key);
             let was_loading = matches!(&entry.item, ImageCacheItem::Loading(_));
@@ -1462,7 +1548,7 @@ impl ImageCache for BudgetedImageCache {
         // A fixed proxy floor is only a scheduling hint. If visible retained
         // images leave less than that floor, reserve the exact remaining
         // bytes instead of permanently deferring a proxy that can fit.
-        let reservation = remaining.min(VIEWPORT_PROXY_MAX_BYTES);
+        let reservation = remaining.min(proxy_reservation_bytes(max_edge));
         // A RenderImage must contain at least one complete RGBA pixel. A
         // smaller remainder is still capacity pressure, not a decoder error;
         // leave it deferred until the visible set/capacity changes.
@@ -1477,7 +1563,8 @@ impl ImageCache for BudgetedImageCache {
         self.reservations.insert(key, (generation, reservation));
         let budget = reservation;
         let source = resource.clone();
-        let load_future = async move { Self::decode_resource_bounded(&source, budget) };
+        let load_future =
+            async move { Self::decode_resource_bounded_with_max_edge(&source, budget, max_edge) };
         let task = cx.background_executor().spawn(load_future).shared();
         self.entries.insert(
             key,
@@ -1485,6 +1572,7 @@ impl ImageCache for BudgetedImageCache {
                 item: ImageCacheItem::Loading(task.clone()),
                 decoded_bytes: 0,
                 generation,
+                proxy_max_edge: max_edge,
             },
         );
         self.in_flight = self.in_flight.saturating_add(1);
@@ -1793,6 +1881,39 @@ mod tests {
     }
 
     #[test]
+    fn viewport_proxy_uses_device_pixels_without_retina_downsampling() {
+        assert_eq!(proxy_max_edge_for_viewport(680.0, 2.0), 1360);
+        assert_eq!(proxy_max_edge_for_viewport(680.0, 1.0), 680);
+    }
+
+    #[test]
+    fn viewport_proxy_ignores_invalid_scale_and_width() {
+        assert_eq!(proxy_max_edge_for_viewport(0.0, 2.0), 1);
+        assert_eq!(proxy_max_edge_for_viewport(680.0, 0.0), 1);
+        assert_eq!(proxy_max_edge_for_viewport(f32::NAN, 2.0), 1);
+    }
+
+    #[test]
+    fn bounded_decode_respects_viewport_device_pixel_edge() {
+        let source = ImageBuffer::from_pixel(4096, 4096, Rgba([0x11, 0x22, 0x33, 0xff]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("fixture PNG should encode");
+        let image = BudgetedImageCache::decode_bounded_with_max_edge(
+            encoded.get_ref(),
+            DECODED_IMAGE_CACHE_BUDGET,
+            1360,
+        )
+        .expect("bounded decode should succeed");
+        let size = image.size(0);
+        assert_eq!(
+            (u32::from(size.width), u32::from(size.height)),
+            (1360, 1360)
+        );
+    }
+
+    #[test]
     fn bounded_svg_uses_target_pixmap_for_huge_source_and_preserves_ratio() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000" height="10000"><rect width="10000" height="10000" fill="#123456"/></svg>"##;
         let image = BudgetedImageCache::decode_bounded(svg, DECODED_IMAGE_CACHE_BUDGET)
@@ -1800,7 +1921,7 @@ mod tests {
         let size = image.size(0);
         let width = u32::from(size.width);
         let height = u32::from(size.height);
-        assert!(width.max(height) <= MACOS_PROXY_MAX_EDGE);
+        assert!(width.max(height) <= DEFAULT_PROXY_MAX_EDGE);
         assert!(u64::from(width) * u64::from(height) * 4 <= DECODED_IMAGE_CACHE_BUDGET as u64);
         assert_eq!((width, height), (1600, 1600));
         let ratio = width as f64 / height as f64;
@@ -1810,7 +1931,7 @@ mod tests {
                 10_000.0,
                 10_000.0,
                 DECODED_IMAGE_CACHE_BUDGET,
-                MACOS_PROXY_MAX_EDGE,
+                DEFAULT_PROXY_MAX_EDGE,
             )
             .expect("bounded SVG geometry"),
             (1600, 1600)
@@ -1823,12 +1944,12 @@ mod tests {
             10_000.0,
             5_000.0,
             DECODED_IMAGE_CACHE_BUDGET,
-            MACOS_PROXY_MAX_EDGE,
+            DEFAULT_PROXY_MAX_EDGE,
         )
         .expect("wide SVG geometry");
         let ratio = width as f64 / height as f64;
         assert!((ratio - 2.0).abs() < 0.002);
-        assert!(width.max(height) <= MACOS_PROXY_MAX_EDGE);
+        assert!(width.max(height) <= DEFAULT_PROXY_MAX_EDGE);
         assert!(u64::from(width) * u64::from(height) * 4 <= DECODED_IMAGE_CACHE_BUDGET as u64);
     }
 
@@ -2024,6 +2145,89 @@ mod tests {
                 assert_eq!(cache.len(), 0);
                 assert!(cache.drop_image_calls_for_test() > 0);
                 assert!(cache.is_settled());
+            });
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn production_cache_promotes_visible_proxy_without_downgrade_churn(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "joplin-lite-cache-promotion-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("promotion fixture directory");
+        let source = root.join("image.png");
+        let image = ImageBuffer::from_pixel(1600, 900, Rgba([0x11, 0x22, 0x33, 0xff]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("promotion fixture should encode");
+        std::fs::write(&source, encoded.into_inner()).expect("promotion fixture should write");
+        let resource = Resource::from(source.clone());
+        let cache =
+            cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
+        let window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&resource]);
+                cache.request_edge(&resource, 680);
+                assert!(cache.load(&resource, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        let low_edge = window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("low-resolution proxy should settle")
+                    .expect("low-resolution proxy should decode");
+                let size = image.size(0);
+                u32::from(size.width).max(u32::from(size.height))
+            })
+        });
+        assert!(
+            low_edge >= 680 && low_edge < 1360,
+            "initial proxy edge was {low_edge}"
+        );
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.request_edge(&resource, 1360);
+                assert!(cache.load(&resource, window, entity_cx).is_none());
+                assert_eq!(cache.in_flight_for_test(), 1);
+            });
+        });
+        window.run_until_parked();
+        let promoted_edge = window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("promoted proxy should settle")
+                    .expect("promoted proxy should decode");
+                let size = image.size(0);
+                u32::from(size.width).max(u32::from(size.height))
+            })
+        });
+        assert!(
+            promoted_edge >= 1360,
+            "promoted proxy edge was {promoted_edge}"
+        );
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.request_edge(&resource, 680);
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("shrinking viewport should reuse promoted proxy")
+                    .expect("promoted proxy should remain valid");
+                let size = image.size(0);
+                assert_eq!(
+                    u32::from(size.width).max(u32::from(size.height)),
+                    promoted_edge
+                );
+                assert_eq!(cache.in_flight_for_test(), 0);
             });
         });
         let _ = std::fs::remove_dir_all(root);
@@ -2247,6 +2451,7 @@ mod tests {
                 item: ImageCacheItem::Loaded(Err(error.clone())),
                 decoded_bytes: 0,
                 generation: 1,
+                proxy_max_edge: 1,
             },
         );
         cache.entries.remove(&key);
@@ -2260,6 +2465,7 @@ mod tests {
                 item: ImageCacheItem::Loaded(Err(error)),
                 decoded_bytes: 0,
                 generation: 2,
+                proxy_max_edge: 1,
             },
         );
 

@@ -2020,7 +2020,7 @@ mod tests {
     use super::*;
     use crate::components::{self, Copy, Cut};
     use crate::native_editor::fixtures::typical_image_payload;
-    use crate::native_editor::images::{ImagePayload, VIEWPORT_IMAGE_PROXY_MAX_EDGE};
+    use crate::native_editor::images::{ImagePayload, proxy_max_edge_for_viewport};
     use gpui::{
         AppContext, ImageCache, Modifiers, Resource, TestAppContext, VisualTestContext, point,
     };
@@ -2176,16 +2176,19 @@ mod tests {
         let cache =
             cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
         let window = cx.add_empty_window();
-        let expected_minimum = VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize
-            * (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize * 900 / 1600)
-            * 4;
+        // This direct cache test supplies the same 680pt editor content width
+        // used by the spike's image blocks. The real render path supplies its
+        // block width before each cache load.
+        let requested_edge = proxy_max_edge_for_viewport(680.0, 1.0);
+        let expected_minimum = requested_edge as usize * (requested_edge as usize * 900 / 1600) * 4;
         let expected_proxy_upper_bound =
-            (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize) * (VIEWPORT_IMAGE_PROXY_MAX_EDGE as usize) * 4;
+            (requested_edge as usize + 63) * (requested_edge as usize + 63) * 4;
         for path in &paths {
             let resource = Resource::from(path.clone());
             window.update(|window, app| {
                 cache.update(app, |cache, entity_cx| {
                     cache.set_visible_resources([&resource]);
+                    cache.request_edge(&resource, requested_edge);
                     cache.evict_offscreen(window, entity_cx);
                     assert!(cache.load(&resource, window, entity_cx).is_none());
                 });
@@ -2197,20 +2200,16 @@ mod tests {
                         .load(&resource, window, entity_cx)
                         .expect("production cache should return decoded image")
                         .expect("typical fixture image should decode");
-                    #[cfg(target_os = "macos")]
-                    {
-                        let size = image.size(0);
-                        let width = u32::from(size.width);
-                        let height = u32::from(size.height);
-                        assert!(
-                            width.max(height) <= VIEWPORT_IMAGE_PROXY_MAX_EDGE,
-                            "production proxy retained at {}x{}",
-                            width,
-                            height
-                        );
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    drop(image);
+                    let size = image.size(0);
+                    let width = u32::from(size.width);
+                    let height = u32::from(size.height);
+                    assert!(
+                        width.max(height) <= requested_edge.saturating_add(63),
+                        "production proxy retained at {}x{} for request {}",
+                        width,
+                        height,
+                        requested_edge
+                    );
                     assert!(cache.used_bytes() >= expected_minimum);
                     assert!(cache.used_bytes() <= DECODED_IMAGE_CACHE_BUDGET);
                     assert!(cache.is_settled());
