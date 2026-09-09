@@ -175,7 +175,14 @@ fn paint_snapshot(
     cx: &mut App,
 ) -> gpui::Result<()> {
     if let Some(cache) = image_cache.as_ref() {
-        cache.update(cx, |cache, _| cache.begin_frame());
+        let visible_resources = snapshot
+            .blocks
+            .iter()
+            .filter_map(|block| block.image_resource.as_ref())
+            .collect::<Vec<_>>();
+        cache.update(cx, |cache, _| {
+            cache.set_visible_resources(visible_resources.iter().copied())
+        });
     }
     // 1. Block surfaces.
     for block in &snapshot.blocks {
@@ -211,10 +218,7 @@ fn paint_snapshot(
         if block.is_image {
             let image = block.image_resource.as_ref().and_then(|resource| {
                 image_cache.as_ref().and_then(|cache| {
-                    cache.update(cx, |cache, cx| {
-                        cache.mark_visible(resource);
-                        cache.load(resource, window, cx)
-                    })
+                    cache.update(cx, |cache, cx| cache.load(resource, window, cx))
                 })
             });
             if let Some(Ok(image)) = image {

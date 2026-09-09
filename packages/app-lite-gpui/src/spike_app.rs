@@ -1532,6 +1532,24 @@ mod tests {
             .bytes
     }
 
+    fn exif_jpeg_bytes(orientation: u32) -> Vec<u8> {
+        assert!((1..=8).contains(&orientation));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::ImageBuffer::from_fn(4, 2, |x, y| {
+            image::Rgb([(x * 50) as u8, (y * 100) as u8, 10])
+        }))
+        .write_to(&mut encoded, image::ImageFormat::Jpeg)
+        .expect("JPEG fixture should encode");
+        let mut exif = b"Exif\0\0MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+        exif.extend_from_slice(&[0, orientation as u8, 0, 0, 0, 0, 0, 0]);
+        let segment_len = u16::try_from(exif.len() + 2).expect("small EXIF fixture");
+        let mut segment = vec![0xff, 0xe1, (segment_len >> 8) as u8, segment_len as u8];
+        segment.extend_from_slice(&exif);
+        let mut jpeg = encoded.into_inner();
+        jpeg.splice(2..2, segment);
+        jpeg
+    }
+
     fn build_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
         let editor = cx.new(|cx| EditorCore::new(Document::from_paragraphs(["alpha", "beta"]), cx));
         editor.read(cx).focus_handle().focus(window);
@@ -1664,6 +1682,71 @@ mod tests {
             !pasteboard_path.exists(),
             "temporary pasteboard file is cleaned up"
         );
+    }
+
+    #[gpui::test]
+    fn production_clipboard_prefers_native_exif_paths_and_decodes_transformed_geometry(
+        cx: &mut TestAppContext,
+    ) {
+        for orientation in [6, 8] {
+            let source_path = std::env::temp_dir().join(format!(
+                "joplin-lite-task6-exif-{orientation}-{}.jpg",
+                std::process::id()
+            ));
+            let bytes = exif_jpeg_bytes(orientation);
+            std::fs::write(&source_path, &bytes).expect("EXIF fixture should be writable");
+            let mut editor = EditorCore::for_test("前后", cx);
+            let merged = resolve_clipboard_payload(
+                Some(ClipboardPayload {
+                    file_urls: vec![source_path.clone()],
+                    temporary_files: vec![source_path.clone()],
+                    ..Default::default()
+                }),
+                Some(ClipboardPayload {
+                    images: vec![ImagePayload::new(gpui::ImageFormat::Jpeg, bytes.clone())],
+                    ..Default::default()
+                }),
+            )
+            .expect("native and GPUI representations should merge");
+            assert!(matches!(
+                classify_clipboard(merged.clone()),
+                PasteIntent::File { .. }
+            ));
+            apply_clipboard_payload(&mut editor, merged)
+                .expect("native EXIF path should insert through production paste");
+
+            let resource_id = editor
+                .document()
+                .blocks()
+                .iter()
+                .find_map(|block| match &block.content {
+                    crate::native_editor::model::BlockContent::Image { resource_id, .. } => {
+                        Some(resource_id.clone())
+                    }
+                    _ => None,
+                })
+                .expect("clipboard paste should commit an image node");
+            let metadata = editor
+                .image_metadata(&resource_id)
+                .expect("image metadata should be retained");
+            assert_eq!((metadata.natural_width, metadata.natural_height), (2, 4));
+            let managed_path = editor
+                .image_source_path(&resource_id)
+                .expect("managed path should be retained")
+                .to_path_buf();
+            assert_eq!(std::fs::read(&managed_path).expect("managed bytes"), bytes);
+            let proxy = BudgetedImageCache::decode_resource_bounded(
+                &gpui::Resource::from(managed_path),
+                DECODED_IMAGE_CACHE_BUDGET,
+            )
+            .expect("ImageIO should decode the transformed EXIF proxy");
+            let size = proxy.size(0);
+            assert_eq!((u32::from(size.width), u32::from(size.height)), (2, 4));
+            assert!(
+                !source_path.exists(),
+                "owned clipboard temp must be reclaimed"
+            );
+        }
     }
 
     #[gpui::test]
