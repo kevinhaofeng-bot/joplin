@@ -22,6 +22,58 @@ use smallvec::SmallVec;
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
 const MACOS_PROXY_MAX_EDGE: u32 = 1600;
 
+#[cfg(target_os = "macos")]
+mod mac_pressure {
+    use std::path::Path;
+
+    const LARGE_RESOURCE_BYTES: u64 = 4 * 1024 * 1024;
+
+    #[cfg(test)]
+    use std::sync::{Mutex, OnceLock};
+
+    #[cfg(test)]
+    type TestHook = Box<dyn Fn() + Send + Sync + 'static>;
+
+    #[cfg(test)]
+    static TEST_HOOK: OnceLock<Mutex<Option<TestHook>>> = OnceLock::new();
+
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+
+    /// Return unused large malloc-zone pages after a large ImageIO decode has
+    /// released its source/thumbnail objects.  This is deliberately called at
+    /// the resource-load boundary, never from paint or cache-hit paths.
+    pub fn relieve_for_path(path: &Path) {
+        let Ok(size) = std::fs::metadata(path).map(|metadata| metadata.len()) else {
+            return;
+        };
+        if size < LARGE_RESOURCE_BYTES {
+            return;
+        }
+
+        #[cfg(test)]
+        if let Ok(guard) = TEST_HOOK.get_or_init(|| Mutex::new(None)).lock()
+            && let Some(hook) = guard.as_ref()
+        {
+            hook();
+            return;
+        }
+
+        // SAFETY: libSystem accepts a null zone to relieve all malloc zones;
+        // this call only asks the allocator to return currently-unused pages.
+        unsafe {
+            let _ = malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_test_hook(hook: Option<TestHook>) {
+        *TEST_HOOK.get_or_init(|| Mutex::new(None)).lock().unwrap() = hook;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImagePayload {
     pub format: ImageFormat,
@@ -759,7 +811,7 @@ impl BudgetedImageCache {
         resource: &Resource,
         budget_bytes: usize,
     ) -> Result<Arc<RenderImage>, ImageCacheError> {
-        match resource {
+        let result = match resource {
             Resource::Path(path) => {
                 #[cfg(target_os = "macos")]
                 {
@@ -767,9 +819,10 @@ impl BudgetedImageCache {
                         extension.to_string_lossy().eq_ignore_ascii_case("svg")
                     }) {
                         let bytes = std::fs::read(path.as_ref()).map_err(ImageCacheError::from)?;
-                        return Self::decode_bounded(&bytes, budget_bytes);
+                        Self::decode_bounded(&bytes, budget_bytes)
+                    } else {
+                        Self::decode_macos_path(path, budget_bytes)
                     }
-                    return Self::decode_macos_path(path, budget_bytes);
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -780,7 +833,14 @@ impl BudgetedImageCache {
             _ => Err(ImageCacheError::from(anyhow!(
                 "native images require a managed path resource"
             ))),
+        };
+        #[cfg(target_os = "macos")]
+        if result.is_ok()
+            && let Resource::Path(path) = resource
+        {
+            mac_pressure::relieve_for_path(path);
         }
+        result
     }
 
     #[cfg(target_os = "macos")]
@@ -1275,5 +1335,68 @@ mod tests {
         assert_eq!(store.metadata(id).unwrap().natural_width, 4031);
         assert_eq!(store.metadata(id).unwrap().natural_height, 3023);
         assert_eq!(std::fs::read(&path).expect("managed source"), original);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_large_resource_decode_reliefs_allocator_once_but_small_does_not() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        mac_pressure::set_test_hook(Some(Box::new(move || {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+        })));
+
+        let source = ImageBuffer::from_fn(1536, 1536, |x, y| {
+            let value = x.wrapping_mul(73).wrapping_add(y.wrapping_mul(151));
+            Rgba([
+                value as u8,
+                value.rotate_left(7) as u8,
+                value.rotate_left(13) as u8,
+                0xff,
+            ])
+        });
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("large fixture PNG should encode");
+        assert!(encoded.get_ref().len() >= 4 * 1024 * 1024);
+
+        let mut store = ImageStore::for_test();
+        let large_id = store.insert_with_format(
+            ImageMetadata::new("pressure-large", 1536, 1536),
+            encoded.get_ref().clone(),
+            ImageFormat::Png,
+        );
+        let large_path = store
+            .source_path_for_resource("pressure-large")
+            .expect("large managed path")
+            .to_owned();
+        BudgetedImageCache::decode_resource_bounded(
+            &Resource::from(large_path),
+            DECODED_IMAGE_CACHE_BUDGET,
+        )
+        .expect("large resource should decode");
+
+        let small_id = store.insert_with_format(
+            ImageMetadata::new("pressure-small", 1, 1),
+            fixture_png_bytes(),
+            ImageFormat::Png,
+        );
+        let small_path = store
+            .source_path_for_resource("pressure-small")
+            .expect("small managed path")
+            .to_owned();
+        BudgetedImageCache::decode_resource_bounded(
+            &Resource::from(small_path),
+            DECODED_IMAGE_CACHE_BUDGET,
+        )
+        .expect("small resource should decode");
+
+        mac_pressure::set_test_hook(None);
+        assert_eq!(store.node_state(large_id), ImageNodeState::Loading);
+        assert_eq!(store.node_state(small_id), ImageNodeState::Loading);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
