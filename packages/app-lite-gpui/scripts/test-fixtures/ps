@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-o" ]]; then
+  counter=${TASK7_PS_COUNTER:?}
+  count=0
+  [[ -f "$counter" ]] && count=$(<"$counter")
+  printf '%s\n' "$((count + 1))" > "$counter"
+  printf '%s\n' "${TASK7_FAKE_RSS_KIB:-1000}"
+elif [[ "${1:-}" == "-axo" ]]; then
+  :
+else
+  exit 2
+fi

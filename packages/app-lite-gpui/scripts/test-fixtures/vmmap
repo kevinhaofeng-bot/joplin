@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'Task 7 fake vmmap\n'
