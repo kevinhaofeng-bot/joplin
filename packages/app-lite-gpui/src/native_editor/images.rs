@@ -46,11 +46,11 @@ mod mac_pressure {
     /// Return unused large malloc-zone pages after a large ImageIO decode has
     /// released its source/thumbnail objects.  This is deliberately called at
     /// the resource-load boundary, never from paint or cache-hit paths.
-    pub fn relieve_for_path(path: &Path) {
-        let Ok(size) = std::fs::metadata(path).map(|metadata| metadata.len()) else {
-            return;
-        };
-        if size < LARGE_RESOURCE_BYTES {
+    pub fn relieve_for_path(path: &Path, decoded_bytes: usize) {
+        let source_bytes = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        if source_bytes < LARGE_RESOURCE_BYTES && (decoded_bytes as u64) < LARGE_RESOURCE_BYTES {
             return;
         }
 
@@ -1104,7 +1104,12 @@ impl BudgetedImageCache {
         if result.is_ok()
             && let Resource::Path(path) = resource
         {
-            mac_pressure::relieve_for_path(path);
+            let decoded_bytes = result
+                .as_ref()
+                .ok()
+                .and_then(|image| Self::image_bytes(image).ok())
+                .unwrap_or_default();
+            mac_pressure::relieve_for_path(path, decoded_bytes);
         }
         result
     }
@@ -2489,6 +2494,43 @@ mod tests {
         mac_pressure::set_test_hook(None);
         assert_eq!(store.node_state(large_id), ImageNodeState::Loading);
         assert_eq!(store.node_state(small_id), ImageNodeState::Loading);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_small_compressed_large_decoded_resource_reliefs_allocator() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        mac_pressure::set_test_hook(Some(Box::new(move || {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+        })));
+        let source = ImageBuffer::from_pixel(1600, 900, Rgba([0x11, 0x22, 0x33, 0xff]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("compact large PNG should encode");
+        assert!(encoded.get_ref().len() < 4 * 1024 * 1024);
+
+        let mut store = ImageStore::for_test();
+        let id = store.insert_with_format(
+            ImageMetadata::new("pressure-decoded-large", 1600, 900),
+            encoded.get_ref().clone(),
+            ImageFormat::Png,
+        );
+        let path = store
+            .source_path_for_resource("pressure-decoded-large")
+            .expect("managed path")
+            .to_owned();
+        BudgetedImageCache::decode_resource_bounded(
+            &Resource::from(path),
+            DECODED_IMAGE_CACHE_BUDGET,
+        )
+        .expect("large decoded resource should decode");
+        mac_pressure::set_test_hook(None);
+        assert_eq!(store.node_state(id), ImageNodeState::Loading);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
