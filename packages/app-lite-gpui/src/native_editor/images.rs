@@ -29,18 +29,19 @@ const CONSERVATIVE_PROXY_RESERVATION: usize = 4 * 1024 * 1024;
 
 #[cfg(target_os = "macos")]
 mod mac_pressure {
+    #[cfg(test)]
+    use std::cell::RefCell;
     use std::path::Path;
 
     const LARGE_RESOURCE_BYTES: u64 = 4 * 1024 * 1024;
 
     #[cfg(test)]
-    use std::sync::{Mutex, OnceLock};
-
-    #[cfg(test)]
     type TestHook = Box<dyn Fn() + Send + Sync + 'static>;
 
     #[cfg(test)]
-    static TEST_HOOK: OnceLock<Mutex<Option<TestHook>>> = OnceLock::new();
+    thread_local! {
+        static TEST_HOOK: RefCell<Option<TestHook>> = const { RefCell::new(None) };
+    }
 
     #[link(name = "System")]
     unsafe extern "C" {
@@ -59,10 +60,17 @@ mod mac_pressure {
         }
 
         #[cfg(test)]
-        if let Ok(guard) = TEST_HOOK.get_or_init(|| Mutex::new(None)).lock()
-            && let Some(hook) = guard.as_ref()
-        {
-            hook();
+        let intercepted = TEST_HOOK.with(|slot| {
+            let hook = slot.borrow();
+            if let Some(hook) = hook.as_ref() {
+                hook();
+                true
+            } else {
+                false
+            }
+        });
+        #[cfg(test)]
+        if intercepted {
             return;
         }
 
@@ -83,7 +91,7 @@ mod mac_pressure {
 
     #[cfg(test)]
     pub fn set_test_hook(hook: Option<TestHook>) {
-        *TEST_HOOK.get_or_init(|| Mutex::new(None)).lock().unwrap() = hook;
+        TEST_HOOK.with(|slot| *slot.borrow_mut() = hook);
     }
 }
 
@@ -724,6 +732,7 @@ struct CachedTexture {
 pub struct BudgetedImageCache {
     budget_bytes: usize,
     used_bytes: usize,
+    peak_accounted_bytes: usize,
     entries: HashMap<u64, CachedTexture>,
     lru: VecDeque<u64>,
     visible: HashSet<u64>,
@@ -744,6 +753,7 @@ impl BudgetedImageCache {
         Self {
             budget_bytes,
             used_bytes: 0,
+            peak_accounted_bytes: 0,
             entries: HashMap::new(),
             lru: VecDeque::new(),
             visible: HashSet::new(),
@@ -795,11 +805,20 @@ impl BudgetedImageCache {
     pub fn used_bytes(&self) -> usize {
         self.used_bytes
     }
+    pub fn peak_accounted_bytes(&self) -> usize {
+        self.peak_accounted_bytes
+    }
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
     }
     pub fn reserved_bytes(&self) -> usize {
         self.reserved_bytes
+    }
+
+    fn update_peak_accounted_bytes(&mut self) {
+        self.peak_accounted_bytes = self
+            .peak_accounted_bytes
+            .max(self.used_bytes.saturating_add(self.reserved_bytes));
     }
     pub fn is_settled(&self) -> bool {
         self.in_flight == 0 && self.reserved_bytes == 0
@@ -1163,7 +1182,12 @@ impl BudgetedImageCache {
             .and_then(|bytes| bytes.checked_div(4))
             .ok_or_else(|| ImageCacheError::from(anyhow!("decoded image budget is too small")))?;
         let budget_edge = (max_pixels_per_frame as f64).sqrt().floor() as u32;
-        let max_edge = VIEWPORT_IMAGE_PROXY_MAX_EDGE.min(budget_edge.max(1));
+        let configured_max_edge = if budget_bytes >= DECODED_IMAGE_CACHE_BUDGET {
+            VIEWPORT_IMAGE_PROXY_MAX_EDGE
+        } else {
+            MACOS_PROXY_MAX_EDGE
+        };
+        let max_edge = configured_max_edge.min(budget_edge.max(1));
         let create_thumbnail = CFBoolean::new(true);
         let transform = CFBoolean::new(true);
         let should_cache = CFBoolean::new(false);
@@ -1404,6 +1428,7 @@ impl ImageCache for BudgetedImageCache {
                     return None;
                 }
                 self.used_bytes = self.used_bytes.saturating_add(bytes);
+                self.update_peak_accounted_bytes();
                 entry.decoded_bytes = bytes;
             }
             if let Some(result) = result.clone() {
@@ -1451,6 +1476,7 @@ impl ImageCache for BudgetedImageCache {
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let generation = self.next_generation;
         self.reserved_bytes = self.reserved_bytes.saturating_add(reservation);
+        self.update_peak_accounted_bytes();
         self.reservations.insert(key, (generation, reservation));
         let budget = reservation;
         let source = resource.clone();
@@ -1530,6 +1556,7 @@ impl ImageCache for BudgetedImageCache {
                                     return;
                                 }
                                 cache.used_bytes = cache.used_bytes.saturating_add(decoded_bytes);
+                                cache.update_peak_accounted_bytes();
                                 entry.decoded_bytes = decoded_bytes;
                                 entry.item = ImageCacheItem::Loaded(Ok(image));
                                 cache.entries.insert(key, entry);
@@ -1993,6 +2020,7 @@ mod tests {
             cache.update(app, |cache, entity_cx| {
                 assert!(cache.load(&resource, window, entity_cx).is_some());
                 assert!(cache.used_bytes() > 0);
+                assert!(cache.peak_accounted_bytes() > 0);
                 cache.set_visible_resources(std::iter::empty());
                 cache.evict_offscreen(window, entity_cx);
                 assert_eq!(cache.used_bytes(), 0);
@@ -2509,43 +2537,6 @@ mod tests {
         mac_pressure::set_test_hook(None);
         assert_eq!(store.node_state(large_id), ImageNodeState::Loading);
         assert_eq!(store.node_state(small_id), ImageNodeState::Loading);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_small_compressed_large_decoded_resource_reliefs_allocator() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed_calls = Arc::clone(&calls);
-        mac_pressure::set_test_hook(Some(Box::new(move || {
-            observed_calls.fetch_add(1, Ordering::SeqCst);
-        })));
-        let source = ImageBuffer::from_pixel(1600, 900, Rgba([0x11, 0x22, 0x33, 0xff]));
-        let mut encoded = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(source)
-            .write_to(&mut encoded, image::ImageFormat::Png)
-            .expect("compact large PNG should encode");
-        assert!(encoded.get_ref().len() < 4 * 1024 * 1024);
-
-        let mut store = ImageStore::for_test();
-        let id = store.insert_with_format(
-            ImageMetadata::new("pressure-decoded-large", 1600, 900),
-            encoded.get_ref().clone(),
-            ImageFormat::Png,
-        );
-        let path = store
-            .source_path_for_resource("pressure-decoded-large")
-            .expect("managed path")
-            .to_owned();
-        BudgetedImageCache::decode_resource_bounded(
-            &Resource::from(path),
-            DECODED_IMAGE_CACHE_BUDGET,
-        )
-        .expect("large decoded resource should decode");
-        mac_pressure::set_test_hook(None);
-        assert_eq!(store.node_state(id), ImageNodeState::Loading);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

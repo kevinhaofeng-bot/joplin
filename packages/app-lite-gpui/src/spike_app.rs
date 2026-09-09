@@ -1479,7 +1479,7 @@ impl SpikeView {
                         let diagnostics = Diagnostics::from_values(
                             view.image_cache
                                 .as_ref()
-                                .map_or(0, |cache| cache.read(view_cx).used_bytes()),
+                                .map_or(0, |cache| cache.read(view_cx).peak_accounted_bytes()),
                             view.editor.read(view_cx).layout_peak_accounted_bytes(),
                             view.editor.read(view_cx).history_used_bytes(),
                             transaction_p95,
@@ -2184,20 +2184,48 @@ mod tests {
             window.update(|window, app| {
                 cache.update(app, |cache, entity_cx| {
                     cache.set_visible_resources([&resource]);
+                    cache.evict_offscreen(window, entity_cx);
                     assert!(cache.load(&resource, window, entity_cx).is_none());
                 });
             });
             window.run_until_parked();
             window.update(|window, app| {
                 cache.update(app, |cache, entity_cx| {
-                    assert!(cache.load(&resource, window, entity_cx).is_some());
+                    let image = cache
+                        .load(&resource, window, entity_cx)
+                        .expect("production cache should return decoded image")
+                        .expect("typical fixture image should decode");
+                    #[cfg(target_os = "macos")]
+                    {
+                        let size = image.size(0);
+                        let width = u32::from(size.width);
+                        let height = u32::from(size.height);
+                        assert!(
+                            width.max(height) <= VIEWPORT_IMAGE_PROXY_MAX_EDGE,
+                            "production proxy retained at {}x{}",
+                            width,
+                            height
+                        );
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    drop(image);
                     assert!(cache.used_bytes() >= expected_minimum);
                     assert!(cache.used_bytes() <= DECODED_IMAGE_CACHE_BUDGET);
                     assert!(cache.is_settled());
                 });
             });
         }
-        assert!(window.read(|app| cache.read(app).used_bytes()) >= expected_minimum);
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources(std::iter::empty());
+                cache.evict_offscreen(window, entity_cx);
+                assert_eq!(cache.used_bytes(), 0);
+                assert_eq!(cache.len(), 0);
+                assert!(cache.peak_accounted_bytes() > 0);
+                assert!(cache.peak_accounted_bytes() <= DECODED_IMAGE_CACHE_BUDGET);
+                assert!(cache.is_settled());
+            });
+        });
         let _ = std::fs::remove_dir_all(root);
     }
 
