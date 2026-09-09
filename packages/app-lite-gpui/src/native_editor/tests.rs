@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui::{AppContext, Bounds, EntityInputHandler, FontStyle, FontWeight, TextStyle, point, px};
 use smallvec::SmallVec;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::model::{
     Affinity, Block, BlockContent, BlockKind, DocPoint, Document, DocumentError, Mark, NodeId,
@@ -49,15 +50,15 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 
-struct AllocationMeasurement;
+pub(crate) struct AllocationMeasurement;
 
 impl AllocationMeasurement {
-    fn begin() -> Self {
+    pub(crate) fn begin() -> Self {
         MEASURING_ALLOCATIONS.with(|measuring| measuring.set(Some(0)));
         Self
     }
 
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         MEASURING_ALLOCATIONS.with(|measuring| measuring.get().unwrap_or(0))
     }
 }
@@ -557,6 +558,98 @@ fn small_edit_does_not_allocate_a_full_document_clone() {
         "small edit allocated a full-document-sized candidate: {} bytes",
         measurement.bytes()
     );
+}
+
+#[test]
+fn ordered_tail_edit_has_bounded_numbering_scratch_and_keeps_marker() {
+    let blocks = (0..100_000)
+        .map(|index| Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: BlockKind::OrderedItem { depth: 0 },
+            content: BlockContent::text(format!("ordered-item-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        })
+        .collect();
+    let mut document = Document::from_blocks(blocks).expect("large ordered fixture");
+    let tail = document.blocks().last().expect("tail item").clone();
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    assert_eq!(layout.ordered_number(tail.id), Some(100_000));
+    let work_before = layout.ordered_number_work_count();
+
+    let outcome = document
+        .apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::with_affinity(
+                tail.id,
+                tail.content.as_text().expect("tail text").len(),
+                Affinity::After,
+            )),
+            text: "!".into(),
+        })
+        .expect("tail inline edit");
+    let measurement = AllocationMeasurement::begin();
+    layout.invalidate_nodes(&document, &outcome.changed_nodes, outcome.structural);
+    let scratch = measurement.bytes();
+    let visited = layout
+        .ordered_number_work_count()
+        .saturating_sub(work_before);
+    assert!(
+        visited <= 32,
+        "tail inline edit visited document-sized numbering state: {visited} nodes"
+    );
+    assert!(
+        scratch < 512 * 1024,
+        "tail inline edit allocated document-sized numbering scratch: {scratch} bytes"
+    );
+    assert_eq!(layout.ordered_number(tail.id), Some(100_000));
+}
+
+#[test]
+fn ordered_tail_kind_depth_change_recomputes_locally_and_keeps_numbers_correct() {
+    let blocks = (0..1_024)
+        .map(|index| Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: BlockKind::OrderedItem { depth: 0 },
+            content: BlockContent::text(format!("ordered-item-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        })
+        .collect();
+    let mut document = Document::from_blocks(blocks).expect("ordered fixture");
+    let tail = document.blocks().last().expect("tail item").clone();
+    let previous = document.blocks()[document.block_count() - 2].id;
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    assert_eq!(layout.ordered_number(previous), Some(1_023));
+    assert_eq!(layout.ordered_number(tail.id), Some(1_024));
+    let work_before = layout.ordered_number_work_count();
+
+    let outcome = document
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(tail.id, 0, Affinity::Before),
+                DocPoint::with_affinity(
+                    tail.id,
+                    tail.content.as_text().expect("tail text").len(),
+                    Affinity::After,
+                ),
+            ),
+            kind: BlockKind::OrderedItem { depth: 1 },
+        })
+        .expect("tail depth change");
+    assert!(outcome.structural);
+    layout.invalidate_nodes(&document, &outcome.changed_nodes, outcome.structural);
+
+    let visited = layout
+        .ordered_number_work_count()
+        .saturating_sub(work_before);
+    assert!(
+        visited <= 64,
+        "tail kind/depth edit recomputed beyond its checkpoint: {visited} nodes"
+    );
+    assert_eq!(layout.ordered_number(previous), Some(1_023));
+    assert_eq!(layout.ordered_number(tail.id), Some(1));
 }
 
 #[test]
@@ -2648,6 +2741,122 @@ async fn wrapped_click_home_end_keep_row_affinity_for_all_alignments(
         editor.move_up();
         assert_eq!(editor.selection().head.utf8_offset, seam);
         assert_eq!(editor.selection().head.affinity, Affinity::Before);
+
+        // The start of the post-wrap row is a distinct affinity at the same
+        // UTF-8 seam. Hit-testing must use y to choose that row, including
+        // center/right alignment where the row has different slack.
+        let row_start = DocPoint::with_affinity(node, seam, Affinity::After);
+        let row_start_bounds = editor
+            .layout()
+            .caret_bounds_for_point(row_start)
+            .expect("post-wrap row-start caret");
+        let row_start_click = point(
+            row_start_bounds.left(),
+            block_bounds.top() + line_height * 1.5,
+        );
+        let row_start_hit = editor
+            .point_from_layout(row_start_click)
+            .expect("post-wrap row-start hit");
+        assert_eq!(row_start_hit.utf8_offset, seam);
+        assert_eq!(row_start_hit.affinity, Affinity::After);
+        editor.set_selection_for_test(Selection::caret(row_start_hit));
+        editor.move_home();
+        assert_eq!(editor.selection().head, row_start);
+
+        // A grapheme-shaped fixture exercises a seam whose adjacent text is
+        // multi-code-point (emoji plus combining sequence), rather than only
+        // ASCII byte boundaries.
+        let grapheme_text = "🙂e\u{301}".repeat(24);
+        let mut grapheme_editor = EditorCore::for_test(&grapheme_text, cx);
+        let grapheme_node = grapheme_editor
+            .document()
+            .first_node_id()
+            .expect("grapheme block");
+        let grapheme_len = grapheme_editor
+            .document()
+            .text_at_index(0)
+            .expect("grapheme text")
+            .len();
+        grapheme_editor
+            .apply(Transaction::SetAlignment {
+                selection: Selection::new(
+                    DocPoint::with_affinity(grapheme_node, 0, Affinity::Before),
+                    DocPoint::with_affinity(grapheme_node, grapheme_len, Affinity::After),
+                ),
+                alignment,
+            })
+            .expect("grapheme alignment transaction");
+        let grapheme_document = grapheme_editor.document().clone();
+        cx.update(|window, _| {
+            grapheme_editor.layout.shape_visible_with_window(
+                &grapheme_document,
+                0.0,
+                800.0,
+                96.0,
+                window,
+            );
+        });
+        let grapheme_line = grapheme_editor
+            .layout()
+            .block_layout(grapheme_node)
+            .expect("grapheme layout")
+            .text_lines
+            .first()
+            .expect("grapheme hard line");
+        let grapheme_seam = grapheme_line
+            .wrap_boundaries()
+            .first()
+            .map(|boundary| grapheme_line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+            .expect("grapheme soft-wrap seam");
+        let grapheme_row_end = grapheme_line
+            .wrap_boundaries()
+            .get(1)
+            .map(|boundary| grapheme_line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+            .unwrap_or_else(|| grapheme_line.len());
+        let grapheme_line_len = grapheme_line.len();
+        assert!(
+            grapheme_line
+                .text
+                .grapheme_indices(true)
+                .any(|(offset, _)| offset == grapheme_seam),
+            "the wrapped seam must be a grapheme boundary"
+        );
+        let grapheme_bounds = grapheme_editor
+            .layout()
+            .block_layout(grapheme_node)
+            .expect("grapheme block layout")
+            .bounds;
+        let grapheme_height = grapheme_editor
+            .layout()
+            .line_height(grapheme_node)
+            .expect("grapheme line height");
+        let grapheme_start = DocPoint::with_affinity(grapheme_node, grapheme_seam, Affinity::After);
+        let grapheme_start_x = grapheme_editor
+            .layout()
+            .caret_bounds_for_point(grapheme_start)
+            .expect("grapheme row start")
+            .left();
+        let grapheme_hit = grapheme_editor
+            .point_from_layout(point(
+                grapheme_start_x,
+                grapheme_bounds.top() + grapheme_height * 1.5,
+            ))
+            .expect("grapheme row-start hit");
+        assert_eq!(grapheme_hit, grapheme_start);
+        grapheme_editor.set_selection_for_test(Selection::caret(grapheme_hit));
+        grapheme_editor.move_home();
+        assert_eq!(grapheme_editor.selection().head, grapheme_start);
+        grapheme_editor.move_end();
+        let grapheme_end = grapheme_editor.selection().head;
+        assert_eq!(grapheme_end.utf8_offset, grapheme_row_end);
+        assert_eq!(
+            grapheme_end.affinity,
+            if grapheme_row_end < grapheme_line_len {
+                Affinity::Before
+            } else {
+                Affinity::After
+            }
+        );
     }
 }
 

@@ -172,6 +172,7 @@ impl History {
         };
         let inverse_outcome = document.apply_batch(entry.inverse.clone())?;
         let changed_nodes = inverse_outcome.changed_nodes.clone();
+        let structural = inverse_outcome.structural;
         let inverse = inverse_outcome.inverse.clone();
         let estimated_bytes = inverse_outcome.estimated_bytes;
         let entry = self.undo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
@@ -188,6 +189,7 @@ impl History {
         Ok(ApplyOutcome {
             selection: entry.before_selection,
             changed_nodes,
+            structural,
             inverse,
             estimated_bytes,
             inserted_span: None,
@@ -207,6 +209,7 @@ impl History {
         };
         let redo_outcome = document.apply_batch(entry.forward.clone())?;
         let changed_nodes = redo_outcome.changed_nodes.clone();
+        let structural = redo_outcome.structural;
         let inverse = redo_outcome.inverse.clone();
         let estimated_bytes = redo_outcome.estimated_bytes;
         let entry = self.redo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
@@ -219,6 +222,7 @@ impl History {
         Ok(ApplyOutcome {
             selection: entry.after_selection,
             changed_nodes,
+            structural,
             inverse,
             estimated_bytes,
             inserted_span: None,

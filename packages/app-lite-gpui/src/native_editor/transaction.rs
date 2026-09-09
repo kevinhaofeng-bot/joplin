@@ -154,6 +154,9 @@ pub struct InsertedTextSpan {
 pub struct ApplyOutcome {
     pub selection: Selection,
     pub changed_nodes: SmallVec<[NodeId; 4]>,
+    /// True when block order or list kind/depth may have changed. Inline
+    /// edits leave this false so layout can invalidate numbering in O(1).
+    pub structural: bool,
     pub inverse: TransactionBatch,
     pub estimated_bytes: usize,
     pub inserted_span: Option<InsertedTextSpan>,
@@ -164,6 +167,7 @@ impl ApplyOutcome {
         Self {
             selection,
             changed_nodes: SmallVec::new(),
+            structural: false,
             inverse: TransactionBatch::default(),
             estimated_bytes: 0,
             inserted_span: None,

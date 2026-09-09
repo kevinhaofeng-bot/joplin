@@ -9,9 +9,7 @@ use gpui::{
     Window, WrappedLine, fill, outline, point, px, rgba,
 };
 #[cfg(test)]
-use std::mem::size_of;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::RefCell;
 
 use super::core::EditorCore;
 use super::layout::{BlockLayout, ordered_number_summary};
@@ -22,8 +20,7 @@ struct RenderBlock {
     layout: BlockLayout,
     text_lines: Vec<WrappedLine>,
     is_image: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
-    has_highlight: bool,
+    shaped_background_run_count: usize,
     line_height: Option<Pixels>,
     marker: Option<String>,
 }
@@ -43,56 +40,53 @@ enum TextPaintPass {
 }
 
 #[cfg(test)]
-static SNAPSHOT_CLONE_PEAK: AtomicUsize = AtomicUsize::new(0);
+#[derive(Default)]
+struct TestRenderObservations {
+    snapshot_clone_peak: usize,
+    shaped_background_paints: usize,
+}
+
 #[cfg(test)]
-static HIGHLIGHT_BACKGROUND_PAINTS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static TEST_RENDER_OBSERVATIONS: RefCell<TestRenderObservations> =
+        RefCell::new(TestRenderObservations::default());
+}
 
 #[cfg(test)]
 pub(crate) fn reset_test_render_observations() {
-    SNAPSHOT_CLONE_PEAK.store(0, Ordering::Relaxed);
-    HIGHLIGHT_BACKGROUND_PAINTS.store(0, Ordering::Relaxed);
+    TEST_RENDER_OBSERVATIONS.with(|observations| {
+        *observations.borrow_mut() = TestRenderObservations::default();
+    });
 }
 
 #[cfg(test)]
 pub(crate) fn test_snapshot_clone_peak() -> usize {
-    SNAPSHOT_CLONE_PEAK.load(Ordering::Relaxed)
+    TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow().snapshot_clone_peak)
 }
 
 #[cfg(test)]
 pub(crate) fn test_highlight_background_paints() -> usize {
-    HIGHLIGHT_BACKGROUND_PAINTS.load(Ordering::Relaxed)
+    TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow().shaped_background_paints)
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_allocation_bytes_for_test(editor: &EditorCore) -> usize {
+    let measurement = super::tests::AllocationMeasurement::begin();
+    let _snapshot = snapshot(editor);
+    measurement.bytes()
 }
 
 #[cfg(test)]
 fn observe_snapshot_clone(cached: &super::layout::CachedBlockLayout) {
-    // This is the payload cloned by the production `snapshot` path: the
-    // block layout/vector plus each WrappedLine's text and shaped glyph
-    // buffers. It deliberately excludes unrelated cache entries.
-    let bytes = size_of::<BlockLayout>()
-        .saturating_add(size_of::<Vec<WrappedLine>>())
-        .saturating_add(cached.layout.text_lines.capacity() * size_of::<WrappedLine>())
-        .saturating_add(
-            cached
-                .layout
-                .text_lines
-                .iter()
-                .map(|line| {
-                    size_of::<WrappedLine>()
-                        .saturating_add(line.text.len())
-                        .saturating_add(
-                            line.runs()
-                                .iter()
-                                .map(|run| {
-                                    size_of_val(run).saturating_add(
-                                        run.glyphs.capacity() * size_of::<gpui::ShapedGlyph>(),
-                                    )
-                                })
-                                .sum::<usize>(),
-                        )
-                })
-                .sum::<usize>(),
-        );
-    SNAPSHOT_CLONE_PEAK.fetch_max(bytes, Ordering::Relaxed);
+    // This is the explicit owned allocation performed by the real
+    // `WrappedLine`/Vec clone in snapshot(), including spilled decoration
+    // runs. Shared text/layout/glyph Arcs are intentionally not counted.
+    TEST_RENDER_OBSERVATIONS.with(|observations| {
+        let mut observations = observations.borrow_mut();
+        observations.snapshot_clone_peak = observations
+            .snapshot_clone_peak
+            .max(cached.snapshot_clone_bytes);
+    });
 }
 
 const fn text_paint_passes() -> [TextPaintPass; 2] {
@@ -109,15 +103,10 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
             let kind = model_block
                 .map(|block| block.kind.clone())
                 .unwrap_or(BlockKind::Paragraph);
-            let has_highlight = model_block
-                .and_then(|block| block.content.styles())
-                .is_some_and(|styles| {
-                    styles.iter().any(|run| {
-                        run.marks
-                            .iter()
-                            .any(|mark| matches!(mark, super::model::Mark::Highlight))
-                    })
-                });
+            let shaped_background_run_count = layout
+                .cache
+                .get(&block.node_id)
+                .map_or(0, |cached| cached.shaped_background_run_count);
             #[cfg(test)]
             if let Some(cached) = layout.cache.get(&block.node_id) {
                 observe_snapshot_clone(cached);
@@ -129,7 +118,7 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                     .map(|cached| cached.text_lines.clone())
                     .unwrap_or_default(),
                 is_image: layout.is_image(block.node_id),
-                has_highlight,
+                shaped_background_run_count,
                 line_height: layout.line_height(block.node_id),
                 marker: list_marker(&kind, layout.ordered_number(block.node_id)),
             }
@@ -220,8 +209,11 @@ fn paint_snapshot(
                             cx,
                         );
                         #[cfg(test)]
-                        if block.has_highlight && result.is_ok() {
-                            HIGHLIGHT_BACKGROUND_PAINTS.fetch_add(1, Ordering::Relaxed);
+                        if block.shaped_background_run_count > 0 && result.is_ok() {
+                            #[cfg(test)]
+                            TEST_RENDER_OBSERVATIONS.with(|observations| {
+                                observations.borrow_mut().shaped_background_paints += 1;
+                            });
                         }
                         result?;
                     }

@@ -9,4 +9,4 @@ pub mod render;
 pub mod transaction;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

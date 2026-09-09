@@ -14,12 +14,12 @@ use gpui::{
     StrikethroughStyle, TextAlign, TextRun, TextStyle, UnderlineStyle, WrapBoundary, WrappedLine,
     WrappedLineLayout, point, px, rgba, size,
 };
+use smallvec::SmallVec;
 use sum_tree::{Bias, ContextLessSummary, Dimension, Item, KeyedItem, SeekTarget, SumTree};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::model::{
-    Affinity, BlockContent, BlockKind, DocPoint, Document, MAX_LIST_DEPTH, Mark, NodeId, Selection,
-    TextAlignment,
+    Affinity, BlockContent, BlockKind, DocPoint, Document, Mark, NodeId, Selection, TextAlignment,
 };
 
 pub const LAYOUT_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
@@ -30,6 +30,7 @@ const FALLBACK_GLYPH_WIDTH: f32 = 8.0;
 const CARET_WIDTH: f32 = 1.0;
 const LIST_MARKER_WIDTH: f32 = 22.0;
 const LIST_DEPTH_INDENT: f32 = 20.0;
+const NUMBERING_CHECKPOINT_STRIDE: usize = 64;
 
 #[derive(Clone)]
 struct BlockVisualStyle {
@@ -258,6 +259,12 @@ impl ShapeKey {
 pub struct CachedBlockLayout {
     pub layout: BlockLayout,
     pub bytes: usize,
+    /// Bytes retained by the cache entry itself, excluding the per-frame
+    /// snapshot clone. This is the retained side of the admission bound.
+    pub(crate) retained_bytes: usize,
+    /// Explicit upper bound for the owned buffers allocated by the real
+    /// render snapshot clone, including spilled decoration runs.
+    pub(crate) snapshot_clone_bytes: usize,
     pub revision: u64,
     pub width: f32,
     pub selection_geometry_bytes: usize,
@@ -265,6 +272,9 @@ pub struct CachedBlockLayout {
     /// lines. `WrappedLine` keeps these in a private SmallVec, so retain the
     /// source run count alongside the public shaped geometry for budgeting.
     pub(crate) decoration_run_count: usize,
+    /// Background-bearing runs that survived into the shaped input. The
+    /// renderer records a paint only after the real GPUI background pass.
+    pub(crate) shaped_background_run_count: usize,
     pub(crate) is_image: bool,
     pub(crate) line_height: Pixels,
     shape_key: ShapeKey,
@@ -278,7 +288,21 @@ enum NumberingKind {
     Boundary,
 }
 
-type NumberingState = [usize; MAX_LIST_DEPTH as usize + 1];
+type NumberingCounter = (u8, usize);
+
+/// Numbering state is retained only at sparse sequence checkpoints. A
+/// checkpoint stores the active list depths, not a MAX_LIST_DEPTH-sized array
+/// for every block; the ordinary shallow case stays inline in SmallVec.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NumberingCursor {
+    counters: SmallVec<[NumberingCounter; 4]>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NumberingCheckpoint {
+    index: usize,
+    cursor: NumberingCursor,
+}
 
 fn numbering_kind(kind: &BlockKind) -> NumberingKind {
     match kind {
@@ -392,12 +416,15 @@ pub struct LayoutRegistry {
     /// Document-order numbering summary. Inline revisions retain these maps;
     /// only list structure changes trigger a suffix update.
     ordered_numbers: HashMap<NodeId, usize>,
-    ordered_states: HashMap<NodeId, NumberingState>,
     ordered_kinds: HashMap<NodeId, NumberingKind>,
     ordered_order: Vec<NodeId>,
+    ordered_index: HashMap<NodeId, usize>,
+    ordered_checkpoints: Vec<NumberingCheckpoint>,
     ordered_summary_valid: bool,
     ordered_structure_revision: Option<u64>,
     ordered_number_scan_count: usize,
+    #[cfg(test)]
+    ordered_number_work_count: usize,
     estimate_revisions: HashMap<NodeId, u64>,
     estimate_width: f32,
     estimate_document_revision: Option<u64>,
@@ -429,12 +456,15 @@ impl LayoutRegistry {
             document_order: HashMap::new(),
             document_order_revision: None,
             ordered_numbers: HashMap::new(),
-            ordered_states: HashMap::new(),
             ordered_kinds: HashMap::new(),
             ordered_order: Vec::new(),
+            ordered_index: HashMap::new(),
+            ordered_checkpoints: Vec::new(),
             ordered_summary_valid: false,
             ordered_structure_revision: None,
             ordered_number_scan_count: 0,
+            #[cfg(test)]
+            ordered_number_work_count: 0,
             estimate_revisions: HashMap::new(),
             estimate_width: 0.0,
             estimate_document_revision: None,
@@ -524,6 +554,11 @@ impl LayoutRegistry {
     #[cfg(test)]
     pub(crate) fn ordered_number_scan_count(&self) -> usize {
         self.ordered_number_scan_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ordered_number_work_count(&self) -> usize {
+        self.ordered_number_work_count
     }
 
     /// Build exact geometry for the viewport plus one viewport of prefetch on
@@ -696,6 +731,10 @@ impl LayoutRegistry {
                 let shared_text = SharedString::from(text.to_owned());
                 let runs = styled_text_runs(block, &shared_text, &visual.font);
                 let decoration_run_count = runs.len();
+                let shaped_background_run_count = runs
+                    .iter()
+                    .filter(|run| run.background_color.is_some())
+                    .count();
                 let block_width = block_bounds(width, block).size.width;
                 let text_width = (f32::from(block_width) - f32::from(visual.text_inset)).max(1.0);
                 let lines = window
@@ -739,6 +778,7 @@ impl LayoutRegistry {
                     visual.line_height,
                     0,
                     decoration_run_count,
+                    shaped_background_run_count,
                 );
             }
             if !estimates_changed {
@@ -779,6 +819,7 @@ impl LayoutRegistry {
             line_height,
             selection_geometry_bytes,
             0,
+            0,
         );
         self.enforce_budget();
     }
@@ -792,9 +833,10 @@ impl LayoutRegistry {
         self.height_document_revision = None;
         self.document_order_revision = None;
         self.ordered_numbers.clear();
-        self.ordered_states.clear();
         self.ordered_kinds.clear();
         self.ordered_order.clear();
+        self.ordered_index.clear();
+        self.ordered_checkpoints.clear();
         self.ordered_summary_valid = false;
         self.ordered_structure_revision = None;
     }
@@ -802,7 +844,12 @@ impl LayoutRegistry {
     /// Invalidate only the model nodes reported by the transaction layer.
     /// Structural edits also invalidate the height/order index, while
     /// unaffected shaped lines remain retained for the next viewport pass.
-    pub(crate) fn invalidate_nodes(&mut self, document: &Document, changed_nodes: &[NodeId]) {
+    pub(crate) fn invalidate_nodes(
+        &mut self,
+        document: &Document,
+        changed_nodes: &[NodeId],
+        structural: bool,
+    ) {
         let invalidated: HashSet<NodeId> = changed_nodes.iter().copied().collect();
         self.visible
             .retain(|layout| !invalidated.contains(&layout.node_id));
@@ -816,12 +863,8 @@ impl LayoutRegistry {
             self.height_document_revision = None;
             self.document_order.clear();
             self.document_order_revision = None;
-            if self.ordered_summary_valid {
-                if let Some((start, last_changed)) =
-                    self.ordered_structure_change_range(document, changed_nodes)
-                {
-                    self.update_ordered_numbers(document, start, last_changed);
-                }
+            if structural && self.ordered_summary_valid {
+                self.update_ordered_structure(document, changed_nodes);
             }
             self.ordered_structure_revision = Some(document.revision());
         }
@@ -1360,16 +1403,23 @@ impl LayoutRegistry {
 
     fn rebuild_ordered_numbers(&mut self, document: &Document) {
         self.ordered_numbers.clear();
-        self.ordered_states.clear();
         self.ordered_kinds.clear();
         self.ordered_order.clear();
-        let mut state = [0; MAX_LIST_DEPTH as usize + 1];
-        for block in document.blocks() {
-            let number = advance_numbering(numbering_kind(&block.kind), &mut state);
+        self.ordered_index.clear();
+        self.ordered_checkpoints.clear();
+        let mut cursor = NumberingCursor::default();
+        for (index, block) in document.blocks().iter().enumerate() {
+            if index % NUMBERING_CHECKPOINT_STRIDE == 0 {
+                self.ordered_checkpoints.push(NumberingCheckpoint {
+                    index,
+                    cursor: cursor.clone(),
+                });
+            }
+            let kind = numbering_kind(&block.kind);
+            let number = advance_numbering(kind, &mut cursor);
             self.ordered_order.push(block.id);
-            self.ordered_kinds
-                .insert(block.id, numbering_kind(&block.kind));
-            self.ordered_states.insert(block.id, state);
+            self.ordered_index.insert(block.id, index);
+            self.ordered_kinds.insert(block.id, kind);
             if let Some(number) = number {
                 self.ordered_numbers.insert(block.id, number);
             }
@@ -1379,112 +1429,100 @@ impl LayoutRegistry {
         self.ordered_number_scan_count = self
             .ordered_number_scan_count
             .saturating_add(document.block_count());
+        #[cfg(test)]
+        {
+            self.ordered_number_work_count = self
+                .ordered_number_work_count
+                .saturating_add(document.block_count());
+        }
     }
 
-    fn ordered_structure_change_range(
-        &self,
-        document: &Document,
-        changed_nodes: &[NodeId],
-    ) -> Option<(usize, usize)> {
+    /// Apply a kind/depth change using the retained O(1) order index. If a
+    /// changed identity moved, was inserted, or was removed, the order
+    /// cannot be patched from the identity set alone and the compact summary
+    /// is rebuilt once; no old maps/vectors or live-id HashSet are cloned.
+    fn update_ordered_structure(&mut self, document: &Document, changed_nodes: &[NodeId]) {
         let mut first = usize::MAX;
-        let mut last = 0;
-        let mut shifted = false;
+        let mut last = 0usize;
         for node_id in changed_nodes {
-            let old_index = self.ordered_order.iter().position(|id| id == node_id);
-            let new_index = document
-                .blocks()
-                .iter()
-                .position(|block| block.id == *node_id);
-            match (old_index, new_index) {
-                (Some(old_index), Some(new_index)) => {
-                    let kind = document
-                        .blocks()
-                        .get(new_index)
-                        .map(|block| numbering_kind(&block.kind));
-                    if old_index != new_index || self.ordered_kinds.get(node_id).copied() != kind {
-                        first = first.min(new_index);
-                        last = last.max(new_index);
-                        shifted |= old_index != new_index;
-                    }
-                }
-                (None, Some(new_index)) => {
-                    first = first.min(new_index);
-                    last = last.max(new_index);
-                    shifted = true;
-                }
-                (Some(old_index), None) => {
-                    first = first.min(old_index);
-                    last = last.max(old_index);
-                    shifted = true;
-                }
-                (None, None) => {
-                    shifted = true;
-                }
+            let Some(&index) = self.ordered_index.get(node_id) else {
+                self.rebuild_ordered_numbers(document);
+                return;
+            };
+            let Some(block) = document.blocks().get(index) else {
+                self.rebuild_ordered_numbers(document);
+                return;
+            };
+            if block.id != *node_id {
+                self.rebuild_ordered_numbers(document);
+                return;
+            }
+            let kind = numbering_kind(&block.kind);
+            if self.ordered_kinds.get(node_id).copied() != Some(kind) {
+                first = first.min(index);
+                last = last.max(index);
             }
         }
         if first == usize::MAX {
-            None
-        } else if shifted {
-            Some((first, document.block_count().saturating_sub(1)))
-        } else {
-            Some((first, last))
+            return;
         }
+        self.update_ordered_numbers(document, first, last);
     }
 
     fn update_ordered_numbers(&mut self, document: &Document, start: usize, last_changed: usize) {
-        let old_order = self.ordered_order.clone();
-        let old_numbers = self.ordered_numbers.clone();
-        let old_states = self.ordered_states.clone();
-        let old_kinds = self.ordered_kinds.clone();
-        let new_order = document
-            .blocks()
-            .iter()
-            .map(|block| block.id)
-            .collect::<Vec<_>>();
-        let mut state = if start == 0 {
-            [0; MAX_LIST_DEPTH as usize + 1]
-        } else {
-            old_order
-                .get(start.saturating_sub(1))
-                .and_then(|node_id| old_states.get(node_id).copied())
-                .unwrap_or([0; MAX_LIST_DEPTH as usize + 1])
-        };
+        let checkpoint_start =
+            (start / NUMBERING_CHECKPOINT_STRIDE).saturating_mul(NUMBERING_CHECKPOINT_STRIDE);
+        let mut cursor = self
+            .ordered_checkpoints
+            .get(checkpoint_start / NUMBERING_CHECKPOINT_STRIDE)
+            .map(|checkpoint| checkpoint.cursor.clone())
+            .unwrap_or_default();
         let mut processed = 0usize;
-        for (index, block) in document.blocks().iter().enumerate().skip(start) {
+        let mut changed_since_checkpoint = false;
+        for (index, block) in document.blocks().iter().enumerate().skip(checkpoint_start) {
             let kind = numbering_kind(&block.kind);
-            let number = advance_numbering(kind, &mut state);
+            let old_kind = self.ordered_kinds.get(&block.id).copied();
+            let old_number = self.ordered_numbers.get(&block.id).copied();
+            let number = advance_numbering(kind, &mut cursor);
             if let Some(number) = number {
                 self.ordered_numbers.insert(block.id, number);
             } else {
                 self.ordered_numbers.remove(&block.id);
             }
-            self.ordered_states.insert(block.id, state);
             self.ordered_kinds.insert(block.id, kind);
             processed = processed.saturating_add(1);
 
-            let unchanged = index >= last_changed
-                && old_order.get(index) == Some(&block.id)
-                && old_kinds.get(&block.id) == Some(&kind)
-                && old_states.get(&block.id) == Some(&state)
-                && old_numbers.get(&block.id).copied() == number;
-            if unchanged {
-                // The state and identity at a structural boundary match the
-                // old suffix, so later markers are unchanged and can remain
-                // in the retained maps.  A shifted sequence is deliberately
-                // processed through its end by the range calculation above.
-                break;
+            if self.ordered_order.get(index) != Some(&block.id)
+                || old_kind != Some(kind)
+                || old_number != number
+            {
+                changed_since_checkpoint = true;
+            }
+            let at_checkpoint_boundary = (index + 1) % NUMBERING_CHECKPOINT_STRIDE == 0;
+            if at_checkpoint_boundary {
+                let checkpoint_index = (index + 1) / NUMBERING_CHECKPOINT_STRIDE;
+                let stable = changed_since_checkpoint
+                    && index >= last_changed
+                    && self
+                        .ordered_checkpoints
+                        .get(checkpoint_index)
+                        .is_some_and(|checkpoint| checkpoint.cursor == cursor);
+                if let Some(checkpoint) = self.ordered_checkpoints.get_mut(checkpoint_index) {
+                    checkpoint.cursor = cursor.clone();
+                }
+                if stable {
+                    break;
+                }
+                changed_since_checkpoint = false;
             }
         }
-        let live_ids = new_order.iter().copied().collect::<HashSet<_>>();
-        self.ordered_numbers
-            .retain(|node_id, _| live_ids.contains(node_id));
-        self.ordered_states
-            .retain(|node_id, _| live_ids.contains(node_id));
-        self.ordered_kinds
-            .retain(|node_id, _| live_ids.contains(node_id));
-        self.ordered_order = new_order;
         self.ordered_summary_valid = true;
         self.ordered_number_scan_count = self.ordered_number_scan_count.saturating_add(processed);
+        #[cfg(test)]
+        {
+            self.ordered_number_work_count =
+                self.ordered_number_work_count.saturating_add(processed);
+        }
     }
 
     fn ensure_height_index(&mut self, document: &Document) {
@@ -1595,6 +1633,7 @@ impl LayoutRegistry {
             px(DEFAULT_TEXT_HEIGHT),
             0,
             0,
+            0,
         );
     }
 
@@ -1606,6 +1645,7 @@ impl LayoutRegistry {
         default_line_height: Pixels,
         requested_selection_geometry_bytes: usize,
         decoration_run_count: usize,
+        shaped_background_run_count: usize,
     ) {
         let node_id = layout.node_id;
         let revision = shape_key.block_revision;
@@ -1619,6 +1659,9 @@ impl LayoutRegistry {
             &layout,
             requested_selection_geometry_bytes.max(size_of::<Bounds<Pixels>>() * 2),
         );
+        let retained_bytes =
+            estimate_retained_cache_bytes(&layout, selection_geometry_bytes, decoration_run_count);
+        let snapshot_clone_bytes = estimate_snapshot_clone_bytes(&layout, decoration_run_count);
         let bytes = estimate_cache_bytes(&layout, selection_geometry_bytes, decoration_run_count);
         if bytes > self.budget_bytes {
             return;
@@ -1633,10 +1676,13 @@ impl LayoutRegistry {
             CachedBlockLayout {
                 layout,
                 bytes,
+                retained_bytes,
+                snapshot_clone_bytes,
                 revision,
                 width,
                 selection_geometry_bytes,
                 decoration_run_count,
+                shaped_background_run_count,
                 is_image,
                 line_height: if line_height == px(0.0) {
                     default_line_height
@@ -1755,7 +1801,7 @@ impl LayoutRegistry {
 /// mixed `[ordered(0), bullet(1), ordered(0)]` run numbered `1., 2.`.
 pub(crate) fn ordered_number_summary(document: &Document) -> HashMap<NodeId, usize> {
     let mut numbers = HashMap::new();
-    let mut counters = [0; MAX_LIST_DEPTH as usize + 1];
+    let mut counters = NumberingCursor::default();
     for block in document.blocks() {
         if let Some(number) = advance_numbering(numbering_kind(&block.kind), &mut counters) {
             numbers.insert(block.id, number);
@@ -1764,25 +1810,49 @@ pub(crate) fn ordered_number_summary(document: &Document) -> HashMap<NodeId, usi
     numbers
 }
 
-fn advance_numbering(kind: NumberingKind, counters: &mut NumberingState) -> Option<usize> {
+fn advance_numbering(kind: NumberingKind, counters: &mut NumberingCursor) -> Option<usize> {
+    fn reset_from(counters: &mut NumberingCursor, depth: u8) {
+        counters
+            .counters
+            .retain(|(entry_depth, _)| *entry_depth < depth);
+    }
+
+    fn value_at(counters: &NumberingCursor, depth: u8) -> Option<usize> {
+        counters
+            .counters
+            .iter()
+            .find_map(|(entry_depth, value)| (*entry_depth == depth).then_some(*value))
+    }
+
     match kind {
         NumberingKind::Ordered(depth) => {
-            let depth = depth as usize;
-            counters[depth.saturating_add(1)..].fill(0);
-            counters[depth] = counters[depth].saturating_add(1).max(1);
-            Some(counters[depth])
+            reset_from(counters, depth.saturating_add(1));
+            if let Some((_, value)) = counters
+                .counters
+                .iter_mut()
+                .find(|(entry_depth, _)| *entry_depth == depth)
+            {
+                *value = value.saturating_add(1).max(1);
+                Some(*value)
+            } else {
+                let value = value_at(counters, depth)
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .max(1);
+                counters.counters.push((depth, value));
+                Some(value)
+            }
         }
         NumberingKind::Bullet(depth) | NumberingKind::Check(depth) => {
-            let depth = depth as usize;
             if depth == 0 {
-                counters.fill(0);
+                counters.counters.clear();
             } else {
-                counters[depth..].fill(0);
+                reset_from(counters, depth);
             }
             None
         }
         NumberingKind::Boundary => {
-            counters.fill(0);
+            counters.counters.clear();
             None
         }
     }
@@ -1823,17 +1893,14 @@ fn estimate_text_height(text: &str, width: f32, kind: &BlockKind) -> f32 {
         * line_height
 }
 
-fn estimate_cache_bytes(
+fn estimate_retained_cache_bytes(
     layout: &BlockLayout,
     selection_geometry_bytes: usize,
     decoration_run_count: usize,
 ) -> usize {
     const ARC_ALLOCATION_OVERHEAD: usize = size_of::<usize>() * 2;
-    // GPUI keeps decoration runs in `SmallVec<[DecorationRun; 32]>`. The
-    // native renderer clones wrapped lines into its frame snapshot, so the
-    // admission estimate must include both the retained line and that
-    // transient clone (including a possible spill capacity).
-    const DECORATION_RUN_BYTES: usize = size_of::<TextRun>() * 2;
+    // GPUI keeps decoration runs in `SmallVec<[DecorationRun; 32]>`.
+    const DECORATION_RUN_BYTES: usize = size_of::<gpui::DecorationRun>();
     let shaped_bytes = layout
         .text_lines
         .iter()
@@ -1874,15 +1941,36 @@ fn estimate_cache_bytes(
         .saturating_sub(32)
         .saturating_mul(DECORATION_RUN_BYTES);
     let shaped_bytes = shaped_bytes.saturating_add(decoration_spill);
-    let transient_clone = shaped_bytes
-        .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
-        .saturating_add(ARC_ALLOCATION_OVERHEAD * 2);
     size_of::<CachedBlockLayout>()
         .saturating_add(size_of::<BlockLayout>())
         .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
         .saturating_add(shaped_bytes)
-        .saturating_add(transient_clone)
         .saturating_add(selection_geometry_bytes)
+}
+
+fn estimate_snapshot_clone_bytes(layout: &BlockLayout, decoration_run_count: usize) -> usize {
+    // The production snapshot clones this Vec and each WrappedLine. GPUI
+    // shares its text/layout Arcs; only these owned buffers are counted.
+    const ARC_ALLOCATION_OVERHEAD: usize = size_of::<usize>() * 2;
+    size_of::<BlockLayout>()
+        .saturating_add(size_of::<Vec<WrappedLine>>())
+        .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
+        .saturating_add(
+            decoration_run_count
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX)
+                .saturating_mul(size_of::<gpui::DecorationRun>()),
+        )
+        .saturating_add(ARC_ALLOCATION_OVERHEAD)
+}
+
+fn estimate_cache_bytes(
+    layout: &BlockLayout,
+    selection_geometry_bytes: usize,
+    decoration_run_count: usize,
+) -> usize {
+    estimate_retained_cache_bytes(layout, selection_geometry_bytes, decoration_run_count)
+        .saturating_add(estimate_snapshot_clone_bytes(layout, decoration_run_count))
 }
 
 fn selection_geometry_reserve(layout: &BlockLayout, requested: usize) -> usize {

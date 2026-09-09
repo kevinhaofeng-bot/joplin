@@ -507,6 +507,7 @@ impl Document {
         let mut selection = self.end_selection();
         let mut estimated_bytes = 0usize;
         let mut inserted_span = None;
+        let mut structural = false;
         let initial_revision = self.revision;
         let initial_next_id = self.next_id;
 
@@ -519,6 +520,7 @@ impl Document {
                 }
             };
             selection = outcome.selection;
+            structural |= outcome.structural;
             // The public outcome describes only the final operation in the
             // batch. A later non-insert operation must clear an earlier span
             // rather than publishing a range that may have moved or vanished.
@@ -543,6 +545,7 @@ impl Document {
         Ok(ApplyOutcome {
             selection,
             changed_nodes,
+            structural,
             inverse: TransactionBatch(inverse),
             estimated_bytes,
             inserted_span,
@@ -568,6 +571,7 @@ impl Document {
         let initial_next_id = self.next_id;
         let mut rollback_journal = Vec::new();
         let mut changed_nodes = SmallVec::new();
+        let mut structural = false;
 
         for transaction in inverse.0 {
             let outcome = match self.apply_transaction(transaction) {
@@ -580,6 +584,7 @@ impl Document {
             for node_id in outcome.changed_nodes.iter().copied() {
                 push_unique(&mut changed_nodes, node_id);
             }
+            structural |= outcome.structural;
             rollback_journal.push(outcome.inverse);
         }
 
@@ -606,10 +611,12 @@ impl Document {
         for node_id in outcome.changed_nodes.iter().copied() {
             push_unique(&mut changed_nodes, node_id);
         }
+        structural |= outcome.structural;
         Ok((
             ApplyOutcome {
                 selection: outcome.selection,
                 changed_nodes,
+                structural,
                 inverse: outcome.inverse,
                 estimated_bytes: outcome.estimated_bytes,
                 inserted_span: outcome.inserted_span,
@@ -697,6 +704,8 @@ impl Document {
     ) -> Result<ApplyOutcome, DocumentError> {
         let original_revision = self.revision;
         let original_next_id = self.next_id;
+        let block_count_before = self.blocks.len();
+        let structural_hint = transaction_changes_list_structure(&transaction);
         let (selection, changed_nodes, inverse, inserted_span) = match transaction {
             Transaction::InsertText { selection, text } => {
                 self.apply_insert_text(selection, text)?
@@ -812,6 +821,7 @@ impl Document {
                 }
                 unique
             },
+            structural: structural_hint || self.blocks.len() != block_count_before,
             inverse,
             estimated_bytes,
             inserted_span,
@@ -2628,6 +2638,20 @@ fn normalize_styles(styles: &mut SmallVec<[StyledRun; 4]>) {
         }
     }
     *styles = merged;
+}
+
+fn transaction_changes_list_structure(transaction: &Transaction) -> bool {
+    matches!(
+        transaction,
+        Transaction::SplitBlock { .. }
+            | Transaction::MergeBlocks { .. }
+            | Transaction::SetBlockKind { .. }
+            | Transaction::IndentList { .. }
+            | Transaction::OutdentList { .. }
+            | Transaction::InsertImage { .. }
+            | Transaction::RemoveNode { .. }
+            | Transaction::RestoreBlocks { .. }
+    )
 }
 
 fn push_unique(nodes: &mut SmallVec<[NodeId; 4]>, node_id: NodeId) {

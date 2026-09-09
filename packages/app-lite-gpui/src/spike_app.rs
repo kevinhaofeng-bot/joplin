@@ -1359,6 +1359,7 @@ mod tests {
     use super::*;
     use crate::components::{self, Copy, Cut};
     use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext, point};
+    use std::mem::size_of;
 
     fn redraw(cx: &mut VisualTestContext) {
         cx.update(|window, app| window.draw(app).clear());
@@ -1382,6 +1383,28 @@ mod tests {
     fn build_long_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
         let editor =
             cx.new(|cx| EditorCore::new(Document::from_paragraph("wrap ".repeat(360)), cx));
+        editor.read(cx).focus_handle().focus(window);
+        SpikeView {
+            editor,
+            catalogue: CommandCatalogue::default(),
+            scroll_handle: ScrollHandle::new(),
+            more_open: false,
+            link_popover: None,
+            pointer_anchor: None,
+            more_trigger_bounds: None,
+        }
+    }
+
+    fn build_multiblock_tail_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
+        let document = Document::from_paragraphs([
+            "first ".repeat(1_200),
+            "second ".repeat(1_200),
+            "third ".repeat(1_200),
+            "fourth ".repeat(1_200),
+            "fifth ".repeat(1_200),
+            "tail ".repeat(1_200),
+        ]);
+        let editor = cx.new(|cx| EditorCore::new(document, cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
@@ -1715,7 +1738,7 @@ mod tests {
         cx.update(|cx| components::init(cx));
         let (view, cx) = cx.add_window_view(build_view);
         redraw(cx);
-        let (first, second) = view.read_with(cx, |view, cx| {
+        let (first, second, first_id, second_id) = view.read_with(cx, |view, cx| {
             let editor = view.editor.read(cx);
             (
                 editor
@@ -1728,19 +1751,17 @@ mod tests {
                     .block_layout(editor.document().blocks()[1].id)
                     .unwrap()
                     .bounds,
+                editor.document().blocks()[0].id,
+                editor.document().blocks()[1].id,
             )
         });
         let a = point(first.left() + px(2.0), first.top() + px(8.0));
         let b = point(second.right() - px(2.0), second.top() + px(8.0));
         let c = point(second.left() + px(20.0), second.top() + px(8.0));
-        let (expected_a, expected_c) = view.update(cx, |view, cx| {
-            view.editor.update(cx, |editor, _| {
-                (
-                    editor.point_from_layout(a).expect("A hit point"),
-                    editor.point_from_layout(c).expect("C hit point"),
-                )
-            })
-        });
+        // These are hand-derived UTF-8 offsets for the literal fixture and
+        // pointer positions, independent of the production hit-test helper.
+        let expected_a = DocPoint::with_affinity(first_id, 0, Affinity::After);
+        let expected_c = DocPoint::with_affinity(second_id, 2, Affinity::After);
         cx.simulate_mouse_down(a, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_up(a, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_down(
@@ -1784,17 +1805,17 @@ mod tests {
         });
         redraw(cx);
 
-        cx.simulate_input("a🙂bc");
+        cx.simulate_input("a🙂b");
         cx.simulate_keystrokes("shift-left shift-left");
         cx.simulate_keystrokes("cmd-c");
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),
-            Some("bc".into())
+            Some("🙂b".into())
         );
         cx.simulate_keystrokes("backspace");
         view.read_with(cx, |view, cx| {
             let popover = view.link_popover.as_ref().expect("URL field remains open");
-            assert_eq!(popover.read(cx).text, "a🙂");
+            assert_eq!(popover.read(cx).text, "a");
             assert_eq!(popover.read(cx).selected_text(), "");
         });
     }
@@ -2272,9 +2293,51 @@ mod tests {
                 .cache
                 .get(&node)
                 .expect("decorated block must be retained for the production paint");
+            let retained_bytes = cached.retained_bytes;
+            let snapshot_clone_bytes = cached.snapshot_clone_bytes;
+            let line_capacity = cached.layout.text_lines.capacity();
+            let decoration_run_count = cached.decoration_run_count;
             assert!(
-                cached.decoration_run_count > 32,
+                decoration_run_count > 32,
                 "fixture must exercise alternating decoration runs"
+            );
+            assert_eq!(cached.bytes, retained_bytes + snapshot_clone_bytes);
+            assert!(
+                retained_bytes + snapshot_clone_bytes <= editor.layout().budget_bytes(),
+                "retained cache plus one real snapshot clone must stay under the budget"
+            );
+            assert!(
+                snapshot_clone_bytes >= line_capacity * size_of::<gpui::WrappedLine>(),
+                "snapshot clone accounting must include its owned WrappedLine Vec"
+            );
+            assert!(
+                snapshot_clone_bytes
+                    > size_of::<gpui::WrappedLine>() * line_capacity
+                        + size_of::<Vec<gpui::WrappedLine>>(),
+                "decoration spill must be part of the clone peak, not just the line Vec"
+            );
+            let actual_snapshot_bytes =
+                crate::native_editor::render::snapshot_allocation_bytes_for_test(editor);
+            assert!(
+                actual_snapshot_bytes > 0,
+                "production snapshot clone must allocate measurable owned buffers"
+            );
+            assert!(
+                retained_bytes + actual_snapshot_bytes <= editor.layout().budget_bytes(),
+                "retained cache plus the measured production snapshot must stay under the budget"
+            );
+            assert!(
+                actual_snapshot_bytes
+                    >= line_capacity * size_of::<gpui::WrappedLine>()
+                        + size_of::<Vec<gpui::WrappedLine>>(),
+                "allocator observation must include the owned WrappedLine Vec"
+            );
+            assert!(
+                actual_snapshot_bytes
+                    >= line_capacity * size_of::<gpui::WrappedLine>()
+                        + decoration_run_count.saturating_sub(32)
+                            * size_of::<gpui::DecorationRun>(),
+                "allocator observation must include spilled decoration runs"
             );
             assert!(editor.layout().used_bytes() <= editor.layout().budget_bytes());
         });
@@ -2291,7 +2354,7 @@ mod tests {
     #[gpui::test]
     async fn shell_live_viewport_membership_reaches_exact_tail_line_click(cx: &mut TestAppContext) {
         cx.update(|cx| components::init(cx));
-        let (view, cx) = cx.add_window_view(build_long_view);
+        let (view, cx) = cx.add_window_view(build_multiblock_tail_view);
         redraw(cx);
         let max_offset = view.read_with(cx, |view, _| view.scroll_handle.max_offset());
         view.update(cx, |view, cx| {
@@ -2301,29 +2364,51 @@ mod tests {
         });
         redraw(cx);
 
-        let (target, target_bounds, line_height, visible_ids) = view.read_with(cx, |view, cx| {
-            let editor = view.editor.read(cx);
-            let target = editor.document().first_node_id().expect("long paragraph");
-            let target_bounds = editor
-                .layout()
-                .block_layout(target)
-                .expect("scrolled tail block remains shaped")
-                .bounds;
-            let line_height = editor
-                .layout()
-                .line_height(target)
-                .expect("tail line height");
-            let visible_ids = editor
-                .layout()
-                .visible()
-                .iter()
-                .map(|layout| layout.node_id)
-                .collect::<Vec<_>>();
-            (target, target_bounds, line_height, visible_ids)
-        });
+        let (target, target_bounds, line_height, visible_ids, expected_ids, tail_len) = view
+            .read_with(cx, |view, cx| {
+                let editor = view.editor.read(cx);
+                let ids = editor
+                    .document()
+                    .blocks()
+                    .iter()
+                    .map(|block| block.id)
+                    .collect::<Vec<_>>();
+                let target = *ids.last().expect("tail paragraph");
+                let target_bounds = editor
+                    .layout()
+                    .block_layout(target)
+                    .expect("scrolled tail block remains shaped")
+                    .bounds;
+                let line_height = editor
+                    .layout()
+                    .line_height(target)
+                    .expect("tail line height");
+                let visible_ids = editor
+                    .layout()
+                    .visible()
+                    .iter()
+                    .map(|layout| layout.node_id)
+                    .collect::<Vec<_>>();
+                let expected_ids = ids[4..].to_vec();
+                let tail_len = editor.document().text_at_index(5).expect("tail text").len();
+                (
+                    target,
+                    target_bounds,
+                    line_height,
+                    visible_ids,
+                    expected_ids,
+                    tail_len,
+                )
+            });
+        assert_eq!(
+            visible_ids, expected_ids,
+            "live viewport must include exactly the tail multi-block range"
+        );
         assert!(
-            visible_ids.contains(&target),
-            "the actual viewport membership must include the block containing the tail line"
+            !visible_ids.contains(&view.read_with(cx, |view, cx| {
+                view.editor.read(cx).document().blocks()[0].id
+            })),
+            "the first offscreen node must be excluded"
         );
         let tail_click = point(
             target_bounds.right() - px(2.0),
@@ -2336,8 +2421,7 @@ mod tests {
             let selection = editor.selection();
             assert_eq!(selection.head.node_id, target);
             assert_eq!(
-                selection.head.utf8_offset,
-                editor.document().text_at_index(0).unwrap().len(),
+                selection.head.utf8_offset, tail_len,
                 "a click in the exact tail row must reach the document end"
             );
             assert_eq!(selection.head.affinity, Affinity::After);
@@ -2365,7 +2449,20 @@ mod tests {
                 .caret_x(origin)
                 .expect("origin caret geometry")
         });
-        cx.simulate_keystrokes("shift-down shift-down shift-up shift-up");
+        for key in ["shift-down", "shift-down", "shift-up", "shift-up"] {
+            cx.simulate_keystrokes(key);
+            view.read_with(cx, |view, cx| {
+                let editor = view.editor.read(cx);
+                let step_x = editor
+                    .layout()
+                    .caret_x(editor.selection().head)
+                    .expect("caret geometry after each vertical event");
+                assert!(
+                    f32::from(step_x - origin_x).abs() <= 0.5,
+                    "{key} must preserve preferred screen x at every step: {origin_x:?} -> {step_x:?}"
+                );
+            });
+        }
         view.read_with(cx, |view, cx| {
             let editor = view.editor.read(cx);
             let selection = editor.selection();
