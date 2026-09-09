@@ -752,6 +752,11 @@ struct CachedTexture {
     proxy_max_edge: u32,
 }
 
+struct PendingPromotion {
+    generation: u64,
+    proxy_max_edge: u32,
+}
+
 /// GPUI 0.2.2 image-cache adapter.  It preserves the donor's shared loading
 /// task and next-frame notification, while adding exact decoded-byte LRU and
 /// `App::drop_image` on eviction.
@@ -767,6 +772,8 @@ pub struct BudgetedImageCache {
     reserved_bytes: usize,
     reservations: HashMap<u64, (u64, usize)>,
     pending_retries: HashMap<u64, (u64, Resource)>,
+    promotions: HashMap<u64, PendingPromotion>,
+    promotion_failures: HashSet<(u64, u32)>,
     requested_edges: HashMap<u64, u32>,
     harvested_generations: HashSet<(u64, u64)>,
     next_generation: u64,
@@ -789,6 +796,8 @@ impl BudgetedImageCache {
             reserved_bytes: 0,
             reservations: HashMap::new(),
             pending_retries: HashMap::new(),
+            promotions: HashMap::new(),
+            promotion_failures: HashSet::new(),
             requested_edges: HashMap::new(),
             harvested_generations: HashSet::new(),
             next_generation: 0,
@@ -819,6 +828,8 @@ impl BudgetedImageCache {
             cache.reserved_bytes = 0;
             cache.reservations.clear();
             cache.pending_retries.clear();
+            cache.promotions.clear();
+            cache.promotion_failures.clear();
             cache.requested_edges.clear();
             cache.harvested_generations.clear();
             #[cfg(test)]
@@ -893,6 +904,8 @@ impl BudgetedImageCache {
         if next != self.visible {
             self.visible = next;
             self.deferred.clear();
+            self.promotion_failures
+                .retain(|(key, _)| self.visible.contains(key));
             self.requested_edges
                 .retain(|key, _| self.visible.contains(key));
         }
@@ -902,8 +915,14 @@ impl BudgetedImageCache {
     /// `ImageCache::load` call. A larger request promotes the proxy; a smaller
     /// request does not churn an already-promoted texture.
     pub fn request_edge(&mut self, resource: &Resource, max_edge: u32) {
-        self.requested_edges
-            .insert(hash(resource), quantize_proxy_edge(max_edge));
+        let key = hash(resource);
+        let max_edge = quantize_proxy_edge(max_edge);
+        self.requested_edges.insert(key, max_edge);
+        // A materially larger request is an explicit opportunity to retry a
+        // promotion that previously failed, while repeated paint requests for
+        // the same edge remain quiet until the caller changes the request.
+        self.promotion_failures
+            .retain(|(failed_key, failed_edge)| *failed_key != key || *failed_edge >= max_edge);
     }
 
     /// Drop completed entries that have left the current viewport. This uses
@@ -970,6 +989,148 @@ impl BudgetedImageCache {
             }
         }
         self.lru.retain(|candidate| *candidate != key);
+    }
+
+    fn start_promotion(
+        &mut self,
+        resource: &Resource,
+        max_edge: u32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let key = hash(resource);
+        if self.in_flight >= 1
+            || self.promotions.contains_key(&key)
+            || self.promotion_failures.contains(&(key, max_edge))
+            || !self.visible.contains(&key)
+        {
+            return false;
+        }
+        let Some(entry) = self.entries.get(&key) else {
+            return false;
+        };
+        if entry.proxy_max_edge >= max_edge || !matches!(entry.item, ImageCacheItem::Loaded(Ok(_)))
+        {
+            return false;
+        }
+
+        let reservation_floor = if self.budget_bytes > CONSERVATIVE_PROXY_RESERVATION {
+            CONSERVATIVE_PROXY_RESERVATION
+        } else {
+            (self.budget_bytes / 2).max(1)
+        };
+        let floor_fits = self.evict_until_fit(reservation_floor, cx, window);
+        let remaining = self
+            .budget_bytes
+            .saturating_sub(self.used_bytes.saturating_add(self.reserved_bytes));
+        if !floor_fits && remaining == 0 {
+            return false;
+        }
+        let reservation = remaining.min(proxy_reservation_bytes(max_edge));
+        if reservation < 4 {
+            return false;
+        }
+
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        self.reserved_bytes = self.reserved_bytes.saturating_add(reservation);
+        self.update_peak_accounted_bytes();
+        self.reservations.insert(key, (generation, reservation));
+        let source = resource.clone();
+        let load_future = async move {
+            Self::decode_resource_bounded_with_max_edge(&source, reservation, max_edge)
+        };
+        let task = cx.background_executor().spawn(load_future).shared();
+        self.promotions.insert(
+            key,
+            PendingPromotion {
+                generation,
+                proxy_max_edge: max_edge,
+            },
+        );
+        self.in_flight = self.in_flight.saturating_add(1);
+
+        let weak_cache = self.weak_entity.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let result = task.await;
+                if let Some(cache) = weak_cache {
+                    let _ = cache.update_in(cx, |cache, window, entity_cx| {
+                        let Some(promotion) = cache.promotions.remove(&key) else {
+                            if let Ok(image) = result {
+                                cache.record_drop_image();
+                                entity_cx.drop_image(image, Some(window));
+                            }
+                            cache.release_reservation(key, generation);
+                            entity_cx.notify();
+                            return;
+                        };
+                        debug_assert_eq!(promotion.generation, generation);
+
+                        let Some(mut entry) = cache.entries.remove(&key) else {
+                            if let Ok(image) = result {
+                                cache.record_drop_image();
+                                entity_cx.drop_image(image, Some(window));
+                            }
+                            cache.release_reservation(key, generation);
+                            entity_cx.notify();
+                            return;
+                        };
+                        cache.lru.retain(|value| *value != key);
+                        let old_image = match &entry.item {
+                            ImageCacheItem::Loaded(Ok(image)) => Some(image.clone()),
+                            _ => None,
+                        };
+                        let reservation = cache
+                            .reservations
+                            .get(&key)
+                            .filter(|(active_generation, _)| *active_generation == generation)
+                            .map(|(_, reservation)| *reservation)
+                            .unwrap_or_default();
+                        if cache.visible.contains(&key) {
+                            if let Ok(image) = result {
+                                if let Ok(decoded_bytes) = Self::image_bytes(&image)
+                                    && decoded_bytes <= reservation
+                                {
+                                    let old_bytes = entry.decoded_bytes;
+                                    cache.used_bytes = cache
+                                        .used_bytes
+                                        .saturating_sub(old_bytes)
+                                        .saturating_add(decoded_bytes);
+                                    entry.decoded_bytes = decoded_bytes;
+                                    entry.proxy_max_edge = promotion.proxy_max_edge;
+                                    entry.item = ImageCacheItem::Loaded(Ok(image));
+                                    cache.entries.insert(key, entry);
+                                    cache.lru.push_back(key);
+                                    cache.release_reservation(key, generation);
+                                    if let Some(old_image) = old_image {
+                                        cache.record_drop_image();
+                                        entity_cx.drop_image(old_image, Some(window));
+                                    }
+                                    entity_cx.notify();
+                                    return;
+                                } else {
+                                    cache.record_drop_image();
+                                    entity_cx.drop_image(image, Some(window));
+                                }
+                            }
+                        } else if let Ok(image) = result {
+                            cache.record_drop_image();
+                            entity_cx.drop_image(image, Some(window));
+                        }
+
+                        cache.entries.insert(key, entry);
+                        cache.lru.push_back(key);
+                        cache
+                            .promotion_failures
+                            .insert((key, promotion.proxy_max_edge));
+                        cache.release_reservation(key, generation);
+                        entity_cx.notify();
+                    });
+                }
+            })
+            .detach();
+        true
     }
 
     fn image_bytes(image: &RenderImage) -> Result<usize, ImageDecodeError> {
@@ -1454,18 +1615,23 @@ impl ImageCache for BudgetedImageCache {
                 window.scale_factor(),
             ))
         });
-        if self
-            .entries
-            .get(&key)
-            .is_some_and(|entry| max_edge > entry.proxy_max_edge)
-        {
-            self.invalidate(resource, window, cx);
-            // An in-flight generation owns the only decode slot. Its
-            // completion callback will restart the pending retry at the
-            // promoted edge once the old proxy has been dropped.
-            if self.in_flight > 0 {
-                return None;
-            }
+        if self.promotions.contains_key(&key) {
+            // A promotion is stale-while-revalidate: keep returning the
+            // settled proxy while the higher-resolution task is in flight.
+            return self
+                .entries
+                .get_mut(&key)
+                .and_then(|entry| entry.item.get());
+        }
+        let should_promote = self.entries.get(&key).is_some_and(|entry| {
+            max_edge > entry.proxy_max_edge && matches!(entry.item, ImageCacheItem::Loaded(Ok(_)))
+        });
+        if should_promote {
+            self.start_promotion(resource, max_edge, window, cx);
+            return self
+                .entries
+                .get_mut(&key)
+                .and_then(|entry| entry.item.get());
         }
         if let Some(mut entry) = self.entries.remove(&key) {
             self.lru.retain(|value| *value != key);
@@ -2195,8 +2361,21 @@ mod tests {
         window.update(|window, app| {
             cache.update(app, |cache, entity_cx| {
                 cache.request_edge(&resource, 1360);
-                assert!(cache.load(&resource, window, entity_cx).is_none());
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("promotion must keep the old proxy drawable")
+                    .expect("old proxy must remain successful while promoting");
+                let size = image.size(0);
+                assert_eq!(
+                    u32::from(size.width).max(u32::from(size.height)),
+                    low_edge,
+                    "promotion must not flash a placeholder or change size in flight"
+                );
                 assert_eq!(cache.in_flight_for_test(), 1);
+                assert!(cache.reserved_bytes_for_test() > 0);
+                assert!(cache.accounted_bytes_for_test() > cache.reserved_bytes_for_test());
+                assert!(cache.peak_accounted_bytes() >= cache.accounted_bytes_for_test());
+                assert!(cache.accounted_bytes_for_test() <= cache.budget_bytes());
             });
         });
         window.run_until_parked();
@@ -2227,6 +2406,104 @@ mod tests {
                     u32::from(size.width).max(u32::from(size.height)),
                     promoted_edge
                 );
+                assert_eq!(cache.in_flight_for_test(), 0);
+                assert!(cache.peak_accounted_bytes() <= cache.budget_bytes());
+            });
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn production_cache_keeps_old_proxy_when_promotion_fails(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "joplin-lite-cache-promotion-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("promotion failure fixture directory");
+        let source = root.join("image.png");
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            1600,
+            900,
+            Rgba([0x11, 0x22, 0x33, 0xff]),
+        ))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("promotion failure fixture should encode");
+        let bytes = encoded.into_inner();
+        std::fs::write(&source, &bytes).expect("promotion failure fixture should write");
+        let resource = Resource::from(source.clone());
+        let cache =
+            cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
+        let window = cx.add_empty_window();
+
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.set_visible_resources([&resource]);
+                cache.request_edge(&resource, 680);
+                assert!(cache.load(&resource, window, entity_cx).is_none());
+            });
+        });
+        window.run_until_parked();
+        let old_edge = window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("initial proxy should settle")
+                    .expect("initial proxy should decode");
+                let size = image.size(0);
+                u32::from(size.width).max(u32::from(size.height))
+            })
+        });
+
+        std::fs::remove_file(&source).expect("promotion source should be removable");
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.request_edge(&resource, 1360);
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("failed promotion must keep old proxy")
+                    .expect("old proxy must remain successful");
+                let size = image.size(0);
+                assert_eq!(u32::from(size.width).max(u32::from(size.height)), old_edge);
+                assert!(cache.reserved_bytes_for_test() > 0);
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("failed promotion should settle back to old proxy")
+                    .expect("old proxy should survive promotion failure");
+                let size = image.size(0);
+                assert_eq!(u32::from(size.width).max(u32::from(size.height)), old_edge);
+                assert_eq!(cache.in_flight_for_test(), 0);
+                assert_eq!(cache.reserved_bytes_for_test(), 0);
+            });
+        });
+
+        std::fs::write(&source, &bytes).expect("promotion retry source should be restored");
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                cache.request_edge(&resource, 1536);
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("retry should keep drawing old proxy")
+                    .expect("old proxy should remain while retrying");
+                let size = image.size(0);
+                assert_eq!(u32::from(size.width).max(u32::from(size.height)), old_edge);
+                assert_eq!(cache.in_flight_for_test(), 1);
+            });
+        });
+        window.run_until_parked();
+        window.update(|window, app| {
+            cache.update(app, |cache, entity_cx| {
+                let image = cache
+                    .load(&resource, window, entity_cx)
+                    .expect("promotion retry should settle")
+                    .expect("promotion retry should decode");
+                let size = image.size(0);
+                assert!(u32::from(size.width).max(u32::from(size.height)) > old_edge);
                 assert_eq!(cache.in_flight_for_test(), 0);
             });
         });
