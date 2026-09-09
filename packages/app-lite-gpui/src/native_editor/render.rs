@@ -16,6 +16,8 @@ use super::images::{BudgetedImageCache, proxy_max_edge_for_viewport};
 use super::layout::{BlockLayout, ordered_number_summary};
 use super::model::{BlockKind, Document, NodeId, Selection};
 
+const PREFETCH_MAX_EDGE: u32 = 512;
+
 pub(crate) fn image_proxy_max_edge_for_bounds(width: f32, height: f32, scale_factor: f32) -> u32 {
     proxy_max_edge_for_viewport(width.max(height), scale_factor)
 }
@@ -45,6 +47,30 @@ struct RenderSnapshot {
     caret_bounds: Option<Bounds<Pixels>>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ImageResidency {
+    visible_indices: Vec<usize>,
+    prefetch_indices: Vec<usize>,
+}
+
+impl ImageResidency {
+    fn resident_indices(&self) -> Vec<usize> {
+        self.visible_indices
+            .iter()
+            .chain(self.prefetch_indices.iter())
+            .copied()
+            .collect()
+    }
+
+    fn is_resident(&self, index: usize) -> bool {
+        self.visible_indices.contains(&index) || self.prefetch_indices.contains(&index)
+    }
+
+    fn is_visible(&self, index: usize) -> bool {
+        self.visible_indices.contains(&index)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextPaintPass {
     Background,
@@ -56,6 +82,18 @@ enum TextPaintPass {
 struct TestRenderObservations {
     snapshot_clone_peak: usize,
     shaped_background_paints: usize,
+    image_residency: Option<TestImageResidencyObservation>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestImageResidencyObservation {
+    pub(crate) content_mask: Bounds<Pixels>,
+    pub(crate) image_bounds: Vec<Bounds<Pixels>>,
+    pub(crate) visible_bounds: Vec<Bounds<Pixels>>,
+    pub(crate) prefetch_bounds: Vec<Bounds<Pixels>>,
+    pub(crate) visible_indices: Vec<usize>,
+    pub(crate) prefetch_indices: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -79,6 +117,18 @@ pub(crate) fn test_snapshot_clone_peak() -> usize {
 #[cfg(test)]
 pub(crate) fn test_highlight_background_paints() -> usize {
     TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow().shaped_background_paints)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_image_residency_observation() {
+    TEST_RENDER_OBSERVATIONS.with(|observations| {
+        observations.borrow_mut().image_residency = None;
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_image_residency_observation() -> Option<TestImageResidencyObservation> {
+    TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow().image_residency.clone())
 }
 
 #[cfg(test)]
@@ -109,6 +159,39 @@ fn observe_snapshot_clone(cached: &super::layout::CachedBlockLayout) {
         observations.snapshot_clone_peak = observations
             .snapshot_clone_peak
             .max(cached.snapshot_clone_bytes);
+    });
+}
+
+#[cfg(test)]
+fn observe_image_residency(
+    snapshot: &RenderSnapshot,
+    content_mask: Bounds<Pixels>,
+    residency: &ImageResidency,
+) {
+    TEST_RENDER_OBSERVATIONS.with(|observations| {
+        observations.borrow_mut().image_residency = Some(TestImageResidencyObservation {
+            content_mask,
+            image_bounds: snapshot
+                .blocks
+                .iter()
+                .filter(|block| block.is_image)
+                .map(|block| block.layout.bounds)
+                .collect(),
+            visible_bounds: residency
+                .visible_indices
+                .iter()
+                .filter_map(|index| snapshot.blocks.get(*index))
+                .map(|block| block.layout.bounds)
+                .collect(),
+            prefetch_bounds: residency
+                .prefetch_indices
+                .iter()
+                .filter_map(|index| snapshot.blocks.get(*index))
+                .map(|block| block.layout.bounds)
+                .collect(),
+            visible_indices: residency.visible_indices.clone(),
+            prefetch_indices: residency.prefetch_indices.clone(),
+        });
     });
 }
 
@@ -178,32 +261,93 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
     }
 }
 
+fn bounds_intersect(left: Bounds<Pixels>, right: Bounds<Pixels>) -> bool {
+    left.left() < right.right()
+        && left.right() > right.left()
+        && left.top() < right.bottom()
+        && left.bottom() > right.top()
+}
+
+fn classify_image_residency(
+    blocks: &[RenderBlock],
+    content_mask: Bounds<Pixels>,
+) -> ImageResidency {
+    let mut residency = ImageResidency::default();
+    let mut preceding_image = None;
+    let mut following_image = None;
+
+    for (index, block) in blocks.iter().enumerate() {
+        if !block.is_image {
+            continue;
+        }
+        if bounds_intersect(block.layout.bounds, content_mask) {
+            residency.visible_indices.push(index);
+            continue;
+        }
+        if block.layout.bounds.bottom() <= content_mask.top() {
+            preceding_image = Some(index);
+        } else if following_image.is_none() && block.layout.bounds.top() >= content_mask.bottom() {
+            following_image = Some(index);
+        }
+    }
+
+    if let Some(index) = preceding_image {
+        residency.prefetch_indices.push(index);
+    }
+    if let Some(index) = following_image {
+        residency.prefetch_indices.push(index);
+    }
+    residency
+}
+
+fn image_request_edge(block: &RenderBlock, scale_factor: f32, is_visible: bool) -> u32 {
+    let edge = image_proxy_max_edge_for_bounds(
+        f32::from(block.layout.bounds.size.width),
+        f32::from(block.layout.bounds.size.height),
+        scale_factor,
+    );
+    if is_visible {
+        edge
+    } else {
+        edge.min(PREFETCH_MAX_EDGE)
+    }
+}
+
 pub fn paint(editor: &EditorCore, window: &mut Window, cx: &mut App) -> gpui::Result<()> {
     let snapshot = snapshot(editor);
-    paint_snapshot(&snapshot, None, None, window, cx)
+    let content_mask = window.content_mask().bounds;
+    paint_snapshot(&snapshot, content_mask, None, None, window, cx)
 }
 
 fn paint_snapshot(
     snapshot: &RenderSnapshot,
+    content_mask: Bounds<Pixels>,
     image_cache: Option<Entity<BudgetedImageCache>>,
     editor: Option<Entity<EditorCore>>,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Result<()> {
+    let residency = classify_image_residency(snapshot.blocks.as_slice(), content_mask);
+    #[cfg(test)]
+    observe_image_residency(snapshot, content_mask, &residency);
     if let Some(cache) = image_cache.as_ref() {
-        let visible_resources = snapshot
-            .blocks
+        let resident_indices = residency.resident_indices();
+        let resident_resources = resident_indices
             .iter()
-            .filter_map(|block| block.image_resource.as_ref())
+            .filter_map(|index| snapshot.blocks[*index].image_resource.as_ref())
             .collect::<Vec<_>>();
         cache.update(cx, |cache, cache_cx| {
-            cache.set_visible_resources(visible_resources.iter().copied());
-            for block in snapshot.blocks.iter().filter(|block| block.is_image) {
+            cache.set_visible_resources(resident_resources.iter().copied());
+            for index in resident_indices.iter().copied() {
+                let block = &snapshot.blocks[index];
+                if !block.is_image {
+                    continue;
+                }
                 if let Some(resource) = block.image_resource.as_ref() {
-                    let max_edge = image_proxy_max_edge_for_bounds(
-                        f32::from(block.layout.bounds.size.width),
-                        f32::from(block.layout.bounds.size.height),
+                    let max_edge = image_request_edge(
+                        block,
                         window.scale_factor(),
+                        residency.is_visible(index),
                     );
                     cache.request_edge_with_natural_max(
                         resource,
@@ -245,13 +389,17 @@ fn paint_snapshot(
     }
 
     // 3. Glyphs/images.
-    for block in &snapshot.blocks {
+    for (index, block) in snapshot.blocks.iter().enumerate() {
         if block.is_image {
-            let image = block.image_resource.as_ref().and_then(|resource| {
-                image_cache.as_ref().and_then(|cache| {
-                    cache.update(cx, |cache, cx| cache.load(resource, window, cx))
-                })
-            });
+            let image = residency
+                .is_resident(index)
+                .then(|| block.image_resource.as_ref())
+                .flatten()
+                .and_then(|resource| {
+                    image_cache.as_ref().and_then(|cache| {
+                        cache.update(cx, |cache, cx| cache.load(resource, window, cx))
+                    })
+                });
             if let Some(Ok(image)) = image {
                 if let (Some(editor), Some(resource_id)) =
                     (editor.as_ref(), block.image_resource_id.as_deref())
@@ -397,7 +545,15 @@ pub fn paint_entity(
         );
     }
     let snapshot = entity.read_with(cx, |editor, _cx| snapshot(editor));
-    paint_snapshot(&snapshot, image_cache, Some(entity), window, cx)
+    let content_mask = window.content_mask().bounds;
+    paint_snapshot(
+        &snapshot,
+        content_mask,
+        image_cache,
+        Some(entity),
+        window,
+        cx,
+    )
 }
 
 /// A small pure description useful to tests and to a future measured-layout
@@ -444,6 +600,67 @@ mod tests {
         assert_eq!(image_proxy_max_edge_for_bounds(680.0, 400.0, 2.0), 1360);
         assert_eq!(natural_max_edge((0, 1600)), None);
         assert_eq!(natural_max_edge((900, 1600)), Some(1600));
+    }
+
+    #[test]
+    fn image_residency_uses_mask_and_only_adjacent_prefetch_images() {
+        let blocks = [
+            test_image_render_block(1, 0.0),
+            test_image_render_block(2, 60.0),
+            test_image_render_block(3, 120.0),
+            test_image_render_block(4, 180.0),
+            test_image_render_block(5, 240.0),
+            test_image_render_block(6, 300.0),
+            test_image_render_block(7, 500.0),
+        ];
+        let mask = Bounds::new(point(px(0.0), px(120.0)), gpui::size(px(100.0), px(130.0)));
+
+        let residency = classify_image_residency(&blocks, mask);
+
+        assert_eq!(residency.visible_indices, vec![2, 3, 4]);
+        assert_eq!(residency.prefetch_indices, vec![1, 5]);
+        assert!(!residency.resident_indices().contains(&6));
+    }
+
+    #[test]
+    fn image_request_edge_keeps_retina_for_visible_and_caps_prefetch() {
+        let block = test_image_render_block(1, 0.0);
+
+        assert_eq!(image_request_edge(&block, 2.0, true), 200);
+        assert_eq!(image_request_edge(&block, 2.0, false), 200);
+
+        let wide = RenderBlock {
+            layout: BlockLayout {
+                bounds: Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(680.0), px(382.5))),
+                ..block.layout.clone()
+            },
+            ..block
+        };
+        assert_eq!(image_request_edge(&wide, 2.0, true), 1360);
+        assert_eq!(image_request_edge(&wide, 2.0, false), PREFETCH_MAX_EDGE);
+    }
+
+    fn test_image_render_block(id: u64, top: f32) -> RenderBlock {
+        let node_id = NodeId::new(id);
+        RenderBlock {
+            layout: BlockLayout {
+                node_id,
+                bounds: Bounds::new(point(px(0.0), px(top)), gpui::size(px(100.0), px(50.0))),
+                text_inset: px(0.0),
+                text_align: gpui::TextAlign::Left,
+                text_lines: Vec::new(),
+                before: super::super::model::DocPoint::new(node_id, 0),
+                after: super::super::model::DocPoint::new(node_id, 0),
+            },
+            text_lines: Vec::new(),
+            is_image: true,
+            shaped_background_run_count: 0,
+            line_height: None,
+            marker: None,
+            image_resource: None,
+            image_resource_id: None,
+            image_natural_max_edge: None,
+        }
     }
 
     #[gpui::test]

@@ -2172,6 +2172,19 @@ mod tests {
     }
 
     #[test]
+    fn request_edge_with_natural_max_keeps_retina_tier_and_small_prefetch_tier() {
+        let resource = Resource::from(PathBuf::from("/tmp/request-edge-tiers.png"));
+        let key = hash(&resource);
+        let mut cache = BudgetedImageCache::new(DECODED_IMAGE_CACHE_BUDGET);
+
+        cache.request_edge_with_natural_max(&resource, 1360, Some(1600));
+        assert_eq!(cache.requested_edges.get(&key), Some(&1408));
+
+        cache.request_edge_with_natural_max(&resource, 512, Some(1600));
+        assert_eq!(cache.requested_edges.get(&key), Some(&512));
+    }
+
+    #[test]
     fn bounded_decode_respects_viewport_device_pixel_edge() {
         let source = ImageBuffer::from_pixel(4096, 4096, Rgba([0x11, 0x22, 0x33, 0xff]));
         let mut encoded = std::io::Cursor::new(Vec::new());

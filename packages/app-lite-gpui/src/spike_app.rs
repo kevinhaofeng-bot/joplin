@@ -2230,6 +2230,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[gpui::test]
+    fn production_paint_entity_uses_translated_content_mask_for_image_residency(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        crate::native_editor::render::reset_test_image_residency_observation();
+        let cache =
+            cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
+        let view_cache = cache.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let editor = cx.new(|cx| EditorCore::new(build_document(FixtureKind::Empty), cx));
+            editor
+                .update(cx, |editor, _| populate_typical_images(editor))
+                .expect("production image fixture should insert");
+            editor.read(cx).focus_handle().focus(window);
+            SpikeView {
+                editor,
+                image_cache: Some(view_cache.clone()),
+                catalogue: CommandCatalogue::default(),
+                scroll_handle: ScrollHandle::new(),
+                more_open: false,
+                link_popover: None,
+                pointer_anchor: None,
+                drop_point: None,
+                more_trigger_bounds: None,
+                measurement: None,
+            }
+        });
+
+        cx.simulate_resize(size(px(1080.0), px(720.0)));
+        redraw(cx);
+
+        let observation = crate::native_editor::render::test_image_residency_observation()
+            .expect("real canvas paint_entity path should record image residency");
+        assert!(!observation.image_bounds.is_empty());
+        assert!(
+            !observation.visible_bounds.is_empty(),
+            "at least one translated image must intersect the real content mask"
+        );
+        assert!(observation.prefetch_bounds.len() <= 2);
+        for bounds in &observation.visible_bounds {
+            assert!(
+                bounds.left() < observation.content_mask.right()
+                    && bounds.right() > observation.content_mask.left()
+                    && bounds.top() < observation.content_mask.bottom()
+                    && bounds.bottom() > observation.content_mask.top(),
+                "visible image and content mask must be in the same translated coordinate space"
+            );
+        }
+        for bounds in &observation.prefetch_bounds {
+            assert!(
+                bounds.bottom() <= observation.content_mask.top()
+                    || bounds.top() >= observation.content_mask.bottom(),
+                "prefetch image must be outside the actual content mask"
+            );
+        }
+        let resident_count = observation.visible_indices.len() + observation.prefetch_indices.len();
+        let settled_entries = cx.update(|_, app| cache.read(app).len());
+        assert!(
+            settled_entries <= resident_count,
+            "paint_entity must not decode remote images outside visible+adjacent prefetch"
+        );
+        let _ = view;
+    }
+
     #[test]
     fn viewport_readiness_requires_all_one_hundred_twenty_commits_and_reset() {
         let options = SpikeLaunchOptions {
