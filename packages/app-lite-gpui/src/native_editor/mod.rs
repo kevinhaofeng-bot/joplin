@@ -1,4 +1,5 @@
 pub mod acceptance;
+pub mod commands;
 pub mod core;
 pub mod history;
 pub mod input;

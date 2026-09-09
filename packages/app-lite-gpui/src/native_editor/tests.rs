@@ -1,6 +1,8 @@
+use super::commands::{CommandArgument, CommandCatalogue, EditorCommand, ToggleState};
 use super::core::EditorCore;
 use super::history::History;
 use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry};
+use crate::spike_app::{SpikeRouteContract, layout_for_viewport, route_contract};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::mem::size_of;
@@ -2786,4 +2788,256 @@ async fn shaped_cache_invalidates_font_family_weight_style_and_size(cx: &mut gpu
         layout.shape_visible_with_style(&document, 0.0, 240.0, 680.0, style, window);
     });
     assert_eq!(layout.shape_count(), first_shape_count + 4);
+}
+
+#[gpui::test]
+fn toolbar_and_overflow_execute_same_command(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("第一行\n第二行", cx);
+    editor.select_all();
+    let catalogue = CommandCatalogue::default();
+    catalogue
+        .execute(
+            EditorCommand::BulletList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    assert!(
+        editor
+            .document()
+            .block_kinds()
+            .iter()
+            .all(|kind| matches!(kind, BlockKind::BulletItem { .. }))
+    );
+    assert_eq!(editor.undo_depth(), 1);
+    catalogue
+        .execute(EditorCommand::Undo, CommandArgument::None, &mut editor)
+        .unwrap();
+    assert_eq!(editor.document().block_kinds(), [BlockKind::Paragraph]);
+}
+
+#[gpui::test]
+fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let descriptors = catalogue.descriptors();
+    let unique_commands = descriptors
+        .iter()
+        .map(|descriptor| descriptor.command)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique_commands.len(), descriptors.len());
+
+    for descriptor in descriptors {
+        let mut editor = EditorCore::for_test("第一行\n第二行", cx);
+        editor.select_all();
+        let before = editor.document().semantic_snapshot();
+        let before_undo = editor.undo_depth();
+        let argument = if descriptor.command == EditorCommand::Link {
+            CommandArgument::LinkUrl("https://example.com".into())
+        } else {
+            CommandArgument::None
+        };
+        let state = catalogue.state(descriptor.command, &editor);
+        let current_state_no_op = state.toggle == ToggleState::On
+            && matches!(
+                descriptor.command,
+                EditorCommand::Paragraph
+                    | EditorCommand::Heading1
+                    | EditorCommand::Heading2
+                    | EditorCommand::Heading3
+                    | EditorCommand::BulletList
+                    | EditorCommand::OrderedList
+                    | EditorCommand::CheckList
+                    | EditorCommand::AlignLeft
+                    | EditorCommand::AlignCenter
+                    | EditorCommand::AlignRight
+            );
+        if current_state_no_op {
+            assert!(!state.enabled, "current-state no-op must be disabled");
+            continue;
+        }
+        if !state.enabled {
+            continue;
+        }
+        catalogue
+            .execute(descriptor.command, argument, &mut editor)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "enabled visible command {:?} returned an error: {error:?}",
+                    descriptor.command
+                )
+            });
+        assert_ne!(
+            editor.document().semantic_snapshot(),
+            before,
+            "enabled visible command {:?} did not change the document",
+            descriptor.command
+        );
+        assert_eq!(editor.undo_depth(), before_undo + 1);
+    }
+
+    let mut editor = EditorCore::for_test("第一行\n第二行", cx);
+    editor.select_all();
+    catalogue
+        .execute(
+            EditorCommand::BulletList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    assert!(catalogue.state(EditorCommand::IndentList, &editor).enabled);
+    catalogue
+        .execute(
+            EditorCommand::IndentList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    assert!(
+        editor
+            .document()
+            .block_kinds()
+            .iter()
+            .all(|kind| matches!(kind, BlockKind::BulletItem { depth: 1 }))
+    );
+    assert_eq!(editor.undo_depth(), 2);
+    assert_eq!(
+        catalogue.state(EditorCommand::Undo, &editor).toggle,
+        ToggleState::On
+    );
+    catalogue
+        .execute(EditorCommand::Undo, CommandArgument::None, &mut editor)
+        .unwrap();
+    assert!(catalogue.state(EditorCommand::Redo, &editor).enabled);
+}
+
+#[gpui::test]
+fn list_boundary_editing_preserves_structure(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let list_kinds = [
+        BlockKind::BulletItem { depth: 0 },
+        BlockKind::OrderedItem { depth: 0 },
+        BlockKind::CheckItem {
+            depth: 0,
+            checked: false,
+        },
+    ];
+
+    for list_kind in list_kinds {
+        let mut editor = EditorCore::for_test_paragraphs(["一", "二", "三"], cx);
+        editor.select_all();
+        let original_selection = editor.selection();
+        let original_document = editor.document().semantic_snapshot();
+        catalogue
+            .execute(
+                match list_kind {
+                    BlockKind::BulletItem { .. } => EditorCommand::BulletList,
+                    BlockKind::OrderedItem { .. } => EditorCommand::OrderedList,
+                    BlockKind::CheckItem { .. } => EditorCommand::CheckList,
+                    _ => unreachable!(),
+                },
+                CommandArgument::None,
+                &mut editor,
+            )
+            .unwrap();
+
+        let ids = editor
+            .document()
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        let middle = ids[1];
+        let middle_end = editor.document().text_at_index(1).unwrap().len();
+        editor.set_selection_for_test(Selection::new(
+            DocPoint::with_affinity(middle, 0, Affinity::Before),
+            DocPoint::with_affinity(middle, middle_end, Affinity::After),
+        ));
+        catalogue
+            .execute(
+                EditorCommand::IndentList,
+                CommandArgument::None,
+                &mut editor,
+            )
+            .unwrap();
+
+        editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+            ids[0],
+            0,
+            Affinity::Before,
+        )));
+        editor.backspace().unwrap();
+        assert!(matches!(
+            editor.document().blocks()[0].kind,
+            BlockKind::Paragraph
+        ));
+        assert_eq!(editor.document().blocks()[1].id, ids[1]);
+        assert_eq!(editor.document().blocks()[2].id, ids[2]);
+
+        editor.undo().unwrap();
+        editor.undo().unwrap();
+        editor.undo().unwrap();
+        assert_eq!(editor.document().semantic_snapshot(), original_document);
+        assert_eq!(editor.selection(), original_selection);
+    }
+}
+
+#[gpui::test]
+fn command_state_reports_on_off_and_mixed_from_real_selection(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let mut editor = EditorCore::for_test("ab\ncd", cx);
+    let first = editor.document().blocks()[0].id;
+    editor
+        .apply(Transaction::ToggleMark {
+            selection: Selection::new(
+                DocPoint::with_affinity(first, 0, Affinity::Before),
+                DocPoint::with_affinity(first, 2, Affinity::After),
+            ),
+            mark: Mark::Bold,
+        })
+        .unwrap();
+    editor.select_all();
+    let mixed = catalogue.state(EditorCommand::Bold, &editor);
+    assert!(mixed.enabled);
+    assert_eq!(mixed.toggle, ToggleState::Mixed);
+
+    editor.select_document_range(0, 2);
+    let on = catalogue.state(EditorCommand::Bold, &editor);
+    assert!(on.enabled);
+    assert_eq!(on.toggle, ToggleState::On);
+
+    let mut fresh = EditorCore::for_test("ab", cx);
+    fresh.select_all();
+    let off = catalogue.state(EditorCommand::Bold, &fresh);
+    assert!(off.enabled);
+    assert_eq!(off.toggle, ToggleState::Off);
+
+    assert!(catalogue.state(EditorCommand::Undo, &editor).enabled);
+    editor.undo().unwrap();
+    assert!(!catalogue.state(EditorCommand::Undo, &editor).enabled);
+    assert!(catalogue.state(EditorCommand::Redo, &editor).enabled);
+}
+
+#[test]
+fn spike_layout_centers_680_and_keeps_narrow_insets_and_bottom_padding() {
+    let wide = layout_for_viewport(1_200.0, 800.0);
+    assert_eq!(wide.content_width, 680.0);
+    assert_eq!(wide.left_inset, 260.0);
+    assert_eq!(wide.right_inset, 260.0);
+    assert!((wide.bottom_padding - 240.0).abs() < 0.01);
+
+    let narrow = layout_for_viewport(700.0, 600.0);
+    assert_eq!(narrow.content_width, 636.0);
+    assert_eq!(narrow.left_inset, 32.0);
+    assert_eq!(narrow.right_inset, 32.0);
+    assert!((narrow.bottom_padding - 180.0).abs() < 0.01);
+}
+
+#[test]
+fn spike_route_uses_native_gpui_without_donor_services() {
+    let contract: SpikeRouteContract = route_contract();
+    assert_eq!(contract.window_count, 1);
+    assert!(contract.uses_native_editor_entity);
+    assert!(contract.uses_real_input_bridge);
+    assert!(!contract.initializes_donor_services);
+    assert!(!contract.initializes_web_runtime);
 }

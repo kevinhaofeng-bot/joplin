@@ -28,6 +28,7 @@ mod file_url;
 mod i18n;
 mod native_editor;
 mod net;
+mod spike_app;
 mod theme;
 mod window_chrome;
 
@@ -96,6 +97,7 @@ fn main() {
 
     // Parse command-line arguments
     let mut detach = false;
+    let mut evernote_spike = false;
     let mut input_paths = Vec::new();
 
     let mut i = 1;
@@ -118,6 +120,7 @@ fn main() {
                 println!("    -v, --version    Print version information");
                 println!("    -h, --help       Print this help message");
                 println!("    -d, --detach     Launch in background (non-blocking)");
+                println!("        --evernote-spike  Launch the native editor spike");
                 println!();
                 println!("FILES:");
                 println!("    One or more markdown files to open. If no files are specified,");
@@ -126,6 +129,9 @@ fn main() {
             }
             "--detach" | "-d" => {
                 detach = true;
+            }
+            "--evernote-spike" => {
+                evernote_spike = true;
             }
             option if option.starts_with('-') => {
                 eprintln!("Unknown option: {}", option);
@@ -185,6 +191,16 @@ fn main() {
     }
 
     app.run(move |cx: &mut App| {
+        if evernote_spike {
+            // Keep this route intentionally below the ordinary app bootstrap:
+            // it needs the donor key/action table, but not donor workspace,
+            // menu, network, updater, exporter, sync, or web runtimes.
+            components::init(cx);
+            spike_app::open(cx);
+            cx.refresh_windows();
+            return;
+        }
+
         let preferences = config::load_or_create_app_preferences().unwrap_or_else(|err| {
             eprintln!("failed to initialize app preferences: {err}");
             Default::default()

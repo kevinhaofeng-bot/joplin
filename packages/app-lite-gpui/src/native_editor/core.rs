@@ -105,6 +105,7 @@ pub struct EditorCore {
     last_input_error: Option<DocumentError>,
     history: History,
     pub(crate) layout: LayoutRegistry,
+    layout_offset: (f32, f32),
 }
 
 impl EditorCore {
@@ -119,6 +120,15 @@ impl EditorCore {
     pub fn for_test(text: &str, cx: &mut gpui::TestAppContext) -> Self {
         let document = Document::from_paragraph(text);
         Self::from_document(document, cx)
+    }
+
+    #[cfg(test)]
+    pub fn for_test_paragraphs<I, S>(paragraphs: I, cx: &mut gpui::TestAppContext) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::from_document(Document::from_paragraphs(paragraphs), cx)
     }
 
     #[cfg(test)]
@@ -218,6 +228,7 @@ impl EditorCore {
             last_input_error: None,
             history: History::new(1_000, 16 * 1024 * 1024),
             layout: LayoutRegistry::new(),
+            layout_offset: (0.0, 0.0),
         }
     }
 
@@ -233,6 +244,96 @@ impl EditorCore {
         self.selection
     }
 
+    /// Return the document-order block interval covered by the active
+    /// selection. Command state and the native toolbar use this same helper so
+    /// they cannot accidentally maintain a second selection interpretation.
+    pub(crate) fn selected_block_indices(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.ordered_selection();
+        Some((
+            self.block_index(start.node_id)?,
+            self.block_index(end.node_id)?,
+        ))
+    }
+
+    /// Return the non-empty text spans covered by the active selection. Image
+    /// atoms are intentionally omitted: text commands must not pretend that a
+    /// structural image selection is editable text.
+    pub(crate) fn selected_text_ranges(&self) -> Vec<(NodeId, Range<usize>)> {
+        let Some((start_index, end_index)) = self.selected_block_indices() else {
+            return Vec::new();
+        };
+        let (start, end) = self.ordered_selection();
+        let mut ranges = Vec::new();
+        for index in start_index..=end_index {
+            let Some(block) = self.document.blocks().get(index) else {
+                continue;
+            };
+            let Some(text) = block.content.as_text() else {
+                continue;
+            };
+            let range_start = if index == start_index {
+                start.utf8_offset.min(text.len())
+            } else {
+                0
+            };
+            let range_end = if index == end_index {
+                end.utf8_offset.min(text.len())
+            } else {
+                text.len()
+            };
+            if range_start < range_end {
+                ranges.push((block.id, range_start..range_end));
+            }
+        }
+        ranges
+    }
+
+    /// Query whether a mark is present in any and all of the selected text.
+    /// The tuple is `(any, all)`; an empty selection uses the mark at the
+    /// caret, preserving the familiar toolbar state while still allowing the
+    /// command catalogue to disable operations that would otherwise be no-op.
+    pub(crate) fn selection_mark_state(&self, mark: &super::model::Mark) -> (bool, bool) {
+        let ranges = self.selected_text_ranges();
+        if !ranges.is_empty() {
+            let mut any = false;
+            let mut all = true;
+            for (node_id, range) in ranges {
+                let Some(block) = self.document.block(node_id) else {
+                    all = false;
+                    continue;
+                };
+                let Some(styles) = block.content.styles() else {
+                    all = false;
+                    continue;
+                };
+                let (range_any, range_all) = mark_state_for_range(styles, range, mark);
+                any |= range_any;
+                all &= range_all;
+            }
+            return (any, all);
+        }
+
+        let Some(block) = self.document.block(self.selection.head.node_id) else {
+            return (false, false);
+        };
+        let Some(styles) = block.content.styles() else {
+            return (false, false);
+        };
+        let offset = self.selection.head.utf8_offset;
+        let active = styles.iter().any(|run| {
+            (run.range.start < offset && offset <= run.range.end)
+                || (run.range.start == offset && self.selection.head.affinity == Affinity::Before)
+        });
+        let has_mark = styles.iter().any(|run| {
+            active
+                && contains_mark(&run.marks, mark)
+                && ((run.range.start < offset && offset <= run.range.end)
+                    || (run.range.start == offset
+                        && self.selection.head.affinity == Affinity::Before))
+        });
+        (has_mark, has_mark)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_selection_for_test(&mut self, selection: Selection) {
         self.selection = selection;
@@ -242,6 +343,60 @@ impl EditorCore {
 
     pub fn layout(&self) -> &LayoutRegistry {
         &self.layout
+    }
+
+    /// Shape the actual document through the donor-backed LayoutRegistry for
+    /// the native spike window. Keeping this adapter on EditorCore preserves
+    /// one document owner while allowing the GPUI view to remain a thin
+    /// render/input bridge.
+    pub(crate) fn shape_visible_with_window(
+        &mut self,
+        viewport_top: f32,
+        viewport_height: f32,
+        width: f32,
+        window: &mut Window,
+    ) {
+        self.clear_layout_translation();
+        let document = &self.document;
+        self.layout.shape_visible_with_window(
+            document,
+            viewport_top,
+            viewport_height,
+            width,
+            window,
+        );
+    }
+
+    pub(crate) fn translate_layout(&mut self, offset_x: f32, offset_y: f32) {
+        let offset_x_pixels = gpui::px(offset_x);
+        let offset_y_pixels = gpui::px(offset_y);
+        for layout in &mut self.layout.visible {
+            layout.bounds.origin.x += offset_x_pixels;
+            layout.bounds.origin.y += offset_y_pixels;
+        }
+        for cached in self.layout.cache.values_mut() {
+            cached.layout.bounds.origin.x += offset_x_pixels;
+            cached.layout.bounds.origin.y += offset_y_pixels;
+        }
+        self.layout_offset = (offset_x, offset_y);
+    }
+
+    fn clear_layout_translation(&mut self) {
+        let (offset_x, offset_y) = self.layout_offset;
+        if offset_x == 0.0 && offset_y == 0.0 {
+            return;
+        }
+        let offset_x_pixels = gpui::px(offset_x);
+        let offset_y_pixels = gpui::px(offset_y);
+        for layout in &mut self.layout.visible {
+            layout.bounds.origin.x -= offset_x_pixels;
+            layout.bounds.origin.y -= offset_y_pixels;
+        }
+        for cached in self.layout.cache.values_mut() {
+            cached.layout.bounds.origin.x -= offset_x_pixels;
+            cached.layout.bounds.origin.y -= offset_y_pixels;
+        }
+        self.layout_offset = (0.0, 0.0);
     }
 
     pub fn visible_text(&self) -> String {
@@ -929,7 +1084,40 @@ impl EditorCore {
             let outcome = self.apply_with_selection(Transaction::DeleteRange { selection })?;
             self.selection = outcome.selection;
         } else if index == 0 {
-            self.clear_composition();
+            // At the start of the first list item, Backspace exits the list
+            // just like the donor editor. Keep the following items and their
+            // depths intact instead of treating the document edge as a hard
+            // no-op.
+            let current = &self.document.blocks()[index];
+            if matches!(
+                current.kind,
+                BlockKind::BulletItem { .. }
+                    | BlockKind::OrderedItem { .. }
+                    | BlockKind::CheckItem { .. }
+            ) {
+                let selection = self.selection;
+                let mut transactions = vec![Transaction::SetBlockKind {
+                    selection,
+                    kind: BlockKind::Paragraph,
+                }];
+                if current.alignment != TextAlignment::Left {
+                    transactions.push(Transaction::SetAlignment {
+                        selection,
+                        alignment: TextAlignment::Left,
+                    });
+                }
+                let outcome = self.history.apply_batch_with_selection(
+                    &mut self.document,
+                    self.selection,
+                    TransactionBatch(transactions),
+                )?;
+                self.selection = outcome.selection;
+                self.preferred_x = None;
+                self.clear_composition();
+                self.layout.invalidate_nodes(&outcome.changed_nodes);
+            } else {
+                self.clear_composition();
+            }
             return Ok(());
         } else if let Some(previous) = self.document.blocks().get(index - 1) {
             if previous.kind == BlockKind::Image {
@@ -1619,6 +1807,43 @@ fn block_points(block: &Block) -> (DocPoint, DocPoint) {
             DocPoint::with_affinity(block.id, 0, Affinity::After),
         ),
     }
+}
+
+fn mark_state_for_range(
+    styles: &[super::model::StyledRun],
+    range: Range<usize>,
+    mark: &super::model::Mark,
+) -> (bool, bool) {
+    let mut cursor = range.start;
+    let mut any = false;
+    let mut all = true;
+    for run in styles {
+        if run.range.end <= range.start || run.range.start >= range.end {
+            continue;
+        }
+        let segment_start = run.range.start.max(range.start);
+        let segment_end = run.range.end.min(range.end);
+        if segment_start > cursor {
+            all = false;
+        }
+        if contains_mark(&run.marks, mark) {
+            any = true;
+        } else {
+            all = false;
+        }
+        cursor = cursor.max(segment_end);
+    }
+    if cursor < range.end {
+        all = false;
+    }
+    (any, all)
+}
+
+fn contains_mark(marks: &[super::model::Mark], mark: &super::model::Mark) -> bool {
+    marks.iter().any(|candidate| match (candidate, mark) {
+        (super::model::Mark::Link(_), super::model::Mark::Link(_)) => true,
+        (candidate, mark) => candidate == mark,
+    })
 }
 
 fn block_flat_len(block: &Block) -> usize {
