@@ -49,7 +49,9 @@ fn proxy_reservation_bytes(max_edge: u32) -> usize {
 }
 
 fn quantize_proxy_edge(max_edge: u32) -> u32 {
-    max_edge.max(1).saturating_add(PROXY_EDGE_TIER - 1) / PROXY_EDGE_TIER * PROXY_EDGE_TIER
+    let max_edge = max_edge.max(1);
+    let tiers = max_edge / PROXY_EDGE_TIER + u32::from(max_edge % PROXY_EDGE_TIER != 0);
+    tiers.saturating_mul(PROXY_EDGE_TIER)
 }
 
 #[cfg(target_os = "macos")]
@@ -2117,6 +2119,12 @@ mod tests {
         assert_eq!(proxy_max_edge_for_viewport(0.0, 2.0), 1);
         assert_eq!(proxy_max_edge_for_viewport(680.0, 0.0), 1);
         assert_eq!(proxy_max_edge_for_viewport(f32::NAN, 2.0), 1);
+    }
+
+    #[test]
+    fn quantized_proxy_edge_saturates_at_u32_max() {
+        assert_eq!(quantize_proxy_edge(u32::MAX - 63), u32::MAX - 63);
+        assert_eq!(quantize_proxy_edge(u32::MAX), u32::MAX);
     }
 
     #[test]

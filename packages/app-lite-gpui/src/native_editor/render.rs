@@ -16,8 +16,20 @@ use super::images::{BudgetedImageCache, proxy_max_edge_for_viewport};
 use super::layout::{BlockLayout, ordered_number_summary};
 use super::model::{BlockKind, Document, NodeId, Selection};
 
-pub(crate) fn image_proxy_max_edge_for_bounds(width: f32, height: f32, scale_factor: f32) -> u32 {
-    proxy_max_edge_for_viewport(width.max(height), scale_factor)
+pub(crate) fn image_proxy_max_edge_for_bounds(
+    width: f32,
+    height: f32,
+    scale_factor: f32,
+    natural_max_edge: Option<u32>,
+) -> u32 {
+    let requested = proxy_max_edge_for_viewport(width.max(height), scale_factor);
+    natural_max_edge
+        .filter(|edge| *edge > 0)
+        .map_or(requested, |edge| requested.min(edge))
+}
+
+fn natural_max_edge(natural_size: (u32, u32)) -> Option<u32> {
+    (natural_size.0 > 0 && natural_size.1 > 0).then(|| natural_size.0.max(natural_size.1))
 }
 
 #[derive(Clone)]
@@ -30,6 +42,7 @@ struct RenderBlock {
     marker: Option<String>,
     image_resource: Option<Resource>,
     image_resource_id: Option<String>,
+    image_natural_max_edge: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -131,6 +144,12 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 super::model::BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
                 _ => None,
             });
+            let image_natural_max_edge = model_block.and_then(|block| match &block.content {
+                super::model::BlockContent::Image { natural_size, .. } => {
+                    natural_max_edge(*natural_size)
+                }
+                _ => None,
+            });
             let shaped_background_run_count = layout
                 .cache
                 .get(&block.node_id)
@@ -151,6 +170,7 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 marker: list_marker(&kind, layout.ordered_number(block.node_id)),
                 image_resource,
                 image_resource_id,
+                image_natural_max_edge,
             }
         })
         .collect();
@@ -192,6 +212,7 @@ fn paint_snapshot(
                         f32::from(block.layout.bounds.size.width),
                         f32::from(block.layout.bounds.size.height),
                         window.scale_factor(),
+                        block.image_natural_max_edge,
                     );
                     cache.request_edge(resource, max_edge);
                 }
@@ -419,13 +440,26 @@ mod tests {
     use crate::native_editor::transaction::Transaction;
 
     #[test]
-    fn portrait_image_proxy_covers_rendered_device_height() {
+    fn image_proxy_uses_rendered_bounds_and_natural_edge_cap() {
         let portrait_height = 680.0 * 1600.0 / 900.0;
         assert_eq!(
-            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0),
+            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0, Some(1600)),
+            1600
+        );
+        assert_eq!(
+            image_proxy_max_edge_for_bounds(680.0, 400.0, 2.0, Some(1600)),
+            1360
+        );
+        assert_eq!(
+            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0, None),
             2418
         );
-        assert_eq!(image_proxy_max_edge_for_bounds(680.0, 400.0, 2.0), 1360);
+        assert_eq!(
+            image_proxy_max_edge_for_bounds(680.0, portrait_height, 2.0, Some(0)),
+            2418
+        );
+        assert_eq!(natural_max_edge((0, 1600)), None);
+        assert_eq!(natural_max_edge((900, 1600)), Some(1600));
     }
 
     #[gpui::test]
