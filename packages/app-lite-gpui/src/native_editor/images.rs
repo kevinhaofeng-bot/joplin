@@ -38,8 +38,8 @@ impl ImagePayload {
         }
     }
 
-    pub fn from_image(image: &Image) -> Self {
-        Self::new(image.format, image.bytes.clone())
+    pub fn from_image(image: Image) -> Self {
+        Self::new(image.format, image.bytes)
     }
 }
 
@@ -50,6 +50,7 @@ impl ImagePayload {
 pub struct ClipboardPayload {
     pub images: Vec<ImagePayload>,
     pub file_urls: Vec<PathBuf>,
+    pub temporary_files: Vec<PathBuf>,
     pub html: Option<String>,
     pub rich_text: Option<String>,
     pub text: Option<String>,
@@ -69,7 +70,7 @@ impl ClipboardPayload {
         for entry in item.into_entries() {
             match entry {
                 ClipboardEntry::Image(image) => {
-                    payload.images.push(ImagePayload::from_image(&image))
+                    payload.images.push(ImagePayload::from_image(image))
                 }
                 ClipboardEntry::String(string) => payload.text = Some(string.text().to_owned()),
             }
@@ -95,27 +96,32 @@ impl ClipboardPayload {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PasteIntent {
     Image { payload: ImagePayload },
-    File { path: PathBuf },
+    File { path: PathBuf, cleanup: bool },
     Text { text: String },
     Unsupported,
 }
 
 /// Adapted from donor `components/block/interactions.rs`: classify image
 /// payloads before text and never insert an image placeholder string.
-pub fn classify_clipboard(payload: &ClipboardPayload) -> PasteIntent {
-    if let Some(image) = payload.images.first() {
-        return PasteIntent::Image {
-            payload: image.clone(),
+pub fn classify_clipboard(payload: ClipboardPayload) -> PasteIntent {
+    let ClipboardPayload {
+        images,
+        file_urls,
+        temporary_files,
+        html,
+        rich_text,
+        text,
+    } = payload;
+    if let Some(image) = images.into_iter().next() {
+        return PasteIntent::Image { payload: image };
+    }
+    if let Some(path) = file_urls.iter().find(|path| is_supported_image_path(path)) {
+        return PasteIntent::File {
+            path: path.clone(),
+            cleanup: temporary_files.iter().any(|temp| temp == path),
         };
     }
-    if let Some(path) = payload
-        .file_urls
-        .iter()
-        .find(|path| is_supported_image_path(path))
-    {
-        return PasteIntent::File { path: path.clone() };
-    }
-    if let Some(html) = payload.html.as_deref()
+    if let Some(html) = html.as_deref()
         && html.to_ascii_lowercase().contains("<img")
     {
         if let Some((format, encoded)) = html.split_once("data:image/").and_then(|(_, value)| {
@@ -141,10 +147,9 @@ pub fn classify_clipboard(payload: &ClipboardPayload) -> PasteIntent {
         // visible markup or a fake PNG node.
         return PasteIntent::Unsupported;
     }
-    payload
-        .rich_text
+    rich_text
         .as_ref()
-        .or(payload.text.as_ref())
+        .or(text.as_ref())
         .map_or(PasteIntent::Unsupported, |text| PasteIntent::Text {
             text: text.clone(),
         })
@@ -165,11 +170,14 @@ pub fn classify_drop(paths: &[PathBuf]) -> PasteIntent {
         .iter()
         .find(|path| is_supported_image_path(path))
         .cloned()
-        .map_or(PasteIntent::Unsupported, |path| PasteIntent::File { path })
+        .map_or(PasteIntent::Unsupported, |path| PasteIntent::File {
+            path,
+            cleanup: false,
+        })
 }
 
-pub fn image_payload_from_file(path: &Path) -> Option<ImagePayload> {
-    let format = path.extension().and_then(|extension| {
+pub fn image_format_from_path(path: &Path) -> Option<ImageFormat> {
+    path.extension().and_then(|extension| {
         match extension.to_string_lossy().to_ascii_lowercase().as_str() {
             "png" => Some(ImageFormat::Png),
             "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
@@ -180,18 +188,23 @@ pub fn image_payload_from_file(path: &Path) -> Option<ImagePayload> {
             "tif" | "tiff" => Some(ImageFormat::Tiff),
             _ => None,
         }
-    })?;
-    Some(ImagePayload::new(format, std::fs::read(path).ok()?))
+    })
 }
 
 fn is_supported_image_path(path: &Path) -> bool {
-    path.is_file()
-        && path.extension().is_some_and(|extension| {
-            matches!(
-                extension.to_string_lossy().to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff"
-            )
-        })
+    path.is_file() && image_format_from_path(path).is_some()
+}
+
+fn image_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -308,6 +321,41 @@ impl ImageStore {
         self.insert_inner(metadata, bytes, Some(format))
     }
 
+    /// Copy an already materialized image into the managed resource directory
+    /// without first reading the source into a Rust `Vec`. This is the
+    /// production path for Finder drops and pasteboard temporary files.
+    pub fn insert_from_path(
+        &mut self,
+        metadata: ImageMetadata,
+        source_path: &Path,
+        format: ImageFormat,
+    ) -> std::io::Result<u64> {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let source = self.resource_root.join(format!(
+            "{}.{}",
+            metadata.resource_id,
+            image_extension(format)
+        ));
+        std::fs::create_dir_all(&self.resource_root)?;
+        if let Err(error) = std::fs::copy(source_path, &source) {
+            let _ = std::fs::remove_file(&source);
+            return Err(error);
+        }
+        self.by_resource_id.insert(metadata.resource_id.clone(), id);
+        self.images.insert(
+            id,
+            StoredImage {
+                metadata,
+                compressed: None,
+                source_path: source,
+                state: ImageNodeState::Loading,
+                retryable: false,
+            },
+        );
+        Ok(id)
+    }
+
     fn insert_inner(
         &mut self,
         metadata: ImageMetadata,
@@ -316,15 +364,7 @@ impl ImageStore {
     ) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        let extension = format.map_or("img", |format| match format {
-            ImageFormat::Png => "png",
-            ImageFormat::Jpeg => "jpg",
-            ImageFormat::Webp => "webp",
-            ImageFormat::Gif => "gif",
-            ImageFormat::Svg => "svg",
-            ImageFormat::Bmp => "bmp",
-            ImageFormat::Tiff => "tiff",
-        });
+        let extension = format.map_or("img", image_extension);
         let source_path = self
             .resource_root
             .join(format!("{}.{}", metadata.resource_id, extension));
@@ -835,8 +875,6 @@ impl BudgetedImageCache {
                 .ok_or_else(|| {
                     ImageCacheError::from(anyhow!("CoreGraphics could not create bitmap context"))
                 })?;
-                CGContext::translate_ctm(Some(&context), 0.0, height as f64);
-                CGContext::scale_ctm(Some(&context), 1.0, -1.0);
                 CGContext::draw_image(
                     Some(&context),
                     CGRect::new(
@@ -966,6 +1004,7 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
         NSFilenamesPboardType, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString,
         NSPasteboardTypeTIFF,
     };
+    use cocoa::base::YES;
     use cocoa::base::{id, nil};
     use cocoa::foundation::{NSArray, NSAutoreleasePool, NSData, NSString};
     unsafe fn string_value(value: id) -> Option<String> {
@@ -1018,16 +1057,24 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
         for (format, ty) in image_types {
             let data = pasteboard.dataForType(ty);
             if data != nil {
-                let bytes =
-                    std::slice::from_raw_parts(data.bytes() as *const u8, data.length() as usize)
-                        .to_vec();
+                let path = std::env::temp_dir().join(format!(
+                    "joplin-lite-pasteboard-{}.{}",
+                    uuid::Uuid::new_v4(),
+                    image_extension(format)
+                ));
+                let path_text = path.to_string_lossy();
+                let path_string = NSString::alloc(nil)
+                    .init_str(path_text.as_ref())
+                    .autorelease();
+                let wrote = data.writeToFile_atomically_(path_string, YES);
+                if !wrote {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
                 let text = string_value(pasteboard.stringForType(NSPasteboardTypeString));
                 return Some(ClipboardPayload {
-                    images: vec![ImagePayload {
-                        format,
-                        bytes,
-                        name: None,
-                    }],
+                    file_urls: vec![path.clone()],
+                    temporary_files: vec![path],
                     text,
                     ..Default::default()
                 });
@@ -1144,10 +1191,56 @@ mod tests {
         assert!(store.can_retry(id));
     }
 
+    #[test]
+    fn production_clipboard_classification_moves_large_image_bytes() {
+        let bytes = vec![0x7f; 16 * 1024 * 1024];
+        let pointer = bytes.as_ptr();
+        let payload = ClipboardPayload {
+            images: vec![ImagePayload::new(ImageFormat::Png, bytes)],
+            ..ClipboardPayload::default()
+        };
+        let intent = classify_clipboard(payload);
+        let PasteIntent::Image { payload } = intent else {
+            panic!("image payload should remain image-first");
+        };
+        assert_eq!(payload.bytes.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn managed_path_insert_copies_original_without_retaining_compressed_bytes() {
+        let source_path = std::env::temp_dir().join(format!(
+            "joplin-lite-path-source-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        let original = fixture_png_bytes();
+        std::fs::write(&source_path, &original).expect("source image should be writable");
+        let mut store = ImageStore::for_test();
+        let id = store
+            .insert_from_path(
+                ImageMetadata::new("path-resource", 1, 1),
+                &source_path,
+                ImageFormat::Png,
+            )
+            .expect("path image should be copied into managed storage");
+        let managed = store
+            .source_path_for_resource("path-resource")
+            .expect("managed source path");
+        assert_ne!(managed, source_path.as_path());
+        assert_eq!(std::fs::read(managed).expect("managed image"), original);
+        assert_eq!(store.compressed_len(id), None);
+        let _ = std::fs::remove_file(source_path);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_resource_load_uses_bounded_imageio_proxy_without_mutating_original() {
-        let source = ImageBuffer::from_pixel(4031, 3023, Rgba([0x11, 0x22, 0x33, 0xff]));
+        let source = ImageBuffer::from_fn(4031, 3023, |_, y| {
+            if y < 1511 {
+                Rgba([0x11, 0x22, 0x33, 0xff])
+            } else {
+                Rgba([0xaa, 0xbb, 0xcc, 0xff])
+            }
+        });
         let mut encoded = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(source)
             .write_to(&mut encoded, image::ImageFormat::Png)
@@ -1175,10 +1268,10 @@ mod tests {
         assert!(width.max(height) <= 1600, "proxy is {width}x{height}");
         let ratio = width as f32 / height as f32;
         assert!((ratio - 4031.0 / 3023.0).abs() < 0.01);
-        assert_eq!(
-            &proxy.as_bytes(0).expect("proxy pixels")[..4],
-            &[0x33, 0x22, 0x11, 0xff]
-        );
+        let pixels = proxy.as_bytes(0).expect("proxy pixels");
+        assert_eq!(&pixels[..4], &[0x33, 0x22, 0x11, 0xff]);
+        let last_row = (height as usize - 1) * width as usize * 4;
+        assert_eq!(&pixels[last_row..last_row + 4], &[0xcc, 0xbb, 0xaa, 0xff]);
         assert_eq!(store.metadata(id).unwrap().natural_width, 4031);
         assert_eq!(store.metadata(id).unwrap().natural_height, 3023);
         assert_eq!(std::fs::read(&path).expect("managed source"), original);

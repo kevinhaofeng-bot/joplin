@@ -3,9 +3,11 @@
 
 use std::io::Cursor;
 use std::ops::Range;
+use std::path::Path;
 
 use gpui::{
-    Bounds, Context, EntityInputHandler, FocusHandle, Pixels, Point, UTF16Selection, Window,
+    Bounds, Context, EntityInputHandler, FocusHandle, ImageFormat, Pixels, Point, UTF16Selection,
+    Window,
 };
 use image::ImageReader;
 use unicode_segmentation::UnicodeSegmentation;
@@ -16,7 +18,7 @@ use uuid::Uuid;
 use gpui::TestAppContext;
 
 use super::history::History;
-use super::images::{ImageMetadata, ImagePayload, ImageStore};
+use super::images::{ImageMetadata, ImagePayload, ImageStore, image_format_from_path};
 use super::input;
 use super::layout::LayoutRegistry;
 use super::model::{
@@ -36,6 +38,17 @@ fn image_dimensions(payload: &ImagePayload) -> Option<(u32, u32)> {
         .ok()?;
     let (width, height) = reader.into_dimensions().ok()?;
     Some((width, height))
+}
+
+fn image_dimensions_from_path(path: &Path, format: ImageFormat) -> Option<(u32, u32)> {
+    if format == ImageFormat::Svg {
+        let bytes = std::fs::read(path).ok()?;
+        let tree = Tree::from_data(&bytes, &Options::default()).ok()?;
+        let size = tree.size();
+        return Some((size.width().ceil() as u32, size.height().ceil() as u32));
+    }
+    let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    reader.into_dimensions().ok()
 }
 
 #[derive(Clone)]
@@ -597,6 +610,33 @@ impl EditorCore {
         let metadata = ImageMetadata::new(resource_id.clone(), width, height);
         self.image_store
             .insert_with_format(metadata, payload.bytes, payload.format);
+        let outcome = self.apply_with_selection(Transaction::InsertImage {
+            selection: self.selection,
+            resource_id,
+            natural_size: (width, height),
+        })?;
+        self.selection = outcome.selection;
+        Ok(())
+    }
+
+    /// Insert a managed image directly from a file path. This is the
+    /// production path for Finder drops and pasteboard temporary files: the
+    /// source is copied by the filesystem and never materialized as a Rust
+    /// `Vec` in the editor process.
+    pub fn insert_image_path(&mut self, path: &Path) -> Result<(), DocumentError> {
+        let format = image_format_from_path(path).ok_or_else(|| {
+            DocumentError::InvalidOperation("unsupported or invalid image path".into())
+        })?;
+        let (width, height) = image_dimensions_from_path(path, format).ok_or_else(|| {
+            DocumentError::InvalidOperation("unsupported or invalid image path".into())
+        })?;
+        let resource_id = Uuid::new_v4().to_string();
+        let metadata = ImageMetadata::new(resource_id.clone(), width, height);
+        self.image_store
+            .insert_from_path(metadata, path, format)
+            .map_err(|error| {
+                DocumentError::InvalidOperation(format!("image resource copy failed: {error}"))
+            })?;
         let outcome = self.apply_with_selection(Transaction::InsertImage {
             selection: self.selection,
             resource_id,

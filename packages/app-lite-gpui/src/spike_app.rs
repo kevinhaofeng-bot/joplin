@@ -31,8 +31,7 @@ use crate::native_editor::commands::{
 use crate::native_editor::core::EditorCore;
 use crate::native_editor::images::{
     BudgetedImageCache, ClipboardPayload, DECODED_IMAGE_CACHE_BUDGET, PasteIntent,
-    classify_clipboard, classify_drop, image_payload_from_file, read_native_pasteboard,
-    resolve_clipboard_payload,
+    classify_clipboard, classify_drop, read_native_pasteboard, resolve_clipboard_payload,
 };
 use crate::native_editor::model::{
     Affinity, BlockKind, DocPoint, Document, DocumentError, Mark, Selection,
@@ -1193,8 +1192,16 @@ fn focus_editor(editor: &Entity<EditorCore>, window: &mut Window, cx: &mut App) 
 fn apply_paste_intent(editor: &mut EditorCore, intent: PasteIntent) -> Result<(), DocumentError> {
     match intent {
         PasteIntent::Image { payload } => editor.insert_image_payload(payload),
-        PasteIntent::File { path } => image_payload_from_file(&path)
-            .map_or(Ok(()), |payload| editor.insert_image_payload(payload)),
+        PasteIntent::File { path, cleanup } => {
+            let result = editor.insert_image_path(&path);
+            if cleanup
+                && let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("failed to remove temporary pasteboard image {path:?}: {error}");
+            }
+            result
+        }
         PasteIntent::Text { text } => editor.paste_plain_text(&text),
         PasteIntent::Unsupported => Ok(()),
     }
@@ -1204,7 +1211,7 @@ fn apply_clipboard_payload(
     editor: &mut EditorCore,
     payload: ClipboardPayload,
 ) -> Result<(), DocumentError> {
-    apply_paste_intent(editor, classify_clipboard(&payload))
+    apply_paste_intent(editor, classify_clipboard(payload))
 }
 
 fn apply_drop_paths(editor: &mut EditorCore, paths: &[PathBuf]) -> Result<(), DocumentError> {
@@ -1480,6 +1487,32 @@ mod tests {
             .count();
         assert_eq!(image_count, 2);
         let _ = std::fs::remove_file(path);
+
+        let pasteboard_path = std::env::temp_dir().join(format!(
+            "joplin-lite-task6-pasteboard-{}.png",
+            std::process::id()
+        ));
+        let pasteboard_bytes = ClipboardPayload::fixture_with_png_and_text("pasteboard")
+            .images
+            .into_iter()
+            .next()
+            .expect("fixture image")
+            .bytes;
+        std::fs::write(&pasteboard_path, pasteboard_bytes)
+            .expect("temporary pasteboard PNG should be writable");
+        apply_clipboard_payload(
+            &mut editor,
+            ClipboardPayload {
+                file_urls: vec![pasteboard_path.clone()],
+                temporary_files: vec![pasteboard_path.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("pasteboard path should insert image");
+        assert!(
+            !pasteboard_path.exists(),
+            "temporary pasteboard file is cleaned up"
+        );
     }
 
     fn build_long_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {

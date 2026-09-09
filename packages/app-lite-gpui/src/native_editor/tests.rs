@@ -3199,7 +3199,7 @@ fn image_cache_evicts_before_exceeding_budget() {
 fn clipboard_prefers_image_payload_over_placeholder_text() {
     let payload = ClipboardPayload::fixture_with_png_and_text("图像占位符");
     assert!(matches!(
-        classify_clipboard(&payload),
+        classify_clipboard(payload),
         PasteIntent::Image { .. }
     ));
 }
@@ -3262,6 +3262,50 @@ fn production_image_insert_uses_uuid_resource_and_managed_path(cx: &mut gpui::Te
     assert!(!editor.mark_image_loaded(&resource_id));
     assert!(editor.mark_image_failed(&resource_id));
     assert!(!editor.mark_image_failed(&resource_id));
+}
+
+#[gpui::test]
+fn production_path_insert_preserves_original_and_uses_header_dimensions(
+    cx: &mut gpui::TestAppContext,
+) {
+    let source_path = std::env::temp_dir().join(format!(
+        "joplin-lite-production-path-{}.png",
+        uuid::Uuid::new_v4()
+    ));
+    let original = ClipboardPayload::fixture_with_png_and_text("ignored")
+        .images
+        .into_iter()
+        .next()
+        .expect("fixture image")
+        .bytes;
+    std::fs::write(&source_path, &original).expect("source PNG should be writable");
+
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    editor
+        .insert_image_path(&source_path)
+        .expect("path insertion should commit a structural image");
+    let resource_id = editor
+        .document()
+        .blocks()
+        .iter()
+        .find_map(|block| match &block.content {
+            BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+            _ => None,
+        })
+        .expect("structural image node");
+    let metadata = editor.image_metadata(&resource_id).expect("image metadata");
+    assert_eq!((metadata.natural_width, metadata.natural_height), (1, 1));
+    assert!(editor.image_bytes(&resource_id).is_none());
+    let managed_path = editor
+        .image_source_path(&resource_id)
+        .expect("managed path");
+    assert_eq!(
+        std::fs::read(managed_path).expect("managed image"),
+        original
+    );
+    assert_ne!(managed_path, source_path.as_path());
+    let _ = std::fs::remove_file(source_path);
 }
 
 #[gpui::test]
