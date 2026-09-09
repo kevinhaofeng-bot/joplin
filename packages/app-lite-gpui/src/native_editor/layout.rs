@@ -10,13 +10,16 @@ use std::mem::size_of;
 use std::ops::Range;
 
 use gpui::{
-    Bounds, Font, Pixels, Point, ShapedGlyph, SharedString, TextRun, TextStyle, WrapBoundary,
-    WrappedLine, WrappedLineLayout, point, px, size,
+    Bounds, Font, FontStyle, FontWeight, Hsla, Pixels, Point, ShapedGlyph, SharedString,
+    StrikethroughStyle, TextAlign, TextRun, TextStyle, UnderlineStyle, WrapBoundary, WrappedLine,
+    WrappedLineLayout, point, px, rgba, size,
 };
 use sum_tree::{Bias, ContextLessSummary, Dimension, Item, KeyedItem, SeekTarget, SumTree};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::model::{Affinity, BlockContent, BlockKind, DocPoint, Document, NodeId, Selection};
+use super::model::{
+    Affinity, BlockContent, BlockKind, DocPoint, Document, Mark, NodeId, Selection, TextAlignment,
+};
 
 pub const LAYOUT_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TEXT_HEIGHT: f32 = 24.0;
@@ -24,6 +27,161 @@ const DEFAULT_IMAGE_HEIGHT: f32 = 180.0;
 const PREFETCH_VIEWPORTS: f32 = 1.0;
 const FALLBACK_GLYPH_WIDTH: f32 = 8.0;
 const CARET_WIDTH: f32 = 1.0;
+const LIST_MARKER_WIDTH: f32 = 22.0;
+const LIST_DEPTH_INDENT: f32 = 20.0;
+
+#[derive(Clone)]
+struct BlockVisualStyle {
+    font: Font,
+    font_size: Pixels,
+    line_height: Pixels,
+    text_inset: Pixels,
+    text_align: TextAlign,
+}
+
+fn block_visual_style(
+    block: &super::model::Block,
+    style: &TextStyle,
+    rem_size: Pixels,
+) -> BlockVisualStyle {
+    let mut font = style.font();
+    let mut font_size = style.font_size.to_pixels(rem_size);
+    let mut line_height = style.line_height_in_pixels(rem_size);
+    match block.kind {
+        BlockKind::Heading { level: 1 } => {
+            font_size = px(30.0);
+            line_height = px(40.0);
+            font.weight = FontWeight::BOLD;
+        }
+        BlockKind::Heading { level: 2 } => {
+            font_size = px(25.0);
+            line_height = px(34.0);
+            font.weight = FontWeight::BOLD;
+        }
+        BlockKind::Heading { level: 3 } => {
+            font_size = px(21.0);
+            line_height = px(29.0);
+            font.weight = FontWeight::BOLD;
+        }
+        BlockKind::Heading { .. } => {
+            font_size = px(18.0);
+            line_height = px(26.0);
+            font.weight = FontWeight::BOLD;
+        }
+        _ => {}
+    }
+    let depth = list_depth(&block.kind);
+    let text_inset = depth.map(|_| px(LIST_MARKER_WIDTH)).unwrap_or_default();
+    BlockVisualStyle {
+        font,
+        font_size,
+        line_height,
+        text_inset,
+        text_align: match block.alignment {
+            TextAlignment::Left => TextAlign::Left,
+            TextAlignment::Center => TextAlign::Center,
+            TextAlignment::Right => TextAlign::Right,
+        },
+    }
+}
+
+fn list_depth(kind: &BlockKind) -> Option<u8> {
+    match kind {
+        BlockKind::BulletItem { depth }
+        | BlockKind::OrderedItem { depth }
+        | BlockKind::CheckItem { depth, .. } => Some(*depth),
+        _ => None,
+    }
+}
+
+fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
+    let left = list_depth(&block.kind)
+        .map(|depth| depth as f32 * LIST_DEPTH_INDENT)
+        .unwrap_or(0.0);
+    Bounds::new(
+        point(px(left), px(0.0)),
+        size(px((width - left).max(1.0)), px(DEFAULT_TEXT_HEIGHT)),
+    )
+}
+
+fn styled_text_runs(
+    block: &super::model::Block,
+    text: &SharedString,
+    base_font: &Font,
+) -> Vec<TextRun> {
+    let Some(styles) = block.content.styles() else {
+        return vec![TextRun {
+            len: text.len(),
+            font: base_font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+    };
+    let mut boundaries = vec![0, text.len()];
+    for run in styles {
+        boundaries.push(run.range.start.min(text.len()));
+        boundaries.push(run.range.end.min(text.len()));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let underline_thickness = px(1.0);
+    let mut shaped = Vec::new();
+    for window in boundaries.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        if start >= end {
+            continue;
+        }
+        let marks = styles
+            .iter()
+            .find(|run| run.range.start <= start && start < run.range.end)
+            .map(|run| run.marks.as_slice())
+            .unwrap_or(&[]);
+        let mut font = base_font.clone();
+        if marks.iter().any(|mark| matches!(mark, Mark::Bold)) {
+            font.weight = FontWeight::BOLD;
+        }
+        if marks.iter().any(|mark| matches!(mark, Mark::Italic)) {
+            font.style = FontStyle::Italic;
+        }
+        let link = marks.iter().any(|mark| matches!(mark, Mark::Link(_)));
+        let underline = marks.iter().any(|mark| matches!(mark, Mark::Underline)) || link;
+        let strike = marks.iter().any(|mark| matches!(mark, Mark::Strike));
+        let color = if link { gpui::blue() } else { gpui::black() };
+        shaped.push(TextRun {
+            len: end - start,
+            font,
+            color,
+            background_color: marks
+                .iter()
+                .any(|mark| matches!(mark, Mark::Highlight))
+                .then(|| Hsla::from(rgba(0xffd84d66))),
+            underline: underline.then_some(UnderlineStyle {
+                color: Some(color),
+                thickness: underline_thickness,
+                wavy: false,
+            }),
+            strikethrough: strike.then_some(StrikethroughStyle {
+                color: Some(color),
+                thickness: underline_thickness,
+            }),
+        });
+    }
+    if shaped.is_empty() {
+        vec![TextRun {
+            len: text.len(),
+            font: base_font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }]
+    } else {
+        shaped
+    }
+}
 
 /// Exact geometry for one block currently in or near the viewport.
 ///
@@ -34,6 +192,10 @@ const CARET_WIDTH: f32 = 1.0;
 pub struct BlockLayout {
     pub node_id: NodeId,
     pub bounds: Bounds<Pixels>,
+    /// Horizontal space reserved for a list marker. Text shaping and all
+    /// selection/caret geometry use this same inset.
+    pub text_inset: Pixels,
+    pub text_align: TextAlign,
     pub text_lines: Vec<WrappedLine>,
     pub before: DocPoint,
     pub after: DocPoint,
@@ -282,6 +444,13 @@ impl LayoutRegistry {
         self.first_visible..self.last_visible
     }
 
+    /// Current measured/estimated document extent from the same height index
+    /// used by viewport seeking.  The spike scroll surface uses this value
+    /// instead of a block-count guess, so wrapped paragraphs remain reachable.
+    pub fn total_height(&self) -> f32 {
+        self.height_tree.summary().height.max(0.0)
+    }
+
     pub fn first_visible(&self) -> usize {
         self.first_visible
     }
@@ -368,9 +537,15 @@ impl LayoutRegistry {
             let y = self.height_prefix(index);
             let height = self.height_prefix(index + 1) - y;
             let (before, after, is_image) = block_points(block);
+            let mut bounds = block_bounds(width, block);
+            bounds.origin.y = px(y);
+            bounds.size.height = px(height.max(1.0));
+            let visual = block_visual_style(block, &TextStyle::default(), px(16.0));
             let layout = BlockLayout {
                 node_id: block.id,
-                bounds: Bounds::new(point(px(0.0), px(y)), size(px(width), px(height.max(1.0)))),
+                bounds,
+                text_inset: visual.text_inset,
+                text_align: visual.text_align,
                 text_lines: Vec::new(),
                 before,
                 after,
@@ -417,9 +592,6 @@ impl LayoutRegistry {
     ) {
         let width = width.max(1.0);
         self.layout_document(document, viewport_top, viewport_height, width);
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_height = style.line_height_in_pixels(window.rem_size());
-        let font = style.font();
         // A measured height can change which blocks belong to the viewport
         // and prefetch window. Rebuild membership after each shaping pass so
         // blocks entering after expansion/contraction are shaped in the same
@@ -436,18 +608,30 @@ impl LayoutRegistry {
                 let Some(block) = document.block(node_id) else {
                     continue;
                 };
+                let visual = block_visual_style(block, &style, window.rem_size());
                 let Some(text) = block.content.as_text() else {
                     self.update_cache_metadata(
                         node_id,
                         block.revision,
                         width,
-                        ShapeKey::new(block.revision, width, font.clone(), font_size, line_height),
-                        line_height,
+                        ShapeKey::new(
+                            block.revision,
+                            width,
+                            visual.font.clone(),
+                            visual.font_size,
+                            visual.line_height,
+                        ),
+                        visual.line_height,
                     );
                     continue;
                 };
-                let shape_key =
-                    ShapeKey::new(block.revision, width, font.clone(), font_size, line_height);
+                let shape_key = ShapeKey::new(
+                    block.revision,
+                    width,
+                    visual.font.clone(),
+                    visual.font_size,
+                    visual.line_height,
+                );
                 let cache_hit = self.cache.get(&node_id).is_some_and(|cached| {
                     cached.shape_key == shape_key && !cached.layout.text_lines.is_empty()
                 });
@@ -456,24 +640,24 @@ impl LayoutRegistry {
                 }
                 self.shape_count = self.shape_count.saturating_add(1);
                 let shared_text = SharedString::from(text.to_owned());
-                let runs = [TextRun {
-                    len: shared_text.len(),
-                    font: font.clone(),
-                    color: gpui::black(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }];
+                let runs = styled_text_runs(block, &shared_text, &visual.font);
+                let text_width = (width - f32::from(visual.text_inset)).max(1.0);
                 let lines = window
                     .text_system()
-                    .shape_text(shared_text, font_size, &runs, Some(px(width)), None)
+                    .shape_text(
+                        shared_text,
+                        visual.font_size,
+                        &runs,
+                        Some(px(text_width)),
+                        None,
+                    )
                     .map(|lines| lines.into_vec())
                     .unwrap_or_default();
                 let measured_height = lines
                     .iter()
-                    .map(|line| line.size(line_height).height)
+                    .map(|line| line.size(visual.line_height).height)
                     .fold(px(0.0), |height, line_height| height + line_height)
-                    .max(line_height);
+                    .max(visual.line_height);
                 if self
                     .estimated_heights
                     .get(&node_id)
@@ -489,8 +673,10 @@ impl LayoutRegistry {
                     continue;
                 };
                 let mut layout = geometry.clone();
+                layout.text_inset = visual.text_inset;
+                layout.text_align = visual.text_align;
                 layout.text_lines = lines;
-                self.insert_shaped(shape_key, layout, false, line_height, 0);
+                self.insert_shaped(shape_key, layout, false, visual.line_height, 0);
             }
             if !estimates_changed {
                 break;
@@ -608,7 +794,8 @@ impl LayoutRegistry {
             let height = line.size(line_height).height;
             if relative_y < line_top + height || line_index + 1 == cached.layout.text_lines.len() {
                 let local_y = (relative_y - line_top).max(px(0.0));
-                let local_x = (position.x - layout.bounds.left()).max(px(0.0));
+                let line_left = aligned_line_left(&cached.layout, line);
+                let local_x = (position.x - line_left).max(px(0.0));
                 let local = line
                     .closest_index_for_position(point(local_x, local_y), line_height)
                     .unwrap_or_else(|offset| offset);
@@ -854,7 +1041,7 @@ impl LayoutRegistry {
         let position = line.position_for_index(offset_in_line, cached.line_height)?;
         Some(Bounds::new(
             point(
-                layout.bounds.left() + position.x,
+                aligned_line_left(layout, line) + position.x,
                 layout.bounds.top() + line_top + position.y,
             ),
             size(px(CARET_WIDTH), cached.line_height),
@@ -992,7 +1179,7 @@ impl LayoutRegistry {
             }
             self.layout_scan_count = self.layout_scan_count.saturating_add(1);
             let height = match &block.content {
-                BlockContent::Text { text, .. } => estimate_text_height(text, width),
+                BlockContent::Text { text, .. } => estimate_text_height(text, width, &block.kind),
                 BlockContent::Image {
                     natural_size: (image_width, image_height),
                     display_width,
@@ -1103,6 +1290,8 @@ impl LayoutRegistry {
             && cached.width.to_bits() == width.to_bits()
         {
             cached.layout.bounds = layout.bounds;
+            cached.layout.text_inset = layout.text_inset;
+            cached.layout.text_align = layout.text_align;
             cached.layout.before = layout.before;
             cached.layout.after = layout.after;
             cached.is_image = is_image;
@@ -1282,12 +1471,24 @@ fn block_points(block: &super::model::Block) -> (DocPoint, DocPoint, bool) {
     }
 }
 
-fn estimate_text_height(text: &str, width: f32) -> f32 {
-    let chars_per_row = (width / FALLBACK_GLYPH_WIDTH).floor().max(1.0) as usize;
+fn estimate_text_height(text: &str, width: f32, kind: &BlockKind) -> f32 {
+    let inset = list_depth(kind)
+        .map(|_| LIST_MARKER_WIDTH)
+        .unwrap_or_default();
+    let chars_per_row = ((width - inset).max(1.0) / FALLBACK_GLYPH_WIDTH)
+        .floor()
+        .max(1.0) as usize;
+    let line_height = match kind {
+        BlockKind::Heading { level: 1 } => 40.0,
+        BlockKind::Heading { level: 2 } => 34.0,
+        BlockKind::Heading { level: 3 } => 29.0,
+        BlockKind::Heading { .. } => 26.0,
+        _ => DEFAULT_TEXT_HEIGHT,
+    };
     text.split('\n')
         .map(|line| line.len().div_ceil(chars_per_row).max(1))
         .sum::<usize>() as f32
-        * DEFAULT_TEXT_HEIGHT
+        * line_height
 }
 
 fn estimate_cache_bytes(layout: &BlockLayout, selection_geometry_bytes: usize) -> usize {
@@ -1515,8 +1716,9 @@ fn append_range_segment_bounds(
         return;
     }
     if layout.text_lines.is_empty() {
-        let left = layout.bounds.left() + px(range.start as f32 * FALLBACK_GLYPH_WIDTH);
-        let right = layout.bounds.left() + px(range.end as f32 * FALLBACK_GLYPH_WIDTH);
+        let text_left = layout.bounds.left() + layout.text_inset;
+        let left = text_left + px(range.start as f32 * FALLBACK_GLYPH_WIDTH);
+        let right = text_left + px(range.end as f32 * FALLBACK_GLYPH_WIDTH);
         segments.push(Bounds::from_corners(
             point(left, layout.bounds.top()),
             point(right.max(left + px(CARET_WIDTH)), layout.bounds.bottom()),
@@ -1549,13 +1751,24 @@ fn append_range_segment_bounds(
         range_segment_bounds_for_line(
             line,
             line_top,
-            layout.bounds.left(),
+            aligned_line_left(layout, line),
             line_height,
             line_start,
             line_end,
             segments,
         );
         line_top += line.size(line_height).height;
+    }
+}
+
+fn aligned_line_left(layout: &BlockLayout, line: &WrappedLine) -> Pixels {
+    let text_left = layout.bounds.left() + layout.text_inset;
+    let text_width = (layout.bounds.size.width - layout.text_inset).max(px(1.0));
+    let slack = (text_width - line.width()).max(px(0.0));
+    match layout.text_align {
+        TextAlign::Left => text_left,
+        TextAlign::Center => text_left + slack / 2.0,
+        TextAlign::Right => text_left + slack,
     }
 }
 

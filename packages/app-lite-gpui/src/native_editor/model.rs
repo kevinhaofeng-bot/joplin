@@ -1174,6 +1174,16 @@ impl Document {
         new_text.push_str(&text);
         new_text.push_str(&old_text[insertion_offset..]);
         let mut new_styles = insert_styles(old_styles, insertion_offset, inserted_len);
+        if is_empty {
+            let inherited = insertion_marks(old_styles, insertion_offset, selection.head.affinity);
+            if !inherited.is_empty() {
+                new_styles.push(StyledRun {
+                    range: insertion_offset..insertion_offset.saturating_add(inserted_len),
+                    marks: inherited,
+                });
+                normalize_styles(&mut new_styles);
+            }
+        }
         normalize_styles_for_text(&new_text, &mut new_styles);
         block.content = BlockContent::Text {
             text: new_text,
@@ -2405,6 +2415,28 @@ fn insert_styles(
     }
     normalize_styles(&mut shifted);
     shifted
+}
+
+/// Resolve the marks used by a collapsed-caret insertion.  Affinity is the
+/// single boundary rule shared by command state and model insertion:
+/// `Before` looks to the run ending at the seam, while `After` looks to the
+/// run beginning at the seam.  Strict interior offsets belong to their
+/// containing run.  This avoids a toolbar state that claims Bold while the
+/// next inserted grapheme is unstyled.
+pub(crate) fn insertion_marks(
+    styles: &[StyledRun],
+    offset: usize,
+    affinity: Affinity,
+) -> SmallVec<[Mark; 4]> {
+    styles
+        .iter()
+        .find(|run| {
+            (run.range.start < offset && offset < run.range.end)
+                || (run.range.end == offset && affinity == Affinity::Before)
+                || (run.range.start == offset && affinity == Affinity::After)
+        })
+        .map(|run| run.marks.clone())
+        .unwrap_or_default()
 }
 
 fn delete_text(

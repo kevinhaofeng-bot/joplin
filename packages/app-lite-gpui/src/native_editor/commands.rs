@@ -76,6 +76,7 @@ pub enum CommandError {
         expected: &'static str,
     },
     EmptyLinkUrl,
+    InvalidLinkUrl,
     Document(DocumentError),
 }
 
@@ -86,6 +87,7 @@ impl fmt::Display for CommandError {
                 write!(f, "command {command:?} requires {expected}")
             }
             Self::EmptyLinkUrl => f.write_str("link URL cannot be empty"),
+            Self::InvalidLinkUrl => f.write_str("link URL is invalid"),
             Self::Document(error) => error.fmt(f),
         }
     }
@@ -325,26 +327,22 @@ impl CommandCatalogue {
                     return disabled();
                 };
                 let blocks = &editor.document().blocks()[start..=end];
-                let mut applicable = 0usize;
-                let mut enabled = false;
-                for block in blocks {
-                    let depth = list_depth(&block.kind);
-                    if let Some(depth) = depth {
-                        applicable += 1;
-                        enabled |= match command {
+                // List-depth transactions are intentionally atomic across the
+                // whole block selection.  A mixed selection must therefore be
+                // disabled whenever one item cannot take the same operation;
+                // reporting enabled for only the applicable subset would make
+                // a toolbar click deterministically return a transaction error.
+                let enabled = !blocks.is_empty()
+                    && blocks.iter().all(|block| {
+                        list_depth(&block.kind).is_some_and(|depth| match command {
                             EditorCommand::IndentList => depth < super::model::MAX_LIST_DEPTH,
                             EditorCommand::OutdentList => depth > 0,
                             _ => false,
-                        };
-                    }
-                }
+                        })
+                    });
                 return CommandState {
                     enabled,
-                    toggle: if applicable > 0 {
-                        ToggleState::Off
-                    } else {
-                        ToggleState::Off
-                    },
+                    toggle: ToggleState::Off,
                 };
             }
         }
@@ -417,7 +415,12 @@ fn validate_argument(
 ) -> Result<CommandArgument, CommandError> {
     match (command, argument) {
         (EditorCommand::Link, CommandArgument::LinkUrl(url)) if !url.trim().is_empty() => {
-            Ok(CommandArgument::LinkUrl(url))
+            let url = url.trim();
+            if url::Url::parse(url).is_ok() {
+                Ok(CommandArgument::LinkUrl(url.to_owned()))
+            } else {
+                Err(CommandError::InvalidLinkUrl)
+            }
         }
         (EditorCommand::Link, CommandArgument::LinkUrl(_)) => Err(CommandError::EmptyLinkUrl),
         (EditorCommand::Link, CommandArgument::None) => Err(CommandError::ArgumentMismatch {

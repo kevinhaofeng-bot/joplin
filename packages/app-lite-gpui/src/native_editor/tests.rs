@@ -1,4 +1,6 @@
-use super::commands::{CommandArgument, CommandCatalogue, EditorCommand, ToggleState};
+use super::commands::{
+    CommandArgument, CommandCatalogue, CommandError, EditorCommand, ToggleState,
+};
 use super::core::EditorCore;
 use super::history::History;
 use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry};
@@ -2490,6 +2492,8 @@ fn register_exact_updates_visible_geometry_and_image_metadata() {
     let layout = super::layout::BlockLayout {
         node_id: block.id,
         bounds: Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(100.0), px(36.0))),
+        text_inset: px(0.0),
+        text_align: gpui::TextAlign::Left,
         text_lines: Vec::new(),
         before,
         after,
@@ -2514,6 +2518,8 @@ fn register_exact_updates_visible_geometry_and_image_metadata() {
         super::layout::BlockLayout {
             node_id: image.id,
             bounds: Bounds::new(point(px(0.0), px(36.0)), gpui::size(px(100.0), px(88.0))),
+            text_inset: px(0.0),
+            text_align: gpui::TextAlign::Left,
             text_lines: Vec::new(),
             before: DocPoint::with_affinity(image.id, 0, Affinity::Before),
             after: DocPoint::with_affinity(image.id, 0, Affinity::After),
@@ -2628,6 +2634,8 @@ fn public_and_fallback_positions_snap_to_graphemes(cx: &mut gpui::TestAppContext
         super::layout::BlockLayout {
             node_id: block.id,
             bounds: Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(100.0), px(24.0))),
+            text_inset: px(0.0),
+            text_align: gpui::TextAlign::Left,
             text_lines: Vec::new(),
             before: DocPoint::with_affinity(block.id, 0, Affinity::Before),
             after: DocPoint::with_affinity(block.id, "a\u{301}b".len(), Affinity::After),
@@ -2852,7 +2860,14 @@ fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
                     | EditorCommand::AlignRight
             );
         if current_state_no_op {
+            assert_eq!(
+                state.toggle,
+                ToggleState::On,
+                "a current-state no-op must advertise its active state"
+            );
             assert!(!state.enabled, "current-state no-op must be disabled");
+            assert_eq!(editor.document().semantic_snapshot(), before);
+            assert_eq!(editor.undo_depth(), before_undo);
             continue;
         }
         if !state.enabled {
@@ -2866,13 +2881,27 @@ fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
                     descriptor.command
                 )
             });
-        assert_ne!(
-            editor.document().semantic_snapshot(),
-            before,
-            "enabled visible command {:?} did not change the document",
-            descriptor.command
-        );
-        assert_eq!(editor.undo_depth(), before_undo + 1);
+        match descriptor.command {
+            EditorCommand::Undo => {
+                assert_ne!(editor.document().semantic_snapshot(), before);
+                assert_eq!(editor.undo_depth(), before_undo.saturating_sub(1));
+                assert_eq!(editor.redo_depth(), 1);
+            }
+            EditorCommand::Redo => {
+                assert_ne!(editor.document().semantic_snapshot(), before);
+                assert_eq!(editor.undo_depth(), before_undo + 1);
+                assert_eq!(editor.redo_depth(), 0);
+            }
+            _ => {
+                assert_ne!(
+                    editor.document().semantic_snapshot(),
+                    before,
+                    "enabled visible command {:?} did not change the document",
+                    descriptor.command
+                );
+                assert_eq!(editor.undo_depth(), before_undo + 1);
+            }
+        }
     }
 
     let mut editor = EditorCore::for_test("第一行\n第二行", cx);
@@ -2908,6 +2937,34 @@ fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
         .execute(EditorCommand::Undo, CommandArgument::None, &mut editor)
         .unwrap();
     assert!(catalogue.state(EditorCommand::Redo, &editor).enabled);
+}
+
+#[gpui::test]
+fn link_argument_validation_is_atomic_for_empty_and_invalid_urls(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let mut editor = EditorCore::for_test("linked text", cx);
+    editor.select_all();
+    let before = editor.document().semantic_snapshot();
+    let before_undo = editor.undo_depth();
+
+    assert_eq!(
+        catalogue.execute(
+            EditorCommand::Link,
+            CommandArgument::LinkUrl("   ".into()),
+            &mut editor,
+        ),
+        Err(CommandError::EmptyLinkUrl)
+    );
+    assert_eq!(
+        catalogue.execute(
+            EditorCommand::Link,
+            CommandArgument::LinkUrl("not a url".into()),
+            &mut editor,
+        ),
+        Err(CommandError::InvalidLinkUrl)
+    );
+    assert_eq!(editor.document().semantic_snapshot(), before);
+    assert_eq!(editor.undo_depth(), before_undo);
 }
 
 #[gpui::test]
@@ -3040,4 +3097,248 @@ fn spike_route_uses_native_gpui_without_donor_services() {
     assert!(contract.uses_real_input_bridge);
     assert!(!contract.initializes_donor_services);
     assert!(!contract.initializes_web_runtime);
+}
+
+#[gpui::test]
+fn mixed_max_depth_indent_is_disabled_before_atomic_execution(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let mut editor = EditorCore::for_test_paragraphs(["at-limit", "still-editable"], cx);
+    let first = editor.document().blocks()[0].id;
+    let second = editor.document().blocks()[1].id;
+    editor
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(first, 0, Affinity::Before),
+                DocPoint::with_affinity(first, "at-limit".len(), Affinity::After),
+            ),
+            kind: BlockKind::BulletItem {
+                depth: super::model::MAX_LIST_DEPTH,
+            },
+        })
+        .unwrap();
+    editor
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(second, 0, Affinity::Before),
+                DocPoint::with_affinity(second, "still-editable".len(), Affinity::After),
+            ),
+            kind: BlockKind::BulletItem { depth: 0 },
+        })
+        .unwrap();
+    editor.select_all();
+
+    let state = catalogue.state(EditorCommand::IndentList, &editor);
+    assert!(
+        !state.enabled,
+        "an atomic mixed-depth indent must be disabled when any selected item is at MAX_LIST_DEPTH"
+    );
+    let before = editor.document().semantic_snapshot();
+    let before_undo = editor.undo_depth();
+    let result = catalogue.execute(
+        EditorCommand::IndentList,
+        CommandArgument::None,
+        &mut editor,
+    );
+    assert!(
+        result.is_err(),
+        "direct execution must still reject the invalid batch"
+    );
+    assert_eq!(editor.document().semantic_snapshot(), before);
+    assert_eq!(editor.undo_depth(), before_undo);
+}
+
+#[gpui::test]
+fn collapsed_caret_state_and_insertion_share_affinity_boundary_rule(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let mut editor = EditorCore::for_test("ab", cx);
+    let node = editor.document().blocks()[0].id;
+    editor
+        .apply(Transaction::ToggleMark {
+            selection: Selection::new(
+                DocPoint::with_affinity(node, 0, Affinity::Before),
+                DocPoint::with_affinity(node, 1, Affinity::After),
+            ),
+            mark: Mark::Bold,
+        })
+        .unwrap();
+
+    // Before the styled run is unstyled; after the run is styled. The same
+    // answer must drive both the toolbar state and inserted-run inheritance.
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        node,
+        0,
+        Affinity::Before,
+    )));
+    assert_eq!(
+        catalogue.state(EditorCommand::Bold, &editor).toggle,
+        ToggleState::Off
+    );
+    editor.insert_text("X").unwrap();
+    let styles = editor.document().blocks()[0]
+        .content
+        .styles()
+        .expect("text styles");
+    assert!(
+        styles
+            .iter()
+            .any(|run| run.range == (1..2) && run.marks.contains(&Mark::Bold)),
+        "the original styled run should remain attached after an unstyled insertion"
+    );
+
+    let mut editor = EditorCore::for_test("ab", cx);
+    let node = editor.document().blocks()[0].id;
+    editor
+        .apply(Transaction::ToggleMark {
+            selection: Selection::new(
+                DocPoint::with_affinity(node, 0, Affinity::Before),
+                DocPoint::with_affinity(node, 1, Affinity::After),
+            ),
+            mark: Mark::Bold,
+        })
+        .unwrap();
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        node,
+        1,
+        Affinity::Before,
+    )));
+    assert_eq!(
+        catalogue.state(EditorCommand::Bold, &editor).toggle,
+        ToggleState::On
+    );
+    editor.insert_text("X").unwrap();
+    let styles = editor.document().blocks()[0]
+        .content
+        .styles()
+        .expect("text styles");
+    assert!(
+        styles
+            .iter()
+            .any(|run| run.range == (0..2) && run.marks.contains(&Mark::Bold)),
+        "insertion at the styled run's before-affinity seam must inherit Bold"
+    );
+
+    let mut editor = EditorCore::for_test("ab", cx);
+    let node = editor.document().blocks()[0].id;
+    editor
+        .apply(Transaction::ToggleMark {
+            selection: Selection::new(
+                DocPoint::with_affinity(node, 0, Affinity::Before),
+                DocPoint::with_affinity(node, 1, Affinity::After),
+            ),
+            mark: Mark::Bold,
+        })
+        .unwrap();
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        node,
+        1,
+        Affinity::After,
+    )));
+    assert_eq!(
+        catalogue.state(EditorCommand::Bold, &editor).toggle,
+        ToggleState::Off
+    );
+    editor.insert_text("Y").unwrap();
+    let styles = editor.document().blocks()[0]
+        .content
+        .styles()
+        .expect("text styles");
+    assert!(
+        styles
+            .iter()
+            .any(|run| run.range == (0..1) && run.marks.contains(&Mark::Bold)),
+        "insertion at the styled run's after-affinity seam must remain unstyled"
+    );
+}
+
+#[gpui::test]
+async fn heading_and_list_layout_are_measured_as_distinct_render_geometry(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let mut document = Document::from_paragraphs(["heading", "list item"]);
+    let heading = document.blocks()[0].id;
+    let list = document.blocks()[1].id;
+    document
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(heading, 0, Affinity::Before),
+                DocPoint::with_affinity(heading, "heading".len(), Affinity::After),
+            ),
+            kind: BlockKind::Heading { level: 1 },
+        })
+        .unwrap();
+    document
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(list, 0, Affinity::Before),
+                DocPoint::with_affinity(list, "list item".len(), Affinity::After),
+            ),
+            kind: BlockKind::BulletItem { depth: 2 },
+        })
+        .unwrap();
+
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 240.0, 680.0, window);
+    });
+    let heading_height = layout
+        .block_layout(heading)
+        .expect("heading should be shaped")
+        .bounds
+        .size
+        .height;
+    let list_layout = layout.block_layout(list).expect("list should be shaped");
+    assert!(
+        heading_height > px(24.0),
+        "heading style must affect measured line height"
+    );
+    assert!(
+        list_layout.bounds.left() > px(0.0),
+        "nested list marker indentation must participate in hit geometry"
+    );
+}
+
+#[gpui::test]
+fn shift_navigation_and_plain_clipboard_use_one_document_selection(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test_paragraphs(["alpha", "beta"], cx);
+    let first = editor.document().blocks()[0].id;
+    let second = editor.document().blocks()[1].id;
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        first,
+        "alpha".len(),
+        Affinity::After,
+    )));
+    editor.select_left();
+    editor.select_left();
+    assert_eq!(editor.copy_plain_text(), "ha");
+    let cut = editor.cut_selection().unwrap();
+    assert_eq!(cut, "ha");
+    assert_eq!(editor.document().text_at_index(0), Some("alp"));
+    editor.paste_plain_text("XYZ").unwrap();
+    assert_eq!(editor.document().text_at_index(0), Some("alpXYZ"));
+
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        first,
+        "alpXYZ".len(),
+        Affinity::After,
+    )));
+    editor.select_down();
+    assert_eq!(editor.selection().head.node_id, second);
+    assert!(!editor.selection().is_caret());
+    editor.select_up();
+    assert_eq!(editor.selection().head.node_id, first);
+}
+
+#[gpui::test]
+async fn measured_total_height_includes_a_single_wrapped_block(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let document = Document::from_paragraph("wrap ".repeat(240));
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 48.0, 120.0, window);
+    });
+    assert!(
+        layout.total_height() > 240.0,
+        "measured wrap height must expose a scrollable extent rather than one guessed row"
+    );
 }

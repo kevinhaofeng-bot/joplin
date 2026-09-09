@@ -16,7 +16,7 @@ use super::input;
 use super::layout::LayoutRegistry;
 use super::model::{
     Affinity, Block, BlockContent, BlockKind, DocPoint, Document, DocumentError, NodeId, Selection,
-    TextAlignment,
+    TextAlignment, insertion_marks,
 };
 use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
 
@@ -319,18 +319,12 @@ impl EditorCore {
         let Some(styles) = block.content.styles() else {
             return (false, false);
         };
-        let offset = self.selection.head.utf8_offset;
-        let active = styles.iter().any(|run| {
-            (run.range.start < offset && offset <= run.range.end)
-                || (run.range.start == offset && self.selection.head.affinity == Affinity::Before)
-        });
-        let has_mark = styles.iter().any(|run| {
-            active
-                && contains_mark(&run.marks, mark)
-                && ((run.range.start < offset && offset <= run.range.end)
-                    || (run.range.start == offset
-                        && self.selection.head.affinity == Affinity::Before))
-        });
+        let inherited = insertion_marks(
+            styles,
+            self.selection.head.utf8_offset,
+            self.selection.head.affinity,
+        );
+        let has_mark = contains_mark(&inherited, mark);
         (has_mark, has_mark)
     }
 
@@ -959,6 +953,97 @@ impl EditorCore {
 
     pub fn move_down(&mut self) {
         self.move_vertical(1);
+    }
+
+    /// Extend the document selection from its anchor while using the same
+    /// movement primitives as the unmodified arrow actions.  Keeping this in
+    /// `EditorCore` means Shift selection never creates a second focus or
+    /// transaction owner in the GPUI route.
+    pub fn select_left(&mut self) {
+        self.extend_with(|editor| editor.move_left());
+    }
+
+    pub fn select_right(&mut self) {
+        self.extend_with(|editor| editor.move_right());
+    }
+
+    pub fn select_up(&mut self) {
+        self.extend_with(|editor| editor.move_up());
+    }
+
+    pub fn select_down(&mut self) {
+        self.extend_with(|editor| editor.move_down());
+    }
+
+    pub fn select_home(&mut self) {
+        self.extend_with(|editor| editor.move_home());
+    }
+
+    pub fn select_end(&mut self) {
+        self.extend_with(|editor| editor.move_end());
+    }
+
+    pub fn select_word_left(&mut self) {
+        let anchor = self.selection.anchor;
+        let head = self.selection.head;
+        let head_offset = self.flat_offset_for_point(head);
+        let text = self.document_text();
+        let target_offset = previous_word_boundary(&text, head_offset);
+        let target = self.point_for_document_offset_with_affinity(target_offset, Affinity::Before);
+        self.selection = Selection::new(anchor, target);
+        self.preferred_x = None;
+        self.clear_composition();
+    }
+
+    pub fn select_word_right(&mut self) {
+        let anchor = self.selection.anchor;
+        let head = self.selection.head;
+        let head_offset = self.flat_offset_for_point(head);
+        let text = self.document_text();
+        let target_offset = next_word_boundary(&text, head_offset);
+        let target = self.point_for_document_offset_with_affinity(target_offset, Affinity::After);
+        self.selection = Selection::new(anchor, target);
+        self.preferred_x = None;
+        self.clear_composition();
+    }
+
+    /// Convert a shaped editor-surface point into the document's canonical
+    /// point.  The layout registry owns hit geometry, including wrapped rows,
+    /// list insets, alignment and image affinities.
+    pub(crate) fn point_from_layout(&mut self, position: Point<Pixels>) -> Option<DocPoint> {
+        let point = self.layout.point_to_doc(position)?;
+        Some(self.snap_layout_point(point))
+    }
+
+    pub(crate) fn begin_pointer_selection(&mut self, position: Point<Pixels>) -> Option<DocPoint> {
+        let point = self.point_from_layout(position)?;
+        self.selection = Selection::caret(point);
+        self.preferred_x = None;
+        self.clear_composition();
+        Some(point)
+    }
+
+    pub(crate) fn update_pointer_selection(
+        &mut self,
+        anchor: DocPoint,
+        position: Point<Pixels>,
+    ) -> Option<Selection> {
+        let head = self.point_from_layout(position)?;
+        self.selection = Selection::new(anchor, head);
+        self.preferred_x = None;
+        self.clear_composition();
+        Some(self.selection)
+    }
+
+    fn extend_with(&mut self, movement: impl FnOnce(&mut Self)) {
+        let anchor = self.selection.anchor;
+        let head = self.selection.head;
+        self.selection = Selection::caret(head);
+        movement(self);
+        let target = self.selection.head;
+        self.selection = Selection::new(anchor, target);
+        self.preferred_x = None;
+        self.clear_composition();
     }
 
     fn move_vertical(&mut self, direction: isize) {
@@ -1885,6 +1970,31 @@ fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
         .map(|(start, _)| start)
         .find(|start| *start > offset)
         .unwrap_or(text.len())
+}
+
+fn previous_word_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    let mut boundary = 0;
+    for (index, segment) in text.split_word_bound_indices() {
+        if index >= offset {
+            break;
+        }
+        boundary = index;
+        if index.saturating_add(segment.len()) >= offset {
+            break;
+        }
+    }
+    boundary
+}
+
+fn next_word_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    for (index, _) in text.split_word_bound_indices() {
+        if index > offset {
+            return index;
+        }
+    }
+    text.len()
 }
 
 fn resolve_grapheme_offset(text: &str, preferred: usize, affinity: Affinity) -> usize {

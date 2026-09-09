@@ -5,13 +5,13 @@
 //! selection geometry, glyphs/images, then the caret.
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, Pixels, TextAlign, Window,
-    WrappedLine, fill, outline, point, px, rgba,
+    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, Pixels, SharedString,
+    TextAlign, TextRun, Window, WrappedLine, fill, outline, point, px, rgba,
 };
 
 use super::core::EditorCore;
 use super::layout::BlockLayout;
-use super::model::Selection;
+use super::model::{BlockKind, Selection};
 
 #[derive(Clone)]
 struct RenderBlock {
@@ -19,6 +19,7 @@ struct RenderBlock {
     text_lines: Vec<WrappedLine>,
     is_image: bool,
     line_height: Option<Pixels>,
+    marker: Option<String>,
 }
 
 #[derive(Clone)]
@@ -34,14 +35,22 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
     let blocks = layout
         .visible()
         .iter()
-        .map(|block| RenderBlock {
-            layout: block.clone(),
-            text_lines: layout
-                .block_layout(block.node_id)
-                .map(|cached| cached.text_lines.clone())
-                .unwrap_or_default(),
-            is_image: layout.is_image(block.node_id),
-            line_height: layout.line_height(block.node_id),
+        .map(|block| {
+            let kind = editor
+                .document()
+                .block(block.node_id)
+                .map(|block| block.kind.clone())
+                .unwrap_or(BlockKind::Paragraph);
+            RenderBlock {
+                layout: block.clone(),
+                text_lines: layout
+                    .block_layout(block.node_id)
+                    .map(|cached| cached.text_lines.clone())
+                    .unwrap_or_default(),
+                is_image: layout.is_image(block.node_id),
+                line_height: layout.line_height(block.node_id),
+                marker: list_marker(&kind, editor, block.node_id),
+            }
         })
         .collect();
     RenderSnapshot {
@@ -105,9 +114,18 @@ fn paint_snapshot(
         }
         let line_height = block.line_height.unwrap_or_else(|| window.line_height());
         for (line_index, line) in block.text_lines.iter().enumerate() {
+            let text_left = block.layout.bounds.left() + block.layout.text_inset;
+            let text_width =
+                (block.layout.bounds.size.width - block.layout.text_inset).max(px(1.0));
+            let slack = (text_width - line.width()).max(px(0.0));
+            let line_left = match block.layout.text_align {
+                TextAlign::Left => text_left,
+                TextAlign::Center => text_left + slack / 2.0,
+                TextAlign::Right => text_left + slack,
+            };
             line.paint(
                 point(
-                    block.layout.bounds.left(),
+                    line_left,
                     block.layout.bounds.top()
                         + block
                             .text_lines
@@ -118,7 +136,33 @@ fn paint_snapshot(
                 ),
                 line_height,
                 TextAlign::Left,
-                Some(block.layout.bounds),
+                Some(Bounds::new(
+                    point(text_left, block.layout.bounds.top()),
+                    gpui::size(text_width, block.layout.bounds.size.height),
+                )),
+                window,
+                cx,
+            )?;
+        }
+        if let Some(marker) = block.marker.as_deref() {
+            let style = window.text_style();
+            let marker_text: SharedString = marker.to_owned().into();
+            let marker_line = window.text_system().shape_line(
+                marker_text.clone(),
+                style.font_size.to_pixels(window.rem_size()),
+                &[TextRun {
+                    len: marker_text.len(),
+                    font: style.font(),
+                    color: rgba(0x536174ff).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            marker_line.paint(
+                point(block.layout.bounds.left(), block.layout.bounds.top()),
+                line_height,
                 window,
                 cx,
             )?;
@@ -133,6 +177,38 @@ fn paint_snapshot(
         }
     }
     Ok(())
+}
+
+fn list_marker(
+    kind: &BlockKind,
+    editor: &EditorCore,
+    node_id: super::model::NodeId,
+) -> Option<String> {
+    match kind {
+        BlockKind::BulletItem { .. } => Some("•".to_owned()),
+        BlockKind::CheckItem { checked, .. } => Some(if *checked { "☑" } else { "☐" }.to_owned()),
+        BlockKind::OrderedItem { depth } => {
+            let Some(index) = editor
+                .document()
+                .blocks()
+                .iter()
+                .position(|block| block.id == node_id)
+            else {
+                return Some("1.".to_owned());
+            };
+            let mut number = 1usize;
+            for block in editor.document().blocks()[..index].iter().rev() {
+                match &block.kind {
+                    BlockKind::OrderedItem {
+                        depth: previous_depth,
+                    } if *previous_depth == *depth => number += 1,
+                    _ => break,
+                }
+            }
+            Some(format!("{number}."))
+        }
+        _ => None,
+    }
 }
 
 /// Paint an editor entity and install GPUI's real input bridge for the same
