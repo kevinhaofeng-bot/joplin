@@ -21,6 +21,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::model::{
     Affinity, BlockContent, BlockKind, DocPoint, Document, Mark, NodeId, Selection, TextAlignment,
 };
+use super::transaction::StructuralSplice;
 
 pub const LAYOUT_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TEXT_HEIGHT: f32 = 24.0;
@@ -189,6 +190,90 @@ fn styled_text_runs(
     }
 }
 
+/// Count the decoration runs that GPUI's `shape_text` retains for each hard
+/// line. `shape_text` starts a fresh `SmallVec<[DecorationRun; 32]>` for every
+/// hard line and merges adjacent source runs only when all decoration fields
+/// match. The newline itself is consumed after the line and is therefore not
+/// part of that line's decoration run count.
+fn decoration_run_counts_per_hard_line(text: &str, runs: &[TextRun]) -> SmallVec<[usize; 4]> {
+    let mut counts = SmallVec::new();
+    let mut run_index = 0usize;
+    let mut run_remaining = 0usize;
+    let mut lines = text.split('\n').peekable();
+
+    while let Some(line) = lines.next() {
+        let mut count = 0usize;
+        let mut previous_run: Option<&TextRun> = None;
+
+        let mut remaining_line = line.len();
+        while remaining_line > 0 {
+            while run_index < runs.len() && run_remaining == 0 {
+                run_remaining = runs[run_index].len;
+                if run_remaining == 0 {
+                    run_index += 1;
+                }
+            }
+            let Some(run) = runs.get(run_index) else {
+                break;
+            };
+            let same_decoration = previous_run.is_some_and(|previous| {
+                previous.color == run.color
+                    && previous.underline == run.underline
+                    && previous.strikethrough == run.strikethrough
+                    && previous.background_color == run.background_color
+            });
+            if !same_decoration {
+                count = count.saturating_add(1);
+            }
+            previous_run = Some(run);
+            let consumed = remaining_line.min(run_remaining);
+            remaining_line -= consumed;
+            run_remaining -= consumed;
+            if run_remaining == 0 {
+                run_index += 1;
+            }
+        }
+
+        counts.push(count);
+
+        // Match GPUI's `shape_text`: after shaping a hard line it consumes
+        // exactly one newline byte from the current source run, advancing to
+        // the next run only when that run is exhausted.
+        if lines.peek().is_some() {
+            while run_index < runs.len() && run_remaining == 0 {
+                run_remaining = runs[run_index].len;
+                if run_remaining == 0 {
+                    run_index += 1;
+                }
+            }
+            if run_remaining > 0 {
+                run_remaining -= 1;
+                if run_remaining == 0 {
+                    run_index += 1;
+                }
+            }
+        }
+    }
+
+    counts
+}
+
+fn decoration_spill_bytes(line_run_counts: &[usize]) -> usize {
+    line_run_counts
+        .iter()
+        .map(|count| {
+            if *count > 32 {
+                count
+                    .checked_next_power_of_two()
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(size_of::<gpui::DecorationRun>())
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
 /// Exact geometry for one block currently in or near the viewport.
 ///
 /// The field is intentionally named `text_lines` for the Task 4 public
@@ -270,8 +355,10 @@ pub struct CachedBlockLayout {
     pub selection_geometry_bytes: usize,
     /// Upper bound for the GPUI decoration runs retained by the wrapped
     /// lines. `WrappedLine` keeps these in a private SmallVec, so retain the
-    /// source run count alongside the public shaped geometry for budgeting.
+    /// per-hard-line source run counts alongside the public shaped geometry
+    /// for budgeting.
     pub(crate) decoration_run_count: usize,
+    pub(crate) decoration_line_run_counts: SmallVec<[usize; 4]>,
     /// Background-bearing runs that survived into the shaped input. The
     /// renderer records a paint only after the real GPUI background pass.
     pub(crate) shaped_background_run_count: usize,
@@ -302,6 +389,47 @@ struct NumberingCursor {
 struct NumberingCheckpoint {
     index: usize,
     cursor: NumberingCursor,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OrderSummary {
+    count: usize,
+}
+
+impl ContextLessSummary for OrderSummary {
+    fn zero() -> Self {
+        Self::default()
+    }
+
+    fn add_summary(&mut self, summary: &Self) {
+        self.count = self.count.saturating_add(summary.count);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OrderItem {
+    node_id: NodeId,
+}
+
+impl Item for OrderItem {
+    type Summary = OrderSummary;
+
+    fn summary(&self, _: ()) -> Self::Summary {
+        OrderSummary { count: 1 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct OrderCount(usize);
+
+impl<'a> Dimension<'a, OrderSummary> for OrderCount {
+    fn zero(_: ()) -> Self {
+        Self(0)
+    }
+
+    fn add_summary(&mut self, summary: &'a OrderSummary, _: ()) {
+        self.0 = self.0.saturating_add(summary.count);
+    }
 }
 
 fn numbering_kind(kind: &BlockKind) -> NumberingKind {
@@ -417,14 +545,15 @@ pub struct LayoutRegistry {
     /// only list structure changes trigger a suffix update.
     ordered_numbers: HashMap<NodeId, usize>,
     ordered_kinds: HashMap<NodeId, NumberingKind>,
-    ordered_order: Vec<NodeId>,
-    ordered_index: HashMap<NodeId, usize>,
+    ordered_tree: SumTree<OrderItem>,
     ordered_checkpoints: Vec<NumberingCheckpoint>,
     ordered_summary_valid: bool,
     ordered_structure_revision: Option<u64>,
     ordered_number_scan_count: usize,
     #[cfg(test)]
     ordered_number_work_count: usize,
+    #[cfg(test)]
+    ordered_splice_work_count: usize,
     estimate_revisions: HashMap<NodeId, u64>,
     estimate_width: f32,
     estimate_document_revision: Option<u64>,
@@ -457,14 +586,15 @@ impl LayoutRegistry {
             document_order_revision: None,
             ordered_numbers: HashMap::new(),
             ordered_kinds: HashMap::new(),
-            ordered_order: Vec::new(),
-            ordered_index: HashMap::new(),
+            ordered_tree: SumTree::new(()),
             ordered_checkpoints: Vec::new(),
             ordered_summary_valid: false,
             ordered_structure_revision: None,
             ordered_number_scan_count: 0,
             #[cfg(test)]
             ordered_number_work_count: 0,
+            #[cfg(test)]
+            ordered_splice_work_count: 0,
             estimate_revisions: HashMap::new(),
             estimate_width: 0.0,
             estimate_document_revision: None,
@@ -559,6 +689,11 @@ impl LayoutRegistry {
     #[cfg(test)]
     pub(crate) fn ordered_number_work_count(&self) -> usize {
         self.ordered_number_work_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ordered_splice_work_count(&self) -> usize {
+        self.ordered_splice_work_count
     }
 
     /// Build exact geometry for the viewport plus one viewport of prefetch on
@@ -730,7 +865,8 @@ impl LayoutRegistry {
                 self.shape_count = self.shape_count.saturating_add(1);
                 let shared_text = SharedString::from(text.to_owned());
                 let runs = styled_text_runs(block, &shared_text, &visual.font);
-                let decoration_run_count = runs.len();
+                let decoration_line_run_counts = decoration_run_counts_per_hard_line(text, &runs);
+                let decoration_run_count = decoration_line_run_counts.iter().sum();
                 let shaped_background_run_count = runs
                     .iter()
                     .filter(|run| run.background_color.is_some())
@@ -778,6 +914,7 @@ impl LayoutRegistry {
                     visual.line_height,
                     0,
                     decoration_run_count,
+                    decoration_line_run_counts,
                     shaped_background_run_count,
                 );
             }
@@ -819,6 +956,7 @@ impl LayoutRegistry {
             line_height,
             selection_geometry_bytes,
             0,
+            SmallVec::new(),
             0,
         );
         self.enforce_budget();
@@ -834,8 +972,7 @@ impl LayoutRegistry {
         self.document_order_revision = None;
         self.ordered_numbers.clear();
         self.ordered_kinds.clear();
-        self.ordered_order.clear();
-        self.ordered_index.clear();
+        self.ordered_tree = SumTree::new(());
         self.ordered_checkpoints.clear();
         self.ordered_summary_valid = false;
         self.ordered_structure_revision = None;
@@ -844,11 +981,13 @@ impl LayoutRegistry {
     /// Invalidate only the model nodes reported by the transaction layer.
     /// Structural edits also invalidate the height/order index, while
     /// unaffected shaped lines remain retained for the next viewport pass.
-    pub(crate) fn invalidate_nodes(
+    pub(crate) fn invalidate_nodes_with_delta(
         &mut self,
         document: &Document,
         changed_nodes: &[NodeId],
         structural: bool,
+        structural_splices: &[StructuralSplice],
+        numbering_ranges: &[Range<usize>],
     ) {
         let invalidated: HashSet<NodeId> = changed_nodes.iter().copied().collect();
         self.visible
@@ -864,7 +1003,12 @@ impl LayoutRegistry {
             self.document_order.clear();
             self.document_order_revision = None;
             if structural && self.ordered_summary_valid {
-                self.update_ordered_structure(document, changed_nodes);
+                self.update_ordered_structure(
+                    document,
+                    changed_nodes,
+                    structural_splices,
+                    numbering_ranges,
+                );
             }
             self.ordered_structure_revision = Some(document.revision());
         }
@@ -1404,9 +1548,14 @@ impl LayoutRegistry {
     fn rebuild_ordered_numbers(&mut self, document: &Document) {
         self.ordered_numbers.clear();
         self.ordered_kinds.clear();
-        self.ordered_order.clear();
-        self.ordered_index.clear();
         self.ordered_checkpoints.clear();
+        self.ordered_tree = SumTree::from_iter(
+            document
+                .blocks()
+                .iter()
+                .map(|block| OrderItem { node_id: block.id }),
+            (),
+        );
         let mut cursor = NumberingCursor::default();
         for (index, block) in document.blocks().iter().enumerate() {
             if index % NUMBERING_CHECKPOINT_STRIDE == 0 {
@@ -1417,8 +1566,6 @@ impl LayoutRegistry {
             }
             let kind = numbering_kind(&block.kind);
             let number = advance_numbering(kind, &mut cursor);
-            self.ordered_order.push(block.id);
-            self.ordered_index.insert(block.id, index);
             self.ordered_kinds.insert(block.id, kind);
             if let Some(number) = number {
                 self.ordered_numbers.insert(block.id, number);
@@ -1437,36 +1584,84 @@ impl LayoutRegistry {
         }
     }
 
-    /// Apply a kind/depth change using the retained O(1) order index. If a
-    /// changed identity moved, was inserted, or was removed, the order
-    /// cannot be patched from the identity set alone and the compact summary
-    /// is rebuilt once; no old maps/vectors or live-id HashSet are cloned.
-    fn update_ordered_structure(&mut self, document: &Document, changed_nodes: &[NodeId]) {
+    /// Apply explicit order replacements and separate kind/depth ranges. The
+    /// order tree is edited with the same cursor slice/append path as GPUI's
+    /// list state, so a tail splice does not copy the suffix into a new Vec.
+    fn update_ordered_structure(
+        &mut self,
+        document: &Document,
+        changed_nodes: &[NodeId],
+        structural_splices: &[StructuralSplice],
+        numbering_ranges: &[Range<usize>],
+    ) {
         let mut first = usize::MAX;
         let mut last = 0usize;
-        for node_id in changed_nodes {
-            let Some(&index) = self.ordered_index.get(node_id) else {
-                self.rebuild_ordered_numbers(document);
-                return;
-            };
-            let Some(block) = document.blocks().get(index) else {
-                self.rebuild_ordered_numbers(document);
-                return;
-            };
-            if block.id != *node_id {
-                self.rebuild_ordered_numbers(document);
-                return;
+        if !structural_splices.is_empty() {
+            for splice in structural_splices {
+                first = first.min(splice.start_index);
+                last = last.max(
+                    splice
+                        .start_index
+                        .saturating_add(splice.inserted.len())
+                        .max(splice.start_index.saturating_add(splice.removed.len())),
+                );
+                self.splice_order_tree(splice);
+                for node_id in &splice.removed {
+                    self.ordered_kinds.remove(node_id);
+                    self.ordered_numbers.remove(node_id);
+                }
+                for node_id in &splice.inserted {
+                    if let Some(block) = document.block(*node_id) {
+                        self.ordered_kinds
+                            .insert(*node_id, numbering_kind(&block.kind));
+                    }
+                }
             }
-            let kind = numbering_kind(&block.kind);
-            if self.ordered_kinds.get(node_id).copied() != Some(kind) {
-                first = first.min(index);
-                last = last.max(index);
+            for node_id in changed_nodes {
+                if let Some(block) = document.block(*node_id) {
+                    self.ordered_kinds
+                        .insert(*node_id, numbering_kind(&block.kind));
+                }
             }
         }
-        if first == usize::MAX {
-            return;
+        for range in numbering_ranges {
+            first = first.min(range.start);
+            last = last.max(range.end.saturating_sub(1));
         }
-        self.update_ordered_numbers(document, first, last);
+        if first != usize::MAX {
+            self.update_ordered_numbers(document, first, last);
+        }
+    }
+
+    fn splice_order_tree(&mut self, splice: &StructuralSplice) {
+        let end = splice.start_index.saturating_add(splice.removed.len());
+        debug_assert!(end <= self.ordered_tree.summary().count);
+        let mut cursor = self.ordered_tree.cursor::<OrderCount>(());
+        let mut new_tree = cursor.slice(&OrderCount(splice.start_index), Bias::Right);
+        cursor.seek_forward(&OrderCount(end), Bias::Right);
+        new_tree.extend(
+            splice
+                .inserted
+                .iter()
+                .copied()
+                .map(|node_id| OrderItem { node_id }),
+            (),
+        );
+        new_tree.append(cursor.suffix(), ());
+        drop(cursor);
+        self.ordered_tree = new_tree;
+        #[cfg(test)]
+        {
+            self.ordered_splice_work_count = self
+                .ordered_splice_work_count
+                .saturating_add(splice.removed.len().saturating_add(splice.inserted.len()));
+        }
+    }
+
+    fn ordered_id_at(&self, index: usize) -> Option<NodeId> {
+        let mut cursor = self.ordered_tree.cursor::<OrderCount>(());
+        cursor.seek(&OrderCount(index), Bias::Right);
+        cursor.item().map(|item| item.node_id)
     }
 
     fn update_ordered_numbers(&mut self, document: &Document, start: usize, last_changed: usize) {
@@ -1479,6 +1674,7 @@ impl LayoutRegistry {
             .unwrap_or_default();
         let mut processed = 0usize;
         let mut changed_since_checkpoint = false;
+        let mut checkpoint_changed_before = false;
         for (index, block) in document.blocks().iter().enumerate().skip(checkpoint_start) {
             let kind = numbering_kind(&block.kind);
             let old_kind = self.ordered_kinds.get(&block.id).copied();
@@ -1492,7 +1688,7 @@ impl LayoutRegistry {
             self.ordered_kinds.insert(block.id, kind);
             processed = processed.saturating_add(1);
 
-            if self.ordered_order.get(index) != Some(&block.id)
+            if self.ordered_id_at(index) != Some(block.id)
                 || old_kind != Some(kind)
                 || old_number != number
             {
@@ -1501,8 +1697,14 @@ impl LayoutRegistry {
             let at_checkpoint_boundary = (index + 1) % NUMBERING_CHECKPOINT_STRIDE == 0;
             if at_checkpoint_boundary {
                 let checkpoint_index = (index + 1) / NUMBERING_CHECKPOINT_STRIDE;
-                let stable = changed_since_checkpoint
-                    && index >= last_changed
+                let stable = index >= last_changed
+                    // A checkpoint containing the changed item cannot be the
+                    // convergence point: the item immediately after it may
+                    // have shifted even when the aggregate cursor happens to
+                    // be equal. The first *clean* checkpoint after that one
+                    // is allowed to converge when its cursor matches.
+                    && checkpoint_changed_before
+                    && !changed_since_checkpoint
                     && self
                         .ordered_checkpoints
                         .get(checkpoint_index)
@@ -1513,6 +1715,7 @@ impl LayoutRegistry {
                 if stable {
                     break;
                 }
+                checkpoint_changed_before = changed_since_checkpoint;
                 changed_since_checkpoint = false;
             }
         }
@@ -1633,6 +1836,7 @@ impl LayoutRegistry {
             px(DEFAULT_TEXT_HEIGHT),
             0,
             0,
+            SmallVec::new(),
             0,
         );
     }
@@ -1645,6 +1849,7 @@ impl LayoutRegistry {
         default_line_height: Pixels,
         requested_selection_geometry_bytes: usize,
         decoration_run_count: usize,
+        decoration_line_run_counts: SmallVec<[usize; 4]>,
         shaped_background_run_count: usize,
     ) {
         let node_id = layout.node_id;
@@ -1659,10 +1864,18 @@ impl LayoutRegistry {
             &layout,
             requested_selection_geometry_bytes.max(size_of::<Bounds<Pixels>>() * 2),
         );
-        let retained_bytes =
-            estimate_retained_cache_bytes(&layout, selection_geometry_bytes, decoration_run_count);
-        let snapshot_clone_bytes = estimate_snapshot_clone_bytes(&layout, decoration_run_count);
-        let bytes = estimate_cache_bytes(&layout, selection_geometry_bytes, decoration_run_count);
+        let retained_bytes = estimate_retained_cache_bytes(
+            &layout,
+            selection_geometry_bytes,
+            &decoration_line_run_counts,
+        );
+        let snapshot_clone_bytes =
+            estimate_snapshot_clone_bytes(&layout, &decoration_line_run_counts);
+        let bytes = estimate_cache_bytes(
+            &layout,
+            selection_geometry_bytes,
+            &decoration_line_run_counts,
+        );
         if bytes > self.budget_bytes {
             return;
         }
@@ -1682,6 +1895,7 @@ impl LayoutRegistry {
                 width,
                 selection_geometry_bytes,
                 decoration_run_count,
+                decoration_line_run_counts,
                 shaped_background_run_count,
                 is_image,
                 line_height: if line_height == px(0.0) {
@@ -1896,11 +2110,9 @@ fn estimate_text_height(text: &str, width: f32, kind: &BlockKind) -> f32 {
 fn estimate_retained_cache_bytes(
     layout: &BlockLayout,
     selection_geometry_bytes: usize,
-    decoration_run_count: usize,
+    decoration_line_run_counts: &[usize],
 ) -> usize {
     const ARC_ALLOCATION_OVERHEAD: usize = size_of::<usize>() * 2;
-    // GPUI keeps decoration runs in `SmallVec<[DecorationRun; 32]>`.
-    const DECORATION_RUN_BYTES: usize = size_of::<gpui::DecorationRun>();
     let shaped_bytes = layout
         .text_lines
         .iter()
@@ -1930,47 +2142,53 @@ fn estimate_retained_cache_bytes(
                 .saturating_add(runs)
         })
         .sum::<usize>();
-    // The public `WrappedLine` API exposes shaped glyph runs but not its
-    // private decoration SmallVec. The source `TextRun` count is a safe upper
-    // bound for the decoration runs GPUI retains per hard line; account for
-    // the spill capacity once across the block (which is conservative when
-    // there are multiple hard lines).
-    let decoration_spill = decoration_run_count
-        .checked_next_power_of_two()
-        .unwrap_or(usize::MAX)
-        .saturating_sub(32)
-        .saturating_mul(DECORATION_RUN_BYTES);
+    // Each hard line owns an independent `SmallVec<[DecorationRun; 32]>` in
+    // GPUI. A line with at most 32 runs has no heap spill; a line above that
+    // threshold allocates its own next-power-of-two backing store. Do not
+    // subtract the inline 32 slots from the spilled capacity.
+    let decoration_spill = decoration_spill_bytes(decoration_line_run_counts);
     let shaped_bytes = shaped_bytes.saturating_add(decoration_spill);
+    let line_count_spill = if decoration_line_run_counts.len() > 4 {
+        decoration_line_run_counts
+            .len()
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .saturating_mul(size_of::<usize>())
+    } else {
+        0
+    };
     size_of::<CachedBlockLayout>()
         .saturating_add(size_of::<BlockLayout>())
         .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
         .saturating_add(shaped_bytes)
+        .saturating_add(line_count_spill)
         .saturating_add(selection_geometry_bytes)
 }
 
-fn estimate_snapshot_clone_bytes(layout: &BlockLayout, decoration_run_count: usize) -> usize {
+fn estimate_snapshot_clone_bytes(
+    layout: &BlockLayout,
+    decoration_line_run_counts: &[usize],
+) -> usize {
     // The production snapshot clones this Vec and each WrappedLine. GPUI
     // shares its text/layout Arcs; only these owned buffers are counted.
     const ARC_ALLOCATION_OVERHEAD: usize = size_of::<usize>() * 2;
     size_of::<BlockLayout>()
         .saturating_add(size_of::<Vec<WrappedLine>>())
         .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
-        .saturating_add(
-            decoration_run_count
-                .checked_next_power_of_two()
-                .unwrap_or(usize::MAX)
-                .saturating_mul(size_of::<gpui::DecorationRun>()),
-        )
+        .saturating_add(decoration_spill_bytes(decoration_line_run_counts))
         .saturating_add(ARC_ALLOCATION_OVERHEAD)
 }
 
 fn estimate_cache_bytes(
     layout: &BlockLayout,
     selection_geometry_bytes: usize,
-    decoration_run_count: usize,
+    decoration_line_run_counts: &[usize],
 ) -> usize {
-    estimate_retained_cache_bytes(layout, selection_geometry_bytes, decoration_run_count)
-        .saturating_add(estimate_snapshot_clone_bytes(layout, decoration_run_count))
+    estimate_retained_cache_bytes(layout, selection_geometry_bytes, decoration_line_run_counts)
+        .saturating_add(estimate_snapshot_clone_bytes(
+            layout,
+            decoration_line_run_counts,
+        ))
 }
 
 fn selection_geometry_reserve(layout: &BlockLayout, requested: usize) -> usize {

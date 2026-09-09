@@ -149,6 +149,19 @@ pub struct InsertedTextSpan {
     pub range: Range<usize>,
 }
 
+/// An explicit document-order replacement emitted by the transaction layer.
+///
+/// `start_index` is relative to the document order immediately before this
+/// splice.  A batch therefore carries splices in application order; layout
+/// can replay them against its balanced order sequence without comparing the
+/// whole document or inferring movement from `changed_nodes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructuralSplice {
+    pub start_index: usize,
+    pub removed: SmallVec<[NodeId; 4]>,
+    pub inserted: SmallVec<[NodeId; 4]>,
+}
+
 /// Result of one transaction or an atomically applied batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplyOutcome {
@@ -157,6 +170,12 @@ pub struct ApplyOutcome {
     /// True when block order or list kind/depth may have changed. Inline
     /// edits leave this false so layout can invalidate numbering in O(1).
     pub structural: bool,
+    /// Ordered structural replacements, in sequential transaction order.
+    pub structural_splices: SmallVec<[StructuralSplice; 2]>,
+    /// Local numbering invalidations for kind/depth edits that do not alter
+    /// document order. These ranges are relative to this transaction's
+    /// resulting document and remain separate from structural splices.
+    pub numbering_ranges: SmallVec<[Range<usize>; 2]>,
     pub inverse: TransactionBatch,
     pub estimated_bytes: usize,
     pub inserted_span: Option<InsertedTextSpan>,
@@ -168,6 +187,8 @@ impl ApplyOutcome {
             selection,
             changed_nodes: SmallVec::new(),
             structural: false,
+            structural_splices: SmallVec::new(),
+            numbering_ranges: SmallVec::new(),
             inverse: TransactionBatch::default(),
             estimated_bytes: 0,
             inserted_span: None,

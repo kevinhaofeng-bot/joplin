@@ -77,6 +77,17 @@ pub(crate) fn snapshot_allocation_bytes_for_test(editor: &EditorCore) -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn wrapped_line_clone_allocation_bytes_for_test(editor: &EditorCore) -> usize {
+    let measurement = super::tests::AllocationMeasurement::begin();
+    for block in editor.layout.visible() {
+        if let Some(layout) = editor.layout.block_layout(block.node_id) {
+            let _wrapped_lines = layout.text_lines.clone();
+        }
+    }
+    measurement.bytes()
+}
+
+#[cfg(test)]
 fn observe_snapshot_clone(cached: &super::layout::CachedBlockLayout) {
     // This is the explicit owned allocation performed by the real
     // `WrappedLine`/Vec clone in snapshot(), including spilled decoration

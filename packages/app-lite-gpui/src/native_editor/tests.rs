@@ -4,6 +4,7 @@ use super::commands::{
 use super::core::EditorCore;
 use super::history::History;
 use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry};
+use super::render;
 use crate::spike_app::{SpikeRouteContract, layout_for_viewport, route_contract};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -589,7 +590,13 @@ fn ordered_tail_edit_has_bounded_numbering_scratch_and_keeps_marker() {
         })
         .expect("tail inline edit");
     let measurement = AllocationMeasurement::begin();
-    layout.invalidate_nodes(&document, &outcome.changed_nodes, outcome.structural);
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
     let scratch = measurement.bytes();
     let visited = layout
         .ordered_number_work_count()
@@ -639,7 +646,13 @@ fn ordered_tail_kind_depth_change_recomputes_locally_and_keeps_numbers_correct()
         })
         .expect("tail depth change");
     assert!(outcome.structural);
-    layout.invalidate_nodes(&document, &outcome.changed_nodes, outcome.structural);
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
 
     let visited = layout
         .ordered_number_work_count()
@@ -650,6 +663,442 @@ fn ordered_tail_kind_depth_change_recomputes_locally_and_keeps_numbers_correct()
     );
     assert_eq!(layout.ordered_number(previous), Some(1_023));
     assert_eq!(layout.ordered_number(tail.id), Some(1));
+}
+
+#[test]
+fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_blocks() {
+    let blocks = (0..100_000)
+        .map(|index| Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: BlockKind::Paragraph,
+            content: BlockContent::text(format!("paragraph-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        })
+        .collect();
+    let mut document = Document::from_blocks(blocks).expect("large plain fixture");
+    let mut history = History::new(32, 4 * 1024 * 1024);
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    let work_before = layout.ordered_number_work_count();
+    let tail = document.blocks().last().expect("tail paragraph").clone();
+    let before_selection = document.end_selection();
+    let outcome = history
+        .apply_with_selection(
+            &mut document,
+            before_selection,
+            Transaction::SplitBlock {
+                at: DocPoint::with_affinity(tail.id, 0, Affinity::Before),
+            },
+        )
+        .expect("tail Return");
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert_eq!(outcome.structural_splices[0].start_index, 99_999);
+    assert_eq!(outcome.structural_splices[0].removed.len(), 1);
+    assert_eq!(outcome.structural_splices[0].inserted.len(), 2);
+    let splice_work_before = layout.ordered_splice_work_count();
+    let scratch = {
+        let measurement = AllocationMeasurement::begin();
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        measurement.bytes()
+    };
+    assert_eq!(document.block_count(), 100_001);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 256,
+        "tail Return rebuilt numbering for the whole document"
+    );
+    assert_eq!(
+        layout
+            .ordered_splice_work_count()
+            .saturating_sub(splice_work_before),
+        3,
+        "tail Return must splice only its removed/inserted identities"
+    );
+    assert!(
+        scratch < 512 * 1024,
+        "tail Return splice scratch grew with the 100k-block suffix: {scratch} bytes"
+    );
+
+    let right = document.blocks().last().expect("split tail").id;
+    let work_before = layout.ordered_number_work_count();
+    let before_selection = document.end_selection();
+    let outcome = history
+        .apply_with_selection(
+            &mut document,
+            before_selection,
+            Transaction::MergeBlocks {
+                left: tail.id,
+                right,
+            },
+        )
+        .expect("tail Backspace merge");
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert_eq!(outcome.structural_splices[0].start_index, 99_999);
+    assert_eq!(outcome.structural_splices[0].removed.len(), 2);
+    assert_eq!(outcome.structural_splices[0].inserted.len(), 1);
+    let splice_work_before = layout.ordered_splice_work_count();
+    let scratch = {
+        let measurement = AllocationMeasurement::begin();
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        measurement.bytes()
+    };
+    assert_eq!(document.block_count(), 100_000);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 256,
+        "tail Backspace merge rebuilt numbering for the whole document"
+    );
+    assert_eq!(
+        layout
+            .ordered_splice_work_count()
+            .saturating_sub(splice_work_before),
+        3,
+        "tail Backspace merge must splice only its removed/inserted identities"
+    );
+    assert!(
+        scratch < 512 * 1024,
+        "tail Backspace splice scratch grew with the 100k-block suffix: {scratch} bytes"
+    );
+
+    let work_before = layout.ordered_number_work_count();
+    let outcome = history
+        .undo_with_outcome(&mut document)
+        .expect("undo merge");
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert_eq!(outcome.structural_splices[0].start_index, 99_999);
+    assert_eq!(outcome.structural_splices[0].removed.len(), 1);
+    assert_eq!(outcome.structural_splices[0].inserted.len(), 2);
+    let splice_work_before = layout.ordered_splice_work_count();
+    let scratch = {
+        let measurement = AllocationMeasurement::begin();
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        measurement.bytes()
+    };
+    assert_eq!(document.block_count(), 100_001);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 256,
+        "undo merge rebuilt numbering for the whole document"
+    );
+    assert_eq!(
+        layout
+            .ordered_splice_work_count()
+            .saturating_sub(splice_work_before),
+        3,
+        "undo merge must splice only its removed/inserted identities"
+    );
+    assert!(
+        scratch < 512 * 1024,
+        "undo merge splice scratch grew with the 100k-block suffix: {scratch} bytes"
+    );
+
+    let work_before = layout.ordered_number_work_count();
+    let outcome = history
+        .redo_with_outcome(&mut document)
+        .expect("redo merge");
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert_eq!(outcome.structural_splices[0].start_index, 99_999);
+    assert_eq!(outcome.structural_splices[0].removed.len(), 2);
+    assert_eq!(outcome.structural_splices[0].inserted.len(), 1);
+    let splice_work_before = layout.ordered_splice_work_count();
+    let scratch = {
+        let measurement = AllocationMeasurement::begin();
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        measurement.bytes()
+    };
+    assert_eq!(document.block_count(), 100_000);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 256,
+        "redo merge rebuilt numbering for the whole document"
+    );
+    assert_eq!(
+        layout
+            .ordered_splice_work_count()
+            .saturating_sub(splice_work_before),
+        3,
+        "redo merge must splice only its removed/inserted identities"
+    );
+    assert!(
+        scratch < 512 * 1024,
+        "redo merge splice scratch grew with the 100k-block suffix: {scratch} bytes"
+    );
+}
+
+#[test]
+fn batched_splices_and_restore_blocks_replay_in_order_through_history() {
+    let mut document = Document::from_paragraphs(["aa", "bb", "cc"]);
+    let first = document.blocks()[0].clone();
+    let second = document.blocks()[1].clone();
+    let mut history = History::new(32, 4 * 1024 * 1024);
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+
+    let batch = TransactionBatch(vec![
+        Transaction::SplitBlock {
+            at: DocPoint::with_affinity(first.id, 1, Affinity::After),
+        },
+        Transaction::SplitBlock {
+            at: DocPoint::with_affinity(second.id, 1, Affinity::After),
+        },
+    ]);
+    let batch_selection = document.end_selection();
+    let outcome = history
+        .apply_batch_with_selection(&mut document, batch_selection, batch)
+        .expect("batched splits");
+    assert_eq!(outcome.structural_splices.len(), 2);
+    assert_eq!(outcome.structural_splices[0].start_index, 0);
+    assert_eq!(
+        outcome.structural_splices[0].removed.as_slice(),
+        &[first.id]
+    );
+    assert_eq!(outcome.structural_splices[0].inserted.len(), 2);
+    assert_eq!(outcome.structural_splices[1].start_index, 2);
+    assert_eq!(
+        outcome.structural_splices[1].removed.as_slice(),
+        &[second.id]
+    );
+    assert_eq!(outcome.structural_splices[1].inserted.len(), 2);
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    assert_eq!(document.block_count(), 5);
+
+    let replacement = Block {
+        id: NodeId::new(10_000),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text("restored"),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    };
+    let restore = Transaction::RestoreBlocks {
+        index: 1,
+        remove_count: 2,
+        blocks: vec![replacement.clone()],
+    };
+    let restore_selection = document.end_selection();
+    let outcome = history
+        .apply_batch_with_selection(
+            &mut document,
+            restore_selection,
+            TransactionBatch(vec![restore]),
+        )
+        .expect("RestoreBlocks splice");
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert_eq!(outcome.structural_splices[0].start_index, 1);
+    assert_eq!(outcome.structural_splices[0].removed.len(), 2);
+    assert_eq!(
+        outcome.structural_splices[0].inserted.as_slice(),
+        &[replacement.id]
+    );
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    assert_eq!(document.blocks()[1].id, replacement.id);
+
+    let outcome = history
+        .undo_with_outcome(&mut document)
+        .expect("undo RestoreBlocks");
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert_eq!(outcome.structural_splices[0].start_index, 1);
+    assert_eq!(outcome.structural_splices[0].removed.len(), 1);
+    assert_eq!(outcome.structural_splices[0].inserted.len(), 2);
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    assert_ne!(document.blocks()[1].id, replacement.id);
+
+    let outcome = history
+        .redo_with_outcome(&mut document)
+        .expect("redo RestoreBlocks");
+    assert_eq!(outcome.structural_splices.len(), 1);
+    assert_eq!(outcome.structural_splices[0].start_index, 1);
+    assert_eq!(outcome.structural_splices[0].removed.len(), 2);
+    assert_eq!(outcome.structural_splices[0].inserted.len(), 1);
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    assert_eq!(document.blocks()[1].id, replacement.id);
+}
+
+#[test]
+fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
+    let mut blocks = Vec::new();
+    for index in 0..64 {
+        blocks.push(Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: BlockKind::OrderedItem { depth: 0 },
+            content: BlockContent::text(format!("left-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        });
+    }
+    blocks.push(Block {
+        id: NodeId::new(65),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text("boundary"),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    });
+    for index in 0..64 {
+        blocks.push(Block {
+            id: NodeId::new((index + 66) as u64),
+            kind: BlockKind::OrderedItem { depth: 0 },
+            content: BlockContent::text(format!("right-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        });
+    }
+    blocks.extend((0..100_000).map(|index| Block {
+        id: NodeId::new((index + 130) as u64),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text(format!("distant-suffix-{index}")),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    }));
+    let mut document = Document::from_blocks(blocks).expect("ordered sequence fixture");
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    let left_tail = document.blocks()[63].id;
+    let right_head = document.blocks()[65].id;
+    assert_eq!(layout.ordered_number(left_tail), Some(64));
+    assert_eq!(layout.ordered_number(right_head), Some(1));
+    let work_before = layout.ordered_number_work_count();
+
+    let outcome = document
+        .apply(Transaction::SplitBlock {
+            at: DocPoint::with_affinity(document.blocks()[32].id, 2, Affinity::After),
+        })
+        .expect("middle Return");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    assert_eq!(
+        document.blocks()[64].kind,
+        BlockKind::OrderedItem { depth: 0 }
+    );
+    assert_eq!(layout.ordered_number(left_tail), Some(65));
+    assert_eq!(layout.ordered_number(right_head), Some(1));
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 320,
+        "middle splice visited the distant suffix"
+    );
+}
+
+#[test]
+fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() {
+    let mut blocks = (0..64)
+        .map(|index| Block {
+            id: NodeId::new((index + 1) as u64),
+            kind: BlockKind::OrderedItem { depth: 0 },
+            content: BlockContent::text(format!("item-{index}")),
+            alignment: TextAlignment::Left,
+            revision: 0,
+        })
+        .collect::<Vec<_>>();
+    blocks.push(Block {
+        id: NodeId::new(65),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text("boundary"),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    });
+    blocks.extend((0..20_000).map(|index| Block {
+        id: NodeId::new((index + 66) as u64),
+        kind: BlockKind::Paragraph,
+        content: BlockContent::text(format!("suffix-{index}")),
+        alignment: TextAlignment::Left,
+        revision: 0,
+    }));
+    let mut document = Document::from_blocks(blocks).expect("checkpoint fixture");
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 32.0, 120.0);
+    let changed = document.blocks()[63].clone();
+    let work_before = layout.ordered_number_work_count();
+    let outcome = document
+        .apply(Transaction::SetBlockKind {
+            selection: Selection::new(
+                DocPoint::with_affinity(changed.id, 0, Affinity::Before),
+                DocPoint::with_affinity(
+                    changed.id,
+                    changed.content.as_text().unwrap().len(),
+                    Affinity::After,
+                ),
+            ),
+            kind: BlockKind::Paragraph,
+        })
+        .expect("index-63 boundary change");
+    layout.invalidate_nodes_with_delta(
+        &document,
+        &outcome.changed_nodes,
+        outcome.structural,
+        &outcome.structural_splices,
+        &outcome.numbering_ranges,
+    );
+    assert_eq!(layout.ordered_number(changed.id), None);
+    assert!(
+        layout
+            .ordered_number_work_count()
+            .saturating_sub(work_before)
+            <= 128,
+        "clean checkpoint at boundary 64 did not stop the suffix scan"
+    );
 }
 
 #[test]
@@ -3080,7 +3529,7 @@ async fn alternating_decorations_account_for_wrapped_line_clone_peak(
     let text = "x".repeat(768);
     let mut document = Document::from_paragraph(text.clone());
     let node = document.first_node_id().expect("decorated paragraph");
-    let transactions = (0..text.len())
+    let transactions: Vec<Transaction> = (0..text.len())
         .map(|offset| {
             let mark = match offset % 4 {
                 0 => Mark::Bold,
@@ -3098,7 +3547,7 @@ async fn alternating_decorations_account_for_wrapped_line_clone_peak(
         })
         .collect();
     document
-        .apply_batch(TransactionBatch(transactions))
+        .apply_batch(TransactionBatch(transactions.clone()))
         .expect("alternating decorations should validate");
 
     let budget = 2 * 1024 * 1024;
@@ -3113,6 +3562,130 @@ async fn alternating_decorations_account_for_wrapped_line_clone_peak(
         cached.decoration_run_count > 32,
         "the fixture must exercise SmallVec decoration spill capacity"
     );
+}
+
+#[gpui::test]
+async fn each_hard_line_accounts_for_its_own_decoration_spill_and_clone_peak(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let line = "x".repeat(40);
+    let text = format!("{line}\n{line}\n{line}");
+    let mut document = Document::from_paragraph(text.clone());
+    let node = document.first_node_id().expect("decorated paragraph");
+    let mut transactions = Vec::new();
+    let mut offset = 0;
+    for (line_index, hard_line) in text.split('\n').enumerate() {
+        for (column, _) in hard_line.bytes().enumerate() {
+            let mark = if (column + line_index) % 2 == 0 {
+                Mark::Bold
+            } else {
+                Mark::Highlight
+            };
+            transactions.push(Transaction::ToggleMark {
+                selection: Selection::new(
+                    DocPoint::with_affinity(node, offset, Affinity::Before),
+                    DocPoint::with_affinity(node, offset + 1, Affinity::After),
+                ),
+                mark,
+            });
+            offset += 1;
+        }
+        offset += 1;
+    }
+    document
+        .apply_batch(TransactionBatch(transactions.clone()))
+        .expect("three hard-line decoration fixture");
+    let mut layout = LayoutRegistry::with_budget(LAYOUT_CACHE_BUDGET_BYTES);
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 4_000.0, 680.0, window);
+    });
+    let cached = layout.cache.get(&node).expect("decorated paragraph cache");
+    assert_eq!(cached.layout.text_lines.len(), 3);
+    assert!(cached.decoration_run_count >= 120);
+    assert_eq!(cached.decoration_line_run_counts.as_slice(), &[40, 40, 40]);
+    assert!(
+        cached
+            .decoration_line_run_counts
+            .iter()
+            .all(|count| *count > 32)
+    );
+    let line_capacity = cached.layout.text_lines.capacity();
+    let decoration_run_bytes = size_of::<gpui::DecorationRun>();
+    let old_block_wide_capacity = cached
+        .decoration_run_count
+        .next_power_of_two()
+        .saturating_mul(decoration_run_bytes);
+    let old_retained_spill =
+        old_block_wide_capacity.saturating_sub(32usize.saturating_mul(decoration_run_bytes));
+    let corrected_spill = cached
+        .decoration_line_run_counts
+        .iter()
+        .map(|count| {
+            count
+                .next_power_of_two()
+                .saturating_mul(decoration_run_bytes)
+        })
+        .sum::<usize>();
+    assert!(
+        corrected_spill.saturating_mul(2)
+            > old_retained_spill.saturating_add(old_block_wide_capacity),
+        "fixture must distinguish per-line and block-wide capacities"
+    );
+    assert!(
+        cached.snapshot_clone_bytes
+            >= line_capacity.saturating_mul(size_of::<gpui::WrappedLine>())
+                + size_of::<Vec<gpui::WrappedLine>>()
+                + corrected_spill,
+        "snapshot clone estimate omitted an independent hard-line spill"
+    );
+
+    // Exercise the real WrappedLine clone path, not only the accounting
+    // formula. The isolated helper clones the exact per-visible-block Vec so
+    // its allocator bytes include each spilled SmallVec backing store.
+    let editor_transactions = transactions.clone();
+    let mut editor = EditorCore::for_test(&text, &mut cx);
+    for transaction in editor_transactions {
+        editor.apply(transaction).expect("decorate editor fixture");
+    }
+    cx.update(|window, _| {
+        editor.shape_visible_with_window(0.0, 4_000.0, 680.0, window);
+    });
+    let observed_wrapped_line_clone = render::wrapped_line_clone_allocation_bytes_for_test(&editor);
+    let observed_snapshot = render::snapshot_allocation_bytes_for_test(&editor);
+    assert!(observed_wrapped_line_clone > 0);
+    assert!(
+        cached.snapshot_clone_bytes >= observed_wrapped_line_clone,
+        "snapshot clone estimate {estimate} missed real WrappedLine clone allocation {observed}",
+        estimate = cached.snapshot_clone_bytes,
+        observed = observed_wrapped_line_clone,
+    );
+    assert!(observed_snapshot >= observed_wrapped_line_clone);
+
+    // Put admission strictly between the old block-wide estimate and the
+    // corrected retained+clone total. The shaped block must be rejected even
+    // though the old estimate would have admitted it.
+    let old_underestimate = cached.bytes.saturating_sub(
+        corrected_spill
+            .saturating_mul(2)
+            .saturating_sub(old_retained_spill.saturating_add(old_block_wide_capacity)),
+    );
+    let corrected_total = cached.bytes;
+    let admission_budget = old_underestimate
+        .saturating_add(corrected_total.saturating_sub(old_underestimate) / 2)
+        .max(old_underestimate.saturating_add(1));
+    assert!(old_underestimate < admission_budget);
+    assert!(admission_budget < corrected_total);
+    let mut constrained = LayoutRegistry::with_budget(admission_budget);
+    cx.update(|window, _| {
+        constrained.shape_visible_with_window(&document, 0.0, 4_000.0, 680.0, window);
+    });
+    assert_eq!(
+        constrained.exact_cache_len(),
+        0,
+        "a budget between old and corrected decoration totals must reject the block"
+    );
+    assert!(constrained.used_bytes() <= admission_budget);
 }
 
 #[gpui::test]

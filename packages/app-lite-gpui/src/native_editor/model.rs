@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use smallvec::SmallVec;
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::transaction::{ApplyOutcome, InsertedTextSpan, Transaction, TransactionBatch};
+use super::transaction::{
+    ApplyOutcome, InsertedTextSpan, StructuralSplice, Transaction, TransactionBatch,
+};
 
 /// Maximum nesting depth accepted by list transactions.
 pub const MAX_LIST_DEPTH: u8 = 64;
@@ -355,6 +357,31 @@ struct SelectionBounds {
     end_affinity: Affinity,
 }
 
+/// Local pre-transaction facts used to publish an explicit structural splice
+/// after the mutation has committed. The plan owns only the affected IDs;
+/// it never snapshots the document order.
+#[derive(Clone, Debug, Default)]
+struct StructuralPlan {
+    start_index: usize,
+    removed: SmallVec<[NodeId; 4]>,
+    inserted_count: usize,
+}
+
+impl StructuralPlan {
+    fn finish(self, blocks: &[Block]) -> Option<StructuralSplice> {
+        let inserted = blocks
+            .get(self.start_index..self.start_index.saturating_add(self.inserted_count))?
+            .iter()
+            .map(|block| block.id)
+            .collect();
+        Some(StructuralSplice {
+            start_index: self.start_index,
+            removed: self.removed,
+            inserted,
+        })
+    }
+}
+
 impl Document {
     pub fn new() -> Self {
         Self::from_paragraph("")
@@ -508,6 +535,8 @@ impl Document {
         let mut estimated_bytes = 0usize;
         let mut inserted_span = None;
         let mut structural = false;
+        let mut structural_splices = SmallVec::new();
+        let mut numbering_ranges = SmallVec::new();
         let initial_revision = self.revision;
         let initial_next_id = self.next_id;
 
@@ -521,6 +550,8 @@ impl Document {
             };
             selection = outcome.selection;
             structural |= outcome.structural;
+            structural_splices.extend(outcome.structural_splices);
+            numbering_ranges.extend(outcome.numbering_ranges);
             // The public outcome describes only the final operation in the
             // batch. A later non-insert operation must clear an earlier span
             // rather than publishing a range that may have moved or vanished.
@@ -546,6 +577,8 @@ impl Document {
             selection,
             changed_nodes,
             structural,
+            structural_splices,
+            numbering_ranges,
             inverse: TransactionBatch(inverse),
             estimated_bytes,
             inserted_span,
@@ -572,6 +605,8 @@ impl Document {
         let mut rollback_journal = Vec::new();
         let mut changed_nodes = SmallVec::new();
         let mut structural = false;
+        let mut structural_splices = SmallVec::new();
+        let mut numbering_ranges = SmallVec::new();
 
         for transaction in inverse.0 {
             let outcome = match self.apply_transaction(transaction) {
@@ -585,6 +620,8 @@ impl Document {
                 push_unique(&mut changed_nodes, node_id);
             }
             structural |= outcome.structural;
+            structural_splices.extend(outcome.structural_splices);
+            numbering_ranges.extend(outcome.numbering_ranges);
             rollback_journal.push(outcome.inverse);
         }
 
@@ -612,11 +649,15 @@ impl Document {
             push_unique(&mut changed_nodes, node_id);
         }
         structural |= outcome.structural;
+        structural_splices.extend(outcome.structural_splices);
+        numbering_ranges.extend(outcome.numbering_ranges);
         Ok((
             ApplyOutcome {
                 selection: outcome.selection,
                 changed_nodes,
                 structural,
+                structural_splices,
+                numbering_ranges,
                 inverse: outcome.inverse,
                 estimated_bytes: outcome.estimated_bytes,
                 inserted_span: outcome.inserted_span,
@@ -698,6 +739,145 @@ impl Document {
         id
     }
 
+    fn structural_plan_for(&self, transaction: &Transaction) -> Option<StructuralPlan> {
+        let mut plan = StructuralPlan::default();
+        match transaction {
+            Transaction::SplitBlock { at } => {
+                let index = self.node_index(at.node_id).ok()?;
+                plan.start_index = index;
+                plan.removed.push(at.node_id);
+                plan.inserted_count = 2;
+                Some(plan)
+            }
+            Transaction::MergeBlocks { left, right } => {
+                let left_index = self.node_index(*left).ok()?;
+                let right_index = self.node_index(*right).ok()?;
+                if right_index != left_index.saturating_add(1) {
+                    return None;
+                }
+                plan.start_index = left_index;
+                plan.removed.extend([*left, *right]);
+                plan.inserted_count = 1;
+                Some(plan)
+            }
+            Transaction::InsertText { selection, .. } => {
+                if let Some(index) = self.adjacent_structural_seam(*selection).ok()? {
+                    plan.start_index = index;
+                    plan.inserted_count = 1;
+                    return Some(plan);
+                }
+                let bounds = self.editable_selection_bounds(*selection).ok()?;
+                if bounds.start_index == bounds.end_index {
+                    if !is_text_block(&self.blocks[bounds.start_index]) && selection.is_caret() {
+                        plan.start_index = match selection.anchor.affinity {
+                            Affinity::Before => bounds.start_index,
+                            Affinity::After => bounds.start_index.saturating_add(1),
+                        };
+                        plan.inserted_count = 1;
+                        return Some(plan);
+                    }
+                    return None;
+                }
+                plan.start_index = bounds.start_index;
+                plan.removed.extend(
+                    self.blocks[bounds.start_index..=bounds.end_index]
+                        .iter()
+                        .map(|block| block.id),
+                );
+                plan.inserted_count = 1;
+                Some(plan)
+            }
+            Transaction::DeleteRange { selection } => {
+                if self.adjacent_structural_seam(*selection).ok()?.is_some() {
+                    return None;
+                }
+                let bounds = self.editable_selection_bounds(*selection).ok()?;
+                if bounds.start_index == bounds.end_index {
+                    if selection.is_caret() || is_text_block(&self.blocks[bounds.start_index]) {
+                        return None;
+                    }
+                    plan.start_index = bounds.start_index;
+                    plan.removed.push(self.blocks[bounds.start_index].id);
+                    return Some(plan);
+                }
+                plan.start_index = bounds.start_index;
+                plan.removed.extend(
+                    self.blocks[bounds.start_index..=bounds.end_index]
+                        .iter()
+                        .map(|block| block.id),
+                );
+                plan.inserted_count = 1;
+                Some(plan)
+            }
+            Transaction::InsertImage { selection, .. } => {
+                if let Some(index) = self.adjacent_structural_seam(*selection).ok()? {
+                    plan.start_index = index;
+                    plan.inserted_count = 1;
+                    return Some(plan);
+                }
+                let bounds = self.editable_selection_bounds(*selection).ok()?;
+                if bounds.start_index == bounds.end_index
+                    && !is_text_block(&self.blocks[bounds.start_index])
+                {
+                    if !selection.is_caret() {
+                        return None;
+                    }
+                    plan.start_index = match selection.anchor.affinity {
+                        Affinity::Before => bounds.start_index,
+                        Affinity::After => bounds.start_index.saturating_add(1),
+                    };
+                    plan.inserted_count = 1;
+                    return Some(plan);
+                }
+                plan.start_index = bounds.start_index;
+                plan.removed.extend(
+                    self.blocks[bounds.start_index..=bounds.end_index]
+                        .iter()
+                        .map(|block| block.id),
+                );
+                plan.inserted_count = 3;
+                Some(plan)
+            }
+            Transaction::RemoveNode { node_id } => {
+                let index = self.node_index(*node_id).ok()?;
+                plan.start_index = index;
+                plan.removed.push(*node_id);
+                Some(plan)
+            }
+            Transaction::RestoreBlocks {
+                index,
+                remove_count,
+                blocks,
+            } => {
+                if *index > self.blocks.len()
+                    || *remove_count > self.blocks.len().saturating_sub(*index)
+                {
+                    return None;
+                }
+                plan.start_index = *index;
+                plan.removed.extend(
+                    self.blocks[*index..index.saturating_add(*remove_count)]
+                        .iter()
+                        .map(|block| block.id),
+                );
+                plan.inserted_count = blocks.len();
+                Some(plan)
+            }
+            _ => None,
+        }
+    }
+
+    fn numbering_range_for(&self, transaction: &Transaction) -> Option<Range<usize>> {
+        let selection = match transaction {
+            Transaction::SetBlockKind { selection, .. }
+            | Transaction::IndentList { selection }
+            | Transaction::OutdentList { selection } => *selection,
+            _ => return None,
+        };
+        let bounds = self.selection_bounds(selection).ok()?;
+        Some(bounds.0..bounds.2.saturating_add(1))
+    }
+
     fn apply_transaction(
         &mut self,
         transaction: Transaction,
@@ -706,6 +886,8 @@ impl Document {
         let original_next_id = self.next_id;
         let block_count_before = self.blocks.len();
         let structural_hint = transaction_changes_list_structure(&transaction);
+        let structural_plan = self.structural_plan_for(&transaction);
+        let numbering_range = self.numbering_range_for(&transaction);
         let (selection, changed_nodes, inverse, inserted_span) = match transaction {
             Transaction::InsertText { selection, text } => {
                 self.apply_insert_text(selection, text)?
@@ -789,6 +971,16 @@ impl Document {
             return Ok(ApplyOutcome::empty(selection));
         }
 
+        let structural_splice = structural_plan.and_then(|plan| plan.finish(&self.blocks));
+        let mut structural_splices = SmallVec::new();
+        if let Some(splice) = structural_splice {
+            structural_splices.push(splice);
+        }
+        let mut numbering_ranges = SmallVec::new();
+        if let Some(range) = numbering_range {
+            numbering_ranges.push(range);
+        }
+
         if let Err(error) = self.validate_selection(selection) {
             self.rollback_journal(vec![inverse], original_revision, original_next_id);
             return Err(error);
@@ -821,7 +1013,11 @@ impl Document {
                 }
                 unique
             },
-            structural: structural_hint || self.blocks.len() != block_count_before,
+            structural: structural_hint
+                || !structural_splices.is_empty()
+                || self.blocks.len() != block_count_before,
+            structural_splices,
+            numbering_ranges,
             inverse,
             estimated_bytes,
             inserted_span,
