@@ -5,6 +5,8 @@
 //! stable node identities, allowing the transaction layer to own structural
 //! edits and history to store inverse operations.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -2420,7 +2422,9 @@ fn resolve_grapheme_offset(text: &str, preferred: usize, affinity: Affinity) -> 
 static GRAPHEME_RESOLUTION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
-static VALIDATION_GRAPHEME_STEPS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static VALIDATION_GRAPHEME_STEPS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn reset_grapheme_resolution_counter() {
@@ -2434,12 +2438,12 @@ pub(crate) fn grapheme_resolution_counter() -> usize {
 
 #[cfg(test)]
 pub(crate) fn reset_validation_grapheme_counter() {
-    VALIDATION_GRAPHEME_STEPS.store(0, AtomicOrdering::Relaxed);
+    VALIDATION_GRAPHEME_STEPS.with(|steps| steps.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn validation_grapheme_counter() -> usize {
-    VALIDATION_GRAPHEME_STEPS.load(AtomicOrdering::Relaxed)
+    VALIDATION_GRAPHEME_STEPS.with(Cell::get)
 }
 
 /// Snap style boundaries out of a newly joined grapheme and rebuild the
@@ -2529,7 +2533,7 @@ fn validation_grapheme_boundaries(text: &str) -> Vec<usize> {
     boundaries.push(0);
     for (start, _) in text.grapheme_indices(true) {
         #[cfg(test)]
-        VALIDATION_GRAPHEME_STEPS.fetch_add(1, AtomicOrdering::Relaxed);
+        VALIDATION_GRAPHEME_STEPS.with(|steps| steps.set(steps.get().saturating_add(1)));
         if start != 0 {
             boundaries.push(start);
         }
@@ -2853,5 +2857,38 @@ fn transaction_changes_list_structure(transaction: &Transaction) -> bool {
 fn push_unique(nodes: &mut SmallVec<[NodeId; 4]>, node_id: NodeId) {
     if !nodes.contains(&node_id) {
         nodes.push(node_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        reset_validation_grapheme_counter, validation_grapheme_boundaries,
+        validation_grapheme_counter,
+    };
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn validation_grapheme_counter_is_thread_local() {
+        let ready = Arc::new(Barrier::new(2));
+        let counted = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let ready = Arc::clone(&ready);
+                let counted = Arc::clone(&counted);
+                thread::spawn(move || {
+                    reset_validation_grapheme_counter();
+                    ready.wait();
+                    let _ = validation_grapheme_boundaries("a");
+                    counted.wait();
+                    validation_grapheme_counter()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 1);
+        }
     }
 }
