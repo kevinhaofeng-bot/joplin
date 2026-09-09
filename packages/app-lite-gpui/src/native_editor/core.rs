@@ -1188,41 +1188,33 @@ impl EditorCore {
             self.clear_composition();
             return;
         }
-        let Some(index) = self.block_index(point.node_id) else {
+        let Some(_index) = self.block_index(point.node_id) else {
             return;
         };
-        let target = if direction < 0 {
-            (0..index).rev().find_map(|candidate| {
-                let block = self.document.blocks().get(candidate)?;
-                self.layout
-                    .visual_edge_point(block.id, preferred_x, true)
-                    .map(|point| self.snap_layout_point(point))
-                    .or_else(|| self.text_point_at_index(candidate, point.utf8_offset))
-            })
+        let block = if direction < 0 {
+            self.document.previous_text_block(point.node_id)
         } else {
-            ((index + 1)..self.document.block_count()).find_map(|candidate| {
-                let block = self.document.blocks().get(candidate)?;
-                self.layout
-                    .visual_edge_point(block.id, preferred_x, false)
-                    .map(|point| self.snap_layout_point(point))
-                    .or_else(|| self.text_point_at_index(candidate, point.utf8_offset))
-            })
+            self.document.next_text_block(point.node_id)
         };
+        let target = block.and_then(|block| {
+            self.layout
+                .visual_edge_point(block.id, preferred_x, direction < 0)
+                .map(|point| self.snap_layout_point(point))
+                .or_else(|| {
+                    block.content.as_text().map(|text| {
+                        DocPoint::with_affinity(
+                            block.id,
+                            nearest_grapheme_boundary(text, point.utf8_offset),
+                            Affinity::After,
+                        )
+                    })
+                })
+        });
         if let Some(target) = target {
             self.selection = Selection::caret(target);
             self.preferred_x = preferred_x;
             self.clear_composition();
         }
-    }
-
-    fn text_point_at_index(&self, index: usize, offset: usize) -> Option<DocPoint> {
-        let block = self.document.blocks().get(index)?;
-        let text = block.content.as_text()?;
-        Some(DocPoint::with_affinity(
-            block.id,
-            nearest_grapheme_boundary(text, offset),
-            Affinity::After,
-        ))
     }
 
     pub fn insert_paragraph_break(&mut self) -> Result<(), DocumentError> {
@@ -1520,9 +1512,8 @@ impl EditorCore {
             .and_then(|block| block.content.as_text().map(|text| (block.id, text)))
             .or_else(|| {
                 self.document
-                    .blocks()
-                    .iter()
-                    .find_map(|block| block.content.as_text().map(|text| (block.id, text)))
+                    .first_text_block()
+                    .and_then(|block| block.content.as_text().map(|text| (block.id, text)))
             })
     }
 
@@ -1645,61 +1636,58 @@ impl EditorCore {
     }
 
     fn previous_block_point(&self, index: usize) -> DocPoint {
+        let Some(current) = self.document.block_at_index(index) else {
+            return self.selection.head;
+        };
         self.document
-            .blocks()
-            .iter()
-            .take(index)
-            .filter_map(|candidate| {
+            .previous_navigation_block(current.id)
+            .map(|candidate| {
                 if candidate.kind == BlockKind::Image {
-                    Some(DocPoint::with_affinity(candidate.id, 0, Affinity::After))
+                    DocPoint::with_affinity(candidate.id, 0, Affinity::After)
                 } else {
-                    candidate.content.as_text().map(|text| {
-                        DocPoint::with_affinity(candidate.id, text.len(), Affinity::After)
-                    })
+                    DocPoint::with_affinity(
+                        candidate.id,
+                        candidate.content.as_text().map_or(0, str::len),
+                        Affinity::After,
+                    )
                 }
             })
-            .last()
             .unwrap_or(self.selection.head)
     }
 
     fn next_block_point(&self, index: usize) -> DocPoint {
-        for candidate in self.document.blocks().iter().skip(index + 1) {
-            if candidate.kind == BlockKind::Image {
-                return DocPoint::with_affinity(candidate.id, 0, Affinity::Before);
-            }
-            if candidate.content.as_text().is_some() {
-                return DocPoint::with_affinity(candidate.id, 0, Affinity::Before);
-            }
-        }
-        self.selection.head
+        let Some(current) = self.document.block_at_index(index) else {
+            return self.selection.head;
+        };
+        self.document
+            .next_navigation_block(current.id)
+            .map(|candidate| DocPoint::with_affinity(candidate.id, 0, Affinity::Before))
+            .unwrap_or(self.selection.head)
     }
 
     fn previous_text_point(&self, index: usize) -> DocPoint {
+        let Some(current) = self.document.block_at_index(index) else {
+            return self.selection.head;
+        };
         self.document
-            .blocks()
-            .iter()
-            .take(index)
-            .filter_map(|block| {
-                block
-                    .content
-                    .as_text()
-                    .map(|text| DocPoint::with_affinity(block.id, text.len(), Affinity::After))
+            .previous_text_block(current.id)
+            .map(|block| {
+                DocPoint::with_affinity(
+                    block.id,
+                    block.content.as_text().map_or(0, str::len),
+                    Affinity::After,
+                )
             })
-            .last()
             .unwrap_or(self.selection.head)
     }
 
     fn next_text_point(&self, index: usize) -> DocPoint {
+        let Some(current) = self.document.block_at_index(index) else {
+            return self.selection.head;
+        };
         self.document
-            .blocks()
-            .iter()
-            .skip(index + 1)
-            .find_map(|block| {
-                block
-                    .content
-                    .as_text()
-                    .map(|_| DocPoint::with_affinity(block.id, 0, Affinity::Before))
-            })
+            .next_text_block(current.id)
+            .map(|block| DocPoint::with_affinity(block.id, 0, Affinity::Before))
             .unwrap_or(self.selection.head)
     }
 

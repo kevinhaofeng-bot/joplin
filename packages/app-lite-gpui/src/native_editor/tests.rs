@@ -9,6 +9,7 @@ use crate::spike_app::{SpikeRouteContract, layout_for_viewport, route_contract};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::mem::size_of;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,9 +19,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::model::{
     Affinity, Block, BlockContent, BlockKind, DocPoint, Document, DocumentError, Mark, NodeId,
-    Selection, StyledRun, TextAlignment, grapheme_resolution_counter,
-    reset_grapheme_resolution_counter, reset_validation_grapheme_counter,
-    validation_grapheme_counter,
+    Selection, StyledRun, TextAlignment, block_sequence_visit_counter, grapheme_resolution_counter,
+    reset_block_sequence_visit_counter, reset_grapheme_resolution_counter,
+    reset_validation_grapheme_counter, validation_grapheme_counter,
 };
 use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
 
@@ -32,6 +33,7 @@ thread_local! {
     // running gpui test contaminate the observed scratch peak.
     static MEASURING_ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
     static MEASURING_RETAINED: Cell<Option<isize>> = const { Cell::new(None) };
+    static MEASURING_RETAINED_PEAK: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -43,7 +45,12 @@ unsafe impl GlobalAlloc for CountingAllocator {
         });
         MEASURING_RETAINED.with(|measuring| {
             if let Some(bytes) = measuring.get() {
-                measuring.set(Some(bytes.saturating_add(layout.size() as isize)));
+                let current = bytes.saturating_add(layout.size() as isize);
+                measuring.set(Some(current));
+                MEASURING_RETAINED_PEAK.with(|peak| {
+                    let current = current.max(0) as usize;
+                    peak.set(Some(peak.get().unwrap_or(0).max(current)));
+                });
             }
         });
         unsafe { System.alloc(layout) }
@@ -86,17 +93,23 @@ struct RetainedAllocationMeasurement;
 impl RetainedAllocationMeasurement {
     fn begin() -> Self {
         MEASURING_RETAINED.with(|measuring| measuring.set(Some(0)));
+        MEASURING_RETAINED_PEAK.with(|peak| peak.set(Some(0)));
         Self
     }
 
     fn bytes(&self) -> usize {
         MEASURING_RETAINED.with(|measuring| measuring.get().unwrap_or(0).max(0) as usize)
     }
+
+    fn peak_bytes(&self) -> usize {
+        MEASURING_RETAINED_PEAK.with(|peak| peak.get().unwrap_or(0))
+    }
 }
 
 impl Drop for RetainedAllocationMeasurement {
     fn drop(&mut self) {
         MEASURING_RETAINED.with(|measuring| measuring.set(None));
+        MEASURING_RETAINED_PEAK.with(|peak| peak.set(None));
     }
 }
 
@@ -1235,6 +1248,215 @@ fn block_sequence_range_edges_use_right_boundary() {
 }
 
 #[test]
+fn ordinary_edit_and_undo_redo_do_not_scan_document_order_to_seed_selection() {
+    fn measure(block_count: usize) -> [usize; 3] {
+        let mut document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let node = document.blocks()[block_count / 2].id;
+        let selection = Selection::caret(DocPoint::with_affinity(node, 1, Affinity::After));
+        let mut history = History::new(32, 4 * 1024 * 1024);
+
+        reset_block_sequence_visit_counter();
+        history
+            .apply_with_selection(
+                &mut document,
+                selection,
+                Transaction::InsertText {
+                    selection,
+                    text: "x".into(),
+                },
+            )
+            .expect("middle insert");
+        let insert_visits = block_sequence_visit_counter();
+
+        reset_block_sequence_visit_counter();
+        history
+            .undo_with_outcome(&mut document)
+            .expect("undo middle insert");
+        let undo_visits = block_sequence_visit_counter();
+
+        reset_block_sequence_visit_counter();
+        history
+            .redo_with_outcome(&mut document)
+            .expect("redo middle insert");
+        let redo_visits = block_sequence_visit_counter();
+
+        [insert_visits, undo_visits, redo_visits]
+    }
+
+    let visits_10k = measure(10_000);
+    let visits_100k = measure(100_000);
+    println!("document-order visits insert/undo/redo: 10k={visits_10k:?} 100k={visits_100k:?}");
+    for visits in visits_10k.into_iter().chain(visits_100k) {
+        assert!(
+            visits < 256,
+            "ordinary edit/history path scanned document order: {visits}"
+        );
+    }
+}
+
+#[test]
+fn multi_step_structural_splices_keep_height_tree_local() {
+    fn measure(block_count: usize) -> (usize, Range<usize>, Range<usize>, f32) {
+        let mut document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let first = document.blocks().first().expect("first block").id;
+        let last = document.blocks().last().expect("last block").id;
+        let mut history = History::new(16, 4 * 1024 * 1024);
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        let before_work = layout.height_index_work_count();
+        let batch_selection = document.end_selection();
+        let outcome = history
+            .apply_batch_with_selection(
+                &mut document,
+                batch_selection,
+                TransactionBatch(vec![
+                    Transaction::SplitBlock {
+                        at: DocPoint::with_affinity(last, 1, Affinity::After),
+                    },
+                    Transaction::RemoveNode { node_id: first },
+                ]),
+            )
+            .expect("multi-step structural batch");
+        assert_eq!(outcome.structural_splices.len(), 2);
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        let apply_work = layout.height_index_work_count().saturating_sub(before_work);
+        let observed_range = layout.visible_range();
+        let observed_height = layout.total_height();
+
+        let mut fresh = LayoutRegistry::new();
+        fresh.layout_document(&document, 0.0, 240.0, 680.0);
+        assert_eq!(observed_range, fresh.visible_range());
+        assert_eq!(observed_height, fresh.total_height());
+
+        let before_undo_work = layout.height_index_work_count();
+        let undo = history
+            .undo_with_outcome(&mut document)
+            .expect("undo batch");
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &undo.changed_nodes,
+            undo.structural,
+            &undo.structural_splices,
+            &undo.numbering_ranges,
+        );
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        let undo_work = layout
+            .height_index_work_count()
+            .saturating_sub(before_undo_work);
+        let mut fresh_undo = LayoutRegistry::new();
+        fresh_undo.layout_document(&document, 0.0, 240.0, 680.0);
+        assert_eq!(layout.visible_range(), fresh_undo.visible_range());
+        assert_eq!(layout.total_height(), fresh_undo.total_height());
+        assert_eq!(document.block_count(), block_count);
+
+        let before_redo_work = layout.height_index_work_count();
+        let redo = history
+            .redo_with_outcome(&mut document)
+            .expect("redo batch");
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &redo.changed_nodes,
+            redo.structural,
+            &redo.structural_splices,
+            &redo.numbering_ranges,
+        );
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        let redo_work = layout
+            .height_index_work_count()
+            .saturating_sub(before_redo_work);
+        let mut fresh_redo = LayoutRegistry::new();
+        fresh_redo.layout_document(&document, 0.0, 240.0, 680.0);
+        assert_eq!(layout.visible_range(), fresh_redo.visible_range());
+        assert_eq!(layout.total_height(), fresh_redo.total_height());
+        assert_eq!(document.block_count(), block_count);
+
+        (
+            apply_work.max(undo_work).max(redo_work),
+            observed_range,
+            fresh.visible_range(),
+            observed_height,
+        )
+    }
+
+    let (work_10k, range_10k, fresh_range_10k, _) = measure(10_000);
+    let (work_100k, range_100k, fresh_range_100k, _) = measure(100_000);
+    println!(
+        "multi-step structural height work: 10k={work_10k} 100k={work_100k}; ranges={range_10k:?}/{fresh_range_10k:?}, {range_100k:?}/{fresh_range_100k:?}"
+    );
+    assert!(work_10k <= 32 && work_100k <= 32);
+}
+
+#[test]
+fn viewport_membership_uses_local_ranges_at_head_middle_and_tail() {
+    fn measure(block_count: usize, viewport_top: f32) -> usize {
+        let document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 96.0, 680.0);
+        reset_block_sequence_visit_counter();
+        layout.layout_document(&document, viewport_top, 96.0, 680.0);
+        block_sequence_visit_counter()
+    }
+
+    let mut observations = Vec::new();
+    for block_count in [10_000, 100_000] {
+        observations.push((
+            block_count,
+            "head",
+            measure(block_count, 0.0),
+            "middle",
+            measure(block_count, block_count as f32 * 12.0),
+            "tail",
+            measure(block_count, block_count as f32 * 24.0),
+        ));
+    }
+    println!("viewport document-order visits: {observations:?}");
+    for (_, _, head, _, middle, _, tail) in observations {
+        assert!(head < 256 && middle < 256 && tail < 256);
+    }
+}
+
+#[test]
+fn non_monotonic_node_ids_keep_selection_geometry_in_document_order() {
+    let blocks = [1, 5, 2, 3, 4]
+        .into_iter()
+        .map(|id| Block {
+            id: NodeId::new(id),
+            kind: BlockKind::Image,
+            content: BlockContent::Image {
+                resource_id: format!("image-{id}"),
+                natural_size: (320, 200),
+                display_width: None,
+            },
+            alignment: TextAlignment::Left,
+            revision: 0,
+        })
+        .collect();
+    let document = Document::from_blocks(blocks).expect("non-monotonic IDs are valid");
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 2_000.0, 680.0);
+    let forward = Selection::new(
+        DocPoint::with_affinity(NodeId::new(1), 0, Affinity::Before),
+        DocPoint::with_affinity(NodeId::new(4), 0, Affinity::After),
+    );
+    let reverse = Selection::new(
+        DocPoint::with_affinity(NodeId::new(4), 0, Affinity::After),
+        DocPoint::with_affinity(NodeId::new(1), 0, Affinity::Before),
+    );
+    assert_eq!(layout.selection_rects(forward).len(), 5);
+    assert_eq!(layout.selection_rects(reverse).len(), 5);
+}
+
+#[test]
 fn capacity_exhaustion_does_not_copy_a_100k_block_order_buffer() {
     let blocks = (0..100_000)
         .map(|index| Block {
@@ -1557,11 +1779,14 @@ fn mixed_sum_tree_paths_scale_on_10k_and_100k_fixtures() {
     );
 }
 
-fn retained_document_fixture(block_count: usize) -> (Document, usize) {
-    let measurement = RetainedAllocationMeasurement::begin();
+fn retained_document_fixture(block_count: usize) -> (Document, usize, usize, usize) {
+    let retained = RetainedAllocationMeasurement::begin();
+    let allocated = AllocationMeasurement::begin();
     let document =
         Document::from_paragraphs((0..block_count).map(|index| format!("retained-row-{index}")));
-    (document, measurement.bytes())
+    let values = (retained.bytes(), retained.peak_bytes(), allocated.bytes());
+    drop(allocated);
+    (document, values.0, values.1, values.2)
 }
 
 fn retained_edit_probe(mut document: Document, structural: bool) -> usize {
@@ -1586,8 +1811,8 @@ fn retained_edit_probe(mut document: Document, structural: bool) -> usize {
 
 #[test]
 fn retained_sum_tree_allocations_scale_for_10k_and_100k_documents() {
-    let (small, small_construct) = retained_document_fixture(10_000);
-    let (large, large_construct) = retained_document_fixture(100_000);
+    let (small, small_construct, small_peak, small_allocated) = retained_document_fixture(10_000);
+    let (large, large_construct, large_peak, large_allocated) = retained_document_fixture(100_000);
     assert!(small_construct > 0 && large_construct > small_construct);
 
     let small_clone = {
@@ -1616,7 +1841,9 @@ fn retained_sum_tree_allocations_scale_for_10k_and_100k_documents() {
         true,
     );
     println!(
-        "retained SumTree: construct 10k={small_construct} 100k={large_construct}; clone 10k={small_clone} 100k={large_clone}; inline 10k={small_inline} 100k={large_inline}; structural 10k={small_structural} 100k={large_structural}"
+        "retained SumTree: construct retained 10k={small_construct} 100k={large_construct} (per_block={:.3}/{:.3}); construct peak retained 10k={small_peak} 100k={large_peak}; construct cumulative allocated 10k={small_allocated} 100k={large_allocated}; clone retained 10k={small_clone} 100k={large_clone}; inline retained 10k={small_inline} 100k={large_inline}; structural retained 10k={small_structural} 100k={large_structural}",
+        small_construct as f64 / 10_000.0,
+        large_construct as f64 / 100_000.0,
     );
     assert!(
         large_inline <= small_inline.saturating_mul(4).saturating_add(256 * 1024),
@@ -4007,44 +4234,264 @@ fn structural_layout_delta_consumes_removed_ids_without_full_refresh() {
 #[gpui::test]
 async fn short_entity_input_query_does_not_allocate_full_document(cx: &mut gpui::TestAppContext) {
     let mut cx = cx.add_empty_window();
-    let document = Document::from_paragraphs((0..100_000).map(|index| format!("row-{index}")));
-    let entity = cx.new(|cx| EditorCore::new(document, cx));
+    let measure = |block_count: usize, cx: &mut gpui::VisualTestContext| {
+        let query_start = if block_count == 100_000 {
+            100_000
+        } else {
+            block_count * 4
+        };
+        let document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let entity = cx.new(|cx| EditorCore::new(document, cx));
 
-    // Warm the callback and GPUI plumbing outside the measured interval. The
-    // request itself is one UTF-16 code unit in the middle of the document.
-    cx.update(|window, cx| {
-        entity.update(cx, |editor, editor_cx| {
-            let mut actual_range = None;
-            let _ = <EditorCore as EntityInputHandler>::text_for_range(
-                editor,
-                100_000..100_001,
-                &mut actual_range,
-                window,
-                editor_cx,
-            );
+        // Warm the callback and GPUI plumbing outside the measured interval.
+        cx.update(|window, cx| {
+            entity.update(cx, |editor, editor_cx| {
+                let mut actual_range = None;
+                let _ = <EditorCore as EntityInputHandler>::text_for_range(
+                    editor,
+                    query_start..query_start + 1,
+                    &mut actual_range,
+                    window,
+                    editor_cx,
+                );
+            });
         });
-    });
-    let measurement = AllocationMeasurement::begin();
-    cx.update(|window, cx| {
-        entity.update(cx, |editor, editor_cx| {
-            let mut actual_range = None;
-            let text = <EditorCore as EntityInputHandler>::text_for_range(
-                editor,
-                100_000..100_001,
-                &mut actual_range,
-                window,
-                editor_cx,
-            )
-            .expect("one UTF-16 code unit");
-            assert_eq!(text.chars().count(), 1);
+        reset_block_sequence_visit_counter();
+        let measurement = AllocationMeasurement::begin();
+        let (allocated, actual_range, visits) = cx.update(|window, cx| {
+            entity.update(cx, |editor, editor_cx| {
+                let mut actual_range = None;
+                let text = <EditorCore as EntityInputHandler>::text_for_range(
+                    editor,
+                    query_start..query_start + 1,
+                    &mut actual_range,
+                    window,
+                    editor_cx,
+                )
+                .expect("one UTF-16 code unit");
+                assert_eq!(text.chars().count(), 1);
+                (
+                    measurement.bytes(),
+                    actual_range,
+                    block_sequence_visit_counter(),
+                )
+            })
         });
-    });
-    let allocated = measurement.bytes();
-    println!("short entity input retained allocation: {allocated} bytes");
-    assert!(
-        allocated < 64 * 1024,
-        "short input query allocated the whole document: {allocated} bytes"
+        drop(measurement);
+        assert_eq!(actual_range, Some(query_start..query_start + 1));
+        (allocated, visits)
+    };
+    let (allocated_10k, visits_10k) = measure(10_000, &mut cx);
+    let (allocated_100k, visits_100k) = measure(100_000, &mut cx);
+    println!(
+        "short entity input cumulative allocated: 10k={allocated_10k}B/{visits_10k} visits; 100k={allocated_100k}B/{visits_100k} visits"
     );
+    assert!(allocated_10k < 64 * 1024 && allocated_100k < 64 * 1024);
+    assert!(visits_10k < 256 && visits_100k < 256);
+    assert!(allocated_100k <= allocated_10k.saturating_mul(2).saturating_add(64 * 1024));
+}
+
+#[gpui::test]
+async fn editor_core_edit_next_layout_and_directional_navigation_scale(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut cx = cx.add_empty_window();
+    let measure = |block_count: usize, cx: &mut gpui::VisualTestContext| {
+        let middle = block_count / 2;
+        let document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let entity = cx.new(|cx| EditorCore::new(document, cx));
+        cx.update(|_, app| {
+            entity.update(app, |editor, _| {
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+            });
+        });
+        let node = entity.read_with(cx, |editor, _| editor.document().blocks()[middle].id);
+        reset_block_sequence_visit_counter();
+        let (visits, layout_scan, height_work, left_index, right_index) = cx.update(|_, app| {
+            entity.update(app, |editor, _| {
+                let before_scan = editor.layout.layout_scan_count();
+                let before_height = editor.layout.height_index_work_count();
+                editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                    node,
+                    1,
+                    Affinity::After,
+                )));
+                editor.insert_text("x").expect("middle editor input");
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+
+                editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                    node,
+                    0,
+                    Affinity::Before,
+                )));
+                editor.move_left();
+                let left_index = editor
+                    .document()
+                    .node_index(editor.selection().head.node_id)
+                    .expect("left neighbor");
+                let text_len = editor
+                    .document()
+                    .block(node)
+                    .and_then(|block| block.content.as_text())
+                    .map_or(0, str::len);
+                editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                    node,
+                    text_len,
+                    Affinity::After,
+                )));
+                editor.move_right();
+                let right_index = editor
+                    .document()
+                    .node_index(editor.selection().head.node_id)
+                    .expect("right neighbor");
+
+                // The current block is outside the head viewport, so these
+                // arrows exercise the text summary fallback rather than a
+                // cached visual neighbor.
+                editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                    node,
+                    0,
+                    Affinity::Before,
+                )));
+                editor.move_up();
+                editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                    node,
+                    0,
+                    Affinity::Before,
+                )));
+                editor.move_down();
+                (
+                    block_sequence_visit_counter(),
+                    editor
+                        .layout
+                        .layout_scan_count()
+                        .saturating_sub(before_scan),
+                    editor
+                        .layout
+                        .height_index_work_count()
+                        .saturating_sub(before_height),
+                    left_index,
+                    right_index,
+                )
+            })
+        });
+        assert_eq!(left_index, middle - 1);
+        assert_eq!(right_index, middle + 1);
+        (visits, layout_scan, height_work)
+    };
+
+    let small = measure(10_000, &mut cx);
+    let large = measure(100_000, &mut cx);
+    println!("editor core edit/layout/navigation work: 10k={small:?} 100k={large:?}");
+    assert!(small.0 < 512 && large.0 < 512);
+    assert!(small.1 < 16 && large.1 < 16);
+    assert!(small.2 < 16 && large.2 < 16);
+}
+
+#[gpui::test]
+async fn entity_input_callbacks_keep_large_document_ranges_local(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let measure = |block_count: usize, cx: &mut gpui::VisualTestContext| {
+        let query_start = block_count * 4;
+        let document =
+            Document::from_paragraphs((0..block_count).map(|index| format!("row-{index}")));
+        let entity = cx.new(|cx| EditorCore::new(document, cx));
+        cx.update(|_, app| {
+            entity.update(app, |editor, _| {
+                let snapshot = editor.document().clone();
+                editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+            });
+        });
+
+        reset_block_sequence_visit_counter();
+        let (actual_range, selected, marked, bounds, point_index, visits) =
+            cx.update(|window, app| {
+                entity.update(app, |editor, editor_cx| {
+                    let point = editor
+                        .document()
+                        .point_for_flat_utf8_offset(query_start, Affinity::Before)
+                        .expect("middle callback point");
+                    editor.set_selection_for_test(Selection::caret(point));
+                    let selected = <EditorCore as EntityInputHandler>::selected_text_range(
+                        editor, false, window, editor_cx,
+                    )
+                    .expect("selected callback");
+
+                    let mut actual_range = None;
+                    let _text = <EditorCore as EntityInputHandler>::text_for_range(
+                        editor,
+                        query_start..query_start + 1,
+                        &mut actual_range,
+                        window,
+                        editor_cx,
+                    )
+                    .expect("raw callback range");
+
+                    // This is the real platform candidate/composition callback;
+                    // it must replace only the requested UTF-16 span.
+                    <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                        editor,
+                        Some(query_start..query_start + 1),
+                        "候选",
+                        Some(0..2),
+                        window,
+                        editor_cx,
+                    );
+                    let marked = <EditorCore as EntityInputHandler>::marked_text_range(
+                        editor, window, editor_cx,
+                    );
+                    let bounds = <EditorCore as EntityInputHandler>::bounds_for_range(
+                        editor,
+                        query_start..query_start + 1,
+                        Bounds::default(),
+                        window,
+                        editor_cx,
+                    );
+                    let first_origin = editor
+                        .layout
+                        .visible()
+                        .first()
+                        .map(|layout| layout.bounds.origin);
+                    let point_index = first_origin.and_then(|origin| {
+                        <EditorCore as EntityInputHandler>::character_index_for_point(
+                            editor, origin, window, editor_cx,
+                        )
+                    });
+                    let snapshot = editor.document().clone();
+                    editor.layout.layout_document(&snapshot, 0.0, 96.0, 680.0);
+                    (
+                        actual_range,
+                        selected,
+                        marked,
+                        bounds,
+                        point_index,
+                        block_sequence_visit_counter(),
+                    )
+                })
+            });
+
+        assert_eq!(actual_range, Some(query_start..query_start + 1));
+        assert_eq!(selected.range, query_start..query_start);
+        assert!(
+            marked
+                .as_ref()
+                .is_some_and(|range| range.start == query_start && range.end > query_start)
+        );
+        if let Some(bounds) = bounds {
+            assert!(bounds.size.width >= px(0.0) && bounds.size.height >= px(0.0));
+        }
+        assert!(point_index.is_some());
+        (visits, selected.range, marked)
+    };
+
+    let small = measure(10_000, &mut cx);
+    let large = measure(100_000, &mut cx);
+    println!("entity input callback work: 10k={small:?} 100k={large:?}");
+    assert!(small.0 < 512 && large.0 < 512);
 }
 
 #[gpui::test]

@@ -733,9 +733,7 @@ impl LayoutRegistry {
 
         let allowed_ids: HashSet<NodeId> = document
             .blocks()
-            .iter()
-            .skip(self.first_visible)
-            .take(self.last_visible.saturating_sub(self.first_visible))
+            .iter_range(self.first_visible..self.last_visible)
             .map(|block| block.id)
             .collect();
         self.evict_outside(&allowed_ids);
@@ -771,12 +769,11 @@ impl LayoutRegistry {
             return;
         }
         if self.order_keys.is_empty() {
-            self.order_keys = TreeMap::from_ordered_entries(
-                document
-                    .blocks()
-                    .iter()
-                    .filter_map(|block| document.order_key(block.id).map(|key| (block.id, key))),
-            );
+            // Document order and NodeId order are independent. Clone the
+            // identity map that BlockSequence already maintains with GPUI's
+            // ordered TreeMap instead of feeding document order to a map
+            // whose SumTree dimension is NodeId.
+            self.order_keys = document.order_keys();
         }
         self.order_keys_revision = Some(document.revision());
     }
@@ -1716,7 +1713,10 @@ impl LayoutRegistry {
 
     fn splice_order_tree(&mut self, splice: &StructuralSplice) {
         let end = splice.start_index.saturating_add(splice.removed.len());
-        debug_assert!(end <= self.ordered_tree.summary().count);
+        assert!(
+            end <= self.ordered_tree.summary().count,
+            "order splice exceeds the current intermediate tree"
+        );
         let mut cursor = self.ordered_tree.cursor::<OrderCount>(());
         let mut new_tree = cursor.slice(&OrderCount(splice.start_index), Bias::Right);
         cursor.seek_forward(&OrderCount(end), Bias::Right);
@@ -1879,20 +1879,28 @@ impl LayoutRegistry {
         self.height_index_work = self.height_index_work.saturating_add(1);
     }
 
-    fn splice_height_index(&mut self, document: &Document, splice: &StructuralSplice) {
+    fn splice_height_index(&mut self, _document: &Document, splice: &StructuralSplice) {
         let count = self.height_tree.summary().count;
-        let start = splice.start_index.min(count);
-        let end = start.saturating_add(splice.removed.len()).min(count);
-        let replacement_end = start
-            .saturating_add(splice.inserted.len())
-            .min(document.block_count());
-        let replacement = document
-            .blocks()
-            .iter_range(start..replacement_end)
-            .map(|block| HeightItem {
-                node_id: block.id,
-                revision: block.revision,
-                height: self.height_for(block.id),
+        assert!(
+            splice.start_index <= count,
+            "height splice starts outside the current intermediate tree"
+        );
+        assert!(
+            splice.removed.len() <= count.saturating_sub(splice.start_index),
+            "height splice removes beyond the current intermediate tree"
+        );
+        assert_eq!(splice.inserted.len(), splice.inserted_revisions.len());
+        let start = splice.start_index;
+        let end = start + splice.removed.len();
+        let replacement = splice
+            .inserted
+            .iter()
+            .copied()
+            .zip(splice.inserted_revisions.iter().copied())
+            .map(|(node_id, revision)| HeightItem {
+                node_id,
+                revision,
+                height: self.height_for(node_id),
             });
         let mut cursor = self.height_tree.cursor::<HeightCount>(());
         let mut new_tree = cursor.slice(&HeightCount(start), Bias::Right);

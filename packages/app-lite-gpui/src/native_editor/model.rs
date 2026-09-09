@@ -504,6 +504,12 @@ impl KeyedItem for BlockItem {
 pub struct BlockSequence {
     tree: SumTree<BlockItem>,
     node_keys: TreeMap<NodeId, FractionalIndex>,
+    /// Keys ordered by document position for navigation that skips arbitrary
+    /// structural atoms. The node-id map above remains the identity index;
+    /// these maps deliberately use the existing fractional key as their
+    /// order dimension instead of rebuilding a positional shadow vector.
+    editable_keys: TreeMap<FractionalIndex, NodeId>,
+    text_keys: TreeMap<FractionalIndex, NodeId>,
 }
 
 impl PartialEq for BlockSequence {
@@ -522,6 +528,8 @@ impl<'a> Iterator for BlockSequenceIter<'a> {
     type Item = &'a Block;
 
     fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(test)]
+        BLOCK_SEQUENCE_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
         self.inner.next().map(|item| item.block.as_ref())
     }
 }
@@ -541,6 +549,8 @@ impl<'a, 'cx> Iterator for BlockSequenceRangeIter<'a, 'cx> {
         if self.cursor.start().0 >= self.end {
             return None;
         }
+        #[cfg(test)]
+        BLOCK_SEQUENCE_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
         let item = self.cursor.item().map(|item| item.block.as_ref());
         self.cursor.next();
         item
@@ -562,13 +572,23 @@ impl BlockSequence {
             .expect("initial document keys have unbounded space");
         let mut items = Vec::with_capacity(blocks.len());
         let mut node_keys = TreeMap::default();
+        let mut editable_keys = TreeMap::default();
+        let mut text_keys = TreeMap::default();
         for (block, key) in blocks.into_iter().zip(keys) {
             node_keys.insert(block.id, key.clone());
+            if is_navigation_block(&block) {
+                editable_keys.insert(key.clone(), block.id);
+            }
+            if block.content.as_text().is_some() {
+                text_keys.insert(key.clone(), block.id);
+            }
             items.push(BlockItem::new(block, BlockKey(key)));
         }
         Self {
             tree: SumTree::from_iter(items, ()),
             node_keys,
+            editable_keys,
+            text_keys,
         }
     }
 
@@ -621,6 +641,54 @@ impl BlockSequence {
 
     fn key_for_node(&self, node_id: NodeId) -> Option<FractionalIndex> {
         self.node_keys.get(&node_id).cloned()
+    }
+
+    fn first_text(&self) -> Option<&Block> {
+        self.text_keys
+            .first()
+            .and_then(|(_, node_id)| self.block_by_node_id(*node_id))
+    }
+
+    fn last_text(&self) -> Option<&Block> {
+        self.text_keys
+            .last()
+            .and_then(|(_, node_id)| self.block_by_node_id(*node_id))
+    }
+
+    fn previous_navigation_block(&self, node_id: NodeId) -> Option<&Block> {
+        let index = self.index_of_node(node_id)?;
+        let key = self.key_at(index.checked_sub(1)?)?;
+        self.editable_keys
+            .closest(&key.0)
+            .and_then(|(_, previous_id)| self.block_by_node_id(*previous_id))
+    }
+
+    fn next_navigation_block(&self, node_id: NodeId) -> Option<&Block> {
+        let key = self.key_for_node(node_id)?;
+        self.editable_keys
+            .iter_from(&key)
+            .find_map(|(candidate, candidate_id)| {
+                (candidate > &key).then(|| self.block_by_node_id(*candidate_id))
+            })
+            .flatten()
+    }
+
+    fn previous_text_block(&self, node_id: NodeId) -> Option<&Block> {
+        let index = self.index_of_node(node_id)?;
+        let key = self.key_at(index.checked_sub(1)?)?;
+        self.text_keys
+            .closest(&key.0)
+            .and_then(|(_, previous_id)| self.block_by_node_id(*previous_id))
+    }
+
+    fn next_text_block(&self, node_id: NodeId) -> Option<&Block> {
+        let key = self.key_for_node(node_id)?;
+        self.text_keys
+            .iter_from(&key)
+            .find_map(|(candidate, candidate_id)| {
+                (candidate > &key).then(|| self.block_by_node_id(*candidate_id))
+            })
+            .flatten()
     }
 
     fn block_by_node_id(&self, node_id: NodeId) -> Option<&Block> {
@@ -903,10 +971,24 @@ impl BlockSequence {
             .map(|(block, key)| BlockItem::new(block, key))
             .collect::<Vec<_>>();
         for block in &removed {
+            if let Some(key) = self.key_for_node(block.id) {
+                if is_navigation_block(block) {
+                    self.editable_keys.remove(&key);
+                }
+                if block.content.as_text().is_some() {
+                    self.text_keys.remove(&key);
+                }
+            }
             self.node_keys.remove(&block.id);
         }
         for item in &replacement_items {
             self.node_keys.insert(item.block.id, item.key.0.clone());
+            if is_navigation_block(item.block.as_ref()) {
+                self.editable_keys.insert(item.key.0.clone(), item.block.id);
+            }
+            if item.block.content.as_text().is_some() {
+                self.text_keys.insert(item.key.0.clone(), item.block.id);
+            }
         }
         let replacement = SumTree::from_iter(replacement_items, ());
         let mut cursor = self.tree.cursor::<BlockCount>(());
@@ -982,22 +1064,28 @@ impl StructuralPlan {
         if end > blocks.len() {
             return None;
         }
-        let inserted = blocks
+        let inserted: SmallVec<[(NodeId, u64); 4]> = blocks
             .iter_range(self.start_index..end)
-            .map(|block| block.id)
+            .map(|block| (block.id, block.revision))
             .collect();
         // A RestoreBlocks inverse is also used for inline edits and for
         // IME replacement. When it puts the exact same identities back in
         // the exact same order, the document order did not change. Keep the
         // operation on the local changed-node path so layout does not treat a
         // content-only restore as an order splice.
-        if self.removed == inserted {
+        if self.removed
+            == inserted
+                .iter()
+                .map(|(node_id, _)| *node_id)
+                .collect::<SmallVec<[NodeId; 4]>>()
+        {
             return None;
         }
         Some(StructuralSplice {
             start_index: self.start_index,
             removed: self.removed,
-            inserted,
+            inserted: inserted.iter().map(|(node_id, _)| *node_id).collect(),
+            inserted_revisions: inserted.iter().map(|(_, revision)| *revision).collect(),
         })
     }
 }
@@ -1083,6 +1171,34 @@ impl Document {
         self.blocks.key_for_node(node_id)
     }
 
+    pub(crate) fn order_keys(&self) -> TreeMap<NodeId, FractionalIndex> {
+        self.blocks.node_keys.clone()
+    }
+
+    pub(crate) fn first_text_block(&self) -> Option<&Block> {
+        self.blocks.first_text()
+    }
+
+    pub(crate) fn last_text_block(&self) -> Option<&Block> {
+        self.blocks.last_text()
+    }
+
+    pub(crate) fn previous_navigation_block(&self, node_id: NodeId) -> Option<&Block> {
+        self.blocks.previous_navigation_block(node_id)
+    }
+
+    pub(crate) fn next_navigation_block(&self, node_id: NodeId) -> Option<&Block> {
+        self.blocks.next_navigation_block(node_id)
+    }
+
+    pub(crate) fn previous_text_block(&self, node_id: NodeId) -> Option<&Block> {
+        self.blocks.previous_text_block(node_id)
+    }
+
+    pub(crate) fn next_text_block(&self, node_id: NodeId) -> Option<&Block> {
+        self.blocks.next_text_block(node_id)
+    }
+
     pub(crate) fn flat_utf8_len(&self) -> usize {
         self.blocks.flat_utf8_len()
     }
@@ -1143,15 +1259,8 @@ impl Document {
     }
 
     pub fn select_all_text(&self) -> Selection {
-        let first = self
-            .blocks
-            .iter()
-            .find(|block| matches!(block.content, BlockContent::Text { .. }));
-        let last = self
-            .blocks
-            .iter()
-            .filter(|block| matches!(block.content, BlockContent::Text { .. }))
-            .last();
+        let first = self.first_text_block();
+        let last = self.last_text_block();
         match (first, last) {
             (Some(first), Some(last)) => {
                 let first_point = DocPoint::with_affinity(first.id, 0, Affinity::Before);
@@ -1164,12 +1273,7 @@ impl Document {
     }
 
     pub fn end_selection(&self) -> Selection {
-        if let Some(block) = self
-            .blocks
-            .iter()
-            .filter(|block| matches!(block.content, BlockContent::Text { .. }))
-            .last()
-        {
+        if let Some(block) = self.last_text_block() {
             return Selection::caret(DocPoint::with_affinity(
                 block.id,
                 block.content.as_text().map_or(0, str::len),
@@ -1203,7 +1307,7 @@ impl Document {
 
         let mut changed_nodes: SmallVec<[NodeId; 4]> = SmallVec::new();
         let mut inverse_batches = Vec::new();
-        let mut selection = self.end_selection();
+        let mut selection = None;
         let mut estimated_bytes = 0usize;
         let mut inserted_span = None;
         let mut structural = false;
@@ -1220,7 +1324,7 @@ impl Document {
                     return Err(error);
                 }
             };
-            selection = outcome.selection;
+            selection = Some(outcome.selection);
             structural |= outcome.structural;
             structural_splices.extend(outcome.structural_splices);
             numbering_ranges.extend(outcome.numbering_ranges);
@@ -1235,6 +1339,7 @@ impl Document {
             inverse_batches.push(outcome.inverse);
         }
 
+        let selection = selection.expect("non-empty batch produced an outcome");
         let rollback_batches = inverse_batches.clone();
         let mut inverse = Vec::new();
         for batch in inverse_batches.into_iter().rev() {
@@ -1692,16 +1797,6 @@ impl Document {
             return Ok(ApplyOutcome::empty(selection));
         }
 
-        let structural_splice = structural_plan.and_then(|plan| plan.finish(&self.blocks));
-        let mut structural_splices = SmallVec::new();
-        if let Some(splice) = structural_splice {
-            structural_splices.push(splice);
-        }
-        let mut numbering_ranges = SmallVec::new();
-        if let Some(range) = numbering_range {
-            numbering_ranges.push(range);
-        }
-
         if let Err(error) = self.validate_selection(selection) {
             self.rollback_journal(vec![inverse], original_revision, original_next_id);
             return Err(error);
@@ -1714,6 +1809,18 @@ impl Document {
                 block.revision = self.revision;
                 self.blocks.replace(index, block);
             }
+        }
+        // Capture structural replacement data only after changed blocks carry
+        // this transaction's committed revision. Each batch splice remains
+        // local and explicit; layout replays it against its intermediate
+        // order rather than reading final-document ordinals.
+        let mut structural_splices = SmallVec::new();
+        if let Some(splice) = structural_plan.and_then(|plan| plan.finish(&self.blocks)) {
+            structural_splices.push(splice);
+        }
+        let mut numbering_ranges = SmallVec::new();
+        if let Some(range) = numbering_range {
+            numbering_ranges.push(range);
         }
         // The IME replacement path calls this primitive repeatedly while
         // restoring and reapplying one provisional block. Validate only the
@@ -3001,18 +3108,16 @@ impl Document {
                 Affinity::After,
             ))
         } else {
-            self.blocks
-                .iter()
-                .find_map(|candidate| {
-                    candidate.content.as_text().map(|text| {
-                        Selection::caret(DocPoint::with_affinity(
-                            candidate.id,
-                            text.len(),
-                            Affinity::After,
-                        ))
-                    })
-                })
-                .unwrap_or_else(|| Selection::caret(DocPoint::new(block.id, 0)))
+            self.blocks.first_text().map_or_else(
+                || Selection::caret(DocPoint::new(block.id, 0)),
+                |candidate| {
+                    Selection::caret(DocPoint::with_affinity(
+                        candidate.id,
+                        candidate.content.as_text().map_or(0, str::len),
+                        Affinity::After,
+                    ))
+                },
+            )
         }
     }
 }
@@ -3032,6 +3137,10 @@ fn is_text_kind(kind: &BlockKind) -> bool {
 
 fn is_text_block(block: &Block) -> bool {
     matches!(block.content, BlockContent::Text { .. }) && is_text_kind(&block.kind)
+}
+
+fn is_navigation_block(block: &Block) -> bool {
+    block.content.as_text().is_some() || block.kind == BlockKind::Image
 }
 
 fn block_flat_lengths(block: &Block) -> (usize, usize) {
@@ -3210,7 +3319,18 @@ static GRAPHEME_RESOLUTION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 thread_local! {
+    static BLOCK_SEQUENCE_VISITS: Cell<usize> = const { Cell::new(0) };
     static VALIDATION_GRAPHEME_STEPS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_block_sequence_visit_counter() {
+    BLOCK_SEQUENCE_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn block_sequence_visit_counter() -> usize {
+    BLOCK_SEQUENCE_VISITS.with(Cell::get)
 }
 
 #[cfg(test)]

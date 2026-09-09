@@ -160,6 +160,10 @@ pub struct StructuralSplice {
     pub start_index: usize,
     pub removed: SmallVec<[NodeId; 4]>,
     pub inserted: SmallVec<[NodeId; 4]>,
+    /// Revisions captured with the inserted identities. A structural batch
+    /// is replayed against its intermediate sequence, so layout must not
+    /// recover these items from the final document's ordinals.
+    pub inserted_revisions: SmallVec<[u64; 4]>,
 }
 
 /// Result of one transaction or an atomically applied batch.
