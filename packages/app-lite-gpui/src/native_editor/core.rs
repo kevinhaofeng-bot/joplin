@@ -986,15 +986,9 @@ impl EditorCore {
     pub fn select_word_left(&mut self) {
         let anchor = self.selection.anchor;
         let head = self.selection.head;
-        let Some(text) = self
-            .document
-            .block(head.node_id)
-            .and_then(|block| block.content.as_text())
-        else {
+        let Some(target) = self.word_boundary_target(head, false) else {
             return;
         };
-        let target_offset = previous_word_boundary(text, head.utf8_offset);
-        let target = DocPoint::with_affinity(head.node_id, target_offset, Affinity::Before);
         self.selection = Selection::new(anchor, target);
         self.preferred_x = None;
         self.clear_composition();
@@ -1003,18 +997,70 @@ impl EditorCore {
     pub fn select_word_right(&mut self) {
         let anchor = self.selection.anchor;
         let head = self.selection.head;
-        let Some(text) = self
-            .document
-            .block(head.node_id)
-            .and_then(|block| block.content.as_text())
-        else {
+        let Some(target) = self.word_boundary_target(head, true) else {
             return;
         };
-        let target_offset = next_word_boundary(text, head.utf8_offset);
-        let target = DocPoint::with_affinity(head.node_id, target_offset, Affinity::After);
         self.selection = Selection::new(anchor, target);
         self.preferred_x = None;
         self.clear_composition();
+    }
+
+    /// Find a word boundary in the current text block first, then continue to
+    /// the nearest text block in document order when the local boundary is
+    /// already exhausted. Structural blocks remain inside the resulting
+    /// document selection, but never manufacture a byte offset of their own.
+    fn word_boundary_target(&self, head: DocPoint, right: bool) -> Option<DocPoint> {
+        let index = self.block_index(head.node_id)?;
+        if let Some(text) = self.document.blocks()[index].content.as_text() {
+            let offset = head.utf8_offset.min(text.len());
+            let local = if right {
+                next_word_boundary(text, offset)
+            } else {
+                previous_word_boundary(text, offset)
+            };
+            if local != offset {
+                return Some(DocPoint::with_affinity(
+                    head.node_id,
+                    local,
+                    if right {
+                        Affinity::After
+                    } else {
+                        Affinity::Before
+                    },
+                ));
+            }
+        }
+
+        if right {
+            for candidate in (index + 1)..self.document.block_count() {
+                let block = self.document.blocks().get(candidate)?;
+                let Some(text) = block.content.as_text() else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                let target = next_word_boundary(text, 0);
+                if target > 0 {
+                    return Some(DocPoint::with_affinity(block.id, target, Affinity::After));
+                }
+            }
+        } else {
+            for candidate in (0..index).rev() {
+                let block = self.document.blocks().get(candidate)?;
+                let Some(text) = block.content.as_text() else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                let target = previous_word_boundary(text, text.len());
+                if target < text.len() {
+                    return Some(DocPoint::with_affinity(block.id, target, Affinity::Before));
+                }
+            }
+        }
+        None
     }
 
     /// Convert a shaped editor-surface point into the document's canonical
@@ -1039,7 +1085,10 @@ impl EditorCore {
         };
         self.preferred_x = None;
         self.clear_composition();
-        Some(point)
+        // Dragging must continue from the original anchor.  For a Shift
+        // click that is the pre-existing selection anchor, not the point
+        // where the extension click landed.
+        Some(anchor)
     }
 
     pub(crate) fn update_pointer_selection(

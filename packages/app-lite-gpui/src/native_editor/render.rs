@@ -10,7 +10,7 @@ use gpui::{
 };
 
 use super::core::EditorCore;
-use super::layout::BlockLayout;
+use super::layout::{BlockLayout, ordered_number_summary};
 use super::model::{BlockKind, Document, NodeId, Selection};
 
 #[derive(Clone)]
@@ -42,7 +42,6 @@ const fn text_paint_passes() -> [TextPaintPass; 2] {
 
 fn snapshot(editor: &EditorCore) -> RenderSnapshot {
     let layout = editor.layout();
-    let ordered_numbers = ordered_list_numbers(editor.document());
     let blocks = layout
         .visible()
         .iter()
@@ -60,7 +59,7 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                     .unwrap_or_default(),
                 is_image: layout.is_image(block.node_id),
                 line_height: layout.line_height(block.node_id),
-                marker: list_marker(&kind, &ordered_numbers, block.node_id),
+                marker: list_marker(&kind, layout.ordered_number(block.node_id)),
             }
         })
         .collect();
@@ -134,17 +133,9 @@ fn paint_snapshot(
                 block.layout.bounds.size.height,
             ),
         );
-        for (line_index, line) in block.text_lines.iter().enumerate() {
-            let origin = point(
-                text_bounds.left(),
-                block.layout.bounds.top()
-                    + block
-                        .text_lines
-                        .iter()
-                        .take(line_index)
-                        .map(|line| line.size(line_height).height)
-                        .fold(px(0.0), |top, height| top + height),
-            );
+        let mut line_top = block.layout.bounds.top();
+        for line in &block.text_lines {
+            let origin = point(text_bounds.left(), line_top);
             for pass in text_paint_passes() {
                 match pass {
                     TextPaintPass::Background => line.paint_background(
@@ -165,6 +156,7 @@ fn paint_snapshot(
                     )?,
                 }
             }
+            line_top += line.size(line_height).height;
         }
         if let Some(marker) = block.marker.as_deref() {
             let style = window.text_style();
@@ -201,18 +193,11 @@ fn paint_snapshot(
     Ok(())
 }
 
-fn list_marker(
-    kind: &BlockKind,
-    ordered_numbers: &std::collections::HashMap<NodeId, usize>,
-    node_id: NodeId,
-) -> Option<String> {
+fn list_marker(kind: &BlockKind, ordered_number: Option<usize>) -> Option<String> {
     match kind {
         BlockKind::BulletItem { .. } => Some("•".to_owned()),
         BlockKind::CheckItem { checked, .. } => Some(if *checked { "☑" } else { "☐" }.to_owned()),
-        BlockKind::OrderedItem { .. } => Some(format!(
-            "{}.",
-            ordered_numbers.get(&node_id).copied().unwrap_or(1)
-        )),
+        BlockKind::OrderedItem { .. } => Some(format!("{}.", ordered_number.unwrap_or(1))),
         _ => None,
     }
 }
@@ -221,22 +206,7 @@ fn list_marker(
 /// advances its own depth; returning to a parent keeps the parent's counter,
 /// so `[0, 1, 0]` renders `1., 1., 2.` instead of resetting the parent.
 fn ordered_list_numbers(document: &Document) -> std::collections::HashMap<NodeId, usize> {
-    let mut numbers = std::collections::HashMap::new();
-    let mut counters: Vec<usize> = Vec::new();
-    for block in document.blocks() {
-        let BlockKind::OrderedItem { depth } = block.kind else {
-            counters.clear();
-            continue;
-        };
-        let depth = depth as usize;
-        counters.truncate(depth + 1);
-        while counters.len() <= depth {
-            counters.push(0);
-        }
-        counters[depth] = counters[depth].saturating_add(1).max(1);
-        numbers.insert(block.id, counters[depth]);
-    }
-    numbers
+    ordered_number_summary(document)
 }
 
 /// Paint an editor entity and install GPUI's real input bridge for the same
@@ -314,17 +284,119 @@ mod tests {
         }
         let numbers = ordered_list_numbers(editor.document());
         assert_eq!(
-            list_marker(&BlockKind::OrderedItem { depth: 0 }, &numbers, blocks[0].id),
+            list_marker(
+                &BlockKind::OrderedItem { depth: 0 },
+                numbers.get(&blocks[0].id).copied(),
+            ),
             Some("1.".into())
         );
         assert_eq!(
-            list_marker(&BlockKind::OrderedItem { depth: 1 }, &numbers, blocks[1].id),
+            list_marker(
+                &BlockKind::OrderedItem { depth: 1 },
+                numbers.get(&blocks[1].id).copied(),
+            ),
             Some("1.".into())
         );
         assert_eq!(
-            list_marker(&BlockKind::OrderedItem { depth: 0 }, &numbers, blocks[2].id),
+            list_marker(
+                &BlockKind::OrderedItem { depth: 0 },
+                numbers.get(&blocks[2].id).copied(),
+            ),
             Some("2.".into())
         );
+    }
+
+    #[gpui::test]
+    fn mixed_child_types_do_not_reset_parent_ordered_numbers(cx: &mut gpui::TestAppContext) {
+        let mut editor = EditorCore::for_test_paragraphs(
+            [
+                "parent one",
+                "bullet child",
+                "parent two",
+                "check child",
+                "parent three",
+            ],
+            cx,
+        );
+        let blocks = editor.document().blocks().to_vec();
+        for (block, kind) in blocks.iter().zip([
+            BlockKind::OrderedItem { depth: 0 },
+            BlockKind::BulletItem { depth: 1 },
+            BlockKind::OrderedItem { depth: 0 },
+            BlockKind::CheckItem {
+                depth: 1,
+                checked: false,
+            },
+            BlockKind::OrderedItem { depth: 0 },
+        ]) {
+            let text_len = block.content.as_text().map_or(0, str::len);
+            editor
+                .apply(Transaction::SetBlockKind {
+                    selection: Selection::new(
+                        DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                        DocPoint::with_affinity(block.id, text_len, Affinity::After),
+                    ),
+                    kind,
+                })
+                .expect("mixed child conversion should succeed");
+        }
+        let numbers = ordered_list_numbers(editor.document());
+        assert_eq!(numbers.get(&blocks[0].id), Some(&1));
+        assert_eq!(numbers.get(&blocks[2].id), Some(&2));
+        assert_eq!(numbers.get(&blocks[4].id), Some(&3));
+    }
+
+    #[gpui::test]
+    fn numbering_summary_reuses_scan_and_snapshot_reads_visible_nodes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let mut editor =
+            EditorCore::for_test_paragraphs((0..256).map(|index| format!("ordered-{index}")), cx);
+        let blocks = editor.document().blocks().to_vec();
+        for block in blocks {
+            let text_len = block.content.as_text().map_or(0, str::len);
+            editor
+                .apply(Transaction::SetBlockKind {
+                    selection: Selection::new(
+                        DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                        DocPoint::with_affinity(block.id, text_len, Affinity::After),
+                    ),
+                    kind: BlockKind::OrderedItem { depth: 0 },
+                })
+                .expect("ordered fixture conversion");
+        }
+        cx.update(|window, _| {
+            editor.shape_visible_with_window(0.0, 32.0, 120.0, window);
+        });
+        let scan_count = editor.layout().ordered_number_scan_count();
+        assert_eq!(scan_count, editor.document().block_count());
+        assert!(editor.layout().visible().len() < editor.document().block_count());
+        let visible_ids = editor
+            .layout()
+            .visible()
+            .iter()
+            .map(|block| block.node_id)
+            .collect::<std::collections::HashSet<_>>();
+        let first = snapshot(&editor);
+        let second = snapshot(&editor);
+        assert!(
+            first
+                .blocks
+                .iter()
+                .all(|block| visible_ids.contains(&block.layout.node_id))
+        );
+        assert!(
+            second
+                .blocks
+                .iter()
+                .all(|block| visible_ids.contains(&block.layout.node_id))
+        );
+        assert_eq!(editor.layout().ordered_number_scan_count(), scan_count);
+        cx.update(|window, _| {
+            editor.shape_visible_with_window(0.0, 32.0, 120.0, window);
+        });
+        assert_eq!(editor.layout().ordered_number_scan_count(), scan_count);
     }
 
     #[test]

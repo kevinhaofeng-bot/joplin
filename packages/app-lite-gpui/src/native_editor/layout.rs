@@ -369,6 +369,12 @@ pub struct LayoutRegistry {
     pub(crate) last_visible: usize,
     document_order: HashMap<NodeId, usize>,
     document_order_revision: Option<u64>,
+    /// Document-order numbering summary.  It is rebuilt only when the model
+    /// revision changes; paint snapshots look up the visible node ids without
+    /// allocating or scanning the complete document.
+    ordered_numbers: HashMap<NodeId, usize>,
+    ordered_numbers_revision: Option<u64>,
+    ordered_number_scan_count: usize,
     estimate_revisions: HashMap<NodeId, u64>,
     estimate_width: f32,
     estimate_document_revision: Option<u64>,
@@ -399,6 +405,9 @@ impl LayoutRegistry {
             last_visible: 0,
             document_order: HashMap::new(),
             document_order_revision: None,
+            ordered_numbers: HashMap::new(),
+            ordered_numbers_revision: None,
+            ordered_number_scan_count: 0,
             estimate_revisions: HashMap::new(),
             estimate_width: 0.0,
             estimate_document_revision: None,
@@ -481,6 +490,15 @@ impl LayoutRegistry {
         self.height_index_work
     }
 
+    pub(crate) fn ordered_number(&self, node_id: NodeId) -> Option<usize> {
+        self.ordered_numbers.get(&node_id).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ordered_number_scan_count(&self) -> usize {
+        self.ordered_number_scan_count
+    }
+
     /// Build exact geometry for the viewport plus one viewport of prefetch on
     /// either side. Height lookup uses a prefix index; the full text is only
     /// inspected when a block revision or width changes.
@@ -492,6 +510,7 @@ impl LayoutRegistry {
         width: f32,
     ) {
         let width = width.max(1.0);
+        self.ensure_ordered_numbers(document);
         self.refresh_estimates(document, width);
         self.ensure_height_index(document);
         self.rebuild_visible_window(document, viewport_top, viewport_height, width);
@@ -745,6 +764,8 @@ impl LayoutRegistry {
         self.estimate_document_revision = None;
         self.height_document_revision = None;
         self.document_order_revision = None;
+        self.ordered_numbers.clear();
+        self.ordered_numbers_revision = None;
     }
 
     /// Invalidate only the model nodes reported by the transaction layer.
@@ -764,6 +785,8 @@ impl LayoutRegistry {
             self.height_document_revision = None;
             self.document_order.clear();
             self.document_order_revision = None;
+            self.ordered_numbers.clear();
+            self.ordered_numbers_revision = None;
         }
         self.enforce_budget();
     }
@@ -808,6 +831,16 @@ impl LayoutRegistry {
                 },
             );
         };
+        // Once the nearest block is selected, pointer coordinates outside its
+        // vertical extent are block-edge hits.  Clamping y to the last row
+        // alone would still use the pointer's x and turn a below-tail click
+        // into the first character of that row.
+        if position.y > layout.bounds.bottom() {
+            return Some(layout.after);
+        }
+        if position.y < layout.bounds.top() {
+            return Some(layout.before);
+        }
         if cached.is_image {
             return Some(image_side(layout.bounds, position, layout.node_id));
         }
@@ -833,12 +866,17 @@ impl LayoutRegistry {
                 let row_end = offsets.get(row + 1).copied().unwrap_or(line.len());
                 let row_origin = wrapped_row_origin_x(&cached.layout, line, row_start, row_end);
                 let local_x = (clamped_x - row_origin).max(px(0.0));
+                // Resolve x in the unwrapped line after selecting the visual
+                // row from y.  `WrappedLine::closest_index_for_position`
+                // combines its own row origin with x and therefore cannot
+                // represent the alignment/slack-adjusted origin we use for a
+                // wrapped row here.
+                let row_start_x = line.unwrapped_layout.x_for_index(row_start);
                 let local = line
-                    .closest_index_for_position(
-                        point(local_x, line_height * row as f32 + local_y),
-                        line_height,
-                    )
-                    .unwrap_or_else(|offset| offset);
+                    .unwrapped_layout
+                    .closest_index_for_x(row_start_x + local_x)
+                    .max(row_start)
+                    .min(row_end);
                 let end = hard_start + line.len();
                 return Some(DocPoint::with_affinity(
                     layout.node_id,
@@ -905,7 +943,6 @@ impl LayoutRegistry {
             let row_count = target_offsets.len().saturating_sub(1);
             if target_visual_row < row_cursor.saturating_add(row_count) {
                 let target_row = target_visual_row.saturating_sub(row_cursor);
-                let target_y = line_height * (target_row as f32 + 0.5);
                 let row_start = target_offsets.get(target_row).copied().unwrap_or(0);
                 let row_end = target_offsets
                     .get(target_row + 1)
@@ -913,25 +950,32 @@ impl LayoutRegistry {
                     .unwrap_or(target_line.len());
                 let row_origin =
                     wrapped_row_origin_x(&cached.layout, target_line, row_start, row_end);
-                let x = (preferred_x.unwrap_or(current_x) - row_origin).max(px(0.0));
+                let row_x = (preferred_x.unwrap_or(current_x) - row_origin).max(px(0.0));
+                let row_start_x = target_line.unwrapped_layout.x_for_index(row_start);
+                let target_x = row_start_x + row_x;
+                // Resolve the target row against the unwrapped line.  The
+                // wrapped helper adds its own row origin and would interpret
+                // the alignment-adjusted x as a second local offset.
                 let local = target_line
-                    .closest_index_for_position(point(x, target_y), line_height)
-                    .unwrap_or_else(|offset| offset)
-                    .min(target_line.len());
+                    .unwrapped_layout
+                    .closest_index_for_x(target_x)
+                    .max(row_start)
+                    .min(row_end);
+                let affinity = if local >= row_end && row_end < target_line.len() {
+                    Affinity::Before
+                } else {
+                    Affinity::After
+                };
                 let target_start = line_start_offset(&cached.layout.text_lines, target_line_index);
                 let target_line_len = target_line.len();
                 let snapped = target_start
                     + snap_grapheme_offset(
                         target_line.text.as_ref(),
                         local.min(target_line_len),
-                        Affinity::After,
+                        affinity,
                     )
                     .min(target_line_len);
-                return Some(DocPoint::with_affinity(
-                    caret.node_id,
-                    snapped,
-                    Affinity::After,
-                ));
+                return Some(DocPoint::with_affinity(caret.node_id, snapped, affinity));
             }
             row_cursor = row_cursor.saturating_add(row_count);
         }
@@ -1010,21 +1054,27 @@ impl LayoutRegistry {
         } else {
             0
         };
-        let y = cached.line_height * (row as f32 + 0.5);
-        let offsets = wrapped_row_offsets(line);
         let row_start = offsets.get(row).copied().unwrap_or(0);
         let row_end = offsets.get(row + 1).copied().unwrap_or(line.len());
         let row_origin = wrapped_row_origin_x(&cached.layout, line, row_start, row_end);
-        let x = (preferred_x.unwrap_or(row_origin) - row_origin).max(px(0.0));
+        let row_x = (preferred_x.unwrap_or(row_origin) - row_origin).max(px(0.0));
+        let row_start_x = line.unwrapped_layout.x_for_index(row_start);
+        let target_x = row_start_x + row_x;
         let local = line
-            .closest_index_for_position(point(x, y), cached.line_height)
-            .unwrap_or_else(|offset| offset)
-            .min(line.len());
+            .unwrapped_layout
+            .closest_index_for_x(target_x)
+            .max(row_start)
+            .min(row_end);
+        let affinity = if local >= row_end && row_end < line.len() {
+            Affinity::Before
+        } else {
+            Affinity::After
+        };
         let start = line_start_offset(&cached.layout.text_lines, line_index);
         let offset = start
-            + snap_grapheme_offset(line.text.as_ref(), local.min(line.len()), Affinity::After)
+            + snap_grapheme_offset(line.text.as_ref(), local.min(line.len()), affinity)
                 .min(line.len());
-        Some(DocPoint::with_affinity(node_id, offset, Affinity::After))
+        Some(DocPoint::with_affinity(node_id, offset, affinity))
     }
 
     pub fn range_bounds(&self, node_id: NodeId, range: Range<usize>) -> Option<Bounds<Pixels>> {
@@ -1093,17 +1143,20 @@ impl LayoutRegistry {
             caret.affinity,
         )
         .min(line.len());
-        let position = line.position_for_index(offset_in_line, cached.line_height)?;
         let offsets = wrapped_row_offsets(line);
         let row = row_index_for_offset(&offsets, offset_in_line, caret.affinity);
         let row_start = offsets.get(row).copied().unwrap_or(0);
         let row_end = offsets.get(row + 1).copied().unwrap_or(line.len());
         let row_origin = wrapped_row_origin_x(layout, line, row_start, row_end);
+        // `position_for_index` resolves a wrap seam to the preceding row for
+        // an exact boundary.  The affinity-selected row is authoritative for
+        // caret geometry, so derive the x/y from that row's unwrapped span
+        // instead of reusing the seam-ambiguous wrapped position.
+        let row_x = line.unwrapped_layout.x_for_index(offset_in_line)
+            - line.unwrapped_layout.x_for_index(row_start);
+        let row_y = cached.line_height * row as f32;
         Some(Bounds::new(
-            point(
-                row_origin + position.x,
-                layout.bounds.top() + line_top + position.y,
-            ),
+            point(row_origin + row_x, layout.bounds.top() + line_top + row_y),
             size(px(CARET_WIDTH), cached.line_height),
         ))
     }
@@ -1255,6 +1308,17 @@ impl LayoutRegistry {
             self.estimate_revisions.insert(block.id, block.revision);
         }
         self.estimate_document_revision = Some(document.revision());
+    }
+
+    fn ensure_ordered_numbers(&mut self, document: &Document) {
+        if self.ordered_numbers_revision == Some(document.revision()) {
+            return;
+        }
+        self.ordered_numbers = ordered_number_summary(document);
+        self.ordered_numbers_revision = Some(document.revision());
+        self.ordered_number_scan_count = self
+            .ordered_number_scan_count
+            .saturating_add(document.block_count());
     }
 
     fn ensure_height_index(&mut self, document: &Document) {
@@ -1517,6 +1581,38 @@ impl LayoutRegistry {
         }
         self.peak_accounted_bytes = self.peak_accounted_bytes.max(self.used_bytes);
     }
+}
+
+/// Build the ordered-list number summary in document order.  Non-ordered
+/// children at a deeper list depth end only their own child sequence, while a
+/// same-level/non-list block ends the parent sequence as well.  This keeps a
+/// mixed `[ordered(0), bullet(1), ordered(0)]` run numbered `1., 2.`.
+pub(crate) fn ordered_number_summary(document: &Document) -> HashMap<NodeId, usize> {
+    let mut numbers = HashMap::new();
+    let mut counters: Vec<usize> = Vec::new();
+    for block in document.blocks() {
+        match &block.kind {
+            BlockKind::OrderedItem { depth } => {
+                let depth = *depth as usize;
+                counters.truncate(depth + 1);
+                while counters.len() <= depth {
+                    counters.push(0);
+                }
+                counters[depth] = counters[depth].saturating_add(1).max(1);
+                numbers.insert(block.id, counters[depth]);
+            }
+            BlockKind::BulletItem { depth } | BlockKind::CheckItem { depth, .. } => {
+                let depth = *depth as usize;
+                if depth == 0 {
+                    counters.clear();
+                } else {
+                    counters.truncate(depth);
+                }
+            }
+            _ => counters.clear(),
+        }
+    }
+    numbers
 }
 
 fn block_points(block: &super::model::Block) -> (DocPoint, DocPoint, bool) {
@@ -1962,7 +2058,8 @@ fn snap_grapheme_offset(text: &str, offset: usize, affinity: Affinity) -> usize 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_editor::model::Document;
+    use crate::native_editor::model::{Affinity, DocPoint, Document, Selection, TextAlignment};
+    use crate::native_editor::transaction::Transaction;
 
     #[test]
     fn long_document_layout_is_bounded() {
@@ -1983,5 +2080,95 @@ mod tests {
         assert!(layout.exact_cache_len() < document.block_count());
         let ids = layout.exact_cache_ids().collect::<HashSet<_>>();
         assert!(ids.len() <= layout.visible_range().len());
+    }
+
+    #[gpui::test]
+    async fn wrapped_hit_test_uses_row_local_y_and_clamps_tail(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        let document = Document::from_paragraph("0123456789".repeat(12));
+        let node = document.first_node_id().expect("text block");
+        let mut layout = LayoutRegistry::new();
+        cx.update(|window, _| {
+            layout.shape_visible_with_window(&document, 0.0, 1_000.0, 32.0, window);
+        });
+        let block = layout.block_layout(node).expect("wrapped block");
+        let block_bounds = block.bounds;
+        let text_inset = block.text_inset;
+        let line = block.text_lines.first().expect("hard line");
+        let offsets = wrapped_row_offsets(line);
+        assert!(offsets.len() >= 4, "fixture must have at least three rows");
+        let line_height = layout.line_height(node).expect("line height");
+        let x = block_bounds.left() + text_inset + px(1.0);
+
+        for row in 1..offsets.len() - 1 {
+            let position = point(x, block_bounds.top() + line_height * (row as f32 + 0.5));
+            let hit = layout.point_to_doc(position).expect("wrapped row hit");
+            assert_eq!(hit.node_id, node);
+            assert_eq!(
+                hit.utf8_offset, offsets[row],
+                "row {row} left edge must map to its exact wrap boundary"
+            );
+        }
+
+        let below = point(x, block_bounds.bottom() + line_height * 4.0);
+        let tail = layout
+            .point_to_doc(below)
+            .expect("below-tail hit should clamp");
+        assert_eq!(tail.node_id, node);
+        assert_eq!(tail.utf8_offset, document.text_at_index(0).unwrap().len());
+    }
+
+    #[gpui::test]
+    async fn wrapped_seam_caret_affinity_uses_the_selected_row(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        for alignment in [
+            TextAlignment::Left,
+            TextAlignment::Center,
+            TextAlignment::Right,
+        ] {
+            let mut document = Document::from_paragraph("0123456789".repeat(16));
+            let node = document.first_node_id().expect("text block");
+            let text_len = document.text_at_index(0).unwrap().len();
+            document
+                .apply(Transaction::SetAlignment {
+                    selection: Selection::new(
+                        DocPoint::with_affinity(node, 0, Affinity::Before),
+                        DocPoint::with_affinity(node, text_len, Affinity::After),
+                    ),
+                    alignment,
+                })
+                .expect("alignment transaction");
+            let mut layout = LayoutRegistry::new();
+            cx.update(|window, _| {
+                layout.shape_visible_with_window(&document, 0.0, 1_000.0, 96.0, window);
+            });
+            let block = layout.block_layout(node).expect("wrapped block");
+            let line = block.text_lines.first().expect("hard line");
+            let offsets = wrapped_row_offsets(line);
+            let seam = offsets.get(1).copied().expect("wrap seam");
+            let line_height = layout.line_height(node).expect("line height");
+            let before = layout
+                .caret_bounds_for_point(DocPoint::with_affinity(node, seam, Affinity::Before))
+                .expect("before seam caret");
+            let after = layout
+                .caret_bounds_for_point(DocPoint::with_affinity(node, seam, Affinity::After))
+                .expect("after seam caret");
+            assert_eq!(before.top(), block.bounds.top());
+            assert_eq!(after.top(), block.bounds.top() + line_height);
+            assert!(
+                after.left() >= block.bounds.left() - px(0.5)
+                    && after.left() <= block.bounds.right() + px(0.5),
+                "after seam caret must remain in the aligned block"
+            );
+            let next = layout
+                .visual_move(
+                    DocPoint::with_affinity(node, seam, Affinity::After),
+                    1,
+                    None,
+                )
+                .expect("vertical move after seam");
+            let next_bounds = layout.caret_bounds_for_point(next).expect("next-row caret");
+            assert!(next_bounds.top() > after.top());
+        }
     }
 }

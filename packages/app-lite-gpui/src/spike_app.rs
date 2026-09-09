@@ -16,6 +16,7 @@ use gpui::{
     UTF16Selection, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div, point, px,
     rgba, size,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::components::{
     BlockDown, BlockUp, BoldSelection, Copy, Cut, Delete, DeleteBack, End, FocusNext, FocusPrev,
@@ -74,15 +75,6 @@ pub fn layout_for_viewport(width: f32, height: f32) -> SpikeLayout {
     }
 }
 
-fn estimate_toolbar_height(width: f32, item_count: usize) -> f32 {
-    let available = width.max(1.0);
-    let approximate_item_width = 72.0;
-    let rows = ((item_count.max(1) as f32 * approximate_item_width) / available)
-        .ceil()
-        .max(1.0);
-    rows * 31.0
-}
-
 fn surface_viewport(surface: Bounds<Pixels>, content_mask: Bounds<Pixels>) -> (f32, f32) {
     let top = surface.top().max(content_mask.top());
     let bottom = surface.bottom().min(content_mask.bottom());
@@ -111,6 +103,7 @@ pub(crate) fn open(cx: &mut App) -> WindowHandle<SpikeView> {
                     more_open: false,
                     link_popover: None,
                     pointer_anchor: None,
+                    more_trigger_bounds: None,
                 })
             },
         )
@@ -169,16 +162,28 @@ impl LinkPopover {
     }
 
     fn ordered_selection(&self) -> (usize, usize) {
+        (self.selection.start, self.selection.end)
+    }
+
+    fn cursor_offset(&self) -> usize {
         if self.reversed {
-            (self.selection.end, self.selection.start)
+            self.selection.start
         } else {
-            (self.selection.start, self.selection.end)
+            self.selection.end
         }
     }
 
-    fn set_selection(&mut self, start: usize, end: usize, reversed: bool) {
-        self.selection = start.min(end)..start.max(end);
-        self.reversed = !self.selection.is_empty() && reversed;
+    fn anchor_offset(&self) -> usize {
+        if self.reversed {
+            self.selection.end
+        } else {
+            self.selection.start
+        }
+    }
+
+    fn set_selection(&mut self, anchor: usize, focus: usize) {
+        self.selection = anchor.min(focus)..anchor.max(focus);
+        self.reversed = !self.selection.is_empty() && focus < anchor;
     }
 
     fn collapse(&mut self, offset: usize) {
@@ -188,7 +193,7 @@ impl LinkPopover {
 
     fn move_horizontal(&mut self, right: bool, extend: bool) {
         let (start, end) = self.ordered_selection();
-        let head = if self.reversed { start } else { end };
+        let head = self.cursor_offset();
         if !extend && start != end {
             self.collapse(if right { end } else { start });
             return;
@@ -199,20 +204,17 @@ impl LinkPopover {
             previous_char_boundary(&self.text, head)
         };
         if extend {
-            let anchor = if self.reversed { end } else { start };
-            self.set_selection(anchor, target, target < anchor);
+            self.set_selection(self.anchor_offset(), target);
         } else {
             self.collapse(target);
         }
     }
 
     fn move_to_edge(&mut self, end: bool, extend: bool) {
-        let (start, old_end) = self.ordered_selection();
-        let head = if self.reversed { start } else { old_end };
+        let head = self.cursor_offset();
         let target = if end { self.text.len() } else { 0 };
         if extend {
-            let anchor = if self.reversed { old_end } else { start };
-            self.set_selection(anchor, target, target < anchor);
+            self.set_selection(self.anchor_offset(), target);
         } else if head != target {
             self.collapse(target);
         }
@@ -239,12 +241,14 @@ impl LinkPopover {
     }
 
     fn select_all(&mut self) {
-        self.set_selection(0, self.text.len(), false);
+        self.set_selection(0, self.text.len());
     }
 
     fn selected_text(&self) -> String {
-        let (start, end) = self.ordered_selection();
-        self.text.get(start..end).unwrap_or_default().to_owned()
+        self.text
+            .get(self.selection.start..self.selection.end)
+            .unwrap_or_default()
+            .to_owned()
     }
 
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
@@ -257,16 +261,17 @@ impl LinkPopover {
 }
 
 fn previous_char_boundary(text: &str, offset: usize) -> usize {
-    text[..offset.min(text.len())]
-        .char_indices()
-        .next_back()
+    text.grapheme_indices(true)
         .map(|(index, _)| index)
+        .take_while(|index| *index < offset.min(text.len()))
+        .last()
         .unwrap_or(0)
 }
 
 fn next_char_boundary(text: &str, offset: usize) -> usize {
-    text.char_indices()
-        .find_map(|(index, _)| (index > offset).then_some(index))
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index > offset.min(text.len()))
         .unwrap_or(text.len())
 }
 
@@ -391,6 +396,7 @@ pub(crate) struct SpikeView {
     more_open: bool,
     link_popover: Option<Entity<LinkPopover>>,
     pointer_anchor: Option<DocPoint>,
+    more_trigger_bounds: Option<Bounds<Pixels>>,
 }
 
 impl SpikeView {
@@ -800,14 +806,29 @@ impl SpikeView {
 
     fn render_more_menu(
         &self,
-        left: f32,
-        top: f32,
-        available_width: f32,
+        trigger_bounds: Option<Bounds<Pixels>>,
+        content_mask: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        let trigger = trigger_bounds?;
         if !self.more_open {
             return None;
         }
+        let mask_left = f32::from(content_mask.left());
+        let mask_right = f32::from(content_mask.right());
+        let mask_top = f32::from(content_mask.top());
+        let mask_bottom = f32::from(content_mask.bottom());
+        let trigger_left = f32::from(trigger.left()).max(mask_left);
+        let available_width = (mask_right - trigger_left)
+            .min(f32::from(content_mask.size.width))
+            .max(1.0);
+        let below_height = (mask_bottom - f32::from(trigger.bottom())).max(0.0);
+        let above_height = (f32::from(trigger.top()) - mask_top).max(0.0);
+        let (top, max_height) = if below_height >= above_height {
+            (f32::from(trigger.bottom()), below_height)
+        } else {
+            (mask_top, above_height)
+        };
         let buttons = self
             .catalogue
             .more_descriptors()
@@ -819,9 +840,11 @@ impl SpikeView {
                 .id("evernote-native-spike-more-menu")
                 .debug_selector(|| "evernote-native-spike-more-menu".to_owned())
                 .absolute()
-                .top(px(top.max(0.0)))
-                .left(px(left))
+                .top(px(top.max(mask_top)))
+                .left(px(trigger_left))
                 .w(px(available_width.max(1.0)))
+                .max_h(px(max_height.max(1.0)))
+                .overflow_y_scroll()
                 .p(px(8.0))
                 .rounded(px(6.0))
                 .bg(rgba(0xffffffff))
@@ -841,6 +864,15 @@ impl SpikeView {
         cx: &mut Context<Self>,
     ) {
         if event.button != MouseButton::Left {
+            cx.propagate();
+            return;
+        }
+        // The popup is rendered above the editor surface. Its command
+        // buttons must get first refusal even though the surface owns a
+        // capture-phase mouse listener; an editor click while the popup is
+        // open is dismissed by the root listener instead of changing the
+        // selection underneath the menu.
+        if self.more_open {
             cx.propagate();
             return;
         }
@@ -1002,7 +1034,6 @@ impl Render for SpikeView {
         let viewport_width = f32::from(window_size.width.max(px(1.0)));
         let viewport_height = f32::from(window_size.height.max(px(1.0)));
         let layout = layout_for_viewport(viewport_width, viewport_height);
-        let scroll_top = (-f32::from(self.scroll_handle.offset().y)).max(0.0);
         let measured_height = self.editor.read(cx).layout().total_height();
         let content_mask = window.content_mask().bounds;
         let content_height = measured_height.max(f32::from(content_mask.size.height) * 0.65);
@@ -1014,17 +1045,30 @@ impl Render for SpikeView {
             .map(|descriptor| self.render_command_button(descriptor, false, cx))
             .collect::<Vec<_>>();
         let more_trigger = self.render_more_trigger(cx);
-        let title_height = f32::from(window.line_height()) + 28.0;
-        let toolbar_height = estimate_toolbar_height(
-            layout.content_width,
-            self.catalogue.primary_descriptors().len() + 1,
-        );
-        let more_menu = self.render_more_menu(
-            layout.left_inset,
-            title_height + toolbar_height - scroll_top,
-            layout.content_width,
-            cx,
-        );
+        let measure_view = cx.entity();
+        let more_measure = canvas(
+            move |bounds, _window, cx| {
+                let _ = measure_view.update(cx, |view, view_cx| {
+                    if view.more_trigger_bounds != Some(bounds) {
+                        view.more_trigger_bounds = Some(bounds);
+                        view_cx.notify();
+                    }
+                });
+                measure_view.clone()
+            },
+            move |_bounds, _view, _window, _cx| {},
+        )
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .w_full()
+        .h_full();
+        let more_trigger = div()
+            .relative()
+            .child(more_measure)
+            .child(more_trigger)
+            .into_any_element();
+        let more_menu = self.render_more_menu(self.more_trigger_bounds, content_mask, cx);
         let editor_surface = self.render_editor_surface(layout, content_height, cx);
 
         let toolbar = div()
@@ -1331,6 +1375,7 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            more_trigger_bounds: None,
         }
     }
 
@@ -1345,6 +1390,38 @@ mod tests {
             more_open: false,
             link_popover: None,
             pointer_anchor: None,
+            more_trigger_bounds: None,
+        }
+    }
+
+    fn build_word_cross_block_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
+        let mut document = Document::from_paragraph("alpha");
+        let first = document.blocks()[0].id;
+        document
+            .apply(Transaction::InsertImage {
+                selection: document.end_selection(),
+                resource_id: "word-selection-image".into(),
+                natural_size: (100, 100),
+            })
+            .expect("image fixture");
+        let trailing = document.blocks().last().expect("trailing text").id;
+        document
+            .apply(Transaction::InsertText {
+                selection: Selection::caret(DocPoint::with_affinity(trailing, 0, Affinity::Before)),
+                text: "omega".into(),
+            })
+            .expect("trailing text fixture");
+        debug_assert_eq!(document.blocks()[0].id, first);
+        let editor = cx.new(|cx| EditorCore::new(document, cx));
+        editor.read(cx).focus_handle().focus(window);
+        SpikeView {
+            editor,
+            catalogue: CommandCatalogue::default(),
+            scroll_handle: ScrollHandle::new(),
+            more_open: false,
+            link_popover: None,
+            pointer_anchor: None,
+            more_trigger_bounds: None,
         }
     }
 
@@ -1433,6 +1510,69 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn shell_word_selection_crosses_text_and_structural_blocks(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_word_cross_block_view);
+        redraw(cx);
+        view.update(cx, |view, cx| {
+            let first = view.editor.read(cx).document().blocks()[0].id;
+            let first_end = view
+                .editor
+                .read(cx)
+                .document()
+                .text_at_index(0)
+                .unwrap()
+                .len();
+            view.editor.update(cx, |editor, editor_cx| {
+                editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                    first,
+                    first_end,
+                    Affinity::After,
+                )));
+                editor_cx.notify();
+            });
+        });
+        cx.simulate_keystrokes("alt-shift-right");
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            assert_eq!(
+                editor.selection().anchor.node_id,
+                editor.document().blocks()[0].id
+            );
+            assert_eq!(
+                editor.selection().head.node_id,
+                editor.document().blocks()[2].id
+            );
+            assert_eq!(editor.selection().head.utf8_offset, "omega".len());
+        });
+
+        view.update(cx, |view, cx| {
+            let third = view.editor.read(cx).document().blocks()[2].id;
+            view.editor.update(cx, |editor, editor_cx| {
+                editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                    third,
+                    0,
+                    Affinity::Before,
+                )));
+                editor_cx.notify();
+            });
+        });
+        cx.simulate_keystrokes("alt-shift-left");
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            assert_eq!(
+                editor.selection().anchor.node_id,
+                editor.document().blocks()[2].id
+            );
+            assert_eq!(
+                editor.selection().head.node_id,
+                editor.document().blocks()[0].id
+            );
+            assert_eq!(editor.selection().head.utf8_offset, 0);
+        });
+    }
+
+    #[gpui::test]
     async fn shell_pointer_capture_clamps_outside_surface_and_shift_clicks(
         cx: &mut TestAppContext,
     ) {
@@ -1479,6 +1619,54 @@ mod tests {
             assert!(
                 !view.editor.read(cx).selection().is_caret(),
                 "Shift-click must extend from the prior anchor"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_shift_click_drag_preserves_original_anchor(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        let (first, second) = view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            (
+                editor
+                    .layout()
+                    .block_layout(editor.document().blocks()[0].id)
+                    .unwrap()
+                    .bounds,
+                editor
+                    .layout()
+                    .block_layout(editor.document().blocks()[1].id)
+                    .unwrap()
+                    .bounds,
+            )
+        });
+        let a = point(first.left() + px(2.0), first.top() + px(8.0));
+        let b = point(second.right() - px(2.0), second.top() + px(8.0));
+        let c = point(second.left() + px(2.0), second.top() + px(8.0));
+        cx.simulate_mouse_down(a, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(a, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_down(
+            b,
+            MouseButton::Left,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        cx.simulate_mouse_move(c, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(c, MouseButton::Left, Modifiers::default());
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            assert_eq!(
+                editor.selection().anchor.node_id,
+                editor.document().blocks()[0].id
+            );
+            assert_eq!(
+                editor.selection().head.node_id,
+                editor.document().blocks()[1].id
             );
         });
     }
@@ -1640,6 +1828,28 @@ mod tests {
     }
 
     #[gpui::test]
+    fn link_popover_reverse_selection_uses_sorted_range_and_graphemes(cx: &mut TestAppContext) {
+        let mut cx = cx.add_empty_window();
+        let field = cx.new(|cx| LinkPopover::new("a🙂e\u{301}bc".to_owned(), cx));
+        cx.update(|_, app| {
+            field.update(app, |field, _| {
+                field.move_to_edge(false, false);
+                field.move_to_edge(true, false);
+                field.move_horizontal(false, true);
+                field.move_horizontal(false, true);
+                assert_eq!(field.selected_text(), "bc");
+                assert!(field.reversed);
+                field.delete_backward();
+                assert_eq!(field.text, "a🙂e\u{301}");
+                field.delete_backward();
+                assert_eq!(field.text, "a🙂");
+                field.delete_backward();
+                assert_eq!(field.text, "a");
+            });
+        });
+    }
+
+    #[gpui::test]
     async fn more_menu_dispatches_catalogue_command_and_restores_editor_focus(
         cx: &mut TestAppContext,
     ) {
@@ -1736,6 +1946,27 @@ mod tests {
         view.read_with(cx, |view, _cx| {
             assert!(!view.more_open, "outside click must dismiss the More menu");
         });
+    }
+
+    #[gpui::test]
+    async fn shell_more_menu_uses_measured_bounds_in_short_narrow_view(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (_view, cx) = cx.add_window_view(build_long_view);
+        cx.simulate_resize(size(px(400.0), px(260.0)));
+        redraw(cx);
+        let trigger = cx
+            .debug_bounds("evernote-native-spike-more-trigger")
+            .expect("More trigger must be mounted in a narrow window");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        redraw(cx);
+        let menu = cx
+            .debug_bounds("evernote-native-spike-more-menu")
+            .expect("More menu must be mounted after the measured trigger click");
+        assert!(menu.left() >= px(0.0));
+        assert!(menu.right() <= px(400.0));
+        assert!(menu.top() >= px(0.0));
+        assert!(menu.bottom() <= px(260.0));
+        assert!(menu.top() >= trigger.bottom() || menu.bottom() <= trigger.top());
     }
 
     #[gpui::test]
