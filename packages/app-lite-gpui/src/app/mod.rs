@@ -5,13 +5,11 @@ pub use actions::*;
 pub use navigation::*;
 
 use app_lite_core::{
-    CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryRepository,
-    ListQuery, NoteId, NoteProjection,
+    CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
+    LibraryRepository, LibraryShellState, ListQuery, Note, NoteId, NoteProjection,
 };
 use std::sync::Arc;
-
-const SELECTED_NOTE_SETTING: &str = "library-shell.selected-note-id";
-const PANE_SETTING: &str = "library-shell.panes";
+use std::sync::mpsc::Receiver;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneState {
@@ -31,41 +29,19 @@ impl PaneState {
         }
     }
 
-    fn from_setting(value: Option<String>) -> Self {
-        let Some(value) = value else {
-            return Self::new(220, 360);
-        };
-        let mut pieces = value.split(',');
-        let Some(sidebar_width) = pieces.next().and_then(|item| item.parse().ok()) else {
-            return Self::new(220, 360);
-        };
-        let Some(list_width) = pieces.next().and_then(|item| item.parse().ok()) else {
-            return Self::new(220, 360);
-        };
-        let sidebar_visible = pieces.next() == Some("1");
-        let list_visible = pieces.next() == Some("1");
+    fn from_shell_state(state: &LibraryShellState) -> Self {
         Self {
-            sidebar_width,
-            list_width,
-            sidebar_visible,
-            list_visible,
+            sidebar_width: state.sidebar_width,
+            list_width: state.list_width,
+            sidebar_visible: state.sidebar_visible,
+            list_visible: state.list_visible,
         }
-    }
-
-    fn setting_value(self) -> String {
-        format!(
-            "{},{},{},{}",
-            self.sidebar_width,
-            self.list_width,
-            self.sidebar_visible as u8,
-            self.list_visible as u8
-        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ActiveSessionPlaceholder {
-    pub note_id: NoteId,
+pub struct ActiveSession {
+    pub note: Note,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,14 +54,24 @@ pub struct AppModel {
     repository: Arc<LibraryRepository>,
     navigation: NavigationState,
     projections: Vec<NoteProjection>,
-    active_session: Option<ActiveSessionPlaceholder>,
+    active_session: Option<ActiveSession>,
     panes: PaneState,
+    list_view_mode: ListViewMode,
+    sort: NoteSort,
     status: AppStatus,
+    // A repository mutation can commit before the subsequent projection
+    // refresh/selection persistence fails. Keep that fact until `dispatch`
+    // converts the error into visible status instead of falsely implying the
+    // user action was rolled back.
+    partial_commit_message: Option<String>,
+    #[cfg(test)]
+    next_refresh_failure: Option<LibraryError>,
 }
 
 impl AppModel {
     pub fn open(repository: Arc<LibraryRepository>) -> Result<Self, LibraryError> {
-        let panes = PaneState::from_setting(repository.read_setting(PANE_SETTING)?);
+        let saved_shell_state = repository.read_library_shell_state()?;
+        let panes = PaneState::from_shell_state(&saved_shell_state);
         let projections = repository.list_notes(ListQuery::default())?;
         let mut model = Self {
             repository,
@@ -93,10 +79,15 @@ impl AppModel {
             projections,
             active_session: None,
             panes,
+            list_view_mode: ListViewMode::default(),
+            sort: NoteSort::default(),
             status: AppStatus::Ready,
+            partial_commit_message: None,
+            #[cfg(test)]
+            next_refresh_failure: None,
         };
-        if let Some(saved) = model.repository.read_setting(SELECTED_NOTE_SETTING)?
-            && let Ok(id) = NoteId::parse(saved)
+        model.sort_projections();
+        if let Some(id) = saved_shell_state.selected_note_id
             && model
                 .projections
                 .iter()
@@ -108,10 +99,17 @@ impl AppModel {
     }
 
     pub fn dispatch(&mut self, action: AppAction) -> Result<(), LibraryError> {
+        self.partial_commit_message = None;
         let result = match action {
             AppAction::CreateNote => self.create_note(),
             AppAction::SelectNote(id) => self.select_note(id),
             AppAction::TrashNote(id) => self.trash_note(id),
+            AppAction::TrashSelected => self
+                .navigation
+                .selected_note_id()
+                .cloned()
+                .ok_or(LibraryError::NotFound)
+                .and_then(|id| self.trash_note(id)),
             AppAction::ToggleSidebar => {
                 self.panes.sidebar_visible = !self.panes.sidebar_visible;
                 self.persist_shell_state()
@@ -120,9 +118,25 @@ impl AppModel {
                 self.panes.list_visible = !self.panes.list_visible;
                 self.persist_shell_state()
             }
+            AppAction::SetListViewMode(mode) => {
+                self.list_view_mode = mode;
+                Ok(())
+            }
+            AppAction::SetSort(sort) => {
+                self.sort = sort;
+                self.sort_projections();
+                Ok(())
+            }
         };
-        if let Err(error) = &result {
-            self.status = AppStatus::Error(error.to_string());
+        match result {
+            Ok(()) => self.status = AppStatus::Ready,
+            Err(ref error) => {
+                self.status = AppStatus::Error(
+                    self.partial_commit_message
+                        .take()
+                        .unwrap_or_else(|| error.to_string()),
+                );
+            }
         }
         result
     }
@@ -135,24 +149,32 @@ impl AppModel {
             document: CanonicalDocument::default(),
         })?;
         self.navigation.clear_search();
-        self.refresh_list()?;
-        self.select_note(note.id)
+        if let Err(error) = self.refresh_list() {
+            self.record_partial_commit("笔记已创建", &error);
+            return Err(error);
+        }
+        if let Err(error) = self.select_note(note.id) {
+            self.record_partial_commit("笔记已创建，但无法恢复选中状态", &error);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn select_note(&mut self, id: NoteId) -> Result<(), LibraryError> {
         if self
             .active_session
             .as_ref()
-            .is_some_and(|session| session.note_id != id)
+            .is_some_and(|session| session.note.id != id)
         {
             // Task 4 owns durable saves. Until then, a switch is allowed only because this
             // shell never exposes unsaved editing as persisted content.
         }
-        if self.repository.load_note(&id)?.is_none() {
-            return Err(LibraryError::NotFound);
-        }
+        let note = self
+            .repository
+            .load_note(&id)?
+            .ok_or(LibraryError::NotFound)?;
         self.navigation.select(Some(id.clone()));
-        self.active_session = Some(ActiveSessionPlaceholder { note_id: id });
+        self.active_session = Some(ActiveSession { note });
         self.persist_shell_state()
     }
 
@@ -175,7 +197,10 @@ impl AppModel {
                 .map(|projection| projection.id.clone())
         });
         self.repository.trash_note(&id)?;
-        self.refresh_list()?;
+        if let Err(error) = self.refresh_list() {
+            self.record_partial_commit("笔记已移至废纸篓", &error);
+            return Err(error);
+        }
         if was_selected {
             let replacement = nearest_before_refresh.filter(|candidate| {
                 self.projections
@@ -183,18 +208,35 @@ impl AppModel {
                     .any(|projection| projection.id == *candidate)
             });
             if let Some(replacement) = replacement {
-                self.select_note(replacement)?;
+                if let Err(error) = self.select_note(replacement) {
+                    self.record_partial_commit(
+                        "笔记已移至废纸篓，但无法恢复相邻笔记选中状态",
+                        &error,
+                    );
+                    return Err(error);
+                }
             } else {
                 self.navigation.select(None);
                 self.active_session = None;
-                self.persist_shell_state()?;
+                if let Err(error) = self.persist_shell_state() {
+                    self.record_partial_commit(
+                        "笔记已移至废纸篓，但无法清除已保存的选中状态",
+                        &error,
+                    );
+                    return Err(error);
+                }
             }
         }
         Ok(())
     }
 
     pub fn refresh_list(&mut self) -> Result<(), LibraryError> {
+        #[cfg(test)]
+        if let Some(error) = self.next_refresh_failure.take() {
+            return Err(error);
+        }
         self.projections = self.repository.list_notes(ListQuery::default())?;
+        self.sort_projections();
         if self.navigation.selected_note_id().is_some_and(|id| {
             !self
                 .projections
@@ -203,18 +245,53 @@ impl AppModel {
         }) {
             self.navigation.select(None);
             self.active_session = None;
+            self.persist_shell_state()?;
         }
         Ok(())
     }
 
+    /// Coalesces a bounded batch from the repository event stream into one
+    /// projection-only refresh. This deliberately does not load a body: the
+    /// selected `Note` remains a session boundary until the user explicitly
+    /// selects another card or Task 4 installs save/reload coordination.
+    pub fn refresh_projection_events(
+        &mut self,
+        events: impl IntoIterator<Item = LibraryEvent>,
+    ) -> Result<bool, LibraryError> {
+        let refresh_needed = events.into_iter().any(|event| {
+            matches!(
+                event,
+                LibraryEvent::NoteCreated(_)
+                    | LibraryEvent::NoteProjectionChanged(_)
+                    | LibraryEvent::NoteTrashed(_)
+                    | LibraryEvent::NoteRestored(_)
+                    | LibraryEvent::OrganizationChanged
+            )
+        });
+        if !refresh_needed {
+            return Ok(false);
+        }
+        let result = self.refresh_list();
+        match &result {
+            Ok(()) => self.status = AppStatus::Ready,
+            Err(error) => self.status = AppStatus::Error(error.to_string()),
+        }
+        result.map(|()| true)
+    }
+
+    pub fn subscribe_library_events(&self) -> Receiver<LibraryEvent> {
+        self.repository.subscribe()
+    }
+
     pub fn persist_shell_state(&self) -> Result<(), LibraryError> {
         self.repository
-            .write_setting(PANE_SETTING, &self.panes.setting_value())?;
-        if let Some(id) = self.navigation.selected_note_id() {
-            self.repository
-                .write_setting(SELECTED_NOTE_SETTING, id.as_str())?;
-        }
-        Ok(())
+            .write_library_shell_state(&LibraryShellState {
+                sidebar_width: self.panes.sidebar_width,
+                list_width: self.panes.list_width,
+                sidebar_visible: self.panes.sidebar_visible,
+                list_visible: self.panes.list_visible,
+                selected_note_id: self.navigation.selected_note_id().cloned(),
+            })
     }
     pub fn navigation(&self) -> &NavigationState {
         &self.navigation
@@ -223,7 +300,10 @@ impl AppModel {
         &self.projections
     }
     pub fn active_session_note_id(&self) -> Option<&NoteId> {
-        self.active_session.as_ref().map(|session| &session.note_id)
+        self.active_session.as_ref().map(|session| &session.note.id)
+    }
+    pub fn active_note(&self) -> Option<&Note> {
+        self.active_session.as_ref().map(|session| &session.note)
     }
     pub fn panes(&self) -> PaneState {
         self.panes
@@ -231,11 +311,21 @@ impl AppModel {
     pub fn status(&self) -> &AppStatus {
         &self.status
     }
+    pub fn list_view_mode(&self) -> ListViewMode {
+        self.list_view_mode
+    }
+    pub fn sort(&self) -> NoteSort {
+        self.sort
+    }
     pub fn set_search_query(&mut self, query: Option<String>) {
         self.navigation.set_search_query(query);
     }
     pub fn set_panes(&mut self, panes: PaneState) {
         self.panes = panes;
+    }
+    #[cfg(test)]
+    pub fn fail_next_refresh_for_test(&mut self, error: LibraryError) {
+        self.next_refresh_failure = Some(error);
     }
     #[cfg(test)]
     pub fn set_projection_for_test(&mut self, ids: Vec<NoteId>) {
@@ -248,6 +338,34 @@ impl AppModel {
                     .cloned()
             })
             .collect();
+    }
+
+    fn sort_projections(&mut self) {
+        match self.sort {
+            NoteSort::UpdatedDescending => self.projections.sort_by(|left, right| {
+                right
+                    .updated_time
+                    .cmp(&left.updated_time)
+                    .then_with(|| left.id.cmp(&right.id))
+            }),
+            NoteSort::TitleAscending => self.projections.sort_by(|left, right| {
+                left.title_prefix
+                    .cmp(&right.title_prefix)
+                    .then_with(|| left.id.cmp(&right.id))
+            }),
+            NoteSort::TitleDescending => self.projections.sort_by(|left, right| {
+                right
+                    .title_prefix
+                    .cmp(&left.title_prefix)
+                    .then_with(|| left.id.cmp(&right.id))
+            }),
+        }
+    }
+
+    fn record_partial_commit(&mut self, committed_action: &str, error: &LibraryError) {
+        self.partial_commit_message = Some(format!(
+            "{committed_action}，但后续界面同步失败：{error}。资料库数据已提交；请重新打开资料库以恢复显示。"
+        ));
     }
 }
 

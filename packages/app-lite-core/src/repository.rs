@@ -13,6 +13,105 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+const LIBRARY_SHELL_PANES_SETTING: &str = "library-shell.panes";
+const LIBRARY_SHELL_SELECTED_NOTE_SETTING: &str = "library-shell.selected-note-id";
+
+/// The durable, application-owned portion of the library window state.
+///
+/// Keeping this DTO in core prevents the GPUI shell from making unrelated
+/// string writes for panes and selection.  The two fields are committed in one
+/// SQLite transaction so an interrupted write cannot resurrect an old
+/// selection alongside new pane settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryShellState {
+    pub sidebar_width: u16,
+    pub list_width: u16,
+    pub sidebar_visible: bool,
+    pub list_visible: bool,
+    pub selected_note_id: Option<NoteId>,
+}
+
+impl LibraryShellState {
+    pub const DEFAULT_SIDEBAR_WIDTH: u16 = 220;
+    pub const DEFAULT_LIST_WIDTH: u16 = 360;
+    pub const MIN_PANE_WIDTH: u16 = 120;
+    pub const MAX_PANE_WIDTH: u16 = 960;
+
+    pub const fn new(sidebar_width: u16, list_width: u16) -> Self {
+        Self {
+            sidebar_width,
+            list_width,
+            sidebar_visible: true,
+            list_visible: true,
+            selected_note_id: None,
+        }
+    }
+
+    pub const fn pane_state(&self) -> (u16, u16, bool, bool) {
+        (
+            self.sidebar_width,
+            self.list_width,
+            self.sidebar_visible,
+            self.list_visible,
+        )
+    }
+
+    fn panes_setting_value(&self) -> String {
+        format!(
+            "{},{},{},{}",
+            self.sidebar_width,
+            self.list_width,
+            self.sidebar_visible as u8,
+            self.list_visible as u8
+        )
+    }
+
+    fn from_settings(panes: Option<&str>, selected_note_id: Option<&str>) -> Self {
+        let mut state = panes
+            .and_then(Self::parse_panes)
+            .unwrap_or_else(Self::default);
+        state.selected_note_id = selected_note_id.and_then(|id| NoteId::parse(id).ok());
+        state
+    }
+
+    fn parse_panes(value: &str) -> Option<Self> {
+        let fields = value.split(',').collect::<Vec<_>>();
+        let [sidebar_width, list_width, sidebar_visible, list_visible] = fields.as_slice() else {
+            return None;
+        };
+        let sidebar_width = sidebar_width.parse::<u16>().ok()?;
+        let list_width = list_width.parse::<u16>().ok()?;
+        if !(Self::MIN_PANE_WIDTH..=Self::MAX_PANE_WIDTH).contains(&sidebar_width)
+            || !(Self::MIN_PANE_WIDTH..=Self::MAX_PANE_WIDTH).contains(&list_width)
+        {
+            return None;
+        }
+        let sidebar_visible = match *sidebar_visible {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let list_visible = match *list_visible {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        Some(Self {
+            sidebar_width,
+            list_width,
+            sidebar_visible,
+            list_visible,
+            selected_note_id: None,
+        })
+    }
+}
+
+impl Default for LibraryShellState {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_SIDEBAR_WIDTH, Self::DEFAULT_LIST_WIDTH)
+    }
+}
+
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenTestPhase {
@@ -430,6 +529,61 @@ impl LibraryRepository {
             .expect("observer mutex poisoned")
             .push(sender);
         receiver
+    }
+
+    /// Reads the complete application-owned library shell state. Corrupt pane
+    /// settings are all-or-default; a malformed note ID is simply no selection.
+    pub fn read_library_shell_state(&self) -> Result<LibraryShellState, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let panes = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [LIBRARY_SHELL_PANES_SETTING],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let selected_note_id = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [LIBRARY_SHELL_SELECTED_NOTE_SETTING],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(LibraryShellState::from_settings(
+            panes.as_deref(),
+            selected_note_id.as_deref(),
+        ))
+    }
+
+    /// Commits pane state and optional selection together. Passing `None`
+    /// explicitly removes any stale selection rather than allowing it to be
+    /// revived after a future restart.
+    pub fn write_library_shell_state(
+        &self,
+        state: &LibraryShellState,
+    ) -> Result<(), LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO settings (key, value, updated_time) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_time = excluded.updated_time",
+            params![LIBRARY_SHELL_PANES_SETTING, state.panes_setting_value(), now],
+        )?;
+        if let Some(id) = &state.selected_note_id {
+            transaction.execute(
+                "INSERT INTO settings (key, value, updated_time) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_time = excluded.updated_time",
+                params![LIBRARY_SHELL_SELECTED_NOTE_SETTING, id.as_str(), now],
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                [LIBRARY_SHELL_SELECTED_NOTE_SETTING],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Reads application-owned shell state without exposing SQLite to the UI.

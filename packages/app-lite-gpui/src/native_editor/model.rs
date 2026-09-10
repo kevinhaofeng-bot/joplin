@@ -285,11 +285,25 @@ impl Selection {
 /// Errors raised before a transaction is committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentError {
+    /// The library shell has no durable save coordinator before Task 4.  This
+    /// guard is intentionally a core error rather than a disabled button so
+    /// IME, paste, drag/drop, image, history, and command paths cannot lose
+    /// a user's change silently.
+    ReadOnly,
     NodeNotFound(NodeId),
-    InvalidUtf8Offset { node_id: NodeId, offset: usize },
-    InvalidGraphemeOffset { node_id: NodeId, offset: usize },
+    InvalidUtf8Offset {
+        node_id: NodeId,
+        offset: usize,
+    },
+    InvalidGraphemeOffset {
+        node_id: NodeId,
+        offset: usize,
+    },
     InvalidSelectionOrder,
-    InvalidAffinity { node_id: NodeId, offset: usize },
+    InvalidAffinity {
+        node_id: NodeId,
+        offset: usize,
+    },
     InvalidHeadingLevel(u8),
     InvalidListDepth(u8),
     InvalidBlockContent(NodeId),
@@ -301,6 +315,7 @@ pub enum DocumentError {
 impl fmt::Display for DocumentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ReadOnly => f.write_str("the editor is read-only until saving is available"),
             Self::NodeNotFound(id) => write!(f, "node {} was not found", id.raw()),
             Self::InvalidUtf8Offset { node_id, offset } => {
                 write!(

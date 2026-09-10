@@ -45,6 +45,7 @@ use crate::native_editor::images::{
 use crate::native_editor::model::{
     Affinity, BlockKind, DocPoint, Document, DocumentError, Mark, Selection,
 };
+use crate::native_editor::surface::{EditorSurface, EditorSurfaceHooks, EditorSurfaceMode};
 use crate::native_editor::transaction::Transaction;
 
 gpui::actions!(evernote_spike, [SubmitLink, CancelLink]);
@@ -274,8 +275,17 @@ pub(crate) fn open_with_options(
                 }
                 let image_cache = BudgetedImageCache::new_entity(cx, DECODED_IMAGE_CACHE_BUDGET);
                 let title = cx.new(|cx| TitleInput::new("会议记录".into(), cx));
+                let surface = cx.new(|surface_cx| {
+                    EditorSurface::new_embedded(
+                        editor.clone(),
+                        EditorSurfaceMode::Editable,
+                        Some(image_cache.clone()),
+                        surface_cx,
+                    )
+                });
                 cx.new(|_| SpikeView {
                     editor,
+                    surface,
                     title,
                     image_cache: Some(image_cache),
                     catalogue: CommandCatalogue::default(),
@@ -689,6 +699,7 @@ impl EntityInputHandler for LinkPopover {
 
 pub(crate) struct SpikeView {
     editor: Entity<EditorCore>,
+    surface: Entity<EditorSurface>,
     title: Entity<TitleInput>,
     image_cache: Option<Entity<BudgetedImageCache>>,
     catalogue: CommandCatalogue,
@@ -699,6 +710,16 @@ pub(crate) struct SpikeView {
     drop_point: Option<DocPoint>,
     more_trigger_bounds: Option<Bounds<Pixels>>,
     measurement: Option<Box<MeasurementRuntime>>,
+}
+
+fn new_embedded_surface(
+    editor: Entity<EditorCore>,
+    image_cache: Option<Entity<BudgetedImageCache>>,
+    cx: &mut Context<SpikeView>,
+) -> Entity<EditorSurface> {
+    cx.new(|surface_cx| {
+        EditorSurface::new_embedded(editor, EditorSurfaceMode::Editable, image_cache, surface_cx)
+    })
 }
 
 impl SpikeView {
@@ -1928,73 +1949,26 @@ impl SpikeView {
     }
 
     fn render_editor_surface(
-        &self,
+        &mut self,
         layout: SpikeLayout,
         content_height: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let editor = self.editor.clone();
-        let image_cache = self.image_cache.clone();
         let width = layout.content_width;
-        let canvas_editor = editor.clone();
         let measurement_view = cx.entity();
         let paint_measurement_view = measurement_view.clone();
-        let mut surface = div()
-            .id("spike-editor-surface")
-            .debug_selector(|| "spike-editor-surface".to_owned())
-            .key_context("BlockEditor")
-            .track_focus(editor.read(cx).focus_handle())
-            .w(px(width))
-            .h(px(content_height))
-            .rounded(px(7.0))
-            .bg(rgba(0xffffffff))
-            .can_drop(|dragged, _window, _cx| dragged.is::<ExternalPaths>())
-            .on_drag_move::<ExternalPaths>(cx.listener(Self::on_external_paths_drag_move))
-            .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
-            .on_key_down(cx.listener(Self::on_surface_key_down))
-            .on_mouse_move(cx.listener(Self::on_surface_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_surface_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_surface_mouse_up));
-
-        if self.link_popover.is_none() {
-            surface = surface.capture_any_mouse_down(cx.listener(Self::on_surface_mouse_down));
-        }
-
-        let canvas = canvas(
-            move |bounds, window, cx| {
+        let hooks = EditorSurfaceHooks::new(
+            move |_window, cx| {
                 let _ = measurement_view.update(cx, |view, _| {
-                    if let Some(runtime) = view.measurement.as_mut() {
-                        if runtime.render_start.is_none() {
-                            runtime.render_start = Some(Instant::now());
-                        }
+                    if let Some(runtime) = view.measurement.as_mut()
+                        && runtime.render_start.is_none()
+                    {
+                        runtime.render_start = Some(Instant::now());
                     }
                 });
-                let _ = canvas_editor.update(cx, |editor, editor_cx| {
-                    let previous_height = editor.layout().total_height();
-                    let mask = window.content_mask().bounds;
-                    let (viewport_top, viewport_height) = surface_viewport(bounds, mask);
-                    editor.shape_visible_with_window(
-                        f32::from(viewport_top),
-                        f32::from(viewport_height),
-                        width,
-                        window,
-                    );
-                    editor.translate_layout(f32::from(bounds.origin.x), f32::from(bounds.origin.y));
-                    let measured_height = editor.layout().total_height();
-                    if (measured_height - previous_height).abs() > 0.01 {
-                        editor_cx.notify();
-                    }
-                });
-                canvas_editor.clone()
             },
-            move |bounds, entity, window, cx| {
-                let _ = crate::native_editor::render::paint_entity(
-                    entity,
-                    bounds,
-                    image_cache.clone(),
-                    window,
-                    cx,
-                );
+            move |window, cx| {
                 let fallback_started = Instant::now();
                 let _ = paint_measurement_view.update(cx, |view, view_cx| {
                     let (first_frame, render_started, shift_frame, reset_frame) = {
@@ -2073,11 +2047,33 @@ impl SpikeView {
                     }
                 });
             },
-        )
-        .w(px(width))
-        .h(px(content_height));
+        );
+        let _ = self.surface.update(cx, |surface, _| {
+            surface.set_embedded_frame(width, content_height);
+            surface.set_paint_hooks(hooks);
+        });
+        let mut surface = div()
+            .id("spike-editor-surface")
+            .debug_selector(|| "spike-editor-surface".to_owned())
+            .key_context("BlockEditor")
+            .track_focus(editor.read(cx).focus_handle())
+            .w(px(width))
+            .h(px(content_height))
+            .rounded(px(7.0))
+            .bg(rgba(0xffffffff))
+            .can_drop(|dragged, _window, _cx| dragged.is::<ExternalPaths>())
+            .on_drag_move::<ExternalPaths>(cx.listener(Self::on_external_paths_drag_move))
+            .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
+            .on_key_down(cx.listener(Self::on_surface_key_down))
+            .on_mouse_move(cx.listener(Self::on_surface_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_surface_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_surface_mouse_up));
 
-        let surface = bind_donor_actions(surface.child(canvas), &self.editor);
+        if self.link_popover.is_none() {
+            surface = surface.capture_any_mouse_down(cx.listener(Self::on_surface_mouse_down));
+        }
+
+        let surface = bind_donor_actions(surface.child(self.surface.clone()), &self.editor);
         surface.into_any_element()
     }
 }
@@ -3004,6 +3000,7 @@ mod tests {
                 .expect("production image fixture should insert");
             editor.read(cx).focus_handle().focus(window);
             SpikeView {
+                surface: new_embedded_surface(editor.clone(), Some(view_cache.clone()), cx),
                 editor,
                 title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
                 image_cache: Some(view_cache.clone()),
@@ -3136,6 +3133,7 @@ mod tests {
             let editor = app.new(|app| EditorCore::new(build_document(FixtureKind::Long), app));
             editor.read(app).focus_handle().focus(window);
             SpikeView {
+                surface: new_embedded_surface(editor.clone(), Some(cache.clone()), app),
                 editor,
                 title: app.new(|app| TitleInput::new("会议记录".into(), app)),
                 image_cache: Some(cache.clone()),
@@ -3338,6 +3336,7 @@ mod tests {
         let editor = cx.new(|cx| EditorCore::new(Document::from_paragraphs(["alpha", "beta"]), cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
+            surface: new_embedded_surface(editor.clone(), None, cx),
             editor,
             title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
@@ -3350,6 +3349,24 @@ mod tests {
             more_trigger_bounds: None,
             measurement: None,
         }
+    }
+
+    #[gpui::test]
+    async fn spike_mounts_the_shared_editable_editor_surface(cx: &mut TestAppContext) {
+        cx.update(|app| components::init(app));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.surface.read(cx).mode(),
+                crate::native_editor::surface::EditorSurfaceMode::Editable
+            );
+        });
+        assert!(
+            cx.debug_bounds("native-editor-surface").is_some(),
+            "spike must mount the reusable EditorSurface canvas, not a copied paint path"
+        );
     }
 
     #[gpui::test]
@@ -3653,6 +3670,7 @@ mod tests {
             cx.new(|cx| EditorCore::new(Document::from_paragraph("wrap ".repeat(360)), cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
+            surface: new_embedded_surface(editor.clone(), None, cx),
             editor,
             title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
@@ -3679,6 +3697,7 @@ mod tests {
         let editor = cx.new(|cx| EditorCore::new(document, cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
+            surface: new_embedded_surface(editor.clone(), None, cx),
             editor,
             title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
@@ -3714,6 +3733,7 @@ mod tests {
         let editor = cx.new(|cx| EditorCore::new(document, cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
+            surface: new_embedded_surface(editor.clone(), None, cx),
             editor,
             title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
@@ -3752,6 +3772,7 @@ mod tests {
         let editor = cx.new(|cx| EditorCore::new(document, cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
+            surface: new_embedded_surface(editor.clone(), None, cx),
             editor,
             title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
@@ -3775,6 +3796,7 @@ mod tests {
         let editor = cx.new(|cx| EditorCore::new(document, cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
+            surface: new_embedded_surface(editor.clone(), None, cx),
             editor,
             title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
@@ -3813,6 +3835,7 @@ mod tests {
         let editor = cx.new(|cx| EditorCore::new(document, cx));
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
+            surface: new_embedded_surface(editor.clone(), None, cx),
             editor,
             title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
@@ -5060,6 +5083,7 @@ mod tests {
             let editor = cx.new(|cx| EditorCore::new(sample_document(), cx));
             editor.read(cx).focus_handle().focus(window);
             SpikeView {
+                surface: new_embedded_surface(editor.clone(), Some(view_cache.clone()), cx),
                 editor,
                 title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
                 image_cache: Some(view_cache.clone()),

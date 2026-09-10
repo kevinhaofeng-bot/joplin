@@ -1,20 +1,30 @@
+use crate::app::ListViewMode;
 use app_lite_core::{NoteId, NoteProjection};
 use gpui::{InteractiveElement, IntoElement, ParentElement, Styled, div, px, rgba};
 use std::hash::{Hash, Hasher};
 
-pub fn render(projection: &NoteProjection, selected: bool) -> impl IntoElement {
+pub const fn fixed_height(mode: ListViewMode) -> f32 {
+    match mode {
+        ListViewMode::Cards => 112.0,
+        ListViewMode::Snippets => 88.0,
+        ListViewMode::Compact => 56.0,
+    }
+}
+
+pub fn render(projection: &NoteProjection, selected: bool, mode: ListViewMode) -> impl IntoElement {
     let title = if projection.title_prefix.trim().is_empty() {
         "无标题笔记"
     } else {
         &projection.title_prefix
     };
     let time = relative_time(projection.updated_time);
-    div()
+    let mut card = div()
         .id(("note-card", stable_element_id(projection.id.as_str())))
+        .debug_selector(|| "library-note-card".to_owned())
         .w_full()
-        .min_h(px(88.0))
+        .h(px(fixed_height(mode)))
+        .overflow_hidden()
         .p(px(12.0))
-        .mb(px(6.0))
         .rounded(px(8.0))
         .bg(if selected {
             rgba(0x00a82d19)
@@ -28,15 +38,18 @@ pub fn render(projection: &NoteProjection, selected: bool) -> impl IntoElement {
                 .text_size(px(15.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child(title.to_owned()),
-        )
-        .child(
+        );
+    if !matches!(mode, ListViewMode::Compact) {
+        card = card.child(
             div()
                 .mt(px(5.0))
                 .text_size(px(12.0))
                 .text_color(rgba(0x647064ff))
                 .child(projection.snippet.clone()),
-        )
-        .child(
+        );
+    }
+    if matches!(mode, ListViewMode::Cards) {
+        card = card.child(
             div()
                 .mt(px(8.0))
                 .text_size(px(11.0))
@@ -46,7 +59,9 @@ pub fn render(projection: &NoteProjection, selected: bool) -> impl IntoElement {
                 } else {
                     time
                 }),
-        )
+        );
+    }
+    card
 }
 
 fn relative_time(updated: i64) -> String {

@@ -2,7 +2,8 @@ use app_lite_core::EditJournalEntry;
 use app_lite_core::ResourceId;
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{
-    CanonicalDocument, CreateNote, LibraryEvent, LibraryRepository, ListQuery, SaveNote,
+    CanonicalDocument, CreateNote, LibraryEvent, LibraryRepository, LibraryShellState,
+    ListQuery, NoteId, SaveNote,
 };
 use rusqlite::Connection;
 use std::sync::mpsc::TryRecvError;
@@ -16,6 +17,60 @@ fn document(text: &str) -> CanonicalDocument {
             marks: Default::default(),
         }],
     }])
+}
+
+#[test]
+fn library_shell_state_is_typed_strict_and_clears_stale_selection_atomically() {
+    // This is deliberately a repository-level test: the UI must never assemble two
+    // unrelated string writes and leave a cross-generation pane/selection pair behind.
+    let profile = tempdir().unwrap();
+    let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let selected = NoteId::parse("11111111111111111111111111111111").unwrap();
+    let state = LibraryShellState {
+        sidebar_width: 260,
+        list_width: 410,
+        sidebar_visible: false,
+        list_visible: true,
+        selected_note_id: Some(selected.clone()),
+    };
+
+    repository.write_library_shell_state(&state).unwrap();
+    assert_eq!(repository.read_library_shell_state().unwrap(), state);
+
+    repository
+        .write_library_shell_state(&LibraryShellState {
+            selected_note_id: None,
+            ..state.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        repository.read_library_shell_state().unwrap().selected_note_id,
+        None
+    );
+
+    // A malformed field count, a non-boolean flag, or an out-of-range width is
+    // never allowed to turn a partially valid setting into invisible panes.
+    repository
+        .write_setting("library-shell.panes", "260,410,1")
+        .unwrap();
+    assert_eq!(
+        repository.read_library_shell_state().unwrap().pane_state(),
+        LibraryShellState::default().pane_state()
+    );
+    repository
+        .write_setting("library-shell.panes", "260,410,yes,1")
+        .unwrap();
+    assert_eq!(
+        repository.read_library_shell_state().unwrap().pane_state(),
+        LibraryShellState::default().pane_state()
+    );
+    repository
+        .write_setting("library-shell.panes", "0,410,1,1")
+        .unwrap();
+    assert_eq!(
+        repository.read_library_shell_state().unwrap().pane_state(),
+        LibraryShellState::default().pane_state()
+    );
 }
 
 #[test]

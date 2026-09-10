@@ -6,7 +6,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::borrow::Cow;
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use gpui::*;
 
@@ -17,9 +19,9 @@ mod components;
 mod config;
 mod editor;
 mod export;
-#[cfg(any(target_os = "macos", test))]
 mod file_url;
 mod i18n;
+mod library_menu;
 mod native_editor;
 mod net;
 mod spike_app;
@@ -28,6 +30,34 @@ mod ui;
 mod window_chrome;
 
 struct VelotypeAssets;
+
+fn resolve_library_profile(profile_override: Option<OsString>) -> Result<PathBuf, String> {
+    if let Some(profile_override) = profile_override {
+        let profile = PathBuf::from(profile_override);
+        if profile.as_os_str().is_empty() || !profile.is_absolute() {
+            return Err("JOPLIN_LITE_PROFILE 必须是非空绝对路径。".into());
+        }
+        return Ok(profile);
+    }
+    directories::ProjectDirs::from("com", "ArielKevin", "Joplin Lite")
+        .map(|dirs| dirs.data_local_dir().join("library"))
+        .ok_or_else(|| "无法解析系统资料库目录；未使用工作目录作为回退。".into())
+}
+
+fn initialize_library_runtime(
+    cx: &mut App,
+    profile: PathBuf,
+    open_url_receiver: mpsc::Receiver<Vec<String>>,
+) -> Result<(), String> {
+    let preferences = config::load_or_create_app_preferences()
+        .map_err(|error| format!("无法加载应用偏好设置: {error}"))?;
+    i18n::I18nManager::init_with_language_id(cx, &preferences.default_language_id);
+    theme::ThemeManager::init_with_theme_id(cx, &preferences.default_theme_id);
+    config::EditorSettings::init(cx, preferences.show_table_headers);
+    components::init_with_keybindings(cx, &preferences.keybindings);
+    library_menu::init(cx, profile, open_url_receiver);
+    Ok(())
+}
 
 impl AssetSource for VelotypeAssets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
@@ -191,7 +221,11 @@ fn main() {
         return;
     }
 
+    let (open_url_sender, open_url_receiver) = mpsc::channel::<Vec<String>>();
     let app = Application::new().with_assets(VelotypeAssets);
+    app.on_open_urls(move |urls| {
+        let _ = open_url_sender.send(urls);
+    });
 
     app.run(move |cx: &mut App| {
         if evernote_spike {
@@ -210,23 +244,35 @@ fn main() {
         }
 
         // The ordinary route is a local library, never the editor spike or a
-        // sample document. A temporary profile can be supplied for smoke tests.
-        let profile = std::env::var_os("JOPLIN_LITE_PROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                directories::ProjectDirs::from("com", "ArielKevin", "Joplin Lite")
-                    .map(|dirs| dirs.data_local_dir().join("library"))
-                    .unwrap_or_else(|| PathBuf::from("Joplin-Lite-Library"))
-            });
-        if !input_paths.is_empty() {
-            eprintln!("file arguments are not imported by the local-library route yet");
+        // sample document. A temporary profile can be supplied for smoke tests,
+        // but it must be an explicit absolute path.
+        let profile = match resolve_library_profile(std::env::var_os("JOPLIN_LITE_PROFILE")) {
+            Ok(profile) => profile,
+            Err(error) => {
+                let _ = ui::open_startup_error_window(cx, error);
+                cx.activate(true);
+                return;
+            }
+        };
+        if let Err(error) = initialize_library_runtime(cx, profile.clone(), open_url_receiver) {
+            let _ = ui::open_startup_error_window(cx, error);
+            cx.activate(true);
+            return;
         }
-        match ui::open_library_window(cx, profile) {
+        let import_notice =
+            (!input_paths.is_empty()).then(|| library_menu::import_notice(&input_paths));
+        match ui::open_library_window_with_notice(cx, profile, import_notice) {
             Ok(_) => {
                 cx.activate(true);
                 cx.refresh_windows();
             }
-            Err(error) => eprintln!("Joplin Lite could not open its local library: {error}"),
+            Err(error) => {
+                let _ = ui::open_startup_error_window(
+                    cx,
+                    format!("Joplin Lite 无法打开本地资料库: {error}"),
+                );
+                cx.activate(true);
+            }
         }
         return;
     });
@@ -234,8 +280,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetSource, VelotypeAssets};
+    use super::{AssetSource, VelotypeAssets, resolve_library_profile};
     use crate::native_editor::commands::CommandCatalogue;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
 
     #[test]
     fn editor_command_icons_load_from_the_real_application_asset_source() {
@@ -250,6 +298,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing descriptor asset: {path}"));
             assert!(!bytes.is_empty(), "empty descriptor asset: {path}");
         }
+    }
+
+    #[test]
+    fn library_profile_override_rejects_empty_and_relative_paths() {
+        assert!(resolve_library_profile(Some(OsString::new())).is_err());
+        assert!(resolve_library_profile(Some(OsString::from("relative-profile"))).is_err());
+        assert_eq!(
+            resolve_library_profile(Some(OsString::from("/tmp/joplin-lite-profile"))).unwrap(),
+            PathBuf::from("/tmp/joplin-lite-profile")
+        );
     }
 }
 

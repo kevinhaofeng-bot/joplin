@@ -153,6 +153,7 @@ impl RawDocumentRange {
 
 pub struct EditorCore {
     pub(crate) focus: FocusHandle,
+    access: EditorAccess,
     document: Document,
     selection: Selection,
     preferred_x: Option<Pixels>,
@@ -170,12 +171,25 @@ pub struct EditorCore {
     layout_offset: (f32, f32),
 }
 
+/// Capability boundary for the single editor core.  The default constructor
+/// remains editable for the performance spike; the real library uses
+/// `ReadOnly` until Task 4 can durably save every mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorAccess {
+    Editable,
+    ReadOnly,
+}
+
 impl EditorCore {
     /// Construct the production editor entity. The focus handle is allocated
     /// from the entity context exactly once and is then retained by this
     /// editor for every paint/input callback.
     pub fn new(document: Document, cx: &mut Context<Self>) -> Self {
-        Self::from_document_with_focus(document, cx.focus_handle())
+        Self::from_document_with_focus(document, cx.focus_handle(), EditorAccess::Editable)
+    }
+
+    pub fn new_read_only(document: Document, cx: &mut Context<Self>) -> Self {
+        Self::from_document_with_focus(document, cx.focus_handle(), EditorAccess::ReadOnly)
     }
 
     #[cfg(test)]
@@ -270,17 +284,27 @@ impl EditorCore {
     fn from_document(document: Document, cx: &mut TestAppContext) -> Self {
         let selection = document.end_selection();
         let focus = cx.update(|app| app.focus_handle());
-        Self::from_parts(document, selection, focus)
+        Self::from_parts(document, selection, focus, EditorAccess::Editable)
     }
 
-    fn from_document_with_focus(document: Document, focus: FocusHandle) -> Self {
+    fn from_document_with_focus(
+        document: Document,
+        focus: FocusHandle,
+        access: EditorAccess,
+    ) -> Self {
         let selection = document.end_selection();
-        Self::from_parts(document, selection, focus)
+        Self::from_parts(document, selection, focus, access)
     }
 
-    fn from_parts(document: Document, selection: Selection, focus: FocusHandle) -> Self {
+    fn from_parts(
+        document: Document,
+        selection: Selection,
+        focus: FocusHandle,
+        access: EditorAccess,
+    ) -> Self {
         Self {
             focus,
+            access,
             document,
             selection,
             preferred_x: None,
@@ -297,6 +321,22 @@ impl EditorCore {
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    pub fn access(&self) -> EditorAccess {
+        self.access
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.access == EditorAccess::ReadOnly
+    }
+
+    fn ensure_editable(&self) -> Result<(), DocumentError> {
+        if self.is_read_only() {
+            Err(DocumentError::ReadOnly)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn document(&self) -> &Document {
@@ -619,6 +659,7 @@ impl EditorCore {
     }
 
     pub fn cut_selection(&mut self) -> Result<String, DocumentError> {
+        self.ensure_editable()?;
         let copied = self.copy_plain_text();
         self.delete_selection()?;
         Ok(copied)
@@ -654,6 +695,7 @@ impl EditorCore {
         payload: ImagePayload,
         selection: Selection,
     ) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         let resource_id = Uuid::new_v4().to_string();
         let (width, height) = image_dimensions(&payload).ok_or_else(|| {
             DocumentError::InvalidOperation("unsupported or invalid image payload".into())
@@ -690,6 +732,7 @@ impl EditorCore {
         path: &Path,
         selection: Selection,
     ) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         let format = image_format_from_path(path).ok_or_else(|| {
             DocumentError::InvalidOperation("unsupported or invalid image path".into())
         })?;
@@ -728,6 +771,7 @@ impl EditorCore {
     }
 
     pub fn apply(&mut self, transaction: Transaction) -> Result<ApplyOutcome, DocumentError> {
+        self.ensure_editable()?;
         let outcome =
             self.history
                 .apply_with_selection(&mut self.document, self.selection, transaction)?;
@@ -748,6 +792,7 @@ impl EditorCore {
         &mut self,
         transaction: Transaction,
     ) -> Result<ApplyOutcome, DocumentError> {
+        self.ensure_editable()?;
         let outcome =
             self.history
                 .apply_with_selection(&mut self.document, self.selection, transaction)?;
@@ -763,6 +808,7 @@ impl EditorCore {
     }
 
     pub fn undo(&mut self) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         let outcome = self.history.undo_with_outcome(&mut self.document)?;
         self.selection = outcome.selection;
         self.preferred_x = None;
@@ -778,6 +824,7 @@ impl EditorCore {
     }
 
     pub fn redo(&mut self) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         let outcome = self.history.redo_with_outcome(&mut self.document)?;
         self.selection = outcome.selection;
         self.preferred_x = None;
@@ -806,6 +853,7 @@ impl EditorCore {
         new_text: &str,
         new_selected_range_utf16: Option<Range<usize>>,
     ) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         if let Some(range) = range_utf16.as_ref() {
             self.validate_input_range(range)?;
         }
@@ -947,6 +995,7 @@ impl EditorCore {
     }
 
     pub fn commit_marked_text(&mut self, text: &str) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         self.commit_marked_text_with_range(None, text)
     }
 
@@ -1436,6 +1485,7 @@ impl EditorCore {
     }
 
     pub fn insert_paragraph_break(&mut self) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         let selection = self.selection;
         let point = if selection.is_caret() {
             selection.head
@@ -1478,6 +1528,7 @@ impl EditorCore {
     }
 
     pub fn backspace(&mut self) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         if !self.selection.is_caret() {
             return self.delete_selection();
         }
@@ -1627,6 +1678,7 @@ impl EditorCore {
     }
 
     pub fn delete_forward(&mut self) -> Result<(), DocumentError> {
+        self.ensure_editable()?;
         if !self.selection.is_caret() {
             return self.delete_selection();
         }
@@ -2078,6 +2130,13 @@ impl EntityInputHandler for EditorCore {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        // A read-only session never owns an IME composition. More
+        // importantly, do not let a delayed platform unmark callback mutate
+        // composition bookkeeping after Task 4 has deliberately disabled all
+        // document-input paths.
+        if self.is_read_only() {
+            return;
+        }
         self.marked = None;
         self.composition_base = None;
         self.composition_base_range = None;
@@ -2090,6 +2149,9 @@ impl EntityInputHandler for EditorCore {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_read_only() {
+            return;
+        }
         if let Some(range) = range_utf16.as_ref()
             && let Err(error) = self.validate_input_range(range)
         {
@@ -2136,6 +2198,9 @@ impl EntityInputHandler for EditorCore {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_read_only() {
+            return;
+        }
         match self.replace_and_mark_utf16(range_utf16, new_text, new_selected_range_utf16) {
             Ok(()) => {
                 self.last_input_error = None;

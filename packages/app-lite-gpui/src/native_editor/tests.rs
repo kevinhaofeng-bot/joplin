@@ -6817,3 +6817,71 @@ async fn vertical_navigation_preserves_screen_x_across_list_inset_and_alignment(
         "vertical navigation must preserve screen x across inset/alignment: {before_x:?} -> {after_x:?}"
     );
 }
+
+#[gpui::test]
+async fn read_only_editor_rejects_document_history_ime_and_image_mutations(
+    cx: &mut gpui::TestAppContext,
+) {
+    // This catches the regression where only the visible toolbar is disabled
+    // while a paste, IME callback, image path, or direct transaction still
+    // changes a note whose Task 4 persistence does not yet exist.
+    let mut cx = cx.add_empty_window();
+    let entity = cx.new(|cx| EditorCore::new_read_only(Document::from_paragraph("原文"), cx));
+    let before = entity.read_with(cx, |editor, _| {
+        (
+            editor.document().semantic_snapshot(),
+            editor.selection(),
+            editor.undo_depth(),
+        )
+    });
+
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, editor_cx| {
+            assert_eq!(editor.insert_text("丢失"), Err(DocumentError::ReadOnly));
+            assert_eq!(
+                editor.insert_paragraph_break(),
+                Err(DocumentError::ReadOnly)
+            );
+            assert_eq!(editor.backspace(), Err(DocumentError::ReadOnly));
+            assert_eq!(editor.delete_forward(), Err(DocumentError::ReadOnly));
+            assert_eq!(editor.undo(), Err(DocumentError::ReadOnly));
+            assert_eq!(editor.redo(), Err(DocumentError::ReadOnly));
+            assert_eq!(
+                editor.insert_fixture_image("image", (8, 8)),
+                Err(DocumentError::ReadOnly)
+            );
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "候选",
+                Some(1..1),
+                window,
+                editor_cx,
+            );
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "提交", window, editor_cx,
+            );
+            editor.select_all();
+            assert_eq!(editor.copy_plain_text(), "原文");
+        });
+    });
+
+    let after = entity.read_with(cx, |editor, _| {
+        (
+            editor.document().semantic_snapshot(),
+            editor.selection(),
+            editor.undo_depth(),
+            editor.input_error().cloned(),
+        )
+    });
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.2, before.2);
+    assert!(
+        after.3.is_none(),
+        "read-only IME callbacks must be a no-op, not merely a rejected document write"
+    );
+    assert!(
+        after.1 != before.1,
+        "selection remains usable in read-only mode"
+    );
+}

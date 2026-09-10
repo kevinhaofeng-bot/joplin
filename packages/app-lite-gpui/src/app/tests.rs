@@ -1,4 +1,5 @@
-use super::{AppAction, AppModel, PaneState};
+use super::{AppAction, AppModel, AppStatus, ListViewMode, NoteSort, PaneState};
+use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, NoteId};
 use std::sync::Arc;
 
@@ -143,4 +144,136 @@ fn default_product_model_has_no_sample_document() {
     let model = AppModel::open(repository).expect("open model");
     assert!(model.projections().is_empty());
     assert_eq!(model.active_session_note_id(), None);
+}
+
+#[test]
+fn selected_session_retains_the_loaded_note_not_just_its_id() {
+    let (_profile, repository) = repository();
+    let stored = repository
+        .create_note(CreateNote {
+            title: "完整会话".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "来自 canonical HTML 的正文".into(),
+                    marks: Default::default(),
+                }],
+            }]),
+        })
+        .expect("create rich note");
+    let id = stored.id.clone();
+    let mut model = AppModel::open(repository).expect("open model");
+
+    model
+        .dispatch(AppAction::SelectNote(id.clone()))
+        .expect("select");
+
+    let note = model.active_note().expect("loaded note retained");
+    assert_eq!(note.id, id);
+    assert_eq!(note.title, "完整会话");
+    assert_eq!(note.body_html, stored.body_html);
+    assert_eq!(note.body_text, "来自 canonical HTML 的正文");
+}
+
+#[test]
+fn sort_and_view_actions_keep_selection_note_id_based_and_clear_old_errors() {
+    let (_profile, repository) = repository();
+    let zulu = create(&repository, "Zulu");
+    let alpha = create(&repository, "Alpha");
+    let mut model = AppModel::open(repository).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(zulu.clone()))
+        .expect("select");
+    assert!(
+        model
+            .dispatch(AppAction::SelectNote(
+                NoteId::parse("ffffffffffffffffffffffffffffffff").unwrap()
+            ))
+            .is_err()
+    );
+    assert!(matches!(model.status(), AppStatus::Error(_)));
+
+    model
+        .dispatch(AppAction::SetSort(NoteSort::TitleAscending))
+        .expect("sort");
+    model
+        .dispatch(AppAction::SetListViewMode(ListViewMode::Compact))
+        .expect("view mode");
+
+    assert_eq!(model.status(), &AppStatus::Ready);
+    assert_eq!(model.navigation().selected_note_id(), Some(&zulu));
+    assert_eq!(model.projections()[0].id, alpha);
+    assert_eq!(model.list_view_mode(), ListViewMode::Compact);
+    assert_eq!(model.sort(), NoteSort::TitleAscending);
+}
+
+#[test]
+fn trash_selected_action_clears_selection_and_removes_stale_restart_setting() {
+    let (_profile, repository) = repository();
+    let only = create(&repository, "唯一笔记");
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model.dispatch(AppAction::SelectNote(only)).expect("select");
+
+    model
+        .dispatch(AppAction::TrashSelected)
+        .expect("trash selected");
+    assert_eq!(model.navigation().selected_note_id(), None);
+    drop(model);
+
+    assert_eq!(
+        AppModel::open(repository)
+            .expect("restart")
+            .navigation()
+            .selected_note_id(),
+        None
+    );
+}
+
+#[test]
+fn committed_create_failure_is_truthful_and_never_creates_a_ghost_selection() {
+    let (_profile, repository) = repository();
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+
+    assert!(model.dispatch(AppAction::CreateNote).is_err());
+    assert_eq!(
+        repository
+            .list_notes(Default::default())
+            .expect("read committed create")
+            .len(),
+        1,
+        "the repository create committed before refresh failed"
+    );
+    assert_eq!(model.navigation().selected_note_id(), None);
+    assert!(matches!(
+        model.status(),
+        AppStatus::Error(message) if message.contains("笔记已创建")
+            && message.contains("资料库数据已提交")
+    ));
+}
+
+#[test]
+fn committed_trash_failure_is_truthful_and_leaves_recovery_possible() {
+    let (_profile, repository) = repository();
+    let note = create(&repository, "待删除");
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(note.clone()))
+        .expect("select note");
+    model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+
+    assert!(model.dispatch(AppAction::TrashSelected).is_err());
+    assert!(
+        repository
+            .list_notes(Default::default())
+            .expect("read committed trash")
+            .is_empty(),
+        "the repository trash committed before refresh failed"
+    );
+    assert!(matches!(
+        model.status(),
+        AppStatus::Error(message) if message.contains("移至废纸篓")
+            && message.contains("资料库数据已提交")
+    ));
 }

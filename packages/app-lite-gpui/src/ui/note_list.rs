@@ -1,45 +1,36 @@
-use crate::app::{AppAction, AppModel};
-use crate::ui::note_card;
-use app_lite_core::{NoteId, NoteProjection};
-use gpui::{
-    Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, div, px, rgba,
-};
+//! Helpers shared by the real GPUI uniform list and its mounted tests.
+//!
+//! The list construction itself belongs to `LibraryShell`, because every card
+//! click must travel through that shell's single action reducer.
 
-/// Windowed card rendering deliberately constructs only the first viewport.
-/// Scrolling/paging can advance this window without changing the projection contract.
-pub fn render(
-    items: &[NoteProjection],
-    selected: Option<&NoteId>,
-    model: Entity<AppModel>,
-    visible: bool,
-) -> impl IntoElement {
-    let width = if visible { 360.0 } else { 0.0 };
-    let mut list = div()
-        .id("note-list")
-        .w(px(width))
-        .h_full()
-        .flex_none()
-        .overflow_y_scroll()
-        .p(px(12.0))
-        .bg(rgba(0xffffffff))
-        .border_r_1()
-        .border_color(rgba(0xe1e5e1ff));
-    for projection in items.iter().take(100) {
-        let id = projection.id.clone();
-        let action_model = model.clone();
-        list = list.child(
-            div()
-                .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                    let _ = action_model.update(cx, |model, _| {
-                        model.dispatch(AppAction::SelectNote(id.clone()))
-                    });
-                })
-                .child(note_card::render(
-                    projection,
-                    selected == Some(&projection.id),
-                )),
-        );
-    }
-    list
+use crate::app::ListViewMode;
+
+pub const fn fixed_card_height(mode: ListViewMode) -> f32 {
+    crate::ui::note_card::fixed_height(mode)
+}
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static CONSTRUCTED_ITEMS: AtomicUsize = AtomicUsize::new(0);
+
+/// Called only for the range requested by GPUI's `uniform_list` processor.
+/// Keeping the instrumentation next to the virtual-list seam makes a future
+/// accidental eager iterator visible in the 1,662-card mounted test.
+pub fn record_constructed_items(count: usize) {
+    #[cfg(test)]
+    CONSTRUCTED_ITEMS.fetch_add(count, Ordering::Relaxed);
+    #[cfg(not(test))]
+    let _ = count;
+}
+
+#[cfg(test)]
+pub fn reset_constructed_items_for_test() {
+    CONSTRUCTED_ITEMS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn constructed_items_for_test() -> usize {
+    CONSTRUCTED_ITEMS.load(Ordering::Relaxed)
 }
