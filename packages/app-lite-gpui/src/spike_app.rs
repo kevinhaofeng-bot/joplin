@@ -652,25 +652,29 @@ impl SpikeView {
         let weak_view: WeakEntity<Self> = cx.entity().downgrade();
         window
             .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-                let result = cx
-                    .update(|window, app| {
-                        run_measurement_workload(&editor, options.fixture, window, app)
-                    })
-                    .ok()
-                    .flatten();
-                if let Some(result) = result {
-                    let _ = cx.update(|window, app| {
-                        let delivered = weak_view.update(app, |view, view_cx| {
-                            view.deliver_measurement_workload(result, window, view_cx)
+                match cx.update(|window, app| {
+                    run_measurement_workload(&editor, options.fixture, window, app)
+                }) {
+                    Ok(Some(result)) => {
+                        let _ = cx.update(|window, app| {
+                            let delivered = weak_view.update(app, |view, view_cx| {
+                                view.deliver_measurement_workload(result, window, view_cx)
+                            });
+                            if delivered.is_ok_and(|advanced| advanced) {
+                                window.refresh();
+                            }
                         });
-                        if delivered.is_ok_and(|advanced| advanced) {
-                            window.refresh();
-                        }
-                    });
-                    // `on_next_frame` only owns the following entity
-                    // notification; the async delivery must explicitly ask
-                    // GPUI to drive the dirty window into that frame.
-                    let _ = cx.refresh();
+                        // `on_next_frame` only owns the following entity
+                        // notification; the async delivery must explicitly ask
+                        // GPUI to drive the dirty window into that frame.
+                        let _ = cx.refresh();
+                    }
+                    Ok(None) => eprintln!(
+                        "Task 7 measurement workload produced no report; the owning window may have closed"
+                    ),
+                    Err(error) => eprintln!(
+                        "Task 7 measurement workload could not update its owning window: {error}"
+                    ),
                 }
             })
             .detach();
@@ -2389,15 +2393,17 @@ mod tests {
         assert!(!runtime.ready_prerequisites(true));
     }
 
-    #[gpui::test]
-    fn long_workload_delivery_starts_a_same_window_viewport_shift_before_its_next_canvas_paint(
+    fn assert_long_async_measurement_delivery_drives_every_production_viewport_paint(
         cx: &mut TestAppContext,
     ) {
         cx.update(|app| components::init(app));
+        let output_root =
+            std::env::temp_dir().join(format!("task7-async-delivery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&output_root).expect("Task 7 async delivery output directory");
         let options = SpikeLaunchOptions {
             fixture: FixtureKind::Long,
-            ready_file: PathBuf::from("/tmp/task7-delivery-ready"),
-            diagnostics_file: PathBuf::from("/tmp/task7-delivery-diagnostics"),
+            ready_file: output_root.join("ready"),
+            diagnostics_file: output_root.join("diagnostics.json"),
             run_id: "test-run".into(),
             binary_sha256: "test-sha".into(),
         };
@@ -2406,13 +2412,6 @@ mod tests {
         let (view, cx) = cx.add_window_view(move |window, app| {
             let editor = app.new(|app| EditorCore::new(build_document(FixtureKind::Long), app));
             editor.read(app).focus_handle().focus(window);
-            let mut measurement = MeasurementRuntime::new(options);
-            // Draw the first frame with no pending measurement work, then
-            // reset into the late-delivery state below. This consumes the
-            // initial window frame before the async workload completes.
-            measurement.workload_started = true;
-            measurement.workload_complete = true;
-            measurement.viewport_complete = true;
             SpikeView {
                 editor,
                 image_cache: Some(cache.clone()),
@@ -2423,41 +2422,21 @@ mod tests {
                 pointer_anchor: None,
                 drop_point: None,
                 more_trigger_bounds: None,
-                measurement: Some(Box::new(measurement)),
+                measurement: Some(Box::new(MeasurementRuntime::new(options))),
             }
         });
 
         cx.simulate_resize(size(px(1080.0), px(720.0)));
-        redraw(cx);
-        cx.update(|_, app| {
-            view.update(app, |view, _| {
-                let runtime = view.measurement.as_mut().expect("measurement runtime");
-                runtime.workload_complete = false;
-                runtime.viewport_complete = false;
-                runtime.viewport_shift_index = 0;
-                runtime.viewport_reset_requested = false;
-                runtime.viewport_reset_completed = false;
-                runtime.viewport_frames_requested = 0;
-                runtime.viewport_frames_completed = 0;
-                runtime.viewport_frame_pending = false;
-                runtime.viewport_reset_frames_requested = 0;
-                runtime.viewport_reset_frames_completed = 0;
-                runtime.viewport_reset_frame_pending = false;
-                runtime.render_sample_count = 0;
-                runtime.viewport_reset_paint_count = 0;
-            });
-        });
-        let report = cx.update(|window, app| {
-            let editor = view.read(app).editor.clone();
-            run_measurement_workload(&editor, FixtureKind::Long, window, app)
-                .expect("long fixture must complete the real 500 edit/undo workload")
-        });
-
+        // This is the only kickoff: the real canvas paint invokes
+        // `start_measurement`, which owns the Window::spawn production path.
         cx.update(|window, app| {
-            view.update(app, |view, view_cx| {
-                assert!(view.deliver_measurement_workload(report, window, view_cx));
-            });
+            window.draw(app).clear();
         });
+        // Drive only the spawned async workload task. `run_until_parked`
+        // would recursively consume the queued next-frame notifications in
+        // TestApp, which would no longer distinguish asynchronous delivery
+        // from the explicit production paints below.
+        let spawned_task_was_pending = cx.executor().tick();
 
         let delivered = cx.update(|_, app| {
             let runtime = view
@@ -2466,22 +2445,48 @@ mod tests {
                 .as_ref()
                 .expect("measurement runtime");
             (
+                runtime.workload_started,
                 runtime.workload_complete,
                 runtime.viewport_shift_index,
                 runtime.viewport_frames_requested,
                 runtime.viewport_frames_completed,
+                runtime.ready_written,
             )
         });
-        assert!(delivered.0);
         assert!(
-            delivered.1 >= 1,
+            delivered.0,
+            "production canvas paint must start Window::spawn"
+        );
+        assert!(
+            spawned_task_was_pending || delivered.1,
+            "Window::spawn must either remain queued or deliver the workload"
+        );
+        assert!(
+            delivered.1,
+            "async workload must be delivered to its live window"
+        );
+        assert!(
+            delivered.2 >= 1,
             "late async delivery must start the first viewport shift on its owning window"
         );
-        assert!(delivered.2 >= 1);
-        assert!(delivered.3 <= delivered.2);
+        assert!(delivered.3 >= 1);
+        assert!(
+            delivered.4 < delivered.3,
+            "the next manually driven canvas paint must have a pending production shift"
+        );
+        assert!(
+            !delivered.5 && !output_root.join("ready").exists(),
+            "delivery may initiate a frame but must not make readiness true before a paint"
+        );
 
-        redraw(cx);
-        let painted = cx.update(|_, app| {
+        // The 120 shift paints do not include the final restored-position
+        // paint, so readiness may only become true after paint 121.
+        for _ in delivered.4..120 {
+            cx.update(|window, app| {
+                window.draw(app).clear();
+            });
+        }
+        let before_reset_paint = cx.update(|_, app| {
             let runtime = view
                 .read(app)
                 .measurement
@@ -2490,13 +2495,65 @@ mod tests {
             (
                 runtime.viewport_frames_completed,
                 runtime.viewport_frames_requested,
+                runtime.viewport_reset_frames_completed,
+                runtime.viewport_reset_frames_requested,
+                runtime.ready_written,
             )
         });
-        assert!(
-            painted.0 >= 1,
-            "real canvas paint must commit a pending shift"
-        );
-        assert!(painted.1 >= painted.0);
+        assert_eq!(before_reset_paint.0, 120);
+        assert_eq!(before_reset_paint.1, 120);
+        assert_eq!(before_reset_paint.2, 0);
+        assert_eq!(before_reset_paint.3, 1);
+        assert!(!before_reset_paint.4);
+
+        cx.update(|window, app| {
+            window.draw(app).clear();
+        });
+        let settled = cx.update(|_, app| {
+            let runtime = view
+                .read(app)
+                .measurement
+                .as_ref()
+                .expect("measurement runtime");
+            (
+                runtime.viewport_frames_completed,
+                runtime.viewport_frames_requested,
+                runtime.viewport_reset_frames_completed,
+                runtime.viewport_reset_frames_requested,
+                runtime.viewport_complete,
+                runtime.ready_written,
+            )
+        });
+        assert_eq!(settled.0, 120);
+        assert_eq!(settled.1, 120);
+        assert_eq!(settled.2, 1);
+        assert_eq!(settled.3, 1);
+        assert!(settled.4 && settled.5);
+        assert!(output_root.join("ready").is_file());
+        assert!(output_root.join("diagnostics.json").is_file());
+        std::fs::remove_dir_all(output_root).expect("Task 7 async delivery output cleanup");
+    }
+
+    #[gpui::test]
+    fn long_async_measurement_delivery_drives_every_production_viewport_paint(
+        _cx: &mut TestAppContext,
+    ) {
+        // Window::spawn can complete synchronously in TestApp while the
+        // initiating canvas draw is still on the call stack. Give that real
+        // production path a normal native-sized stack; this is test harness
+        // isolation, not a production executor or scheduler.
+        std::thread::Builder::new()
+            .name("task7-async-delivery-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let mut cx = TestAppContext::single();
+                assert_long_async_measurement_delivery_drives_every_production_viewport_paint(
+                    &mut cx,
+                );
+            })
+            .expect("Task 7 async delivery test thread should start")
+            .join()
+            .expect("Task 7 async delivery test thread should pass");
     }
 
     #[test]
