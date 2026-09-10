@@ -432,6 +432,27 @@ impl LibraryRepository {
         receiver
     }
 
+    /// Reads application-owned shell state without exposing SQLite to the UI.
+    pub fn read_setting(&self, key: &str) -> Result<Option<String>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        connection
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Persists application-owned shell state without exposing SQLite to the UI.
+    pub fn write_setting(&self, key: &str, value: &str) -> Result<(), LibraryError> {
+        let now = self.now();
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        connection.execute(
+            "INSERT INTO settings (key, value, updated_time) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_time = excluded.updated_time",
+            params![key, value, now],
+        )?;
+        Ok(())
+    }
+
     pub fn default_notebook(&self) -> Result<Notebook, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
         connection
