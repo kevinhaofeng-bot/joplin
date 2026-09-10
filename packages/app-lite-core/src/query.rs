@@ -1,10 +1,18 @@
 use crate::{NoteId, NotebookId, ResourceId, TagId};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeletionScope {
+    #[default]
+    Active,
+    Trash,
+    All,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListQuery {
     pub notebook_id: Option<NotebookId>,
     pub tag_id: Option<TagId>,
-    pub include_trashed: bool,
+    pub deletion_scope: DeletionScope,
     pub limit: Option<usize>,
 }
 

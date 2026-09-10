@@ -33,3 +33,35 @@
 - This is only Task 2’s durable core contract, not an MVP application: GPUI `AppModel`, editor-session timing/coordinator, search workers, attachment UI, import/export, and transport remain owned by later tasks.
 - `edit_journal` stores deterministic UTF-8 deltas and is compacted atomically by `flush_snapshot`; timing/scheduling and replay orchestration are deliberately deferred to Task 4.
 - The schema contains durable search/sync contracts; Task 7 and Task 9 own FTS workers and network transport respectively.
+
+## Fix round 1 — review closure (baseline `079044e504cfa323844817fb473da4d4608dd31c`)
+
+### TDD record
+
+1. Added black-box `repository_review_regressions` coverage before the repair. Its first focused run was RED in six independent ways: legacy RTF opened instead of failing closed; `A,B,A` resources violated the relation key; stale snapshot saves overwrote a newer revision; organization changes did not enqueue search; a persisted thumbnail was recomputed; and purge created no durable tombstone.
+2. Added migration/association/ID-clock regression cases while closing those failures: rich RTF including bold/italic/underline/image overlay/draft/deleted metadata; v3 canonical `A,B,A`; stale association rollback; true FK behavior; deterministic per-repository clock rollback; and deterministic entity-ID collision retries.
+3. The final focused review suite is GREEN (11 tests), followed by the complete core/native/GPUI gates below.
+
+### Review-item mapping
+
+- C1: v3 rows with `markup_language=1` now return `LegacyRtfMigrationRequired` before any transaction or schema write. The raw RTF, row metadata, `user_version=3`, and absent outbox are asserted. Task 8 remains responsible for a backed-up RTF conversion.
+- C2: `note_resources` now keys each occurrence by `(note_id, position)` and indexes `resource_id`; snapshot and v3 migration tests prove exact `A,B,A` ordering after reopen.
+- I1/I2: move, tag, trash, and restore write search queue/outbox within their data transaction, emit only after commit, use live-notebook restore fallback, and are protected by SQLite foreign keys with PRAGMA readback and behavior checks.
+- I3/I4: `SaveNote` carries `expected_revision` and returns typed `StaleRevision`; v3 imports get revision-1 history plus migration search bootstrap but no outbox, while v4 reopen returns without logical writes.
+- I5/I6: resource-store safety preflight happens before migration; purge is trash-only, records a durable tombstone, and retains independent revision audit history.
+- I7/I11: production IDs use OS CSPRNG 128-bit values; per-repository ID/clock seams are deterministic and isolated to tests. Database collisions retry before exposure, and note `updated_time` is `max(now, previous + 1)` for identical or backward clocks.
+- I8/I9: selected thumbnails are persisted and read only if still a live associated image (otherwise ordered fallback); `DeletionScope` explicitly selects Active, Trash, or All.
+- I10/M3: `AssociateResource` applies body/resource occurrence/revision/search/outbox as one snapshot transaction; stale association rolls back without a visible partial relation. Resource metadata exposes typed `BlobHash`.
+- M1/M2: WAL and foreign-key PRAGMAs are read back; migration and SQLite errors retain typed source errors rather than becoming opaque strings.
+
+### Fix-round verification
+
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml` — 76 tests passed.
+- `cargo test --manifest-path packages/app-lite-native/Cargo.toml` — 225 tests passed.
+- `cargo check --manifest-path packages/app-lite-gpui/Cargo.toml` — passed (existing warnings only).
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores` — 996 passed, 1 filtered.
+- `cargo fmt --manifest-path packages/app-lite-core/Cargo.toml -- --check` and `git diff --check` — passed.
+
+### Remaining concern
+
+- Fail-closed legacy RTF is intentional until Task 8 can perform its dedicated, backed-up conversion; no RTF parser or AppKit/GPUI dependency was introduced into `app-lite-core`.

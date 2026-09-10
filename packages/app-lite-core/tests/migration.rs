@@ -76,6 +76,32 @@ fn v3_upgrade_is_atomic_and_does_not_enqueue_imported_history() {
     assert_eq!(migrated.body_html, "<p>body</p>");
     assert_eq!(repository.outbox_count().unwrap(), 0);
     assert_eq!(migrated.revision, 1);
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM note_revisions WHERE note_id=?1 AND revision=1",
+                [migrated.id.as_str()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT reason FROM search_queue WHERE note_id=?1",
+                [migrated.id.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "migration-bootstrap"
+    );
+    drop(repository);
+    let before = std::fs::read(&path).unwrap();
+    LibraryRepository::open(&path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]
@@ -88,7 +114,7 @@ fn deterministic_mid_migration_failure_preserves_v3_version_and_rows() {
     drop(connection);
     assert!(matches!(
         LibraryRepository::open(&path),
-        Err(LibraryError::MigrationFailed)
+        Err(LibraryError::MigrationFailed(_))
     ));
     let check = Connection::open(&path).unwrap();
     assert_eq!(
@@ -119,6 +145,34 @@ fn open_refuses_database_path_replaced_with_symlink() {
         LibraryRepository::open(&path),
         Err(LibraryError::InvalidDatabasePath)
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn unsafe_resource_preflight_leaves_v3_database_unmigrated() {
+    // Catches publishing schema v4 before the profile resource root has been safety-bound.
+    use std::os::unix::fs::symlink;
+    let profile = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    seed_native_v3(&connection, false);
+    drop(connection);
+    symlink(outside.path(), profile.path().join("resources")).unwrap();
+    assert!(LibraryRepository::open(&path).is_err());
+    let check = Connection::open(&path).unwrap();
+    assert_eq!(
+        check
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        check
+            .query_row("SELECT count(*) FROM notes", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 
 fn seed_native_v3(connection: &Connection, incompatible_notebooks: bool) {

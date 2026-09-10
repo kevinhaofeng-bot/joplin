@@ -4,15 +4,11 @@ use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceId(String);
@@ -75,6 +71,8 @@ pub enum ResourceError {
     Symlink,
     #[error("resource blob is corrupt")]
     CorruptBlob,
+    #[error("resource ID entropy failed")]
+    Entropy(String),
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +122,7 @@ impl ResourceStore {
         let sha256 = BlobHash::new(hex_digest(&digest)).expect("SHA-256 digest is valid");
         persist_blob(self.blobs_dir.0, input.bytes, sha256.as_str())?;
         Ok(ResourceBlob {
-            id: ResourceId::new(new_resource_id()).expect("generated resource id is valid"),
+            id: ResourceId::new(new_resource_id()?).expect("generated resource id is valid"),
             sha256,
             size: input.bytes.len(),
         })
@@ -182,7 +180,7 @@ fn persist_blob(dir_fd: RawFd, bytes: &[u8], sha256: &str) -> Result<(), Resourc
         return Ok(());
     }
 
-    let temp_name = format!(".{sha256}.{}.tmp", new_resource_id());
+    let temp_name = format!(".{sha256}.{}.tmp", new_resource_id()?);
     let temp_fd = unsafe {
         let name =
             std::ffi::CString::new(temp_name.as_bytes()).map_err(|_| ResourceError::UnsafePath)?;
@@ -412,13 +410,10 @@ fn hex_digest(digest: &[u8]) -> String {
     output
 }
 
-fn new_resource_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let counter = NEXT_ID.fetch_add(1, Ordering::Relaxed) as u128;
-    format!("{nanos:032x}", nanos = nanos ^ counter)
+fn new_resource_id() -> Result<String, ResourceError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| ResourceError::Entropy(error.to_string()))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(test)]

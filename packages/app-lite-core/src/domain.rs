@@ -1,4 +1,4 @@
-use crate::{CanonicalDocument, ResourceId};
+use crate::{BlobHash, CanonicalDocument, ResourceId};
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -66,7 +66,7 @@ pub struct Tag {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredResource {
     pub id: ResourceId,
-    pub sha256: String,
+    pub sha256: BlobHash,
     pub title: String,
     pub mime: String,
     pub file_extension: String,
@@ -100,9 +100,16 @@ pub struct CreateNote {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveNote {
     pub id: NoteId,
+    pub expected_revision: i64,
     pub title: String,
     pub document: CanonicalDocument,
     pub resource_ids: Vec<ResourceId>,
+    pub selected_thumbnail_id: Option<ResourceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociateResource {
+    pub snapshot: SaveNote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

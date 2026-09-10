@@ -57,6 +57,7 @@ fn repository_flow_persists_ids_relationships_html_text_and_resource_order() {
     let updated = repository
         .save_note(SaveNote {
             id: first.id.clone(),
+            expected_revision: first.revision,
             title: "图文笔记".into(),
             document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
                 style: BlockStyle::default(),
@@ -76,6 +77,7 @@ fn repository_flow_persists_ids_relationships_html_text_and_resource_order() {
                 ],
             }]),
             resource_ids: vec![image.clone()],
+            selected_thumbnail_id: Some(image.clone()),
         })
         .unwrap();
     repository
@@ -218,9 +220,11 @@ fn flush_snapshot_compacts_crash_journal_with_the_next_durable_revision() {
     let saved = repository
         .flush_snapshot(SaveNote {
             id: note.id,
+            expected_revision: note.revision,
             title: "journal".into(),
             document: document("after"),
             resource_ids: Vec::new(),
+            selected_thumbnail_id: None,
         })
         .unwrap();
     assert_eq!(saved.revision, 2);
