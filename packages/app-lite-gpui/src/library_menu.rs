@@ -151,7 +151,7 @@ pub(crate) fn import_notice(paths: &[PathBuf]) -> String {
 mod tests {
     use super::{LibraryMenuLifecycle, import_notice};
     use crate::ui::{self, StartupErrorView};
-    use gpui::{AppContext, TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext};
     use std::path::PathBuf;
 
     #[test]

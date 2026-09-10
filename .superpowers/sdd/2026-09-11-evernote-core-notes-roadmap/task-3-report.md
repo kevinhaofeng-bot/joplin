@@ -73,3 +73,56 @@ durable `SaveCoordinator`. Image/resource resolution and durable image insertion
 remain Task 5. These are visible limits, not silent fallback paths. The listed
 Task 3 review findings now have code and test closure; the architecture still
 requires an independent re-review before declaring final acceptance.
+
+## Fix round 2 — 2026-09-11
+
+This round addresses every item from the independent `Fix round` re-review.
+The product/test implementation is `884573693` (`Close Task 3 review gaps`);
+the small follow-up also adds a positive resource-read-observer proof so the
+projection's zero-read assertion cannot pass after its real notification is
+deleted.
+
+| Re-review finding | Closure and mutation-sensitive evidence |
+| --- | --- |
+| R-I1 restored tail not visible | `LibraryShell::new` issues the selected-item `UniformListScrollHandle` request immediately after initial surface sync. `restored_tail_selection_scrolls_on_its_first_mounted_draw` pre-writes the 1,662nd selected `NoteId`, mounts once, and requires that tail range/card on the first draw. |
+| R-I2 observer was bypassable | `apply_action` and the event bridge now only reduce/mutate `AppModel` and call `model_cx.notify()`. The retained observer is the sole normal path for surface replacement, deferred scroll and shell notification. `retained_model_observer_syncs_and_scrolls_an_independent_model_change` mutates/notifies the retained model outside an input callback and requires both mounted surface replacement and tail scroll, so deleting the observer or model notify turns it red. |
+| R-I3 split read snapshot | `read_library_shell_state` reads panes and selection inside one deferred SQLite read transaction. A two-repository interleave hook commits a full next generation between its two reads and proves the first result is entirely old while the next is entirely new. |
+| R-I4 Cmd-N double hydrate | `AppModel::create_note` now consumes the complete `Note` returned by `repository.create_note`, refreshes projection successfully first, then creates the selected active session without a second `load_note`. The load observer test requires exactly one selected ID and one hydration. |
+| R-I5 early error lifecycle / dropped URL errors | The last-window quit subscription installs before every fallible profile/runtime branch, including startup-error creation. The URL bridge turns open failure into a visible `StartupErrorView` and preserves its `Result`. Mounted tests close the only startup error window and verify quit, and verify a forced URL-open failure paints an error window. |
+| R-I6 retained spike strong cycle | Retained surface hooks capture `WeakEntity<SpikeView>` and tolerate failed upgrades. The typical-fixture close test holds weak parent/surface/editor/cache handles, closes the window, drains GPUI releases, and requires every handle to expire. |
+| R-I7 evidence gaps | Test-only library surface hooks plus core shape and `paint_entity` counters prove the shared canvas really shapes and paints. The mounted readonly test drives real surface click, IME input, clipboard paste/key handling and copy, then checks document semantic snapshot, history depths/bytes, image-store count and selection are unchanged. Resource observers now have both a positive exact-hash test and the unsupported-image library zero-byte-read test. |
+| R-M1 shell-state boundaries | `LibraryShellState::validate`/`try_new`, writer validation and live `PaneState` normalization reject or repair zero/out-of-range dimensions before rendering/persisting. Generic settings APIs reject reserved shell keys; raw SQLite remains the narrow corruption seam for recovery testing. |
+| R-M2 formatting | Rustfmt was applied to both manifests and both formatter checks now pass. |
+
+### Exact Fix-round-2 test accounting
+
+This round adds **11 new independent tests**: one cross-connection snapshot
+test; two `AppModel` tests (Cmd-N one-hydrate and live pane normalization); two
+library-menu lifecycle/error-window tests; one spike destruction test; four
+mounted UI tests (first-draw restored tail, independent retained observer,
+shared canvas shape/paint, resource zero-read); and one positive resource-read
+observer test. It also strengthens the existing mounted readonly test with real
+mouse, IME, key and clipboard delivery plus document/history/image-store
+invariants, and strengthens the existing persistence corruption test to use the
+typed writer/reserved-key boundary.
+
+### Fix-round-2 verification
+
+- `cargo test --quiet --manifest-path packages/app-lite-core/Cargo.toml` — **PASS, 72 tests**.
+- `cargo test --quiet --manifest-path packages/app-lite-native/Cargo.toml` — **PASS, 225 tests**.
+- `cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype app::tests::` — **PASS, 62 focused matches**.
+- `cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype ui::tests::` — **PASS, 19 mounted shell tests**.
+- Exact codec and read-only filters — **PASS** (3 codec and 4 readonly matches); `spike_app::tests::` — **PASS, 43 matches**.
+- Full GPUI suite with only the existing exact donor skip: `cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores` — **PASS, 1,047 passed, 1 filtered**.
+- `cargo check --all-targets --manifest-path packages/app-lite-gpui/Cargo.toml` and `cargo build --release --manifest-path packages/app-lite-gpui/Cargo.toml` — **PASS**.
+- `cargo fmt --manifest-path packages/app-lite-core/Cargo.toml -- --check`, `cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml -- --check`, and `git diff --check` — **PASS**.
+- Fresh absolute `JOPLIN_LITE_PROFILE` release smoke stayed alive for eight seconds, created only the isolated `library.sqlite` + WAL/SHM, and returned `PRAGMA integrity_check = ok`; the child process was then intentionally terminated.
+- Release spike contracts: `empty` wrote `task7-ready` and diagnostics with `texture_bytes=0`, `layout_cache_bytes=9,672`, `undo_bytes=1,233`, `render_commit_p95_us=9,091`; `typical` wrote `task7-ready` and diagnostics with `texture_bytes=26,361,856`, `layout_cache_bytes=1,009,056`, `undo_bytes=3,822`, `render_commit_p95_us=9,175`. Each smoke child was intentionally terminated after both artifacts existed.
+
+### Remaining scope limits after round 2
+
+There are no known remaining Task-3 Critical/Important/Minor findings in this
+round. The library is deliberately read-only until Task 4; reverse conversion,
+durable saving and writable editing are not claimed here. Resource/image decode
+and durable insertion remain Task 5. Independent re-review remains the approval
+authority.

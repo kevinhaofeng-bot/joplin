@@ -24,6 +24,22 @@ fn put_publishes_sha256_addressed_bytes_that_read_back() {
 }
 
 #[test]
+fn read_observer_reports_the_exact_blob_that_was_hydrated() {
+    // Pairs with the library projection's zero-read assertion: deleting the
+    // actual notification from ResourceStore::read must make this fail.
+    let root = tempdir().unwrap();
+    let store = ResourceStore::new(root.path()).unwrap();
+    let stored = store.put(png_input(b"observed resource bytes")).unwrap();
+    let reads = store.observe_reads();
+
+    assert_eq!(
+        store.read(&stored.sha256).unwrap(),
+        b"observed resource bytes"
+    );
+    assert_eq!(reads.recv().unwrap(), stored.sha256);
+}
+
+#[test]
 fn put_keeps_duplicate_blobs_addressed_once_and_readable() {
     // Catches duplicate input publishing divergent blobs or corrupting the first publication.
     let root = tempdir().unwrap();
