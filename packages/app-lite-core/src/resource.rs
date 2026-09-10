@@ -93,6 +93,7 @@ pub struct ResourceBlob {
 
 pub struct ResourceStore {
     blobs_dir: DirFd,
+    cleanup_profile: Option<DirFd>,
 }
 
 /// A profile directory held open by descriptor. SQLite still needs a pathname,
@@ -123,13 +124,29 @@ impl ResourceStore {
         let profile_dir = open_dir_path(&profile_root)?;
         let resources_dir = open_or_create_dir(profile_dir.0, "resources")?;
         let blobs_dir = open_or_create_dir(resources_dir.0, "blobs")?;
-        Ok(Self { blobs_dir })
+        Ok(Self {
+            blobs_dir,
+            cleanup_profile: None,
+        })
     }
 
     pub(crate) fn from_profile_dir(profile: &ProfileDir) -> Result<Self, ResourceError> {
+        let created_root = !child_exists(profile.fd.0, "resources")?;
         let resources_dir = open_or_create_dir(profile.fd.0, "resources")?;
         let blobs_dir = open_or_create_dir(resources_dir.0, "blobs")?;
-        Ok(Self { blobs_dir })
+        let cleanup_profile = if created_root {
+            Some(duplicate_dir_fd(profile.fd.0)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            blobs_dir,
+            cleanup_profile,
+        })
+    }
+
+    pub(crate) fn mark_published(&mut self) {
+        self.cleanup_profile = None;
     }
 
     pub fn put(&self, input: ResourceInput<'_>) -> Result<ResourceBlob, ResourceError> {
@@ -164,6 +181,16 @@ impl ResourceStore {
             return Err(ResourceError::CorruptBlob);
         }
         Ok(bytes)
+    }
+}
+
+impl Drop for ResourceStore {
+    fn drop(&mut self) {
+        let Some(profile) = self.cleanup_profile.take() else {
+            return;
+        };
+        let _ = unlink_dir_at(profile.0, "resources/blobs");
+        let _ = unlink_dir_at(profile.0, "resources");
     }
 }
 
@@ -346,6 +373,47 @@ fn open_or_create_dir(parent_fd: RawFd, name: &str) -> Result<DirFd, ResourceErr
     let child = DirFd(fd);
     fsync_fd(parent_fd)?;
     Ok(child)
+}
+
+fn child_exists(parent_fd: RawFd, name: &str) -> Result<bool, ResourceError> {
+    let name = std::ffi::CString::new(name).map_err(|_| ResourceError::UnsafePath)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error.into())
+    }
+}
+
+fn duplicate_dir_fd(fd: RawFd) -> Result<DirFd, ResourceError> {
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        Err(io_error())
+    } else {
+        Ok(DirFd(duplicate))
+    }
+}
+
+fn unlink_dir_at(parent_fd: RawFd, name: &str) -> std::io::Result<()> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn open_blob(dir_fd: RawFd, name: &str) -> Result<Option<File>, ResourceError> {

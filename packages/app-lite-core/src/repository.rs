@@ -14,6 +14,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenTestPhase {
+    AfterProfileBound,
+    AfterSqliteOpen,
+    AfterLegacyGate,
+    BeforeMigrationCommit,
+}
+
+#[cfg(feature = "test-support")]
+pub type OpenTestHook = Arc<dyn Fn(OpenTestPhase) + Send + Sync>;
+
 /// Supplies wall-clock milliseconds.  Kept at the repository boundary so a
 /// transaction can protect monotonic note timestamps even if the wall clock is
 /// adjusted backwards.
@@ -116,7 +128,13 @@ pub struct LibraryRepository {
 
 impl LibraryRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LibraryError> {
-        Self::open_inner(path, Arc::new(SystemClock), Arc::new(SystemIdSource))
+        Self::open_inner(
+            path,
+            Arc::new(SystemClock),
+            Arc::new(SystemIdSource),
+            #[cfg(feature = "test-support")]
+            None,
+        )
     }
 
     #[cfg(feature = "test-support")]
@@ -126,17 +144,33 @@ impl LibraryRepository {
         clock: Arc<dyn RepositoryClock>,
         id_source: Arc<dyn RepositoryIdSource>,
     ) -> Result<Self, LibraryError> {
-        Self::open_inner(path, clock, id_source)
+        Self::open_inner(path, clock, id_source, None)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn open_with_sources_and_hook(
+        path: impl AsRef<Path>,
+        clock: Arc<dyn RepositoryClock>,
+        id_source: Arc<dyn RepositoryIdSource>,
+        hook: OpenTestHook,
+    ) -> Result<Self, LibraryError> {
+        Self::open_inner(path, clock, id_source, Some(hook))
     }
 
     fn open_inner(
         path: impl AsRef<Path>,
         clock: Arc<dyn RepositoryClock>,
         id_source: Arc<dyn RepositoryIdSource>,
+        #[cfg(feature = "test-support")] hook: Option<OpenTestHook>,
     ) -> Result<Self, LibraryError> {
         let path = checked_database_path(path.as_ref())?;
         let profile = ProfileDir::open(path.parent().ok_or(LibraryError::InvalidDatabasePath)?)
             .map_err(|_| LibraryError::InvalidDatabasePath)?;
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &hook {
+            hook(OpenTestPhase::AfterProfileBound);
+        }
         if !profile
             .verify_path_identity()
             .map_err(|_| LibraryError::InvalidDatabasePath)?
@@ -148,6 +182,10 @@ impl LibraryRepository {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(&path, flags)?;
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &hook {
+            hook(OpenTestPhase::AfterSqliteOpen);
+        }
         if !profile
             .verify_path_identity()
             .map_err(|_| LibraryError::InvalidDatabasePath)?
@@ -176,6 +214,18 @@ impl LibraryRepository {
                     Ok(())
                 } else {
                     Err(LibraryError::InvalidDatabasePath)
+                }
+            },
+            || {
+                #[cfg(feature = "test-support")]
+                if let Some(hook) = &hook {
+                    hook(OpenTestPhase::AfterLegacyGate);
+                }
+            },
+            || {
+                #[cfg(feature = "test-support")]
+                if let Some(hook) = &hook {
+                    hook(OpenTestPhase::BeforeMigrationCommit);
                 }
             },
         )

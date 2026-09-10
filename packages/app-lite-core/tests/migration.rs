@@ -2,6 +2,30 @@ use app_lite_core::{LibraryError, LibraryRepository};
 use rusqlite::Connection;
 use tempfile::tempdir;
 
+#[cfg(feature = "test-support")]
+use app_lite_core::{OpenTestHook, OpenTestPhase, RepositoryClock, RepositoryIdSource};
+#[cfg(feature = "test-support")]
+use std::sync::{Arc, Mutex, mpsc};
+#[cfg(feature = "test-support")]
+use std::thread;
+
+#[cfg(feature = "test-support")]
+struct FixedClock;
+#[cfg(feature = "test-support")]
+impl RepositoryClock for FixedClock {
+    fn now_millis(&self) -> i64 {
+        1
+    }
+}
+#[cfg(feature = "test-support")]
+struct FixedIds;
+#[cfg(feature = "test-support")]
+impl RepositoryIdSource for FixedIds {
+    fn next_id(&self) -> Result<String, LibraryError> {
+        Ok("a".repeat(32))
+    }
+}
+
 #[test]
 fn open_creates_clean_v4_database_idempotently() {
     // Catches a fresh profile missing v4 schema/PRAGMAs or a second open changing it.
@@ -112,6 +136,8 @@ fn deterministic_mid_migration_failure_preserves_v3_version_and_rows() {
     let connection = Connection::open(&path).unwrap();
     seed_native_v3(&connection, true);
     drop(connection);
+    let before = v3_snapshot(&path);
+    let before_entries = profile_entries(profile.path());
     assert!(matches!(
         LibraryRepository::open(&path),
         Err(LibraryError::MigrationFailed(_))
@@ -129,6 +155,30 @@ fn deterministic_mid_migration_failure_preserves_v3_version_and_rows() {
             .unwrap(),
         "legacy"
     );
+    assert_eq!(v3_snapshot(&path), before);
+    assert_eq!(profile_entries(profile.path()), before_entries);
+}
+
+#[test]
+fn legacy_refusal_preserves_the_complete_v3_profile_snapshot() {
+    // Catches a refusal that leaves a hidden DDL, WAL, resource directory, or legacy field mutation.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    seed_native_v3(&connection, false);
+    connection.execute(
+        "UPDATE notes SET body_rtf=X'7b5c727466315c6220626f6c645c6230', markup_language=1, is_draft=1, deleted_time=9",
+        [],
+    ).unwrap();
+    drop(connection);
+    let before = v3_snapshot(&path);
+    let before_entries = profile_entries(profile.path());
+    assert!(matches!(
+        LibraryRepository::open(&path),
+        Err(LibraryError::LegacyRtfMigrationRequired)
+    ));
+    assert_eq!(v3_snapshot(&path), before);
+    assert_eq!(profile_entries(profile.path()), before_entries);
 }
 
 #[cfg(unix)]
@@ -187,5 +237,174 @@ PRAGMA user_version = 3;").unwrap();
         connection
             .execute_batch("CREATE TABLE notebooks (wrong TEXT);")
             .unwrap();
+    }
+}
+
+fn v3_snapshot(path: &std::path::Path) -> String {
+    let connection = Connection::open(path).unwrap();
+    let master = connection
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let columns = [
+        "notes",
+        "resource_blobs",
+        "resources",
+        "note_resources",
+        "notebooks",
+    ]
+    .iter()
+    .map(|table| {
+        let sql = format!("PRAGMA table_info({table})");
+        let values = connection
+            .prepare(&sql)
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        ((*table).to_owned(), values)
+    })
+    .collect::<Vec<_>>();
+    let rows = connection.prepare("SELECT id,title,body,body_text,hex(body_rtf),markup_language,is_draft,created_time,updated_time,deleted_time FROM notes ORDER BY id").unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?, row.get::<_, i64>(7)?, row.get::<_, i64>(8)?, row.get::<_, i64>(9)?))).unwrap()
+        .collect::<Result<Vec<_>, _>>().unwrap();
+    let journal: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    format!("{master:?}|{columns:?}|{rows:?}|{journal}|{version}")
+}
+
+fn profile_entries(path: &std::path::Path) -> Vec<String> {
+    let mut entries = std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn migration_gate_blocks_a_second_v3_writer_before_html_publication() {
+    // Catches checking legacy RTF outside the BEGIN IMMEDIATE lock.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let seed = Connection::open(&path).unwrap();
+    seed_native_v3(&seed, false);
+    drop(seed);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let gate_receiver = Arc::clone(&release_rx);
+    let hook: OpenTestHook = Arc::new(move |phase| {
+        if phase == OpenTestPhase::AfterLegacyGate {
+            entered_tx.send(()).unwrap();
+            gate_receiver.lock().unwrap().recv().unwrap();
+        }
+    });
+    let worker_path = path.clone();
+    let opener = thread::spawn(move || {
+        LibraryRepository::open_with_sources_and_hook(
+            worker_path,
+            Arc::new(FixedClock),
+            Arc::new(FixedIds),
+            hook,
+        )
+    });
+    entered_rx.recv().unwrap();
+    let writer = Connection::open(&path).unwrap();
+    let write = writer.execute("INSERT INTO notes VALUES ('11111111111111111111111111111111', 'rtf', '<p>fallback</p>', 'fallback', X'7b5c727466317d', 1, 1, 1, 1, 0)", []);
+    assert!(
+        write.is_err(),
+        "writer crossed the migration gate: {write:?}"
+    );
+    drop(writer);
+    release_tx.send(()).unwrap();
+    let repository = opener.join().unwrap().unwrap();
+    drop(repository);
+    let check = Connection::open(&path).unwrap();
+    assert_eq!(
+        check
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        check
+            .query_row("SELECT count(*) FROM notes", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[cfg(all(feature = "test-support", unix))]
+#[test]
+fn profile_swaps_at_both_open_gaps_abort_before_v4_publication() {
+    // Catches pairing SQLite and resources with different profile directories.
+    for phase in [
+        OpenTestPhase::AfterProfileBound,
+        OpenTestPhase::AfterSqliteOpen,
+    ] {
+        let root = tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let path = profile.join("library.sqlite");
+        let seed = Connection::open(&path).unwrap();
+        seed_native_v3(&seed, false);
+        drop(seed);
+        let original = root.path().join("original");
+        let replacement = profile.clone();
+        let fired = Arc::new(Mutex::new(false));
+        let fired_hook = Arc::clone(&fired);
+        let hook_original = original.clone();
+        let hook_replacement = replacement.clone();
+        let hook: OpenTestHook = Arc::new(move |current| {
+            if current == phase {
+                std::fs::rename(&hook_replacement, &hook_original).unwrap();
+                std::fs::create_dir(&hook_replacement).unwrap();
+                *fired_hook.lock().unwrap() = true;
+            }
+        });
+        assert!(matches!(
+            LibraryRepository::open_with_sources_and_hook(
+                &path,
+                Arc::new(FixedClock),
+                Arc::new(FixedIds),
+                hook,
+            ),
+            Err(LibraryError::InvalidDatabasePath)
+        ));
+        assert!(*fired.lock().unwrap());
+        let original_db = Connection::open(original.join("library.sqlite")).unwrap();
+        assert_eq!(
+            original_db
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert!(!replacement.join("resources").exists());
     }
 }

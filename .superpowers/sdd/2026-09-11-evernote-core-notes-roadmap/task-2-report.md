@@ -86,3 +86,10 @@
 - `cargo test --manifest-path packages/app-lite-core/Cargo.toml` — passed.
 - `cargo test --manifest-path packages/app-lite-core/Cargo.toml --features test-support` — passed (16 review regressions active).
 - `cargo test --manifest-path packages/app-lite-native/Cargo.toml` — 225 passed.
+
+## Fix round 2 proof completion
+
+- Added a per-repository, `test-support`-only open-phase hook. A channel-controlled two-connection test stops immediately after the locked legacy gate; the second v3 writer receives an SQLite write error and no RTF row can cross into the HTML migration.
+- Added real rename/replacement tests at both profile-bind→SQLite-open and SQLite-open→resource-bind gaps. Both return `InvalidDatabasePath`, leave the original v3 database at version 3, and do not bind resources in the replacement directory.
+- Added a `migrate_schema` v4-fast-path authorizer test that denies and records INSERT/UPDATE/DELETE/DDL/REINDEX actions. The actual fast path succeeds with an empty write record; a same-value update would therefore turn it RED.
+- Expanded v3 refusal and mid-migration rollback checks to snapshot `sqlite_master`, `table_info`, every legacy source field including RTF/markup/draft/deleted state, `journal_mode`, `user_version`, and profile entries. The new snapshot test exposed an empty `resources` directory surviving an aborted migration; preflight-created trees are now cleaned through the bound profile fd unless the transaction commits.

@@ -8,6 +8,8 @@ pub(crate) fn migrate_schema(
     next_id: &mut dyn FnMut() -> Result<String, LibraryError>,
     preflight: impl FnOnce() -> Result<ResourceStore, LibraryError>,
     verify_profile: impl Fn() -> Result<(), LibraryError>,
+    after_legacy_gate: impl Fn(),
+    before_commit: impl Fn(),
 ) -> Result<(bool, ResourceStore), LibraryError> {
     // BEGIN IMMEDIATE is deliberately the first migration operation. It keeps
     // the legacy-RTF gate authoritative until the schema publication commits.
@@ -26,12 +28,14 @@ pub(crate) fn migrate_schema(
             return Err(LibraryError::LegacyRtfMigrationRequired);
         }
     }
+    after_legacy_gate();
     // Resource binding is intentionally after the legacy gate but before any
     // schema/data mutation, while this migration-wide lock is still held.
-    let resource_store = preflight()?;
+    let mut resource_store = preflight()?;
     if version == SCHEMA_VERSION {
         verify_profile()?;
         transaction.commit()?;
+        resource_store.mark_published();
         return Ok((false, resource_store));
     }
     transaction.execute_batch("CREATE TABLE IF NOT EXISTS stacks (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0);
@@ -114,7 +118,9 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     transaction.execute("INSERT OR IGNORE INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-bootstrap' FROM notes", [])?;
     transaction.execute_batch("PRAGMA user_version = 4")?;
     verify_profile()?;
+    before_commit();
     transaction.commit()?;
+    resource_store.mark_published();
     Ok((true, resource_store))
 }
 
@@ -228,4 +234,57 @@ fn column_exists(t: &Transaction<'_>, table: &str, column: &str) -> Result<bool,
         .collect::<Result<Vec<_>, _>>()?
         .iter()
         .any(|name| name == column))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LibraryRepository;
+    use rusqlite::hooks::{AuthAction, Authorization};
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+
+    #[test]
+    fn v4_fast_path_denies_every_logical_write() {
+        // Catches a future same-value UPDATE/DDL hidden by unchanged WAL/main bytes.
+        let profile = tempdir().unwrap();
+        let path = profile.path().join("library.sqlite");
+        LibraryRepository::open(&path).unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&writes);
+        connection.authorizer(Some(
+            move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                AuthAction::Insert { .. }
+                | AuthAction::Update { .. }
+                | AuthAction::Delete { .. }
+                | AuthAction::CreateIndex { .. }
+                | AuthAction::CreateTable { .. }
+                | AuthAction::CreateTempIndex { .. }
+                | AuthAction::CreateTempTable { .. }
+                | AuthAction::DropIndex { .. }
+                | AuthAction::DropTable { .. }
+                | AuthAction::Reindex { .. } => {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(format!("{:?}", context.action));
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            },
+        ));
+        let mut ids = || Ok("a".repeat(32));
+        let result = migrate_schema(
+            &mut connection,
+            &mut ids,
+            || ResourceStore::new(profile.path()).map_err(Into::into),
+            || Ok(()),
+            || {},
+            || {},
+        );
+        connection.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
+        assert!(matches!(result, Ok((false, _))));
+        assert!(writes.lock().unwrap().is_empty());
+    }
 }
