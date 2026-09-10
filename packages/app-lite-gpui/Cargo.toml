@@ -54,6 +54,7 @@ code-highlight-config = [
 ]
 
 [dependencies]
+app-lite-core = { path = "../app-lite-core" }
 anyhow = "1"
 base64 = "0.23"
 uuid = "1.23"

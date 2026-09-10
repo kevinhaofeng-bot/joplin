@@ -1,0 +1,18 @@
+[package]
+name = "app-lite-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "app_lite_core"
+path = "src/lib.rs"
+
+[dependencies]
+html5ever = "0.38"
+libc = "0.2"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
