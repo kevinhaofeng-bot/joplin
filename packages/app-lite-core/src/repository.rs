@@ -7,7 +7,6 @@ use crate::{
 use rusqlite::hooks::{AuthAction, Authorization};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -17,6 +16,7 @@ use thiserror::Error;
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenTestPhase {
+    BeforeProfileBind,
     AfterProfileBound,
     AfterSqliteOpen,
     AfterLegacyGate,
@@ -88,6 +88,13 @@ pub enum LibraryError {
     Entropy(#[source] getrandom::Error),
     #[error("SQLite pragmas could not be established")]
     Pragma,
+    #[error("migration failed and journal mode could not be restored to {original_mode}")]
+    JournalModeRestoreFailed {
+        original_mode: String,
+        migration: Box<LibraryError>,
+        #[source]
+        restore: rusqlite::Error,
+    },
     #[error("schema version {0} is newer than this library supports")]
     UnsupportedSchema(i64),
     #[error("invalid opaque entity ID")]
@@ -164,9 +171,20 @@ impl LibraryRepository {
         id_source: Arc<dyn RepositoryIdSource>,
         #[cfg(feature = "test-support")] hook: Option<OpenTestHook>,
     ) -> Result<Self, LibraryError> {
-        let path = checked_database_path(path.as_ref())?;
-        let profile = ProfileDir::open(path.parent().ok_or(LibraryError::InvalidDatabasePath)?)
-            .map_err(|_| LibraryError::InvalidDatabasePath)?;
+        let requested_path = checked_database_path(path.as_ref())?;
+        let name = requested_path
+            .file_name()
+            .ok_or(LibraryError::InvalidDatabasePath)?;
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &hook {
+            hook(OpenTestPhase::BeforeProfileBind);
+        }
+        let profile = ProfileDir::open(
+            requested_path
+                .parent()
+                .ok_or(LibraryError::InvalidDatabasePath)?,
+        )
+        .map_err(|_| LibraryError::InvalidDatabasePath)?;
         #[cfg(feature = "test-support")]
         if let Some(hook) = &hook {
             hook(OpenTestPhase::AfterProfileBound);
@@ -177,6 +195,9 @@ impl LibraryRepository {
         {
             return Err(LibraryError::InvalidDatabasePath);
         }
+        let path = profile
+            .database_path(name)
+            .map_err(|_| LibraryError::InvalidDatabasePath)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -192,9 +213,32 @@ impl LibraryRepository {
         {
             return Err(LibraryError::InvalidDatabasePath);
         }
+        // Re-check the SQLite child after the pathname-only open; this rejects
+        // a symlink replacement in the only interval SQLite cannot use our fd.
+        profile
+            .database_path(name)
+            .map_err(|_| LibraryError::InvalidDatabasePath)?;
+        // This is connection-local and precedes all schema/data writes.
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        // A legacy RTF profile is rejected before even a journal-mode change.
+        // The later check inside `migrate_schema` remains authoritative while
+        // BEGIN IMMEDIATE is held against a concurrent v3 writer.
+        if has_legacy_rtf(&connection)? {
+            return Err(LibraryError::LegacyRtfMigrationRequired);
+        }
+        let original_journal_mode = journal_mode(&connection)?;
+        if let Err(error) = establish_wal(&connection) {
+            return match restore_journal_mode(&connection, &profile, name, &original_journal_mode) {
+                Ok(()) => Err(error),
+                Err(restore) => Err(LibraryError::JournalModeRestoreFailed {
+                    original_mode: original_journal_mode,
+                    migration: Box::new(error),
+                    restore,
+                }),
+            };
+        }
         let mut next_migration_id = || id_source.next_id();
-        let (migrated, resource_store) = migrate_schema(
+        let migration = migrate_schema(
             &mut connection,
             &mut next_migration_id,
             || {
@@ -228,20 +272,43 @@ impl LibraryRepository {
                     hook(OpenTestPhase::BeforeMigrationCommit);
                 }
             },
-        )
-        .map_err(|error| match error {
-            LibraryError::Storage(error) => LibraryError::MigrationFailed(error),
-            other => other,
-        })?;
-        if migrated {
-            connection.pragma_update(None, "journal_mode", "WAL")?;
-        }
-        let journal_mode: String =
-            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        );
+        let (_migrated, resource_store) = match migration {
+            Ok(result) => result,
+            Err(error) => {
+                let error = match error {
+                    LibraryError::Storage(error) => LibraryError::MigrationFailed(error),
+                    other => other,
+                };
+                return match restore_journal_mode(
+                    &connection,
+                    &profile,
+                    name,
+                    &original_journal_mode,
+                ) {
+                    Ok(()) => Err(error),
+                    Err(restore) => Err(LibraryError::JournalModeRestoreFailed {
+                        original_mode: original_journal_mode,
+                        migration: Box::new(error),
+                        restore,
+                    }),
+                };
+            }
+        };
+        let journal_mode = journal_mode(&connection)?;
         let foreign_keys: i64 =
             connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
         if journal_mode.to_ascii_lowercase() != "wal" || foreign_keys != 1 {
             return Err(LibraryError::Pragma);
+        }
+        // SQLite's commit is necessarily pathname-independent once the file
+        // is open, so make the selected profile identity part of the return
+        // boundary as well as the migration transaction's last check.
+        if !profile
+            .verify_path_identity()
+            .map_err(|_| LibraryError::InvalidDatabasePath)?
+        {
+            return Err(LibraryError::InvalidDatabasePath);
         }
         Ok(Self {
             connection: Mutex::new(connection),
@@ -289,6 +356,28 @@ impl LibraryRepository {
         Err(LibraryError::IdCollisionExhausted)
     }
 
+    /// The existence probe avoids ordinary collisions, but it is only an
+    /// optimization: the insert is the authority.  Retrying the actual
+    /// primary-key constraint closes the inter-repository race without ever
+    /// exposing a partial transaction.
+    fn insert_with_unique_id<T>(
+        &self,
+        transaction: &Transaction<'_>,
+        table: &str,
+        mut insert: impl FnMut(&str) -> Result<T, rusqlite::Error>,
+    ) -> Result<(String, T), LibraryError> {
+        for _ in 0..16 {
+            let id = self.allocate_id(transaction, table)?;
+            match insert(&id) {
+                Ok(value) => return Ok((id, value)),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::ConstraintViolation => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(LibraryError::IdCollisionExhausted)
+    }
+
     pub fn subscribe(&self) -> Receiver<LibraryEvent> {
         let (sender, receiver) = channel();
         self.events
@@ -328,8 +417,6 @@ impl LibraryRepository {
         let resource_ids = input.document.resource_ids();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
-        let id = NoteId::parse(self.allocate_id(&transaction, "notes")?)
-            .expect("validated generated ID is valid");
         let notebook_id = match input.notebook_id {
             Some(id) => {
                 require_notebook(&transaction, &id)?;
@@ -337,11 +424,14 @@ impl LibraryRepository {
             }
             None => default_notebook_id(&transaction)?,
         };
-        transaction.execute(
-            "INSERT INTO notes (id, title, body_html, body_text, snippet, notebook_id, selected_thumbnail_id, created_time, updated_time, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, 1)",
-            params![id.as_str(), input.title, html, text, snippet(input.document.search_text().as_str()), notebook_id.as_str(), now],
-        )?;
+        let (raw_id, _) = self.insert_with_unique_id(&transaction, "notes", |candidate| {
+            transaction.execute(
+                "INSERT INTO notes (id, title, body_html, body_text, snippet, notebook_id, selected_thumbnail_id, created_time, updated_time, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, 1)",
+                params![candidate, input.title, html, text, snippet(input.document.search_text().as_str()), notebook_id.as_str(), now],
+            )
+        })?;
+        let id = NoteId::parse(raw_id).expect("validated generated ID is valid");
         replace_note_resources(&transaction, &id, &resource_ids)?;
         let thumbnail = selected_thumbnail_id(&transaction, &id, None)?;
         transaction.execute(
@@ -598,12 +688,13 @@ impl LibraryRepository {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
-        let id = NotebookId::parse(self.allocate_id(&transaction, "notebooks")?)
-            .expect("validated generated ID is valid");
         if let Some(stack_id) = stack_id {
             require_stack(&transaction, stack_id)?;
         }
-        transaction.execute("INSERT INTO notebooks (id, title, stack_id, revision, created_time, updated_time) VALUES (?1, ?2, ?3, 1, ?4, ?4)", params![id.as_str(), title, stack_id.map(StackId::as_str), now])?;
+        let (raw_id, _) = self.insert_with_unique_id(&transaction, "notebooks", |candidate| {
+            transaction.execute("INSERT INTO notebooks (id, title, stack_id, revision, created_time, updated_time) VALUES (?1, ?2, ?3, 1, ?4, ?4)", params![candidate, title, stack_id.map(StackId::as_str), now])
+        })?;
+        let id = NotebookId::parse(raw_id).expect("validated generated ID is valid");
         enqueue_sync(
             &transaction,
             self.id_source.as_ref(),
@@ -630,9 +721,10 @@ impl LibraryRepository {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
-        let id = StackId::parse(self.allocate_id(&transaction, "stacks")?)
-            .expect("validated generated ID is valid");
-        transaction.execute("INSERT INTO stacks (id, title, revision, created_time, updated_time) VALUES (?1, ?2, 1, ?3, ?3)", params![id.as_str(), title, now])?;
+        let (raw_id, _) = self.insert_with_unique_id(&transaction, "stacks", |candidate| {
+            transaction.execute("INSERT INTO stacks (id, title, revision, created_time, updated_time) VALUES (?1, ?2, 1, ?3, ?3)", params![candidate, title, now])
+        })?;
+        let id = StackId::parse(raw_id).expect("validated generated ID is valid");
         enqueue_sync(
             &transaction,
             self.id_source.as_ref(),
@@ -657,9 +749,10 @@ impl LibraryRepository {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
-        let id = TagId::parse(self.allocate_id(&transaction, "tags")?)
-            .expect("validated generated ID is valid");
-        transaction.execute("INSERT INTO tags (id, title, revision, created_time, updated_time) VALUES (?1, ?2, 1, ?3, ?3)", params![id.as_str(), title, now])?;
+        let (raw_id, _) = self.insert_with_unique_id(&transaction, "tags", |candidate| {
+            transaction.execute("INSERT INTO tags (id, title, revision, created_time, updated_time) VALUES (?1, ?2, 1, ?3, ?3)", params![candidate, title, now])
+        })?;
+        let id = TagId::parse(raw_id).expect("validated generated ID is valid");
         enqueue_sync(
             &transaction,
             self.id_source.as_ref(),
@@ -785,8 +878,9 @@ impl LibraryRepository {
         if !exists {
             return Err(LibraryError::NotFound);
         }
-        let journal_id = self.allocate_id(&transaction, "edit_journal")?;
-        transaction.execute("INSERT INTO edit_journal (id, note_id, generation, delta_utf8, created_time) VALUES (?1, ?2, ?3, ?4, ?5)", params![journal_id, entry.note_id.as_str(), entry.generation, entry.delta_utf8, now])?;
+        self.insert_with_unique_id(&transaction, "edit_journal", |candidate| {
+            transaction.execute("INSERT INTO edit_journal (id, note_id, generation, delta_utf8, created_time) VALUES (?1, ?2, ?3, ?4, ?5)", params![candidate, entry.note_id.as_str(), entry.generation, entry.delta_utf8, now])
+        })?;
         transaction.commit()?;
         Ok(())
     }
@@ -818,10 +912,11 @@ impl LibraryRepository {
         // Blob persistence is content-addressed and may safely precede this
         // transaction; the entity ID itself is allocated against SQLite so an
         // astronomically unlikely CSPRNG collision is retried before exposure.
-        let resource_id = ResourceId::new(self.allocate_id(&transaction, "resources")?)
-            .expect("validated generated ID is valid");
         transaction.execute("INSERT OR IGNORE INTO resource_blobs (sha256, size, mime, relative_path, created_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, 1)", params![blob.sha256.as_str(), blob.size as i64, mime, format!("resources/blobs/{}", blob.sha256.as_str()), now])?;
-        transaction.execute("INSERT INTO resources (id, sha256, title, mime, file_extension, size, created_time, updated_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)", params![resource_id.as_str(), blob.sha256.as_str(), title, mime, extension, blob.size as i64, now])?;
+        let (raw_id, _) = self.insert_with_unique_id(&transaction, "resources", |candidate| {
+            transaction.execute("INSERT INTO resources (id, sha256, title, mime, file_extension, size, created_time, updated_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)", params![candidate, blob.sha256.as_str(), title, mime, extension, blob.size as i64, now])
+        })?;
+        let resource_id = ResourceId::new(raw_id).expect("validated generated ID is valid");
         enqueue_sync(
             &transaction,
             self.id_source.as_ref(),
@@ -857,12 +952,27 @@ impl LibraryRepository {
     pub fn rollback_unassociated_resource(&self, id: &ResourceId) -> Result<(), LibraryError> {
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
+        let hash: Option<String> = transaction
+            .query_row(
+                "SELECT sha256 FROM resources WHERE id=?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
         let deleted = transaction.execute("DELETE FROM resources WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM note_resources WHERE resource_id=?1)", [id.as_str()])?;
         if deleted == 1 {
             transaction.execute(
                 "DELETE FROM sync_outbox WHERE entity_type='resource' AND entity_id=?1",
                 [id.as_str()],
             )?;
+            if let Some(hash) = hash {
+                // Blob bytes are intentionally left for safe content-addressed
+                // GC, but database metadata must not survive as an orphan.
+                transaction.execute(
+                    "DELETE FROM resource_blobs WHERE sha256=?1 AND NOT EXISTS(SELECT 1 FROM resources WHERE sha256=?1)",
+                    [hash],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -873,6 +983,38 @@ impl LibraryRepository {
         connection
             .query_row("SELECT count(*) FROM sync_outbox", [], |row| row.get(0))
             .map_err(Into::into)
+    }
+
+    /// Takes immutable search work for the indexer.  Work is acknowledged by
+    /// its full queue identity so a newer upsert cannot be accidentally lost.
+    pub fn take_search_jobs(&self, limit: usize) -> Result<Vec<crate::SearchJob>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT note_id, updated_time, reason FROM search_queue ORDER BY updated_time, note_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit as i64], |row| {
+                Ok(crate::SearchJob {
+                    note_id: NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                    updated_time: row.get(1)?,
+                    reason: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn ack_search_jobs(&self, jobs: &[crate::SearchJob]) -> Result<(), LibraryError> {
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        for job in jobs {
+            transaction.execute(
+                "DELETE FROM search_queue WHERE note_id=?1 AND updated_time=?2 AND reason=?3",
+                params![job.note_id.as_str(), job.updated_time, job.reason],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn set_deleted(&self, id: &NoteId, deleted: bool) -> Result<(), LibraryError> {
@@ -941,22 +1083,95 @@ impl LibraryRepository {
 
 fn checked_database_path(path: &Path) -> Result<PathBuf, LibraryError> {
     let parent = path.parent().ok_or(LibraryError::InvalidDatabasePath)?;
-    let metadata = fs::symlink_metadata(parent).map_err(|_| LibraryError::InvalidDatabasePath)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if parent.as_os_str().is_empty() || path.file_name().is_none() {
         return Err(LibraryError::InvalidDatabasePath);
     }
-    if path.exists()
-        && fs::symlink_metadata(path)
-            .map_err(|_| LibraryError::InvalidDatabasePath)?
-            .file_type()
-            .is_symlink()
-    {
-        return Err(LibraryError::InvalidDatabasePath);
+    // Do not stat/canonicalize here: ProfileDir binds this lexical parent by
+    // descriptor before metadata is consulted.
+    Ok(path.to_owned())
+}
+
+fn has_legacy_rtf(connection: &Connection) -> Result<bool, LibraryError> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 3 {
+        return Ok(false);
     }
-    let name = path.file_name().ok_or(LibraryError::InvalidDatabasePath)?;
-    Ok(fs::canonicalize(parent)
-        .map_err(|_| LibraryError::InvalidDatabasePath)?
-        .join(name))
+    let has_markup: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('notes') WHERE name='markup_language')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_markup == 0 {
+        return Ok(false);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM notes WHERE markup_language=1)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn journal_mode(connection: &Connection) -> Result<String, LibraryError> {
+    connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        .map(|mode| mode.to_ascii_lowercase())
+        .map_err(Into::into)
+}
+
+fn establish_wal(connection: &Connection) -> Result<(), LibraryError> {
+    let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    if mode.eq_ignore_ascii_case("wal") && journal_mode(connection)?.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(LibraryError::Pragma)
+    }
+}
+
+fn restore_journal_mode(
+    connection: &Connection,
+    profile: &ProfileDir,
+    name: &std::ffi::OsStr,
+    original: &str,
+) -> Result<(), rusqlite::Error> {
+    match restore_journal_mode_on_connection(connection, original) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            // A rename can make SQLite's original lexical WAL sidecar path
+            // read-only. Re-open the same already-bound directory by its fd's
+            // live path, not the replacement profile pathname, to restore the
+            // prior v3 journal mode before surfacing InvalidDatabasePath.
+            let path = profile.current_database_path(name).map_err(|_| first)?;
+            let recovery = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            restore_journal_mode_on_connection(&recovery, original)
+        }
+    }
+}
+
+fn restore_journal_mode_on_connection(
+    connection: &Connection,
+    original: &str,
+) -> Result<(), rusqlite::Error> {
+    let mode = match original.to_ascii_lowercase().as_str() {
+        "delete" => "DELETE",
+        "truncate" => "TRUNCATE",
+        "persist" => "PERSIST",
+        "memory" => "MEMORY",
+        "wal" => "WAL",
+        "off" => "OFF",
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let returned: String =
+        connection.query_row(&format!("PRAGMA journal_mode={mode}"), [], |row| row.get(0))?;
+    if returned.eq_ignore_ascii_case(mode) {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::InvalidQuery)
+    }
 }
 
 fn snippet(text: &str) -> String {

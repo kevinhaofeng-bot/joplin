@@ -117,8 +117,11 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     transaction.execute("INSERT OR IGNORE INTO note_revisions (note_id, revision, title, body_html, body_text, created_time) SELECT id, 1, title, body_html, body_text, updated_time FROM notes", [])?;
     transaction.execute("INSERT OR IGNORE INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-bootstrap' FROM notes", [])?;
     transaction.execute_batch("PRAGMA user_version = 4")?;
-    verify_profile()?;
     before_commit();
+    // The test hook models the last pathname/descriptor race.  It must run
+    // before the final identity check so a swapped profile aborts the still
+    // uncommitted publication.
+    verify_profile()?;
     transaction.commit()?;
     resource_store.mark_published();
     Ok((true, resource_store))

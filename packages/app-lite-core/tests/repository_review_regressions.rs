@@ -598,17 +598,15 @@ fn purge_keeps_a_durable_search_delete_job_after_reopen() {
     repository.trash_note(&note.id).unwrap();
     repository.purge_note(&note.id).unwrap();
     drop(repository);
-    let check = Connection::open(&path).unwrap();
-    assert_eq!(
-        check
-            .query_row(
-                "SELECT reason FROM search_queue WHERE note_id=?1",
-                [note.id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        "purge"
-    );
+    let reopened = LibraryRepository::open(&path).unwrap();
+    let jobs = reopened.take_search_jobs(10).unwrap();
+    let delete = jobs
+        .iter()
+        .find(|job| job.note_id == note.id && job.reason == "purge")
+        .cloned()
+        .expect("durable purge delete job");
+    reopened.ack_search_jobs(&[delete]).unwrap();
+    assert!(reopened.take_search_jobs(10).unwrap().is_empty());
     assert!(events
         .try_iter()
         .any(|event| matches!(event, app_lite_core::LibraryEvent::SearchProjectionQueued(id) if id == note.id)));
@@ -672,6 +670,42 @@ fn associated_resource_rollback_is_a_complete_noop() {
             )
             .unwrap(),
         before
+    );
+}
+
+#[test]
+fn rollback_unassociated_resource_collects_only_a_uniquely_owned_blob_record() {
+    // Catches leaving resource_blobs metadata orphaned after a successfully
+    // rolled-back import (the immutable byte file remains GC-owned).
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).unwrap();
+    let image = repository
+        .import_image(b"unique", "unique", "image/png", "png")
+        .unwrap();
+    let hash: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT sha256 FROM resources WHERE id=?1",
+            [image.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    repository.rollback_unassociated_resource(&image).unwrap();
+    drop(repository);
+    let reopened = LibraryRepository::open(&path).unwrap();
+    assert!(reopened.resource_metadata(&image).unwrap().is_none());
+    drop(reopened);
+    let check = Connection::open(&path).unwrap();
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT count(*) FROM resource_blobs WHERE sha256=?1",
+                [hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
     );
 }
 

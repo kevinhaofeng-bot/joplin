@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
@@ -93,6 +93,10 @@ pub struct ResourceBlob {
 
 pub struct ResourceStore {
     blobs_dir: DirFd,
+    // A preflight can create either directory independently. Keep distinct
+    // descriptor-relative cleanup ownership so a failed migration never
+    // removes a caller's pre-existing resources directory.
+    cleanup_resources: Option<DirFd>,
     cleanup_profile: Option<DirFd>,
 }
 
@@ -126,6 +130,7 @@ impl ResourceStore {
         let blobs_dir = open_or_create_dir(resources_dir.0, "blobs")?;
         Ok(Self {
             blobs_dir,
+            cleanup_resources: None,
             cleanup_profile: None,
         })
     }
@@ -133,7 +138,21 @@ impl ResourceStore {
     pub(crate) fn from_profile_dir(profile: &ProfileDir) -> Result<Self, ResourceError> {
         let created_root = !child_exists(profile.fd.0, "resources")?;
         let resources_dir = open_or_create_dir(profile.fd.0, "resources")?;
-        let blobs_dir = open_or_create_dir(resources_dir.0, "blobs")?;
+        let created_blobs = !child_exists(resources_dir.0, "blobs")?;
+        let blobs_dir = match open_or_create_dir(resources_dir.0, "blobs") {
+            Ok(dir) => dir,
+            Err(error) => {
+                if created_root {
+                    let _ = unlink_dir_at(profile.fd.0, "resources");
+                }
+                return Err(error);
+            }
+        };
+        let cleanup_resources = if created_blobs {
+            Some(duplicate_dir_fd(resources_dir.0)?)
+        } else {
+            None
+        };
         let cleanup_profile = if created_root {
             Some(duplicate_dir_fd(profile.fd.0)?)
         } else {
@@ -141,11 +160,13 @@ impl ResourceStore {
         };
         Ok(Self {
             blobs_dir,
+            cleanup_resources,
             cleanup_profile,
         })
     }
 
     pub(crate) fn mark_published(&mut self) {
+        self.cleanup_resources = None;
         self.cleanup_profile = None;
     }
 
@@ -186,20 +207,33 @@ impl ResourceStore {
 
 impl Drop for ResourceStore {
     fn drop(&mut self) {
+        if let Some(resources) = self.cleanup_resources.take() {
+            let _ = unlink_dir_at(resources.0, "blobs");
+        }
         let Some(profile) = self.cleanup_profile.take() else {
             return;
         };
-        let _ = unlink_dir_at(profile.0, "resources/blobs");
         let _ = unlink_dir_at(profile.0, "resources");
     }
 }
 
 impl ProfileDir {
     pub(crate) fn open(path: &Path) -> Result<Self, ResourceError> {
-        ensure_directory(path)?;
-        let path = fs::canonicalize(path)?;
-        let fd = open_dir_path(&path)?;
+        // Bind the caller's lexical directory before doing any metadata or
+        // canonical-path work.  `open(..., O_DIRECTORY|O_NOFOLLOW)` is the
+        // authority; any replacement while deriving a display path is caught
+        // by comparing the pathname back to this descriptor identity.
+        let fd = open_dir_path(path)?;
         let (device, inode) = fd_identity(fd.0)?;
+        let path = fs::canonicalize(path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.dev() != device
+            || metadata.ino() != inode
+        {
+            return Err(ResourceError::UnsafePath);
+        }
         Ok(Self {
             fd,
             path,
@@ -214,6 +248,48 @@ impl ProfileDir {
             && !metadata.file_type().is_symlink()
             && metadata.dev() == self.device
             && metadata.ino() == self.inode)
+    }
+
+    pub(crate) fn database_path(&self, name: &std::ffi::OsStr) -> Result<PathBuf, ResourceError> {
+        let c_name =
+            std::ffi::CString::new(name.as_bytes()).map_err(|_| ResourceError::UnsafePath)?;
+        if child_is_symlink(self.fd.0, &c_name) {
+            return Err(ResourceError::Symlink);
+        }
+        Ok(self.path.join(name))
+    }
+
+    /// Resolve the live display path of the already-bound descriptor.  This
+    /// is only used to recover SQLite journal mode after a detected rename;
+    /// SQLite itself is never opened through `/dev/fd`.
+    pub(crate) fn current_database_path(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> Result<PathBuf, ResourceError> {
+        let c_name =
+            std::ffi::CString::new(name.as_bytes()).map_err(|_| ResourceError::UnsafePath)?;
+        if child_is_symlink(self.fd.0, &c_name) {
+            return Err(ResourceError::Symlink);
+        }
+        Ok(fd_display_path(self.fd.0)?.join(name))
+    }
+}
+
+fn fd_display_path(fd: RawFd) -> Result<PathBuf, ResourceError> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffer = [0_i8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buffer.as_mut_ptr()) } < 0 {
+            return Err(io_error());
+        }
+        let path = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+            .to_str()
+            .map_err(|_| ResourceError::UnsafePath)?;
+        return Ok(PathBuf::from(path));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).map_err(Into::into)
     }
 }
 

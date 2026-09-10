@@ -118,3 +118,12 @@ pub struct EditJournalEntry {
     pub generation: i64,
     pub delta_utf8: String,
 }
+
+/// Durable Task 7 hand-off.  Delete jobs intentionally remain addressable
+/// after their note row has been purged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchJob {
+    pub note_id: NoteId,
+    pub updated_time: i64,
+    pub reason: String,
+}

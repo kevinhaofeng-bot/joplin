@@ -93,3 +93,32 @@
 - Added real rename/replacement tests at both profile-bind→SQLite-open and SQLite-open→resource-bind gaps. Both return `InvalidDatabasePath`, leave the original v3 database at version 3, and do not bind resources in the replacement directory.
 - Added a `migrate_schema` v4-fast-path authorizer test that denies and records INSERT/UPDATE/DELETE/DDL/REINDEX actions. The actual fast path succeeds with an empty write record; a same-value update would therefore turn it RED.
 - Expanded v3 refusal and mid-migration rollback checks to snapshot `sqlite_master`, `table_info`, every legacy source field including RTF/markup/draft/deleted state, `journal_mode`, `user_version`, and profile entries. The new snapshot test exposed an empty `resources` directory surviving an aborted migration; preflight-created trees are now cleaned through the bound profile fd unless the transaction commits.
+
+## Fix round 3 — repository publication safety (baseline `bdf8d710aa25137fd6bc48af9bd4aec6a4708313`)
+
+### TDD record
+
+1. Extended the existing deterministic rename/replacement test to the `BeforeMigrationCommit` seam. It was RED: the old implementation verified the selected profile before the hook, then committed v4 to the renamed-away database.
+2. Added a nested-preflight failure case where `resources/` existed but `resources/blobs/` did not. It was RED because the aborted migration leaked `blobs`.
+3. Added v4 DELETE→WAL repair and migration-failure journal restoration tests, lexical pre-bind symlink replacement, repository reopen/search take+ack, and uniquely-owned resource blob rollback tests.
+
+### Review mapping
+
+- C1: opening now performs a static, read-only legacy RTF probe; only a non-RTF profile establishes and reads back WAL before `BEGIN IMMEDIATE`. The authoritative locked RTF gate remains in `migrate_schema`. A refusal or migration error restores the original journal mode; if restoration itself fails, `JournalModeRestoreFailed` preserves both the original typed migration error and SQLite restore source. Every v4 open repairs DELETE mode back to WAL.
+- C2/I4: the final hook now runs before the final descriptor/path identity verification, followed by a post-commit return-boundary verification. The profile parent is bound directly from the lexical user path using `O_DIRECTORY|O_NOFOLLOW`; canonical/display work occurs only after descriptor binding, and SQLite child names are checked before and after its pathname API boundary. Recovery after a detected rename resolves the held descriptor's live path rather than following the replacement profile.
+- I1: note/notebook/stack/tag/resource/edit-journal insertion now retries primary-key uniqueness failures at the real `INSERT` boundary, while retaining existing tombstone/revision reservation checks and transactional rollback behavior.
+- I2/I3: `take_search_jobs`/`ack_search_jobs` provide the typed Task 7 boundary and prove an immediate trash→purge delete job survives a genuine repository reopen. Resource cleanup deletes a `resource_blobs` metadata row only if its resource row was actually removed and no other resource references the hash; bytes remain safe content-addressed GC material.
+- I5/I6: v3 failure snapshots compare schema, columns, all legacy note fields, relation rows, PRAGMAs, and a recursive profile-tree type/size/SHA-256 snapshot. The main SQLite file is intentionally compared semantically (schema/rows/PRAGMAs) rather than bytewise because WAL→DELETE restoration legitimately changes SQLite internal header bytes; any leaked WAL/SHM/resource file remains part of the recursive tree assertion. Resource preflight independently owns and reverses newly-created `resources` and `blobs` directories.
+
+### Concern
+
+- The deterministic tests prove normal collision exhaustion and actual-insert retry paths, but do not inject `SQLITE_BUSY_SNAPSHOT`; a whole-transaction retry policy for that SQLite-specific conflict remains a later hardening candidate. No Task 3 work or native/GPUI source changes were made.
+
+### Final verification
+
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml` — passed (69 tests).
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml --features test-support` — passed (89 tests, including 17 review regressions and 11 migration proofs).
+- `cargo test --manifest-path packages/app-lite-native/Cargo.toml` — passed (225 tests).
+- `cargo check --manifest-path packages/app-lite-gpui/Cargo.toml` — passed with pre-existing warnings.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores` — passed (996, 1 filtered).
+- `cargo fmt --manifest-path packages/app-lite-core/Cargo.toml -- --check` and `git diff --check` — passed.
