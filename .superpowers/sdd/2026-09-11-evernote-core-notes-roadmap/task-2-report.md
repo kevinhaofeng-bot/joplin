@@ -133,7 +133,7 @@
 
 ### Critical closure mapping
 
-- C1 — database child identity: `ProfileDir::bind_database` now claims/opens `library.sqlite` through the bound parent fd with `openat(O_RDWR|O_NOFOLLOW|O_CLOEXEC)` (and exclusive `O_CREAT` only for a new child), rejects non-regular files, retains the file descriptor and `(st_dev, st_ino)`, and cleans a failed new-file claim only when the current child still matches that identity. SQLite uses `SQLITE_OPEN_NOFOLLOW`; its reported main filename, the bound-parent child, and the held inode are compared after pathname open and again immediately before commit. The deterministic regular-file-only swap now returns `InvalidDatabasePath` before WAL/schema/resource writes; original v3 content, replacement schema, WAL/SHM absence, and profile tree behavior are asserted.
+- C1 — database child identity: `ProfileDir::bind_database` now claims/opens `library.sqlite` through the bound parent fd with `openat(O_RDWR|O_NOFOLLOW|O_CLOEXEC)` (and exclusive `O_CREAT` only for a new child), rejects non-regular files, and retains the file descriptor and `(st_dev, st_ino)`. SQLite uses `SQLITE_OPEN_NOFOLLOW`; its reported main filename, the bound-parent child, and the held inode are compared after pathname open and again immediately before commit. The deterministic regular-file-only swap now returns `InvalidDatabasePath` before WAL/schema/resource writes; original v3 content, replacement schema, WAL/SHM absence, and profile tree behavior are asserted. Later round 5 intentionally removes failed-new-claim deletion: leaving an un-published empty child is safer than potentially unlinking a replacement.
 - C2 — no-fail publication boundary: WAL/FK readback and profile/database identity verification run inside the still-rollback-capable schema transaction immediately before `commit`. `ResourceStore::mark_published` is purely in-memory and follows successful commit only. After a migrated commit, repository construction only moves already-verified owned state and cannot return an ordinary open error. `AfterMigrationCommit` proves a selected-profile rename/replacement returns the already-bound repository and can read the migrated legacy note. The v4 fast path retains its pre-return WAL/FK/profile checks because it has no new schema publication.
 
 ### Explicitly deferred, non-blocking hardening
@@ -146,6 +146,36 @@
 
 - `cargo test --manifest-path packages/app-lite-core/Cargo.toml` — passed (69 tests).
 - `cargo test --manifest-path packages/app-lite-core/Cargo.toml --features test-support` — passed (91 tests, including 13 migration proofs).
+- `cargo test --manifest-path packages/app-lite-native/Cargo.toml` — passed (225 tests).
+- `cargo check --manifest-path packages/app-lite-gpui/Cargo.toml` — passed with existing warnings.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores` — passed (996, 1 filtered).
+- `cargo fmt --manifest-path packages/app-lite-core/Cargo.toml -- --check` and `git diff --check` — passed.
+
+## Fix round 5 — verify live SQLite file identity (baseline `8741bb7f374e56605d2fef2cddea88759c165013`)
+
+### TDD record
+
+1. Added `sqlite_connection_aba_swap_is_rejected_before_wal_or_schema_writes` before the repair. It was RED: after binding A, the `BeforeSqliteOpen` hook replaced its pathname with B; after SQLite opened B, `AfterSqliteOpen` restored A. The old inode/path comparison returned success because both held/current pathnames were A while the live SQLite handle was B.
+2. The GREEN path calls bundled SQLite's public `SQLITE_FCNTL_HAS_MOVED` file-control on `main` immediately after pathname open and again in the pre-commit verifier. The ABA test now returns `InvalidDatabasePath` before WAL/schema/resource writes and confirms both v3 databases and the profile tree are unchanged.
+3. Added `failed_fresh_open_leaves_its_unpublished_database_for_retry`: a post-open unsafe resources symlink aborts a fresh open, and the test confirms the empty v0 database remains without WAL/SHM files. This locks the no-delete recovery policy.
+
+### Critical closure and safety boundary
+
+- `sqlite3_file_control(Connection::handle(), "main", SQLITE_FCNTL_HAS_MOVED, &mut int)` is wrapped as a small safe helper. `SQLITE_OK` returns the VFS boolean; `SQLITE_NOTFOUND` fails closed through a typed `DatabaseFileControlUnavailable` error; every other SQLite return becomes a typed `DatabaseFileControl` error with source/context. No SQLite private VFS structure or custom VFS is used.
+- Normal new-library creation, v3 migration, and v4 fast-path reopen remain green, proving the bundled VFS returns “not moved” in ordinary operation. Single-replacement and pre-commit verifier paths now invoke the live-handle check before descriptor/path comparison.
+- Removed `BoundDatabaseFile`'s `fstatat`/`unlinkat` cleanup path entirely. An unsuccessful fresh open may leave its own empty, un-published `library.sqlite` for retry or diagnosis; this is recoverable and deliberately preferred to any risk of deleting a same-name replacement.
+- The C2 no-fail commit boundary remains unchanged: no ordinary fallible open result is introduced after schema commit.
+
+### Deferred unchanged
+
+- Cross-process `SQLITE_BUSY_SNAPSHOT` whole-transaction retry and exact extended-constraint classification.
+- Descriptor-duplication constructor-edge preflight cleanup.
+- Broader empty-fixture resource/blob mutation coverage.
+
+### Final verification
+
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml` — passed (69 tests).
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml --features test-support` — passed (93 tests, including the ABA and recoverable-residue regressions).
 - `cargo test --manifest-path packages/app-lite-native/Cargo.toml` — passed (225 tests).
 - `cargo check --manifest-path packages/app-lite-gpui/Cargo.toml` — passed with existing warnings.
 - `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores` — passed (996, 1 filtered).

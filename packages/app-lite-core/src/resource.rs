@@ -117,11 +117,9 @@ pub(crate) struct ProfileDir {
 pub(crate) struct DatabaseFile {
     #[allow(dead_code)] // Keeps the inode bound for the repository lifetime.
     file: File,
-    parent: DirFd,
     name: std::ffi::OsString,
     device: u64,
     inode: u64,
-    created: bool,
 }
 
 struct DirFd(RawFd);
@@ -277,24 +275,13 @@ impl ProfileDir {
         &self,
         name: &std::ffi::OsStr,
     ) -> Result<DatabaseFile, ResourceError> {
-        let (file, created) = open_or_create_regular_file(self.fd.0, name)?;
+        let file = open_or_create_regular_file(self.fd.0, name)?;
         let (device, inode) = fd_identity(file.as_raw_fd())?;
-        let parent = match duplicate_dir_fd(self.fd.0) {
-            Ok(parent) => parent,
-            Err(error) => {
-                if created {
-                    let _ = unlink_regular_if_identity(self.fd.0, name, device, inode);
-                }
-                return Err(error);
-            }
-        };
         Ok(DatabaseFile {
             file,
-            parent,
             name: name.to_owned(),
             device,
             inode,
-            created,
         })
     }
 
@@ -345,18 +332,6 @@ impl DatabaseFile {
             && !metadata.file_type().is_symlink()
             && metadata.dev() == self.device
             && metadata.ino() == self.inode)
-    }
-
-    pub(crate) fn mark_published(&mut self) {
-        self.created = false;
-    }
-}
-
-impl Drop for DatabaseFile {
-    fn drop(&mut self) {
-        if self.created {
-            let _ = unlink_regular_if_identity(self.parent.0, &self.name, self.device, self.inode);
-        }
     }
 }
 
@@ -491,9 +466,9 @@ fn fd_identity(fd: RawFd) -> Result<(u64, u64), ResourceError> {
 fn open_or_create_regular_file(
     parent_fd: RawFd,
     name: &std::ffi::OsStr,
-) -> Result<(File, bool), ResourceError> {
+) -> Result<File, ResourceError> {
     match open_regular_file(parent_fd, name) {
-        Ok(file) => Ok((file, false)),
+        Ok(file) => Ok(file),
         Err(ResourceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             let c_name =
                 std::ffi::CString::new(name.as_bytes()).map_err(|_| ResourceError::UnsafePath)?;
@@ -512,16 +487,13 @@ fn open_or_create_regular_file(
             if fd >= 0 {
                 let file = unsafe { File::from_raw_fd(fd) };
                 if is_regular_fd(file.as_raw_fd())? {
-                    return Ok((file, true));
-                }
-                if let Ok((device, inode)) = fd_identity(file.as_raw_fd()) {
-                    let _ = unlink_regular_if_identity(parent_fd, name, device, inode);
+                    return Ok(file);
                 }
                 return Err(ResourceError::UnsafePath);
             }
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return open_regular_file(parent_fd, name).map(|file| (file, false));
+                return open_regular_file(parent_fd, name);
             }
             if child_is_symlink(parent_fd, &c_name) {
                 Err(ResourceError::Symlink)
@@ -564,42 +536,6 @@ fn is_regular_fd(fd: RawFd) -> Result<bool, ResourceError> {
     }
     let stat = unsafe { stat.assume_init() };
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
-}
-
-fn unlink_regular_if_identity(
-    parent_fd: RawFd,
-    name: &std::ffi::OsStr,
-    device: u64,
-    inode: u64,
-) -> std::io::Result<()> {
-    let name = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            parent_fd,
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } < 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    let stat = unsafe { stat.assume_init() };
-    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG
-        || stat.st_dev as u64 != device
-        || stat.st_ino as u64 != inode
-    {
-        return Ok(());
-    }
-    if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    fsync_fd(parent_fd).map_err(|error| match error {
-        ResourceError::Io(error) => error,
-        _ => std::io::Error::other("database cleanup fsync failed"),
-    })
 }
 
 fn open_or_create_dir(parent_fd: RawFd, name: &str) -> Result<DirFd, ResourceError> {

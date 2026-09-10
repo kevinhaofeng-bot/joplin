@@ -489,6 +489,105 @@ fn migration_gate_blocks_a_second_v3_writer_before_html_publication() {
 
 #[cfg(all(feature = "test-support", unix))]
 #[test]
+fn sqlite_connection_aba_swap_is_rejected_before_wal_or_schema_writes() {
+    // Catches a pathname/inode ABA: A is bound, SQLite opens B, then A is
+    // restored at the selected pathname before ordinary identity checks run.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let a = Connection::open(&path).unwrap();
+    seed_native_v3(&a, false);
+    drop(a);
+    let before_a = v3_snapshot(&path);
+
+    let staged_b = profile.path().join("staged-b.sqlite");
+    let b = Connection::open(&staged_b).unwrap();
+    seed_native_v3(&b, false);
+    b.execute("UPDATE notes SET title='replacement-b'", [])
+        .unwrap();
+    drop(b);
+    let before_b = v3_snapshot(&staged_b);
+
+    let held_a = profile.path().join("held-a.sqlite");
+    let opened_b = profile.path().join("opened-b.sqlite");
+    let before_path = path.clone();
+    let after_path = path.clone();
+    let before_held_a = held_a.clone();
+    let before_staged_b = staged_b.clone();
+    let after_held_a = held_a.clone();
+    let after_opened_b = opened_b.clone();
+    let hook: OpenTestHook = Arc::new(move |phase| match phase {
+        OpenTestPhase::BeforeSqliteOpen => {
+            std::fs::rename(&before_path, &before_held_a).unwrap();
+            std::fs::rename(&before_staged_b, &before_path).unwrap();
+        }
+        OpenTestPhase::AfterSqliteOpen => {
+            std::fs::rename(&after_path, &after_opened_b).unwrap();
+            std::fs::rename(&after_held_a, &after_path).unwrap();
+        }
+        _ => {}
+    });
+
+    assert!(matches!(
+        LibraryRepository::open_with_sources_and_hook(
+            &path,
+            Arc::new(FixedClock),
+            Arc::new(FixedIds),
+            hook,
+        ),
+        Err(LibraryError::InvalidDatabasePath)
+    ));
+    assert_eq!(v3_snapshot(&path), before_a);
+    assert_eq!(v3_snapshot(&opened_b), before_b);
+    let b_bytes = std::fs::read(&opened_b).unwrap();
+    assert_eq!(
+        profile_entries(profile.path()),
+        vec![format!(
+            "f:opened-b.sqlite:{}:{:x}",
+            b_bytes.len(),
+            Sha256::digest(b_bytes)
+        )]
+    );
+    assert!(!profile.path().join("resources").exists());
+}
+
+#[cfg(all(feature = "test-support", unix))]
+#[test]
+fn failed_fresh_open_leaves_its_unpublished_database_for_retry() {
+    // A failed claim must not race a same-name replacement during Drop. Keeping
+    // an empty, un-published child is the deliberate recoverable outcome.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let resources = profile.path().join("resources");
+    let target = profile.path().join("outside-resources");
+    let hook: OpenTestHook = Arc::new(move |phase| {
+        if phase == OpenTestPhase::AfterSqliteOpen {
+            std::os::unix::fs::symlink(&target, &resources).unwrap();
+        }
+    });
+
+    assert!(
+        LibraryRepository::open_with_sources_and_hook(
+            &path,
+            Arc::new(FixedClock),
+            Arc::new(FixedIds),
+            hook,
+        )
+        .is_err()
+    );
+    assert!(path.is_file());
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(!profile.path().join("library.sqlite-wal").exists());
+    assert!(!profile.path().join("library.sqlite-shm").exists());
+}
+
+#[cfg(all(feature = "test-support", unix))]
+#[test]
 fn database_file_swap_after_sqlite_open_aborts_before_wal_or_schema_writes() {
     // Catches retaining only the parent directory identity while SQLite keeps
     // a pathname-opened, now-unlinked database inode alive for migration.

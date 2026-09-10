@@ -18,6 +18,7 @@ use thiserror::Error;
 pub enum OpenTestPhase {
     BeforeProfileBind,
     AfterProfileBound,
+    BeforeSqliteOpen,
     AfterSqliteOpen,
     AfterLegacyGate,
     BeforeMigrationCommit,
@@ -89,6 +90,10 @@ pub enum LibraryError {
     Entropy(#[source] getrandom::Error),
     #[error("SQLite pragmas could not be established")]
     Pragma,
+    #[error("SQLite VFS cannot verify the live database-file identity")]
+    DatabaseFileControlUnavailable(#[source] rusqlite::Error),
+    #[error("SQLite VFS live database-file identity check failed")]
+    DatabaseFileControl(#[source] rusqlite::Error),
     #[error("migration failed and journal mode could not be restored to {original_mode}")]
     JournalModeRestoreFailed {
         original_mode: String,
@@ -198,7 +203,7 @@ impl LibraryRepository {
         {
             return Err(LibraryError::InvalidDatabasePath);
         }
-        let mut database_file = profile
+        let database_file = profile
             .bind_database(name)
             .map_err(|_| LibraryError::InvalidDatabasePath)?;
         if !database_file
@@ -214,10 +219,17 @@ impl LibraryRepository {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &hook {
+            hook(OpenTestPhase::BeforeSqliteOpen);
+        }
         let mut connection = Connection::open_with_flags(&path, flags)?;
         #[cfg(feature = "test-support")]
         if let Some(hook) = &hook {
             hook(OpenTestPhase::AfterSqliteOpen);
+        }
+        if connection_has_moved(&connection)? {
+            return Err(LibraryError::InvalidDatabasePath);
         }
         if !profile
             .verify_path_identity()
@@ -267,9 +279,10 @@ impl LibraryRepository {
                 ResourceStore::from_profile_dir(&profile).map_err(Into::into)
             },
             |transaction| {
-                if !profile
-                    .verify_path_identity()
-                    .map_err(|_| LibraryError::InvalidDatabasePath)?
+                if connection_has_moved(transaction)?
+                    || !profile
+                        .verify_path_identity()
+                        .map_err(|_| LibraryError::InvalidDatabasePath)?
                     || !database_file
                         .matches_sqlite_connection(transaction, &profile)
                         .map_err(|_| LibraryError::InvalidDatabasePath)?
@@ -330,7 +343,6 @@ impl LibraryRepository {
         // Every operation above this line can still return a normal open
         // failure.  Once schema commit succeeds, publication is only owned-fd
         // and in-memory state movement; do not lie that it failed afterward.
-        database_file.mark_published();
         Ok(Self {
             connection: Mutex::new(connection),
             database_file,
@@ -1138,6 +1150,36 @@ fn journal_mode(connection: &Connection) -> Result<String, LibraryError> {
         .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
         .map(|mode| mode.to_ascii_lowercase())
         .map_err(Into::into)
+}
+
+fn connection_has_moved(connection: &Connection) -> Result<bool, LibraryError> {
+    const MAIN_DATABASE: &[u8] = b"main\0";
+    let mut moved: std::os::raw::c_int = 0;
+    // `SQLITE_FCNTL_HAS_MOVED` is the public VFS contract for the actual
+    // opened file handle.  It closes the pathname/inode ABA which cannot be
+    // observed by restatting the currently selected directory entry.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            MAIN_DATABASE.as_ptr().cast(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::os::raw::c_int).cast(),
+        )
+    };
+    match result {
+        rusqlite::ffi::SQLITE_OK => Ok(moved != 0),
+        rusqlite::ffi::SQLITE_NOTFOUND => Err(LibraryError::DatabaseFileControlUnavailable(
+            file_control_error(result, "SQLITE_FCNTL_HAS_MOVED is unavailable for main"),
+        )),
+        _ => Err(LibraryError::DatabaseFileControl(file_control_error(
+            result,
+            "SQLITE_FCNTL_HAS_MOVED failed for main",
+        ))),
+    }
+}
+
+fn file_control_error(result: std::os::raw::c_int, context: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(result), Some(context.to_owned()))
 }
 
 fn establish_wal(connection: &Connection) -> Result<(), LibraryError> {
