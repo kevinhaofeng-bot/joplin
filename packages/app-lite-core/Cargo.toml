@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 html5ever = "0.38"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 sha2 = "0.10"
 thiserror = "2"
 

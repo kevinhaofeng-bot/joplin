@@ -1,7 +1,16 @@
 pub mod document;
+pub mod domain;
+pub mod query;
+pub mod repository;
 pub mod resource;
+pub mod revision;
+pub mod schema;
 
 pub use document::{CanonicalDocument, CanonicalHtml, DocumentError, SearchText};
+pub use domain::*;
+pub use query::*;
+pub use repository::*;
 pub use resource::{
     BlobHash, ResourceBlob, ResourceError, ResourceId, ResourceInput, ResourceStore,
 };
+pub use revision::*;
