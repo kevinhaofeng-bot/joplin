@@ -20,21 +20,35 @@ pub struct PaneState {
 }
 
 impl PaneState {
-    pub const fn new(sidebar_width: u16, list_width: u16) -> Self {
+    pub fn new(sidebar_width: u16, list_width: u16) -> Self {
         Self {
             sidebar_width,
             list_width,
             sidebar_visible: true,
             list_visible: true,
         }
+        .normalized()
     }
 
     fn from_shell_state(state: &LibraryShellState) -> Self {
-        Self {
-            sidebar_width: state.sidebar_width,
-            list_width: state.list_width,
-            sidebar_visible: state.sidebar_visible,
-            list_visible: state.list_visible,
+        let mut panes = Self::new(state.sidebar_width, state.list_width);
+        panes.sidebar_visible = state.sidebar_visible;
+        panes.list_visible = state.list_visible;
+        panes
+    }
+
+    fn normalized(self) -> Self {
+        if LibraryShellState::pane_width_is_valid(self.sidebar_width)
+            && LibraryShellState::pane_width_is_valid(self.list_width)
+        {
+            self
+        } else {
+            Self {
+                sidebar_width: LibraryShellState::DEFAULT_SIDEBAR_WIDTH,
+                list_width: LibraryShellState::DEFAULT_LIST_WIDTH,
+                sidebar_visible: self.sidebar_visible,
+                list_visible: self.list_visible,
+            }
         }
     }
 }
@@ -162,7 +176,7 @@ impl AppModel {
             self.record_partial_commit("笔记已创建", &error);
             return Err(error);
         }
-        if let Err(error) = self.select_note(note.id) {
+        if let Err(error) = self.select_loaded_note(note) {
             self.record_partial_commit("笔记已创建，但无法恢复选中状态", &error);
             return Err(error);
         }
@@ -184,7 +198,14 @@ impl AppModel {
             .repository
             .load_note(&id)?
             .ok_or(LibraryError::NotFound)?;
-        self.navigation.select(Some(id.clone()));
+        self.select_loaded_note(note)
+    }
+
+    /// Installs a fully hydrated repository result as the active session. The
+    /// create path already owns such a result, so routing it through here
+    /// avoids immediately loading the same Note a second time.
+    fn select_loaded_note(&mut self, note: Note) -> Result<(), LibraryError> {
+        self.navigation.select(Some(note.id.clone()));
         self.active_session = Some(ActiveSession { note });
         self.persist_shell_state()
     }
@@ -336,7 +357,7 @@ impl AppModel {
         self.navigation.set_search_query(query);
     }
     pub fn set_panes(&mut self, panes: PaneState) {
-        self.panes = panes;
+        self.panes = panes.normalized();
     }
     #[cfg(test)]
     pub fn fail_next_refresh_for_test(&mut self, error: LibraryError) {

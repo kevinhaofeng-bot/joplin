@@ -1956,7 +1956,10 @@ impl SpikeView {
     ) -> gpui::AnyElement {
         let editor = self.editor.clone();
         let width = layout.content_width;
-        let measurement_view = cx.entity();
+        // The surface retains these hooks across frames. They must hold only
+        // weak parent handles so closing the spike releases the surface,
+        // editor, and its typical image cache instead of forming a cycle.
+        let measurement_view: WeakEntity<Self> = cx.weak_entity();
         let paint_measurement_view = measurement_view.clone();
         let hooks = EditorSurfaceHooks::new(
             move |_window, cx| {
@@ -3366,6 +3369,74 @@ mod tests {
         assert!(
             cx.debug_bounds("native-editor-surface").is_some(),
             "spike must mount the reusable EditorSurface canvas, not a copied paint path"
+        );
+    }
+
+    #[gpui::test]
+    async fn closing_typical_spike_releases_parent_surface_editor_and_image_cache(
+        cx: &mut TestAppContext,
+    ) {
+        // Catches EditorSurface paint hooks retaining a strong SpikeView. The
+        // typical image-cache fixture makes the cycle observable beyond an
+        // empty editor: closing its only window must release every retained
+        // entity, not merely hide the parent view.
+        cx.update(|app| components::init(app));
+        let cache =
+            cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let editor = cx.new(|cx| EditorCore::new(build_document(FixtureKind::Typical), cx));
+            editor
+                .update(cx, |editor, _| populate_typical_images(editor))
+                .expect("typical fixture image insertion");
+            editor.read(cx).focus_handle().focus(window);
+            SpikeView {
+                surface: new_embedded_surface(editor.clone(), Some(cache.clone()), cx),
+                editor,
+                title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
+                image_cache: Some(cache),
+                catalogue: CommandCatalogue::default(),
+                scroll_handle: ScrollHandle::new(),
+                more_open: false,
+                link_popover: None,
+                pointer_anchor: None,
+                drop_point: None,
+                more_trigger_bounds: None,
+                measurement: None,
+            }
+        });
+        redraw(cx);
+        let (weak_surface, weak_editor, weak_cache) = view.read_with(cx, |view, _| {
+            (
+                view.surface.downgrade(),
+                view.editor.downgrade(),
+                view.image_cache
+                    .as_ref()
+                    .expect("typical spike owns its production cache")
+                    .downgrade(),
+            )
+        });
+        let weak_view = view.downgrade();
+
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        cx.cx.update(|_| {});
+        cx.run_until_parked();
+
+        assert!(
+            weak_view.upgrade().is_none(),
+            "parent view leaked after close"
+        );
+        assert!(
+            weak_surface.upgrade().is_none(),
+            "surface hook must not keep the shared canvas alive"
+        );
+        assert!(
+            weak_editor.upgrade().is_none(),
+            "surface must release its editor after the parent closes"
+        );
+        assert!(
+            weak_cache.upgrade().is_none(),
+            "typical image cache must release with the closed spike"
         );
     }
 

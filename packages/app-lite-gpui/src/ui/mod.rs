@@ -8,6 +8,8 @@ use crate::app::{
 };
 use crate::native_editor::codec::import_canonical;
 use crate::native_editor::core::EditorCore;
+#[cfg(test)]
+use crate::native_editor::surface::EditorSurfaceHooks;
 use crate::native_editor::surface::{EditorSurface, EditorSurfaceMode};
 use app_lite_core::{CanonicalDocument, LibraryRepository, Note, NoteId, NoteProjection};
 use gpui::{
@@ -18,6 +20,8 @@ use gpui::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 #[cfg(test)]
 use std::sync::mpsc::{self, Sender};
@@ -43,6 +47,15 @@ pub struct LibraryShell {
     rendered_note_range: Option<std::ops::Range<usize>>,
     #[cfg(test)]
     last_scroll_request: Option<usize>,
+    #[cfg(test)]
+    library_surface_paint_hooks_for_test: Arc<LibrarySurfacePaintHooks>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct LibrarySurfacePaintHooks {
+    shape: AtomicUsize,
+    paint: AtomicUsize,
 }
 
 /// A task-local lifetime guard. In production it is deliberately zero-sized;
@@ -145,6 +158,7 @@ impl LibraryShell {
         focus_handle.focus(window);
         let observation = cx.observe(&model, |shell, _, cx| {
             shell.sync_editor_surface(cx);
+            shell.scroll_selected_into_view(cx);
             cx.notify();
         });
         let event_receiver = model.read(cx).subscribe_library_events();
@@ -169,8 +183,14 @@ impl LibraryShell {
             rendered_note_range: None,
             #[cfg(test)]
             last_scroll_request: None,
+            #[cfg(test)]
+            library_surface_paint_hooks_for_test: Arc::new(LibrarySurfacePaintHooks::default()),
         };
         shell.sync_editor_surface(cx);
+        // UniformListScrollHandle retains this request until its first
+        // `track_scroll` mount, so a restored selection can reach a distant
+        // card before the window has drawn for the first time.
+        shell.scroll_selected_into_view(cx);
         shell
     }
 
@@ -195,16 +215,10 @@ impl LibraryShell {
                 }
                 if this
                     .update(cx, |shell, shell_cx| {
-                        let refresh = shell.model.update(shell_cx, |model, model_cx| {
-                            let refresh = model.refresh_projection_events(events);
+                        let _ = shell.model.update(shell_cx, |model, model_cx| {
+                            let _ = model.refresh_projection_events(events);
                             model_cx.notify();
-                            refresh
                         });
-                        if matches!(refresh, Ok(true)) {
-                            shell.sync_editor_surface(shell_cx);
-                            shell.scroll_selected_into_view(shell_cx);
-                        }
-                        shell_cx.notify();
                     })
                     .is_err()
                 {
@@ -232,17 +246,14 @@ impl LibraryShell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let result = self.model.update(cx, |model, model_cx| {
-            let result = model.dispatch(action);
+        let _ = self.model.update(cx, |model, model_cx| {
+            let _ = model.dispatch(action);
             model_cx.notify();
-            result
         });
-        if result.is_ok() {
-            self.sync_editor_surface(cx);
-            self.scroll_selected_into_view(cx);
-        }
-        // The action failure is retained in AppModel::status and rendered below.
-        cx.notify();
+        // The retained model observer owns surface synchronization, deferred
+        // scrolling, and shell invalidation. Keeping this reducer to model
+        // mutation plus notification makes every user and event route share
+        // the exact same visible-state bridge.
     }
 
     fn create_note(&mut self, _: &CreateNote, window: &mut Window, cx: &mut Context<Self>) {
@@ -306,10 +317,27 @@ impl LibraryShell {
         match native_document {
             Ok(document) => {
                 let editor = cx.new(|cx| EditorCore::new_read_only(document, cx));
-                self.editor_surface =
-                    Some(cx.new(|cx| {
-                        EditorSurface::new(editor, EditorSurfaceMode::ReadOnly, None, cx)
-                    }));
+                #[cfg(test)]
+                let before_shape = Arc::clone(&self.library_surface_paint_hooks_for_test);
+                #[cfg(test)]
+                let after_paint = Arc::clone(&self.library_surface_paint_hooks_for_test);
+                self.editor_surface = Some(cx.new(move |cx| {
+                    #[cfg(test)]
+                    let mut surface =
+                        EditorSurface::new(editor, EditorSurfaceMode::ReadOnly, None, cx);
+                    #[cfg(not(test))]
+                    let surface = EditorSurface::new(editor, EditorSurfaceMode::ReadOnly, None, cx);
+                    #[cfg(test)]
+                    surface.set_paint_hooks(EditorSurfaceHooks::new(
+                        move |_window, _app| {
+                            before_shape.shape.fetch_add(1, Ordering::Relaxed);
+                        },
+                        move |_window, _app| {
+                            after_paint.paint.fetch_add(1, Ordering::Relaxed);
+                        },
+                    ));
+                    surface
+                }));
             }
             Err(error) => self.unsupported_document = Some(error),
         }

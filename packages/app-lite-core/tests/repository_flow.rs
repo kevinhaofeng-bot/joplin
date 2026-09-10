@@ -2,8 +2,8 @@ use app_lite_core::EditJournalEntry;
 use app_lite_core::ResourceId;
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{
-    CanonicalDocument, CreateNote, LibraryEvent, LibraryRepository, LibraryShellState,
-    ListQuery, NoteId, SaveNote,
+    CanonicalDocument, CreateNote, LibraryEvent, LibraryRepository, LibraryShellState, ListQuery,
+    NoteId, SaveNote,
 };
 use rusqlite::Connection;
 use std::sync::mpsc::TryRecvError;
@@ -44,29 +44,59 @@ fn library_shell_state_is_typed_strict_and_clears_stale_selection_atomically() {
         })
         .unwrap();
     assert_eq!(
-        repository.read_library_shell_state().unwrap().selected_note_id,
+        repository
+            .read_library_shell_state()
+            .unwrap()
+            .selected_note_id,
         None
     );
 
     // A malformed field count, a non-boolean flag, or an out-of-range width is
     // never allowed to turn a partially valid setting into invisible panes.
-    repository
-        .write_setting("library-shell.panes", "260,410,1")
-        .unwrap();
+    assert!(
+        repository
+            .write_library_shell_state(&LibraryShellState {
+                sidebar_width: 0,
+                ..state.clone()
+            })
+            .is_err(),
+        "the typed writer must reject invalid pane state before it reaches SQLite"
+    );
+    assert!(
+        repository
+            .write_setting("library-shell.panes", "260,410,1")
+            .is_err(),
+        "the generic settings API must not bypass the typed shell-state writer"
+    );
+
+    // A raw database write models pre-Task-3/corrupt storage. The reader must
+    // still fail closed to defaults; product code has no generic reserved-key
+    // escape hatch for creating this state.
+    let raw = Connection::open(profile.path().join("library.sqlite")).unwrap();
+    raw.execute(
+        "INSERT INTO settings (key, value, updated_time) VALUES (?1, ?2, 1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ["library-shell.panes", "260,410,1"],
+    )
+    .unwrap();
     assert_eq!(
         repository.read_library_shell_state().unwrap().pane_state(),
         LibraryShellState::default().pane_state()
     );
-    repository
-        .write_setting("library-shell.panes", "260,410,yes,1")
-        .unwrap();
+    raw.execute(
+        "UPDATE settings SET value = ?2 WHERE key = ?1",
+        ["library-shell.panes", "260,410,yes,1"],
+    )
+    .unwrap();
     assert_eq!(
         repository.read_library_shell_state().unwrap().pane_state(),
         LibraryShellState::default().pane_state()
     );
-    repository
-        .write_setting("library-shell.panes", "0,410,1,1")
-        .unwrap();
+    raw.execute(
+        "UPDATE settings SET value = ?2 WHERE key = ?1",
+        ["library-shell.panes", "0,410,1,1"],
+    )
+    .unwrap();
     assert_eq!(
         repository.read_library_shell_state().unwrap().pane_state(),
         LibraryShellState::default().pane_state()

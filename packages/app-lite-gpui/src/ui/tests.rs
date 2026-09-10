@@ -1,6 +1,6 @@
 use super::*;
 use crate::app::AppAction;
-use crate::components::{Copy, SelectAll};
+use crate::components::{Copy, Paste, SelectAll};
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryShellState};
 use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext};
@@ -446,6 +446,65 @@ async fn rich_body_mounts_the_native_canvas_and_never_uses_body_text_fallback(
 }
 
 #[gpui::test]
+async fn library_canvas_shapes_and_executes_the_shared_paint_entity_path(cx: &mut TestAppContext) {
+    // Catches a library route that mounts the right surface chrome but skips
+    // either donor shaping or render::paint_entity inside its canvas callback.
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "真实画布".into(),
+            notebook_id: None,
+            document: rich_document("必须由共享画布 shape 和 paint"),
+        })
+        .expect("create canvas fixture");
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |view, view_cx| {
+            view.apply_action(AppAction::SelectNote(note.id.clone()), window, view_cx)
+        });
+    });
+    crate::native_editor::render::reset_test_render_observations();
+    redraw(cx);
+
+    let editor = view.read_with(cx, |view, cx| {
+        view.editor_surface
+            .as_ref()
+            .expect("selection mounts library surface")
+            .read(cx)
+            .editor()
+            .clone()
+    });
+    let hook_counts = view.read_with(cx, |view, _| {
+        (
+            view.library_surface_paint_hooks_for_test
+                .shape
+                .load(std::sync::atomic::Ordering::Relaxed),
+            view.library_surface_paint_hooks_for_test
+                .paint
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    });
+    let shape_calls = cx.update(|_, app| editor.read(app).shape_calls_for_test());
+    assert!(
+        hook_counts.0 > 0,
+        "library surface before-shape hook must run"
+    );
+    assert!(
+        hook_counts.1 > 0,
+        "library surface after-paint hook must run"
+    );
+    assert!(
+        shape_calls > 0,
+        "library canvas must shape the selected document"
+    );
+    assert!(
+        crate::native_editor::render::test_paint_entity_calls() > 0,
+        "library canvas must invoke the shared paint_entity path"
+    );
+}
+
+#[gpui::test]
 async fn mounted_read_only_surface_keeps_selection_and_copy_available(cx: &mut TestAppContext) {
     cx.update(|app| crate::components::init(app));
     let (_profile, repository) = repository();
@@ -473,7 +532,26 @@ async fn mounted_read_only_surface_keeps_selection_and_copy_available(cx: &mut T
             .editor()
             .clone()
     });
-    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    let baseline = cx.update(|_, app| {
+        let editor = editor.read(app);
+        (
+            editor.document().semantic_snapshot(),
+            editor.undo_depth(),
+            editor.redo_depth(),
+            editor.history_used_bytes(),
+            editor.image_resource_count_for_test(),
+        )
+    });
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted read-only canvas");
+    // Use the mounted surface's real pointer focus and GPUI input bridge,
+    // rather than calling EditorCore mutation methods directly.
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input("不应写入");
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("剪贴板不应写入".into()));
+    cx.simulate_keystrokes("cmd-v backspace");
+    cx.dispatch_action(Paste);
     cx.dispatch_action(SelectAll);
     cx.dispatch_action(Copy);
     assert_eq!(
@@ -488,12 +566,61 @@ async fn mounted_read_only_surface_keeps_selection_and_copy_available(cx: &mut T
             surface.read(cx).editor().read(cx).copy_all_plain_text(),
             "只读正文仍应允许复制"
         );
+        let editor = surface.read(cx).editor().read(cx);
+        assert_eq!(
+            editor.document().semantic_snapshot(),
+            baseline.0,
+            "mounted mouse/IME/paste input must not mutate a read-only document"
+        );
+        assert_eq!(editor.undo_depth(), baseline.1);
+        assert_eq!(editor.redo_depth(), baseline.2);
+        assert_eq!(editor.history_used_bytes(), baseline.3);
+        assert_eq!(
+            editor.image_resource_count_for_test(),
+            baseline.4,
+            "read-only clipboard handling must not add image-store resources"
+        );
         assert_eq!(
             view.model.read(cx).navigation().selected_note_id(),
             Some(&stored.id),
             "copy actions must not mutate library selection"
         );
     });
+}
+
+#[gpui::test]
+async fn selecting_an_unsupported_resource_note_never_reads_blob_bytes(cx: &mut TestAppContext) {
+    // Catches accidental Task-5-style blob hydration while Task 3 only needs
+    // metadata/canonical parsing to fail closed on image notes.
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_image(b"resource observer fixture", "image", "image/png", "png")
+        .expect("create resource blob");
+    let note = repository
+        .create_note(CreateNote {
+            title: "资源未加载".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Image {
+                    resource_id: image,
+                    alt: "Task 5 owns decode".into(),
+                }],
+            }]),
+        })
+        .expect("create unsupported note");
+    let resource_reads = repository.observe_resource_reads();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |view, view_cx| {
+            view.apply_action(AppAction::SelectNote(note.id.clone()), window, view_cx)
+        });
+    });
+    redraw(cx);
+
+    assert!(cx.debug_bounds("unsupported-native-document").is_some());
+    assert_eq!(resource_reads.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[gpui::test]
@@ -649,6 +776,101 @@ async fn uniform_list_constructs_only_requested_ranges_and_reaches_1662_tail(
         note_list::constructed_items_for_test() < 320,
         "tail scroll built the whole library"
     );
+}
+
+#[gpui::test]
+async fn restored_tail_selection_scrolls_on_its_first_mounted_draw(cx: &mut TestAppContext) {
+    // Catches LibraryShell::new synchronizing its surface but forgetting the
+    // deferred UniformListScrollHandle request that makes a restored tail
+    // selection visible before the first user interaction.
+    let (_profile, repository) = repository();
+    for index in 0..1_662 {
+        repository
+            .create_note(CreateNote {
+                title: format!("restored tail {index:04}"),
+                notebook_id: None,
+                document: CanonicalDocument::default(),
+            })
+            .expect("create restored-selection fixture");
+    }
+    let tail = AppModel::open(Arc::clone(&repository))
+        .expect("inspect projections")
+        .projections()
+        .last()
+        .expect("tail projection")
+        .id
+        .clone();
+    repository
+        .write_library_shell_state(&LibraryShellState {
+            selected_note_id: Some(tail.clone()),
+            ..LibraryShellState::default()
+        })
+        .expect("persist restored tail selection");
+
+    let (view, cx) = mount_shell(repository, cx);
+    note_list::reset_constructed_items_for_test();
+    redraw(cx);
+
+    view.read_with(cx, |view, cx| {
+        let model = view.model.read(cx);
+        let tail_index = model
+            .projections()
+            .iter()
+            .position(|projection| projection.id == tail)
+            .expect("restored note remains in projection");
+        assert_eq!(model.navigation().selected_note_id(), Some(&tail));
+        assert_eq!(view.last_scroll_request, Some(tail_index));
+        assert!(
+            view.rendered_note_range
+                .as_ref()
+                .is_some_and(|range| range.contains(&tail_index)),
+            "first library draw must construct the restored tail card"
+        );
+    });
+    assert!(
+        note_list::constructed_items_for_test() < 160,
+        "restoring a tail selection must stay virtualized"
+    );
+}
+
+#[gpui::test]
+async fn retained_model_observer_syncs_and_scrolls_an_independent_model_change(
+    cx: &mut TestAppContext,
+) {
+    // Catches removal of the retained observer or its scroll side effect. This
+    // intentionally bypasses LibraryShell::apply_action, so no UI callback
+    // can mask a missing model-notification bridge.
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "observer seam".into(),
+            notebook_id: None,
+            document: rich_document("observer must mount this body"),
+        })
+        .expect("create observer fixture");
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+
+    cx.update(|_window, app| {
+        let model = view.read(app).model.clone();
+        model.update(app, |model, model_cx| {
+            model
+                .dispatch(AppAction::SelectNote(note.id.clone()))
+                .expect("dispatch independent selection");
+            model_cx.notify();
+        });
+    });
+    redraw(cx);
+
+    view.read_with(cx, |view, cx| {
+        assert_eq!(
+            view.model.read(cx).navigation().selected_note_id(),
+            Some(&note.id)
+        );
+        assert_eq!(view.surface_note_id, Some(note.id.clone()));
+        assert!(view.editor_surface.is_some());
+        assert_eq!(view.last_scroll_request, Some(0));
+    });
 }
 
 #[gpui::test]

@@ -235,6 +235,10 @@ fn main() {
     });
 
     app.run(move |cx: &mut App| {
+        // This must precede profile resolution and runtime initialization so
+        // even an early visible StartupErrorView has ordinary last-window
+        // quit semantics.
+        library_menu::install_last_window_quit(cx);
         if evernote_spike {
             // Keep this route intentionally below the ordinary app bootstrap:
             // it needs the donor key/action table, but not donor workspace,

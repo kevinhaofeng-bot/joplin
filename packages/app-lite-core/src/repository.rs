@@ -1,11 +1,13 @@
 use crate::resource::{DatabaseFile, ProfileDir, ResourceError, ResourceInput, ResourceStore};
 use crate::schema::migrate_schema;
 use crate::{
-    CreateNote, EditJournalEntry, EntityRef, ListQuery, Note, NoteId, NoteProjection, Notebook,
-    NotebookId, ResourceId, SaveNote, SavedRevision, Stack, StackId, Tag, TagId,
+    BlobHash, CreateNote, EditJournalEntry, EntityRef, ListQuery, Note, NoteId, NoteProjection,
+    Notebook, NotebookId, ResourceId, SaveNote, SavedRevision, Stack, StackId, Tag, TagId,
 };
 use rusqlite::hooks::{AuthAction, Authorization};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -15,6 +17,13 @@ use thiserror::Error;
 
 const LIBRARY_SHELL_PANES_SETTING: &str = "library-shell.panes";
 const LIBRARY_SHELL_SELECTED_NOTE_SETTING: &str = "library-shell.selected-note-id";
+
+fn is_reserved_library_shell_setting(key: &str) -> bool {
+    matches!(
+        key,
+        LIBRARY_SHELL_PANES_SETTING | LIBRARY_SHELL_SELECTED_NOTE_SETTING
+    )
+}
 
 /// The durable, application-owned portion of the library window state.
 ///
@@ -45,6 +54,28 @@ impl LibraryShellState {
             list_visible: true,
             selected_note_id: None,
         }
+    }
+
+    /// Builds a writable shell state only when both persisted dimensions are
+    /// within the product's real pane range.
+    pub fn try_new(sidebar_width: u16, list_width: u16) -> Result<Self, LibraryError> {
+        let state = Self::new(sidebar_width, list_width);
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn validate(&self) -> Result<(), LibraryError> {
+        if Self::pane_width_is_valid(self.sidebar_width)
+            && Self::pane_width_is_valid(self.list_width)
+        {
+            Ok(())
+        } else {
+            Err(LibraryError::InvalidLibraryShellState)
+        }
+    }
+
+    pub const fn pane_width_is_valid(width: u16) -> bool {
+        width >= Self::MIN_PANE_WIDTH && width <= Self::MAX_PANE_WIDTH
     }
 
     pub const fn pane_state(&self) -> (u16, u16, bool, bool) {
@@ -81,9 +112,7 @@ impl LibraryShellState {
         };
         let sidebar_width = sidebar_width.parse::<u16>().ok()?;
         let list_width = list_width.parse::<u16>().ok()?;
-        if !(Self::MIN_PANE_WIDTH..=Self::MAX_PANE_WIDTH).contains(&sidebar_width)
-            || !(Self::MIN_PANE_WIDTH..=Self::MAX_PANE_WIDTH).contains(&list_width)
-        {
+        if !Self::pane_width_is_valid(sidebar_width) || !Self::pane_width_is_valid(list_width) {
             return None;
         }
         let sidebar_visible = match *sidebar_visible {
@@ -214,6 +243,10 @@ pub enum LibraryError {
     StaleRevision { expected: i64, actual: i64 },
     #[error("could not allocate a unique opaque entity ID")]
     IdCollisionExhausted,
+    #[error("library shell state contains invalid pane dimensions")]
+    InvalidLibraryShellState,
+    #[error("generic settings access cannot address reserved library shell state")]
+    ReservedLibraryShellSetting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +268,8 @@ pub struct LibraryRepository {
     events: Mutex<Vec<Sender<LibraryEvent>>>,
     list_observers: Mutex<Vec<Sender<Vec<String>>>>,
     note_load_observers: Mutex<Vec<Sender<NoteId>>>,
+    #[cfg(test)]
+    shell_state_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[allow(dead_code)]
     database_path: PathBuf,
     clock: Arc<dyn RepositoryClock>,
@@ -450,6 +485,8 @@ impl LibraryRepository {
             events: Mutex::new(Vec::new()),
             list_observers: Mutex::new(Vec::new()),
             note_load_observers: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            shell_state_read_hook: Mutex::new(None),
             database_path: path,
             clock,
             id_source,
@@ -545,37 +582,63 @@ impl LibraryRepository {
         receiver
     }
 
+    /// Records actual resource-blob reads separately from SQLite card and
+    /// complete-note hydration. A Task 3 projection or read-only selection
+    /// must not touch blob bytes before Task 5 owns image resources.
+    pub fn observe_resource_reads(&self) -> Receiver<BlobHash> {
+        self.resource_store.observe_reads()
+    }
+
+    #[cfg(test)]
+    fn install_shell_state_interleave_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .shell_state_read_hook
+            .lock()
+            .expect("shell-state read hook mutex poisoned") = Some(Box::new(hook));
+    }
+
     /// Reads the complete application-owned library shell state. Corrupt pane
     /// settings are all-or-default; a malformed note ID is simply no selection.
     pub fn read_library_shell_state(&self) -> Result<LibraryShellState, LibraryError> {
-        let connection = self.connection.lock().expect("library mutex poisoned");
-        let panes = connection
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        // A deferred read transaction pins one SQLite snapshot after the first
+        // SELECT. A concurrent writer can commit its next atomic generation,
+        // but it cannot make the later selection read observe a different
+        // generation from the panes read above.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let panes = transaction
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
                 [LIBRARY_SHELL_PANES_SETTING],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        let selected_note_id = connection
+        #[cfg(test)]
+        if let Some(hook) = self
+            .shell_state_read_hook
+            .lock()
+            .expect("shell-state read hook mutex poisoned")
+            .take()
+        {
+            hook();
+        }
+        let selected_note_id = transaction
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
                 [LIBRARY_SHELL_SELECTED_NOTE_SETTING],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        Ok(LibraryShellState::from_settings(
-            panes.as_deref(),
-            selected_note_id.as_deref(),
-        ))
+        let state = LibraryShellState::from_settings(panes.as_deref(), selected_note_id.as_deref());
+        transaction.commit()?;
+        Ok(state)
     }
 
     /// Commits pane state and optional selection together. Passing `None`
     /// explicitly removes any stale selection rather than allowing it to be
     /// revived after a future restart.
-    pub fn write_library_shell_state(
-        &self,
-        state: &LibraryShellState,
-    ) -> Result<(), LibraryError> {
+    pub fn write_library_shell_state(&self, state: &LibraryShellState) -> Result<(), LibraryError> {
+        state.validate()?;
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
@@ -602,15 +665,23 @@ impl LibraryRepository {
 
     /// Reads application-owned shell state without exposing SQLite to the UI.
     pub fn read_setting(&self, key: &str) -> Result<Option<String>, LibraryError> {
+        if is_reserved_library_shell_setting(key) {
+            return Err(LibraryError::ReservedLibraryShellSetting);
+        }
         let connection = self.connection.lock().expect("library mutex poisoned");
         connection
-            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
             .optional()
             .map_err(Into::into)
     }
 
     /// Persists application-owned shell state without exposing SQLite to the UI.
     pub fn write_setting(&self, key: &str, value: &str) -> Result<(), LibraryError> {
+        if is_reserved_library_shell_setting(key) {
+            return Err(LibraryError::ReservedLibraryShellSetting);
+        }
         let now = self.now();
         let connection = self.connection.lock().expect("library mutex poisoned");
         connection.execute(
@@ -1569,6 +1640,60 @@ fn enqueue_sync(
         }
     }
     Err(LibraryError::IdCollisionExhausted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn shell_state_read_keeps_one_snapshot_when_a_second_connection_commits_between_fields() {
+        // Catches two independent SELECTs combining old panes with a new
+        // selection. The hook runs after the first field read, while the
+        // reader's SQLite snapshot must remain pinned.
+        let profile = tempdir().expect("temporary profile");
+        let database = profile.path().join("library.sqlite");
+        let reader = LibraryRepository::open(&database).expect("open reader");
+        let writer = LibraryRepository::open(&database).expect("open writer");
+        let old = LibraryShellState {
+            sidebar_width: 260,
+            list_width: 410,
+            sidebar_visible: true,
+            list_visible: false,
+            selected_note_id: Some(NoteId::parse("11111111111111111111111111111111").unwrap()),
+        };
+        let new = LibraryShellState {
+            sidebar_width: 300,
+            list_width: 480,
+            sidebar_visible: false,
+            list_visible: true,
+            selected_note_id: Some(NoteId::parse("22222222222222222222222222222222").unwrap()),
+        };
+        reader
+            .write_library_shell_state(&old)
+            .expect("write initial generation");
+        let expected_new = new.clone();
+        reader.install_shell_state_interleave_hook_for_test(move || {
+            writer
+                .write_library_shell_state(&new)
+                .expect("writer commits a complete next generation");
+        });
+
+        assert_eq!(
+            reader
+                .read_library_shell_state()
+                .expect("read pinned snapshot"),
+            old,
+            "one reader call must not combine different durable generations"
+        );
+        assert_eq!(
+            reader
+                .read_library_shell_state()
+                .expect("read next snapshot"),
+            expected_new
+        );
+    }
 }
 
 fn row_to_notebook(row: &rusqlite::Row<'_>) -> rusqlite::Result<Notebook> {

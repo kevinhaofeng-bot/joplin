@@ -1,6 +1,6 @@
 use super::{AppAction, AppModel, AppStatus, ListViewMode, NoteSort, PaneState};
 use app_lite_core::document::{Block, BlockStyle, Inline};
-use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, NoteId};
+use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, LibraryShellState, NoteId};
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 
@@ -40,6 +40,31 @@ fn create_note_persists_before_it_becomes_selected() {
         .expect("selection");
     assert!(repository.load_note(&id).expect("load").is_some());
     assert_eq!(model.active_session_note_id(), Some(&id));
+}
+
+#[test]
+fn create_note_reuses_the_repository_hydration_for_its_active_session() {
+    // Catches AppModel::create_note selecting the returned ID through a second
+    // load_note call after the repository already returned the complete Note.
+    let (_profile, repository) = repository();
+    let loads = repository.observe_note_loads();
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+
+    model
+        .dispatch(AppAction::CreateNote)
+        .expect("create action");
+
+    let selected = model
+        .navigation()
+        .selected_note_id()
+        .cloned()
+        .expect("created note becomes selected after refresh");
+    assert_eq!(loads.try_recv(), Ok(selected));
+    assert_eq!(
+        loads.try_recv(),
+        Err(TryRecvError::Empty),
+        "the complete Note returned by create_note must become the active session without a second hydration"
+    );
 }
 
 #[test]
@@ -170,13 +195,31 @@ fn restart_restores_panes_and_a_valid_note_selection() {
 }
 
 #[test]
+fn set_panes_normalizes_invalid_live_dimensions_before_persisting() {
+    // Catches a resize/UI caller leaving an invalid 0px or oversized pane in
+    // AppModel memory even though the repository rejects it later.
+    let (_profile, repository) = repository();
+    let mut model = AppModel::open(repository).expect("open model");
+
+    model.set_panes(PaneState {
+        sidebar_width: 0,
+        list_width: u16::MAX,
+        sidebar_visible: true,
+        list_visible: true,
+    });
+
+    assert_eq!(model.panes(), PaneState::new(220, 360));
+}
+
+#[test]
 fn invalid_saved_selection_falls_back_without_loading_a_body() {
     let (_profile, repository) = repository();
+    let stale = NoteId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("valid opaque ID");
     repository
-        .write_setting(
-            "library-shell.selected-note-id",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
+        .write_library_shell_state(&LibraryShellState {
+            selected_note_id: Some(stale),
+            ..LibraryShellState::default()
+        })
         .expect("write stale setting");
     let observed = repository.observe_next_list_query();
 

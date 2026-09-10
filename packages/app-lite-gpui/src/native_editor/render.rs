@@ -82,6 +82,7 @@ enum TextPaintPass {
 struct TestRenderObservations {
     snapshot_clone_peak: usize,
     shaped_background_paints: usize,
+    paint_entity_calls: usize,
     image_residency: Option<TestImageResidencyObservation>,
 }
 
@@ -117,6 +118,11 @@ pub(crate) fn test_snapshot_clone_peak() -> usize {
 #[cfg(test)]
 pub(crate) fn test_highlight_background_paints() -> usize {
     TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow().shaped_background_paints)
+}
+
+#[cfg(test)]
+pub(crate) fn test_paint_entity_calls() -> usize {
+    TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow().paint_entity_calls)
 }
 
 #[cfg(test)]
@@ -536,6 +542,10 @@ pub fn paint_entity(
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Result<()> {
+    #[cfg(test)]
+    TEST_RENDER_OBSERVATIONS.with(|observations| {
+        observations.borrow_mut().paint_entity_calls += 1;
+    });
     let focus_handle = entity.read(cx).focus_handle().clone();
     if focus_handle.is_focused(window) {
         window.handle_input(

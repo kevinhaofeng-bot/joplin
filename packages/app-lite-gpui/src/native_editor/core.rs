@@ -169,6 +169,8 @@ pub struct EditorCore {
     image_store: ImageStore,
     pub(crate) layout: LayoutRegistry,
     layout_offset: (f32, f32),
+    #[cfg(test)]
+    shape_calls: usize,
 }
 
 /// Capability boundary for the single editor core.  The default constructor
@@ -316,6 +318,8 @@ impl EditorCore {
             image_store: ImageStore::default(),
             layout: LayoutRegistry::new(),
             layout_offset: (0.0, 0.0),
+            #[cfg(test)]
+            shape_calls: 0,
         }
     }
 
@@ -353,6 +357,11 @@ impl EditorCore {
 
     pub fn image_bytes(&self, resource_id: &str) -> Option<&[u8]> {
         self.image_store.compressed_for_resource(resource_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn image_resource_count_for_test(&self) -> usize {
+        self.image_store.resource_count_for_test()
     }
 
     pub fn image_state(&self, resource_id: &str) -> Option<super::images::ImageNodeState> {
@@ -497,6 +506,10 @@ impl EditorCore {
         width: f32,
         window: &mut Window,
     ) {
+        #[cfg(test)]
+        {
+            self.shape_calls += 1;
+        }
         self.clear_layout_translation();
         let document = &self.document;
         self.layout.shape_visible_with_window(
@@ -506,6 +519,11 @@ impl EditorCore {
             width,
             window,
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shape_calls_for_test(&self) -> usize {
+        self.shape_calls
     }
 
     pub(crate) fn translate_layout(&mut self, offset_x: f32, offset_y: f32) {

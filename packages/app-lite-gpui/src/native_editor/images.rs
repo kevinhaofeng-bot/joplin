@@ -445,6 +445,11 @@ impl ImageStore {
         Self::default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn resource_count_for_test(&self) -> usize {
+        self.images.len()
+    }
+
     pub fn insert_invalid_fixture(&mut self, resource_id: impl Into<String>) -> u64 {
         self.insert(
             ImageMetadata::new(resource_id, 1, 1),

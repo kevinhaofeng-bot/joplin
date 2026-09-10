@@ -5,8 +5,10 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use thiserror::Error;
 
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -98,6 +100,7 @@ pub struct ResourceStore {
     // removes a caller's pre-existing resources directory.
     cleanup_resources: Option<DirFd>,
     cleanup_profile: Option<DirFd>,
+    read_observers: Mutex<Vec<Sender<BlobHash>>>,
 }
 
 /// A profile directory held open by descriptor. SQLite still needs a pathname,
@@ -144,6 +147,7 @@ impl ResourceStore {
             blobs_dir,
             cleanup_resources: None,
             cleanup_profile: None,
+            read_observers: Mutex::new(Vec::new()),
         })
     }
 
@@ -174,6 +178,7 @@ impl ResourceStore {
             blobs_dir,
             cleanup_resources,
             cleanup_profile,
+            read_observers: Mutex::new(Vec::new()),
         })
     }
 
@@ -195,7 +200,22 @@ impl ResourceStore {
         })
     }
 
+    /// Observes actual blob-byte reads. Projection/list consumers use this
+    /// narrow diagnostic seam to prove they never hydrate Task-5 resources.
+    pub fn observe_reads(&self) -> Receiver<BlobHash> {
+        let (sender, receiver) = channel();
+        self.read_observers
+            .lock()
+            .expect("resource read observer mutex poisoned")
+            .push(sender);
+        receiver
+    }
+
     pub fn read(&self, sha256: &BlobHash) -> Result<Vec<u8>, ResourceError> {
+        self.read_observers
+            .lock()
+            .expect("resource read observer mutex poisoned")
+            .retain(|observer| observer.send(sha256.clone()).is_ok());
         self.read_blob(sha256.as_str())
     }
 
