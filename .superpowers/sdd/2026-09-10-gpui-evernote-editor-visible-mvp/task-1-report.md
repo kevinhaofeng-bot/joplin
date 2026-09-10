@@ -109,3 +109,43 @@ Status: DONE_WITH_CONCERNS
 
 - The diff remains limited to the title/input shell and report; no Task 7 thresholds, drawable-pool settings, image cache budgets, or measurement workloads changed.
 - Real-window status remains PENDING for the unchanged desktop automation limitation documented in Round 1; no screenshot or native interaction is claimed as PASS.
+
+## Round 3 — asynchronous native-picker image repaint regression
+
+Status: DONE_WITH_CONCERNS
+
+### Root cause proved
+
+The reproduced release symptom was not an image-path, catalogue, document transaction, resource, decode-cache, or body-focus failure. The native completion previously retained only `Entity<EditorCore>` and `CommandCatalogue`, then called `editor_cx.notify()`. `EditorCore` therefore changed and decoded the image, but the parent-owned `SpikeView` canvas/scroll surface received no notification to recompute its measured height and paint snapshot after that asynchronous callback. This exactly matches the manual evidence: the picker closed, the body caret returned, the note thumbnail changed, and stderr remained empty while the old current surface stayed clipped.
+
+The fix retains a typed `WindowHandle<SpikeView>` before opening the platform picker. On completion it executes the existing selected-image transaction through the owning `SpikeView` context, then calls `Context<SpikeView>::notify()`. It does not use a global refresh, a note switch, or a nested `Entity::update` (the latter was experimentally rejected because GPUI panics when updating the view already being updated by `WindowHandle::update`). Cancellation remains an explicit no-op for editor data/focus and is only allowed to invalidate the shell harmlessly.
+
+### Round 3 RED to GREEN evidence
+
+1. RED on the `478deb054` behavior model: the new real asynchronous seam spawned a completion outside `SpikeView::update`, performed the valid picker insertion, then asserted that the owning shell had been notified. It failed with: `an async picker completion must notify its owning SpikeView so the current surface can relayout`. This was intentionally a parent canvas/scroll contract, not a document-only or mock assertion.
+2. GREEN: `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_picker_selection_immediately_paints_the_inserted_image_in_the_current_surface -- --nocapture` passed (`1 passed; 0 failed`). The production seam drives the actual spawned callback and typed window update, then proves one structured image block in the current render snapshot, one visible image, decoded cache state `Loaded`, increased scroll extent, increased `spike-editor-surface` height, and a real `SpikeView` notification.
+3. The same seam uses the exact manual-acceptance asset: `/Users/kevinhao/Projects/joplin/.worktrees/joplin-lite-native-rust-mvp/packages/app-lite-gpui/assets/showcase/1.png`. It checks the file exists before dispatch and exercises the same `InsertImage` catalogue transaction as the native prompt.
+
+### Round 3 controller gates
+
+- Focused current-surface image seam: PASS, `1 passed; 0 failed`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype image -- --nocapture`: PASS, `142 passed; 0 failed; 850 filtered out`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype chrome -- --nocapture`: PASS, `22 passed; 0 failed`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_ -- --nocapture`: PASS, `17 passed; 0 failed`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores`: PASS, `991 passed; 0 failed; 1 filtered out`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run`: PASS.
+- `cargo fmt --check --manifest-path packages/app-lite-gpui/Cargo.toml`: PASS.
+- `git diff --check`: PASS.
+- `cargo build --manifest-path packages/app-lite-gpui/Cargo.toml --release`: PASS (optimized release build completed in 2m13s; pre-existing macro/unused warnings remain).
+
+### Real-window evidence
+
+- Baseline failure screenshots supplied with the reproduction remain preserved: `/tmp/joplin-lite-visible-mvp/fresh-known-inserted-front.png` and `/tmp/joplin-lite-visible-mvp/image-after-resize.png`.
+- The repaired exact Release binary was freshly launched as `packages/app-lite-gpui/target/release/velotype --evernote-spike`; launch/foreground screenshots are preserved at `/tmp/joplin-lite-round3/release-launch.png` and `/tmp/joplin-lite-round3/release-front.png`.
+- Native picker selection of the known image is PENDING, not PASS. In this shared desktop session the foreground-window contention prevented reliable accessibility automation of the unbundled `velotype` process; a later screenshot after an attempted toolbar click showed an unrelated foreground application rather than an attributable picker result. No visual acceptance is inferred from the seam tests.
+
+### Round 3 self-review and known concerns
+
+- The source diff is limited to `packages/app-lite-gpui/src/spike_app.rs`; it does not alter Task 7 image budgets, drawable-pool settings, fixtures, measurement limits, paste/drop behavior, or title/link/toolbar paths.
+- The selected-image callback retains its typed parent ownership for the whole prompt lifetime and invokes the pre-existing transaction/focus logic exactly once. The regression test would fail under the old child-only notification semantics.
+- Real native-picker/manual visual acceptance remains PENDING due to the desktop automation limitation above. This is the only promotion concern; no claim is made for `clippy -D warnings` because the repository retains pre-existing warnings.

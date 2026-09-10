@@ -1534,7 +1534,7 @@ impl SpikeView {
                     move |_event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                         cx.stop_propagation();
                         if command == EditorCommand::InsertImage {
-                            prompt_for_image_path(editor.clone(), catalogue, cx);
+                            prompt_for_image_path(cx);
                         } else if command == EditorCommand::Link {
                             let _ = view.update(cx, |view, view_cx| {
                                 view.open_link_popover(window, view_cx)
@@ -2133,8 +2133,10 @@ fn run_measurement_workload(
 
 /// Uses GPUI's native single-file prompt. Cancellation is deliberately a
 /// no-op: the editor is neither changed nor moved through history.
-fn prompt_for_image_path(editor: Entity<EditorCore>, catalogue: CommandCatalogue, cx: &mut App) {
-    let active_window = cx.active_window();
+fn prompt_for_image_path(cx: &mut App) {
+    let active_window = cx
+        .active_window()
+        .and_then(|window| window.downcast::<SpikeView>());
     let prompt = cx.prompt_for_paths(PathPromptOptions {
         files: true,
         directories: false,
@@ -2154,12 +2156,8 @@ fn prompt_for_image_path(editor: Entity<EditorCore>, catalogue: CommandCatalogue
             let Some(window_handle) = active_window else {
                 return;
             };
-            let _ = window_handle.update(cx, |_view, window, cx| {
-                if let Err(error) =
-                    complete_image_picker(&editor, catalogue, completion, window, cx)
-                {
-                    eprintln!("spike image command failed: {error}");
-                }
+            let _ = window_handle.update(cx, |view, window, view_cx| {
+                complete_image_picker_in_view(view, completion, window, view_cx);
             });
         });
     })
@@ -2169,6 +2167,23 @@ fn prompt_for_image_path(editor: Entity<EditorCore>, catalogue: CommandCatalogue
 enum ImagePickerCompletion {
     Cancelled,
     Selected(PathBuf),
+}
+
+/// Route the platform picker completion through the owning shell entity.
+/// EditorCore owns the transaction itself, but SpikeView owns the canvas
+/// dimensions and scroll extent which must be relaid out after an image node
+/// changes the document's measured height.
+fn complete_image_picker_in_view(
+    view: &mut SpikeView,
+    completion: ImagePickerCompletion,
+    window: &mut Window,
+    cx: &mut Context<SpikeView>,
+) {
+    if let Err(error) = complete_image_picker(&view.editor, view.catalogue, completion, window, cx)
+    {
+        eprintln!("spike image command failed: {error}");
+    }
+    cx.notify();
 }
 
 /// This is the selected-image half of the completion seam. Cancellation is
@@ -2600,9 +2615,14 @@ mod tests {
     use crate::native_editor::fixtures::typical_image_payload;
     use crate::native_editor::images::{ImagePayload, proxy_max_edge_for_viewport};
     use gpui::{
-        AppContext, ImageCache, Modifiers, Resource, TestAppContext, VisualTestContext, point,
+        AppContext, ImageCache, Modifiers, Resource, TestAppContext, VisualContext,
+        VisualTestContext, point,
     };
     use std::mem::size_of;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn drawable_pool_contract_rejects_gpui_default_count() {
@@ -4450,6 +4470,121 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[gpui::test]
+    async fn shell_picker_selection_immediately_paints_the_inserted_image_in_the_current_surface(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let image_cache =
+            cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
+        let view_cache = image_cache.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let editor = cx.new(|cx| EditorCore::new(sample_document(), cx));
+            editor.read(cx).focus_handle().focus(window);
+            SpikeView {
+                editor,
+                title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
+                image_cache: Some(view_cache.clone()),
+                catalogue: CommandCatalogue::default(),
+                scroll_handle: ScrollHandle::new(),
+                more_open: false,
+                link_popover: None,
+                pointer_anchor: None,
+                drop_point: None,
+                more_trigger_bounds: None,
+                measurement: None,
+            }
+        });
+        cx.simulate_resize(size(px(760.0), px(500.0)));
+        redraw(cx);
+        let surface_before = cx
+            .debug_bounds("spike-editor-surface")
+            .expect("mounted editor surface");
+        crate::native_editor::render::reset_test_image_residency_observation();
+        let path = PathBuf::from(
+            "/Users/kevinhao/Projects/joplin/.worktrees/joplin-lite-native-rust-mvp/packages/app-lite-gpui/assets/showcase/1.png",
+        );
+        assert!(
+            path.is_file(),
+            "the manual-acceptance picker image must exist"
+        );
+
+        let window_handle = cx
+            .window_handle()
+            .downcast::<SpikeView>()
+            .expect("picker callback must retain its owning spike window");
+        let parent_notifications = Arc::new(AtomicUsize::new(0));
+        let observed_parent_notifications = parent_notifications.clone();
+        let _parent_observer = cx.update(|_, app| {
+            app.observe(&view, move |_, _| {
+                observed_parent_notifications.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        cx.update(|_, app| {
+            app.spawn(async move |cx| {
+                let _ = cx.update(move |app| {
+                    let _ = window_handle.update(app, |view, window, app| {
+                        complete_image_picker_in_view(
+                            view,
+                            ImagePickerCompletion::Selected(path),
+                            window,
+                            app,
+                        );
+                    });
+                });
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        assert!(
+            parent_notifications.load(Ordering::Relaxed) > 0,
+            "an async picker completion must notify its owning SpikeView so the current surface can relayout"
+        );
+
+        let observation = crate::native_editor::render::test_image_residency_observation()
+            .expect("picker completion must schedule the current surface for painting");
+        assert_eq!(observation.image_bounds.len(), 1);
+        assert_eq!(observation.visible_indices.len(), 1);
+        assert!(
+            observation.visible_bounds[0].top() < observation.content_mask.bottom(),
+            "the inserted image must belong to the current surface's visible render snapshot"
+        );
+        let resource_id = view.read_with(cx, |view, cx| {
+            view.editor
+                .read(cx)
+                .document()
+                .blocks()
+                .iter()
+                .find_map(|block| match &block.content {
+                    crate::native_editor::model::BlockContent::Image { resource_id, .. } => {
+                        Some(resource_id.clone())
+                    }
+                    _ => None,
+                })
+                .expect("picker transaction must create an image block")
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .editor
+                .read(cx)
+                .image_state(&resource_id)),
+            Some(crate::native_editor::images::ImageNodeState::Loaded),
+            "the current surface must repaint after its cache decode, not leave the inserted image loading forever"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_handle.max_offset().height) > px(0.0),
+            "the enclosing scroll surface must grow after an async picker image insertion"
+        );
+        assert!(
+            cx.debug_bounds("spike-editor-surface")
+                .expect("mounted editor surface after picker completion")
+                .size
+                .height
+                > surface_before.size.height,
+            "the current surface must be relaid out instead of clipping the inserted image at its old height"
+        );
     }
 
     #[gpui::test]
