@@ -489,6 +489,115 @@ fn migration_gate_blocks_a_second_v3_writer_before_html_publication() {
 
 #[cfg(all(feature = "test-support", unix))]
 #[test]
+fn database_file_swap_after_sqlite_open_aborts_before_wal_or_schema_writes() {
+    // Catches retaining only the parent directory identity while SQLite keeps
+    // a pathname-opened, now-unlinked database inode alive for migration.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let seed = Connection::open(&path).unwrap();
+    seed_native_v3(&seed, false);
+    drop(seed);
+    let before = v3_snapshot(&path);
+    let original = profile.path().join("original.sqlite");
+    let replacement = path.clone();
+    let hook_original = original.clone();
+    let hook: OpenTestHook = Arc::new(move |phase| {
+        if phase == OpenTestPhase::AfterSqliteOpen {
+            std::fs::rename(&replacement, &hook_original).unwrap();
+            drop(Connection::open(&replacement).unwrap());
+        }
+    });
+
+    assert!(matches!(
+        LibraryRepository::open_with_sources_and_hook(
+            &path,
+            Arc::new(FixedClock),
+            Arc::new(FixedIds),
+            hook,
+        ),
+        Err(LibraryError::InvalidDatabasePath)
+    ));
+    assert_eq!(v3_snapshot(&original), before);
+    for sidecar in [
+        original.with_extension("sqlite-wal"),
+        original.with_extension("sqlite-shm"),
+        path.with_extension("sqlite-wal"),
+        path.with_extension("sqlite-shm"),
+    ] {
+        assert!(
+            !sidecar.exists(),
+            "database-file swap reached a WAL/schema pathname side effect: {sidecar:?}"
+        );
+    }
+    assert!(!profile.path().join("resources").exists());
+    let replacement = Connection::open(&path).unwrap();
+    assert_eq!(
+        replacement
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        replacement
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(all(feature = "test-support", unix))]
+#[test]
+fn migration_commit_returns_bound_repository_when_selected_profile_is_replaced() {
+    // Catches a post-commit pathname check returning an apparent migration
+    // failure even though the old, already-published database is readable.
+    let root = tempdir().unwrap();
+    let profile = root.path().join("profile");
+    std::fs::create_dir(&profile).unwrap();
+    let path = profile.join("library.sqlite");
+    let seed = Connection::open(&path).unwrap();
+    seed_native_v3(&seed, false);
+    drop(seed);
+    let moved = root.path().join("published-profile");
+    let swap_profile = profile.clone();
+    let hook_moved = moved.clone();
+    let hook: OpenTestHook = Arc::new(move |phase| {
+        if phase == OpenTestPhase::AfterMigrationCommit {
+            std::fs::rename(&swap_profile, &hook_moved).unwrap();
+            std::fs::create_dir(&swap_profile).unwrap();
+        }
+    });
+
+    let repository = LibraryRepository::open_with_sources_and_hook(
+        &path,
+        Arc::new(FixedClock),
+        Arc::new(FixedIds),
+        hook,
+    )
+    .expect("a committed migration must not be reported as an open failure");
+    assert_eq!(
+        repository
+            .load_note_by_hex("0123456789abcdef0123456789abcdef")
+            .unwrap()
+            .unwrap()
+            .title,
+        "legacy"
+    );
+    drop(repository);
+    let published = Connection::open(moved.join("library.sqlite")).unwrap();
+    assert_eq!(
+        published
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+}
+
+#[cfg(all(feature = "test-support", unix))]
+#[test]
 fn profile_swaps_at_both_open_gaps_abort_before_v4_publication() {
     // Catches pairing SQLite and resources with different profile directories.
     for phase in [

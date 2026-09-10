@@ -122,3 +122,31 @@
 - `cargo check --manifest-path packages/app-lite-gpui/Cargo.toml` — passed with pre-existing warnings.
 - `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores` — passed (996, 1 filtered).
 - `cargo fmt --manifest-path packages/app-lite-core/Cargo.toml -- --check` and `git diff --check` — passed.
+
+## Fix round 4 — seal repository publication boundary (baseline `dc506fa4fa8d0a58a66d6c461a5295794e6ec554`)
+
+### TDD record
+
+1. Added `database_file_swap_after_sqlite_open_aborts_before_wal_or_schema_writes` before the repair. It was RED against the prior implementation: the `AfterSqliteOpen` hook renamed only `library.sqlite` and installed another regular database in the same bound profile, yet `open` returned success.
+2. Added `migration_commit_returns_bound_repository_when_selected_profile_is_replaced` before the return-boundary repair. The new post-commit test hook made the previously missing phase explicit; restoring the prior post-commit pathname identity check made it RED with `InvalidDatabasePath` after commit. The green implementation returns the committed repository and reads the migrated note.
+3. Both focused regressions are GREEN, followed by default and `test-support` core suites plus native/GPUI gates.
+
+### Critical closure mapping
+
+- C1 — database child identity: `ProfileDir::bind_database` now claims/opens `library.sqlite` through the bound parent fd with `openat(O_RDWR|O_NOFOLLOW|O_CLOEXEC)` (and exclusive `O_CREAT` only for a new child), rejects non-regular files, retains the file descriptor and `(st_dev, st_ino)`, and cleans a failed new-file claim only when the current child still matches that identity. SQLite uses `SQLITE_OPEN_NOFOLLOW`; its reported main filename, the bound-parent child, and the held inode are compared after pathname open and again immediately before commit. The deterministic regular-file-only swap now returns `InvalidDatabasePath` before WAL/schema/resource writes; original v3 content, replacement schema, WAL/SHM absence, and profile tree behavior are asserted.
+- C2 — no-fail publication boundary: WAL/FK readback and profile/database identity verification run inside the still-rollback-capable schema transaction immediately before `commit`. `ResourceStore::mark_published` is purely in-memory and follows successful commit only. After a migrated commit, repository construction only moves already-verified owned state and cannot return an ordinary open error. `AfterMigrationCommit` proves a selected-profile rename/replacement returns the already-bound repository and can read the migrated legacy note. The v4 fast path retains its pre-return WAL/FK/profile checks because it has no new schema publication.
+
+### Explicitly deferred, non-blocking hardening
+
+- Cross-process `SQLITE_BUSY_SNAPSHOT` whole-transaction retry and exact extended constraint classification.
+- Descriptor-duplication constructor-edge cleanup for preflight directories.
+- Broader empty-fixture mutation coverage for resource/blob failure snapshots.
+
+### Final verification
+
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml` — passed (69 tests).
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml --features test-support` — passed (91 tests, including 13 migration proofs).
+- `cargo test --manifest-path packages/app-lite-native/Cargo.toml` — passed (225 tests).
+- `cargo check --manifest-path packages/app-lite-gpui/Cargo.toml` — passed with existing warnings.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores` — passed (996, 1 filtered).
+- `cargo fmt --manifest-path packages/app-lite-core/Cargo.toml -- --check` and `git diff --check` — passed.

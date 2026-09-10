@@ -7,9 +7,10 @@ pub(crate) fn migrate_schema(
     connection: &mut Connection,
     next_id: &mut dyn FnMut() -> Result<String, LibraryError>,
     preflight: impl FnOnce() -> Result<ResourceStore, LibraryError>,
-    verify_profile: impl Fn() -> Result<(), LibraryError>,
+    verify_profile: impl Fn(&Transaction<'_>) -> Result<(), LibraryError>,
     after_legacy_gate: impl Fn(),
     before_commit: impl Fn(),
+    after_migration_commit: impl Fn(),
 ) -> Result<(bool, ResourceStore), LibraryError> {
     // BEGIN IMMEDIATE is deliberately the first migration operation. It keeps
     // the legacy-RTF gate authoritative until the schema publication commits.
@@ -33,7 +34,7 @@ pub(crate) fn migrate_schema(
     // schema/data mutation, while this migration-wide lock is still held.
     let mut resource_store = preflight()?;
     if version == SCHEMA_VERSION {
-        verify_profile()?;
+        verify_profile(&transaction)?;
         transaction.commit()?;
         resource_store.mark_published();
         return Ok((false, resource_store));
@@ -121,9 +122,10 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     // The test hook models the last pathname/descriptor race.  It must run
     // before the final identity check so a swapped profile aborts the still
     // uncommitted publication.
-    verify_profile()?;
+    verify_profile(&transaction)?;
     transaction.commit()?;
     resource_store.mark_published();
+    after_migration_commit();
     Ok((true, resource_store))
 }
 
@@ -282,7 +284,8 @@ mod tests {
             &mut connection,
             &mut ids,
             || ResourceStore::new(profile.path()).map_err(Into::into),
-            || Ok(()),
+            |_| Ok(()),
+            || {},
             || {},
             || {},
         );

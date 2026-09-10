@@ -1,4 +1,4 @@
-use crate::resource::{ProfileDir, ResourceError, ResourceInput, ResourceStore};
+use crate::resource::{DatabaseFile, ProfileDir, ResourceError, ResourceInput, ResourceStore};
 use crate::schema::migrate_schema;
 use crate::{
     CreateNote, EditJournalEntry, EntityRef, ListQuery, Note, NoteId, NoteProjection, Notebook,
@@ -21,6 +21,7 @@ pub enum OpenTestPhase {
     AfterSqliteOpen,
     AfterLegacyGate,
     BeforeMigrationCommit,
+    AfterMigrationCommit,
 }
 
 #[cfg(feature = "test-support")]
@@ -124,6 +125,8 @@ pub enum LibraryEvent {
 
 pub struct LibraryRepository {
     connection: Mutex<Connection>,
+    #[allow(dead_code)]
+    database_file: DatabaseFile,
     resource_store: ResourceStore,
     events: Mutex<Vec<Sender<LibraryEvent>>>,
     list_observers: Mutex<Vec<Sender<Vec<String>>>>,
@@ -195,6 +198,15 @@ impl LibraryRepository {
         {
             return Err(LibraryError::InvalidDatabasePath);
         }
+        let mut database_file = profile
+            .bind_database(name)
+            .map_err(|_| LibraryError::InvalidDatabasePath)?;
+        if !database_file
+            .matches_profile_child(&profile)
+            .map_err(|_| LibraryError::InvalidDatabasePath)?
+        {
+            return Err(LibraryError::InvalidDatabasePath);
+        }
         let path = profile
             .database_path(name)
             .map_err(|_| LibraryError::InvalidDatabasePath)?;
@@ -213,11 +225,15 @@ impl LibraryRepository {
         {
             return Err(LibraryError::InvalidDatabasePath);
         }
-        // Re-check the SQLite child after the pathname-only open; this rejects
-        // a symlink replacement in the only interval SQLite cannot use our fd.
-        profile
-            .database_path(name)
-            .map_err(|_| LibraryError::InvalidDatabasePath)?;
+        // SQLite necessarily receives a pathname. Compare both the child
+        // reached through our parent descriptor and SQLite's reported main
+        // filename to the inode bound before that pathname operation.
+        if !database_file
+            .matches_sqlite_connection(&connection, &profile)
+            .map_err(|_| LibraryError::InvalidDatabasePath)?
+        {
+            return Err(LibraryError::InvalidDatabasePath);
+        }
         // This is connection-local and precedes all schema/data writes.
         connection.pragma_update(None, "foreign_keys", "ON")?;
         // A legacy RTF profile is rejected before even a journal-mode change.
@@ -250,14 +266,24 @@ impl LibraryRepository {
                 }
                 ResourceStore::from_profile_dir(&profile).map_err(Into::into)
             },
-            || {
-                if profile
+            |transaction| {
+                if !profile
                     .verify_path_identity()
                     .map_err(|_| LibraryError::InvalidDatabasePath)?
+                    || !database_file
+                        .matches_sqlite_connection(transaction, &profile)
+                        .map_err(|_| LibraryError::InvalidDatabasePath)?
                 {
-                    Ok(())
-                } else {
                     Err(LibraryError::InvalidDatabasePath)
+                } else {
+                    let journal_mode = journal_mode(transaction)?;
+                    let foreign_keys: i64 =
+                        transaction.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+                    if journal_mode.to_ascii_lowercase() != "wal" || foreign_keys != 1 {
+                        Err(LibraryError::Pragma)
+                    } else {
+                        Ok(())
+                    }
                 }
             },
             || {
@@ -270,6 +296,12 @@ impl LibraryRepository {
                 #[cfg(feature = "test-support")]
                 if let Some(hook) = &hook {
                     hook(OpenTestPhase::BeforeMigrationCommit);
+                }
+            },
+            || {
+                #[cfg(feature = "test-support")]
+                if let Some(hook) = &hook {
+                    hook(OpenTestPhase::AfterMigrationCommit);
                 }
             },
         );
@@ -295,23 +327,13 @@ impl LibraryRepository {
                 };
             }
         };
-        let journal_mode = journal_mode(&connection)?;
-        let foreign_keys: i64 =
-            connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
-        if journal_mode.to_ascii_lowercase() != "wal" || foreign_keys != 1 {
-            return Err(LibraryError::Pragma);
-        }
-        // SQLite's commit is necessarily pathname-independent once the file
-        // is open, so make the selected profile identity part of the return
-        // boundary as well as the migration transaction's last check.
-        if !profile
-            .verify_path_identity()
-            .map_err(|_| LibraryError::InvalidDatabasePath)?
-        {
-            return Err(LibraryError::InvalidDatabasePath);
-        }
+        // Every operation above this line can still return a normal open
+        // failure.  Once schema commit succeeds, publication is only owned-fd
+        // and in-memory state movement; do not lie that it failed afterward.
+        database_file.mark_published();
         Ok(Self {
             connection: Mutex::new(connection),
+            database_file,
             resource_store,
             events: Mutex::new(Vec::new()),
             list_observers: Mutex::new(Vec::new()),
