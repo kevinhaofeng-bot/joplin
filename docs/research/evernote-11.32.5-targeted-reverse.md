@@ -6,6 +6,8 @@ Scope: read-only inspection of the installed application bundle and source maps.
 
 > Status note (2026-09-09): the observations and identified Evernote mechanisms in this file remain active evidence for the new GPUI editor. Earlier paragraphs labelled `Native ruling` were written for the retired AppKit/Joplin-compatible client. Where they conflict with `docs/superpowers/specs/2026-09-09-evernote-native-editor-core-design.md`, preserve the Evernote observation and use the newer GPUI ruling.
 
+> Program reconstruction (2026-09-09): [`evernote-11.32.5-program-main-reconstruction.md`](evernote-11.32.5-program-main-reconstruction.md) now records the recovered `main.js` entry point, module boundaries, window/IPC/Conduit topology, local-store validation and editor-to-storage message chain. It also corrects an earlier loose assumption: this build's current rich body is persisted as per-note Yjs `.dat` state, while SQLite materializes note metadata and searchable content; ENML is a derived conversion/interchange projection, not a confirmed primary readable file at rest.
+
 ## Evidence surface
 
 - `/Applications/Evernote.app` is approximately 906 MB; `Contents/Resources/app.asar` is approximately 436 MB.
