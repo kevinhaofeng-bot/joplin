@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+json_path=""
+target_pid=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -j)
+      [[ $# -ge 2 ]] || exit 2
+      json_path=$2
+      shift 2
+      ;;
+    *)
+      target_pid=$1
+      shift
+      ;;
+  esac
+done
+[[ -n "$json_path" && -n "$target_pid" ]]
+
+case "${TASK7_FAKE_FOOTPRINT_MODE:-ok}" in
+  missing)
+    exit 1
+    ;;
+  malformed)
+    printf '{not-json\n' > "$json_path"
+    ;;
+  pid-mismatch)
+    printf '{"unit":"byte","bytes per unit":1,"processes":[{"pid":%s,"footprint":1048576,"auxiliary":{"phys_footprint_peak":2097152}}]}\n' \
+      "$((target_pid + 1))" > "$json_path"
+    ;;
+  overlimit)
+    printf '{"unit":"byte","bytes per unit":1,"processes":[{"pid":%s,"footprint":125829121,"auxiliary":{"phys_footprint_peak":150000000}}]}\n' \
+      "$target_pid" > "$json_path"
+    ;;
+  peak-only)
+    printf '{"unit":"byte","bytes per unit":1,"processes":[{"pid":%s,"footprint":1048576,"auxiliary":{"phys_footprint_peak":150000000}}]}\n' \
+      "$target_pid" > "$json_path"
+    ;;
+  *)
+    printf '{"unit":"byte","bytes per unit":1,"processes":[{"pid":%s,"footprint":1048576,"auxiliary":{"phys_footprint_peak":2097152}}]}\n' \
+      "$target_pid" > "$json_path"
+    ;;
+esac

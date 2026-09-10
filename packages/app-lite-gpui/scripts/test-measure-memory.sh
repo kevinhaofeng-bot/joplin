@@ -25,6 +25,13 @@ if expected == "success":
     assert data["pass"] is True, data
     assert len(data["rss_kib"]) == 6, data
     assert data["internal"]["texture_bytes"] == 0, data
+    assert data["physical_footprint_bytes"] == 1048576, data
+    assert data["physical_footprint_peak_bytes"] == 2097152, data
+    assert data["gates"]["physical_footprint"] is True, data
+    assert data["legacy_rss_gates"]["stable"] is True, data
+    assert pathlib.Path(data["footprint_file"]).is_file(), data
+    raw = json.loads(pathlib.Path(data["footprint_file"]).read_text(encoding="utf-8"))
+    assert [item["pid"] for item in raw["processes"]] == [data["pid"]], data
 elif expected == "internal-failure":
     assert data["pass"] is False, data
     assert data["gates"]["texture_bytes"] is False, data
@@ -45,6 +52,7 @@ run_sampler() {
   local path="$fixture_dir:$PATH"
   TASK7_FAKE_MODE="$mode" \
   TASK7_FAKE_MARKER="$marker" \
+  TASK7_FAKE_FOOTPRINT_MODE="${TASK7_FAKE_FOOTPRINT_MODE:-ok}" \
   TASK7_PS_COUNTER="$test_root/ps-count" \
   TASK7_FAKE_RSS_KIB="${TASK7_FAKE_RSS_KIB:-1000}" \
   PATH="$path" \
@@ -54,7 +62,7 @@ run_sampler() {
 
 fake="$fixture_dir/fake-task7-binary.sh"
 fake_alt="$fixture_dir/fake-task7-binary-alt.sh"
-[[ -x "$fake" && -x "$fake_alt" ]] || fail "test fixtures are missing"
+[[ -x "$fake" && -x "$fake_alt" && -x "$fixture_dir/footprint" ]] || fail "test fixtures are missing"
 
 # A successful run must publish a nonempty identity-bound marker, collect exactly
 # six samples, and clean its application PID on exit. This case intentionally
@@ -100,8 +108,7 @@ for mode in ready-empty ready-bad; do
   [[ ! -e "$bad_dir/task-7-empty.json" ]] || fail "$mode wrote a result after readiness failure"
 done
 
-# Internal diagnostics and RSS gates must produce an explicit failed result,
-# not a false successful measurement.
+# Internal diagnostics must produce an explicit failed result.
 internal_dir="$test_root/internal"
 mkdir -p "$internal_dir"
 if run_sampler internal-fail "$fake" "$internal_dir" empty "$internal_dir/process"; then
@@ -112,8 +119,79 @@ assert_json "$internal_dir/task-7-empty.json" internal-failure
 rss_dir="$test_root/rss"
 mkdir -p "$rss_dir"
 TASK7_FAKE_RSS_KIB=90000 run_sampler ok "$fake" "$rss_dir" empty "$rss_dir/process" \
-  && fail "RSS gate failure unexpectedly passed"
-assert_json "$rss_dir/task-7-empty.json" rss-failure
+  || fail "RSS legacy observation unexpectedly failed the sampler"
+python3 - "$rss_dir/task-7-empty.json" <<'PY'
+import json
+import pathlib
+import sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert data["pass"] is True, data
+assert data["legacy_rss_gates"]["stable"] is False, data
+assert data["gates"]["physical_footprint"] is True, data
+PY
+
+# Physical footprint is the acceptance gate. A high stable footprint fails,
+# while a high transient peak alone must not fail the run.
+for mode in overlimit peak-only; do
+  physical_dir="$test_root/physical-$mode"
+  mkdir -p "$physical_dir"
+  if TASK7_FAKE_FOOTPRINT_MODE="$mode" run_sampler ok "$fake" "$physical_dir" empty "$physical_dir/process"; then
+    if [[ "$mode" == overlimit ]]; then
+      fail "physical footprint over-limit unexpectedly passed"
+    fi
+  elif [[ "$mode" == peak-only ]]; then
+    fail "physical footprint peak incorrectly became the stable gate"
+  fi
+  [[ "$(<"$physical_dir/process.status")" == terminated ]] || fail "$mode leaked application PID"
+done
+python3 - "$test_root/physical-overlimit/task-7-empty.json" <<'PY'
+import json
+import pathlib
+import sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert data["pass"] is False, data
+assert data["physical_footprint_bytes"] == 125829121, data
+assert data["gates"]["physical_footprint"] is False, data
+PY
+
+# A long run compares stable physical footprint against the same run-set's
+# empty result, while retaining the legacy RSS delta observation separately.
+long_ok_dir="$test_root/long-ok"
+mkdir -p "$long_ok_dir"
+run_sampler ok "$fake" "$long_ok_dir" empty "$long_ok_dir/empty" \
+  || fail "failed to create long physical baseline"
+run_sampler ok "$fake" "$long_ok_dir" long "$long_ok_dir/long" \
+  || fail "long physical delta unexpectedly failed"
+python3 - "$long_ok_dir/task-7-long.json" <<'PY'
+import json
+import pathlib
+import sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert data["pass"] is True, data
+assert data["gates"]["physical_footprint"] is True, data
+assert data["legacy_rss_gates"]["stable_delta"] is True, data
+assert data["legacy_rss_gates"]["physical_delta_bytes"] == 0, data
+PY
+
+# Missing, malformed, and wrong-PID footprint evidence must fail closed and
+# still terminate the exact application process.
+for mode in missing malformed pid-mismatch; do
+  footprint_dir="$test_root/footprint-$mode"
+  mkdir -p "$footprint_dir"
+  if TASK7_FAKE_FOOTPRINT_MODE="$mode" run_sampler ok "$fake" "$footprint_dir" empty "$footprint_dir/process"; then
+    fail "$mode footprint unexpectedly passed"
+  fi
+  [[ "$(<"$footprint_dir/process.status")" == terminated ]] || fail "$mode leaked application PID"
+  python3 - "$footprint_dir/task-7-empty.json" "$mode" <<'PY'
+import json
+import pathlib
+import sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert data["pass"] is False, data
+assert data["gates"]["physical_footprint"] is False, data
+assert data["physical_footprint_error"], (sys.argv[2], data)
+PY
+done
 
 # Reusing a run-set manifest with a different binary must be rejected before
 # launching the fake application.
