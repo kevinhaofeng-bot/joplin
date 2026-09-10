@@ -6,6 +6,8 @@
 
 范围：仅编辑器，不包含同步、搜索、笔记列表、Joplin 兼容或跨平台
 
+> 产品级定位（2026-09-11）：本文只规范编辑器子系统，不再代表整款笔记软件 MVP。产品总设计见 [`2026-09-11-evernote-core-notes-product-design.md`](2026-09-11-evernote-core-notes-product-design.md)，Evernote 核心产品源码映射见 [`../../research/evernote-11.32.5-core-product-behavior-map.md`](../../research/evernote-11.32.5-core-product-behavior-map.md)，新版执行路线见 [`../plans/2026-09-11-evernote-core-notes-roadmap.md`](../plans/2026-09-11-evernote-core-notes-roadmap.md)。真实新建、保存、列表、笔记本、标签、搜索、附件、同步、导入导出和恢复未闭环前，不得把单篇编辑器样机称为产品 MVP。
+
 ## 1. 决策与纠偏
 
 本阶段唯一目标是：以尽可能低的常驻内存，实现可验证的 Evernote 核心所见即所得编辑行为复刻。
