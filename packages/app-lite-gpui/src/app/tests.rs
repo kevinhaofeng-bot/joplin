@@ -2,6 +2,7 @@ use super::{AppAction, AppModel, AppStatus, ListViewMode, NoteSort, PaneState};
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, NoteId};
 use std::sync::Arc;
+use std::sync::mpsc::TryRecvError;
 
 fn repository() -> (tempfile::TempDir, Arc<LibraryRepository>) {
     let profile = tempfile::tempdir().expect("temporary profile");
@@ -90,6 +91,68 @@ fn trashing_selected_note_selects_nearest_surviving_card() {
 }
 
 #[test]
+fn trashing_first_selected_note_selects_the_next_card() {
+    let (_profile, repository) = repository();
+    let first = create(&repository, "first");
+    let second = create(&repository, "second");
+    let third = create(&repository, "third");
+    let mut model = AppModel::open(repository).expect("open model");
+    model.set_projection_for_test(vec![first.clone(), second.clone(), third]);
+    model
+        .dispatch(AppAction::SelectNote(first))
+        .expect("select first");
+
+    model
+        .dispatch(AppAction::TrashSelected)
+        .expect("trash first");
+
+    assert_eq!(model.navigation().selected_note_id(), Some(&second));
+}
+
+#[test]
+fn trashing_last_selected_note_selects_the_previous_card() {
+    let (_profile, repository) = repository();
+    let first = create(&repository, "first");
+    let second = create(&repository, "second");
+    let third = create(&repository, "third");
+    let mut model = AppModel::open(repository).expect("open model");
+    model.set_projection_for_test(vec![first, second.clone(), third.clone()]);
+    model
+        .dispatch(AppAction::SelectNote(third))
+        .expect("select last");
+
+    model
+        .dispatch(AppAction::TrashSelected)
+        .expect("trash last");
+
+    assert_eq!(model.navigation().selected_note_id(), Some(&second));
+}
+
+#[test]
+fn failed_trash_keeps_the_existing_selected_session_intact() {
+    let (_profile, repository) = repository();
+    let selected = create(&repository, "selected");
+    let missing = NoteId::parse("ffffffffffffffffffffffffffffffff").expect("valid opaque id");
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(selected.clone()))
+        .expect("select note");
+
+    assert!(model.dispatch(AppAction::TrashNote(missing)).is_err());
+
+    assert_eq!(model.navigation().selected_note_id(), Some(&selected));
+    assert_eq!(model.active_session_note_id(), Some(&selected));
+    assert_eq!(
+        repository
+            .list_notes(Default::default())
+            .expect("read unaffected library")
+            .len(),
+        1
+    );
+    assert!(matches!(model.status(), AppStatus::Error(_)));
+}
+
+#[test]
 fn restart_restores_panes_and_a_valid_note_selection() {
     let (_profile, repository) = repository();
     let selected = create(&repository, "selected");
@@ -120,8 +183,21 @@ fn invalid_saved_selection_falls_back_without_loading_a_body() {
     let resumed = AppModel::open(Arc::clone(&repository)).expect("resume");
 
     assert_eq!(resumed.navigation().selected_note_id(), None);
+    assert_eq!(
+        repository
+            .read_library_shell_state()
+            .expect("stale setting should be cleared")
+            .selected_note_id,
+        None,
+        "an invalid restored selection must not be retried on every launch"
+    );
     let fields = observed.recv().expect("list observation");
-    assert!(!fields.iter().any(|field| field == "notes.body_html"));
+    assert!(!fields.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "notes.body_html" | "notes.body_text" | "notes.merge_state"
+        )
+    }));
 }
 
 #[test]
@@ -135,7 +211,48 @@ fn opening_library_hydrates_only_projections_not_note_bodies() {
 
     assert_eq!(model.projections().len(), 2);
     let fields = observed.recv().expect("list observation");
-    assert!(!fields.iter().any(|field| field == "notes.body_html"));
+    assert!(!fields.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "notes.body_html" | "notes.body_text" | "notes.merge_state"
+        )
+    }));
+}
+
+#[test]
+fn projection_actions_never_hydrate_a_body_and_an_explicit_selection_loads_once() {
+    let (_profile, repository) = repository();
+    let first = create(&repository, "Alpha");
+    create(&repository, "Zulu");
+    let loads = repository.observe_note_loads();
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+
+    model
+        .dispatch(AppAction::SetSort(NoteSort::TitleDescending))
+        .expect("sort projections");
+    model
+        .dispatch(AppAction::SetListViewMode(ListViewMode::Compact))
+        .expect("change card presentation");
+    assert_eq!(loads.try_recv(), Err(TryRecvError::Empty));
+
+    model
+        .dispatch(AppAction::SelectNote(first.clone()))
+        .expect("explicit selection");
+    assert_eq!(loads.try_recv(), Ok(first.clone()));
+    assert_eq!(
+        loads.try_recv(),
+        Err(TryRecvError::Empty),
+        "one selection must not eagerly hydrate additional note bodies"
+    );
+
+    model
+        .dispatch(AppAction::SelectNote(first))
+        .expect("reselect current session");
+    assert_eq!(
+        loads.try_recv(),
+        Err(TryRecvError::Empty),
+        "reselecting the retained session must not issue a second body load"
+    );
 }
 
 #[test]

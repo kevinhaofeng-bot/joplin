@@ -66,6 +66,8 @@ pub struct AppModel {
     partial_commit_message: Option<String>,
     #[cfg(test)]
     next_refresh_failure: Option<LibraryError>,
+    #[cfg(test)]
+    projection_event_refreshes: usize,
 }
 
 impl AppModel {
@@ -85,15 +87,22 @@ impl AppModel {
             partial_commit_message: None,
             #[cfg(test)]
             next_refresh_failure: None,
+            #[cfg(test)]
+            projection_event_refreshes: 0,
         };
         model.sort_projections();
-        if let Some(id) = saved_shell_state.selected_note_id
-            && model
+        if let Some(id) = saved_shell_state.selected_note_id {
+            if model
                 .projections
                 .iter()
                 .any(|projection| projection.id == id)
-        {
-            model.select_note(id)?;
+            {
+                model.select_note(id)?;
+            } else {
+                // Do not keep retrying a deleted/stale selection on every
+                // launch. The typed atomic write also preserves the panes.
+                model.persist_shell_state()?;
+            }
         }
         Ok(model)
     }
@@ -164,10 +173,12 @@ impl AppModel {
         if self
             .active_session
             .as_ref()
-            .is_some_and(|session| session.note.id != id)
+            .is_some_and(|session| session.note.id == id)
         {
-            // Task 4 owns durable saves. Until then, a switch is allowed only because this
-            // shell never exposes unsaved editing as persisted content.
+            // Sorting, a repeated card click, or a scroll-to-selected request
+            // must not hydrate the already retained full body again.
+            self.navigation.select(Some(id));
+            return self.persist_shell_state();
         }
         let note = self
             .repository
@@ -271,6 +282,10 @@ impl AppModel {
         if !refresh_needed {
             return Ok(false);
         }
+        #[cfg(test)]
+        {
+            self.projection_event_refreshes += 1;
+        }
         let result = self.refresh_list();
         match &result {
             Ok(()) => self.status = AppStatus::Ready,
@@ -326,6 +341,10 @@ impl AppModel {
     #[cfg(test)]
     pub fn fail_next_refresh_for_test(&mut self, error: LibraryError) {
         self.next_refresh_failure = Some(error);
+    }
+    #[cfg(test)]
+    pub fn projection_event_refreshes_for_test(&self) -> usize {
+        self.projection_event_refreshes
     }
     #[cfg(test)]
     pub fn set_projection_for_test(&mut self, ids: Vec<NoteId>) {

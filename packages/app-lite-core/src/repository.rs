@@ -234,6 +234,7 @@ pub struct LibraryRepository {
     resource_store: ResourceStore,
     events: Mutex<Vec<Sender<LibraryEvent>>>,
     list_observers: Mutex<Vec<Sender<Vec<String>>>>,
+    note_load_observers: Mutex<Vec<Sender<NoteId>>>,
     #[allow(dead_code)]
     database_path: PathBuf,
     clock: Arc<dyn RepositoryClock>,
@@ -448,6 +449,7 @@ impl LibraryRepository {
             resource_store,
             events: Mutex::new(Vec::new()),
             list_observers: Mutex::new(Vec::new()),
+            note_load_observers: Mutex::new(Vec::new()),
             database_path: path,
             clock,
             id_source,
@@ -527,6 +529,18 @@ impl LibraryRepository {
         self.list_observers
             .lock()
             .expect("observer mutex poisoned")
+            .push(sender);
+        receiver
+    }
+
+    /// Records complete-note hydration independently from card-list queries.
+    /// This lets the product shell prove that sorting, scrolling and projection
+    /// refreshes stay cheap until the user explicitly selects a note.
+    pub fn observe_note_loads(&self) -> Receiver<NoteId> {
+        let (sender, receiver) = channel();
+        self.note_load_observers
+            .lock()
+            .expect("note-load observer mutex poisoned")
             .push(sender);
         receiver
     }
@@ -674,16 +688,28 @@ impl LibraryRepository {
 
     pub fn load_note(&self, id: &NoteId) -> Result<Option<Note>, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
-        let base = connection.query_row(
-            "SELECT id, title, body_html, body_text, snippet, notebook_id, created_time, updated_time, deleted_time, revision
-             FROM notes WHERE id = ?1", [id.as_str()], row_to_note_base,
-        ).optional()?;
-        let Some(mut note) = base else {
-            return Ok(None);
-        };
-        note.resource_ids = note_resource_ids(&connection, id)?;
-        note.tag_ids = note_tag_ids(&connection, id)?;
-        Ok(Some(note))
+        let result = (|| {
+            let base = connection
+                .query_row(
+                    "SELECT id, title, body_html, body_text, snippet, notebook_id, created_time, updated_time, deleted_time, revision
+                     FROM notes WHERE id = ?1",
+                    [id.as_str()],
+                    row_to_note_base,
+                )
+                .optional()?;
+            let Some(mut note) = base else {
+                return Ok(None);
+            };
+            note.resource_ids = note_resource_ids(&connection, id)?;
+            note.tag_ids = note_tag_ids(&connection, id)?;
+            Ok(Some(note))
+        })();
+        drop(connection);
+        self.note_load_observers
+            .lock()
+            .expect("note-load observer mutex poisoned")
+            .retain(|observer| observer.send(id.clone()).is_ok());
+        result
     }
 
     pub fn load_note_by_hex(&self, id: &str) -> Result<Option<Note>, LibraryError> {

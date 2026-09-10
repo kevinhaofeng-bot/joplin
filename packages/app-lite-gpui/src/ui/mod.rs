@@ -11,9 +11,10 @@ use crate::native_editor::core::EditorCore;
 use crate::native_editor::surface::{EditorSurface, EditorSurfaceMode};
 use app_lite_core::{CanonicalDocument, LibraryRepository, Note, NoteId, NoteProjection};
 use gpui::{
-    App, AppContext, Context, Entity, InteractiveElement, IntoElement, KeyBinding, MouseButton,
-    ParentElement, Render, ScrollStrategy, Styled, Subscription, Task, UniformListScrollHandle,
-    Window, WindowBounds, WindowHandle, WindowOptions, div, px, rgba, size, uniform_list,
+    App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
+    MouseButton, ParentElement, Render, ScrollStrategy, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowOptions, div, px, rgba,
+    size, uniform_list,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub struct LibraryShell {
     surface_note_id: Option<NoteId>,
     unsupported_document: Option<String>,
     startup_notice: Option<String>,
+    focus_handle: FocusHandle,
     note_list_scroll: UniformListScrollHandle,
     _model_observation: Subscription,
     // Held by the entity so GPUI cancels the receiver loop when this window is
@@ -37,6 +39,17 @@ pub struct LibraryShell {
     rendered_note_range: Option<std::ops::Range<usize>>,
     #[cfg(test)]
     last_scroll_request: Option<usize>,
+}
+
+fn bind_library_keybindings(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-n", CreateNote, Some("LibraryShell")),
+        KeyBinding::new("cmd-shift-backspace", TrashSelected, Some("LibraryShell")),
+        KeyBinding::new("cmd-alt-s", ToggleSidebar, Some("LibraryShell")),
+        KeyBinding::new("cmd-alt-l", ToggleNoteList, Some("LibraryShell")),
+        KeyBinding::new("cmd-alt-v", CycleListViewMode, Some("LibraryShell")),
+        KeyBinding::new("cmd-alt-o", CycleSort, Some("LibraryShell")),
+    ]);
 }
 
 pub fn open_library_window(
@@ -65,24 +78,17 @@ pub(crate) fn open_library_window_with_notice(
     let model_state =
         AppModel::open(repository).map_err(|error| format!("无法读取资料库: {error}"))?;
     let model = cx.new(|_| model_state);
-    cx.bind_keys([
-        KeyBinding::new("cmd-n", CreateNote, Some("LibraryShell")),
-        KeyBinding::new("cmd-shift-backspace", TrashSelected, Some("LibraryShell")),
-        KeyBinding::new("cmd-alt-s", ToggleSidebar, Some("LibraryShell")),
-        KeyBinding::new("cmd-alt-l", ToggleNoteList, Some("LibraryShell")),
-        KeyBinding::new("cmd-alt-v", CycleListViewMode, Some("LibraryShell")),
-        KeyBinding::new("cmd-alt-o", CycleSort, Some("LibraryShell")),
-    ]);
+    bind_library_keybindings(cx);
     let bounds = gpui::Bounds::centered(None, size(px(1160.0), px(760.0)), cx);
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..WindowOptions::default()
         },
-        move |_window, cx| {
+        move |window, cx| {
             let model = model.clone();
             let startup_notice = startup_notice.clone();
-            cx.new(move |cx| LibraryShell::new(model, startup_notice, cx))
+            cx.new(move |cx| LibraryShell::new(model, startup_notice, window, cx))
         },
     )
     .map_err(|error| error.to_string())
@@ -92,8 +98,11 @@ impl LibraryShell {
     fn new(
         model: Entity<AppModel>,
         startup_notice: Option<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
         let observation = cx.observe(&model, |shell, _, cx| {
             shell.sync_editor_surface(cx);
             cx.notify();
@@ -106,6 +115,7 @@ impl LibraryShell {
             surface_note_id: None,
             unsupported_document: None,
             startup_notice,
+            focus_handle,
             note_list_scroll: UniformListScrollHandle::new(),
             _model_observation: observation,
             _event_task: event_task,
@@ -133,18 +143,25 @@ impl LibraryShell {
                 if events.is_empty() {
                     continue;
                 }
-                let _ = this.update(cx, |shell, shell_cx| {
-                    let refresh = shell.model.update(shell_cx, |model, model_cx| {
-                        let refresh = model.refresh_projection_events(events);
-                        model_cx.notify();
-                        refresh
-                    });
-                    if matches!(refresh, Ok(true)) {
-                        shell.sync_editor_surface(shell_cx);
-                        shell.scroll_selected_into_view(shell_cx);
-                    }
-                    shell_cx.notify();
-                });
+                if this
+                    .update(cx, |shell, shell_cx| {
+                        let refresh = shell.model.update(shell_cx, |model, model_cx| {
+                            let refresh = model.refresh_projection_events(events);
+                            model_cx.notify();
+                            refresh
+                        });
+                        if matches!(refresh, Ok(true)) {
+                            shell.sync_editor_surface(shell_cx);
+                            shell.scroll_selected_into_view(shell_cx);
+                        }
+                        shell_cx.notify();
+                    })
+                    .is_err()
+                {
+                    // The shell owns the task, but stop promptly as well if
+                    // an already-queued timer wakes after its entity died.
+                    break;
+                }
             }
         })
     }
@@ -300,6 +317,13 @@ impl LibraryShell {
                         Some(
                             div()
                                 .id(("library-note-list-row", index))
+                                .debug_selector(move || {
+                                    if selected {
+                                        "library-selected-note-card".to_owned()
+                                    } else {
+                                        format!("library-note-card-{index}")
+                                    }
+                                })
                                 .h(px(note_list::fixed_card_height(mode)))
                                 .px(px(6.0))
                                 .cursor_pointer()
@@ -425,9 +449,9 @@ impl Render for LibraryShell {
                     model.active_note().cloned(),
                 )
             });
-        let status_text = match status {
-            AppStatus::Ready => String::new(),
-            AppStatus::Error(error) => format!("资料库错误：{error}"),
+        let status_message = match status {
+            AppStatus::Ready => None,
+            AppStatus::Error(error) => Some(format!("资料库错误：{error}")),
         };
         let editor = self.render_editor_panel(items.is_empty(), active_note, cx);
         let note_list = self.render_note_list(
@@ -502,6 +526,7 @@ impl Render for LibraryShell {
             .relative()
             .flex()
             .key_context("LibraryShell")
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::create_note))
             .on_action(cx.listener(Self::trash_selected))
             .on_action(cx.listener(Self::toggle_sidebar))
@@ -520,18 +545,21 @@ impl Render for LibraryShell {
                     .child(toolbar)
                     .child(editor),
             )
-            .child(
+            .children(status_message.map(|message| {
                 div()
+                    .id("library-action-error")
+                    .debug_selector(|| "library-action-error".to_owned())
                     .absolute()
                     .bottom(px(10.0))
                     .right(px(14.0))
                     .text_size(px(11.0))
                     .text_color(rgba(0xa34838ff))
-                    .child(status_text),
-            )
+                    .child(message)
+            }))
             .children(self.startup_notice.as_ref().map(|notice| {
                 div()
                     .id("library-startup-notice")
+                    .debug_selector(|| "library-startup-notice".to_owned())
                     .absolute()
                     .top(px(52.0))
                     .right(px(16.0))
@@ -556,6 +584,7 @@ impl Render for StartupErrorView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("library-startup-error")
+            .debug_selector(|| "library-startup-error".to_owned())
             .size_full()
             .p(px(32.0))
             .flex()
@@ -599,6 +628,7 @@ fn library_action_button(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .debug_selector(move || id.to_owned())
         .px(px(8.0))
         .py(px(5.0))
         .rounded(px(5.0))

@@ -8,12 +8,29 @@ use super::core::EditorCore;
 use super::images::BudgetedImageCache;
 use super::model::DocPoint;
 use super::render;
+use crate::components::{
+    BlockDown, BlockUp, Copy, End, FocusNext, FocusPrev, Home, MoveLeft, MoveRight, SelectAll,
+    SelectEnd, SelectHome, SelectLeft, SelectRight, WordSelectLeft, WordSelectRight,
+};
 use gpui::{
-    App, Context, Entity, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Subscription, Window, canvas, div, px, rgba,
+    App, ClipboardItem, Context, Entity, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
+    ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Window, canvas, div, px, rgba,
 };
 use std::sync::Arc;
+
+macro_rules! bind_selection_action {
+    ($surface:ident, $editor:expr, $action:ty, $method:ident) => {{
+        let action_editor = $editor.clone();
+        $surface = $surface.on_action(move |_action: &$action, window, cx| {
+            let _ = action_editor.update(cx, |editor, editor_cx| {
+                editor.$method();
+                editor_cx.notify();
+            });
+            focus_editor(&action_editor, window, cx);
+        });
+    }};
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorSurfaceMode {
@@ -242,6 +259,33 @@ impl Render for EditorSurface {
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .capture_any_mouse_down(cx.listener(Self::on_mouse_down));
         }
+        // These are deliberately the non-mutating half of the donor action
+        // map. A Task 4 library surface must remain useful for keyboard
+        // selection and copying, while all mutation entry points stay behind
+        // `EditorCore::ensure_editable`. The editable spike can also receive
+        // these handlers through the same mounted entity.
+        bind_selection_action!(surface, editor, MoveLeft, move_left);
+        bind_selection_action!(surface, editor, MoveRight, move_right);
+        bind_selection_action!(surface, editor, Home, move_home);
+        bind_selection_action!(surface, editor, End, move_end);
+        bind_selection_action!(surface, editor, SelectLeft, select_left);
+        bind_selection_action!(surface, editor, SelectRight, select_right);
+        bind_selection_action!(surface, editor, WordSelectLeft, select_word_left);
+        bind_selection_action!(surface, editor, WordSelectRight, select_word_right);
+        bind_selection_action!(surface, editor, SelectHome, select_home);
+        bind_selection_action!(surface, editor, SelectEnd, select_end);
+        bind_selection_action!(surface, editor, BlockUp, move_up);
+        bind_selection_action!(surface, editor, BlockDown, move_down);
+        bind_selection_action!(surface, editor, FocusPrev, move_up);
+        bind_selection_action!(surface, editor, FocusNext, move_down);
+        bind_selection_action!(surface, editor, SelectAll, select_all);
+        let copy_editor = editor.clone();
+        surface = surface.on_action(move |_action: &Copy, _window, cx| {
+            let text = copy_editor.read(cx).copy_plain_text();
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        });
         let surface = surface.child(editor_canvas(
             editor,
             self.image_cache.clone(),

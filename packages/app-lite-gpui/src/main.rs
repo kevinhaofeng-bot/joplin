@@ -1,7 +1,4 @@
-//! Velotype - a block-based Markdown editor built with GPUI.
-//!
-//! Reads file paths from command-line arguments and opens one GPUI window per
-//! file. With no arguments, a single empty window is created.
+//! Joplin Lite - a local-first native notes library built with GPUI.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -206,17 +203,23 @@ fn main() {
         use std::process::Command;
 
         // Re-launch the application in the background without the --detach flag
-        let exe_path = std::env::current_exe().expect("Failed to get executable path");
+        let exe_path = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("无法确定 Joplin Lite 可执行文件以后台启动: {error}");
+                std::process::exit(1);
+            }
+        };
         let non_detach_args: Vec<String> = args
             .iter()
             .filter(|arg| *arg != "--detach" && *arg != "-d")
             .cloned()
             .collect();
 
-        Command::new(exe_path)
-            .args(&non_detach_args[1..])
-            .spawn()
-            .expect("Failed to detach process");
+        if let Err(error) = Command::new(exe_path).args(&non_detach_args[1..]).spawn() {
+            eprintln!("无法在后台启动 Joplin Lite: {error}");
+            std::process::exit(1);
+        }
 
         return;
     }
@@ -313,12 +316,12 @@ mod tests {
 
 fn print_help() {
     println!(
-        "velotype {} - A block-based Markdown editor",
+        "Joplin Lite {} - 本地优先的原生笔记资料库",
         env!("CARGO_PKG_VERSION")
     );
     println!();
     println!("USAGE:");
-    println!("    velotype [OPTIONS] [FILES...]");
+    println!("    joplin-lite [OPTIONS] [FILES...]");
     println!();
     println!("OPTIONS:");
     println!("    -v, --version    Print version information");
@@ -331,6 +334,6 @@ fn print_help() {
     println!("        --diagnostics-file PATH  Task 7 JSON diagnostics (absolute)");
     println!();
     println!("FILES:");
-    println!("    One or more markdown files to open. If no files are specified,");
-    println!("    opens an empty document.");
+    println!("    传入的文件会显示“暂不支持导入”提示；不会读取或修改源文件。");
+    println!("    未传入文件时打开本地笔记资料库。");
 }

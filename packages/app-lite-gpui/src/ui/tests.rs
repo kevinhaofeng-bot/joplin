@@ -1,9 +1,11 @@
 use super::*;
 use crate::app::AppAction;
+use crate::components::{Copy, SelectAll};
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryShellState};
 use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext};
 use std::sync::Arc;
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 fn redraw(cx: &mut VisualTestContext) {
@@ -36,7 +38,7 @@ fn mount_shell<'a>(
 ) -> (Entity<LibraryShell>, &'a mut VisualTestContext) {
     let model_state = AppModel::open(repository).expect("open model");
     let model = cx.new(|_| model_state);
-    cx.add_window_view(move |_window, cx| LibraryShell::new(model, None, cx))
+    cx.add_window_view(move |window, cx| LibraryShell::new(model, None, window, cx))
 }
 
 #[gpui::test]
@@ -54,6 +56,40 @@ async fn mounted_empty_cta_uses_the_shell_action_reducer(cx: &mut TestAppContext
         assert_eq!(view.model.read(cx).projections().len(), 1);
         assert!(view.model.read(cx).active_note().is_some());
         assert!(view.editor_surface.is_some());
+    });
+}
+
+#[gpui::test]
+async fn mounted_keyboard_actions_use_the_same_shell_reducer(cx: &mut TestAppContext) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+
+    cx.simulate_keystrokes("cmd-n");
+    redraw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.model.read(cx).projections().len(), 1);
+        assert!(view.model.read(cx).active_note().is_some());
+    });
+
+    for key in ["cmd-alt-s", "cmd-alt-l", "cmd-alt-v", "cmd-alt-o"] {
+        cx.simulate_keystrokes(key);
+        redraw(cx);
+    }
+    view.read_with(cx, |view, cx| {
+        let model = view.model.read(cx);
+        assert!(!model.panes().sidebar_visible);
+        assert!(!model.panes().list_visible);
+        assert_eq!(model.list_view_mode(), ListViewMode::Snippets);
+        assert_eq!(model.sort(), crate::app::NoteSort::TitleAscending);
+    });
+
+    cx.simulate_keystrokes("cmd-shift-backspace");
+    redraw(cx);
+    view.read_with(cx, |view, cx| {
+        assert!(view.model.read(cx).projections().is_empty());
+        assert_eq!(view.model.read(cx).status(), &AppStatus::Ready);
     });
 }
 
@@ -81,6 +117,134 @@ async fn mounted_card_click_reaches_the_same_shell_action_reducer(cx: &mut TestA
         );
         assert!(view.editor_surface.is_some());
     });
+}
+
+#[gpui::test]
+async fn mounted_toolbar_actions_notify_the_retained_shell_and_render_failures(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "Zulu".into(),
+            notebook_id: None,
+            document: rich_document("first"),
+        })
+        .expect("first note");
+    repository
+        .create_note(CreateNote {
+            title: "Alpha".into(),
+            notebook_id: None,
+            document: rich_document("second"),
+        })
+        .expect("second note");
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    for selector in ["library-cycle-view", "library-cycle-sort"] {
+        let control = cx.debug_bounds(selector).expect("toolbar control");
+        cx.simulate_click(control.center(), Modifiers::default());
+        redraw(cx);
+    }
+    view.read_with(cx, |view, cx| {
+        let model = view.model.read(cx);
+        assert_eq!(model.list_view_mode(), ListViewMode::Snippets);
+        assert_eq!(model.sort(), crate::app::NoteSort::TitleAscending);
+        assert_eq!(model.projections()[0].title_prefix, "Alpha");
+    });
+
+    for selector in ["library-toggle-sidebar", "library-toggle-list"] {
+        let control = cx.debug_bounds(selector).expect("toggle control");
+        cx.simulate_click(control.center(), Modifiers::default());
+        redraw(cx);
+    }
+    assert_eq!(
+        f32::from(
+            cx.debug_bounds("library-sidebar")
+                .expect("hidden sidebar")
+                .size
+                .width,
+        ),
+        0.0
+    );
+    assert_eq!(
+        f32::from(
+            cx.debug_bounds("library-note-list")
+                .expect("hidden list")
+                .size
+                .width,
+        ),
+        0.0
+    );
+
+    let trash = cx
+        .debug_bounds("library-trash-selected")
+        .expect("trash control");
+    cx.simulate_click(trash.center(), Modifiers::default());
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.model.read(cx).projections().len()),
+        1
+    );
+
+    let trash = cx
+        .debug_bounds("library-trash-selected")
+        .expect("trash control remains mounted");
+    cx.simulate_click(trash.center(), Modifiers::default());
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.model.read(cx).projections().len()),
+        0
+    );
+
+    let trash = cx
+        .debug_bounds("library-trash-selected")
+        .expect("trash control remains mounted for empty-state error");
+    cx.simulate_click(trash.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("library-action-error").is_some(),
+        "a reducer error must be visible in the mounted library shell"
+    );
+}
+
+#[gpui::test]
+async fn mounted_open_request_notice_is_visible_without_opening_an_old_editor(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let model = cx.new(|_| AppModel::open(repository).expect("open model"));
+    let (_view, cx) = cx.add_window_view(move |window, cx| {
+        LibraryShell::new(
+            model,
+            Some("暂不支持导入 /tmp/incoming.md；原文件未被读取或修改。".into()),
+            window,
+            cx,
+        )
+    });
+    redraw(cx);
+    assert!(cx.debug_bounds("library-startup-notice").is_some());
+    assert!(cx.debug_bounds("native-editor-surface").is_none());
+}
+
+#[gpui::test]
+async fn mounted_startup_error_is_visible_when_no_library_model_can_be_opened(
+    cx: &mut TestAppContext,
+) {
+    let (_view, cx) = cx.add_window_view(|_window, _cx| StartupErrorView {
+        message: "无法打开受保护的资料库目录".into(),
+    });
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("library-startup-error").is_some(),
+        "fallible bootstrap failures must be rendered in a window"
+    );
 }
 
 #[gpui::test]
@@ -128,33 +292,61 @@ async fn event_bridge_coalesces_external_projection_changes_without_loading_bodi
     let (_profile, repository) = repository();
     let (view, cx) = mount_shell(Arc::clone(&repository), cx);
     redraw(cx);
-    repository
-        .create_note(CreateNote {
-            title: "外部创建".into(),
-            notebook_id: None,
-            document: rich_document("事件桥不应把这段正文当作列表字段读取"),
+    let ids = (0..3)
+        .map(|index| {
+            repository
+                .create_note(CreateNote {
+                    title: format!("外部创建 {index}"),
+                    notebook_id: None,
+                    document: rich_document("事件桥不应把这段正文当作列表字段读取"),
+                })
+                .expect("external create")
+                .id
         })
-        .expect("external create");
-    cx.executor().advance_clock(Duration::from_millis(60));
-    cx.run_until_parked();
-    redraw(cx);
-    let id = view.read_with(cx, |view, cx| {
-        let model = view.model.read(cx);
-        assert_eq!(model.projections().len(), 1);
-        assert!(
-            model.active_note().is_none(),
-            "event refresh must not hydrate a body"
-        );
-        model.projections()[0].id.clone()
-    });
-
-    repository.trash_note(&id).expect("external trash");
+        .collect::<Vec<_>>();
+    let list_query = repository.observe_next_list_query();
+    let body_loads = repository.observe_note_loads();
     cx.executor().advance_clock(Duration::from_millis(60));
     cx.run_until_parked();
     redraw(cx);
     view.read_with(cx, |view, cx| {
-        assert!(view.model.read(cx).projections().is_empty());
+        let model = view.model.read(cx);
+        assert_eq!(model.projections().len(), 3);
+        assert!(
+            model.active_note().is_none(),
+            "event refresh must not hydrate a body"
+        );
+        assert_eq!(
+            model.projection_event_refreshes_for_test(),
+            1,
+            "a burst must make one projection refresh, not one per event"
+        );
     });
+    let fields = list_query.recv().expect("one coalesced projection query");
+    assert!(!fields.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "notes.body_html" | "notes.body_text" | "notes.merge_state"
+        )
+    }));
+    assert_eq!(body_loads.try_recv(), Err(TryRecvError::Empty));
+
+    for id in &ids {
+        repository.trash_note(id).expect("external trash");
+    }
+    cx.executor().advance_clock(Duration::from_millis(60));
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |view, cx| {
+        let model = view.model.read(cx);
+        assert!(model.projections().is_empty());
+        assert_eq!(
+            model.projection_event_refreshes_for_test(),
+            2,
+            "the trash burst must also refresh once"
+        );
+    });
+    assert_eq!(body_loads.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[gpui::test]
@@ -195,6 +387,57 @@ async fn rich_body_mounts_the_native_canvas_and_never_uses_body_text_fallback(
                 .read(cx)
                 .copy_all_plain_text()
                 .contains("来自 HTML 的粗体正文")
+        );
+    });
+}
+
+#[gpui::test]
+async fn mounted_read_only_surface_keeps_selection_and_copy_available(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let stored = repository
+        .create_note(CreateNote {
+            title: "可复制的只读笔记".into(),
+            notebook_id: None,
+            document: rich_document("只读正文仍应允许复制"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted virtual-list card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    let editor = view.read_with(cx, |view, cx| {
+        view.editor_surface
+            .as_ref()
+            .expect("selected note mounts an editor surface")
+            .read(cx)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    cx.dispatch_action(SelectAll);
+    cx.dispatch_action(Copy);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("只读正文仍应允许复制".into()),
+        "Task 4 read-only mode must preserve selection and copy"
+    );
+    view.read_with(cx, |view, cx| {
+        let surface = view.editor_surface.as_ref().expect("mounted surface");
+        assert_eq!(surface.read(cx).mode(), EditorSurfaceMode::ReadOnly);
+        assert_eq!(
+            surface.read(cx).editor().read(cx).copy_all_plain_text(),
+            "只读正文仍应允许复制"
+        );
+        assert_eq!(
+            view.model.read(cx).navigation().selected_note_id(),
+            Some(&stored.id),
+            "copy actions must not mutate library selection"
         );
     });
 }
@@ -336,6 +579,18 @@ async fn uniform_list_constructs_only_requested_ranges_and_reaches_1662_tail(
             Some(&tail)
         );
     });
+    let tail_card = cx
+        .debug_bounds("library-selected-note-card")
+        .expect("tail card must be interactable after scroll-to-item");
+    cx.simulate_click(tail_card.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(
+            view.model.read(cx).navigation().selected_note_id(),
+            Some(&tail),
+            "mounted tail card click must use the same NoteId reducer"
+        );
+    });
     assert!(
         note_list::constructed_items_for_test() < 320,
         "tail scroll built the whole library"
@@ -381,6 +636,18 @@ async fn uniform_list_does_not_truncate_the_101st_projection(cx: &mut TestAppCon
                 .as_ref()
                 .is_some_and(|range| range.contains(&100)),
             "the 101st card must be mounted after its NoteId is selected"
+        );
+    });
+    let tail_card = cx
+        .debug_bounds("library-selected-note-card")
+        .expect("the mounted 101st card must be clickable");
+    cx.simulate_click(tail_card.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(
+            view.model.read(cx).navigation().selected_note_id(),
+            Some(&tail),
+            "the 101st card must dispatch selection through LibraryShell"
         );
     });
 }
