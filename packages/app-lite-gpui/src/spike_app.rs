@@ -14,9 +14,10 @@ use gpui::{
     App, AppContext, AsyncWindowContext, Bounds, ClipboardItem, Context, DragMoveEvent,
     ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollHandle, ShapedLine, SharedString,
-    StatefulInteractiveElement, Styled, TextRun, UTF16Selection, WeakEntity, Window, WindowBounds,
-    WindowHandle, WindowOptions, canvas, div, point, px, rgba, size,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
+    ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun, UTF16Selection,
+    WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div, point, px, rgba,
+    size, svg,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -25,6 +26,10 @@ use crate::components::{
     Home, IndentBlock, ItalicSelection, MoveLeft, MoveRight, Newline, OutdentBlock, Paste, Redo,
     SelectAll, SelectEnd, SelectHome, SelectLeft, SelectRight, UnderlineSelection, Undo,
     WordSelectLeft, WordSelectRight,
+};
+use crate::native_editor::chrome::{
+    EDITOR_HEADER_MAX_WIDTH, EVERNOTE_GREEN, NOTE_BODY_MAX_WIDTH, TitleInput,
+    editor_chrome_metrics, toolbar_placement,
 };
 use crate::native_editor::commands::{
     CommandArgument, CommandCatalogue, CommandDescriptor, EditorCommand,
@@ -246,7 +251,7 @@ pub(crate) fn open_with_options(
     cx: &mut App,
     options: Option<SpikeLaunchOptions>,
 ) -> WindowHandle<SpikeView> {
-    let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
+    let bounds = Bounds::centered(None, size(px(1200.0), px(820.0)), cx);
     let fixture = options.as_ref().map(|options| options.fixture);
     let options_for_window = options.clone();
     let handle = cx
@@ -269,8 +274,10 @@ pub(crate) fn open_with_options(
                     debug_assert_eq!(typical_image_count(), 10);
                 }
                 let image_cache = BudgetedImageCache::new_entity(cx, DECODED_IMAGE_CACHE_BUDGET);
+                let title = cx.new(|cx| TitleInput::new("会议记录".into(), cx));
                 cx.new(|_| SpikeView {
                     editor,
+                    title,
                     image_cache: Some(image_cache),
                     catalogue: CommandCatalogue::default(),
                     scroll_handle: ScrollHandle::new(),
@@ -413,6 +420,7 @@ struct LinkPopover {
     marked: Option<Range<usize>>,
     last_bounds: Option<Bounds<Pixels>>,
     last_layout: Option<ShapedLine>,
+    invalid: bool,
 }
 
 impl LinkPopover {
@@ -426,6 +434,7 @@ impl LinkPopover {
             marked: None,
             last_bounds: None,
             last_layout: None,
+            invalid: false,
         }
     }
 
@@ -674,6 +683,7 @@ impl EntityInputHandler for LinkPopover {
 
 pub(crate) struct SpikeView {
     editor: Entity<EditorCore>,
+    title: Entity<TitleInput>,
     image_cache: Option<Entity<BudgetedImageCache>>,
     catalogue: CommandCatalogue,
     scroll_handle: ScrollHandle,
@@ -686,6 +696,96 @@ pub(crate) struct SpikeView {
 }
 
 impl SpikeView {
+    fn render_title_input(&self, width: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let title = self.title.clone();
+        let paint_title = title.clone();
+        let click_title = title.clone();
+        let view = cx.entity();
+        let canvas = canvas(
+            move |_bounds, _window, _cx| title.clone(),
+            move |bounds, entity, window, cx| {
+                let (text, selection, focus) = entity.read_with(cx, |title, _| {
+                    (
+                        SharedString::from(title.text().to_owned()),
+                        title.selection().clone(),
+                        title.focus_handle().clone(),
+                    )
+                });
+                let style = window.text_style();
+                let line = window.text_system().shape_line(
+                    text,
+                    px(30.0),
+                    &[TextRun {
+                        len: entity.read(cx).text().len(),
+                        font: style.font(),
+                        color: rgba(0x172033ff).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+                if focus.is_focused(window) && !selection.is_empty() {
+                    window.paint_quad(gpui::fill(
+                        Bounds::from_corners(
+                            point(
+                                bounds.left() + line.x_for_index(selection.start),
+                                bounds.top(),
+                            ),
+                            point(
+                                bounds.left() + line.x_for_index(selection.end),
+                                bounds.bottom(),
+                            ),
+                        ),
+                        rgba(0x00a82d33),
+                    ));
+                }
+                line.paint(bounds.origin, bounds.size.height, window, cx)
+                    .ok();
+                if focus.is_focused(window) && selection.is_empty() {
+                    let x = line.x_for_index(selection.start);
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(
+                            point(bounds.left() + x, bounds.top()),
+                            size(px(1.0), bounds.size.height),
+                        ),
+                        rgba(EVERNOTE_GREEN),
+                    ));
+                }
+                if focus.is_focused(window) {
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(bounds, paint_title.clone()),
+                        cx,
+                    );
+                }
+            },
+        )
+        .w_full()
+        .h(px(40.0));
+        div()
+            .id("evernote-note-title")
+            .debug_selector(|| "evernote-note-title".to_owned())
+            .w(px(width))
+            .h(px(40.0))
+            .key_context("EvernoteTitle")
+            .track_focus(self.title.read(cx).focus_handle())
+            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                click_title.read(cx).focus_handle().focus(window);
+                cx.stop_propagation();
+            })
+            .on_key_down(move |event, window, cx| {
+                if TitleInput::moves_focus_to_body_for(&event.keystroke.key) {
+                    let _ = view.update(cx, |view, view_cx| {
+                        focus_editor(&view.editor, window, view_cx)
+                    });
+                    cx.stop_propagation();
+                }
+            })
+            .child(canvas)
+            .into_any_element()
+    }
+
     fn start_measurement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(runtime) = self.measurement.as_mut() else {
             return;
@@ -900,23 +1000,26 @@ impl SpikeView {
     }
 
     fn submit_link(&mut self, _action: &SubmitLink, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(popover) = self.link_popover.take() else {
+        let Some(popover) = self.link_popover.clone() else {
             return;
         };
         let url = popover.read(cx).text.trim().to_owned();
-        if !url.is_empty() {
-            let _ = self.editor.update(cx, |editor, editor_cx| {
-                let result = self.catalogue.execute(
-                    EditorCommand::Link,
-                    CommandArgument::LinkUrl(url),
-                    editor,
-                );
-                editor_cx.notify();
-                if let Err(error) = result {
-                    eprintln!("spike link command failed: {error}");
-                }
+        let result = self.editor.update(cx, |editor, editor_cx| {
+            let result =
+                self.catalogue
+                    .execute(EditorCommand::Link, CommandArgument::LinkUrl(url), editor);
+            editor_cx.notify();
+            result
+        });
+        if result.is_err() {
+            popover.update(cx, |popover, popover_cx| {
+                popover.invalid = true;
+                popover_cx.notify();
             });
+            cx.notify();
+            return;
         }
+        self.link_popover = None;
         focus_editor(&self.editor, window, cx);
         cx.notify();
     }
@@ -1048,6 +1151,7 @@ impl SpikeView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let focus = popover.read(cx).focus.clone();
+        let invalid = popover.read(cx).invalid;
         let canvas_popover = popover.clone();
         let paint_popover = popover.clone();
         let click_popover = popover.clone();
@@ -1117,7 +1221,7 @@ impl SpikeView {
             },
         )
         .w_full()
-        .h(px(28.0));
+        .h(px(40.0));
         div()
             .id("evernote-link-popover")
             .absolute()
@@ -1128,7 +1232,11 @@ impl SpikeView {
             .rounded(px(6.0))
             .bg(rgba(0xffffffff))
             .border(px(1.0))
-            .border_color(rgba(0xc7d0ddff))
+            .border_color(if invalid {
+                rgba(0xd92d20ff)
+            } else {
+                rgba(0xc7d0ddff)
+            })
             .key_context("EvernoteLinkPopover")
             .track_focus(&focus)
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
@@ -1151,7 +1259,29 @@ impl SpikeView {
             .on_key_down(cx.listener(Self::on_link_key_down))
             .on_action(cx.listener(Self::submit_link))
             .on_action(cx.listener(Self::cancel_link))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgba(0x475467ff))
+                    .child("链接地址"),
+            )
             .child(input_canvas)
+            .children(invalid.then(|| {
+                div()
+                    .pt(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(rgba(0xd92d20ff))
+                    .child("请输入有效 URL")
+            }))
+            .child(
+                div()
+                    .pt(px(8.0))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child("取消")
+                    .child("应用"),
+            )
             .into_any_element()
     }
 
@@ -1168,9 +1298,9 @@ impl SpikeView {
         let catalogue = self.catalogue;
         let view = cx.entity();
         let background = match state.toggle {
-            crate::native_editor::commands::ToggleState::On => rgba(0x2f6feb44),
-            crate::native_editor::commands::ToggleState::Mixed => rgba(0xf2b84b55),
-            crate::native_editor::commands::ToggleState::Off => rgba(0x00000010),
+            crate::native_editor::commands::ToggleState::On
+            | crate::native_editor::commands::ToggleState::Mixed => rgba(EVERNOTE_GREEN),
+            crate::native_editor::commands::ToggleState::Off => rgba(0x00000000),
         };
         let foreground = if state.enabled {
             rgba(0x172033ff)
@@ -1181,15 +1311,26 @@ impl SpikeView {
             .id(descriptor.label)
             .debug_selector(|| descriptor.label.to_owned())
             .flex_shrink_0()
-            .px(px(9.0))
-            .py(px(6.0))
-            .mr(px(5.0))
-            .mb(px(5.0))
+            .size(px(32.0))
+            .items_center()
+            .justify_center()
+            .mr(px(4.0))
             .rounded(px(5.0))
             .bg(background)
             .text_size(px(12.0))
             .text_color(foreground)
-            .child(descriptor.label);
+            .opacity(if state.enabled { 1.0 } else { 0.35 })
+            .child(match descriptor.icon_path {
+                Some(path) => svg()
+                    .path(path)
+                    .size(px(20.0))
+                    .text_color(foreground)
+                    .into_any_element(),
+                None => div()
+                    .text_size(px(13.0))
+                    .child(descriptor.label_zh)
+                    .into_any_element(),
+            });
 
         if state.enabled {
             button = button
@@ -1201,7 +1342,9 @@ impl SpikeView {
                     MouseButton::Left,
                     move |_event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                         cx.stop_propagation();
-                        if command == EditorCommand::Link {
+                        if command == EditorCommand::InsertImage {
+                            prompt_for_image_path(editor.clone(), catalogue, cx);
+                        } else if command == EditorCommand::Link {
                             let _ = view.update(cx, |view, view_cx| {
                                 view.open_link_popover(window, view_cx)
                             });
@@ -1233,13 +1376,12 @@ impl SpikeView {
             .id("evernote-native-spike-more-trigger")
             .debug_selector(|| "evernote-native-spike-more-trigger".to_owned())
             .flex_shrink_0()
-            .px(px(9.0))
-            .py(px(6.0))
-            .mr(px(5.0))
-            .mb(px(5.0))
+            .h(px(32.0))
+            .px(px(10.0))
+            .mr(px(4.0))
             .rounded(px(5.0))
             .bg(if self.more_open {
-                rgba(0x2f6feb44)
+                rgba(EVERNOTE_GREEN)
             } else {
                 rgba(0x00000010)
             })
@@ -1255,9 +1397,9 @@ impl SpikeView {
                 });
             })
             .child(if self.more_open {
-                "More ▴"
+                "更多 ▴"
             } else {
-                "More ▾"
+                "更多 ▾"
             })
             .into_any_element()
     }
@@ -1268,10 +1410,15 @@ impl SpikeView {
         content_mask: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        let trigger = trigger_bounds?;
         if !self.more_open {
             return None;
         }
+        let trigger = trigger_bounds.unwrap_or_else(|| {
+            Bounds::new(
+                point(content_mask.left(), content_mask.top()),
+                size(px(52.0), px(32.0)),
+            )
+        });
         let mask_left = f32::from(content_mask.left());
         let mask_right = f32::from(content_mask.right());
         let mask_top = f32::from(content_mask.top());
@@ -1287,10 +1434,21 @@ impl SpikeView {
         } else {
             (mask_top, above_height)
         };
-        let buttons = self
-            .catalogue
-            .more_descriptors()
+        let mut commands = toolbar_placement(f32::from(content_mask.size.width)).overflow;
+        commands.extend(
+            self.catalogue
+                .more_descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.command),
+        );
+        let buttons = commands
             .into_iter()
+            .filter_map(|command| {
+                self.catalogue
+                    .descriptors()
+                    .iter()
+                    .find(|d| d.command == command)
+            })
             .map(|descriptor| self.render_command_button(descriptor, true, cx))
             .collect::<Vec<_>>();
         Some(
@@ -1300,8 +1458,8 @@ impl SpikeView {
                 .absolute()
                 .top(px(top.max(mask_top)))
                 .left(px(trigger_left))
-                .w(px(available_width.max(1.0)))
-                .max_h(px(max_height.max(1.0)))
+                .w(px(220.0_f32.min(available_width.max(1.0))))
+                .max_h(px(300.0_f32.min(max_height.max(1.0))))
                 .overflow_y_scroll()
                 .p(px(8.0))
                 .rounded(px(6.0))
@@ -1309,7 +1467,7 @@ impl SpikeView {
                 .border(px(1.0))
                 .border_color(rgba(0xc7d0ddff))
                 .flex()
-                .flex_wrap()
+                .flex_col()
                 .children(buttons)
                 .into_any_element(),
         )
@@ -1602,14 +1760,21 @@ impl Render for SpikeView {
         let viewport_width = f32::from(window_size.width.max(px(1.0)));
         let viewport_height = f32::from(window_size.height.max(px(1.0)));
         let layout = layout_for_viewport(viewport_width, viewport_height);
+        let chrome = editor_chrome_metrics(viewport_width, viewport_height);
         let measured_height = self.editor.read(cx).layout().total_height();
         let content_mask = window.content_mask().bounds;
         let content_height = measured_height.max(f32::from(content_mask.size.height) * 0.65);
 
-        let primary_buttons = self
-            .catalogue
-            .primary_descriptors()
+        let placement = toolbar_placement(chrome.header_width);
+        let primary_buttons = placement
+            .primary
             .into_iter()
+            .filter_map(|command| {
+                self.catalogue
+                    .descriptors()
+                    .iter()
+                    .find(|descriptor| descriptor.command == command)
+            })
             .map(|descriptor| self.render_command_button(descriptor, false, cx))
             .collect::<Vec<_>>();
         let more_trigger = self.render_more_trigger(cx);
@@ -1633,6 +1798,7 @@ impl Render for SpikeView {
         .h_full();
         let more_trigger = div()
             .relative()
+            .h(px(32.0))
             .child(more_measure)
             .child(more_trigger)
             .into_any_element();
@@ -1643,9 +1809,10 @@ impl Render for SpikeView {
             .id("evernote-native-spike-primary-toolbar")
             .debug_selector(|| "evernote-native-spike-primary-toolbar".to_owned())
             .relative()
-            .w(px(layout.content_width))
+            .w(px(chrome.header_width))
             .flex()
-            .flex_wrap()
+            .h(px(chrome.toolbar_height))
+            .items_center()
             .children(primary_buttons)
             .child(more_trigger);
         let scroll = div()
@@ -1658,22 +1825,38 @@ impl Render for SpikeView {
             .track_scroll(&self.scroll_handle)
             .child(
                 div()
-                    .w(px(layout.content_width))
-                    .pt(px(28.0))
-                    .pb(px(10.0))
-                    .text_size(px(24.0))
-                    .text_color(rgba(0x172033ff))
-                    .child("Evernote editor spike"),
+                    .w(px(chrome.header_width))
+                    .pt(px(26.0))
+                    .pb(px(12.0))
+                    .text_size(px(13.0))
+                    .text_color(rgba(0x667085ff))
+                    .child("本地资料库  ›  笔记"),
+            )
+            .child(
+                div()
+                    .w(px(chrome.header_width))
+                    .pl(px(chrome.body_left_in_header))
+                    .child(self.render_title_input(chrome.body_width, cx)),
+            )
+            .child(
+                div()
+                    .w(px(chrome.header_width))
+                    .pl(px(chrome.body_left_in_header))
+                    .pt(px(4.0))
+                    .pb(px(18.0))
+                    .text_size(px(13.0))
+                    .text_color(rgba(0x667085ff))
+                    .child("更新 刚刚"),
             )
             .child(toolbar)
             .child(editor_surface)
-            .pb(px(layout.bottom_padding));
+            .pb(px(chrome.bottom_padding));
 
         let mut root = div()
             .id("evernote-native-spike")
             .size_full()
             .relative()
-            .bg(rgba(0xf1f3f6ff))
+            .bg(rgba(0xf6f5f1ff))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_root_mouse_down))
             // The root hitbox remains active while a drag leaves the editor
             // surface. This is GPUI's practical pointer-capture fallback for
@@ -1713,6 +1896,38 @@ fn run_measurement_workload(
         editor.shape_visible_with_window(0.0, VIEWPORT_HEIGHT, CONTENT_WIDTH, window);
     });
     run_edit_undo_pairs(editor, 500, true, cx)
+}
+
+/// Uses GPUI's native single-file prompt. Cancellation is deliberately a
+/// no-op: the editor is neither changed nor moved through history.
+fn prompt_for_image_path(editor: Entity<EditorCore>, catalogue: CommandCatalogue, cx: &mut App) {
+    let prompt = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some("选择图片".into()),
+    });
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = prompt.await else {
+            return;
+        };
+        let Some(path) = paths.into_iter().next() else {
+            return;
+        };
+        let _ = cx.update(move |cx| {
+            editor.update(cx, |editor, editor_cx| {
+                if let Err(error) = catalogue.execute(
+                    EditorCommand::InsertImage,
+                    CommandArgument::ImagePath(path),
+                    editor,
+                ) {
+                    eprintln!("spike image command failed: {error}");
+                }
+                editor_cx.notify();
+            });
+        });
+    })
+    .detach();
 }
 
 fn run_edit_undo_pairs(
@@ -2339,6 +2554,7 @@ mod tests {
             editor.read(cx).focus_handle().focus(window);
             SpikeView {
                 editor,
+                title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
                 image_cache: Some(view_cache.clone()),
                 catalogue: CommandCatalogue::default(),
                 scroll_handle: ScrollHandle::new(),
@@ -2470,6 +2686,7 @@ mod tests {
             editor.read(app).focus_handle().focus(window);
             SpikeView {
                 editor,
+                title: app.new(|app| TitleInput::new("会议记录".into(), app)),
                 image_cache: Some(cache.clone()),
                 catalogue: CommandCatalogue::default(),
                 scroll_handle: ScrollHandle::new(),
@@ -2671,6 +2888,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
@@ -2985,6 +3203,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
@@ -3010,6 +3229,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
@@ -3044,6 +3264,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
@@ -3081,6 +3302,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
@@ -3103,6 +3325,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
@@ -3140,6 +3363,7 @@ mod tests {
         editor.read(cx).focus_handle().focus(window);
         SpikeView {
             editor,
+            title: cx.new(|cx| TitleInput::new("会议记录".into(), cx)),
             image_cache: None,
             catalogue: CommandCatalogue::default(),
             scroll_handle: ScrollHandle::new(),
@@ -3619,8 +3843,8 @@ mod tests {
         redraw(cx);
         view.read_with(cx, |view, cx| {
             assert!(
-                view.link_popover.is_none(),
-                "invalid submit must close without mutating"
+                view.link_popover.is_some(),
+                "invalid submit must stay open without mutating"
             );
             assert_eq!(
                 view.editor.read(cx).document().semantic_snapshot(),
@@ -3631,26 +3855,9 @@ mod tests {
         });
 
         cx.update(|window, app| {
-            view.update(app, |view, view_cx| view.open_link_popover(window, view_cx));
-        });
-        redraw(cx);
-        cx.simulate_keystrokes("enter");
-        redraw(cx);
-        view.read_with(cx, |view, cx| {
-            assert!(
-                view.link_popover.is_none(),
-                "empty submit must close without mutating"
-            );
-            assert_eq!(
-                view.editor.read(cx).document().semantic_snapshot(),
-                before_cancel.0
-            );
-            assert_eq!(view.editor.read(cx).undo_depth(), before_cancel.1);
-            assert_eq!(view.editor.read(cx).selection(), before_cancel.2);
-        });
-
-        cx.update(|window, app| {
-            view.update(app, |view, view_cx| view.open_link_popover(window, view_cx));
+            view.update(app, |view, view_cx| {
+                view.cancel_link(&CancelLink, window, view_cx)
+            });
         });
         redraw(cx);
         cx.simulate_keystrokes("escape");

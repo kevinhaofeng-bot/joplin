@@ -14,6 +14,7 @@ use super::transaction::Transaction;
 /// Commands visible in the native Evernote-order editor strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EditorCommand {
+    InsertImage,
     Undo,
     Redo,
     Paragraph,
@@ -43,6 +44,7 @@ pub enum EditorCommand {
 pub enum CommandArgument {
     None,
     LinkUrl(String),
+    ImagePath(std::path::PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +64,8 @@ pub struct CommandState {
 pub struct CommandDescriptor {
     pub command: EditorCommand,
     pub label: &'static str,
+    pub label_zh: &'static str,
+    pub icon_path: Option<&'static str>,
     pub group: u8,
     pub primary: bool,
 }
@@ -103,122 +107,170 @@ impl From<DocumentError> for CommandError {
 
 const COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
+        command: EditorCommand::InsertImage,
+        label: "Insert image",
+        label_zh: "插入图片",
+        icon_path: Some("icon/editor/image.svg"),
+        group: 0,
+        primary: true,
+    },
+    CommandDescriptor {
         command: EditorCommand::Undo,
         label: "Undo",
+        label_zh: "撤销",
+        icon_path: Some("icon/editor/undo.svg"),
         group: 0,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::Redo,
         label: "Redo",
+        label_zh: "重做",
+        icon_path: Some("icon/editor/redo.svg"),
         group: 0,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::Paragraph,
         label: "Paragraph",
+        label_zh: "正文",
+        icon_path: None,
         group: 1,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::Heading1,
         label: "Heading 1",
+        label_zh: "标题 1",
+        icon_path: None,
         group: 1,
         primary: false,
     },
     CommandDescriptor {
         command: EditorCommand::Heading2,
         label: "Heading 2",
+        label_zh: "标题 2",
+        icon_path: None,
         group: 1,
         primary: false,
     },
     CommandDescriptor {
         command: EditorCommand::Heading3,
         label: "Heading 3",
+        label_zh: "标题 3",
+        icon_path: None,
         group: 1,
         primary: false,
     },
     CommandDescriptor {
         command: EditorCommand::Bold,
         label: "Bold",
+        label_zh: "粗体",
+        icon_path: Some("icon/editor/bold.svg"),
         group: 2,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::Italic,
         label: "Italic",
+        label_zh: "斜体",
+        icon_path: Some("icon/editor/italic.svg"),
         group: 2,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::Underline,
         label: "Underline",
+        label_zh: "下划线",
+        icon_path: Some("icon/editor/underline.svg"),
         group: 2,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::Strike,
         label: "Strike",
+        label_zh: "删除线",
+        icon_path: Some("icon/editor/strike.svg"),
         group: 2,
         primary: false,
     },
     CommandDescriptor {
         command: EditorCommand::Highlight,
         label: "Highlight",
+        label_zh: "高亮",
+        icon_path: Some("icon/editor/highlight.svg"),
         group: 2,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::BulletList,
         label: "Bulleted list",
+        label_zh: "项目符号列表",
+        icon_path: Some("icon/editor/bulleted-list.svg"),
         group: 3,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::OrderedList,
         label: "Numbered list",
+        label_zh: "编号列表",
+        icon_path: Some("icon/editor/ordered-list.svg"),
         group: 3,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::CheckList,
         label: "Checklist",
+        label_zh: "待办事项",
+        icon_path: Some("icon/editor/checklist.svg"),
         group: 3,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::Link,
         label: "Link",
+        label_zh: "链接",
+        icon_path: Some("icon/editor/link.svg"),
         group: 4,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::AlignLeft,
         label: "Align left",
+        label_zh: "左对齐",
+        icon_path: Some("icon/editor/align-left.svg"),
         group: 5,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::AlignCenter,
         label: "Align center",
+        label_zh: "居中",
+        icon_path: Some("icon/editor/align-center.svg"),
         group: 5,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::AlignRight,
         label: "Align right",
+        label_zh: "右对齐",
+        icon_path: Some("icon/editor/align-right.svg"),
         group: 5,
         primary: true,
     },
     CommandDescriptor {
         command: EditorCommand::IndentList,
         label: "Indent list",
+        label_zh: "增加缩进",
+        icon_path: Some("icon/editor/indent.svg"),
         group: 6,
         primary: false,
     },
     CommandDescriptor {
         command: EditorCommand::OutdentList,
         label: "Outdent list",
+        label_zh: "减少缩进",
+        icon_path: Some("icon/editor/outdent.svg"),
         group: 6,
         primary: false,
     },
@@ -253,6 +305,10 @@ impl CommandCatalogue {
     /// Derive the toolbar state from the real editor selection/document.
     pub fn state(&self, command: EditorCommand, editor: &EditorCore) -> CommandState {
         match command {
+            EditorCommand::InsertImage => CommandState {
+                enabled: editor.selected_block_indices().is_some(),
+                toggle: ToggleState::Off,
+            },
             EditorCommand::Undo => return history_state(editor.undo_depth()),
             EditorCommand::Redo => return history_state(editor.redo_depth()),
             EditorCommand::Bold
@@ -391,6 +447,12 @@ impl CommandCatalogue {
         let argument = validate_argument(command, argument)?;
         let selection = editor.selection();
         match command {
+            EditorCommand::InsertImage => {
+                let CommandArgument::ImagePath(path) = argument else {
+                    unreachable!("validate_argument checked InsertImage's argument");
+                };
+                editor.insert_image_path(&path)?;
+            }
             EditorCommand::Undo => editor.undo()?,
             EditorCommand::Redo => editor.redo()?,
             EditorCommand::Paragraph
@@ -446,6 +508,13 @@ fn validate_argument(
     argument: CommandArgument,
 ) -> Result<CommandArgument, CommandError> {
     match (command, argument) {
+        (EditorCommand::InsertImage, CommandArgument::ImagePath(path)) => {
+            Ok(CommandArgument::ImagePath(path))
+        }
+        (EditorCommand::InsertImage, _) => Err(CommandError::ArgumentMismatch {
+            command,
+            expected: "CommandArgument::ImagePath",
+        }),
         (EditorCommand::Link, CommandArgument::LinkUrl(url)) if !url.trim().is_empty() => {
             let url = url.trim();
             if url::Url::parse(url).is_ok() {
@@ -461,6 +530,10 @@ fn validate_argument(
         }),
         (_, CommandArgument::None) => Ok(CommandArgument::None),
         (_, CommandArgument::LinkUrl(_)) => Err(CommandError::ArgumentMismatch {
+            command,
+            expected: "CommandArgument::None",
+        }),
+        (_, CommandArgument::ImagePath(_)) => Err(CommandError::ArgumentMismatch {
             command,
             expected: "CommandArgument::None",
         }),
@@ -551,5 +624,93 @@ fn list_depth(kind: &BlockKind) -> Option<u8> {
         | BlockKind::OrderedItem { depth }
         | BlockKind::CheckItem { depth, .. } => Some(*depth),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandArgument, CommandCatalogue, CommandError, EditorCommand};
+    use crate::native_editor::core::EditorCore;
+    use crate::native_editor::images::ClipboardPayload;
+
+    #[gpui::test]
+    fn insert_image_command_commits_a_real_structural_image_and_undo_restores_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "joplin-lite-command-image-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        let bytes = ClipboardPayload::fixture_with_png_and_text("ignored")
+            .images
+            .into_iter()
+            .next()
+            .expect("fixture PNG")
+            .bytes;
+        std::fs::write(&path, bytes).expect("fixture path");
+        let mut editor = EditorCore::for_test("前后", cx);
+        editor.set_caret_utf8("前".len());
+        let selection_before = editor.selection();
+        let history_before = editor.undo_depth();
+
+        CommandCatalogue::new()
+            .execute(
+                EditorCommand::InsertImage,
+                CommandArgument::ImagePath(path.clone()),
+                &mut editor,
+            )
+            .expect("typed image command must use EditorCore insertion");
+
+        assert_eq!(editor.copy_all_plain_text(), "前\n\u{fffc}\n后");
+        assert_ne!(editor.selection(), selection_before);
+        assert_eq!(editor.undo_depth(), history_before + 1);
+        editor.undo().expect("catalogue insertion must be undoable");
+        assert_eq!(editor.copy_all_plain_text(), "前后");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[gpui::test]
+    fn insert_image_command_rejects_unsupported_and_mismatched_arguments_without_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut editor = EditorCore::for_test("前后", cx);
+        editor.set_caret_utf8("前".len());
+        let baseline = (
+            editor.copy_all_plain_text(),
+            editor.selection(),
+            editor.undo_depth(),
+        );
+        let catalogue = CommandCatalogue::new();
+
+        assert!(matches!(
+            catalogue.execute(
+                EditorCommand::InsertImage,
+                CommandArgument::None,
+                &mut editor,
+            ),
+            Err(CommandError::ArgumentMismatch { .. })
+        ));
+        let unsupported = std::env::temp_dir().join(format!(
+            "joplin-lite-command-image-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&unsupported, "not an image").expect("unsupported fixture");
+        assert!(matches!(
+            catalogue.execute(
+                EditorCommand::InsertImage,
+                CommandArgument::ImagePath(unsupported.clone()),
+                &mut editor,
+            ),
+            Err(CommandError::Document(_))
+        ));
+        assert_eq!(
+            (
+                editor.copy_all_plain_text(),
+                editor.selection(),
+                editor.undo_depth()
+            ),
+            baseline
+        );
+        let _ = std::fs::remove_file(unsupported);
     }
 }

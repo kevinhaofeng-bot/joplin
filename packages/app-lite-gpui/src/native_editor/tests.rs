@@ -6182,6 +6182,17 @@ fn toolbar_and_overflow_execute_same_command(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
     let catalogue = CommandCatalogue::default();
+    let image_path = std::env::temp_dir().join(format!(
+        "joplin-lite-visible-command-{}.png",
+        uuid::Uuid::new_v4()
+    ));
+    let image_bytes = ClipboardPayload::fixture_with_png_and_text("ignored")
+        .images
+        .into_iter()
+        .next()
+        .expect("real PNG fixture")
+        .bytes;
+    std::fs::write(&image_path, image_bytes).expect("real image command fixture");
     let descriptors = catalogue.descriptors();
     let unique_commands = descriptors
         .iter()
@@ -6194,10 +6205,10 @@ fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
         editor.select_all();
         let before = editor.document().semantic_snapshot();
         let before_undo = editor.undo_depth();
-        let argument = if descriptor.command == EditorCommand::Link {
-            CommandArgument::LinkUrl("https://example.com".into())
-        } else {
-            CommandArgument::None
+        let argument = match descriptor.command {
+            EditorCommand::Link => CommandArgument::LinkUrl("https://example.com".into()),
+            EditorCommand::InsertImage => CommandArgument::ImagePath(image_path.clone()),
+            _ => CommandArgument::None,
         };
         let state = catalogue.state(descriptor.command, &editor);
         let current_state_no_op = state.toggle == ToggleState::On
@@ -6292,6 +6303,7 @@ fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
         .execute(EditorCommand::Undo, CommandArgument::None, &mut editor)
         .unwrap();
     assert!(catalogue.state(EditorCommand::Redo, &editor).enabled);
+    let _ = std::fs::remove_file(image_path);
 }
 
 #[gpui::test]

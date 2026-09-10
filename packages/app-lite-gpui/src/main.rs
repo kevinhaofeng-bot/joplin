@@ -83,6 +83,57 @@ impl AssetSource for VelotypeAssets {
             "icon/titlebar/chrome-restore.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/icon/titlebar/chrome-restore.svg"
             )))),
+            "icon/editor/image.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/image.svg"
+            )))),
+            "icon/editor/undo.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/undo.svg"
+            )))),
+            "icon/editor/redo.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/redo.svg"
+            )))),
+            "icon/editor/bold.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/bold.svg"
+            )))),
+            "icon/editor/italic.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/italic.svg"
+            )))),
+            "icon/editor/underline.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/underline.svg"
+            )))),
+            "icon/editor/highlight.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/highlight.svg"
+            )))),
+            "icon/editor/bulleted-list.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/bulleted-list.svg"
+            )))),
+            "icon/editor/ordered-list.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/ordered-list.svg"
+            )))),
+            "icon/editor/checklist.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/checklist.svg"
+            )))),
+            "icon/editor/link.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/link.svg"
+            )))),
+            "icon/editor/align-left.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/align-left.svg"
+            )))),
+            "icon/editor/align-center.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/align-center.svg"
+            )))),
+            "icon/editor/align-right.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/align-right.svg"
+            )))),
+            "icon/editor/indent.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/indent.svg"
+            )))),
+            "icon/editor/outdent.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/outdent.svg"
+            )))),
+            "icon/editor/strike.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icon/editor/strike.svg"
+            )))),
             _ => Ok(None),
         }
     }
@@ -285,6 +336,27 @@ fn main() {
         app_menu::install_menus(cx);
         cx.refresh_windows();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AssetSource, VelotypeAssets};
+    use crate::native_editor::commands::CommandCatalogue;
+
+    #[test]
+    fn editor_command_icons_load_from_the_real_application_asset_source() {
+        let assets = VelotypeAssets;
+        for descriptor in CommandCatalogue::new().descriptors() {
+            let Some(path) = descriptor.icon_path else {
+                continue;
+            };
+            let bytes = assets
+                .load(path)
+                .expect("asset source should not fail")
+                .unwrap_or_else(|| panic!("missing descriptor asset: {path}"));
+            assert!(!bytes.is_empty(), "empty descriptor asset: {path}");
+        }
+    }
 }
 
 fn print_help() {

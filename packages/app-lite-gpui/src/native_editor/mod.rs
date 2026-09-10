@@ -1,4 +1,5 @@
 pub mod acceptance;
+pub mod chrome;
 pub mod commands;
 pub mod core;
 pub mod diagnostics;
