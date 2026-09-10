@@ -1,8 +1,11 @@
 # Evernote 11.32.5 program and `main.js` reconstruction
 
-Date: 2026-09-09  
-Installed build: `11.32.5` / `20260830093737`  
-Status: direct bundle inspection complete for the desktop orchestration, Conduit storage, local search and rich-text persistence paths  
+Date: 2026-09-09
+
+Installed build: `11.32.5` / `20260830093737`
+
+Status: direct bundle inspection complete for the desktop orchestration, Conduit storage, local search and rich-text persistence paths
+
 Scope: read-only inspection of the installed application, extracted package, source maps and aggregate local-store shape. This document records names, boundaries and behavior; it does not copy application source or account content.
 
 ## 1. What “reconstruct `main.js`” means
