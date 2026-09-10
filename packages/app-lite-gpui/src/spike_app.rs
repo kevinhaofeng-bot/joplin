@@ -413,6 +413,7 @@ fn measurement_workload_needs_frame(runtime: Option<&MeasurementRuntime>) -> boo
 /// bridge so AppKit/IME replacement edits the field rather than a fake label.
 struct LinkPopover {
     focus: FocusHandle,
+    anchor: Option<Point<Pixels>>,
     text: String,
     selection: Range<usize>,
     reversed: bool,
@@ -427,6 +428,7 @@ impl LinkPopover {
         let end = initial.len();
         Self {
             focus: cx.focus_handle(),
+            anchor: None,
             text: initial,
             selection: end..end,
             reversed: false,
@@ -435,6 +437,11 @@ impl LinkPopover {
             last_layout: None,
             invalid: false,
         }
+    }
+
+    fn anchored_at(mut self, anchor: Point<Pixels>) -> Self {
+        self.anchor = Some(anchor);
+        self
     }
 
     fn replace_range(&mut self, range: Option<Range<usize>>, text: &str) {
@@ -1094,6 +1101,15 @@ impl SpikeView {
     }
 
     fn open_link_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_link_popover_at(None, window, cx);
+    }
+
+    fn open_link_popover_at(
+        &mut self,
+        anchor: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.link_popover.is_some() {
             return;
         }
@@ -1122,7 +1138,13 @@ impl SpikeView {
                     })
             })
             .unwrap_or_default();
-        let popover = cx.new(|cx| LinkPopover::new(initial, cx));
+        let popover = cx.new(|cx| {
+            let popover = LinkPopover::new(initial, cx);
+            match anchor {
+                Some(anchor) => popover.anchored_at(anchor),
+                None => popover,
+            }
+        });
         popover.update(cx, |popover, _cx| popover.focus.focus(window));
         self.link_popover = Some(popover);
         cx.notify();
@@ -1283,10 +1305,28 @@ impl SpikeView {
     fn render_link_popover(
         &self,
         popover: Entity<LinkPopover>,
+        content_mask: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let focus = popover.read(cx).focus.clone();
         let invalid = popover.read(cx).invalid;
+        let anchor = popover.read(cx).anchor;
+        let mask_left = f32::from(content_mask.left());
+        let mask_right = f32::from(content_mask.right());
+        let mask_top = f32::from(content_mask.top());
+        let mask_bottom = f32::from(content_mask.bottom());
+        let width = 360.0_f32.min((mask_right - mask_left).max(1.0));
+        let estimated_height = if invalid { 144.0 } else { 126.0 };
+        let anchor = anchor.unwrap_or_else(|| point(content_mask.left(), content_mask.top()));
+        let left = f32::from(anchor.x)
+            .max(mask_left)
+            .min((mask_right - width).max(mask_left));
+        let below = f32::from(anchor.y) + 16.0;
+        let top = if below + estimated_height <= mask_bottom {
+            below
+        } else {
+            (f32::from(anchor.y) - estimated_height - 16.0).max(mask_top)
+        };
         let canvas_popover = popover.clone();
         let paint_popover = popover.clone();
         let click_popover = popover.clone();
@@ -1360,10 +1400,13 @@ impl SpikeView {
         .h(px(40.0));
         div()
             .id("evernote-link-popover")
+            .debug_selector(|| "evernote-link-popover".to_owned())
             .absolute()
-            .top(px(94.0))
-            .left(px(12.0))
-            .w(px(360.0))
+            .top(px(top))
+            .left(px(left))
+            .w(px(width))
+            .flex()
+            .flex_col()
             .p(px(8.0))
             .rounded(px(6.0))
             .bg(rgba(0xffffffff))
@@ -1375,22 +1418,8 @@ impl SpikeView {
             })
             .key_context("EvernoteLinkPopover")
             .track_focus(&focus)
-            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                let _ = click_popover.update(cx, |popover, popover_cx| {
-                    if let Some(index) =
-                        popover.character_index_for_point(event.position, window, popover_cx)
-                    {
-                        let index = crate::native_editor::input::utf16_range_to_utf8_in(
-                            &popover.text,
-                            &(index..index),
-                        )
-                        .start;
-                        popover.collapse(index);
-                        popover.focus.focus(window);
-                        popover_cx.notify();
-                    }
-                });
-                cx.stop_propagation();
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation()
             })
             .on_key_down(cx.listener(Self::on_link_key_down))
             .on_action(cx.listener(Self::submit_link))
@@ -1401,17 +1430,50 @@ impl SpikeView {
                     .text_color(rgba(0x475467ff))
                     .child("链接地址"),
             )
-            .child(input_canvas)
+            .child(
+                div()
+                    .h(px(40.0))
+                    .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                        let handled = click_popover.update(cx, |popover, popover_cx| {
+                            if let Some(index) = popover.character_index_for_point(
+                                event.position,
+                                window,
+                                popover_cx,
+                            ) {
+                                let index = crate::native_editor::input::utf16_range_to_utf8_in(
+                                    &popover.text,
+                                    &(index..index),
+                                )
+                                .start;
+                                popover.collapse(index);
+                                popover.focus.focus(window);
+                                popover_cx.notify();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        } else {
+                            cx.propagate();
+                        }
+                    })
+                    .child(input_canvas),
+            )
             .children(invalid.then(|| {
                 div()
+                    .id("evernote-link-invalid-error")
+                    .debug_selector(|| "evernote-link-invalid-error".to_owned())
                     .pt(px(4.0))
                     .text_size(px(12.0))
                     .text_color(rgba(0xd92d20ff))
                     .child("请输入有效 URL")
             }))
-            .child(
+            .child({
                 div()
                     .pt(px(8.0))
+                    .w_full()
                     .flex()
                     .justify_end()
                     .gap(px(8.0))
@@ -1419,8 +1481,8 @@ impl SpikeView {
                         div()
                             .id("evernote-link-cancel")
                             .debug_selector(|| "evernote-link-cancel".to_owned())
+                            .w(px(64.0))
                             .h(px(32.0))
-                            .px(px(10.0))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1440,8 +1502,8 @@ impl SpikeView {
                         div()
                             .id("evernote-link-apply")
                             .debug_selector(|| "evernote-link-apply".to_owned())
+                            .w(px(64.0))
                             .h(px(32.0))
-                            .px(px(10.0))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1457,8 +1519,8 @@ impl SpikeView {
                                 });
                             })
                             .child("应用")
-                    }),
-            )
+                    })
+            })
             .into_any_element()
     }
 
@@ -1484,44 +1546,87 @@ impl SpikeView {
         } else {
             rgba(0x68738699)
         };
-        let mut button = div()
-            .id(descriptor.label)
-            .debug_selector(|| descriptor.label.to_owned())
-            .flex_shrink_0()
-            .size(px(32.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .mr(px(4.0))
-            .rounded(px(5.0))
-            .bg(background)
-            .hover(move |this| {
-                this.bg(
-                    if matches!(
-                        state.toggle,
-                        crate::native_editor::commands::ToggleState::On
-                            | crate::native_editor::commands::ToggleState::Mixed
-                    ) {
-                        rgba(0x008f26ff)
-                    } else {
-                        rgba(0x17203312)
-                    },
+        let icon = match descriptor.icon_path {
+            Some(path) => svg()
+                .path(path)
+                .size(px(20.0))
+                .text_color(foreground)
+                .into_any_element(),
+            None if from_more => div()
+                .w(px(20.0))
+                .text_size(px(13.0))
+                .child("T")
+                .into_any_element(),
+            None => div()
+                .text_size(px(13.0))
+                .child(descriptor.label_zh)
+                .into_any_element(),
+        };
+        let mut button = if from_more {
+            div()
+                .id(descriptor.label)
+                .debug_selector(|| descriptor.label.to_owned())
+                .w_full()
+                .h(px(36.0))
+                .flex_none()
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(5.0))
+                .bg(background)
+                .hover(move |this| {
+                    this.bg(
+                        if matches!(
+                            state.toggle,
+                            crate::native_editor::commands::ToggleState::On
+                                | crate::native_editor::commands::ToggleState::Mixed
+                        ) {
+                            rgba(0x008f26ff)
+                        } else {
+                            rgba(0x17203312)
+                        },
+                    )
+                })
+                .text_size(px(13.0))
+                .text_color(foreground)
+                .opacity(if state.enabled { 1.0 } else { 0.35 })
+                .child(icon)
+                .child(
+                    div()
+                        .debug_selector(|| descriptor.label_zh.to_owned())
+                        .child(descriptor.label_zh),
                 )
-            })
-            .text_size(px(12.0))
-            .text_color(foreground)
-            .opacity(if state.enabled { 1.0 } else { 0.35 })
-            .child(match descriptor.icon_path {
-                Some(path) => svg()
-                    .path(path)
-                    .size(px(20.0))
-                    .text_color(foreground)
-                    .into_any_element(),
-                None => div()
-                    .text_size(px(13.0))
-                    .child(descriptor.label_zh)
-                    .into_any_element(),
-            });
+        } else {
+            div()
+                .id(descriptor.label)
+                .debug_selector(|| descriptor.label.to_owned())
+                .flex_shrink_0()
+                .size(px(32.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .mr(px(4.0))
+                .rounded(px(5.0))
+                .bg(background)
+                .hover(move |this| {
+                    this.bg(
+                        if matches!(
+                            state.toggle,
+                            crate::native_editor::commands::ToggleState::On
+                                | crate::native_editor::commands::ToggleState::Mixed
+                        ) {
+                            rgba(0x008f26ff)
+                        } else {
+                            rgba(0x17203312)
+                        },
+                    )
+                })
+                .text_size(px(12.0))
+                .text_color(foreground)
+                .opacity(if state.enabled { 1.0 } else { 0.35 })
+                .child(icon)
+        };
 
         if state.enabled {
             button = button
@@ -1531,7 +1636,7 @@ impl SpikeView {
                 // like the donor block toolbar.
                 .on_mouse_down(
                     MouseButton::Left,
-                    move |_event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                    move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                         cx.stop_propagation();
                         if command == EditorCommand::InsertImage {
                             if let Some(window_handle) =
@@ -1541,7 +1646,7 @@ impl SpikeView {
                             }
                         } else if command == EditorCommand::Link {
                             let _ = view.update(cx, |view, view_cx| {
-                                view.open_link_popover(window, view_cx)
+                                view.open_link_popover_at(Some(event.position), window, view_cx)
                             });
                         } else {
                             run_command(
@@ -1690,7 +1795,7 @@ impl SpikeView {
         // capture-phase mouse listener; an editor click while the popup is
         // open is dismissed by the root listener instead of changing the
         // selection underneath the menu.
-        if self.more_open {
+        if self.more_open || self.link_popover.is_some() {
             cx.propagate();
             return;
         }
@@ -1783,6 +1888,12 @@ impl SpikeView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.link_popover.is_some() {
+            // The modal backdrop owns Link's outside-click dismissal. Do not
+            // compete with its mounted input or action controls.
+            cx.propagate();
+            return;
+        }
         let dismissed = self.more_open || self.link_popover.is_some();
         if self.more_open {
             self.more_open = false;
@@ -1816,7 +1927,7 @@ impl SpikeView {
         let canvas_editor = editor.clone();
         let measurement_view = cx.entity();
         let paint_measurement_view = measurement_view.clone();
-        let surface = div()
+        let mut surface = div()
             .id("spike-editor-surface")
             .debug_selector(|| "spike-editor-surface".to_owned())
             .key_context("BlockEditor")
@@ -1828,11 +1939,14 @@ impl SpikeView {
             .can_drop(|dragged, _window, _cx| dragged.is::<ExternalPaths>())
             .on_drag_move::<ExternalPaths>(cx.listener(Self::on_external_paths_drag_move))
             .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
-            .capture_any_mouse_down(cx.listener(Self::on_surface_mouse_down))
             .on_key_down(cx.listener(Self::on_surface_key_down))
             .on_mouse_move(cx.listener(Self::on_surface_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_surface_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_surface_mouse_up));
+
+        if self.link_popover.is_none() {
+            surface = surface.capture_any_mouse_down(cx.listener(Self::on_surface_mouse_down));
+        }
 
         let canvas = canvas(
             move |bounds, window, cx| {
@@ -2075,6 +2189,7 @@ impl Render for SpikeView {
 
         let mut root = div()
             .id("evernote-native-spike")
+            .debug_selector(|| "evernote-native-spike".to_owned())
             .size_full()
             .relative()
             .bg(rgba(0xf6f5f1ff))
@@ -2091,7 +2206,22 @@ impl Render for SpikeView {
             root = root.child(menu);
         }
         if let Some(popover) = self.link_popover.clone() {
-            root = root.child(self.render_link_popover(popover, cx));
+            let view = cx.entity();
+            root = root
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .size_full()
+                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                            cx.stop_propagation();
+                            let _ = view.update(cx, |view, view_cx| {
+                                view.cancel_link(&CancelLink, window, view_cx);
+                            });
+                        }),
+                )
+                .child(self.render_link_popover(popover, content_mask, cx));
         }
         root
     }
@@ -4198,6 +4328,14 @@ mod tests {
             });
         });
         cx.simulate_keystrokes("home up shift-right");
+        let invalid_baseline = view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            (
+                editor.document().semantic_snapshot(),
+                editor.undo_depth(),
+                editor.selection(),
+            )
+        });
         let link = cx.debug_bounds("Link").expect("visible Link command");
         cx.simulate_click(link.center(), Modifiers::default());
         redraw(cx);
@@ -4205,16 +4343,62 @@ mod tests {
         let apply = cx
             .debug_bounds("evernote-link-apply")
             .expect("Apply must be a real hit target");
-        cx.simulate_input("not a URL");
+        let panel = cx
+            .debug_bounds("evernote-link-popover")
+            .expect("mounted Link panel before Apply");
+        assert!(
+            apply.left() >= panel.left()
+                && apply.right() <= panel.right()
+                && apply.top() >= panel.top()
+                && apply.bottom() <= panel.bottom(),
+            "mounted Apply bounds must belong to the Link panel; apply={apply:?}, panel={panel:?}"
+        );
+        cx.simulate_input("not-a-url");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.link_popover.as_ref().unwrap().read(cx).text,
+                "not-a-url",
+                "mounted URL field must receive the invalid text before Apply"
+            );
+        });
+        redraw(cx);
         cx.simulate_click(apply.center(), Modifiers::default());
         redraw(cx);
         view.read_with(cx, |view, cx| {
             assert!(
                 view.link_popover.is_some(),
-                "invalid Apply keeps the popover open"
+                "invalid Apply keeps the popover open; history={}, document_changed={}",
+                view.editor.read(cx).undo_depth(),
+                view.editor.read(cx).document().semantic_snapshot() != invalid_baseline.0
             );
-            assert!(view.link_popover.as_ref().unwrap().read(cx).invalid);
+            let popover = view.link_popover.as_ref().unwrap().read(cx);
+            assert!(
+                popover.invalid,
+                "mounted Apply must invoke URL validation; text={:?}, selection={:?}",
+                popover.text, popover.selection,
+            );
+            let editor = view.editor.read(cx);
+            assert_eq!(editor.document().semantic_snapshot(), invalid_baseline.0);
+            assert_eq!(editor.undo_depth(), invalid_baseline.1);
+            assert_eq!(editor.selection(), invalid_baseline.2);
         });
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                assert!(
+                    view.link_popover
+                        .as_ref()
+                        .unwrap()
+                        .read(app)
+                        .focus
+                        .is_focused(window),
+                    "invalid Apply must retain URL-field focus"
+                );
+            });
+        });
+        assert!(
+            cx.debug_bounds("evernote-link-invalid-error").is_some(),
+            "invalid mounted Apply must show the Chinese URL error"
+        );
         let cancel = cx
             .debug_bounds("evernote-link-cancel")
             .expect("Cancel remains clickable after invalid validation");
@@ -4319,6 +4503,152 @@ mod tests {
                 descriptor.label
             );
         }
+    }
+
+    #[gpui::test]
+    async fn shell_more_rows_have_chinese_labels_and_full_line_hit_targets_at_wide_and_narrow_widths(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (_view, cx) = cx.add_window_view(build_view);
+        let catalogue = CommandCatalogue::default();
+
+        for width in [1200.0, 760.0] {
+            cx.simulate_resize(size(px(width), px(820.0)));
+            redraw(cx);
+            let trigger = cx
+                .debug_bounds("evernote-native-spike-more-trigger")
+                .expect("mounted More trigger");
+            cx.simulate_click(trigger.center(), Modifiers::default());
+            redraw(cx);
+            let menu = cx
+                .debug_bounds("evernote-native-spike-more-menu")
+                .expect("mounted More menu");
+            assert_eq!(menu.size.width, px(220.0), "{width}pt menu width");
+            assert!(menu.size.height <= px(300.0), "{width}pt menu scroll cap");
+
+            let placement = toolbar_placement(editor_chrome_metrics(width, 820.0).header_width);
+            let mut commands = placement.overflow;
+            commands.extend(
+                catalogue
+                    .more_descriptors()
+                    .into_iter()
+                    .map(|descriptor| descriptor.command),
+            );
+            for command in commands {
+                let descriptor = catalogue
+                    .descriptors()
+                    .iter()
+                    .find(|descriptor| descriptor.command == command)
+                    .expect("catalogue descriptor");
+                let row = cx
+                    .debug_bounds(descriptor.label)
+                    .unwrap_or_else(|| panic!("{} More row", descriptor.label));
+                let chinese = cx
+                    .debug_bounds(descriptor.label_zh)
+                    .unwrap_or_else(|| panic!("{} Chinese More label", descriptor.label));
+                let clipped_by_scroll_edge =
+                    row.top() == menu.top() || row.bottom() == menu.bottom();
+                assert!(
+                    row.size.width >= menu.size.width - px(18.0)
+                        && (row.size.height >= px(36.0) || clipped_by_scroll_edge),
+                    "{} must be a full menu-row hit target; row={row:?}, menu={menu:?}",
+                    descriptor.label,
+                );
+                assert!(
+                    chinese.left() >= row.left()
+                        && chinese.right() <= row.right()
+                        && chinese.top() >= row.top()
+                        && chinese.bottom() <= row.bottom(),
+                    "{} Chinese label belongs to its command row",
+                    descriptor.label
+                );
+            }
+
+            let trigger = cx
+                .debug_bounds("evernote-native-spike-more-trigger")
+                .expect("More trigger remains mounted");
+            cx.simulate_click(trigger.center(), Modifiers::default());
+            redraw(cx);
+        }
+    }
+
+    #[gpui::test]
+    async fn shell_link_popover_anchors_to_clicked_trigger_and_stays_inside_content_mask(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                view.editor.read(app).focus_handle().focus(window)
+            });
+        });
+        cx.simulate_keystrokes("home up shift-right");
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(
+                !view.editor.read(cx).selection().is_caret(),
+                "Link trigger requires a real text selection"
+            );
+        });
+        let wide_link = cx.debug_bounds("Link").expect("wide Link trigger");
+        cx.simulate_click(wide_link.center(), Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.link_popover.is_some(),
+                "wide Link hit target must open its panel"
+            )
+        });
+        redraw(cx);
+        let wide_panel = cx
+            .debug_bounds("evernote-link-popover")
+            .expect("wide Link panel");
+        let wide_mask = cx
+            .debug_bounds("evernote-native-spike")
+            .expect("wide content mask root");
+        assert!(wide_panel.left() >= wide_mask.left() && wide_panel.right() <= wide_mask.right());
+        assert!(wide_panel.top() >= wide_mask.top() && wide_panel.bottom() <= wide_mask.bottom());
+        assert!(
+            wide_panel.left() <= wide_link.right() + px(1.0)
+                && wide_panel.right() >= wide_link.left() - px(1.0),
+            "wide panel must be anchored beside its actual Link trigger"
+        );
+        cx.update(|window, app| {
+            view.update(app, |view, view_cx| {
+                view.cancel_link(&CancelLink, window, view_cx)
+            });
+        });
+
+        cx.simulate_resize(size(px(760.0), px(820.0)));
+        redraw(cx);
+        let more = cx
+            .debug_bounds("evernote-native-spike-more-trigger")
+            .expect("narrow More trigger");
+        cx.simulate_click(more.center(), Modifiers::default());
+        redraw(cx);
+        let narrow_link = cx.debug_bounds("Link").expect("narrow Link row");
+        cx.simulate_click(narrow_link.center(), Modifiers::default());
+        redraw(cx);
+        let narrow_panel = cx
+            .debug_bounds("evernote-link-popover")
+            .expect("narrow Link panel");
+        let narrow_mask = cx
+            .debug_bounds("evernote-native-spike")
+            .expect("narrow content mask root");
+        assert!(
+            narrow_panel.left() >= narrow_mask.left()
+                && narrow_panel.right() <= narrow_mask.right()
+                && narrow_panel.top() >= narrow_mask.top()
+                && narrow_panel.bottom() <= narrow_mask.bottom()
+        );
+        assert!(
+            narrow_panel.left() <= narrow_link.right() + px(1.0)
+                && narrow_panel.right() >= narrow_link.left() - px(1.0),
+            "narrow panel must be anchored beside its actual Link row"
+        );
     }
 
     #[gpui::test]

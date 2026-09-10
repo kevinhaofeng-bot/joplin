@@ -195,3 +195,33 @@ Status: PARTIAL_PASS
 - PASS: the caret remained usable directly after the image and accepted `after image typing`. Two screenshots sampled two seconds apart show the same image/text geometry and scroll position; their file hashes differ because cursor/system chrome are dynamic, so this is recorded as sampled layout stability rather than a general proof that every animation frame is flash-free. Evidence: `/tmp/joplin-lite-visible-mvp/round4-image-followup-ascii-1.png` and `/tmp/joplin-lite-visible-mvp/round4-image-followup-ascii-2.png`.
 - The Release process was stopped after capture. Finder/Preview clipboard insertion, drag/drop, cross-image drag selection, narrow-window overflow, and a complete macOS Pinyin candidate-revision pass remain separate manual matrix items and are not promoted by this focused acceptance.
 - Independent scoped review of `d4dccff30..93a469340` approved the picker-completion repair with zero Critical, Important, or Minor findings. The controller gates remain PASS: focused asynchronous picker seam, `chrome`, `shell_`, `image`, full bin (`991 passed; 0 failed; 1 filtered out`), all-target compilation, formatting, diff check, and optimized Release build.
+
+## Round 5 — visible More/Link acceptance repair
+
+Status: DONE_WITH_CONCERNS
+
+### RED to GREEN evidence
+
+1. RED — `shell_more_rows_have_chinese_labels_and_full_line_hit_targets_at_wide_and_narrow_widths` initially failed at `Heading 1 Chinese More label`: the mounted overflow entries exposed only their SVG hit boxes. The test checks every shared-catalogue overflow descriptor at 1200 pt and 760 pt, its Chinese `label_zh` bounds, full row bounds, 220-pt menu width, and 300-pt maximum height.
+2. GREEN — the same test passed after rendering every More descriptor as a 36-pt full-width flex row with a 20-pt icon and the real `label_zh`; rows retain active/disabled styling. A first Green attempt exposed a 28-pt shrunken narrow row; adding `flex_none` fixed that visual layout defect. Final focused command: `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_more_rows_have_chinese_labels_and_full_line_hit_targets_at_wide_and_narrow_widths -- --nocapture` — `1 passed; 0 failed`.
+3. RED — `shell_link_popover_anchors_to_clicked_trigger_and_stays_inside_content_mask` first had no mounted popover selector, then exposed the fixed-left/fixed-top panel behavior. It opens the actual wide Link trigger and narrow More→Link row and checks the resulting panel bounds overlap the clicked trigger and stay inside the mounted root/content mask.
+4. GREEN — Link now carries the actual mouse-down trigger point, clamps its 360-pt maximum width to the mask, and flips/clamps vertically. The panel is `absolute` (not subsequently overwritten by `relative`) and is a column flex layout. Focused command passed: `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_link_popover_anchors_to_clicked_trigger_and_stays_inside_content_mask -- --nocapture` — `1 passed; 0 failed`.
+5. RED — the strengthened `shell_visible_link_buttons_keep_invalid_open_and_dispatch_cancel_or_apply` used the mounted `evernote-link-apply` bounds and a real simulated click after entering `not-a-url`. Under the previous event layering, it failed at `mounted Apply must invoke URL validation`; no error state was set.
+6. GREEN — `CommandCatalogue::execute(LinkUrl)` now accepts only absolute `http`/`https` URLs with a host. Link-open disables the editor-surface capture listener; a single full-window backdrop is placed below the panel solely for outside cancellation, while the panel remains the highest sibling and its actual input/Cancel/Apply controls own their own mouse handlers. The mounted click now retains the panel and input focus, renders `请输入有效 URL`, and leaves the semantic snapshot, undo depth, and selection unchanged. Valid Apply creates one real link transaction and Cancel restores body focus. Focused command passed: `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_visible_link_buttons_keep_invalid_open_and_dispatch_cancel_or_apply -- --nocapture` — `1 passed; 0 failed`.
+
+### Round 5 controller gates
+
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype chrome -- --nocapture`: PASS, `22 passed; 0 failed`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_ -- --nocapture`: PASS, `19 passed; 0 failed`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores`: PASS, `993 passed; 0 failed; 1 filtered out`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run`: PASS.
+- `cargo fmt --check --manifest-path packages/app-lite-gpui/Cargo.toml`: PASS.
+- `git diff --check`: PASS.
+- `cargo build --manifest-path packages/app-lite-gpui/Cargo.toml --release`: PASS (optimized LTO link; existing repository warnings remain).
+
+### Round 5 self-review and concerns
+
+- The product diff is confined to `spike_app.rs` and the shared-command URL validation. It does not change Task 7 thresholds, drawable settings, image budgets, fixtures, measurement workloads, paste/drop, or the typed picker completion route.
+- More uses only the existing `CommandCatalogue` descriptors; no hard-coded duplicate command list or source-string detector was added.
+- The Link dismissal/event flow has one outside-click owner (the backdrop). The panel is above that backdrop; the real input, Cancel, and Apply targets handle their own events. There is no global refresh, helper-only Apply assertion, or document mutation on invalid input.
+- Existing real-window screenshots establishing the failures are preserved at `/tmp/joplin-lite-visible-mvp/acceptance2/08-more-open.png`, `/tmp/joplin-lite-visible-mvp/acceptance2/12-narrow-more.png`, and `/tmp/joplin-lite-visible-mvp/acceptance2/09-link-panel.png`. Fresh desktop re-acceptance of this follow-up is PENDING because this session did not perform another attributable native Release interaction; no visual PASS is inferred from automated seam results.

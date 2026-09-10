@@ -517,7 +517,8 @@ fn validate_argument(
         }),
         (EditorCommand::Link, CommandArgument::LinkUrl(url)) if !url.trim().is_empty() => {
             let url = url.trim();
-            if url::Url::parse(url).is_ok() {
+            let parsed = url::Url::parse(url).map_err(|_| CommandError::InvalidLinkUrl)?;
+            if matches!(parsed.scheme(), "http" | "https") && parsed.has_host() {
                 Ok(CommandArgument::LinkUrl(url.to_owned()))
             } else {
                 Err(CommandError::InvalidLinkUrl)
