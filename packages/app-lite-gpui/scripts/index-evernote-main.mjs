@@ -16,7 +16,9 @@ const lines = source.split(/\r?\n/);
 const moduleStarts = [];
 
 for (let index = 0; index < lines.length; index += 1) {
-  const match = lines[index].match(/^\s{8}(\d+): function\b/);
+  const match = lines[index].match(
+    /^ {8}(0[xX][0-9a-fA-F]+|\d+(?:[eE][+-]?\d+)?): function\b/,
+  );
   if (match) {
     moduleStarts.push({
       id: Number(match[1]),

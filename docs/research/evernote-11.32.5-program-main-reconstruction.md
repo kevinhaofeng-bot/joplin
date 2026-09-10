@@ -1,6 +1,6 @@
 # Evernote 11.32.5 program and `main.js` reconstruction
 
-Date: 2026-09-09
+Date: 2026-09-09 (reconstruction artifact updated 2026-09-11)
 
 Installed build: `11.32.5` / `20260830093737`
 
@@ -52,7 +52,44 @@ node packages/app-lite-gpui/scripts/index-evernote-main.mjs \
   /tmp/evernote-main-11.32.5.beautified.js
 ```
 
-It emits module IDs, line spans, logger labels and selected architectural markers. On this build it identifies 2,841 Webpack modules.
+It emits module IDs, line spans, logger labels and selected architectural markers. On this build it identifies 2,843 Webpack modules. Two IDs are written by Terser as numeric exponent literals—`7e3` and `98e3`—and must be canonicalised to `7000` and `98000`; an earlier decimal-only pass incorrectly reported 2,841.
+
+### 2.1 Readable source delivery
+
+The full local reconstruction is generated outside the Git worktree at:
+
+```text
+/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5/main-readable
+```
+
+It contains:
+
+- a 94-line readable CommonJS entry at `src/main.js`;
+- 2,843 split and dependency-linked modules under `src/modules/`;
+- 589 evidence-backed semantic module filenames, with the numeric module ID retained as a stable prefix;
+- 8,571 dependency-graph edges and 8,659 verified relative `require()` links, including entry links;
+- input/output hashes for every module in `manifest.json`;
+- a sortable `module-map.csv`, `dependency-graph.json` and full checksum manifest;
+- the complete Webcrack full-bundle reconstruction and bundle metadata under `diagnostics/` for lossless auditing.
+
+Every delivered module parses as CommonJS or ESM with Babel's unambiguous mode. One Webcrack transform produced an illegal strict-mode/default-parameter combination in module `73180`; the reconstruction pipeline conservatively restores the original equivalent ordinary parameter plus explicit `undefined` default assignment. All 2,850 checksum entries pass after that repair.
+
+The editor source map has also been extracted separately to:
+
+```text
+/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5/common-editor-sourcemap
+```
+
+That tree contains all 3,618 embedded source files, including the original TypeScript/TSX for editor transactions, composition-safe input, lists, clipboard, layout, viewport optimization and explicit flush commands.
+
+The self-contained delivery archive is:
+
+```text
+/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5-readable-source.tar.gz
+SHA-256 aa04f75a3e9a4e1f89d3fa664e453eed987645802cc9a3210a81c87c69c15150
+```
+
+It contains 6,474 files: the readable main-process tree, all extracted common-editor sources, the exact original inputs and a delivery-wide checksum manifest.
 
 ## 3. Obfuscation assessment
 
@@ -95,7 +132,7 @@ This is not “a web page that directly opens SQLite.” The main process delibe
 
 ## 5. Entry point and recovered main modules
 
-The final entry imports bootstrap modules `33448`, `23302`, `38666` and `46670`, then loads environment, settings, logging, Electron, Conduit bridge, Sentry and `ApplicationController`.
+The final entry imports bootstrap modules `33448`, `23302`, `38666` and `46670`, then loads environment, settings, logging, Electron, the Conduit bridge, the system-audio capture initializer and `ApplicationController`. Module `72879` is the audio-capture initializer; an earlier name-only pass incorrectly described it as Sentry initialization.
 
 Its visible sequence is:
 
