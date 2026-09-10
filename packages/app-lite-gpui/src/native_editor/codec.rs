@@ -301,6 +301,74 @@ mod tests {
     }
 
     #[test]
+    fn imports_every_supported_heading_and_list_variant() {
+        // Keep the Task 3 one-way bridge honest for the complete supported
+        // block set; a body-text fallback could not satisfy these kinds.
+        let item = |text: &str, checked: Option<bool>| ListItem {
+            checked,
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: text.into(),
+                marks: Marks::default(),
+            }],
+        };
+        let document = CanonicalDocument::from_blocks(vec![
+            CanonicalBlock::Heading {
+                level: HeadingLevel::One,
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "一级".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            CanonicalBlock::Heading {
+                level: HeadingLevel::Two,
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "二级".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            CanonicalBlock::Heading {
+                level: HeadingLevel::Three,
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "三级".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            CanonicalBlock::List {
+                kind: ListKind::Unordered,
+                items: vec![item("项目", None)],
+            },
+            CanonicalBlock::List {
+                kind: ListKind::Ordered,
+                items: vec![item("编号", None)],
+            },
+            CanonicalBlock::List {
+                kind: ListKind::Checklist,
+                items: vec![item("待办", Some(false))],
+            },
+        ]);
+
+        let imported = import_canonical(&document).expect("all Task 3 variants import");
+        assert_eq!(
+            imported.block_kinds(),
+            vec![
+                BlockKind::Heading { level: 1 },
+                BlockKind::Heading { level: 2 },
+                BlockKind::Heading { level: 3 },
+                BlockKind::BulletItem { depth: 0 },
+                BlockKind::OrderedItem { depth: 0 },
+                BlockKind::CheckItem {
+                    depth: 0,
+                    checked: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_unrepresentable_canonical_content_instead_of_flattening_it() {
         let indented = CanonicalDocument::from_blocks(vec![CanonicalBlock::Paragraph {
             style: BlockStyle {

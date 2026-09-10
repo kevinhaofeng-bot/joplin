@@ -94,6 +94,29 @@ async fn mounted_keyboard_actions_use_the_same_shell_reducer(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+async fn mounted_native_menu_actions_use_the_same_shell_reducer(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+
+    // Native menus dispatch the action object directly, rather than a mouse
+    // event or key binding. The focused LibraryShell must still receive it.
+    cx.dispatch_action(crate::app::CreateNote);
+    redraw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.model.read(cx).projections().len(), 1);
+        assert!(view.model.read(cx).active_note().is_some());
+    });
+
+    cx.dispatch_action(crate::app::TrashSelected);
+    redraw(cx);
+    view.read_with(cx, |view, cx| {
+        assert!(view.model.read(cx).projections().is_empty());
+        assert_eq!(view.model.read(cx).status(), &AppStatus::Ready);
+    });
+}
+
+#[gpui::test]
 async fn mounted_card_click_reaches_the_same_shell_action_reducer(cx: &mut TestAppContext) {
     let (_profile, repository) = repository();
     let stored = repository

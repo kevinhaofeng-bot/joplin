@@ -304,6 +304,12 @@ impl CommandCatalogue {
 
     /// Derive the toolbar state from the real editor selection/document.
     pub fn state(&self, command: EditorCommand, editor: &EditorCore) -> CommandState {
+        // Command execution is also protected by EditorCore, but a read-only
+        // Task 3 surface must not advertise any durable-edit operation that
+        // Task 4 has not installed yet.
+        if editor.is_read_only() {
+            return disabled();
+        }
         match command {
             EditorCommand::InsertImage => CommandState {
                 enabled: editor.selected_block_indices().is_some(),
@@ -633,6 +639,79 @@ mod tests {
     use super::{CommandArgument, CommandCatalogue, CommandError, EditorCommand};
     use crate::native_editor::core::EditorCore;
     use crate::native_editor::images::ClipboardPayload;
+    use crate::native_editor::model::{Document, DocumentError};
+    use gpui::AppContext;
+
+    #[gpui::test]
+    fn read_only_catalogue_disables_every_mutating_command(cx: &mut gpui::TestAppContext) {
+        // A future toolbar must not advertise an operation that the Task 4
+        // read-only core will reject. This fails if the access capability is
+        // ignored while deriving command state.
+        let editor =
+            cx.new(|cx| EditorCore::new_read_only(Document::from_paragraph("只读正文"), cx));
+        editor.update(cx, |editor, _| editor.select_all());
+        let catalogue = CommandCatalogue::new();
+
+        editor.read_with(cx, |editor, _| {
+            for descriptor in catalogue.descriptors() {
+                assert!(
+                    !catalogue.state(descriptor.command, editor).enabled,
+                    "{command:?} must be disabled for a read-only document",
+                    command = descriptor.command,
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn read_only_catalogue_execution_cannot_mutate_document_or_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // This catches a bypass where a future menu calls `execute` directly
+        // instead of checking the disabled toolbar state first.
+        let editor =
+            cx.new(|cx| EditorCore::new_read_only(Document::from_paragraph("只读正文"), cx));
+        editor.update(cx, |editor, _| editor.select_all());
+        let before = editor.read_with(cx, |editor, _| {
+            (
+                editor.document().semantic_snapshot(),
+                editor.selection(),
+                editor.undo_depth(),
+                editor.redo_depth(),
+            )
+        });
+        let catalogue = CommandCatalogue::new();
+
+        editor.update(cx, |editor, _| {
+            for descriptor in catalogue.descriptors() {
+                let argument = match descriptor.command {
+                    EditorCommand::InsertImage => {
+                        CommandArgument::ImagePath("/tmp/read-only-drop.png".into())
+                    }
+                    EditorCommand::Link => {
+                        CommandArgument::LinkUrl("https://example.com/read-only".into())
+                    }
+                    _ => CommandArgument::None,
+                };
+                assert_eq!(
+                    catalogue.execute(descriptor.command, argument, editor),
+                    Err(CommandError::Document(DocumentError::ReadOnly)),
+                    "{command:?} must stop at the read-only core gate",
+                    command = descriptor.command,
+                );
+            }
+        });
+
+        let after = editor.read_with(cx, |editor, _| {
+            (
+                editor.document().semantic_snapshot(),
+                editor.selection(),
+                editor.undo_depth(),
+                editor.redo_depth(),
+            )
+        });
+        assert_eq!(after, before);
+    }
 
     #[gpui::test]
     fn insert_image_command_commits_a_real_structural_image_and_undo_restores_text(

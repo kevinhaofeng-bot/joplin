@@ -6839,6 +6839,11 @@ async fn read_only_editor_rejects_document_history_ime_and_image_mutations(
         entity.update(cx, |editor, editor_cx| {
             assert_eq!(editor.insert_text("丢失"), Err(DocumentError::ReadOnly));
             assert_eq!(
+                editor.paste_plain_text("粘贴"),
+                Err(DocumentError::ReadOnly)
+            );
+            assert_eq!(editor.cut_selection(), Err(DocumentError::ReadOnly));
+            assert_eq!(
                 editor.insert_paragraph_break(),
                 Err(DocumentError::ReadOnly)
             );
@@ -6848,6 +6853,26 @@ async fn read_only_editor_rejects_document_history_ime_and_image_mutations(
             assert_eq!(editor.redo(), Err(DocumentError::ReadOnly));
             assert_eq!(
                 editor.insert_fixture_image("image", (8, 8)),
+                Err(DocumentError::ReadOnly)
+            );
+            let image = ClipboardPayload::fixture_with_png_and_text("ignored")
+                .images
+                .into_iter()
+                .next()
+                .expect("fixture image");
+            assert_eq!(
+                editor.insert_image_payload(image),
+                Err(DocumentError::ReadOnly)
+            );
+            assert_eq!(
+                editor.insert_image_path(std::path::Path::new("/tmp/read-only-drop.png")),
+                Err(DocumentError::ReadOnly)
+            );
+            assert_eq!(
+                editor.apply(Transaction::ToggleMark {
+                    selection: editor.selection(),
+                    mark: Mark::Bold,
+                }),
                 Err(DocumentError::ReadOnly)
             );
             <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
