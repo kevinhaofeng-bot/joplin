@@ -126,3 +126,42 @@ round. The library is deliberately read-only until Task 4; reverse conversion,
 durable saving and writable editing are not claimed here. Resource/image decode
 and durable insertion remain Task 5. Independent re-review remains the approval
 authority.
+
+## Fix round 3 — 2026-09-11
+
+The third independent review found no Critical issues and two narrow Important
+truthfulness gaps. This round closes only those gaps in
+`5da1f9d1f` (`Preserve committed action warnings`); it does not broaden Task 4
+or Task 5 scope.
+
+| Third-review finding | Closure and mutation-sensitive evidence |
+| --- | --- |
+| T3-I1 queued events erased a partial-commit warning | `AppModel` now records the visible status origin (`Action`, `ProjectionEvent`, or neutral). `refresh_projection_events` can only replace a projection-origin status; it cannot turn an action/persistence error into `Ready`. A successful explicit create/select/trash recovery path clears the retained partial warning, while cosmetic actions do not. The mounted `queued_action_event_cannot_clear_partial_create_error_before_explicit_selection_recovery` test drives the real empty CTA, forces its post-commit refresh to fail, advances the retained event bridge by 60 ms, requires the visible committed-create warning to remain, then clicks the real recovered card and requires `Ready`. Deleting the action-origin guard restores the old false `Ready` and makes this test fail. |
+| T3-I2 create could fail after commit while hydrating its return value | `LibraryRepository::create_note` now constructs the complete `Note` from the transaction-known title/body/snippet/default notebook/resource relations before committing, then publishes and returns that committed snapshot with no subsequent `load_note`. `create_note_does_not_consume_a_post_commit_complete_note_load_fault` arms a one-shot real `load_note` fault before create: create must publish `NoteCreated`, the explicitly later load must consume the fault, and the following load must still find the committed note. The prior post-commit hydration consumes that fault and turns an already committed create into `Err`. The strengthened `AppModel` load-observer test separately requires the transaction snapshot to install as the active session without a second hydration. |
+
+### Exact Fix-round-3 test accounting
+
+This round adds **2 independent mutation-sensitive tests**: one core
+post-commit `load_note` fault/committed-event test and one mounted action →
+event-poll → explicit-recovery composition test. It also strengthens the
+existing AppModel create-session test to require zero post-commit hydrations.
+
+### Fix-round-3 verification
+
+- `cargo test --quiet --manifest-path packages/app-lite-core/Cargo.toml` — **PASS, 73 tests**.
+- `cargo test --quiet --manifest-path packages/app-lite-native/Cargo.toml` — **PASS, 225 tests**.
+- `cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype app::tests::` — **PASS, 62 focused matches**.
+- `cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype ui::tests::` — **PASS, 20 mounted shell tests**.
+- Exact `native_editor::codec::tests::`, `read_only`, and `spike_app::tests::` filters — **PASS, 3 / 4 / 43 matches**.
+- Full GPUI suite with only the existing exact donor skip: `cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores` — **PASS, 1,048 passed, 1 filtered**.
+- `cargo check --all-targets --manifest-path packages/app-lite-gpui/Cargo.toml` and `cargo build --release --manifest-path packages/app-lite-gpui/Cargo.toml` — **PASS**.
+- `cargo fmt --check` for core and GPUI manifests, plus `git diff --check` — **PASS**.
+- Fresh absolute `JOPLIN_LITE_PROFILE` release smoke stayed alive for eight seconds, created the isolated `library.sqlite` + WAL/SHM, and returned `PRAGMA integrity_check = ok`; it was then intentionally terminated.
+- Release spike contracts: `empty` wrote `task7-ready` with `texture_bytes=0`, `layout_cache_bytes=9,672`, `undo_bytes=1,233`, `render_commit_p95_us=8,557`; `typical` wrote `task7-ready` with `texture_bytes=26,361,856`, `layout_cache_bytes=1,009,056`, `undo_bytes=3,822`, `render_commit_p95_us=12,623`. Each smoke child was intentionally terminated after both artifacts existed.
+
+### Remaining scope limits after round 3
+
+There are no known remaining findings from this third-review scope. The library
+remains intentionally read-only until Task 4; reverse conversion, durable
+saving and writable editing are still not claimed. Resource/image decode and
+durable insertion remain Task 5.
