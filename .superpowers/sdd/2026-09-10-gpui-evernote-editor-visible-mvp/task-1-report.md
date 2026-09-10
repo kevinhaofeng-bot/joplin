@@ -185,3 +185,13 @@ Round 3's parent-notification observation is now treated as a demonstrated neces
 - No Task 7 threshold, image-budget, drawable-pool, fixture, paste/drop, or measurement change was made.
 - The source contains one typed completion route used after real native prompt settlement and in both production-seam tests; it cannot open a panel without an owning typed spike window and does not duplicate insertion.
 - Native-picker/manual visual acceptance remains PENDING under the existing desktop accessibility limitation; nothing in this round promotes it to PASS.
+
+## Controller real-window acceptance after Round 4
+
+Status: PARTIAL_PASS
+
+- Launched the exact optimized binary at `packages/app-lite-gpui/target/release/velotype --evernote-spike`, brought that process to the foreground, clicked the production image command, and completed the native macOS file picker with `packages/app-lite-gpui/assets/showcase/1.png`.
+- PASS: the selected image appeared immediately in the currently focused editor surface. No note switch, focus detour, window resize, or reload was used between picker confirmation and the visible result. Evidence: `/tmp/joplin-lite-visible-mvp/round4-image-immediate.png`.
+- PASS: the caret remained usable directly after the image and accepted `after image typing`. Two screenshots sampled two seconds apart show the same image/text geometry and scroll position; their file hashes differ because cursor/system chrome are dynamic, so this is recorded as sampled layout stability rather than a general proof that every animation frame is flash-free. Evidence: `/tmp/joplin-lite-visible-mvp/round4-image-followup-ascii-1.png` and `/tmp/joplin-lite-visible-mvp/round4-image-followup-ascii-2.png`.
+- The Release process was stopped after capture. Finder/Preview clipboard insertion, drag/drop, cross-image drag selection, narrow-window overflow, and a complete macOS Pinyin candidate-revision pass remain separate manual matrix items and are not promoted by this focused acceptance.
+- Independent scoped review of `d4dccff30..93a469340` approved the picker-completion repair with zero Critical, Important, or Minor findings. The controller gates remain PASS: focused asynchronous picker seam, `chrome`, `shell_`, `image`, full bin (`991 passed; 0 failed; 1 filtered out`), all-target compilation, formatting, diff check, and optimized Release build.
