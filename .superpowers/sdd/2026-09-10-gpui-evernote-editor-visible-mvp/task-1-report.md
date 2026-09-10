@@ -225,3 +225,31 @@ Status: DONE_WITH_CONCERNS
 - More uses only the existing `CommandCatalogue` descriptors; no hard-coded duplicate command list or source-string detector was added.
 - The Link dismissal/event flow has one outside-click owner (the backdrop). The panel is above that backdrop; the real input, Cancel, and Apply targets handle their own events. There is no global refresh, helper-only Apply assertion, or document mutation on invalid input.
 - Existing real-window screenshots establishing the failures are preserved at `/tmp/joplin-lite-visible-mvp/acceptance2/08-more-open.png`, `/tmp/joplin-lite-visible-mvp/acceptance2/12-narrow-more.png`, and `/tmp/joplin-lite-visible-mvp/acceptance2/09-link-panel.png`. Fresh desktop re-acceptance of this follow-up is PENDING because this session did not perform another attributable native Release interaction; no visual PASS is inferred from automated seam results.
+
+## Round 6 — More→Link state and short-mask containment repair
+
+Status: DONE_WITH_CONCERNS
+
+### RED to GREEN evidence
+
+1. RED — `shell_more_to_link_dismisses_overflow_for_cancel_apply_and_outside` drove the mounted 760-pt More trigger and mounted Link row. On the previous branch it failed at `opening Link from More must close More`: `more_open` remained true after Link opened.
+2. GREEN — the Link branch now clears `more_open` in the same `SpikeView` update that opens the popover. The real mounted test then covers More→Link→Cancel, More→Link→valid Apply, and More→Link→outside backdrop dismissal. Each finishes with `more_open == false` and no Link panel; Cancel/outside preserve selection and valid Apply creates exactly one history entry. Focused command: `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_more_to_link_dismisses_overflow_for_cancel_apply_and_outside -- --nocapture` — `1 passed; 0 failed`.
+3. RED — `shell_link_popover_clamps_normal_and_invalid_height_after_resize` opened the actual Link control, resized 820 pt to 112 pt high, and failed with a normal panel at `y=22`, `height=117.5` against a 112-pt root mask. This proves the former upward-only clamp still allowed bottom overflow.
+4. GREEN — normal and invalid Link layouts use explicit 118-pt/134-pt natural heights, clamp top into `[mask_top, mask_bottom - panel_height]`, constrain height to the available mask, and use vertical scrolling when the mask is shorter. The same test covers normal resize, invalid-error resize, and opening More→Link directly while short. Focused command passed: `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_link_popover_clamps_normal_and_invalid_height_after_resize -- --nocapture` — `1 passed; 0 failed`.
+5. Mounted validation coverage — `shell_mounted_apply_rejects_parseable_disallowed_link_urls` uses the real Apply target for `mailto:note@example.com`, `file:///tmp/note`, and the parseable hostless `data:text/plain,no-host`. Each retains the panel, error, and URL focus, with unchanged document, history, and selection. Focused command passed: `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_mounted_apply_rejects_parseable_disallowed_link_urls -- --nocapture` — `1 passed; 0 failed`.
+
+### Round 6 controller gates
+
+- `chrome`: PASS, `22 passed; 0 failed`.
+- `shell_`: PASS, `22 passed; 0 failed`.
+- Full bin with the specified skip: PASS, `996 passed; 0 failed; 1 filtered out`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run`: PASS.
+- `cargo fmt --check --manifest-path packages/app-lite-gpui/Cargo.toml`: PASS.
+- `git diff --check`: PASS.
+- `cargo build --manifest-path packages/app-lite-gpui/Cargo.toml --release`: PASS (optimized LTO link completed; existing repository warnings remain).
+
+### Round 6 self-review and concerns
+
+- The fix preserves the single backdrop/panel hierarchy from Round 5. It adds no helper-dispatch layer, overlay, or second event owner.
+- The short-mask rule constrains the popover itself rather than moving the content mask, editor surface, Task 7 thresholds, or measurement path.
+- Fresh real-window Release re-acceptance remains PENDING; these are mounted GPUI seam results, not a claim of manual desktop PASS.

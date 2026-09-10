@@ -1316,17 +1316,24 @@ impl SpikeView {
         let mask_top = f32::from(content_mask.top());
         let mask_bottom = f32::from(content_mask.bottom());
         let width = 360.0_f32.min((mask_right - mask_left).max(1.0));
-        let estimated_height = if invalid { 144.0 } else { 126.0 };
+        // Keep the panel itself inside the content mask. The normal and
+        // invalid layouts have fixed, measured chrome heights; when the mask
+        // is shorter, the panel scrolls instead of escaping the editor.
+        let natural_height: f32 = if invalid { 134.0 } else { 118.0 };
+        let panel_height = natural_height.min((mask_bottom - mask_top).max(1.0));
         let anchor = anchor.unwrap_or_else(|| point(content_mask.left(), content_mask.top()));
         let left = f32::from(anchor.x)
             .max(mask_left)
             .min((mask_right - width).max(mask_left));
         let below = f32::from(anchor.y) + 16.0;
-        let top = if below + estimated_height <= mask_bottom {
+        let preferred_top = if below + natural_height <= mask_bottom {
             below
         } else {
-            (f32::from(anchor.y) - estimated_height - 16.0).max(mask_top)
+            f32::from(anchor.y) - natural_height - 16.0
         };
+        let top = preferred_top
+            .max(mask_top)
+            .min((mask_bottom - panel_height).max(mask_top));
         let canvas_popover = popover.clone();
         let paint_popover = popover.clone();
         let click_popover = popover.clone();
@@ -1405,8 +1412,10 @@ impl SpikeView {
             .top(px(top))
             .left(px(left))
             .w(px(width))
+            .h(px(panel_height))
             .flex()
             .flex_col()
+            .overflow_y_scroll()
             .p(px(8.0))
             .rounded(px(6.0))
             .bg(rgba(0xffffffff))
@@ -1646,6 +1655,9 @@ impl SpikeView {
                             }
                         } else if command == EditorCommand::Link {
                             let _ = view.update(cx, |view, view_cx| {
+                                if from_more {
+                                    view.more_open = false;
+                                }
                                 view.open_link_popover_at(Some(event.position), window, view_cx)
                             });
                         } else {
@@ -4453,6 +4465,68 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn shell_mounted_apply_rejects_parseable_disallowed_link_urls(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                view.editor.read(app).focus_handle().focus(window)
+            });
+        });
+        cx.simulate_keystrokes("home up shift-right");
+        let baseline = view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            (
+                editor.document().semantic_snapshot(),
+                editor.undo_depth(),
+                editor.selection(),
+            )
+        });
+        let link = cx.debug_bounds("Link").expect("mounted Link trigger");
+        cx.simulate_click(link.center(), Modifiers::default());
+        redraw(cx);
+
+        for url in [
+            "mailto:note@example.com",
+            "file:///tmp/note",
+            "data:text/plain,no-host",
+        ] {
+            cx.simulate_input(url);
+            redraw(cx);
+            let apply = cx
+                .debug_bounds("evernote-link-apply")
+                .expect("mounted Apply target");
+            cx.simulate_click(apply.center(), Modifiers::default());
+            redraw(cx);
+            cx.update(|window, app| {
+                view.read_with(app, |view, app| {
+                    let popover = view
+                        .link_popover
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("invalid panel remains for {url}"))
+                        .read(app);
+                    assert!(popover.invalid, "{url} must show invalid state");
+                    assert!(popover.focus.is_focused(window), "{url} keeps URL focus");
+                    let editor = view.editor.read(app);
+                    assert_eq!(editor.document().semantic_snapshot(), baseline.0);
+                    assert_eq!(editor.undo_depth(), baseline.1);
+                    assert_eq!(editor.selection(), baseline.2);
+                });
+            });
+            assert!(
+                cx.debug_bounds("evernote-link-invalid-error").is_some(),
+                "{url} must show the mounted Chinese error",
+            );
+            cx.simulate_keystrokes("cmd-a");
+        }
+        let cancel = cx
+            .debug_bounds("evernote-link-cancel")
+            .expect("mounted Cancel target");
+        cx.simulate_click(cancel.center(), Modifiers::default());
+    }
+
+    #[gpui::test]
     async fn shell_760pt_primary_and_more_partition_has_no_missing_command(
         cx: &mut TestAppContext,
     ) {
@@ -4648,6 +4722,162 @@ mod tests {
             narrow_panel.left() <= narrow_link.right() + px(1.0)
                 && narrow_panel.right() >= narrow_link.left() - px(1.0),
             "narrow panel must be anchored beside its actual Link row"
+        );
+    }
+
+    #[gpui::test]
+    async fn shell_more_to_link_dismisses_overflow_for_cancel_apply_and_outside(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        cx.simulate_resize(size(px(760.0), px(820.0)));
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                view.editor.read(app).focus_handle().focus(window)
+            });
+        });
+        cx.simulate_keystrokes("home up shift-right");
+        let selected = view.read_with(cx, |view, cx| view.editor.read(cx).selection());
+
+        let open_from_more = |cx: &mut VisualTestContext| {
+            let more = cx
+                .debug_bounds("evernote-native-spike-more-trigger")
+                .expect("narrow More trigger");
+            cx.simulate_click(more.center(), Modifiers::default());
+            redraw(cx);
+            let link = cx.debug_bounds("Link").expect("mounted More Link row");
+            cx.simulate_click(link.center(), Modifiers::default());
+            redraw(cx);
+        };
+
+        open_from_more(cx);
+        view.read_with(cx, |view, _| {
+            assert!(!view.more_open, "opening Link from More must close More");
+            assert!(view.link_popover.is_some());
+        });
+        let cancel = cx
+            .debug_bounds("evernote-link-cancel")
+            .expect("mounted Cancel target");
+        cx.simulate_click(cancel.center(), Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.more_open);
+            assert!(view.link_popover.is_none());
+            assert_eq!(view.editor.read(cx).selection(), selected);
+        });
+
+        open_from_more(cx);
+        let before_apply = view.read_with(cx, |view, cx| view.editor.read(cx).undo_depth());
+        cx.simulate_input("https://example.com");
+        redraw(cx);
+        let apply = cx
+            .debug_bounds("evernote-link-apply")
+            .expect("mounted Apply target");
+        cx.simulate_click(apply.center(), Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.more_open);
+            assert!(view.link_popover.is_none());
+            assert_eq!(view.editor.read(cx).undo_depth(), before_apply + 1);
+        });
+
+        open_from_more(cx);
+        let root = cx
+            .debug_bounds("evernote-native-spike")
+            .expect("mounted root backdrop owner");
+        cx.simulate_click(
+            point(root.left() + px(2.0), root.top() + px(2.0)),
+            Modifiers::default(),
+        );
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.more_open);
+            assert!(view.link_popover.is_none());
+            assert_eq!(view.editor.read(cx).selection(), selected);
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_link_popover_clamps_normal_and_invalid_height_after_resize(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                view.editor.read(app).focus_handle().focus(window)
+            });
+        });
+        cx.simulate_keystrokes("home up shift-right");
+        let link = cx.debug_bounds("Link").expect("wide Link trigger");
+        cx.simulate_click(link.center(), Modifiers::default());
+        redraw(cx);
+
+        cx.simulate_resize(size(px(760.0), px(112.0)));
+        redraw(cx);
+        let normal_panel = cx
+            .debug_bounds("evernote-link-popover")
+            .expect("normal panel after short resize");
+        let normal_mask = cx
+            .debug_bounds("evernote-native-spike")
+            .expect("short root mask");
+        assert!(
+            normal_panel.top() >= normal_mask.top()
+                && normal_panel.bottom() <= normal_mask.bottom(),
+            "normal panel must stay inside a short mask; panel={normal_panel:?}, mask={normal_mask:?}"
+        );
+
+        cx.simulate_resize(size(px(1200.0), px(820.0)));
+        redraw(cx);
+        cx.simulate_input("not-a-url");
+        redraw(cx);
+        let apply = cx
+            .debug_bounds("evernote-link-apply")
+            .expect("invalid Apply target");
+        cx.simulate_click(apply.center(), Modifiers::default());
+        redraw(cx);
+        assert!(cx.debug_bounds("evernote-link-invalid-error").is_some());
+
+        cx.simulate_resize(size(px(760.0), px(112.0)));
+        redraw(cx);
+        let invalid_panel = cx
+            .debug_bounds("evernote-link-popover")
+            .expect("invalid panel after short resize");
+        let invalid_mask = cx
+            .debug_bounds("evernote-native-spike")
+            .expect("short root mask after invalidation");
+        assert!(
+            invalid_panel.top() >= invalid_mask.top()
+                && invalid_panel.bottom() <= invalid_mask.bottom(),
+            "invalid panel must stay inside a short mask; panel={invalid_panel:?}, mask={invalid_mask:?}"
+        );
+
+        cx.simulate_click(
+            point(invalid_mask.left() + px(2.0), invalid_mask.top() + px(2.0)),
+            Modifiers::default(),
+        );
+        redraw(cx);
+        let more = cx
+            .debug_bounds("evernote-native-spike-more-trigger")
+            .expect("direct-short More trigger");
+        cx.simulate_click(more.center(), Modifiers::default());
+        redraw(cx);
+        let direct_short_link = cx.debug_bounds("Link").expect("direct-short Link row");
+        cx.simulate_click(direct_short_link.center(), Modifiers::default());
+        redraw(cx);
+        let direct_short_panel = cx
+            .debug_bounds("evernote-link-popover")
+            .expect("panel opened directly in a short mask");
+        let direct_short_mask = cx
+            .debug_bounds("evernote-native-spike")
+            .expect("direct-short root mask");
+        assert!(
+            direct_short_panel.top() >= direct_short_mask.top()
+                && direct_short_panel.bottom() <= direct_short_mask.bottom(),
+            "direct-short panel must stay inside its mask; panel={direct_short_panel:?}, mask={direct_short_mask:?}"
         );
     }
 
