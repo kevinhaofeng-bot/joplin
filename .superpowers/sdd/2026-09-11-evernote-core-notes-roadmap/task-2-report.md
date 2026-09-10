@@ -65,3 +65,24 @@
 ### Remaining concern
 
 - Fail-closed legacy RTF is intentional until Task 8 can perform its dedicated, backed-up conversion; no RTF parser or AppKit/GPUI dependency was introduced into `app-lite-core`.
+
+## Fix round 2 — migration safety closure (baseline `486024a3a64cc1c17eb2f67ffdc81105f11713ec`)
+
+### TDD record
+
+1. Added and ran deterministic RED cases for legacy refusal changing DELETE/WAL/profile entries, purge losing its search deletion instruction, associated-resource cleanup deleting its upload operation, outbox-ID collision, and purged-ID reuse.
+2. Each failed against the previous implementation for its named observable condition; the focused `test-support` suite is GREEN with 16 tests after the corresponding changes.
+
+### Review mapping
+
+- C1/I5: migration now starts with `BEGIN IMMEDIATE`; the RTF gate runs while that lock is held and before resource preflight/schema mutation/WAL. Resource preflight runs under that same lock, profile identity is checked around SQLite and before commit, and WAL is established only after a successful migration.
+- I1: migration/default IDs, durable entity IDs, and sync-outbox operation IDs use the per-repository allocator; outbox insertion retries real uniqueness failures, and notes reserve IDs named by tombstones or retained revisions.
+- I2/I3: `search_queue` delete jobs outlive a purged note and purge emits `SearchProjectionQueued` after commit. Resource rollback only removes the resource outbox when its unassociated row was actually deleted.
+- I4: profile binding holds a `O_DIRECTORY|O_NOFOLLOW` descriptor; resources are opened relative to it and pathname identity mismatches reject before schema publication.
+- M1/M2: clock/ID injection is behind non-default `test-support`; entropy variants retain `getrandom::Error` as their typed source.
+
+### Fix-round verification
+
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml` — passed.
+- `cargo test --manifest-path packages/app-lite-core/Cargo.toml --features test-support` — passed (16 review regressions active).
+- `cargo test --manifest-path packages/app-lite-native/Cargo.toml` — 225 passed.

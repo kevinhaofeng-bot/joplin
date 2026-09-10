@@ -1,4 +1,4 @@
-use crate::resource::{ResourceError, ResourceInput, ResourceStore};
+use crate::resource::{ProfileDir, ResourceError, ResourceInput, ResourceStore};
 use crate::schema::migrate_schema;
 use crate::{
     CreateNote, EditJournalEntry, EntityRef, ListQuery, Note, NoteId, NoteProjection, Notebook,
@@ -17,13 +17,25 @@ use thiserror::Error;
 /// Supplies wall-clock milliseconds.  Kept at the repository boundary so a
 /// transaction can protect monotonic note timestamps even if the wall clock is
 /// adjusted backwards.
+#[cfg(feature = "test-support")]
 pub trait RepositoryClock: Send + Sync {
+    fn now_millis(&self) -> i64;
+}
+
+#[cfg(not(feature = "test-support"))]
+trait RepositoryClock: Send + Sync {
     fn now_millis(&self) -> i64;
 }
 
 /// Supplies opaque identifiers. Production uses the operating-system CSPRNG;
 /// callers may supply a narrow per-repository source in deterministic tests.
+#[cfg(feature = "test-support")]
 pub trait RepositoryIdSource: Send + Sync {
+    fn next_id(&self) -> Result<String, LibraryError>;
+}
+
+#[cfg(not(feature = "test-support"))]
+trait RepositoryIdSource: Send + Sync {
     fn next_id(&self) -> Result<String, LibraryError>;
 }
 
@@ -43,8 +55,7 @@ struct SystemIdSource;
 impl RepositoryIdSource for SystemIdSource {
     fn next_id(&self) -> Result<String, LibraryError> {
         let mut bytes = [0_u8; 16];
-        getrandom::getrandom(&mut bytes)
-            .map_err(|error| LibraryError::Entropy(error.to_string()))?;
+        getrandom::getrandom(&mut bytes).map_err(LibraryError::Entropy)?;
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 }
@@ -62,7 +73,7 @@ pub enum LibraryError {
     #[error("library schema migration failed")]
     MigrationFailed(#[source] rusqlite::Error),
     #[error("library entropy source failed")]
-    Entropy(String),
+    Entropy(#[source] getrandom::Error),
     #[error("SQLite pragmas could not be established")]
     Pragma,
     #[error("schema version {0} is newer than this library supports")]
@@ -105,25 +116,76 @@ pub struct LibraryRepository {
 
 impl LibraryRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LibraryError> {
-        Self::open_with_sources(path, Arc::new(SystemClock), Arc::new(SystemIdSource))
+        Self::open_inner(path, Arc::new(SystemClock), Arc::new(SystemIdSource))
     }
 
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn open_with_sources(
         path: impl AsRef<Path>,
         clock: Arc<dyn RepositoryClock>,
         id_source: Arc<dyn RepositoryIdSource>,
     ) -> Result<Self, LibraryError> {
+        Self::open_inner(path, clock, id_source)
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        clock: Arc<dyn RepositoryClock>,
+        id_source: Arc<dyn RepositoryIdSource>,
+    ) -> Result<Self, LibraryError> {
         let path = checked_database_path(path.as_ref())?;
+        let profile = ProfileDir::open(path.parent().ok_or(LibraryError::InvalidDatabasePath)?)
+            .map_err(|_| LibraryError::InvalidDatabasePath)?;
+        if !profile
+            .verify_path_identity()
+            .map_err(|_| LibraryError::InvalidDatabasePath)?
+        {
+            return Err(LibraryError::InvalidDatabasePath);
+        }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(&path, flags)?;
-        let resource_store =
-            ResourceStore::new(path.parent().ok_or(LibraryError::InvalidDatabasePath)?)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        if !profile
+            .verify_path_identity()
+            .map_err(|_| LibraryError::InvalidDatabasePath)?
+        {
+            return Err(LibraryError::InvalidDatabasePath);
+        }
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        let mut next_migration_id = || id_source.next_id();
+        let (migrated, resource_store) = migrate_schema(
+            &mut connection,
+            &mut next_migration_id,
+            || {
+                if !profile
+                    .verify_path_identity()
+                    .map_err(|_| LibraryError::InvalidDatabasePath)?
+                {
+                    return Err(LibraryError::InvalidDatabasePath);
+                }
+                ResourceStore::from_profile_dir(&profile).map_err(Into::into)
+            },
+            || {
+                if profile
+                    .verify_path_identity()
+                    .map_err(|_| LibraryError::InvalidDatabasePath)?
+                {
+                    Ok(())
+                } else {
+                    Err(LibraryError::InvalidDatabasePath)
+                }
+            },
+        )
+        .map_err(|error| match error {
+            LibraryError::Storage(error) => LibraryError::MigrationFailed(error),
+            other => other,
+        })?;
+        if migrated {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
         let journal_mode: String =
             connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         let foreign_keys: i64 =
@@ -131,10 +193,6 @@ impl LibraryRepository {
         if journal_mode.to_ascii_lowercase() != "wal" || foreign_keys != 1 {
             return Err(LibraryError::Pragma);
         }
-        migrate_schema(&mut connection, &id_source.next_id()?).map_err(|error| match error {
-            LibraryError::Storage(error) => LibraryError::MigrationFailed(error),
-            other => other,
-        })?;
         Ok(Self {
             connection: Mutex::new(connection),
             resource_store,
@@ -161,11 +219,19 @@ impl LibraryRepository {
             if NoteId::parse(&id).is_err() {
                 return Err(LibraryError::InvalidId);
             }
-            let exists: i64 = transaction.query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=?1)"),
-                [&id],
-                |row| row.get(0),
-            )?;
+            let exists: i64 = if table == "notes" {
+                transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1 UNION ALL SELECT 1 FROM note_revisions WHERE note_id=?1 UNION ALL SELECT 1 FROM tombstones WHERE entity_type='note' AND entity_id=?1)",
+                    [&id],
+                    |row| row.get(0),
+                )?
+            } else {
+                transaction.query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=?1)"),
+                    [&id],
+                    |row| row.get(0),
+                )?
+            };
             if exists == 0 {
                 return Ok(id);
             }
@@ -238,7 +304,14 @@ impl LibraryRepository {
             [id.as_str()],
         )?;
         queue_search(&transaction, &id, now, "snapshot")?;
-        enqueue_sync(&transaction, &EntityRef::Note(id.clone()), 1, "create", now)?;
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Note(id.clone()),
+            1,
+            "create",
+            now,
+        )?;
         transaction.commit()?;
         drop(connection);
         self.publish(vec![
@@ -342,6 +415,7 @@ impl LibraryRepository {
         }
         enqueue_sync(
             &transaction,
+            self.id_source.as_ref(),
             &EntityRef::Note(input.id.clone()),
             revision,
             "save",
@@ -448,8 +522,10 @@ impl LibraryRepository {
         let final_revision = revision + 1;
         transaction.execute("INSERT INTO tombstones (entity_type, entity_id, final_revision, deleted_time, purged_time) VALUES ('note', ?1, ?2, ?3, ?4)", params![id.as_str(), final_revision, deleted_time, now])?;
         transaction.execute("DELETE FROM notes WHERE id = ?1", [id.as_str()])?;
+        queue_search(&transaction, id, now, "purge")?;
         enqueue_sync(
             &transaction,
+            self.id_source.as_ref(),
             &EntityRef::Note(id.clone()),
             final_revision,
             "purge",
@@ -458,6 +534,7 @@ impl LibraryRepository {
         transaction.commit()?;
         self.publish(vec![
             LibraryEvent::NoteProjectionChanged(id.clone()),
+            LibraryEvent::SearchProjectionQueued(id.clone()),
             LibraryEvent::SyncQueued(EntityRef::Note(id.clone())),
         ]);
         Ok(())
@@ -479,6 +556,7 @@ impl LibraryRepository {
         transaction.execute("INSERT INTO notebooks (id, title, stack_id, revision, created_time, updated_time) VALUES (?1, ?2, ?3, 1, ?4, ?4)", params![id.as_str(), title, stack_id.map(StackId::as_str), now])?;
         enqueue_sync(
             &transaction,
+            self.id_source.as_ref(),
             &EntityRef::Notebook(id.clone()),
             1,
             "create",
@@ -507,6 +585,7 @@ impl LibraryRepository {
         transaction.execute("INSERT INTO stacks (id, title, revision, created_time, updated_time) VALUES (?1, ?2, 1, ?3, ?3)", params![id.as_str(), title, now])?;
         enqueue_sync(
             &transaction,
+            self.id_source.as_ref(),
             &EntityRef::Stack(id.clone()),
             1,
             "create",
@@ -531,7 +610,14 @@ impl LibraryRepository {
         let id = TagId::parse(self.allocate_id(&transaction, "tags")?)
             .expect("validated generated ID is valid");
         transaction.execute("INSERT INTO tags (id, title, revision, created_time, updated_time) VALUES (?1, ?2, 1, ?3, ?3)", params![id.as_str(), title, now])?;
-        enqueue_sync(&transaction, &EntityRef::Tag(id.clone()), 1, "create", now)?;
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Tag(id.clone()),
+            1,
+            "create",
+            now,
+        )?;
         transaction.commit()?;
         self.publish(vec![
             LibraryEvent::OrganizationChanged,
@@ -572,6 +658,7 @@ impl LibraryRepository {
             queue_search(&transaction, id, updated, "organization")?;
             enqueue_sync(
                 &transaction,
+                self.id_source.as_ref(),
                 &EntityRef::Note(id.clone()),
                 revision,
                 "move",
@@ -620,6 +707,7 @@ impl LibraryRepository {
         queue_search(&transaction, note_id, updated, "organization")?;
         enqueue_sync(
             &transaction,
+            self.id_source.as_ref(),
             &EntityRef::Note(note_id.clone()),
             revision,
             "tags",
@@ -686,6 +774,7 @@ impl LibraryRepository {
         transaction.execute("INSERT INTO resources (id, sha256, title, mime, file_extension, size, created_time, updated_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)", params![resource_id.as_str(), blob.sha256.as_str(), title, mime, extension, blob.size as i64, now])?;
         enqueue_sync(
             &transaction,
+            self.id_source.as_ref(),
             &EntityRef::Resource(resource_id.clone()),
             1,
             "create",
@@ -718,11 +807,13 @@ impl LibraryRepository {
     pub fn rollback_unassociated_resource(&self, id: &ResourceId) -> Result<(), LibraryError> {
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM resources WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM note_resources WHERE resource_id=?1)", [id.as_str()])?;
-        transaction.execute(
-            "DELETE FROM sync_outbox WHERE entity_type='resource' AND entity_id=?1",
-            [id.as_str()],
-        )?;
+        let deleted = transaction.execute("DELETE FROM resources WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM note_resources WHERE resource_id=?1)", [id.as_str()])?;
+        if deleted == 1 {
+            transaction.execute(
+                "DELETE FROM sync_outbox WHERE entity_type='resource' AND entity_id=?1",
+                [id.as_str()],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -764,6 +855,7 @@ impl LibraryRepository {
         }
         enqueue_sync(
             &transaction,
+            self.id_source.as_ref(),
             &EntityRef::Note(id.clone()),
             revision,
             if deleted { "trash" } else { "restore" },
@@ -817,9 +909,6 @@ fn checked_database_path(path: &Path) -> Result<PathBuf, LibraryError> {
         .join(name))
 }
 
-fn new_id() -> Result<String, LibraryError> {
-    SystemIdSource.next_id()
-}
 fn snippet(text: &str) -> String {
     text.chars().take(160).collect()
 }
@@ -925,6 +1014,7 @@ fn queue_search(
 }
 fn enqueue_sync(
     transaction: &Transaction<'_>,
+    id_source: &dyn RepositoryIdSource,
     entity: &EntityRef,
     revision: i64,
     operation: &str,
@@ -937,8 +1027,18 @@ fn enqueue_sync(
         EntityRef::Tag(id) => ("tag", id.as_str()),
         EntityRef::Resource(id) => ("resource", id.as_str()),
     };
-    transaction.execute("INSERT INTO sync_outbox (id, entity_type, entity_id, entity_revision, operation, created_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![new_id()?, kind, id, revision, operation, now])?;
-    Ok(())
+    for _ in 0..16 {
+        let operation_id = id_source.next_id()?;
+        if NoteId::parse(&operation_id).is_err() {
+            return Err(LibraryError::InvalidId);
+        }
+        match transaction.execute("INSERT INTO sync_outbox (id, entity_type, entity_id, entity_revision, operation, created_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![operation_id, kind, id, revision, operation, now]) {
+            Ok(_) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::ConstraintViolation => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(LibraryError::IdCollisionExhausted)
 }
 
 fn row_to_notebook(row: &rusqlite::Row<'_>) -> rusqlite::Result<Notebook> {

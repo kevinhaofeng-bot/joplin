@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{
     AssociateResource, CanonicalDocument, CreateNote, DeletionScope, LibraryError,
@@ -118,6 +120,42 @@ fn v3_rtf_rows_fail_closed_without_changing_version_or_source_rows() {
             )
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn legacy_refusal_leaves_delete_journal_mode_and_profile_entries_unchanged() {
+    // Catches opening a legacy profile by creating resources or switching WAL
+    // before the authoritative refusal is protected by the migration lock.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE notes (id TEXT PRIMARY KEY, title TEXT, body TEXT, body_text TEXT, body_rtf BLOB, markup_language INTEGER, is_draft INTEGER, created_time INTEGER, updated_time INTEGER, deleted_time INTEGER); INSERT INTO notes VALUES ('0123456789abcdef0123456789abcdef', 'legacy', '<p>fallback</p>', 'fallback', X'7b5c727466317d', 1, 1, 1, 2, 3); PRAGMA user_version = 3;").unwrap();
+    assert_eq!(
+        db.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap()
+            .to_ascii_lowercase(),
+        "delete"
+    );
+    drop(db);
+    assert!(matches!(
+        LibraryRepository::open(&path),
+        Err(LibraryError::LegacyRtfMigrationRequired)
+    ));
+    let after = Connection::open(&path).unwrap();
+    assert_eq!(
+        after
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap()
+            .to_ascii_lowercase(),
+        "delete"
+    );
+    assert_eq!(
+        std::fs::read_dir(profile.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from("library.sqlite")]
     );
 }
 
@@ -294,7 +332,7 @@ fn ids_retry_collisions_and_note_time_never_moves_back() {
     let repository = LibraryRepository::open_with_sources(
         profile.path().join("library.sqlite"),
         Arc::new(SequenceClock(Mutex::new(VecDeque::from([100, 100, 99])))),
-        fixture_ids(&['d', 'a', 'a', 'b']),
+        fixture_ids(&['d', 'a', 'e', 'a', 'b', 'c', 'f']),
     )
     .unwrap();
     let first = repository
@@ -334,7 +372,7 @@ fn resource_entity_ids_retry_database_collisions() {
     let repository = LibraryRepository::open_with_sources(
         profile.path().join("library.sqlite"),
         Arc::new(SequenceClock(Mutex::new(VecDeque::from([1, 2])))),
-        fixture_ids(&['d', 'a', 'a', 'b']),
+        fixture_ids(&['d', 'a', 'e', 'a', 'b', 'f']),
     )
     .unwrap();
     assert_eq!(
@@ -351,6 +389,74 @@ fn resource_entity_ids_retry_database_collisions() {
             .as_str(),
         "b".repeat(32)
     );
+}
+
+#[test]
+fn outbox_operations_retry_the_repository_id_source_after_a_collision() {
+    // Catches durable sync operations bypassing the per-repository allocator.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open_with_sources(
+        &path,
+        Arc::new(SequenceClock(Mutex::new(VecDeque::from([1])))),
+        fixture_ids(&['d', 'a', 'b', 'c']),
+    )
+    .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO sync_outbox VALUES (?1, 'note', ?2, 1, 'create', 0)",
+            rusqlite::params!["b".repeat(32), "f".repeat(32)],
+        )
+        .unwrap();
+    repository
+        .create_note(CreateNote {
+            title: "n".into(),
+            notebook_id: None,
+            document: document("n"),
+        })
+        .unwrap();
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sync_outbox WHERE id=?1",
+                ["c".repeat(32)],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn purged_note_ids_remain_reserved_for_future_allocations() {
+    // Catches reusing an opaque ID that is still named by retained history and a tombstone.
+    let profile = tempdir().unwrap();
+    let repository = LibraryRepository::open_with_sources(
+        profile.path().join("library.sqlite"),
+        Arc::new(SequenceClock(Mutex::new(VecDeque::from([1, 2, 3, 4])))),
+        fixture_ids(&['d', 'a', 'b', 'c', 'd', 'a', 'e', 'f']),
+    )
+    .unwrap();
+    let retired = repository
+        .create_note(CreateNote {
+            title: "retired".into(),
+            notebook_id: None,
+            document: document("retired"),
+        })
+        .unwrap();
+    repository.trash_note(&retired.id).unwrap();
+    repository.purge_note(&retired.id).unwrap();
+    let replacement = repository
+        .create_note(CreateNote {
+            title: "replacement".into(),
+            notebook_id: None,
+            document: document("replacement"),
+        })
+        .unwrap();
+    assert_eq!(retired.id.as_str(), "a".repeat(32));
+    assert_eq!(replacement.id.as_str(), "e".repeat(32));
 }
 
 #[test]
@@ -472,6 +578,100 @@ fn purge_keeps_a_durable_tombstone_and_rejects_active_notes() {
             )
             .unwrap(),
         1
+    );
+}
+
+#[test]
+fn purge_keeps_a_durable_search_delete_job_after_reopen() {
+    // Catches foreign-key cascade deleting the only search-removal instruction.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).unwrap();
+    let note = repository
+        .create_note(CreateNote {
+            title: "purge".into(),
+            notebook_id: None,
+            document: document("purge"),
+        })
+        .unwrap();
+    let events = repository.subscribe();
+    repository.trash_note(&note.id).unwrap();
+    repository.purge_note(&note.id).unwrap();
+    drop(repository);
+    let check = Connection::open(&path).unwrap();
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT reason FROM search_queue WHERE note_id=?1",
+                [note.id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "purge"
+    );
+    assert!(events
+        .try_iter()
+        .any(|event| matches!(event, app_lite_core::LibraryEvent::SearchProjectionQueued(id) if id == note.id)));
+}
+
+#[test]
+fn associated_resource_rollback_is_a_complete_noop() {
+    // Catches cleanup deleting the pending resource upload while an association survives.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).unwrap();
+    let image = repository
+        .import_image(b"image", "image", "image/png", "png")
+        .unwrap();
+    let note = repository
+        .create_note(CreateNote {
+            title: "n".into(),
+            notebook_id: None,
+            document: document("n"),
+        })
+        .unwrap();
+    repository
+        .associate_resource(AssociateResource {
+            snapshot: SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: "n".into(),
+                document: image_document(std::slice::from_ref(&image)),
+                resource_ids: vec![image.clone()],
+                selected_thumbnail_id: Some(image.clone()),
+            },
+        })
+        .unwrap();
+    let before = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sync_outbox WHERE entity_type='resource' AND entity_id=?1",
+            [image.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    repository.rollback_unassociated_resource(&image).unwrap();
+    drop(repository);
+    let check = Connection::open(&path).unwrap();
+    assert!(
+        check
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE id=?1)",
+                [image.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    );
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT count(*) FROM sync_outbox WHERE entity_type='resource' AND entity_id=?1",
+                [image.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        before
     );
 }
 

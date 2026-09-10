@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
@@ -72,7 +73,7 @@ pub enum ResourceError {
     #[error("resource blob is corrupt")]
     CorruptBlob,
     #[error("resource ID entropy failed")]
-    Entropy(String),
+    Entropy(#[source] getrandom::Error),
 }
 
 #[derive(Clone, Copy)]
@@ -94,6 +95,16 @@ pub struct ResourceStore {
     blobs_dir: DirFd,
 }
 
+/// A profile directory held open by descriptor. SQLite still needs a pathname,
+/// so repository open verifies this identity before and after each pathname
+/// boundary; resource children are always opened relative to this descriptor.
+pub(crate) struct ProfileDir {
+    fd: DirFd,
+    path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+}
+
 struct DirFd(RawFd);
 
 impl Drop for DirFd {
@@ -111,6 +122,12 @@ impl ResourceStore {
         let profile_root = fs::canonicalize(profile_root)?;
         let profile_dir = open_dir_path(&profile_root)?;
         let resources_dir = open_or_create_dir(profile_dir.0, "resources")?;
+        let blobs_dir = open_or_create_dir(resources_dir.0, "blobs")?;
+        Ok(Self { blobs_dir })
+    }
+
+    pub(crate) fn from_profile_dir(profile: &ProfileDir) -> Result<Self, ResourceError> {
+        let resources_dir = open_or_create_dir(profile.fd.0, "resources")?;
         let blobs_dir = open_or_create_dir(resources_dir.0, "blobs")?;
         Ok(Self { blobs_dir })
     }
@@ -147,6 +164,29 @@ impl ResourceStore {
             return Err(ResourceError::CorruptBlob);
         }
         Ok(bytes)
+    }
+}
+
+impl ProfileDir {
+    pub(crate) fn open(path: &Path) -> Result<Self, ResourceError> {
+        ensure_directory(path)?;
+        let path = fs::canonicalize(path)?;
+        let fd = open_dir_path(&path)?;
+        let (device, inode) = fd_identity(fd.0)?;
+        Ok(Self {
+            fd,
+            path,
+            device,
+            inode,
+        })
+    }
+
+    pub(crate) fn verify_path_identity(&self) -> Result<bool, ResourceError> {
+        let metadata = fs::symlink_metadata(&self.path)?;
+        Ok(metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode)
     }
 }
 
@@ -249,6 +289,15 @@ fn open_dir_path(path: &Path) -> Result<DirFd, ResourceError> {
         return Err(io_error());
     }
     Ok(DirFd(fd))
+}
+
+fn fd_identity(fd: RawFd) -> Result<(u64, u64), ResourceError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(io_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
 fn open_or_create_dir(parent_fd: RawFd, name: &str) -> Result<DirFd, ResourceError> {
@@ -412,7 +461,7 @@ fn hex_digest(digest: &[u8]) -> String {
 
 fn new_resource_id() -> Result<String, ResourceError> {
     let mut bytes = [0_u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|error| ResourceError::Entropy(error.to_string()))?;
+    getrandom::getrandom(&mut bytes).map_err(ResourceError::Entropy)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 

@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+test-support = []
+
 [lib]
 name = "app_lite_core"
 path = "src/lib.rs"
 
 [dependencies]
-getrandom = "0.2"
+getrandom = { version = "0.2", features = ["std"] }
 html5ever = "0.38"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled", "hooks"] }

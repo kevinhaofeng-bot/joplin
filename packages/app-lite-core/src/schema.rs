@@ -1,21 +1,23 @@
-use crate::{CanonicalDocument, repository::LibraryError};
-use rusqlite::{Connection, Transaction, params};
+use crate::{CanonicalDocument, repository::LibraryError, resource::ResourceStore};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 pub const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) fn migrate_schema(
     connection: &mut Connection,
-    default_id: &str,
-) -> Result<(), LibraryError> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    next_id: &mut dyn FnMut() -> Result<String, LibraryError>,
+    preflight: impl FnOnce() -> Result<ResourceStore, LibraryError>,
+    verify_profile: impl Fn() -> Result<(), LibraryError>,
+) -> Result<(bool, ResourceStore), LibraryError> {
+    // BEGIN IMMEDIATE is deliberately the first migration operation. It keeps
+    // the legacy-RTF gate authoritative until the schema publication commits.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(LibraryError::UnsupportedSchema(version));
     }
-    if version == SCHEMA_VERSION {
-        return Ok(());
-    }
-    if version == 3 && column_exists_connection(connection, "notes", "markup_language")? {
-        let legacy: i64 = connection.query_row(
+    if version == 3 && column_exists(&transaction, "notes", "markup_language")? {
+        let legacy: i64 = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM notes WHERE markup_language = 1)",
             [],
             |row| row.get(0),
@@ -24,7 +26,14 @@ pub(crate) fn migrate_schema(
             return Err(LibraryError::LegacyRtfMigrationRequired);
         }
     }
-    let transaction = connection.transaction()?;
+    // Resource binding is intentionally after the legacy gate but before any
+    // schema/data mutation, while this migration-wide lock is still held.
+    let resource_store = preflight()?;
+    if version == SCHEMA_VERSION {
+        verify_profile()?;
+        transaction.commit()?;
+        return Ok((false, resource_store));
+    }
     transaction.execute_batch("CREATE TABLE IF NOT EXISTS stacks (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS notebooks (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, stack_id TEXT REFERENCES stacks(id) ON DELETE SET NULL, is_default INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS resource_blobs (sha256 TEXT PRIMARY KEY NOT NULL, size INTEGER NOT NULL, mime TEXT NOT NULL, relative_path TEXT NOT NULL, created_time INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
@@ -35,7 +44,7 @@ CREATE TABLE IF NOT EXISTS note_tags (note_id TEXT NOT NULL REFERENCES notes(id)
 CREATE TABLE IF NOT EXISTS note_resources (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, position INTEGER NOT NULL, resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE RESTRICT, is_associated INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(note_id, position));
 CREATE TABLE IF NOT EXISTS note_revisions (note_id TEXT NOT NULL, revision INTEGER NOT NULL, title TEXT NOT NULL, body_html TEXT NOT NULL, body_text TEXT NOT NULL, created_time INTEGER NOT NULL, PRIMARY KEY(note_id, revision));
 CREATE TABLE IF NOT EXISTS edit_journal (id TEXT PRIMARY KEY NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, generation INTEGER NOT NULL, delta_utf8 TEXT NOT NULL, created_time INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS search_queue (note_id TEXT PRIMARY KEY NOT NULL REFERENCES notes(id) ON DELETE CASCADE, updated_time INTEGER NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS search_queue (note_id TEXT PRIMARY KEY NOT NULL, updated_time INTEGER NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sync_outbox (id TEXT PRIMARY KEY NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, entity_revision INTEGER NOT NULL, operation TEXT NOT NULL, created_time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sync_cursor (name TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL, updated_time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sync_conflicts (id TEXT PRIMARY KEY NOT NULL, entity_id TEXT NOT NULL, local_revision INTEGER NOT NULL, remote_revision INTEGER NOT NULL, created_time INTEGER NOT NULL, resolved_time INTEGER NOT NULL DEFAULT 0);
@@ -56,12 +65,34 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     ] {
         ensure_column(&transaction, table, column, definition)?;
     }
-    transaction.execute("INSERT INTO notebooks (id, title, is_default, revision, created_time, updated_time) SELECT ?1, '默认笔记本', 1, 1, 0, 0 WHERE NOT EXISTS (SELECT 1 FROM notebooks WHERE is_default = 1 AND deleted_time = 0)", [default_id])?;
-    let notebook: String = transaction.query_row(
-        "SELECT id FROM notebooks WHERE is_default = 1 AND deleted_time = 0 ORDER BY id LIMIT 1",
-        [],
-        |row| row.get(0),
-    )?;
+    let existing_default: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM notebooks WHERE is_default = 1 AND deleted_time = 0 ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let notebook = if let Some(id) = existing_default {
+        id
+    } else {
+        let mut created = None;
+        for _ in 0..16 {
+            let id = next_id()?;
+            if id.len() != 32
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(LibraryError::InvalidId);
+            }
+            match transaction.execute("INSERT INTO notebooks (id, title, is_default, revision, created_time, updated_time) VALUES (?1, '默认笔记本', 1, 1, 0, 0)", [&id]) {
+                Ok(_) => { created = Some(id); break; }
+                Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::ConstraintViolation => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        created.ok_or(LibraryError::IdCollisionExhausted)?
+    };
     if column_exists(&transaction, "notes", "body")? {
         transaction.execute(
             "UPDATE notes SET body_html = body WHERE body_html = '' AND body <> ''",
@@ -82,8 +113,9 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     transaction.execute("INSERT OR IGNORE INTO note_revisions (note_id, revision, title, body_html, body_text, created_time) SELECT id, 1, title, body_html, body_text, updated_time FROM notes", [])?;
     transaction.execute("INSERT OR IGNORE INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-bootstrap' FROM notes", [])?;
     transaction.execute_batch("PRAGMA user_version = 4")?;
+    verify_profile()?;
     transaction.commit()?;
-    Ok(())
+    Ok((true, resource_store))
 }
 
 fn canonicalize_notes(transaction: &Transaction<'_>) -> Result<(), LibraryError> {
@@ -174,7 +206,7 @@ fn rebuild_v3_notes(
         };
         transaction.execute("INSERT INTO notes (id,title,body_html,body_text,snippet,notebook_id,selected_thumbnail_id,created_time,updated_time,deleted_time,revision) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![id,title,html,text,snippet,notebook,thumbnail,created,updated,deleted,revision])?;
     }
-    transaction.execute_batch("DROP TABLE notes_v3_source; CREATE TABLE note_tags (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE, position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(note_id,tag_id)); CREATE TABLE note_resources (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, position INTEGER NOT NULL, resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE RESTRICT, is_associated INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(note_id,position)); CREATE TABLE edit_journal (id TEXT PRIMARY KEY NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, generation INTEGER NOT NULL, delta_utf8 TEXT NOT NULL, created_time INTEGER NOT NULL); CREATE TABLE search_queue (note_id TEXT PRIMARY KEY NOT NULL REFERENCES notes(id) ON DELETE CASCADE, updated_time INTEGER NOT NULL, reason TEXT NOT NULL);")?;
+    transaction.execute_batch("DROP TABLE notes_v3_source; CREATE TABLE note_tags (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE, position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(note_id,tag_id)); CREATE TABLE note_resources (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, position INTEGER NOT NULL, resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE RESTRICT, is_associated INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(note_id,position)); CREATE TABLE edit_journal (id TEXT PRIMARY KEY NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, generation INTEGER NOT NULL, delta_utf8 TEXT NOT NULL, created_time INTEGER NOT NULL); CREATE TABLE search_queue (note_id TEXT PRIMARY KEY NOT NULL, updated_time INTEGER NOT NULL, reason TEXT NOT NULL);")?;
     Ok(())
 }
 fn ensure_column(
@@ -192,17 +224,6 @@ fn ensure_column(
 }
 fn column_exists(t: &Transaction<'_>, table: &str, column: &str) -> Result<bool, LibraryError> {
     let mut s = t.prepare(&format!("PRAGMA table_info({table})"))?;
-    Ok(s.query_map([], |r| r.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == column))
-}
-fn column_exists_connection(
-    c: &Connection,
-    table: &str,
-    column: &str,
-) -> Result<bool, LibraryError> {
-    let mut s = c.prepare(&format!("PRAGMA table_info({table})"))?;
     Ok(s.query_map([], |r| r.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?
         .iter()
