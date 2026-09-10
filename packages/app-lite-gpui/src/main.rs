@@ -200,6 +200,11 @@ fn main() {
             // it needs the donor key/action table, but not donor workspace,
             // menu, network, updater, exporter, sync, or web runtimes.
             components::init(cx);
+            // This route intentionally skips `init_app_menu`, which is where
+            // the ordinary application activates itself. The native GPUI
+            // window must still be active so macOS keeps its display link
+            // driving the measurement frames after the asynchronous workload.
+            cx.activate(true);
             spike_app::open_with_options(cx, spike_options.clone());
             cx.refresh_windows();
             return;

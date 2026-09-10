@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, ElementInputHandler, Entity,
-    EntityInputHandler, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun,
-    UTF16Selection, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div,
-    point, px, rgba, size,
+    App, AppContext, AsyncWindowContext, Bounds, ClipboardItem, Context, DragMoveEvent,
+    ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollHandle, ShapedLine, SharedString,
+    StatefulInteractiveElement, Styled, TextRun, UTF16Selection, WeakEntity, Window, WindowBounds,
+    WindowHandle, WindowOptions, canvas, div, point, px, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -650,35 +650,30 @@ impl SpikeView {
         let options = runtime.options.clone();
         let editor = self.editor.clone();
         let weak_view: WeakEntity<Self> = cx.entity().downgrade();
-        let window_handle = window.window_handle();
-        cx.spawn(async move |_this, cx| {
-            let result = cx
-                .update_window(window_handle, |_view, window, app| {
-                    let result = run_measurement_workload(&editor, options.fixture, window, app);
-                    // The workload runs outside a paint callback. Schedule a
-                    // harmless next-frame refresh without calling
-                    // `request_animation_frame`, whose current-view lookup is
-                    // only valid during paint/prepaint.
-                    window.on_next_frame(|window, _cx| window.refresh());
-                    window.refresh();
-                    result
-                })
-                .ok()
-                .flatten();
-            if let Some(result) = result {
-                let _ = cx.update(|app| {
-                    let delivered = weak_view.update(app, |view, view_cx| {
-                        view.measurement_workload_finished(result);
-                        view_cx.notify();
+        window
+            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                let result = cx
+                    .update(|window, app| {
+                        run_measurement_workload(&editor, options.fixture, window, app)
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(result) = result {
+                    let _ = cx.update(|window, app| {
+                        let delivered = weak_view.update(app, |view, view_cx| {
+                            view.deliver_measurement_workload(result, window, view_cx)
+                        });
+                        if delivered.is_ok_and(|advanced| advanced) {
+                            window.refresh();
+                        }
                     });
-                    if delivered.is_ok() {
-                        app.refresh_windows();
-                    }
-                    delivered.is_ok()
-                });
-            }
-        })
-        .detach();
+                    // `on_next_frame` only owns the following entity
+                    // notification; the async delivery must explicitly ask
+                    // GPUI to drive the dirty window into that frame.
+                    let _ = cx.refresh();
+                }
+            })
+            .detach();
     }
 
     fn measurement_workload_finished(&mut self, report: WorkloadReport) {
@@ -696,6 +691,23 @@ impl SpikeView {
         runtime.workload_complete = true;
     }
 
+    fn deliver_measurement_workload(
+        &mut self,
+        report: WorkloadReport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.measurement_workload_finished(report);
+        let workload_complete = self
+            .measurement
+            .as_ref()
+            .is_some_and(|runtime| runtime.workload_complete);
+        if workload_complete {
+            self.advance_measurement_frame(window, cx);
+        }
+        workload_complete
+    }
+
     /// Drive each viewport shift through a separate GPUI animation frame. A
     /// synchronous loop of `ScrollHandle::set_offset` calls would be coalesced
     /// by GPUI and would not measure the production layout+paint lifecycle.
@@ -706,8 +718,8 @@ impl SpikeView {
         if !runtime.workload_complete || runtime.viewport_complete {
             return;
         }
-        let shift_index = runtime.viewport_shift_index;
         let reset_requested = runtime.viewport_reset_requested;
+        let shift_index = runtime.viewport_shift_index;
         if shift_index < 120 {
             let total_height = self.editor.read(cx).layout().total_height();
             let max_top = (total_height - 520.0).max(0.0);
@@ -721,7 +733,7 @@ impl SpikeView {
                 runtime.viewport_shift_index += 1;
                 runtime.request_viewport_frame();
             }
-            window.request_animation_frame();
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
             cx.notify();
         } else if !reset_requested {
             if let Some(runtime) = self.measurement.as_mut() {
@@ -732,7 +744,7 @@ impl SpikeView {
                 runtime.viewport_reset_requested = true;
                 runtime.request_viewport_reset_frame();
             }
-            window.request_animation_frame();
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
             cx.notify();
         } else {
             if let Some(runtime) = self.measurement.as_mut()
@@ -2375,6 +2387,116 @@ mod tests {
         assert_eq!(runtime.render_histogram.sample_count(), 120);
         assert_eq!(runtime.viewport_reset_paint_count, 1);
         assert!(!runtime.ready_prerequisites(true));
+    }
+
+    #[gpui::test]
+    fn long_workload_delivery_starts_a_same_window_viewport_shift_before_its_next_canvas_paint(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|app| components::init(app));
+        let options = SpikeLaunchOptions {
+            fixture: FixtureKind::Long,
+            ready_file: PathBuf::from("/tmp/task7-delivery-ready"),
+            diagnostics_file: PathBuf::from("/tmp/task7-delivery-diagnostics"),
+            run_id: "test-run".into(),
+            binary_sha256: "test-sha".into(),
+        };
+        let cache =
+            cx.update(|app| BudgetedImageCache::new_entity(app, DECODED_IMAGE_CACHE_BUDGET));
+        let (view, cx) = cx.add_window_view(move |window, app| {
+            let editor = app.new(|app| EditorCore::new(build_document(FixtureKind::Long), app));
+            editor.read(app).focus_handle().focus(window);
+            let mut measurement = MeasurementRuntime::new(options);
+            // Draw the first frame with no pending measurement work, then
+            // reset into the late-delivery state below. This consumes the
+            // initial window frame before the async workload completes.
+            measurement.workload_started = true;
+            measurement.workload_complete = true;
+            measurement.viewport_complete = true;
+            SpikeView {
+                editor,
+                image_cache: Some(cache.clone()),
+                catalogue: CommandCatalogue::default(),
+                scroll_handle: ScrollHandle::new(),
+                more_open: false,
+                link_popover: None,
+                pointer_anchor: None,
+                drop_point: None,
+                more_trigger_bounds: None,
+                measurement: Some(Box::new(measurement)),
+            }
+        });
+
+        cx.simulate_resize(size(px(1080.0), px(720.0)));
+        redraw(cx);
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                let runtime = view.measurement.as_mut().expect("measurement runtime");
+                runtime.workload_complete = false;
+                runtime.viewport_complete = false;
+                runtime.viewport_shift_index = 0;
+                runtime.viewport_reset_requested = false;
+                runtime.viewport_reset_completed = false;
+                runtime.viewport_frames_requested = 0;
+                runtime.viewport_frames_completed = 0;
+                runtime.viewport_frame_pending = false;
+                runtime.viewport_reset_frames_requested = 0;
+                runtime.viewport_reset_frames_completed = 0;
+                runtime.viewport_reset_frame_pending = false;
+                runtime.render_sample_count = 0;
+                runtime.viewport_reset_paint_count = 0;
+            });
+        });
+        let report = cx.update(|window, app| {
+            let editor = view.read(app).editor.clone();
+            run_measurement_workload(&editor, FixtureKind::Long, window, app)
+                .expect("long fixture must complete the real 500 edit/undo workload")
+        });
+
+        cx.update(|window, app| {
+            view.update(app, |view, view_cx| {
+                assert!(view.deliver_measurement_workload(report, window, view_cx));
+            });
+        });
+
+        let delivered = cx.update(|_, app| {
+            let runtime = view
+                .read(app)
+                .measurement
+                .as_ref()
+                .expect("measurement runtime");
+            (
+                runtime.workload_complete,
+                runtime.viewport_shift_index,
+                runtime.viewport_frames_requested,
+                runtime.viewport_frames_completed,
+            )
+        });
+        assert!(delivered.0);
+        assert!(
+            delivered.1 >= 1,
+            "late async delivery must start the first viewport shift on its owning window"
+        );
+        assert!(delivered.2 >= 1);
+        assert!(delivered.3 <= delivered.2);
+
+        redraw(cx);
+        let painted = cx.update(|_, app| {
+            let runtime = view
+                .read(app)
+                .measurement
+                .as_ref()
+                .expect("measurement runtime");
+            (
+                runtime.viewport_frames_completed,
+                runtime.viewport_frames_requested,
+            )
+        });
+        assert!(
+            painted.0 >= 1,
+            "real canvas paint must commit a pending shift"
+        );
+        assert!(painted.1 >= painted.0);
     }
 
     #[test]
