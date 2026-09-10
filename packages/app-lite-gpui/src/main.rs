@@ -28,6 +28,10 @@ mod window_chrome;
 
 struct VelotypeAssets;
 
+fn library_version_label() -> String {
+    format!("Joplin Lite {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn resolve_library_profile(profile_override: Option<OsString>) -> Result<PathBuf, String> {
     if let Some(profile_override) = profile_override {
         let profile = PathBuf::from(profile_override);
@@ -142,7 +146,7 @@ fn main() {
     if let Some(request) = spike_app::global_help_or_version(&args[1..]) {
         match request {
             "version" => {
-                println!("velotype {}", env!("CARGO_PKG_VERSION"));
+                println!("{}", library_version_label());
             }
             "help" => print_help(),
             _ => unreachable!("global help/version parser returned unknown request"),
@@ -283,7 +287,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetSource, VelotypeAssets, resolve_library_profile};
+    use super::{AssetSource, VelotypeAssets, library_version_label, resolve_library_profile};
     use crate::native_editor::commands::CommandCatalogue;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -311,6 +315,12 @@ mod tests {
             resolve_library_profile(Some(OsString::from("/tmp/joplin-lite-profile"))).unwrap(),
             PathBuf::from("/tmp/joplin-lite-profile")
         );
+    }
+
+    #[test]
+    fn ordinary_product_version_uses_the_library_identity() {
+        assert!(library_version_label().starts_with("Joplin Lite "));
+        assert!(!library_version_label().contains("velotype"));
     }
 }
 
