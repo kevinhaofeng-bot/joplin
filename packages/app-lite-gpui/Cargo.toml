@@ -57,7 +57,7 @@ code-highlight-config = [
 anyhow = "1"
 base64 = "0.23"
 uuid = "1.23"
-gpui = { version = "0.2", features = ["runtime_shaders"] }
+gpui = "0.2"
 sum_tree = { package = "gpui_sum_tree", version = "0.2.2" }
 loro_fractional_index = "1.13.0"
 smallvec = "1.15.2"
@@ -109,6 +109,7 @@ tree-sitter-toml = { package = "adot-tree-sitter-toml", version = "0.1", optiona
 # only for pasteboard extraction; editing remains entirely GPUI/Rust-owned.
 cocoa = "0.26"
 objc = "0.2.7"
+raw-window-handle = "0.6"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFData", "CFDictionary", "CFNumber", "CFURL", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage", "objc2"] }
 objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "CGImageProperties", "objc2-core-graphics", "objc2"] }

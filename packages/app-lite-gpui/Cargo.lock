@@ -7118,6 +7118,7 @@ dependencies = [
  "ratex-layout",
  "ratex-parser",
  "ratex-svg",
+ "raw-window-handle",
  "reqwest",
  "resvg",
  "schemars",

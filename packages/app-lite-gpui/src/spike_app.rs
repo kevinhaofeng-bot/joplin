@@ -66,6 +66,49 @@ pub const fn route_contract() -> SpikeRouteContract {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+const SPIKE_MAXIMUM_DRAWABLE_COUNT: usize = 2;
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_spike_drawable_pool_limit(actual: usize) -> Result<(), String> {
+    if actual == SPIKE_MAXIMUM_DRAWABLE_COUNT {
+        Ok(())
+    } else {
+        Err(format!(
+            "Task 7 CAMetalLayer maximumDrawableCount must be {SPIKE_MAXIMUM_DRAWABLE_COUNT}; got {actual}"
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_spike_drawable_pool_limit(window: &Window) -> Result<(), String> {
+    use cocoa::base::{id, nil};
+    use objc::{msg_send, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = HasWindowHandle::window_handle(window)
+        .map_err(|error| format!("Task 7 could not read its native window handle: {error}"))?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return Err("Task 7 expected an AppKit native window handle on macOS".into());
+    };
+    let native_view = handle.ns_view.as_ptr() as id;
+    // SAFETY: GPUI invokes this only from its macOS main-thread window-build closure.
+    // The borrowed Window keeps the GPUI-owned NSView alive, and the fixed macOS Metal
+    // backend installs its CAMetalLayer as that view's backing layer.
+    let layer: id = unsafe { msg_send![native_view, layer] };
+    if layer == nil {
+        return Err("Task 7 native window has no CAMetalLayer before its first draw".into());
+    }
+
+    // SAFETY: `layer` is the live CAMetalLayer established above. Both selectors are
+    // standard CAMetalLayer accessors and execute synchronously on the same main thread.
+    let actual = unsafe {
+        let _: () = msg_send![layer, setMaximumDrawableCount: SPIKE_MAXIMUM_DRAWABLE_COUNT];
+        msg_send![layer, maximumDrawableCount]
+    };
+    validate_spike_drawable_pool_limit(actual)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpikeLaunchOptions {
     pub fixture: FixtureKind,
@@ -212,7 +255,11 @@ pub(crate) fn open_with_options(
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..WindowOptions::default()
             },
-            move |_window, cx| {
+            move |window, cx| {
+                #[cfg(target_os = "macos")]
+                configure_spike_drawable_pool_limit(window).unwrap_or_else(|error| {
+                    panic!("Task 7 must configure its CAMetalLayer before the first draw: {error}")
+                });
                 let document = fixture.map_or_else(sample_document, build_document);
                 let editor = cx.new(|cx| EditorCore::new(document, cx));
                 if fixture == Some(FixtureKind::Typical) {
@@ -2061,6 +2108,15 @@ mod tests {
         AppContext, ImageCache, Modifiers, Resource, TestAppContext, VisualTestContext, point,
     };
     use std::mem::size_of;
+
+    #[test]
+    fn drawable_pool_contract_rejects_gpui_default_count() {
+        assert!(validate_spike_drawable_pool_limit(2).is_ok());
+        assert_eq!(
+            validate_spike_drawable_pool_limit(3).expect_err("GPUI's three drawable default"),
+            "Task 7 CAMetalLayer maximumDrawableCount must be 2; got 3"
+        );
+    }
 
     #[test]
     fn task7_cli_requires_strict_fixture_and_absolute_output_paths() {

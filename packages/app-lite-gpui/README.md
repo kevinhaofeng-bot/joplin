@@ -84,6 +84,9 @@ Prerequisites:
 - A Rust toolchain with Rust 2024 edition support
 - Cargo
 - Platform-native build dependencies required by GPUI and the system toolchain
+- On macOS, Xcode Command Line Tools: source builds compile GPUI's bundled Metal shaders through
+  `xcrun metal` and `xcrun metallib`. This is a build-time prerequisite only; distributed Release
+  binaries use the compiled shader library and do not require Xcode or its command-line tools.
 
 Build Velotype locally:
 
