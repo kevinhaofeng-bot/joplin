@@ -149,3 +149,39 @@ The fix retains a typed `WindowHandle<SpikeView>` before opening the platform pi
 - The source diff is limited to `packages/app-lite-gpui/src/spike_app.rs`; it does not alter Task 7 image budgets, drawable-pool settings, fixtures, measurement limits, paste/drop behavior, or title/link/toolbar paths.
 - The selected-image callback retains its typed parent ownership for the whole prompt lifetime and invokes the pre-existing transaction/focus logic exactly once. The regression test would fail under the old child-only notification semantics.
 - Real native-picker/manual visual acceptance remains PENDING due to the desktop automation limitation above. This is the only promotion concern; no claim is made for `clippy -D warnings` because the repository retains pre-existing warnings.
+
+## Round 4 — picker completion seam review repair
+
+Status: DONE_WITH_CONCERNS
+
+### Changes made
+
+- Replaced the non-portable test image path with `PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/showcase/1.png")`.
+- Captured the owning typed `WindowHandle<SpikeView>` directly from the toolbar click's `window.window_handle()` before opening the native prompt. If that exact window cannot be downcast, no picker is opened. The prompt no longer relies on global `active_window`.
+- Extracted the actual post-await completion handoff into `deliver_image_picker_completion`. Both the production await and the tests' already-settled results use that same `AsyncApp -> WindowHandle<SpikeView>::update -> complete_image_picker_in_view` path. A closed window is safely discarded by the failed typed handle update; there is no nested update or global refresh.
+- Moved cancellation and selection focus/data assertions onto the shared asynchronous completion entry. Cancelled completion keeps document semantic snapshot, undo depth, selection, and title focus unchanged; successful completion restores body focus and adds exactly the normal image transaction.
+
+### Corrected root-cause statement and RED to GREEN evidence
+
+Round 3's parent-notification observation is now treated as a demonstrated necessary repaint/relayout contract rather than as a claim that every real-world symptom had a single independently isolated cause. The regression test now checks user-visible current-surface behavior before notification count.
+
+1. RED: after adding the shared completion test, the helper was deliberately run with the old child-only completion body (real `complete_image_picker` transaction but no `SpikeView` notification). `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_picker_selection_immediately_paints_the_inserted_image_in_the_current_surface -- --nocapture` failed at `picker completion must schedule the current surface for painting`. This proves the old semantics reaches a document mutation but fails at the current visible paint/surface seam, not merely at an observer counter.
+2. GREEN: after routing that exact shared helper through `complete_image_picker_in_view`, the same command passed (`1 passed; 0 failed`). It verifies current render membership and visibility, decoded image cache state, scroll growth, surface-height growth, and then the parent notification as supplementary evidence.
+3. Shared asynchronous cancel/selection seam: `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype shell_picker_ -- --nocapture` passed (`2 passed; 0 failed`), including full cancellation no-op checks and selected-image body-focus/transaction checks through the production completion entry.
+
+### Round 4 controller gates
+
+- `chrome`: PASS.
+- `shell_`: PASS.
+- `image`: PASS.
+- Full bin with the specified skip: PASS.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --all-targets --no-run`: PASS.
+- `cargo fmt --check --manifest-path packages/app-lite-gpui/Cargo.toml`: PASS after standard formatting.
+- `git diff --check`: PASS.
+- `cargo build --manifest-path packages/app-lite-gpui/Cargo.toml --release`: PASS (optimized release build; existing warnings remain).
+
+### Round 4 self-review and concerns
+
+- No Task 7 threshold, image-budget, drawable-pool, fixture, paste/drop, or measurement change was made.
+- The source contains one typed completion route used after real native prompt settlement and in both production-seam tests; it cannot open a panel without an owning typed spike window and does not duplicate insertion.
+- Native-picker/manual visual acceptance remains PENDING under the existing desktop accessibility limitation; nothing in this round promotes it to PASS.

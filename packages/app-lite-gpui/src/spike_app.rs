@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use gpui::{
-    App, AppContext, AsyncWindowContext, Bounds, ClipboardItem, Context, DragMoveEvent,
+    App, AppContext, AsyncApp, AsyncWindowContext, Bounds, ClipboardItem, Context, DragMoveEvent,
     ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontWeight,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
@@ -1534,7 +1534,11 @@ impl SpikeView {
                     move |_event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                         cx.stop_propagation();
                         if command == EditorCommand::InsertImage {
-                            prompt_for_image_path(cx);
+                            if let Some(window_handle) =
+                                window.window_handle().downcast::<SpikeView>()
+                            {
+                                prompt_for_image_path(window_handle, cx);
+                            }
                         } else if command == EditorCommand::Link {
                             let _ = view.update(cx, |view, view_cx| {
                                 view.open_link_popover(window, view_cx)
@@ -2133,10 +2137,7 @@ fn run_measurement_workload(
 
 /// Uses GPUI's native single-file prompt. Cancellation is deliberately a
 /// no-op: the editor is neither changed nor moved through history.
-fn prompt_for_image_path(cx: &mut App) {
-    let active_window = cx
-        .active_window()
-        .and_then(|window| window.downcast::<SpikeView>());
+fn prompt_for_image_path(window_handle: WindowHandle<SpikeView>, cx: &mut App) {
     let prompt = cx.prompt_for_paths(PathPromptOptions {
         files: true,
         directories: false,
@@ -2152,14 +2153,7 @@ fn prompt_for_image_path(cx: &mut App) {
                 .unwrap_or(ImagePickerCompletion::Cancelled),
             _ => ImagePickerCompletion::Cancelled,
         };
-        let _ = cx.update(move |cx| {
-            let Some(window_handle) = active_window else {
-                return;
-            };
-            let _ = window_handle.update(cx, |view, window, view_cx| {
-                complete_image_picker_in_view(view, completion, window, view_cx);
-            });
-        });
+        deliver_image_picker_completion(window_handle, completion, cx);
     })
     .detach();
 }
@@ -2167,6 +2161,21 @@ fn prompt_for_image_path(cx: &mut App) {
 enum ImagePickerCompletion {
     Cancelled,
     Selected(PathBuf),
+}
+
+/// Delivers a settled platform picker result to the exact spike window that
+/// opened it. If that window has closed while the native panel was visible,
+/// `WindowHandle::update` fails harmlessly and the completion is discarded.
+fn deliver_image_picker_completion(
+    window_handle: WindowHandle<SpikeView>,
+    completion: ImagePickerCompletion,
+    cx: &mut AsyncApp,
+) {
+    let _ = cx.update(move |app| {
+        let _ = window_handle.update(app, |view, window, view_cx| {
+            complete_image_picker_in_view(view, completion, window, view_cx);
+        });
+    });
 }
 
 /// Route the platform picker completion through the owning shell entity.
@@ -4399,6 +4408,10 @@ mod tests {
         cx.update(|cx| components::init(cx));
         let (view, cx) = cx.add_window_view(build_view);
         redraw(cx);
+        let window_handle = cx
+            .window_handle()
+            .downcast::<SpikeView>()
+            .expect("picker completion must retain the owning spike window");
         cx.update(|window, app| {
             view.read_with(app, |view, app| {
                 view.title.read(app).focus_handle().focus(window)
@@ -4412,16 +4425,19 @@ mod tests {
                 editor.selection(),
             )
         });
-        cx.update(|window, app| {
-            view.update(app, |view, view_cx| {
-                complete_image_picker(
-                    &view.editor,
-                    view.catalogue,
+        cx.update(|_, app| {
+            app.spawn(async move |mut app| {
+                deliver_image_picker_completion(
+                    window_handle.clone(),
                     ImagePickerCompletion::Cancelled,
-                    window,
-                    view_cx,
-                )
-                .expect("cancelled picker is a no-op");
+                    &mut app,
+                );
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.read_with(app, |view, view_cx| {
                 assert!(view.title.read(view_cx).focus_handle().is_focused(window));
                 let editor = view.editor.read(view_cx);
                 assert_eq!(editor.document().semantic_snapshot(), cancelled_baseline.0);
@@ -4438,18 +4454,18 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, valid_png_bytes()).expect("temporary picker image");
-        cx.update(|window, app| {
-            view.update(app, |view, view_cx| {
-                complete_image_picker(
-                    &view.editor,
-                    view.catalogue,
-                    ImagePickerCompletion::Selected(path.clone()),
-                    window,
-                    view_cx,
-                )
-                .expect("selected image transaction");
-            });
+        let selected_path = path.clone();
+        cx.update(|_, app| {
+            app.spawn(async move |mut app| {
+                deliver_image_picker_completion(
+                    window_handle,
+                    ImagePickerCompletion::Selected(selected_path),
+                    &mut app,
+                );
+            })
+            .detach();
         });
+        cx.run_until_parked();
         let _ = std::fs::remove_file(path);
         cx.update(|window, app| {
             view.read_with(app, |view, app| {
@@ -4503,9 +4519,7 @@ mod tests {
             .debug_bounds("spike-editor-surface")
             .expect("mounted editor surface");
         crate::native_editor::render::reset_test_image_residency_observation();
-        let path = PathBuf::from(
-            "/Users/kevinhao/Projects/joplin/.worktrees/joplin-lite-native-rust-mvp/packages/app-lite-gpui/assets/showcase/1.png",
-        );
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/showcase/1.png");
         assert!(
             path.is_file(),
             "the manual-acceptance picker image must exist"
@@ -4523,25 +4537,16 @@ mod tests {
             })
         });
         cx.update(|_, app| {
-            app.spawn(async move |cx| {
-                let _ = cx.update(move |app| {
-                    let _ = window_handle.update(app, |view, window, app| {
-                        complete_image_picker_in_view(
-                            view,
-                            ImagePickerCompletion::Selected(path),
-                            window,
-                            app,
-                        );
-                    });
-                });
+            app.spawn(async move |mut app| {
+                deliver_image_picker_completion(
+                    window_handle,
+                    ImagePickerCompletion::Selected(path),
+                    &mut app,
+                );
             })
             .detach();
         });
         cx.run_until_parked();
-        assert!(
-            parent_notifications.load(Ordering::Relaxed) > 0,
-            "an async picker completion must notify its owning SpikeView so the current surface can relayout"
-        );
 
         let observation = crate::native_editor::render::test_image_residency_observation()
             .expect("picker completion must schedule the current surface for painting");
@@ -4584,6 +4589,10 @@ mod tests {
                 .height
                 > surface_before.size.height,
             "the current surface must be relaid out instead of clipping the inserted image at its old height"
+        );
+        assert!(
+            parent_notifications.load(Ordering::Relaxed) > 0,
+            "the typed completion entry must notify the owning SpikeView after the visible surface contract holds"
         );
     }
 
