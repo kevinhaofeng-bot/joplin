@@ -270,6 +270,8 @@ pub struct LibraryRepository {
     note_load_observers: Mutex<Vec<Sender<NoteId>>>,
     #[cfg(test)]
     shell_state_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    next_note_load_failure: Mutex<Option<LibraryError>>,
     #[allow(dead_code)]
     database_path: PathBuf,
     clock: Arc<dyn RepositoryClock>,
@@ -487,6 +489,8 @@ impl LibraryRepository {
             note_load_observers: Mutex::new(Vec::new()),
             #[cfg(test)]
             shell_state_read_hook: Mutex::new(None),
+            #[cfg(test)]
+            next_note_load_failure: Mutex::new(None),
             database_path: path,
             clock,
             id_source,
@@ -595,6 +599,14 @@ impl LibraryRepository {
             .shell_state_read_hook
             .lock()
             .expect("shell-state read hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn fail_next_note_load_for_test(&self, error: LibraryError) {
+        *self
+            .next_note_load_failure
+            .lock()
+            .expect("note-load failure mutex poisoned") = Some(error);
     }
 
     /// Reads the complete application-owned library shell state. Corrupt pane
@@ -706,8 +718,10 @@ impl LibraryRepository {
 
     pub fn create_note(&self, input: CreateNote) -> Result<Note, LibraryError> {
         let now = self.now();
+        let title = input.title;
         let html = input.document.to_canonical_html().as_str().to_owned();
         let text = input.document.search_text().as_str().to_owned();
+        let note_snippet = snippet(input.document.search_text().as_str());
         let resource_ids = input.document.resource_ids();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
@@ -722,7 +736,7 @@ impl LibraryRepository {
             transaction.execute(
                 "INSERT INTO notes (id, title, body_html, body_text, snippet, notebook_id, selected_thumbnail_id, created_time, updated_time, revision)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, 1)",
-                params![candidate, input.title, html, text, snippet(input.document.search_text().as_str()), notebook_id.as_str(), now],
+                params![candidate, &title, &html, &text, &note_snippet, notebook_id.as_str(), now],
             )
         })?;
         let id = NoteId::parse(raw_id).expect("validated generated ID is valid");
@@ -746,6 +760,23 @@ impl LibraryRepository {
             "create",
             now,
         )?;
+        // All content and relationships are now known inside the same
+        // transaction. Build the full return value before commit so the
+        // committed outcome has no later fallible hydration step.
+        let note = Note {
+            id: id.clone(),
+            title,
+            body_html: html,
+            body_text: text,
+            snippet: note_snippet,
+            notebook_id,
+            resource_ids,
+            tag_ids: Vec::new(),
+            created_time: now,
+            updated_time: now,
+            deleted_time: None,
+            revision: 1,
+        };
         transaction.commit()?;
         drop(connection);
         self.publish(vec![
@@ -754,10 +785,19 @@ impl LibraryRepository {
             LibraryEvent::SearchProjectionQueued(id.clone()),
             LibraryEvent::SyncQueued(EntityRef::Note(id.clone())),
         ]);
-        self.load_note(&id)?.ok_or(LibraryError::NotFound)
+        Ok(note)
     }
 
     pub fn load_note(&self, id: &NoteId) -> Result<Option<Note>, LibraryError> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .next_note_load_failure
+            .lock()
+            .expect("note-load failure mutex poisoned")
+            .take()
+        {
+            return Err(error);
+        }
         let connection = self.connection.lock().expect("library mutex poisoned");
         let result = (|| {
             let base = connection
@@ -1692,6 +1732,41 @@ mod tests {
                 .read_library_shell_state()
                 .expect("read next snapshot"),
             expected_new
+        );
+    }
+
+    #[test]
+    fn create_note_does_not_consume_a_post_commit_complete_note_load_fault() {
+        // Catches create_note committing/publishing successfully and then
+        // calling load_note. The armed real load fault must remain pending
+        // until this test explicitly invokes it after create returns.
+        let profile = tempdir().expect("temporary profile");
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open repository");
+        let events = repository.subscribe();
+        repository.fail_next_note_load_for_test(LibraryError::NotFound);
+
+        let created = repository
+            .create_note(CreateNote {
+                title: "commit snapshot".into(),
+                notebook_id: None,
+                document: crate::CanonicalDocument::default(),
+            })
+            .expect("a post-commit load fault must not turn a committed create into Err");
+        assert_eq!(
+            events.recv().expect("create publishes its committed event"),
+            LibraryEvent::NoteCreated(created.id.clone())
+        );
+        assert!(matches!(
+            repository.load_note(&created.id),
+            Err(LibraryError::NotFound)
+        ));
+        assert_eq!(
+            repository
+                .load_note(&created.id)
+                .expect("fault consumed by this explicit load"),
+            Some(created),
+            "the committed record remains durable after the deliberately later load fault"
         );
     }
 }

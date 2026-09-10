@@ -373,6 +373,72 @@ async fn event_bridge_coalesces_external_projection_changes_without_loading_bodi
 }
 
 #[gpui::test]
+async fn queued_action_event_cannot_clear_partial_create_error_before_explicit_selection_recovery(
+    cx: &mut TestAppContext,
+) {
+    // Catches refresh_projection_events unconditionally setting Ready after
+    // the create action committed but its own refresh failed. The queued
+    // repository event may repair projections, but it never retried the
+    // action's selection/persistence phase; a real card selection must be
+    // the explicit recovery that clears the warning.
+    let (_profile, repository) = repository();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    view.update(cx, |view, view_cx| {
+        view.model.update(view_cx, |model, _| {
+            model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+        });
+    });
+
+    let create = cx
+        .debug_bounds("create-first-note")
+        .expect("empty-library create CTA");
+    cx.simulate_click(create.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("library-action-error").is_some(),
+        "the action's committed-create warning must first be visible"
+    );
+
+    let created = repository
+        .list_notes(Default::default())
+        .expect("read committed create")
+        .into_iter()
+        .next()
+        .expect("one committed projection")
+        .id;
+    cx.executor().advance_clock(Duration::from_millis(60));
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("library-action-error").is_some(),
+        "a queued projection event must not erase an unresolved action warning"
+    );
+    view.read_with(cx, |view, cx| {
+        assert!(matches!(
+            view.model.read(cx).status(),
+            AppStatus::Error(message) if message.contains("笔记已创建")
+                && message.contains("资料库数据已提交")
+        ));
+        assert_eq!(view.model.read(cx).projections().len(), 1);
+        assert_eq!(view.model.read(cx).projection_event_refreshes_for_test(), 1);
+    });
+
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("event refresh exposes the committed card for recovery");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.model.read(cx).status(), &AppStatus::Ready);
+        assert_eq!(
+            view.model.read(cx).navigation().selected_note_id(),
+            Some(&created)
+        );
+    });
+}
+
+#[gpui::test]
 async fn event_bridge_task_is_cancelled_immediately_when_the_shell_is_destroyed(
     cx: &mut TestAppContext,
 ) {

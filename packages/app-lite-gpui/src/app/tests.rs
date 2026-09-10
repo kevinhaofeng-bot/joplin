@@ -43,9 +43,10 @@ fn create_note_persists_before_it_becomes_selected() {
 }
 
 #[test]
-fn create_note_reuses_the_repository_hydration_for_its_active_session() {
-    // Catches AppModel::create_note selecting the returned ID through a second
-    // load_note call after the repository already returned the complete Note.
+fn create_note_installs_the_transaction_snapshot_without_post_commit_hydration() {
+    // Catches create_note returning only an ID and hydrating it after commit.
+    // The repository must return its transaction-built complete Note so a
+    // later I/O fault cannot disguise an already-committed create as failure.
     let (_profile, repository) = repository();
     let loads = repository.observe_note_loads();
     let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
@@ -59,12 +60,12 @@ fn create_note_reuses_the_repository_hydration_for_its_active_session() {
         .selected_note_id()
         .cloned()
         .expect("created note becomes selected after refresh");
-    assert_eq!(loads.try_recv(), Ok(selected));
     assert_eq!(
         loads.try_recv(),
         Err(TryRecvError::Empty),
-        "the complete Note returned by create_note must become the active session without a second hydration"
+        "create must install its transaction snapshot without any post-commit load_note"
     );
+    assert_eq!(model.active_session_note_id(), Some(&selected));
 }
 
 #[test]

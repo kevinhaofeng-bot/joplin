@@ -64,6 +64,16 @@ pub enum AppStatus {
     Error(String),
 }
 
+/// Tracks who owns the currently visible status. A projection event may
+/// refresh its own transient error, but must never erase a user action's
+/// committed-but-not-yet-recovered warning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusOrigin {
+    Neutral,
+    Action,
+    ProjectionEvent,
+}
+
 pub struct AppModel {
     repository: Arc<LibraryRepository>,
     navigation: NavigationState,
@@ -73,10 +83,11 @@ pub struct AppModel {
     list_view_mode: ListViewMode,
     sort: NoteSort,
     status: AppStatus,
+    status_origin: StatusOrigin,
     // A repository mutation can commit before the subsequent projection
-    // refresh/selection persistence fails. Keep that fact until `dispatch`
-    // converts the error into visible status instead of falsely implying the
-    // user action was rolled back.
+    // refresh/selection persistence fails. Keep that fact until an explicit
+    // recovery action completes; a later projection event must not falsely
+    // imply the user action was rolled back.
     partial_commit_message: Option<String>,
     #[cfg(test)]
     next_refresh_failure: Option<LibraryError>,
@@ -98,6 +109,7 @@ impl AppModel {
             list_view_mode: ListViewMode::default(),
             sort: NoteSort::default(),
             status: AppStatus::Ready,
+            status_origin: StatusOrigin::Neutral,
             partial_commit_message: None,
             #[cfg(test)]
             next_refresh_failure: None,
@@ -122,7 +134,13 @@ impl AppModel {
     }
 
     pub fn dispatch(&mut self, action: AppAction) -> Result<(), LibraryError> {
-        self.partial_commit_message = None;
+        let action_can_recover_partial = matches!(
+            action,
+            AppAction::CreateNote
+                | AppAction::SelectNote(_)
+                | AppAction::TrashNote(_)
+                | AppAction::TrashSelected
+        );
         let result = match action {
             AppAction::CreateNote => self.create_note(),
             AppAction::SelectNote(id) => self.select_note(id),
@@ -152,13 +170,17 @@ impl AppModel {
             }
         };
         match result {
-            Ok(()) => self.status = AppStatus::Ready,
+            Ok(()) => {
+                // Only an explicit user action that re-runs the
+                // refresh/selection path may resolve a prior committed
+                // mutation warning. Cosmetic list actions do not retry it.
+                if action_can_recover_partial {
+                    self.partial_commit_message = None;
+                }
+                self.set_action_success_status();
+            }
             Err(ref error) => {
-                self.status = AppStatus::Error(
-                    self.partial_commit_message
-                        .take()
-                        .unwrap_or_else(|| error.to_string()),
-                );
+                self.set_action_error_status(error);
             }
         }
         result
@@ -309,8 +331,15 @@ impl AppModel {
         }
         let result = self.refresh_list();
         match &result {
-            Ok(()) => self.status = AppStatus::Ready,
-            Err(error) => self.status = AppStatus::Error(error.to_string()),
+            Ok(()) if self.status_origin != StatusOrigin::Action => {
+                self.status = AppStatus::Ready;
+                self.status_origin = StatusOrigin::Neutral;
+            }
+            Err(error) if self.status_origin != StatusOrigin::Action => {
+                self.status = AppStatus::Error(error.to_string());
+                self.status_origin = StatusOrigin::ProjectionEvent;
+            }
+            Ok(()) | Err(_) => {}
         }
         result.map(|()| true)
     }
@@ -406,6 +435,25 @@ impl AppModel {
         self.partial_commit_message = Some(format!(
             "{committed_action}，但后续界面同步失败：{error}。资料库数据已提交；请重新打开资料库以恢复显示。"
         ));
+    }
+
+    fn set_action_success_status(&mut self) {
+        if let Some(message) = &self.partial_commit_message {
+            self.status = AppStatus::Error(message.clone());
+            self.status_origin = StatusOrigin::Action;
+        } else {
+            self.status = AppStatus::Ready;
+            self.status_origin = StatusOrigin::Neutral;
+        }
+    }
+
+    fn set_action_error_status(&mut self, error: &LibraryError) {
+        self.status = AppStatus::Error(
+            self.partial_commit_message
+                .clone()
+                .unwrap_or_else(|| error.to_string()),
+        );
+        self.status_origin = StatusOrigin::Action;
     }
 }
 
