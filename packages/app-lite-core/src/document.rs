@@ -45,7 +45,7 @@ impl SearchText {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CanonicalDocument {
-    pub blocks: Vec<Block>,
+    blocks: Vec<Block>,
 }
 
 impl CanonicalDocument {
@@ -53,6 +53,10 @@ impl CanonicalDocument {
         Self {
             blocks: normalize_blocks(blocks),
         }
+    }
+
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
     }
 
     fn normalized(&self) -> Self {
@@ -73,9 +77,6 @@ impl CanonicalDocument {
 
     pub fn resource_ids(&self) -> Vec<ResourceId> {
         resource_ids(self)
-            .into_iter()
-            .map(|value| ResourceId::new(value).expect("projected resource id is validated"))
-            .collect()
     }
 }
 
@@ -151,9 +152,15 @@ pub struct Marks {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inline {
-    Text { text: String, marks: Marks },
+    Text {
+        text: String,
+        marks: Marks,
+    },
     SoftBreak,
-    Image { resource_id: String, alt: String },
+    Image {
+        resource_id: ResourceId,
+        alt: String,
+    },
 }
 
 fn parse_html(input: &str) -> Result<CanonicalDocument, DocumentError> {
@@ -310,7 +317,7 @@ fn append_search_inlines(inlines: &[Inline], output: &mut String) {
     }
 }
 
-fn resource_ids(document: &CanonicalDocument) -> Vec<String> {
+fn resource_ids(document: &CanonicalDocument) -> Vec<ResourceId> {
     document
         .blocks
         .iter()
@@ -318,11 +325,7 @@ fn resource_ids(document: &CanonicalDocument) -> Vec<String> {
             Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => inlines
                 .iter()
                 .filter_map(|inline| match inline {
-                    Inline::Image { resource_id, .. }
-                        if validate_resource_id(resource_id).is_ok() =>
-                    {
-                        Some(resource_id.clone())
-                    }
+                    Inline::Image { resource_id, .. } => Some(resource_id.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -330,28 +333,12 @@ fn resource_ids(document: &CanonicalDocument) -> Vec<String> {
                 .iter()
                 .flat_map(|item| item.inlines.iter())
                 .filter_map(|inline| match inline {
-                    Inline::Image { resource_id, .. }
-                        if validate_resource_id(resource_id).is_ok() =>
-                    {
-                        Some(resource_id.clone())
-                    }
+                    Inline::Image { resource_id, .. } => Some(resource_id.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
         })
         .collect()
-}
-
-fn validate_resource_id(resource_id: &str) -> Result<(), DocumentError> {
-    if resource_id.len() == 32
-        && resource_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        Ok(())
-    } else {
-        Err(DocumentError::Parse)
-    }
 }
 
 fn block_is_empty(block: &Block) -> bool {
@@ -505,15 +492,11 @@ fn serialize_inlines(inlines: &[Inline], output: &mut String) {
             Inline::Text { text, marks } => serialize_text(text, marks, inlines, index, output),
             Inline::SoftBreak => output.push_str("<br>"),
             Inline::Image { resource_id, alt } => {
-                if validate_resource_id(resource_id).is_ok() {
-                    output.push_str("<img src=\":/");
-                    escape_attribute(resource_id, output);
-                    output.push_str("\" alt=\"");
-                    escape_attribute(alt, output);
-                    output.push_str("\">");
-                } else {
-                    escape_plain_text(alt, output);
-                }
+                output.push_str("<img src=\":/");
+                escape_attribute(resource_id.as_str(), output);
+                output.push_str("\" alt=\"");
+                escape_attribute(alt, output);
+                output.push_str("\">");
             }
         }
     }
@@ -580,20 +563,6 @@ fn escape_text_run(text: &str, inlines: &[Inline], index: usize, output: &mut St
             ' ' if !ordinary_space_can_collapse(&characters, position, inlines, index) => {
                 output.push_str("&nbsp;")
             }
-            _ => output.push(character),
-        }
-    }
-}
-
-fn escape_plain_text(text: &str, output: &mut String) {
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '"' => output.push_str("&quot;"),
-            '\'' => output.push_str("&#39;"),
-            ' ' | '\u{00a0}' => output.push_str("&nbsp;"),
             _ => output.push(character),
         }
     }
@@ -1617,15 +1586,13 @@ impl Projection {
             self.text(&alt, marks, true);
             return;
         };
-        if validate_resource_id(resource_id).is_err() {
+        let Ok(resource_id) = ResourceId::new(resource_id) else {
             self.text(&alt, marks, true);
             return;
-        }
+        };
         self.flush_pending_space();
-        self.ensure_current().push(Inline::Image {
-            resource_id: resource_id.to_owned(),
-            alt,
-        });
+        self.ensure_current()
+            .push(Inline::Image { resource_id, alt });
         self.flow_has_visible = true;
         self.current_item_has_content = true;
     }
@@ -1834,7 +1801,10 @@ mod tests {
         );
         assert_eq!(
             resource_ids(&document),
-            vec![RESOURCE_ID.to_owned(), RESOURCE_ID.to_owned()]
+            vec![
+                ResourceId::new(RESOURCE_ID).unwrap(),
+                ResourceId::new(RESOURCE_ID).unwrap()
+            ]
         );
         assert!(matches!(
             document.blocks.as_slice(),
@@ -1887,9 +1857,9 @@ mod tests {
         assert_eq!(
             resource_ids(&document),
             vec![
-                RESOURCE_ID.to_owned(),
-                SECOND_RESOURCE_ID.to_owned(),
-                RESOURCE_ID.to_owned()
+                ResourceId::new(RESOURCE_ID).unwrap(),
+                ResourceId::new(SECOND_RESOURCE_ID).unwrap(),
+                ResourceId::new(RESOURCE_ID).unwrap()
             ]
         );
         assert_eq!(search_text(&document), "beforea\ninnerb\naftera-again");
@@ -1977,7 +1947,10 @@ mod tests {
         assert_eq!(search_text(&document), "onea\ntwob");
         assert_eq!(
             resource_ids(&document),
-            vec![RESOURCE_ID.to_owned(), SECOND_RESOURCE_ID.to_owned()]
+            vec![
+                ResourceId::new(RESOURCE_ID).unwrap(),
+                ResourceId::new(SECOND_RESOURCE_ID).unwrap()
+            ]
         );
         let Block::List { items, .. } = &document.blocks[0] else {
             panic!("expected list");
@@ -2129,7 +2102,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                 },
                 Inline::SoftBreak,
                 Inline::Image {
-                    resource_id: RESOURCE_ID.into(),
+                    resource_id: ResourceId::new(RESOURCE_ID).unwrap(),
                     alt: "截图 & 证据.png".into(),
                 },
                 Inline::Text {
@@ -2176,12 +2149,15 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
             "<p><img src=\":/{RESOURCE_ID}\" alt=\"ok\"><img src=\"data:image/png;base64,AAAA\" alt=\"data\"><img src=\"https://example.com/a.png\" alt=\"remote\"><img src=\":/NOT-VALID\" alt=\"invalid\"></p>"
         );
         let document = parse_html(&html).unwrap();
-        assert_eq!(resource_ids(&document), vec![RESOURCE_ID]);
+        assert_eq!(
+            resource_ids(&document),
+            vec![ResourceId::new(RESOURCE_ID).unwrap()]
+        );
         assert_eq!(
             document,
             CanonicalDocument::from_blocks(vec![paragraph(vec![
                 Inline::Image {
-                    resource_id: RESOURCE_ID.into(),
+                    resource_id: ResourceId::new(RESOURCE_ID).unwrap(),
                     alt: "ok".into(),
                 },
                 Inline::Text {

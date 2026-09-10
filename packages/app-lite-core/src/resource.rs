@@ -3,8 +3,10 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -18,7 +20,7 @@ pub struct ResourceId(String);
 impl ResourceId {
     pub fn new(value: impl AsRef<str>) -> Result<Self, ResourceError> {
         let value = value.as_ref();
-        if matches!(value.len(), 32 | 64)
+        if value.len() == 32
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
@@ -31,6 +33,33 @@ impl ResourceId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlobHash(String);
+
+impl BlobHash {
+    pub fn new(value: impl AsRef<str>) -> Result<Self, ResourceError> {
+        let value = value.as_ref();
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(ResourceError::InvalidData)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self(hex_digest(&Sha256::digest(bytes)))
     }
 }
 
@@ -59,13 +88,11 @@ pub struct ResourceInput<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceBlob {
     pub id: ResourceId,
-    pub sha256: ResourceId,
+    pub sha256: BlobHash,
     pub size: usize,
-    pub path: PathBuf,
 }
 
 pub struct ResourceStore {
-    blobs_root: PathBuf,
     blobs_dir: DirFd,
 }
 
@@ -87,32 +114,27 @@ impl ResourceStore {
         let profile_dir = open_dir_path(&profile_root)?;
         let resources_dir = open_or_create_dir(profile_dir.0, "resources")?;
         let blobs_dir = open_or_create_dir(resources_dir.0, "blobs")?;
-        let blobs_root = profile_root.join("resources").join("blobs");
-        Ok(Self {
-            blobs_root,
-            blobs_dir,
-        })
+        Ok(Self { blobs_dir })
     }
 
     pub fn put(&self, input: ResourceInput<'_>) -> Result<ResourceBlob, ResourceError> {
         validate_import(&input)?;
 
         let digest = Sha256::digest(input.bytes);
-        let sha256 = hex_digest(&digest);
-        persist_blob(self.blobs_dir.0, input.bytes, &sha256)?;
+        let sha256 = BlobHash::new(hex_digest(&digest)).expect("SHA-256 digest is valid");
+        persist_blob(self.blobs_dir.0, input.bytes, sha256.as_str())?;
         Ok(ResourceBlob {
             id: ResourceId::new(new_resource_id()).expect("generated resource id is valid"),
-            sha256: ResourceId::new(&sha256).expect("SHA-256 digest is a valid resource id"),
+            sha256,
             size: input.bytes.len(),
-            path: self.path_for(&sha256),
         })
     }
 
-    pub fn read(&self, sha256: &ResourceId) -> Result<Vec<u8>, ResourceError> {
+    pub fn read(&self, sha256: &BlobHash) -> Result<Vec<u8>, ResourceError> {
         self.read_blob(sha256.as_str())
     }
 
-    pub(crate) fn read_blob(&self, sha256: &str) -> Result<Vec<u8>, ResourceError> {
+    fn read_blob(&self, sha256: &str) -> Result<Vec<u8>, ResourceError> {
         if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ResourceError::InvalidData);
         }
@@ -127,10 +149,6 @@ impl ResourceStore {
             return Err(ResourceError::CorruptBlob);
         }
         Ok(bytes)
-    }
-
-    pub(crate) fn path_for(&self, sha256: &str) -> PathBuf {
-        self.blobs_root.join(sha256)
     }
 }
 
@@ -181,6 +199,11 @@ fn persist_blob(dir_fd: RawFd, bytes: &[u8], sha256: &str) -> Result<(), Resourc
     let mut temp = unsafe { File::from_raw_fd(temp_fd) };
     let result = temp.write_all(bytes).and_then(|_| temp.sync_all());
     if let Err(error) = result {
+        drop(temp);
+        let _ = unlink_at(dir_fd, &temp_name);
+        return Err(error.into());
+    }
+    if let Err(error) = test_publish_hook(dir_fd, sha256) {
         drop(temp);
         let _ = unlink_at(dir_fd, &temp_name);
         return Err(error.into());
@@ -338,9 +361,23 @@ fn rename_at(
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let new = std::ffi::CString::new(new_name)
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    if unsafe { libc::renameat(old_dir, old.as_ptr(), new_dir, new.as_ptr()) } < 0 {
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            old_dir,
+            old.as_ptr(),
+            new_dir,
+            new.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let result = unsafe { libc::linkat(old_dir, old.as_ptr(), new_dir, new.as_ptr(), 0) };
+    if result < 0 {
         Err(std::io::Error::last_os_error())
     } else {
+        #[cfg(not(target_os = "macos"))]
+        unlink_at(old_dir, old_name)?;
         Ok(())
     }
 }
@@ -385,10 +422,154 @@ fn new_resource_id() -> String {
 }
 
 #[cfg(test)]
+enum PublishHook {
+    Fail,
+    PublishExisting(Vec<u8>),
+}
+
+#[cfg(test)]
+struct PendingPublishHook {
+    sha256: BlobHash,
+    hook: PublishHook,
+}
+
+#[cfg(test)]
+static PUBLISH_HOOK: OnceLock<Mutex<Vec<PendingPublishHook>>> = OnceLock::new();
+
+#[cfg(test)]
+fn publish_hook() -> &'static Mutex<Vec<PendingPublishHook>> {
+    PUBLISH_HOOK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn fail_next_publish_after_temp_sync(sha256: BlobHash) {
+    publish_hook().lock().unwrap().push(PendingPublishHook {
+        sha256,
+        hook: PublishHook::Fail,
+    });
+}
+
+#[cfg(test)]
+fn publish_existing_target_after_temp_sync(sha256: BlobHash, bytes: &[u8]) {
+    publish_hook().lock().unwrap().push(PendingPublishHook {
+        sha256,
+        hook: PublishHook::PublishExisting(bytes.to_vec()),
+    });
+}
+
+#[cfg(test)]
+fn test_publish_hook(dir_fd: RawFd, sha256: &str) -> std::io::Result<()> {
+    let mut pending = publish_hook().lock().unwrap();
+    let Some(position) = pending
+        .iter()
+        .position(|candidate| candidate.sha256.as_str() == sha256)
+    else {
+        return Ok(());
+    };
+    let hook = pending.remove(position).hook;
+    drop(pending);
+    match hook {
+        PublishHook::Fail => Err(std::io::Error::other("test publish interruption")),
+        PublishHook::PublishExisting(bytes) => {
+            let name = std::ffi::CString::new(sha256)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            let fd = unsafe {
+                libc::openat(
+                    dir_fd,
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            file.write_all(&bytes)?;
+            file.sync_all()
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn test_publish_hook(_dir_fd: RawFd, _sha256: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{MAX_IMAGE_BYTES, ResourceError, ResourceInput, ResourceStore};
+    use super::{
+        BlobHash, MAX_IMAGE_BYTES, ResourceError, ResourceInput, ResourceStore,
+        fail_next_publish_after_temp_sync, publish_existing_target_after_temp_sync,
+    };
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
+
+    #[test]
+    fn after_temp_sync_failure_does_not_publish_or_poison_a_later_put() {
+        // Catches direct-final writes and failure paths that leave a published target behind.
+        let dir = tempdir().unwrap();
+        let store = ResourceStore::new(dir.path()).unwrap();
+        let bytes = b"recover after publish failure";
+        let hash = BlobHash::from_bytes(bytes);
+
+        fail_next_publish_after_temp_sync(hash.clone());
+        assert!(matches!(
+            store.put(ResourceInput {
+                bytes,
+                title: "failure",
+                mime: "image/png",
+                file_extension: "png",
+            }),
+            Err(ResourceError::Io(_))
+        ));
+        assert!(
+            !dir.path()
+                .join("resources/blobs")
+                .join(hash.as_str())
+                .exists()
+        );
+        assert_eq!(
+            store
+                .put(ResourceInput {
+                    bytes,
+                    title: "recovered",
+                    mime: "image/png",
+                    file_extension: "png",
+                })
+                .unwrap()
+                .sha256,
+            hash
+        );
+    }
+
+    #[test]
+    fn concurrent_existing_target_after_temp_sync_is_not_replaced() {
+        // Catches overwrite-on-rename if another publisher creates the final name after temp sync.
+        let dir = tempdir().unwrap();
+        let store = ResourceStore::new(dir.path()).unwrap();
+        let bytes = b"target race";
+        let hash = BlobHash::from_bytes(bytes);
+
+        publish_existing_target_after_temp_sync(hash.clone(), b"racing publisher");
+        assert!(matches!(
+            store.put(ResourceInput {
+                bytes,
+                title: "race",
+                mime: "image/png",
+                file_extension: "png",
+            }),
+            Err(ResourceError::CorruptBlob)
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join("resources/blobs").join(hash.as_str())).unwrap(),
+            b"racing publisher"
+        );
+    }
 
     #[test]
     fn put_rejects_empty_and_over_limit_data() {

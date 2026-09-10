@@ -1,3 +1,4 @@
+use app_lite_core::document::{Block, BlockStyle, Inline, Marks};
 use app_lite_core::{CanonicalDocument, ResourceId};
 
 const FIRST_RESOURCE: &str = "0123456789abcdef0123456789abcdef";
@@ -62,5 +63,42 @@ fn canonical_document_projects_one_hundred_thousand_visible_characters() {
     assert_eq!(
         CanonicalDocument::parse_html(parsed.to_canonical_html().as_str()).unwrap(),
         parsed
+    );
+}
+
+#[test]
+fn public_constructor_keeps_document_canonical_and_rejects_invalid_image_ids() {
+    // Catches public construction that can defer normalization until serialization.
+    let valid = ResourceId::new(FIRST_RESOURCE).unwrap();
+    assert!(ResourceId::new("not-a-resource-id").is_err());
+    assert!(ResourceId::new("a".repeat(64)).is_err());
+
+    let document = CanonicalDocument::from_blocks(vec![Block::Paragraph {
+        style: BlockStyle {
+            indent: 99,
+            ..BlockStyle::default()
+        },
+        inlines: vec![
+            Inline::Image {
+                resource_id: valid,
+                alt: "receipt".into(),
+            },
+            Inline::Text {
+                text: " linked".into(),
+                marks: Marks {
+                    link: Some("javascript:alert(1)".into()),
+                    ..Marks::default()
+                },
+            },
+        ],
+    }]);
+
+    assert_eq!(document.blocks().len(), 1);
+    let html = document.to_canonical_html();
+    assert!(html.as_str().contains("data-indent=\"8\""));
+    assert!(!html.as_str().contains("href="));
+    assert_eq!(
+        CanonicalDocument::parse_html(html.as_str()).unwrap(),
+        document
     );
 }
