@@ -252,4 +252,14 @@ Status: DONE_WITH_CONCERNS
 
 - The fix preserves the single backdrop/panel hierarchy from Round 5. It adds no helper-dispatch layer, overlay, or second event owner.
 - The short-mask rule constrains the popover itself rather than moving the content mask, editor surface, Task 7 thresholds, or measurement path.
-- Fresh real-window Release re-acceptance remains PENDING; these are mounted GPUI seam results, not a claim of manual desktop PASS.
+- Independent scoped review of `6512f51da..94168c807` approved the repair with no Critical or Important findings. One non-blocking Minor remains: the invalid-state 134-pt natural height is conservative and scroll-contained, but an actual very-short-window click after scrolling was not manually exercised.
+
+### Round 6 exact Release acceptance
+
+Status: PASS_WITH_MINOR_FOLLOWUP
+
+- Wide window PASS: More renders full Chinese labels and full-row targets; Link opens at the clicked toolbar trigger and stays inside the note surface. Evidence: `/tmp/joplin-lite-visible-mvp/acceptance3/01-wide-more-labelled.png` and `/tmp/joplin-lite-visible-mvp/acceptance3/05-wide-link-anchored.png`.
+- Real invalid Apply PASS: with the first line selected, entering `not-a-url` and clicking the mounted 应用 button kept the panel open, rendered the red invalid field plus `请输入有效 URL`, and did not replace the selected document text. Evidence: `/tmp/joplin-lite-visible-mvp/acceptance3/08-invalid-link-real-apply.png`.
+- Real Cancel PASS: clicking the mounted 取消 button closed Link and restored the original first-line selection. Evidence: `/tmp/joplin-lite-visible-mvp/acceptance3/09-invalid-cancel-selection-restored.png`.
+- Narrow 760-pt window PASS: More retained Chinese labels; More→Link atomically removed the overflow menu; both the mounted 取消 button and an outside-body click closed Link without leaving either panel behind, while the original selection remained. Evidence: `/tmp/joplin-lite-visible-mvp/acceptance3/11-narrow-more-labelled.png`, `/tmp/joplin-lite-visible-mvp/acceptance3/12-narrow-more-to-link.png`, `/tmp/joplin-lite-visible-mvp/acceptance3/13-narrow-cancel-no-stale-panel.png`, and `/tmp/joplin-lite-visible-mvp/acceptance3/14-narrow-outside-dismiss-no-stale-panel.png`.
+- The exact Release process was stopped after capture. Manual very-short-window scrolling/clickability remains the single Minor follow-up; the mounted resize/containment test is PASS, so no clipping or stale state is inferred beyond what was exercised.
