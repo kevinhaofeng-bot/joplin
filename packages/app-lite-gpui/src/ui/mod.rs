@@ -19,6 +19,8 @@ use gpui::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+#[cfg(test)]
+use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 /// The product library shell. All user operations arrive at `apply_action`,
@@ -36,9 +38,47 @@ pub struct LibraryShell {
     // destroyed. The task captures only a WeakEntity and never blocks on recv.
     _event_task: Task<()>,
     #[cfg(test)]
+    event_task_cancellation_receiver: Option<Receiver<()>>,
+    #[cfg(test)]
     rendered_note_range: Option<std::ops::Range<usize>>,
     #[cfg(test)]
     last_scroll_request: Option<usize>,
+}
+
+/// A task-local lifetime guard. In production it is deliberately zero-sized;
+/// tests attach a receiver so they can prove that dropping the retained `Task`
+/// cancels the future immediately instead of merely letting a later weak-entity
+/// update notice the closed window.
+struct EventTaskLifetime {
+    #[cfg(test)]
+    cancellation_sender: Option<Sender<()>>,
+}
+
+impl EventTaskLifetime {
+    #[cfg(test)]
+    fn observed() -> (Self, Receiver<()>) {
+        let (cancellation_sender, cancellation_receiver) = mpsc::channel();
+        (
+            Self {
+                cancellation_sender: Some(cancellation_sender),
+            },
+            cancellation_receiver,
+        )
+    }
+
+    #[cfg(not(test))]
+    const fn unobserved() -> Self {
+        Self {}
+    }
+}
+
+impl Drop for EventTaskLifetime {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(cancellation_sender) = self.cancellation_sender.take() {
+            let _ = cancellation_sender.send(());
+        }
+    }
 }
 
 fn bind_library_keybindings(cx: &mut App) {
@@ -108,7 +148,11 @@ impl LibraryShell {
             cx.notify();
         });
         let event_receiver = model.read(cx).subscribe_library_events();
-        let event_task = Self::spawn_event_bridge(event_receiver, cx);
+        #[cfg(test)]
+        let (event_task_lifetime, event_task_cancellation_receiver) = EventTaskLifetime::observed();
+        #[cfg(not(test))]
+        let event_task_lifetime = EventTaskLifetime::unobserved();
+        let event_task = Self::spawn_event_bridge(event_receiver, event_task_lifetime, cx);
         let mut shell = Self {
             model,
             editor_surface: None,
@@ -120,6 +164,8 @@ impl LibraryShell {
             _model_observation: observation,
             _event_task: event_task,
             #[cfg(test)]
+            event_task_cancellation_receiver: Some(event_task_cancellation_receiver),
+            #[cfg(test)]
             rendered_note_range: None,
             #[cfg(test)]
             last_scroll_request: None,
@@ -130,9 +176,13 @@ impl LibraryShell {
 
     fn spawn_event_bridge(
         receiver: Receiver<app_lite_core::LibraryEvent>,
+        event_task_lifetime: EventTaskLifetime,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
+            // Keep the guard inside the cancellable future, not on the shell.
+            // When `_event_task` drops, this guard drops in the same turn.
+            let _event_task_lifetime = event_task_lifetime;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
@@ -164,6 +214,13 @@ impl LibraryShell {
                 }
             }
         })
+    }
+
+    #[cfg(test)]
+    fn take_event_task_cancellation_receiver_for_test(&mut self) -> Receiver<()> {
+        self.event_task_cancellation_receiver
+            .take()
+            .expect("event task cancellation receiver is taken only once per test")
     }
 
     /// The single UI reducer seam. It notifies the model even on errors, then

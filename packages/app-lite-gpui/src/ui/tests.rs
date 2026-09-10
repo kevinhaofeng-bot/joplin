@@ -373,6 +373,37 @@ async fn event_bridge_coalesces_external_projection_changes_without_loading_bodi
 }
 
 #[gpui::test]
+async fn event_bridge_task_is_cancelled_immediately_when_the_shell_is_destroyed(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    let weak_shell = view.downgrade();
+    let task_cancelled = view.update(cx, |view, _| {
+        view.take_event_task_cancellation_receiver_for_test()
+    });
+
+    // Removing the window drops its root. Releasing our final Entity handle
+    // queues GPUI's entity-release pass; do not advance the 50ms poll timer,
+    // because delayed weak-update exit is not cancellation.
+    cx.update(|window, _| window.remove_window());
+    drop(view);
+    assert!(
+        weak_shell.upgrade().is_none(),
+        "the window must release its shell"
+    );
+    // GPUI releases zero-count entities at the next app effect boundary, then
+    // async-task schedules one final cancellation runnable. Drain both without
+    // advancing the polling clock.
+    cx.cx.update(|_| {});
+    cx.run_until_parked();
+    task_cancelled
+        .try_recv()
+        .expect("destroying the shell must cancel the retained event task immediately");
+}
+
+#[gpui::test]
 async fn rich_body_mounts_the_native_canvas_and_never_uses_body_text_fallback(
     cx: &mut TestAppContext,
 ) {
