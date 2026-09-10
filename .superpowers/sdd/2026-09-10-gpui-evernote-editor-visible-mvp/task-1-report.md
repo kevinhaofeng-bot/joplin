@@ -77,3 +77,35 @@ Status: DONE_WITH_CONCERNS
 
 - Verified the Round 1 diff changes only `spike_app.rs` and `native_editor/chrome.rs`; Task 7 fixture counts, memory thresholds, drawable-pool logic, image paste/drop paths, and measurement code were not changed.
 - More and primary resolve their command descriptors through the same catalogue placement; Link buttons call the production submit/cancel methods rather than test helpers. Picker selection calls the same typed `InsertImage` catalogue transaction as the prompt.
+
+## Round 2 review repairs
+
+Status: DONE_WITH_CONCERNS
+
+### Changes made
+
+- Replaced the title's potentially reversed byte `Range` state with an always-ordered selection range plus an explicit anchor and direction flag. Platform `UTF16Selection` now reports that direction, while ordinary input, Cmd-V, IME marked replacement, painting, and byte replacement always operate on an ordered range.
+- Fixed non-extending Left/Right so a nonempty title selection first collapses at the requested edge and returns; it only moves one grapheme on the next keypress.
+- Made Cmd-X a true no-op for an empty title selection, preserving both text and clipboard. Nonempty title selections retain copy-and-delete behavior.
+- Tightened the one-row toolbar to a nonshrinking 44pt flex item and made every 32pt command hit target an actual flex container, so the 20pt SVG child is centered.
+- Strengthened Link Apply verification to assert exactly one history entry and a real URL mark. Picker completion now asserts cancellation leaves document/history/selection/focus identical and selection creates a structured image block, valid selection, one history entry, and body focus.
+
+### Round 2 RED to GREEN evidence
+
+1. RED: `cargo test native_editor::chrome::tests::title_input_reverse_selection_replaces_and_marks_without_reversed_ranges -- --exact` failed with `slice index starts at 10 but ends at 7` when Shift-Left formed a reversed range and the IME replacement path reached `String::replace_range`. GREEN: the same test passes after storing ordered range plus direction.
+2. The title production-shell test now drives reverse selection through normal key events, ordinary input, Cmd-V, and `EntityInputHandler` IME mark/commit calls; it also demonstrates empty-selection Cmd-X preserves clipboard. The Link and picker shell seams now assert transaction-level effects rather than only focus/panel state.
+
+### Round 2 controller gates
+
+- `cargo test --manifest-path Cargo.toml --bin velotype chrome -- --nocapture`: PASS, 22 tests.
+- `cargo test --manifest-path Cargo.toml --bin velotype shell_ -- --nocapture`: PASS, 16 tests.
+- `cargo test --manifest-path Cargo.toml --bin velotype -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores`: PASS, 990 passed / 0 failed / 1 filtered out.
+- `cargo test --manifest-path Cargo.toml --all-targets --no-run`: PASS.
+- `cargo fmt --check --manifest-path Cargo.toml`: PASS.
+- `git diff --check`: PASS.
+- `cargo build --manifest-path Cargo.toml --release`: PASS (final optimized LTO link completed in 2m19s).
+
+### Round 2 self-review and concerns
+
+- The diff remains limited to the title/input shell and report; no Task 7 thresholds, drawable-pool settings, image cache budgets, or measurement workloads changed.
+- Real-window status remains PENDING for the unchanged desktop automation limitation documented in Round 1; no screenshot or native interaction is claimed as PASS.

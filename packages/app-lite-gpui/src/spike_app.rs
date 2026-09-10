@@ -900,11 +900,13 @@ impl SpikeView {
             }
             "x" if secondary => {
                 let text = self.title.read(cx).selected_text().to_owned();
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                self.title.update(cx, |title, title_cx| {
-                    title.delete_forward();
-                    title_cx.notify();
-                });
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.title.update(cx, |title, title_cx| {
+                        title.delete_forward();
+                        title_cx.notify();
+                    });
+                }
                 true
             }
             "v" if secondary => {
@@ -1487,6 +1489,7 @@ impl SpikeView {
             .debug_selector(|| descriptor.label.to_owned())
             .flex_shrink_0()
             .size(px(32.0))
+            .flex()
             .items_center()
             .justify_center()
             .mr(px(4.0))
@@ -2024,6 +2027,7 @@ impl Render for SpikeView {
             .relative()
             .w(px(chrome.header_width))
             .flex()
+            .flex_none()
             .h(px(chrome.toolbar_height))
             .items_center()
             .children(primary_buttons)
@@ -2167,10 +2171,10 @@ enum ImagePickerCompletion {
     Selected(PathBuf),
 }
 
-/// This is the completion seam shared by the native file picker and shell
-/// tests. A dismissed picker never reaches it, so its prior focus remains;
-/// a selected image is a real editor transaction and deliberately returns
-/// focus to the body for continued writing.
+/// This is the selected-image half of the completion seam. Cancellation is
+/// represented explicitly by `ImagePickerCompletion::Cancelled` and leaves
+/// focus untouched; a selected image is a real editor transaction and
+/// deliberately returns focus to the body for continued writing.
 fn apply_selected_image_path(
     editor: &Entity<EditorCore>,
     catalogue: CommandCatalogue,
@@ -4172,9 +4176,6 @@ mod tests {
         let apply = cx
             .debug_bounds("evernote-link-apply")
             .expect("Apply must be a real hit target");
-        let cancel = cx
-            .debug_bounds("evernote-link-cancel")
-            .expect("Cancel must be a real hit target");
         cx.simulate_input("not a URL");
         cx.simulate_click(apply.center(), Modifiers::default());
         redraw(cx);
@@ -4197,6 +4198,12 @@ mod tests {
             });
         });
 
+        let (before_apply_history, selected_range) = view.read_with(cx, |view, cx| {
+            (
+                view.editor.read(cx).undo_depth(),
+                view.editor.read(cx).selected_text_ranges(),
+            )
+        });
         let link = cx.debug_bounds("Link").expect("Link remains mounted");
         cx.simulate_click(link.center(), Modifiers::default());
         redraw(cx);
@@ -4210,6 +4217,24 @@ mod tests {
             view.read_with(app, |view, app| {
                 assert!(view.link_popover.is_none());
                 assert!(view.editor.read(app).focus_handle().is_focused(window));
+                assert_eq!(view.editor.read(app).undo_depth(), before_apply_history + 1);
+                let (node_id, range) = selected_range
+                    .first()
+                    .expect("link test has a real selected text range");
+                let styles = view
+                    .editor
+                    .read(app)
+                    .document()
+                    .block(*node_id)
+                    .and_then(|block| block.content.styles())
+                    .expect("Apply creates a styled text block");
+                assert!(styles.iter().any(|run| {
+                    run.range.start <= range.start
+                        && run.range.end >= range.end
+                        && run.marks.iter().any(
+                            |mark| matches!(mark, Mark::Link(url) if url == "https://example.com"),
+                        )
+                }));
             });
         });
     }
@@ -4238,9 +4263,13 @@ mod tests {
                 .iter()
                 .find(|descriptor| descriptor.command == *command)
                 .unwrap();
-            assert!(
-                cx.debug_bounds(descriptor.label).is_some(),
-                "{} primary",
+            let bounds = cx
+                .debug_bounds(descriptor.label)
+                .unwrap_or_else(|| panic!("{} primary", descriptor.label));
+            assert_eq!(
+                bounds.size,
+                size(px(32.0), px(32.0)),
+                "{} hit target",
                 descriptor.label
             );
         }
@@ -4292,6 +4321,48 @@ mod tests {
         view.read_with(cx, |view, cx| {
             assert_eq!(view.title.read(cx).text(), "新会议记")
         });
+        cx.simulate_keystrokes("end shift-left");
+        cx.simulate_input("录");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.title.read(cx).text(), "新会议录");
+        });
+        cx.simulate_keystrokes("end shift-left");
+        cx.write_to_clipboard(ClipboardItem::new_string("本".into()));
+        cx.simulate_keystrokes("cmd-v");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.title.read(cx).text(), "新会议本");
+        });
+        cx.simulate_keystrokes("end shift-left");
+        cx.update(|window, app| {
+            view.update(app, |view, view_cx| {
+                view.title.update(view_cx, |title, title_cx| {
+                    <TitleInput as EntityInputHandler>::replace_and_mark_text_in_range(
+                        title,
+                        None,
+                        "候",
+                        Some(1..1),
+                        window,
+                        title_cx,
+                    );
+                    <TitleInput as EntityInputHandler>::replace_text_in_range(
+                        title, None, "后", window, title_cx,
+                    );
+                });
+            });
+        });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.title.read(cx).text(), "新会议后");
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string("剪贴板保留".into()));
+        cx.simulate_keystrokes("cmd-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("剪贴板保留".into()),
+            "Cmd-X with an empty title selection must not replace clipboard"
+        );
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.title.read(cx).text(), "新会议后");
+        });
         cx.simulate_keystrokes("enter");
         cx.update(|window, app| {
             view.read_with(app, |view, app| {
@@ -4313,6 +4384,14 @@ mod tests {
                 view.title.read(app).focus_handle().focus(window)
             });
         });
+        let cancelled_baseline = view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            (
+                editor.document().semantic_snapshot(),
+                editor.undo_depth(),
+                editor.selection(),
+            )
+        });
         cx.update(|window, app| {
             view.update(app, |view, view_cx| {
                 complete_image_picker(
@@ -4324,7 +4403,15 @@ mod tests {
                 )
                 .expect("cancelled picker is a no-op");
                 assert!(view.title.read(view_cx).focus_handle().is_focused(window));
+                let editor = view.editor.read(view_cx);
+                assert_eq!(editor.document().semantic_snapshot(), cancelled_baseline.0);
+                assert_eq!(editor.undo_depth(), cancelled_baseline.1);
+                assert_eq!(editor.selection(), cancelled_baseline.2);
             });
+        });
+        let selected_baseline = view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            (editor.document().block_count(), editor.undo_depth())
         });
         let path = std::env::temp_dir().join(format!(
             "joplin-lite-picker-focus-{}.png",
@@ -4346,8 +4433,21 @@ mod tests {
         let _ = std::fs::remove_file(path);
         cx.update(|window, app| {
             view.read_with(app, |view, app| {
-                assert!(view.editor.read(app).focus_handle().is_focused(window));
+                let editor = view.editor.read(app);
+                assert!(editor.focus_handle().is_focused(window));
                 assert!(!view.title.read(app).focus_handle().is_focused(window));
+                assert_eq!(editor.undo_depth(), selected_baseline.1 + 1);
+                assert!(editor.document().block_count() > selected_baseline.0);
+                assert!(editor.document().blocks().iter().any(|block| matches!(
+                    block.content,
+                    crate::native_editor::model::BlockContent::Image { .. }
+                )));
+                assert!(
+                    editor
+                        .document()
+                        .block(editor.selection().head.node_id)
+                        .is_some()
+                );
             });
         });
     }
@@ -4812,7 +4912,11 @@ mod tests {
         let more = cx
             .debug_bounds("evernote-native-spike-more-trigger")
             .expect("narrow overflow trigger");
-        assert!(toolbar.size.height >= px(32.0));
+        assert_eq!(
+            toolbar.size.height,
+            px(44.0),
+            "primary toolbar owns one exact 44pt row"
+        );
         assert_eq!(
             undo.center().y,
             more.center().y,

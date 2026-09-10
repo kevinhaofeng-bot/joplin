@@ -44,6 +44,8 @@ pub struct ToolbarPlacement {
 pub struct TitleInput {
     text: String,
     selection: Range<usize>,
+    selection_anchor: usize,
+    selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     focus: FocusHandle,
     last_bounds: Option<Bounds<Pixels>>,
@@ -57,6 +59,8 @@ impl TitleInput {
         Self {
             text,
             selection: end..end,
+            selection_anchor: end,
+            selection_reversed: false,
             marked_range: None,
             focus: cx.focus_handle(),
             last_bounds: None,
@@ -86,55 +90,63 @@ impl TitleInput {
     }
 
     pub fn selected_text(&self) -> &str {
-        let range = ordered_range(&self.selection);
-        self.text.get(range).unwrap_or_default()
+        self.text.get(self.selection.clone()).unwrap_or_default()
     }
 
     pub fn select_all(&mut self) {
-        self.selection = 0..self.text.len();
+        self.set_selection(0, self.text.len());
         self.marked_range = None;
     }
 
     pub fn collapse(&mut self, index: usize) {
         let index = grapheme_boundary_at_or_before(&self.text, index);
-        self.selection = index..index;
+        self.set_selection(index, index);
         self.marked_range = None;
     }
 
     pub fn move_to_edge(&mut self, end: bool, extend: bool) {
         let index = if end { self.text.len() } else { 0 };
         if extend {
-            self.selection.end = index;
+            self.set_selection(self.selection_anchor, index);
         } else {
-            self.selection = index..index;
+            self.set_selection(index, index);
         }
         self.marked_range = None;
     }
 
     pub fn move_horizontal(&mut self, right: bool, extend: bool) {
-        let ordered = ordered_range(&self.selection);
-        let index = if extend {
-            self.selection.end
-        } else if !ordered.is_empty() {
-            if right { ordered.end } else { ordered.start }
-        } else {
-            self.selection.end
-        };
+        if !extend && !self.selection.is_empty() {
+            self.set_selection(
+                if right {
+                    self.selection.end
+                } else {
+                    self.selection.start
+                },
+                if right {
+                    self.selection.end
+                } else {
+                    self.selection.start
+                },
+            );
+            self.marked_range = None;
+            return;
+        }
+        let index = self.selection_head();
         let next = if right {
             next_grapheme_boundary(&self.text, index)
         } else {
             previous_grapheme_boundary(&self.text, index)
         };
         if extend {
-            self.selection.end = next;
+            self.set_selection(self.selection_anchor, next);
         } else {
-            self.selection = next..next;
+            self.set_selection(next, next);
         }
         self.marked_range = None;
     }
 
     pub fn delete_backward(&mut self) {
-        let range = ordered_range(&self.selection);
+        let range = self.selection.clone();
         let range = if range.is_empty() {
             previous_grapheme_boundary(&self.text, range.start)..range.start
         } else {
@@ -144,7 +156,7 @@ impl TitleInput {
     }
 
     pub fn delete_forward(&mut self) {
-        let range = ordered_range(&self.selection);
+        let range = self.selection.clone();
         let range = if range.is_empty() {
             range.end..next_grapheme_boundary(&self.text, range.end)
         } else {
@@ -168,7 +180,7 @@ impl TitleInput {
             return;
         }
         self.text.replace_range(range.clone(), "");
-        self.selection = range.start..range.start;
+        self.set_selection(range.start, range.start);
         self.marked_range = None;
     }
 
@@ -183,8 +195,8 @@ impl TitleInput {
 
     pub fn begin_pointer_selection(&mut self, point: Point<Pixels>, extend: bool) -> Option<usize> {
         let index = self.byte_index_for_point(point)?;
-        let anchor = if extend { self.selection.start } else { index };
-        self.selection = anchor.min(index)..anchor.max(index);
+        let anchor = if extend { self.selection_anchor } else { index };
+        self.set_selection(anchor, index);
         self.pointer_anchor = Some(anchor);
         self.marked_range = None;
         Some(index)
@@ -192,8 +204,8 @@ impl TitleInput {
 
     pub fn extend_pointer_selection(&mut self, point: Point<Pixels>) -> Option<usize> {
         let index = self.byte_index_for_point(point)?;
-        let anchor = self.pointer_anchor.unwrap_or(self.selection.start);
-        self.selection = anchor.min(index)..anchor.max(index);
+        let anchor = self.pointer_anchor.unwrap_or(self.selection_anchor);
+        self.set_selection(anchor, index);
         self.marked_range = None;
         Some(index)
     }
@@ -207,6 +219,20 @@ impl TitleInput {
         let line = self.last_layout.as_ref()?;
         let x = (point.x - bounds.left()).max(gpui::px(0.0)).min(line.width);
         Some(line.closest_index_for_x(x).min(self.text.len()))
+    }
+
+    fn selection_head(&self) -> usize {
+        if self.selection_reversed {
+            self.selection.start
+        } else {
+            self.selection.end
+        }
+    }
+
+    fn set_selection(&mut self, anchor: usize, head: usize) {
+        self.selection = anchor.min(head)..anchor.max(head);
+        self.selection_anchor = anchor;
+        self.selection_reversed = !self.selection.is_empty() && head < anchor;
     }
 
     fn checked_utf16_range(&self, range: &Range<usize>) -> Option<Range<usize>> {
@@ -237,7 +263,7 @@ impl TitleInput {
         }
         self.text.replace_range(range.clone(), replacement);
         let caret = range.start + replacement.len();
-        self.selection = caret..caret;
+        self.set_selection(caret, caret);
         self.marked_range = None;
         true
     }
@@ -277,9 +303,12 @@ impl TitleInput {
         }
         let start = range.start;
         self.text.replace_range(range, replacement);
-        self.selection = selected
-            .map(|range| start + range.start..start + range.end)
-            .unwrap_or_else(|| start + replacement.len()..start + replacement.len());
+        if let Some(range) = selected {
+            self.set_selection(start + range.start, start + range.end);
+        } else {
+            let caret = start + replacement.len();
+            self.set_selection(caret, caret);
+        }
         self.marked_range = (!replacement.is_empty()).then_some(start..start + replacement.len());
         true
     }
@@ -287,10 +316,6 @@ impl TitleInput {
     fn unmark(&mut self) {
         self.marked_range = None;
     }
-}
-
-fn ordered_range(range: &Range<usize>) -> Range<usize> {
-    range.start.min(range.end)..range.start.max(range.end)
 }
 
 fn grapheme_boundary_at_or_before(text: &str, index: usize) -> usize {
@@ -356,7 +381,7 @@ impl EntityInputHandler for TitleInput {
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
             range: crate::native_editor::input::utf8_range_to_utf16_in(&self.text, &self.selection),
-            reversed: false,
+            reversed: self.selection_reversed,
         })
     }
 
@@ -497,7 +522,7 @@ pub fn toolbar_placement(available_width: f32) -> ToolbarPlacement {
 mod tests {
     use super::{TitleInput, editor_chrome_metrics, toolbar_placement};
     use crate::native_editor::commands::EditorCommand;
-    use gpui::AppContext;
+    use gpui::{AppContext, EntityInputHandler};
 
     #[test]
     fn chrome_metrics_keep_the_evernote_writing_column_centered() {
@@ -609,6 +634,61 @@ mod tests {
             assert_eq!(title.text(), "甲");
             title.select_all();
             assert_eq!(title.selected_text(), "甲");
+        });
+    }
+
+    #[gpui::test]
+    fn title_input_reverse_selection_replaces_and_marks_without_reversed_ranges(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let title = cx.new(|cx| TitleInput::new("甲🙂乙".into(), cx));
+        title.update(cx, |title, _| {
+            title.move_to_edge(true, false);
+            title.move_horizontal(false, true);
+            assert_eq!(title.selected_text(), "乙");
+            assert!(title.replace_utf16(None, "丙"));
+            assert_eq!(title.text(), "甲🙂丙");
+
+            title.move_to_edge(true, false);
+            title.move_horizontal(false, true);
+            assert!(title.replace_and_mark_utf16(None, "丁", Some(1..1)));
+            assert_eq!(title.text(), "甲🙂丁");
+            assert_eq!(title.marked_range(), Some(&(7..10)));
+        });
+    }
+
+    #[gpui::test]
+    fn title_input_reports_ordered_utf16_range_with_reverse_direction(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut cx = cx.add_empty_window();
+        let title = cx.new(|cx| TitleInput::new("甲🙂乙".into(), cx));
+        cx.update(|window, app| {
+            title.update(app, |title, title_cx| {
+                title.move_to_edge(true, false);
+                title.move_horizontal(false, true);
+                let selection = <TitleInput as EntityInputHandler>::selected_text_range(
+                    title, false, window, title_cx,
+                )
+                .expect("title selection bridge");
+                assert_eq!(selection.range, 3..4);
+                assert!(selection.reversed);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn title_nonextending_arrow_collapses_selection_before_moving_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let title = cx.new(|cx| TitleInput::new("甲🙂乙".into(), cx));
+        title.update(cx, |title, _| {
+            title.move_to_edge(true, false);
+            title.move_horizontal(false, true);
+            title.move_horizontal(false, false);
+            assert_eq!(title.selection(), &(7..7));
+            title.move_horizontal(false, false);
+            assert_eq!(title.selection(), &(3..3));
         });
     }
 }
