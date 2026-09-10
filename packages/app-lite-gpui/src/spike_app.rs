@@ -350,6 +350,10 @@ impl MeasurementRuntime {
     }
 }
 
+fn measurement_workload_needs_frame(runtime: Option<&MeasurementRuntime>) -> bool {
+    runtime.is_some_and(|runtime| !runtime.workload_complete)
+}
+
 /// Small real text-input owner for the link popover.  The editor selection
 /// never moves into this entity; only the URL field owns focus while the
 /// popover is open.  This follows the pinned donor's `ElementInputHandler`
@@ -650,14 +654,27 @@ impl SpikeView {
         cx.spawn(async move |_this, cx| {
             let result = cx
                 .update_window(window_handle, |_view, window, app| {
-                    run_measurement_workload(&editor, options.fixture, window, app)
+                    let result = run_measurement_workload(&editor, options.fixture, window, app);
+                    // The workload runs outside a paint callback. Schedule a
+                    // harmless next-frame refresh without calling
+                    // `request_animation_frame`, whose current-view lookup is
+                    // only valid during paint/prepaint.
+                    window.on_next_frame(|window, _cx| window.refresh());
+                    window.refresh();
+                    result
                 })
                 .ok()
                 .flatten();
             if let Some(result) = result {
-                let _ = weak_view.update(cx, |view, view_cx| {
-                    view.measurement_workload_finished(result);
-                    view_cx.notify();
+                let _ = cx.update(|app| {
+                    let delivered = weak_view.update(app, |view, view_cx| {
+                        view.measurement_workload_finished(result);
+                        view_cx.notify();
+                    });
+                    if delivered.is_ok() {
+                        app.refresh_windows();
+                    }
+                    delivered.is_ok()
                 });
             }
         })
@@ -1501,6 +1518,9 @@ impl SpikeView {
                             runtime.ready_written = true;
                         }
                         view_cx.notify();
+                    }
+                    if measurement_workload_needs_frame(view.measurement.as_deref()) {
+                        window.request_animation_frame();
                     }
                 });
             },
@@ -2355,6 +2375,26 @@ mod tests {
         assert_eq!(runtime.render_histogram.sample_count(), 120);
         assert_eq!(runtime.viewport_reset_paint_count, 1);
         assert!(!runtime.ready_prerequisites(true));
+    }
+
+    #[test]
+    fn measurement_frame_drive_stays_pending_until_workload_delivery() {
+        let options = SpikeLaunchOptions {
+            fixture: FixtureKind::Empty,
+            ready_file: PathBuf::from("/tmp/task7-ready"),
+            diagnostics_file: PathBuf::from("/tmp/task7-diagnostics"),
+            run_id: "test-run".into(),
+            binary_sha256: "test-sha".into(),
+        };
+        let mut runtime = MeasurementRuntime::new(options);
+
+        assert!(measurement_workload_needs_frame(Some(&runtime)));
+        runtime.workload_started = true;
+        assert!(measurement_workload_needs_frame(Some(&runtime)));
+
+        runtime.workload_complete = true;
+        assert!(!measurement_workload_needs_frame(Some(&runtime)));
+        assert!(!measurement_workload_needs_frame(None));
     }
 
     fn redraw(cx: &mut VisualTestContext) {
