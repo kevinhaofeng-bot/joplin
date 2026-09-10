@@ -670,7 +670,7 @@ impl SpikeView {
                         let _ = cx.refresh();
                     }
                     Ok(None) => eprintln!(
-                        "Task 7 measurement workload produced no report; the owning window may have closed"
+                        "Task 7 measurement workload failed to produce a validated report"
                     ),
                     Err(error) => eprintln!(
                         "Task 7 measurement workload could not update its owning window: {error}"
@@ -2427,8 +2427,10 @@ mod tests {
         });
 
         cx.simulate_resize(size(px(1080.0), px(720.0)));
-        // This is the only kickoff: the real canvas paint invokes
-        // `start_measurement`, which owns the Window::spawn production path.
+        // TestApp may paint implicitly while creating the window or flushing
+        // effects. Drive the real canvas path explicitly, then check that
+        // asynchronous delivery has left a pending shift before the following
+        // explicit paint loop can make the measurement ready.
         cx.update(|window, app| {
             window.draw(app).clear();
         });
@@ -2539,9 +2541,9 @@ mod tests {
         _cx: &mut TestAppContext,
     ) {
         // Window::spawn can complete synchronously in TestApp while the
-        // initiating canvas draw is still on the call stack. Give that real
-        // production path a normal native-sized stack; this is test harness
-        // isolation, not a production executor or scheduler.
+        // initiating canvas draw is still on the call stack. This test-thread
+        // stack configuration contains that nested test-harness callback chain;
+        // it does not configure a production executor or scheduler.
         std::thread::Builder::new()
             .name("task7-async-delivery-test".into())
             .stack_size(32 * 1024 * 1024)
