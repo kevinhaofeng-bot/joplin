@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use gpui::{
     App, AppContext, AsyncWindowContext, Bounds, ClipboardItem, Context, DragMoveEvent,
-    ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle,
+    ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontWeight,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
     ShapedLine, SharedString, StatefulInteractiveElement, Styled, TextRun, UTF16Selection,
@@ -28,11 +28,10 @@ use crate::components::{
     WordSelectLeft, WordSelectRight,
 };
 use crate::native_editor::chrome::{
-    EDITOR_HEADER_MAX_WIDTH, EVERNOTE_GREEN, NOTE_BODY_MAX_WIDTH, TitleInput,
-    editor_chrome_metrics, toolbar_placement,
+    EVERNOTE_GREEN, TitleInput, ToolbarPlacement, editor_chrome_metrics, toolbar_placement,
 };
 use crate::native_editor::commands::{
-    CommandArgument, CommandCatalogue, CommandDescriptor, EditorCommand,
+    CommandArgument, CommandCatalogue, CommandDescriptor, CommandError, EditorCommand,
 };
 use crate::native_editor::core::EditorCore;
 use crate::native_editor::diagnostics::{Diagnostics, FixedHistogram};
@@ -699,10 +698,12 @@ impl SpikeView {
     fn render_title_input(&self, width: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
         let title = self.title.clone();
         let paint_title = title.clone();
-        let click_title = title.clone();
-        let view = cx.entity();
+        let canvas_title = title.clone();
         let canvas = canvas(
-            move |_bounds, _window, _cx| title.clone(),
+            move |bounds, _window, cx| {
+                let _ = canvas_title.update(cx, |title, _| title.record_bounds(bounds));
+                canvas_title.clone()
+            },
             move |bounds, entity, window, cx| {
                 let (text, selection, focus) = entity.read_with(cx, |title, _| {
                     (
@@ -712,12 +713,14 @@ impl SpikeView {
                     )
                 });
                 let style = window.text_style();
+                let mut font = style.font();
+                font.weight = FontWeight::SEMIBOLD;
                 let line = window.text_system().shape_line(
                     text,
                     px(30.0),
                     &[TextRun {
                         len: entity.read(cx).text().len(),
-                        font: style.font(),
+                        font,
                         color: rgba(0x172033ff).into(),
                         background_color: None,
                         underline: None,
@@ -725,6 +728,7 @@ impl SpikeView {
                     }],
                     None,
                 );
+                entity.update(cx, |title, _| title.record_layout(bounds, line.clone()));
                 if focus.is_focused(window) && !selection.is_empty() {
                     window.paint_quad(gpui::fill(
                         Bounds::from_corners(
@@ -770,20 +774,149 @@ impl SpikeView {
             .h(px(40.0))
             .key_context("EvernoteTitle")
             .track_focus(self.title.read(cx).focus_handle())
-            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                click_title.read(cx).focus_handle().focus(window);
-                cx.stop_propagation();
-            })
-            .on_key_down(move |event, window, cx| {
-                if TitleInput::moves_focus_to_body_for(&event.keystroke.key) {
-                    let _ = view.update(cx, |view, view_cx| {
-                        focus_editor(&view.editor, window, view_cx)
-                    });
-                    cx.stop_propagation();
-                }
-            })
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_title_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_title_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_title_mouse_up))
+            .on_key_down(cx.listener(Self::on_title_key_down))
             .child(canvas)
             .into_any_element()
+    }
+
+    fn on_title_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            cx.propagate();
+            return;
+        }
+        self.title.update(cx, |title, title_cx| {
+            title.begin_pointer_selection(event.position, event.modifiers.shift);
+            title.focus_handle().focus(window);
+            title_cx.notify();
+        });
+        cx.stop_propagation();
+    }
+
+    fn on_title_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            cx.propagate();
+            return;
+        }
+        self.title.update(cx, |title, title_cx| {
+            if title.extend_pointer_selection(event.position).is_some() {
+                title_cx.notify();
+            }
+        });
+        cx.stop_propagation();
+    }
+
+    fn on_title_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.title
+            .update(cx, |title, _| title.end_pointer_selection());
+        cx.stop_propagation();
+    }
+
+    fn on_title_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        let secondary = modifiers.secondary();
+        if TitleInput::moves_focus_to_body_for(key) {
+            focus_editor(&self.editor, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        let handled = match key {
+            "backspace" => {
+                self.title.update(cx, |title, title_cx| {
+                    title.delete_backward();
+                    title_cx.notify();
+                });
+                true
+            }
+            "delete" => {
+                self.title.update(cx, |title, title_cx| {
+                    title.delete_forward();
+                    title_cx.notify();
+                });
+                true
+            }
+            "left" => {
+                self.title.update(cx, |title, title_cx| {
+                    title.move_horizontal(false, modifiers.shift);
+                    title_cx.notify();
+                });
+                true
+            }
+            "right" => {
+                self.title.update(cx, |title, title_cx| {
+                    title.move_horizontal(true, modifiers.shift);
+                    title_cx.notify();
+                });
+                true
+            }
+            "home" => {
+                self.title.update(cx, |title, title_cx| {
+                    title.move_to_edge(false, modifiers.shift);
+                    title_cx.notify();
+                });
+                true
+            }
+            "end" => {
+                self.title.update(cx, |title, title_cx| {
+                    title.move_to_edge(true, modifiers.shift);
+                    title_cx.notify();
+                });
+                true
+            }
+            "a" if secondary => {
+                self.title.update(cx, |title, title_cx| {
+                    title.select_all();
+                    title_cx.notify();
+                });
+                true
+            }
+            "c" if secondary => {
+                let text = self.title.read(cx).selected_text().to_owned();
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                true
+            }
+            "x" if secondary => {
+                let text = self.title.read(cx).selected_text().to_owned();
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.title.update(cx, |title, title_cx| {
+                    title.delete_forward();
+                    title_cx.notify();
+                });
+                true
+            }
+            "v" if secondary => {
+                self.title
+                    .update(cx, |title, title_cx| title.paste_from_clipboard(title_cx));
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            cx.stop_propagation();
+        }
     }
 
     fn start_measurement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1155,6 +1288,7 @@ impl SpikeView {
         let canvas_popover = popover.clone();
         let paint_popover = popover.clone();
         let click_popover = popover.clone();
+        let view = cx.entity();
         let input_canvas = canvas(
             move |bounds, _window, cx| {
                 let _ = canvas_popover.update(cx, |popover, _cx| {
@@ -1279,8 +1413,49 @@ impl SpikeView {
                     .flex()
                     .justify_end()
                     .gap(px(8.0))
-                    .child("取消")
-                    .child("应用"),
+                    .child(
+                        div()
+                            .id("evernote-link-cancel")
+                            .debug_selector(|| "evernote-link-cancel".to_owned())
+                            .h(px(32.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgba(0xeff2f6ff)))
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                cx.stop_propagation();
+                                let _ = view.update(cx, |view, view_cx| {
+                                    view.cancel_link(&CancelLink, window, view_cx)
+                                });
+                            })
+                            .child("取消"),
+                    )
+                    .child({
+                        let view = cx.entity();
+                        div()
+                            .id("evernote-link-apply")
+                            .debug_selector(|| "evernote-link-apply".to_owned())
+                            .h(px(32.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .bg(rgba(EVERNOTE_GREEN))
+                            .text_color(rgba(0xffffffff))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgba(0x008f26ff)))
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                cx.stop_propagation();
+                                let _ = view.update(cx, |view, view_cx| {
+                                    view.submit_link(&SubmitLink, window, view_cx)
+                                });
+                            })
+                            .child("应用")
+                    }),
             )
             .into_any_element()
     }
@@ -1317,6 +1492,19 @@ impl SpikeView {
             .mr(px(4.0))
             .rounded(px(5.0))
             .bg(background)
+            .hover(move |this| {
+                this.bg(
+                    if matches!(
+                        state.toggle,
+                        crate::native_editor::commands::ToggleState::On
+                            | crate::native_editor::commands::ToggleState::Mixed
+                    ) {
+                        rgba(0x008f26ff)
+                    } else {
+                        rgba(0x17203312)
+                    },
+                )
+            })
             .text_size(px(12.0))
             .text_color(foreground)
             .opacity(if state.enabled { 1.0 } else { 0.35 })
@@ -1388,6 +1576,7 @@ impl SpikeView {
             .text_size(px(12.0))
             .text_color(rgba(0x172033ff))
             .cursor_pointer()
+            .hover(|this| this.bg(rgba(0x17203318)))
             .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                 cx.stop_propagation();
                 let _ = view.update(cx, |view, view_cx| {
@@ -1408,6 +1597,7 @@ impl SpikeView {
         &self,
         trigger_bounds: Option<Bounds<Pixels>>,
         content_mask: Bounds<Pixels>,
+        placement: &ToolbarPlacement,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         if !self.more_open {
@@ -1423,10 +1613,15 @@ impl SpikeView {
         let mask_right = f32::from(content_mask.right());
         let mask_top = f32::from(content_mask.top());
         let mask_bottom = f32::from(content_mask.bottom());
-        let trigger_left = f32::from(trigger.left()).max(mask_left);
-        let available_width = (mask_right - trigger_left)
-            .min(f32::from(content_mask.size.width))
-            .max(1.0);
+        let mask_width = (mask_right - mask_left).max(1.0);
+        let menu_width = 220.0_f32.min(mask_width);
+        let left = if mask_width >= 220.0 {
+            f32::from(trigger.left())
+                .max(mask_left)
+                .min(mask_right - 220.0)
+        } else {
+            mask_left
+        };
         let below_height = (mask_bottom - f32::from(trigger.bottom())).max(0.0);
         let above_height = (f32::from(trigger.top()) - mask_top).max(0.0);
         let (top, max_height) = if below_height >= above_height {
@@ -1434,7 +1629,7 @@ impl SpikeView {
         } else {
             (mask_top, above_height)
         };
-        let mut commands = toolbar_placement(f32::from(content_mask.size.width)).overflow;
+        let mut commands = placement.overflow.clone();
         commands.extend(
             self.catalogue
                 .more_descriptors()
@@ -1457,8 +1652,8 @@ impl SpikeView {
                 .debug_selector(|| "evernote-native-spike-more-menu".to_owned())
                 .absolute()
                 .top(px(top.max(mask_top)))
-                .left(px(trigger_left))
-                .w(px(220.0_f32.min(available_width.max(1.0))))
+                .left(px(left))
+                .w(px(menu_width))
                 .max_h(px(300.0_f32.min(max_height.max(1.0))))
                 .overflow_y_scroll()
                 .p(px(8.0))
@@ -1759,24 +1954,41 @@ impl Render for SpikeView {
         let window_size = window.bounds().size;
         let viewport_width = f32::from(window_size.width.max(px(1.0)));
         let viewport_height = f32::from(window_size.height.max(px(1.0)));
-        let layout = layout_for_viewport(viewport_width, viewport_height);
         let chrome = editor_chrome_metrics(viewport_width, viewport_height);
+        // The title and document are one writing column at every width. The
+        // legacy shell computed the body from a separate 64pt inset, which
+        // shifted the document 8pt left of the title below 696pt.
+        let mut layout = layout_for_viewport(viewport_width, viewport_height);
+        layout.content_width = chrome.body_width;
         let measured_height = self.editor.read(cx).layout().total_height();
         let content_mask = window.content_mask().bounds;
         let content_height = measured_height.max(f32::from(content_mask.size.height) * 0.65);
 
         let placement = toolbar_placement(chrome.header_width);
-        let primary_buttons = placement
-            .primary
-            .into_iter()
-            .filter_map(|command| {
-                self.catalogue
-                    .descriptors()
-                    .iter()
-                    .find(|descriptor| descriptor.command == command)
-            })
-            .map(|descriptor| self.render_command_button(descriptor, false, cx))
-            .collect::<Vec<_>>();
+        let mut primary_buttons = Vec::new();
+        let mut previous_group = None;
+        for command in &placement.primary {
+            let group = toolbar_group(*command);
+            if previous_group.is_some_and(|previous| previous != group) {
+                primary_buttons.push(
+                    div()
+                        .w(px(1.0))
+                        .h(px(18.0))
+                        .mx(px(4.0))
+                        .bg(rgba(0xd0d5ddff))
+                        .into_any_element(),
+                );
+            }
+            if let Some(descriptor) = self
+                .catalogue
+                .descriptors()
+                .iter()
+                .find(|descriptor| descriptor.command == *command)
+            {
+                primary_buttons.push(self.render_command_button(descriptor, false, cx));
+            }
+            previous_group = Some(group);
+        }
         let more_trigger = self.render_more_trigger(cx);
         let measure_view = cx.entity();
         let more_measure = canvas(
@@ -1802,7 +2014,8 @@ impl Render for SpikeView {
             .child(more_measure)
             .child(more_trigger)
             .into_any_element();
-        let more_menu = self.render_more_menu(self.more_trigger_bounds, content_mask, cx);
+        let more_menu =
+            self.render_more_menu(self.more_trigger_bounds, content_mask, &placement, cx);
         let editor_surface = self.render_editor_surface(layout, content_height, cx);
 
         let toolbar = div()
@@ -1876,6 +2089,22 @@ impl Render for SpikeView {
     }
 }
 
+fn toolbar_group(command: EditorCommand) -> u8 {
+    match command {
+        EditorCommand::InsertImage => 0,
+        EditorCommand::Undo | EditorCommand::Redo => 1,
+        EditorCommand::Paragraph => 2,
+        EditorCommand::Bold
+        | EditorCommand::Italic
+        | EditorCommand::Underline
+        | EditorCommand::Highlight => 3,
+        EditorCommand::BulletList | EditorCommand::OrderedList | EditorCommand::CheckList => 4,
+        EditorCommand::Link => 5,
+        EditorCommand::AlignLeft | EditorCommand::AlignCenter | EditorCommand::AlignRight => 6,
+        _ => 7,
+    }
+}
+
 struct WorkloadReport {
     transaction_histogram: FixedHistogram,
     apply_undo_pairs: u32,
@@ -1901,6 +2130,7 @@ fn run_measurement_workload(
 /// Uses GPUI's native single-file prompt. Cancellation is deliberately a
 /// no-op: the editor is neither changed nor moved through history.
 fn prompt_for_image_path(editor: Entity<EditorCore>, catalogue: CommandCatalogue, cx: &mut App) {
+    let active_window = cx.active_window();
     let prompt = cx.prompt_for_paths(PathPromptOptions {
         files: true,
         directories: false,
@@ -1908,26 +2138,72 @@ fn prompt_for_image_path(editor: Entity<EditorCore>, catalogue: CommandCatalogue
         prompt: Some("选择图片".into()),
     });
     cx.spawn(async move |cx| {
-        let Ok(Ok(Some(paths))) = prompt.await else {
-            return;
-        };
-        let Some(path) = paths.into_iter().next() else {
-            return;
+        let completion = match prompt.await {
+            Ok(Ok(Some(paths))) => paths
+                .into_iter()
+                .next()
+                .map(ImagePickerCompletion::Selected)
+                .unwrap_or(ImagePickerCompletion::Cancelled),
+            _ => ImagePickerCompletion::Cancelled,
         };
         let _ = cx.update(move |cx| {
-            editor.update(cx, |editor, editor_cx| {
-                if let Err(error) = catalogue.execute(
-                    EditorCommand::InsertImage,
-                    CommandArgument::ImagePath(path),
-                    editor,
-                ) {
+            let Some(window_handle) = active_window else {
+                return;
+            };
+            let _ = window_handle.update(cx, |_view, window, cx| {
+                if let Err(error) =
+                    complete_image_picker(&editor, catalogue, completion, window, cx)
+                {
                     eprintln!("spike image command failed: {error}");
                 }
-                editor_cx.notify();
             });
         });
     })
     .detach();
+}
+
+enum ImagePickerCompletion {
+    Cancelled,
+    Selected(PathBuf),
+}
+
+/// This is the completion seam shared by the native file picker and shell
+/// tests. A dismissed picker never reaches it, so its prior focus remains;
+/// a selected image is a real editor transaction and deliberately returns
+/// focus to the body for continued writing.
+fn apply_selected_image_path(
+    editor: &Entity<EditorCore>,
+    catalogue: CommandCatalogue,
+    path: PathBuf,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<(), CommandError> {
+    editor.update(cx, |editor, editor_cx| -> Result<(), CommandError> {
+        catalogue.execute(
+            EditorCommand::InsertImage,
+            CommandArgument::ImagePath(path),
+            editor,
+        )?;
+        editor_cx.notify();
+        Ok(())
+    })?;
+    focus_editor(editor, window, cx);
+    Ok(())
+}
+
+fn complete_image_picker(
+    editor: &Entity<EditorCore>,
+    catalogue: CommandCatalogue,
+    completion: ImagePickerCompletion,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<(), CommandError> {
+    match completion {
+        ImagePickerCompletion::Cancelled => Ok(()),
+        ImagePickerCompletion::Selected(path) => {
+            apply_selected_image_path(editor, catalogue, path, window, cx)
+        }
+    }
 }
 
 fn run_edit_undo_pairs(
@@ -3877,6 +4153,206 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn shell_visible_link_buttons_keep_invalid_open_and_dispatch_cancel_or_apply(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                view.editor.read(app).focus_handle().focus(window)
+            });
+        });
+        cx.simulate_keystrokes("home up shift-right");
+        let link = cx.debug_bounds("Link").expect("visible Link command");
+        cx.simulate_click(link.center(), Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |view, _| assert!(view.link_popover.is_some()));
+        let apply = cx
+            .debug_bounds("evernote-link-apply")
+            .expect("Apply must be a real hit target");
+        let cancel = cx
+            .debug_bounds("evernote-link-cancel")
+            .expect("Cancel must be a real hit target");
+        cx.simulate_input("not a URL");
+        cx.simulate_click(apply.center(), Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.link_popover.is_some(),
+                "invalid Apply keeps the popover open"
+            );
+            assert!(view.link_popover.as_ref().unwrap().read(cx).invalid);
+        });
+        let cancel = cx
+            .debug_bounds("evernote-link-cancel")
+            .expect("Cancel remains clickable after invalid validation");
+        cx.simulate_click(cancel.center(), Modifiers::default());
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                assert!(view.link_popover.is_none());
+                assert!(view.editor.read(app).focus_handle().is_focused(window));
+            });
+        });
+
+        let link = cx.debug_bounds("Link").expect("Link remains mounted");
+        cx.simulate_click(link.center(), Modifiers::default());
+        redraw(cx);
+        cx.simulate_input("https://example.com");
+        let apply = cx
+            .debug_bounds("evernote-link-apply")
+            .expect("Apply remains clickable after reopening");
+        cx.simulate_click(apply.center(), Modifiers::default());
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                assert!(view.link_popover.is_none());
+                assert!(view.editor.read(app).focus_handle().is_focused(window));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_760pt_primary_and_more_partition_has_no_missing_command(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (_view, cx) = cx.add_window_view(build_view);
+        cx.simulate_resize(size(px(760.0), px(820.0)));
+        redraw(cx);
+        let placement = toolbar_placement(editor_chrome_metrics(760.0, 820.0).header_width);
+        assert_eq!(
+            placement.overflow,
+            vec![
+                EditorCommand::Link,
+                EditorCommand::AlignLeft,
+                EditorCommand::AlignCenter,
+                EditorCommand::AlignRight,
+            ]
+        );
+        for command in &placement.primary {
+            let descriptor = CommandCatalogue::default()
+                .descriptors()
+                .iter()
+                .find(|descriptor| descriptor.command == *command)
+                .unwrap();
+            assert!(
+                cx.debug_bounds(descriptor.label).is_some(),
+                "{} primary",
+                descriptor.label
+            );
+        }
+        let more = cx
+            .debug_bounds("evernote-native-spike-more-trigger")
+            .expect("More trigger at 760pt");
+        cx.simulate_click(more.center(), Modifiers::default());
+        redraw(cx);
+        for command in &placement.overflow {
+            let descriptor = CommandCatalogue::default()
+                .descriptors()
+                .iter()
+                .find(|descriptor| descriptor.command == *command)
+                .unwrap();
+            assert!(
+                cx.debug_bounds(descriptor.label).is_some(),
+                "{} overflow",
+                descriptor.label
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn shell_title_click_edit_and_return_focus_to_body(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        cx.simulate_resize(size(px(760.0), px(820.0)));
+        redraw(cx);
+        let title = cx
+            .debug_bounds("evernote-note-title")
+            .expect("mounted title input");
+        let surface = cx
+            .debug_bounds("spike-editor-surface")
+            .expect("mounted body");
+        assert_eq!(
+            title.left(),
+            surface.left(),
+            "narrow title/body left edges align"
+        );
+        cx.simulate_click(
+            point(title.left() + px(1.0), title.center().y),
+            Modifiers::default(),
+        );
+        cx.simulate_input("新");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.title.read(cx).text(), "新会议记录")
+        });
+        cx.simulate_keystrokes("end backspace");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.title.read(cx).text(), "新会议记")
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                assert!(view.editor.read(app).focus_handle().is_focused(window));
+                assert!(!view.title.read(app).focus_handle().is_focused(window));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn shell_picker_cancel_preserves_title_focus_but_selection_restores_body_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                view.title.read(app).focus_handle().focus(window)
+            });
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, view_cx| {
+                complete_image_picker(
+                    &view.editor,
+                    view.catalogue,
+                    ImagePickerCompletion::Cancelled,
+                    window,
+                    view_cx,
+                )
+                .expect("cancelled picker is a no-op");
+                assert!(view.title.read(view_cx).focus_handle().is_focused(window));
+            });
+        });
+        let path = std::env::temp_dir().join(format!(
+            "joplin-lite-picker-focus-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, valid_png_bytes()).expect("temporary picker image");
+        cx.update(|window, app| {
+            view.update(app, |view, view_cx| {
+                complete_image_picker(
+                    &view.editor,
+                    view.catalogue,
+                    ImagePickerCompletion::Selected(path.clone()),
+                    window,
+                    view_cx,
+                )
+                .expect("selected image transaction");
+            });
+        });
+        let _ = std::fs::remove_file(path);
+        cx.update(|window, app| {
+            view.read_with(app, |view, app| {
+                assert!(view.editor.read(app).focus_handle().is_focused(window));
+                assert!(!view.title.read(app).focus_handle().is_focused(window));
+            });
+        });
+    }
+
+    #[gpui::test]
     fn link_popover_ime_candidate_updates_replace_the_marked_range(cx: &mut TestAppContext) {
         let mut cx = cx.add_empty_window();
         let field = cx.new(|cx| LinkPopover::new(String::new(), cx));
@@ -4318,7 +4794,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn shell_narrow_wrapped_toolbar_and_scrolled_title_keep_live_membership(
+    async fn shell_narrow_single_row_toolbar_aligns_writing_column_and_keeps_live_membership(
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| components::init(cx));
@@ -4332,13 +4808,27 @@ mod tests {
         let surface = cx
             .debug_bounds("spike-editor-surface")
             .expect("editor surface should be mounted");
-        assert!(
-            toolbar.size.height > px(31.0),
-            "narrow width must wrap the primary command strip"
+        let undo = cx.debug_bounds("Undo").expect("narrow primary action");
+        let more = cx
+            .debug_bounds("evernote-native-spike-more-trigger")
+            .expect("narrow overflow trigger");
+        assert!(toolbar.size.height >= px(32.0));
+        assert_eq!(
+            undo.center().y,
+            more.center().y,
+            "overflow keeps primary actions and More on one flex row"
+        );
+        let title = cx
+            .debug_bounds("evernote-note-title")
+            .expect("narrow title should be mounted");
+        assert_eq!(
+            title.left(),
+            surface.left(),
+            "title and body share a left writing edge below the wide breakpoint"
         );
         assert!(
             surface.top() > px(118.0),
-            "surface origin must include the wrapped toolbar rather than a fixed 118pt shell offset"
+            "surface origin must include the single-row chrome rather than a fixed shell offset"
         );
         let before_top = view.read_with(cx, |view, cx| {
             view.editor

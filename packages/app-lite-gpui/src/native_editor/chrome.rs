@@ -1,6 +1,10 @@
 use crate::native_editor::commands::EditorCommand;
-use gpui::{Bounds, Context, EntityInputHandler, FocusHandle, Pixels, UTF16Selection, Window};
+use gpui::{
+    Bounds, Context, EntityInputHandler, FocusHandle, Pixels, Point, ShapedLine, UTF16Selection,
+    Window,
+};
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const EVERNOTE_GREEN: u32 = 0x00a82dff;
 pub const NOTE_BODY_MAX_WIDTH: f32 = 680.0;
@@ -42,6 +46,9 @@ pub struct TitleInput {
     selection: Range<usize>,
     marked_range: Option<Range<usize>>,
     focus: FocusHandle,
+    last_bounds: Option<Bounds<Pixels>>,
+    last_layout: Option<ShapedLine>,
+    pointer_anchor: Option<usize>,
 }
 
 impl TitleInput {
@@ -52,6 +59,9 @@ impl TitleInput {
             selection: end..end,
             marked_range: None,
             focus: cx.focus_handle(),
+            last_bounds: None,
+            last_layout: None,
+            pointer_anchor: None,
         }
     }
 
@@ -73,6 +83,130 @@ impl TitleInput {
 
     pub fn moves_focus_to_body_for(key: &str) -> bool {
         matches!(key, "enter" | "down")
+    }
+
+    pub fn selected_text(&self) -> &str {
+        let range = ordered_range(&self.selection);
+        self.text.get(range).unwrap_or_default()
+    }
+
+    pub fn select_all(&mut self) {
+        self.selection = 0..self.text.len();
+        self.marked_range = None;
+    }
+
+    pub fn collapse(&mut self, index: usize) {
+        let index = grapheme_boundary_at_or_before(&self.text, index);
+        self.selection = index..index;
+        self.marked_range = None;
+    }
+
+    pub fn move_to_edge(&mut self, end: bool, extend: bool) {
+        let index = if end { self.text.len() } else { 0 };
+        if extend {
+            self.selection.end = index;
+        } else {
+            self.selection = index..index;
+        }
+        self.marked_range = None;
+    }
+
+    pub fn move_horizontal(&mut self, right: bool, extend: bool) {
+        let ordered = ordered_range(&self.selection);
+        let index = if extend {
+            self.selection.end
+        } else if !ordered.is_empty() {
+            if right { ordered.end } else { ordered.start }
+        } else {
+            self.selection.end
+        };
+        let next = if right {
+            next_grapheme_boundary(&self.text, index)
+        } else {
+            previous_grapheme_boundary(&self.text, index)
+        };
+        if extend {
+            self.selection.end = next;
+        } else {
+            self.selection = next..next;
+        }
+        self.marked_range = None;
+    }
+
+    pub fn delete_backward(&mut self) {
+        let range = ordered_range(&self.selection);
+        let range = if range.is_empty() {
+            previous_grapheme_boundary(&self.text, range.start)..range.start
+        } else {
+            range
+        };
+        self.replace_byte_range(range);
+    }
+
+    pub fn delete_forward(&mut self) {
+        let range = ordered_range(&self.selection);
+        let range = if range.is_empty() {
+            range.end..next_grapheme_boundary(&self.text, range.end)
+        } else {
+            range
+        };
+        self.replace_byte_range(range);
+    }
+
+    pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.replace_utf16(None, &text);
+            cx.notify();
+        }
+    }
+
+    fn replace_byte_range(&mut self, range: Range<usize>) {
+        if range.start > range.end
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        self.text.replace_range(range.clone(), "");
+        self.selection = range.start..range.start;
+        self.marked_range = None;
+    }
+
+    pub fn record_layout(&mut self, bounds: Bounds<Pixels>, line: ShapedLine) {
+        self.last_bounds = Some(bounds);
+        self.last_layout = Some(line);
+    }
+
+    pub fn record_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.last_bounds = Some(bounds);
+    }
+
+    pub fn begin_pointer_selection(&mut self, point: Point<Pixels>, extend: bool) -> Option<usize> {
+        let index = self.byte_index_for_point(point)?;
+        let anchor = if extend { self.selection.start } else { index };
+        self.selection = anchor.min(index)..anchor.max(index);
+        self.pointer_anchor = Some(anchor);
+        self.marked_range = None;
+        Some(index)
+    }
+
+    pub fn extend_pointer_selection(&mut self, point: Point<Pixels>) -> Option<usize> {
+        let index = self.byte_index_for_point(point)?;
+        let anchor = self.pointer_anchor.unwrap_or(self.selection.start);
+        self.selection = anchor.min(index)..anchor.max(index);
+        self.marked_range = None;
+        Some(index)
+    }
+
+    pub fn end_pointer_selection(&mut self) {
+        self.pointer_anchor = None;
+    }
+
+    fn byte_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
+        let bounds = self.last_bounds?;
+        let line = self.last_layout.as_ref()?;
+        let x = (point.x - bounds.left()).max(gpui::px(0.0)).min(line.width);
+        Some(line.closest_index_for_x(x).min(self.text.len()))
     }
 
     fn checked_utf16_range(&self, range: &Range<usize>) -> Option<Range<usize>> {
@@ -153,6 +287,33 @@ impl TitleInput {
     fn unmark(&mut self) {
         self.marked_range = None;
     }
+}
+
+fn ordered_range(range: &Range<usize>) -> Range<usize> {
+    range.start.min(range.end)..range.start.max(range.end)
+}
+
+fn grapheme_boundary_at_or_before(text: &str, index: usize) -> usize {
+    let index = index.min(text.len());
+    UnicodeSegmentation::grapheme_indices(text, true)
+        .map(|(start, _)| start)
+        .chain(std::iter::once(text.len()))
+        .take_while(|boundary| *boundary <= index)
+        .last()
+        .unwrap_or(0)
+}
+
+fn previous_grapheme_boundary(text: &str, index: usize) -> usize {
+    grapheme_boundary_at_or_before(text, index.saturating_sub(1))
+}
+
+fn next_grapheme_boundary(text: &str, index: usize) -> usize {
+    let index = index.min(text.len());
+    UnicodeSegmentation::grapheme_indices(text, true)
+        .map(|(start, _)| start)
+        .chain(std::iter::once(text.len()))
+        .find(|boundary| *boundary > index)
+        .unwrap_or(text.len())
 }
 
 fn is_utf16_boundary(text: &str, offset: usize) -> bool {
@@ -251,14 +412,12 @@ impl EntityInputHandler for TitleInput {
 
     fn character_index_for_point(
         &mut self,
-        _point: gpui::Point<Pixels>,
+        point: gpui::Point<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(crate::native_editor::input::utf8_to_utf16_in(
-            &self.text,
-            self.text.len(),
-        ))
+        self.byte_index_for_point(point)
+            .map(|index| crate::native_editor::input::utf8_to_utf16_in(&self.text, index))
     }
 }
 
@@ -430,6 +589,26 @@ mod tests {
             );
             assert!(TitleInput::moves_focus_to_body_for("enter"));
             assert!(TitleInput::moves_focus_to_body_for("down"));
+        });
+    }
+
+    #[gpui::test]
+    fn title_input_edits_by_grapheme_without_splitting_utf8_or_utf16(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let title = cx.new(|cx| TitleInput::new("甲🙂e\u{301}乙".into(), cx));
+        title.update(cx, |title, _| {
+            title.move_to_edge(true, false);
+            title.delete_backward();
+            assert_eq!(title.text(), "甲🙂e\u{301}");
+            title.delete_backward();
+            assert_eq!(title.text(), "甲🙂");
+            title.move_horizontal(false, true);
+            assert_eq!(title.selected_text(), "🙂");
+            title.delete_forward();
+            assert_eq!(title.text(), "甲");
+            title.select_all();
+            assert_eq!(title.selected_text(), "甲");
         });
     }
 }
