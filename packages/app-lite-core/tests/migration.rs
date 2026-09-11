@@ -224,6 +224,165 @@ fn v4_legacy_journal_backfills_payload_revision_without_losing_recovery() {
 }
 
 #[test]
+fn v4_migration_keeps_one_latest_current_checkpoint_per_note_without_touching_other_notes() {
+    // Catches the old v4->v5 migration preserving every legacy row. A
+    // lifecycle snapshot could then delete only the recovered row and leave
+    // a different old owner behind to block the next edit forever. The v4
+    // writer legitimately appended many rows, so select one current-base
+    // checkpoint deterministically per note and discard stale-base rows.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).expect("create release-shaped profile");
+    let first = repository
+        .create_note(CreateNote {
+            title: "first durable title".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("create first note");
+    let first_revision_two = repository
+        .flush_snapshot(
+            SaveNote {
+                id: first.id.clone(),
+                expected_revision: first.revision,
+                title: "first revision two base".into(),
+                document: CanonicalDocument::default(),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            None,
+        )
+        .expect("advance first note to revision two");
+    assert_eq!(first_revision_two.revision, 2);
+    let second = repository
+        .create_note(CreateNote {
+            title: "second durable title".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("create second note");
+    drop(repository);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE edit_journal;
+             CREATE TABLE edit_journal (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 note_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 delta_utf8 TEXT NOT NULL,
+                 created_time INTEGER NOT NULL
+             );
+             PRAGMA user_version = 4;",
+        )
+        .expect("seed a real v4 journal table");
+    for (id, note_id, revision, generation, created_time, title, body_html) in [
+        (
+            "a".repeat(32),
+            first.id.as_str(),
+            2_i64,
+            3_i64,
+            100_i64,
+            "first J1",
+            "<p>first J1</p>",
+        ),
+        (
+            "b".repeat(32),
+            first.id.as_str(),
+            2_i64,
+            9_i64,
+            200_i64,
+            "first J2 newest",
+            "<p><strong>first J2 newest</strong></p>",
+        ),
+        // This row is syntactically valid but was based on revision one. Its
+        // later timestamp/generation must not let it beat revision-two J2.
+        (
+            "c".repeat(32),
+            first.id.as_str(),
+            1_i64,
+            99_i64,
+            999_i64,
+            "first stale must not win",
+            "<p>first stale must not win</p>",
+        ),
+        (
+            "d".repeat(32),
+            second.id.as_str(),
+            1_i64,
+            4_i64,
+            150_i64,
+            "second checkpoint survives",
+            "<p>second checkpoint survives</p>",
+        ),
+    ] {
+        let payload = format!(
+            r#"{{"version":1,"note_id":"{note_id}","expected_revision":{revision},"generation":{generation},"title":"{title}","body_html":"{body_html}","resource_ids":[]}}"#
+        );
+        connection
+            .execute(
+                "INSERT INTO edit_journal (id, note_id, generation, delta_utf8, created_time)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, note_id, generation, payload, created_time],
+            )
+            .expect("seed v4 checkpoint");
+    }
+    drop(connection);
+
+    drop(LibraryRepository::open(&path).expect("migrate v4 multi-checkpoint profile"));
+    let check = Connection::open(&path).unwrap();
+    let rows = check
+        .prepare(
+            "SELECT id, note_id, expected_revision, writer_token, sequence, generation, delta_utf8
+             FROM edit_journal
+             ORDER BY note_id, sequence",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "migration keeps one recoverable row per note"
+    );
+    let first_row = rows
+        .iter()
+        .find(|(_, note_id, ..)| note_id == first.id.as_str())
+        .expect("first note retains a checkpoint");
+    assert_eq!(first_row.0, "b".repeat(32));
+    assert_eq!(first_row.2, first_revision_two.revision);
+    assert_eq!(first_row.3, format!("legacy-v4-{}", "b".repeat(32)));
+    assert!(first_row.4 > 0);
+    assert_eq!(first_row.5, 9);
+    assert!(first_row.6.contains("first J2 newest"));
+    let second_row = rows
+        .iter()
+        .find(|(_, note_id, ..)| note_id == second.id.as_str())
+        .expect("migration must not delete another note's valid checkpoint");
+    assert_eq!(second_row.0, "d".repeat(32));
+    assert_eq!(second_row.2, second.revision);
+    assert!(second_row.6.contains("second checkpoint survives"));
+    assert!(
+        rows.iter()
+            .all(|(_, _, _, _, _, _, delta)| !delta.contains("stale must not win")),
+        "a stale base revision must never remain eligible after migration"
+    );
+}
+
+#[test]
 fn v3_upgrade_is_atomic_and_does_not_enqueue_imported_history() {
     // Catches migration that partly commits, loses v3 readable data, or schedules legacy rows for upload.
     let profile = tempdir().unwrap();

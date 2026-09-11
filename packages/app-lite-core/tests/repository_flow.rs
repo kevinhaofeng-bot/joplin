@@ -440,6 +440,53 @@ fn journal_writer_token_owns_the_checkpoint_against_cross_window_replay() {
             .unwrap()
             .is_none()
     );
+
+    // A stale old-base row cannot make a current lifecycle snapshot or the
+    // next current-base edit fail permanently. This models a legacy residue
+    // after a recovered snapshot; the current revision owns the decision,
+    // and the successful snapshot must compact the obsolete residue too.
+    let after_stale_boundary = first
+        .flush_snapshot(
+            SaveNote {
+                id: note.id.clone(),
+                expected_revision: saved.revision,
+                title: "two windows".into(),
+                document: document("revision three"),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            None,
+        )
+        .expect("a stale old-base row must not block a current lifecycle snapshot");
+    assert_eq!(after_stale_boundary.revision, saved.revision + 1);
+    assert!(
+        first.latest_edit_journal(&note.id).unwrap().is_none(),
+        "the lifecycle snapshot must compact stale ownership residue"
+    );
+    let resumed_ownership = first
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: after_stale_boundary.revision,
+            writer_token: "current-window-after-stale".into(),
+            sequence: 0,
+            generation: 1001,
+            delta_utf8: "current revision checkpoint".into(),
+        })
+        .expect("the next current-base journal must not inherit a stale foreign owner");
+    let final_snapshot = first
+        .flush_snapshot(
+            SaveNote {
+                id: note.id,
+                expected_revision: after_stale_boundary.revision,
+                title: "two windows".into(),
+                document: document("revision four"),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            Some(resumed_ownership),
+        )
+        .expect("the resumed current writer must snapshot normally");
+    assert_eq!(final_snapshot.revision, after_stale_boundary.revision + 1);
 }
 
 #[test]

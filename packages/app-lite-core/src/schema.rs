@@ -262,22 +262,41 @@ fn ensure_edit_journal_v5(
 
 fn backfill_v4_edit_journal(transaction: &Transaction<'_>) -> Result<(), LibraryError> {
     let mut statement = transaction.prepare(
-        "SELECT id, note_id, delta_utf8
+        "SELECT rowid, id, note_id, generation, delta_utf8, created_time
          FROM edit_journal
          ORDER BY rowid ASC",
     )?;
     let rows = statement
         .query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
 
-    for (id, row_note_id, delta_utf8) in rows {
+    // v4 appended rather than compacted checkpoints. A crash can therefore
+    // leave J1, J2, and even an older-base row for one note. Preserve exactly
+    // the newest replayable current-base checkpoint per note. Stored
+    // `created_time` is the primary recency signal; generation and rowid make
+    // ties deterministic without letting a stale base revision win merely
+    // because its clock was later.
+    struct Candidate {
+        rowid: i64,
+        id: String,
+        expected_revision: i64,
+        generation: i64,
+        created_time: i64,
+    }
+
+    let mut winners = std::collections::BTreeMap::<String, Candidate>::new();
+    let mut obsolete_ids = Vec::new();
+    for (rowid, id, row_note_id, generation, delta_utf8, created_time) in rows {
         let payload: serde_json::Value = serde_json::from_str(&delta_utf8)
             .map_err(|_| LibraryError::InvalidLegacyEditJournal)?;
         let payload_note_id = payload
@@ -301,18 +320,58 @@ fn backfill_v4_edit_journal(transaction: &Transaction<'_>) -> Result<(), Library
                 |row| row.get(0),
             )
             .optional()?;
-        if current_revision != Some(payload_revision) {
-            // Refusing the entire migration is intentional. A mismatched
-            // delta cannot be replayed safely and silently skipping it would
-            // discard unsnapshotted user data without any visible notice.
+        let Some(current_revision) = current_revision else {
+            return Err(LibraryError::InvalidLegacyEditJournal);
+        };
+        if payload_revision < current_revision {
+            // This delta was already superseded by a durable note snapshot.
+            // It cannot be replayed at the current base, so retaining it as
+            // an apparent owner would only block the next real edit.
+            obsolete_ids.push(id);
+            continue;
+        }
+        if payload_revision > current_revision {
+            // A future-base delta has no safe interpretation. Keep the
+            // existing fail-closed behavior for corrupt/rolled-back profiles.
             return Err(LibraryError::InvalidLegacyEditJournal);
         }
+        let candidate = Candidate {
+            rowid,
+            id,
+            expected_revision: payload_revision,
+            generation,
+            created_time,
+        };
+        let replace_winner = match winners.get(&row_note_id) {
+            Some(current) => {
+                (
+                    candidate.created_time,
+                    candidate.generation,
+                    candidate.rowid,
+                ) > (current.created_time, current.generation, current.rowid)
+            }
+            None => true,
+        };
+        if replace_winner {
+            if let Some(previous) = winners.insert(row_note_id, candidate) {
+                obsolete_ids.push(previous.id);
+            }
+        } else {
+            obsolete_ids.push(candidate.id);
+        }
+    }
+
+    for candidate in winners.into_values() {
+        let writer_token = format!("legacy-v4-{}", candidate.id);
         transaction.execute(
             "UPDATE edit_journal
              SET expected_revision = ?2, writer_token = ?3
              WHERE id = ?1",
-            params![id, payload_revision, format!("legacy-v4-{id}")],
+            params![candidate.id, candidate.expected_revision, writer_token],
         )?;
+    }
+    for id in obsolete_ids {
+        transaction.execute("DELETE FROM edit_journal WHERE id = ?1", [id])?;
     }
     Ok(())
 }

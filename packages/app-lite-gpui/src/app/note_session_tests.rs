@@ -1304,6 +1304,176 @@ async fn v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_co
     assert!(semantic.contains("Bold"));
 }
 
+#[gpui::test]
+async fn v4_multi_checkpoint_recovery_lifecycle_flush_compacts_then_continues_after_restart(
+    cx: &mut gpui::TestAppContext,
+) {
+    // Catches a real v4 crash profile where J1 and J2 share a live base
+    // revision. The session must recover J2, compact every superseded legacy
+    // row on a lifecycle boundary before any new input, then accept a fresh
+    // 100 ms journal / 500 ms snapshot and restart exactly. A stale revision
+    // with a later timestamp is deliberately included so it cannot win just
+    // because it was the final v4 append.
+    let cx = cx.add_empty_window();
+    let profile = tempfile::tempdir().expect("temporary release profile");
+    let path = profile.path().join("library.sqlite");
+    let repository = Arc::new(LibraryRepository::open(&path).expect("open profile"));
+    let note = create(&repository, "旧标题", rich_document("旧正文"));
+    repository
+        .flush_snapshot(
+            SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: "revision two base".into(),
+                document: rich_document("持久化基线"),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            None,
+        )
+        .expect("advance note to revision two");
+    drop(repository);
+
+    let connection = Connection::open(&path).expect("open v4 fixture sqlite");
+    connection
+        .execute_batch(
+            "DROP TABLE edit_journal;
+             CREATE TABLE edit_journal (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 note_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 delta_utf8 TEXT NOT NULL,
+                 created_time INTEGER NOT NULL
+             );
+             PRAGMA user_version = 4;",
+        )
+        .expect("seed v4 journal shape");
+    for (id, revision, generation, created_time, title, body_html) in [
+        (
+            "a".repeat(32),
+            2_i64,
+            3_i64,
+            100_i64,
+            "迁移 J1",
+            "<p>迁移 J1</p>",
+        ),
+        (
+            "b".repeat(32),
+            2_i64,
+            9_i64,
+            200_i64,
+            "迁移 J2 最新标题",
+            "<p><strong>迁移 J2 最新正文</strong></p>",
+        ),
+        (
+            "c".repeat(32),
+            1_i64,
+            99_i64,
+            999_i64,
+            "过期标题不得恢复",
+            "<p>过期正文不得恢复</p>",
+        ),
+    ] {
+        let payload = format!(
+            r#"{{"version":1,"note_id":"{}","expected_revision":{},"generation":{},"title":"{}","body_html":"{}","resource_ids":[]}}"#,
+            note.id.as_str(),
+            revision,
+            generation,
+            title,
+            body_html
+        );
+        connection
+            .execute(
+                "INSERT INTO edit_journal (id, note_id, generation, delta_utf8, created_time)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, note.id.as_str(), generation, payload, created_time],
+            )
+            .expect("seed v4 checkpoint");
+    }
+    drop(connection);
+
+    let migrated = Arc::new(LibraryRepository::open(&path).expect("migrate v4 profile"));
+    let durable = migrated
+        .load_note(&note.id)
+        .expect("load migrated base")
+        .expect("note exists");
+    assert_eq!(durable.revision, 2);
+    let clock = Arc::new(ManualSaveClock::default());
+    let restored = session(durable, Arc::clone(&migrated), Arc::clone(&clock), cx);
+    let (title, body) = restored.read_with(cx, |session, session_cx| {
+        (
+            session.title().read(session_cx).text().to_owned(),
+            session.editor().read(session_cx).visible_text(),
+        )
+    });
+    assert_eq!(title, "迁移 J2 最新标题");
+    assert!(body.contains("迁移 J2 最新正文"));
+    assert!(!body.contains("过期正文"));
+
+    // This is deliberately before another input event. The old implementation
+    // removed only J2 here, leaving J1/stale rows to become foreign owners.
+    flush_until_clean(&restored, FlushReason::WindowClose, cx);
+    let after_lifecycle: i64 = Connection::open(&path)
+        .expect("inspect compacted migrated journal")
+        .query_row(
+            "SELECT count(*) FROM edit_journal WHERE note_id = ?1",
+            [note.id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("count note journals");
+    assert_eq!(
+        after_lifecycle, 0,
+        "no legacy foreign owner may survive J2's snapshot"
+    );
+
+    append_title_via_entity_input(&restored, "继续编辑", cx);
+    append_body_via_entity_input(&restored, "并保存到第二次重启", cx);
+    clock.advance(Duration::from_millis(100));
+    poll_and_drain(&restored, cx);
+    let continued = migrated
+        .latest_edit_journal_for_revision(&note.id, Some(3))
+        .expect("read current-base continued journal")
+        .expect("continued input must journal after lifecycle compaction");
+    assert!(continued.delta_utf8.contains("继续编辑"));
+    assert!(continued.delta_utf8.contains("第二次重启"));
+    clock.advance(Duration::from_millis(400));
+    poll_and_drain(&restored, cx);
+    assert!(
+        migrated
+            .latest_edit_journal(&note.id)
+            .expect("read compacted continuation")
+            .is_none(),
+        "the fresh owner snapshots and compacts normally"
+    );
+
+    drop(restored);
+    let restarted_note = migrated
+        .load_note(&note.id)
+        .expect("load continued note")
+        .expect("continued note exists");
+    assert_eq!(restarted_note.revision, 4);
+    let restarted = session(restarted_note, migrated, clock, cx);
+    let (restarted_title, restarted_body, semantic) =
+        restarted.read_with(cx, |session, session_cx| {
+            (
+                session.title().read(session_cx).text().to_owned(),
+                session.editor().read(session_cx).visible_text(),
+                format!(
+                    "{:?}",
+                    session
+                        .editor()
+                        .read(session_cx)
+                        .document()
+                        .semantic_snapshot()
+                ),
+            )
+        });
+    assert_eq!(restarted_title, "迁移 J2 最新标题继续编辑");
+    assert!(restarted_body.contains("迁移 J2 最新正文"));
+    assert!(restarted_body.contains("第二次重启"));
+    assert!(semantic.contains("Bold"));
+}
+
 #[test]
 fn stale_timer_generation_cannot_snapshot_a_note_selected_after_its_session() {
     use super::save_coordinator::{SaveCoordinator, SaveWork};

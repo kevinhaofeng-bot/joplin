@@ -873,10 +873,10 @@ impl LibraryRepository {
                 .query_row(
                     "SELECT expected_revision, writer_token, sequence
                      FROM edit_journal
-                     WHERE note_id = ?1
+                     WHERE note_id = ?1 AND expected_revision = ?2
                      ORDER BY sequence DESC
                      LIMIT 1",
-                    [input.id.as_str()],
+                    params![input.id.as_str(), input.expected_revision],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
@@ -938,21 +938,18 @@ impl LibraryRepository {
         )?;
         queue_search(&transaction, &input.id, now, "snapshot")?;
         if clear_journal {
-            if let Some(owner) = journal_ownership {
-                let deleted = transaction.execute(
-                    "DELETE FROM edit_journal
-                     WHERE note_id = ?1 AND expected_revision = ?2
-                       AND writer_token = ?3 AND sequence = ?4",
-                    params![
-                        input.id.as_str(),
-                        input.expected_revision,
-                        owner.writer_token,
-                        owner.sequence
-                    ],
-                )?;
-                if deleted != 1 {
-                    return Err(LibraryError::JournalOwnershipConflict);
-                }
+            // The exact-current lease was verified above while this IMMEDIATE
+            // transaction was held. Once it owns the newest current-base row,
+            // compact it together with any safely obsolete lower-base rows
+            // (and legacy same-base predecessors) for this note. Never touch
+            // a hypothetical future-base row.
+            let deleted = transaction.execute(
+                "DELETE FROM edit_journal
+                 WHERE note_id = ?1 AND expected_revision <= ?2",
+                params![input.id.as_str(), input.expected_revision],
+            )?;
+            if journal_ownership.is_some() && deleted == 0 {
+                return Err(LibraryError::JournalOwnershipConflict);
             }
         }
         enqueue_sync(
@@ -1325,8 +1322,12 @@ impl LibraryRepository {
         }
         let existing_writer: Option<String> = transaction
             .query_row(
-                "SELECT writer_token FROM edit_journal WHERE note_id = ?1 ORDER BY sequence DESC LIMIT 1",
-                [entry.note_id.as_str()],
+                "SELECT writer_token
+                 FROM edit_journal
+                 WHERE note_id = ?1 AND expected_revision = ?2
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+                params![entry.note_id.as_str(), entry.expected_revision],
                 |row| row.get(0),
             )
             .optional()?;
