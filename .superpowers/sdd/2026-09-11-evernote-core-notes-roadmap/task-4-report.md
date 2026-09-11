@@ -194,3 +194,24 @@ Targeted verification before the broad release pass:
 - `cargo test ui::tests:: -- --nocapture` in `packages/app-lite-gpui` —
   **PASS, 28 tests**.
 - `cargo fmt` for both manifests and `git diff --check` — **PASS**.
+
+Broad verification after repair commit `8f6debc032059c4cfdee61ae5f3f0a2a4edb36b1`:
+
+- `cargo test --no-fail-fast` in `packages/app-lite-core` — **PASS, 77
+  tests** (including the v4 revision-2 recovery migration).
+- `cargo check --all-targets` in `packages/app-lite-gpui` — **PASS**.
+- `cargo test --no-fail-fast` in `packages/app-lite-native` — **PASS, 225
+  tests**.
+- Full GPUI binary suite with only the pre-existing exact donor skip —
+  **PASS, 1,076 tests**; 1 filtered donor test and no new skip.
+- `cargo build --release` in `packages/app-lite-gpui` — **PASS**.
+- A fresh absolute `JOPLIN_LITE_PROFILE` release smoke created an isolated
+  `library.sqlite`, WAL, and SHM; `PRAGMA integrity_check` returned **`ok`**.
+  The smoke child was intentionally terminated after initialization.
+- Release `--evernote-spike --fixture empty` — **PASS**: ready marker plus
+  diagnostics were emitted (texture 0, layout 9,672, undo 1,233,
+  transaction p95 6 us, render-commit p95 9,185 us).
+- Release `--evernote-spike --fixture typical` — **PASS**: ready marker plus
+  diagnostics were emitted (texture 26,361,856, layout 1,009,056, undo 3,822,
+  transaction p95 31 us, render-commit p95 9,169 us).
+- `cargo fmt --check` for core and GPUI plus `git diff --check` — **PASS**.
