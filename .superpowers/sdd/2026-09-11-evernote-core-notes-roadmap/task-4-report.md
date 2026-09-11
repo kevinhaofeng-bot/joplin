@@ -335,3 +335,71 @@ Verification after repair commit `e8e151359`:
   undo 3,822, transaction p95 31 us, render-commit p95 9,177 us).
 - `cargo fmt --check` for core and GPUI manifests plus `git diff --check` —
   **PASS** after the final report commit below.
+
+## Independent review repair round 5 — 2026-09-11
+
+This narrow compatibility repair closes the remaining v4 multi-checkpoint
+recovery gap without a schema bump or any Task 5 resource/import work.
+
+- **T4-R5-I1:** the v4-to-v5 journal backfill now parses and validates every
+  legacy version-1 payload inside the migration transaction, then groups rows
+  independently by note. For each live base revision it keeps exactly one
+  replayable checkpoint, choosing deterministically by
+  `(created_time, generation, rowid)`. It safely removes lower-revision rows
+  that are already superseded by the durable note; a future revision, missing
+  note, malformed payload, or note-ID mismatch remains fail-closed. This
+  prevents a later timestamp on a stale base from winning and never deletes a
+  valid checkpoint belonging to another note.
+- Current journal ownership lookup in both snapshot and append is now scoped
+  to the current `expected_revision`. After the supplied lease has been
+  verified inside the same `BEGIN IMMEDIATE` snapshot transaction, compaction
+  removes that note's same-or-lower-base residue while preserving a hypothetical
+  future-base row. A recovered lifecycle flush therefore cannot strand a
+  legacy foreign owner that blocks the next journal or snapshot.
+
+The repair was developed RED first. Before the migration change, the real
+multi-row v4 fixtures failed closed with `InvalidLegacyEditJournal` because a
+valid stale-base legacy row was treated as fatal; before revision-scoped
+ownership/compaction, the core stale-residue continuation failed with
+`JournalOwnershipConflict`. All three tests are now green and would fail again
+if their corresponding grouping, scope, or cleanup statements were removed:
+
+- `v4_migration_keeps_one_latest_current_checkpoint_per_note_without_touching_other_notes`
+  seeds J1/J2 for a revision-2 note, a later-timestamp stale revision-1 row,
+  and another note's valid journal; only J2 and the other note survive.
+- strengthened
+  `journal_writer_token_owns_the_checkpoint_against_cross_window_replay`
+  injects an old-base v5 residue, verifies a current lifecycle snapshot cleans
+  it, then journals and snapshots a new current generation normally.
+- `v4_multi_checkpoint_recovery_lifecycle_flush_compacts_then_continues_after_restart`
+  uses real `EntityInputHandler` title/body input: recover J2, invoke a
+  `WindowClose` flush before another edit, assert no same-note foreign journal
+  remains, then complete the 100 ms journal, 500 ms snapshot, and exact styled
+  second restart.
+
+Implementation commit: `6a50a33ff Compact stale v4 journal checkpoints`.
+
+Verification after that commit:
+
+- Core targeted migration/repository flow suites — **PASS, 11/11 and 7/7**.
+- `cargo test app::note_session_tests:: -- --nocapture` — **PASS, 22/22**.
+- `cargo test ui::tests:: -- --nocapture` — **PASS, 28/28**.
+- `cargo test --no-fail-fast` in `packages/app-lite-core` — **PASS, 79
+  tests**.
+- `cargo test --no-fail-fast` in `packages/app-lite-native` — **PASS, 225
+  tests**.
+- `cargo check --all-targets` in `packages/app-lite-gpui` — **PASS**.
+- Full GPUI binary suite with exactly the pre-existing donor skip — **PASS,
+  1,081 tests**; 1 filtered donor test and no new skip.
+- `cargo build --release` in `packages/app-lite-gpui` — **PASS**.
+- A fresh absolute `JOPLIN_LITE_PROFILE` release smoke created an isolated
+  `library.sqlite`; `PRAGMA integrity_check` returned **`ok`**. The child was
+  intentionally terminated after initialization.
+- Release `--evernote-spike --fixture empty` — **PASS**: exact readiness
+  marker plus five-number diagnostics (texture 0, layout 9,672, undo 1,233,
+  transaction p95 5 us, render-commit p95 9,140 us).
+- Release `--evernote-spike --fixture typical` — **PASS**: exact readiness
+  marker plus five-number diagnostics (texture 26,361,856, layout 1,009,056,
+  undo 3,822, transaction p95 31 us, render-commit p95 9,306 us).
+- `cargo fmt --check` for core and GPUI manifests plus `git diff --check` —
+  **PASS** after the report commit below.
