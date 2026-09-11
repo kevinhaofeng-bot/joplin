@@ -1,7 +1,8 @@
 use super::*;
 use crate::app::AppAction;
-use crate::components::{Copy, Paste, SelectAll};
-use app_lite_core::document::{Block, BlockStyle, Inline};
+use crate::app::save_coordinator::ManualSaveClock;
+use crate::components::{Copy, SelectAll};
+use app_lite_core::document::{Block, BlockStyle, Inline, Marks};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryShellState};
 use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext};
 use std::sync::Arc;
@@ -39,6 +40,18 @@ fn mount_shell<'a>(
     let model_state = AppModel::open(repository).expect("open model");
     let model = cx.new(|_| model_state);
     cx.add_window_view(move |window, cx| LibraryShell::new(model, None, window, cx))
+}
+
+fn mount_shell_with_save_clock<'a>(
+    repository: Arc<LibraryRepository>,
+    clock: Arc<ManualSaveClock>,
+    cx: &'a mut TestAppContext,
+) -> (Entity<LibraryShell>, &'a mut VisualTestContext) {
+    let model_state = AppModel::open(repository).expect("open model");
+    let model = cx.new(|_| model_state);
+    cx.add_window_view(move |window, cx| {
+        LibraryShell::new_with_save_clock(model, None, clock, window, cx)
+    })
 }
 
 #[gpui::test]
@@ -499,7 +512,7 @@ async fn rich_body_mounts_the_native_canvas_and_never_uses_body_text_fallback(
     assert!(cx.debug_bounds("native-editor-surface").is_some());
     view.read_with(cx, |view, cx| {
         let surface = view.editor_surface.as_ref().expect("mounted surface");
-        assert_eq!(surface.read(cx).mode(), EditorSurfaceMode::ReadOnly);
+        assert_eq!(surface.read(cx).mode(), EditorSurfaceMode::Editable);
         assert!(
             surface
                 .read(cx)
@@ -571,17 +584,29 @@ async fn library_canvas_shapes_and_executes_the_shared_paint_entity_path(cx: &mu
 }
 
 #[gpui::test]
-async fn mounted_read_only_surface_keeps_selection_and_copy_available(cx: &mut TestAppContext) {
+async fn mounted_editable_session_uses_real_title_and_body_input_then_persists(
+    cx: &mut TestAppContext,
+) {
     cx.update(|app| crate::components::init(app));
     let (_profile, repository) = repository();
     let stored = repository
         .create_note(CreateNote {
-            title: "可复制的只读笔记".into(),
+            title: "可编辑笔记".into(),
             notebook_id: None,
-            document: rich_document("只读正文仍应允许复制"),
+            document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "保留富文本样式".into(),
+                    marks: Marks {
+                        bold: true,
+                        italic: true,
+                        ..Marks::default()
+                    },
+                }],
+            }]),
         })
         .expect("create note");
-    let (view, cx) = mount_shell(repository, cx);
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
     redraw(cx);
 
     let card = cx
@@ -590,68 +615,352 @@ async fn mounted_read_only_surface_keeps_selection_and_copy_available(cx: &mut T
     cx.simulate_click(card.center(), Modifiers::default());
     redraw(cx);
 
-    let editor = view.read_with(cx, |view, cx| {
-        view.editor_surface
-            .as_ref()
-            .expect("selected note mounts an editor surface")
-            .read(cx)
-            .editor()
-            .clone()
-    });
-    let baseline = cx.update(|_, app| {
-        let editor = editor.read(app);
-        (
-            editor.document().semantic_snapshot(),
-            editor.undo_depth(),
-            editor.redo_depth(),
-            editor.history_used_bytes(),
-            editor.image_resource_count_for_test(),
-        )
-    });
+    let title = cx
+        .debug_bounds("library-note-title")
+        .expect("mounted title EntityInputHandler canvas");
+    cx.simulate_click(title.center(), Modifiers::default());
+    cx.simulate_input("中文标题");
     let surface = cx
         .debug_bounds("native-editor-surface")
-        .expect("mounted read-only canvas");
-    // Use the mounted surface's real pointer focus and GPUI input bridge,
-    // rather than calling EditorCore mutation methods directly.
+        .expect("mounted editable canvas");
+    // Both edits pass through the production canvas/EntityInputHandler route;
+    // no test-only mutation helper supplies the title or body string.
     cx.simulate_click(surface.center(), Modifiers::default());
-    cx.simulate_input("不应写入");
-    cx.write_to_clipboard(gpui::ClipboardItem::new_string("剪贴板不应写入".into()));
-    cx.simulate_keystrokes("cmd-v backspace");
-    cx.dispatch_action(Paste);
+    cx.simulate_input("中文正文");
     cx.dispatch_action(SelectAll);
     cx.dispatch_action(Copy);
     assert_eq!(
         cx.read_from_clipboard().and_then(|item| item.text()),
-        Some("只读正文仍应允许复制".into()),
-        "Task 4 read-only mode must preserve selection and copy"
+        Some("保留富文本样式中文正文".into()),
+        "editable body keeps the mounted copy path available"
     );
+    let save = cx
+        .debug_bounds("library-sync-current")
+        .expect("manual sync action");
+    cx.simulate_click(save.center(), Modifiers::default());
+    redraw(cx);
+
+    let persisted = repository
+        .load_note(&stored.id)
+        .expect("load saved note")
+        .expect("saved note");
+    assert_eq!(persisted.title, "可编辑笔记中文标题");
+    assert!(persisted.body_text.contains("中文正文"));
+    let canonical = CanonicalDocument::parse_html(&persisted.body_html).expect("canonical save");
+    assert!(format!("{canonical:?}").contains("bold: true"));
+    assert!(format!("{canonical:?}").contains("italic: true"));
     view.read_with(cx, |view, cx| {
         let surface = view.editor_surface.as_ref().expect("mounted surface");
-        assert_eq!(surface.read(cx).mode(), EditorSurfaceMode::ReadOnly);
-        assert_eq!(
-            surface.read(cx).editor().read(cx).copy_all_plain_text(),
-            "只读正文仍应允许复制"
-        );
-        let editor = surface.read(cx).editor().read(cx);
-        assert_eq!(
-            editor.document().semantic_snapshot(),
-            baseline.0,
-            "mounted mouse/IME/paste input must not mutate a read-only document"
-        );
-        assert_eq!(editor.undo_depth(), baseline.1);
-        assert_eq!(editor.redo_depth(), baseline.2);
-        assert_eq!(editor.history_used_bytes(), baseline.3);
-        assert_eq!(
-            editor.image_resource_count_for_test(),
-            baseline.4,
-            "read-only clipboard handling must not add image-store resources"
+        assert_eq!(surface.read(cx).mode(), EditorSurfaceMode::Editable);
+        assert!(
+            surface
+                .read(cx)
+                .editor()
+                .read(cx)
+                .copy_all_plain_text()
+                .contains("中文正文")
         );
         assert_eq!(
             view.model.read(cx).navigation().selected_note_id(),
             Some(&stored.id),
-            "copy actions must not mutate library selection"
+            "input/save actions must not mutate library selection"
         );
     });
+}
+
+#[gpui::test]
+async fn stale_delayed_session_save_cannot_overwrite_the_newly_selected_note(
+    cx: &mut TestAppContext,
+) {
+    // This models the hardest real ordering: A has a delayed save queued,
+    // selection changes to B through the retained-model observer, and the
+    // old callback wakes afterwards. A stale callback may save A's own
+    // generation, but it must never borrow the newly mounted B surface.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "会话 A".into(),
+            notebook_id: None,
+            document: rich_document("A 原文"),
+        })
+        .expect("create A");
+    let second = repository
+        .create_note(CreateNote {
+            title: "会话 B".into(),
+            notebook_id: None,
+            document: rich_document("B 原文"),
+        })
+        .expect("create B");
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |view, view_cx| {
+            view.apply_action(AppAction::SelectNote(first.id.clone()), window, view_cx)
+        });
+    });
+    redraw(cx);
+    let first_surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("A mounts editable canvas");
+    cx.simulate_click(first_surface.center(), Modifiers::default());
+    cx.simulate_input(" A 延迟编辑");
+    let stale_session = view.read_with(cx, |view, _| {
+        view.note_session
+            .as_ref()
+            .expect("A session retained")
+            .clone()
+    });
+
+    // Deliberately bypass the shell reducer's normal flush. This represents a
+    // platform selection/update racing the already-scheduled A callback and
+    // catches any implementation that makes a session consult global active
+    // selection when it finally serializes.
+    cx.update(|_window, app| {
+        let model = view.read(app).model.clone();
+        model.update(app, |model, model_cx| {
+            model
+                .dispatch(AppAction::SelectNote(second.id.clone()))
+                .expect("select B through model seam");
+            model_cx.notify();
+        });
+    });
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.surface_note_id.clone()),
+        Some(second.id.clone()),
+        "retained observer must mount B before the stale work fires"
+    );
+
+    clock.advance(Duration::from_millis(500));
+    stale_session.update(cx, |session, session_cx| {
+        session
+            .poll(session_cx)
+            .expect("delayed A work is contained")
+    });
+
+    let saved_first = repository
+        .load_note(&first.id)
+        .expect("load A")
+        .expect("A exists");
+    let saved_second = repository
+        .load_note(&second.id)
+        .expect("load B")
+        .expect("B exists");
+    assert!(saved_first.body_text.contains("A 延迟编辑"));
+    assert_eq!(saved_second.body_text, "B 原文");
+    assert_eq!(saved_second.revision, second.revision);
+}
+
+#[gpui::test]
+async fn mounted_window_close_flushes_the_current_edit_before_teardown(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "关闭前保存".into(),
+            notebook_id: None,
+            document: rich_document("关闭前正文"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |view, view_cx| {
+            view.apply_action(AppAction::SelectNote(note.id.clone()), window, view_cx)
+        });
+    });
+    redraw(cx);
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted session surface");
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 已编辑");
+
+    // `simulate_close` invokes GPUI's platform should-close callback, exactly
+    // like Cmd-W/the titlebar control. `remove_window` is a programmatic
+    // teardown primitive and intentionally bypasses that callback.
+    assert!(
+        cx.simulate_close(),
+        "successful flush permits the window close"
+    );
+
+    let saved = repository
+        .load_note(&note.id)
+        .expect("load after close")
+        .expect("note remains");
+    assert!(saved.body_text.contains("已编辑"));
+}
+
+#[gpui::test]
+async fn mounted_action_boundaries_flush_before_switch_new_manual_sync_and_delete(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "切换前".into(),
+            notebook_id: None,
+            document: rich_document("A"),
+        })
+        .expect("create A");
+    let second = repository
+        .create_note(CreateNote {
+            title: "新建前".into(),
+            notebook_id: None,
+            document: rich_document("B"),
+        })
+        .expect("create B");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(first.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let first_surface = cx.debug_bounds("native-editor-surface").expect("A surface");
+    cx.simulate_click(first_surface.center(), Modifiers::default());
+    cx.simulate_input(" 已编辑");
+
+    // Card/keyboard routes end here too: the shared reducer must compact A
+    // before it changes retained selection to B.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(second.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    assert!(
+        repository
+            .load_note(&first.id)
+            .expect("load A")
+            .expect("A exists")
+            .body_text
+            .contains("已编辑")
+    );
+
+    let second_surface = cx.debug_bounds("native-editor-surface").expect("B surface");
+    cx.simulate_click(second_surface.center(), Modifiers::default());
+    cx.simulate_input(" 待新建");
+    let create = cx
+        .debug_bounds("library-create-note")
+        .expect("mounted create action");
+    cx.simulate_click(create.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        repository
+            .load_note(&second.id)
+            .expect("load B")
+            .expect("B exists")
+            .body_text
+            .contains("待新建")
+    );
+
+    let created_id = view.read_with(cx, |shell, shell_cx| {
+        shell
+            .model
+            .read(shell_cx)
+            .active_note()
+            .expect("new note selected")
+            .id
+            .clone()
+    });
+    let created_surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("new note surface");
+    cx.simulate_click(created_surface.center(), Modifiers::default());
+    cx.simulate_input(" 手动保存后删除");
+    let save = cx
+        .debug_bounds("library-sync-current")
+        .expect("manual-save action");
+    cx.simulate_click(save.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        repository
+            .load_note(&created_id)
+            .expect("load manually saved note")
+            .expect("new note exists")
+            .body_text
+            .contains("手动保存后删除")
+    );
+
+    let created_surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("new note remains selected");
+    cx.simulate_click(created_surface.center(), Modifiers::default());
+    cx.simulate_input(" 删除前最后一笔");
+    let trash = cx
+        .debug_bounds("library-trash-selected")
+        .expect("mounted trash action");
+    cx.simulate_click(trash.center(), Modifiers::default());
+    redraw(cx);
+    let deleted = repository
+        .load_note(&created_id)
+        .expect("load trashed note")
+        .expect("trashed row retained");
+    assert!(deleted.body_text.contains("删除前最后一笔"));
+    assert!(deleted.deleted_time.is_some());
+}
+
+#[gpui::test]
+async fn mounted_quit_lifecycle_flushes_the_current_edit_before_the_platform_request(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "退出前保存".into(),
+            notebook_id: None,
+            document: rich_document("退出前正文"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted session");
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 已编辑");
+
+    assert!(view.read_with(cx, |shell, shell_cx| {
+        shell.note_session.as_ref().is_some_and(|session| {
+            !matches!(
+                session.read(shell_cx).save_state(),
+                crate::app::save_coordinator::SaveState::Clean
+            )
+        })
+    }));
+    cx.cx.update(|app| {
+        assert!(
+            app.windows()
+                .iter()
+                .any(|window| window.downcast::<LibraryShell>().is_some())
+        );
+    });
+
+    // Native-menu dispatch owns an App callback, not a nested window update.
+    // Use the same context here so its root-window handle can be updated.
+    cx.cx
+        .update(|app| crate::library_menu::request_quit_library(app));
+    assert!(
+        repository
+            .load_note(&note.id)
+            .expect("load after quit request")
+            .expect("note retained")
+            .body_text
+            .contains("已编辑")
+    );
 }
 
 #[gpui::test]

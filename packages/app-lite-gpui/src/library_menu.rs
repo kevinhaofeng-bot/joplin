@@ -5,11 +5,13 @@
 //! product. The common lifecycle/menu infrastructure is retained here with
 //! library-native actions only.
 
+use crate::app::save_coordinator::FlushReason;
 use crate::app::{
-    CreateNote, CycleListViewMode, CycleSort, ToggleNoteList, ToggleSidebar, TrashSelected,
+    CreateNote, CycleListViewMode, CycleSort, SyncCurrent, ToggleNoteList, ToggleSidebar,
+    TrashSelected,
 };
 use crate::file_url::parse_file_url;
-use crate::ui;
+use crate::ui::{self, LibraryShell};
 use gpui::{App, Global, Menu, MenuItem, Subscription, Task, actions};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -83,7 +85,7 @@ fn present_open_request_result(cx: &mut App, result: Result<(), String>) -> Resu
 pub(crate) fn init(cx: &mut App, profile: PathBuf, open_url_receiver: Receiver<Vec<String>>) {
     install_last_window_quit(cx);
 
-    cx.on_action(|_: &QuitLibrary, cx| cx.quit());
+    cx.on_action(|_: &QuitLibrary, cx| request_quit_library(cx));
     cx.set_menus(vec![Menu {
         name: "Joplin Lite".into(),
         items: vec![
@@ -94,6 +96,7 @@ pub(crate) fn init(cx: &mut App, profile: PathBuf, open_url_receiver: Receiver<V
             MenuItem::action("显示/隐藏笔记列表", ToggleNoteList),
             MenuItem::action("切换列表视图", CycleListViewMode),
             MenuItem::action("切换排序", CycleSort),
+            MenuItem::action("保存当前笔记", SyncCurrent),
             MenuItem::separator(),
             MenuItem::action("退出 Joplin Lite", QuitLibrary),
         ],
@@ -134,6 +137,26 @@ pub(crate) fn init(cx: &mut App, profile: PathBuf, open_url_receiver: Receiver<V
         }
     });
     cx.global_mut::<LibraryMenuLifecycle>().open_url_task = Some(task);
+}
+
+/// The app menu can receive Cmd-Q while a library editor has focus. Ask each
+/// mounted library shell to complete its exact current generation first; if a
+/// snapshot fails, the shell stays open and renders the local-save error.
+pub(crate) fn request_quit_library(cx: &mut App) {
+    for window in cx.windows() {
+        let Some(shell) = window.downcast::<LibraryShell>() else {
+            continue;
+        };
+        let flushed = shell
+            .update(cx, |shell, _window, shell_cx| {
+                shell.flush_for_lifecycle(FlushReason::Quit, shell_cx)
+            })
+            .unwrap_or(false);
+        if !flushed {
+            return;
+        }
+    }
+    cx.quit();
 }
 
 pub(crate) fn import_notice(paths: &[PathBuf]) -> String {

@@ -1,5 +1,7 @@
 mod actions;
 mod navigation;
+pub(crate) mod note_session;
+pub(crate) mod save_coordinator;
 
 pub use actions::*;
 pub use navigation::*;
@@ -168,6 +170,11 @@ impl AppModel {
                 self.sort_projections();
                 Ok(())
             }
+            // The retained UI session performs the blocking flush before it
+            // reaches this shared reducer. Keeping the resulting visible
+            // success/error state here means menu, key and button callers all
+            // still use one action path.
+            AppAction::ManualSync => Ok(()),
         };
         match result {
             Ok(()) => {
@@ -348,6 +355,10 @@ impl AppModel {
         self.repository.subscribe()
     }
 
+    pub(crate) fn repository(&self) -> Arc<LibraryRepository> {
+        Arc::clone(&self.repository)
+    }
+
     pub fn persist_shell_state(&self) -> Result<(), LibraryError> {
         self.repository
             .write_library_shell_state(&LibraryShellState {
@@ -457,5 +468,7 @@ impl AppModel {
     }
 }
 
+#[cfg(test)]
+mod note_session_tests;
 #[cfg(test)]
 mod tests;

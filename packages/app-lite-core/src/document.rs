@@ -95,6 +95,34 @@ pub enum Block {
         kind: ListKind,
         items: Vec<ListItem>,
     },
+    /// A quoted text block. Keeping quote as a first-class canonical node
+    /// avoids representing it as indentation, which the native codec must
+    /// deliberately reject rather than flatten.
+    Quote {
+        style: BlockStyle,
+        inlines: Vec<Inline>,
+    },
+    /// A preformatted text block. The text remains represented by the same
+    /// safe inline DTO, so marks and soft breaks have one deterministic path.
+    Code {
+        style: BlockStyle,
+        inlines: Vec<Inline>,
+    },
+    /// A resource-backed image at block position. Inline images remain part
+    /// of the legacy HTML projection; Task 4's native editor maps this
+    /// structural form without inventing an import transaction.
+    Image {
+        resource_id: ResourceId,
+        alt: String,
+    },
+    /// A resource-backed attachment card at block position.
+    Attachment {
+        resource_id: ResourceId,
+        filename: String,
+        media_type: String,
+    },
+    /// A semantic horizontal divider.
+    Divider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +176,7 @@ pub struct Marks {
     pub strikethrough: bool,
     pub highlight: bool,
     pub link: Option<String>,
+    pub inline_code: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,14 +277,82 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                 output.push_str(tag);
                 output.push('>');
             }
+            // These markers distinguish the native editor's structural
+            // blocks from legacy HTML. In particular, old `<pre>` content
+            // remains a preformatted paragraph instead of changing shape on
+            // its next save.
+            Block::Quote { style, inlines } => serialize_marked_block(
+                "blockquote",
+                "data-joplin-lite-block-quote",
+                style,
+                inlines,
+                &mut output,
+            ),
+            Block::Code { style, inlines } => serialize_marked_block(
+                "pre",
+                "data-joplin-lite-block-code",
+                style,
+                inlines,
+                &mut output,
+            ),
+            Block::Image { resource_id, alt } => {
+                output.push_str("<img data-joplin-lite-block-image=\"true\" src=\":/");
+                escape_attribute(resource_id.as_str(), &mut output);
+                output.push_str("\" alt=\"");
+                escape_attribute(alt, &mut output);
+                output.push_str("\">");
+            }
+            Block::Attachment {
+                resource_id,
+                filename,
+                media_type,
+            } => {
+                output.push_str("<a data-joplin-lite-block-attachment=\"true\" href=\":/");
+                escape_attribute(resource_id.as_str(), &mut output);
+                output.push_str("\" data-resource-id=\"");
+                escape_attribute(resource_id.as_str(), &mut output);
+                output.push_str("\" data-filename=\"");
+                escape_attribute(filename, &mut output);
+                output.push_str("\" data-media-type=\"");
+                escape_attribute(media_type, &mut output);
+                output.push_str("\">");
+                escape_text_run(filename, &[], 0, &mut output);
+                output.push_str("</a>");
+            }
+            Block::Divider => output.push_str("<hr data-joplin-lite-block-divider=\"true\">"),
         }
     }
     output
 }
 
 fn serialize_block(tag: &str, style: &BlockStyle, inlines: &[Inline], output: &mut String) {
+    serialize_optional_marked_block(tag, None, style, inlines, output);
+}
+
+fn serialize_marked_block(
+    tag: &str,
+    marker: &str,
+    style: &BlockStyle,
+    inlines: &[Inline],
+    output: &mut String,
+) {
+    serialize_optional_marked_block(tag, Some(marker), style, inlines, output);
+}
+
+fn serialize_optional_marked_block(
+    tag: &str,
+    marker: Option<&str>,
+    style: &BlockStyle,
+    inlines: &[Inline],
+    output: &mut String,
+) {
     output.push('<');
     output.push_str(tag);
+    if let Some(marker) = marker {
+        output.push(' ');
+        output.push_str(marker);
+        output.push_str("=\"true\"");
+    }
     serialize_style_attributes(style, output);
     output.push('>');
     if inlines.is_empty() {
@@ -291,7 +388,10 @@ fn search_text(document: &CanonicalDocument) -> String {
             output.push('\n');
         }
         match block {
-            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => {
+            Block::Paragraph { inlines, .. }
+            | Block::Heading { inlines, .. }
+            | Block::Quote { inlines, .. }
+            | Block::Code { inlines, .. } => {
                 append_search_inlines(inlines, &mut output);
             }
             Block::List { items, .. } => {
@@ -302,6 +402,9 @@ fn search_text(document: &CanonicalDocument) -> String {
                     append_search_inlines(&item.inlines, &mut output);
                 }
             }
+            Block::Image { alt, .. } => output.push_str(alt),
+            Block::Attachment { filename, .. } => output.push_str(filename),
+            Block::Divider => {}
         }
     }
     output
@@ -322,7 +425,10 @@ fn resource_ids(document: &CanonicalDocument) -> Vec<ResourceId> {
         .blocks
         .iter()
         .flat_map(|block| match block {
-            Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => inlines
+            Block::Paragraph { inlines, .. }
+            | Block::Heading { inlines, .. }
+            | Block::Quote { inlines, .. }
+            | Block::Code { inlines, .. } => inlines
                 .iter()
                 .filter_map(|inline| match inline {
                     Inline::Image { resource_id, .. } => Some(resource_id.clone()),
@@ -337,6 +443,10 @@ fn resource_ids(document: &CanonicalDocument) -> Vec<ResourceId> {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
+            Block::Image { resource_id, .. } | Block::Attachment { resource_id, .. } => {
+                vec![resource_id.clone()]
+            }
+            Block::Divider => Vec::new(),
         })
         .collect()
 }
@@ -354,7 +464,13 @@ fn block_is_empty(block: &Block) -> bool {
         // Headings and lists are semantic blocks even when they have no
         // visible text. They must retain a reversible placeholder instead of
         // disappearing as an all-empty document.
-        Block::Heading { .. } | Block::List { .. } => false,
+        Block::Heading { .. }
+        | Block::List { .. }
+        | Block::Quote { .. }
+        | Block::Code { .. }
+        | Block::Image { .. }
+        | Block::Attachment { .. }
+        | Block::Divider => false,
     }
 }
 
@@ -390,6 +506,25 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                     })
                     .collect(),
             },
+            Block::Quote { style, inlines } => Block::Quote {
+                style: normalize_style(style),
+                inlines: normalize_inlines(inlines),
+            },
+            Block::Code { style, inlines } => Block::Code {
+                style: normalize_style(style),
+                inlines: normalize_inlines(inlines),
+            },
+            Block::Image { resource_id, alt } => Block::Image { resource_id, alt },
+            Block::Attachment {
+                resource_id,
+                filename,
+                media_type,
+            } => Block::Attachment {
+                resource_id,
+                filename,
+                media_type,
+            },
+            Block::Divider => Block::Divider,
         })
         .fold(Vec::new(), |mut normalized, block| {
             if let (
@@ -483,6 +618,7 @@ fn normalize_marks(marks: &Marks) -> Marks {
         strikethrough: marks.strikethrough,
         highlight: marks.highlight,
         link: marks.link.clone().filter(|value| valid_link(value)),
+        inline_code: marks.inline_code,
     }
 }
 
@@ -529,7 +665,13 @@ fn serialize_text(
     if marks.underline {
         output.push_str("<u>");
     }
+    if marks.inline_code {
+        output.push_str("<code>");
+    }
     escape_text_run(text, inlines, index, output);
+    if marks.inline_code {
+        output.push_str("</code>");
+    }
     if marks.underline {
         output.push_str("</u>");
     }
@@ -1081,6 +1223,67 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                         }
                         continue;
                     }
+                    // The native editor writes these explicit structural
+                    // markers. They are accepted only at document level: a
+                    // resource card nested inside a list is not a shape our
+                    // canonical model can preserve, so it remains ordinary
+                    // visible inline content rather than being silently
+                    // hoisted across list boundaries.
+                    if projection.list_contexts.is_empty()
+                        && tag == "img"
+                        && attribute(&attrs.borrow(), "data-joplin-lite-block-image").as_deref()
+                            == Some("true")
+                    {
+                        projection.block_image(&attrs.borrow());
+                        continue;
+                    }
+                    if projection.list_contexts.is_empty()
+                        && tag == "a"
+                        && attribute(&attrs.borrow(), "data-joplin-lite-block-attachment")
+                            .as_deref()
+                            == Some("true")
+                    {
+                        projection.block_attachment(&attrs.borrow());
+                        continue;
+                    }
+                    if projection.list_contexts.is_empty()
+                        && tag == "hr"
+                        && attribute(&attrs.borrow(), "data-joplin-lite-block-divider").as_deref()
+                            == Some("true")
+                    {
+                        projection.block_divider();
+                        continue;
+                    }
+                    let native_structural_text = (tag == "blockquote"
+                        && attribute(&attrs.borrow(), "data-joplin-lite-block-quote").as_deref()
+                            == Some("true"))
+                        || (tag == "pre"
+                            && attribute(&attrs.borrow(), "data-joplin-lite-block-code")
+                                .as_deref()
+                                == Some("true"));
+                    if projection.list_contexts.is_empty() && native_structural_text {
+                        let blocks_before = projection.document.blocks.len();
+                        let style = block_style(&attrs.borrow(), 0);
+                        let kind = if tag == "blockquote" {
+                            BlockKind::Quote
+                        } else {
+                            BlockKind::Code
+                        };
+                        projection.begin_block(kind, style);
+                        pending.push(ProjectionFrame::FinishBlock {
+                            blocks_before,
+                            kind,
+                            style,
+                        });
+                        for child in children.into_iter().rev() {
+                            pending.push(ProjectionFrame::Visit {
+                                node: child,
+                                marks: marks.clone(),
+                                preformatted: preformatted || tag == "pre",
+                            });
+                        }
+                        continue;
+                    }
                     if is_block_element(&tag)
                         || matches!(
                             tag.as_str(),
@@ -1154,6 +1357,7 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                         strikethrough: marks.strikethrough
                             || matches!(tag.as_str(), "del" | "s" | "strike"),
                         highlight: marks.highlight || tag == "mark",
+                        inline_code: marks.inline_code || tag == "code",
                         link: if marks.link.is_some() {
                             marks.link.clone()
                         } else if tag == "a" {
@@ -1218,6 +1422,7 @@ struct ProjectionMarks {
     strikethrough: bool,
     highlight: bool,
     link: Option<Rc<str>>,
+    inline_code: bool,
 }
 
 fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
@@ -1227,6 +1432,7 @@ fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
         && public.strikethrough == projected.strikethrough
         && public.highlight == projected.highlight
         && public.link.as_deref() == projected.link.as_deref()
+        && public.inline_code == projected.inline_code
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1234,6 +1440,8 @@ enum BlockKind {
     #[default]
     Paragraph,
     Heading(HeadingLevel),
+    Quote,
+    Code,
 }
 
 struct ListContext {
@@ -1340,6 +1548,8 @@ impl Projection {
                 style,
                 inlines,
             },
+            BlockKind::Quote => Block::Quote { style, inlines },
+            BlockKind::Code => Block::Code { style, inlines },
         });
     }
 
@@ -1572,6 +1782,7 @@ impl Projection {
             strikethrough: projected.strikethrough,
             highlight: projected.highlight,
             link,
+            inline_code: projected.inline_code,
         }
     }
 
@@ -1595,6 +1806,59 @@ impl Projection {
             .push(Inline::Image { resource_id, alt });
         self.flow_has_visible = true;
         self.current_item_has_content = true;
+    }
+
+    fn block_image(&mut self, attrs: &[Attribute]) {
+        let source = attribute(attrs, "src");
+        let alt = attribute(attrs, "alt").unwrap_or_default();
+        let Some(resource_id) =
+            source.and_then(|source| source.strip_prefix(":/").map(str::to_owned))
+        else {
+            return;
+        };
+        let Ok(resource_id) = ResourceId::new(resource_id) else {
+            return;
+        };
+        self.flush();
+        self.document.blocks.push(Block::Image { resource_id, alt });
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
+    }
+
+    fn block_attachment(&mut self, attrs: &[Attribute]) {
+        let raw_resource_id = attribute(attrs, "data-resource-id").or_else(|| {
+            attribute(attrs, "href").and_then(|href| href.strip_prefix(":/").map(str::to_owned))
+        });
+        let Some(raw_resource_id) = raw_resource_id else {
+            return;
+        };
+        let Ok(resource_id) = ResourceId::new(raw_resource_id) else {
+            return;
+        };
+        let Some(filename) = attribute(attrs, "data-filename") else {
+            return;
+        };
+        let Some(media_type) = attribute(attrs, "data-media-type") else {
+            return;
+        };
+        self.flush();
+        self.document.blocks.push(Block::Attachment {
+            resource_id,
+            filename,
+            media_type,
+        });
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
+    }
+
+    fn block_divider(&mut self) {
+        self.flush();
+        self.document.blocks.push(Block::Divider);
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
     }
 }
 
@@ -1786,6 +2050,49 @@ mod tests {
         );
         assert_eq!(serialize_html(&parse_html(&html).unwrap()), html);
         assert_eq!(search_text(&parse_html(&html).unwrap()), "标题\n待办\n完成");
+    }
+
+    #[test]
+    fn explicit_native_quote_and_code_markers_round_trip_without_reclassifying_legacy_html() {
+        let document = CanonicalDocument::from_blocks(vec![
+            Block::Quote {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "引用".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Code {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "let x = 1;".into(),
+                    marks: Marks {
+                        inline_code: true,
+                        ..Marks::default()
+                    },
+                }],
+            },
+        ]);
+        let html = document.to_canonical_html();
+        assert!(
+            html.as_str()
+                .contains("data-joplin-lite-block-quote=\"true\"")
+        );
+        assert!(
+            html.as_str()
+                .contains("data-joplin-lite-block-code=\"true\"")
+        );
+        assert_eq!(parse_html(html.as_str()).unwrap(), document);
+
+        // Imported legacy HTML retains the long-standing paragraph fallback;
+        // it never gains an editor-only block kind merely by being opened.
+        assert!(matches!(
+            parse_html("<blockquote>legacy</blockquote>")
+                .unwrap()
+                .blocks
+                .as_slice(),
+            [Block::Paragraph { .. }]
+        ));
     }
 
     #[test]

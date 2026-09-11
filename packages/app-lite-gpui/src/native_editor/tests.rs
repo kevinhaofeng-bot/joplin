@@ -1438,6 +1438,7 @@ fn non_monotonic_node_ids_keep_selection_geometry_in_document_order() {
             kind: BlockKind::Image,
             content: BlockContent::Image {
                 resource_id: format!("image-{id}"),
+                alt: String::new(),
                 natural_size: (320, 200),
                 display_width: None,
             },
@@ -4926,6 +4927,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             kind: BlockKind::Image,
             content: BlockContent::Image {
                 resource_id: "one".into(),
+                alt: String::new(),
                 natural_size: (100, 100),
                 display_width: None,
             },
@@ -4951,6 +4953,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             kind: BlockKind::Image,
             content: BlockContent::Image {
                 resource_id: "five".into(),
+                alt: String::new(),
                 natural_size: (100, 100),
                 display_width: None,
             },

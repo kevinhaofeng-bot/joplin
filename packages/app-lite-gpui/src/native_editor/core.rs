@@ -2147,7 +2147,7 @@ impl EntityInputHandler for EditorCore {
         Some(self.document.utf8_range_to_utf16(start..end))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // A read-only session never owns an IME composition. More
         // importantly, do not let a delayed platform unmark callback mutate
         // composition bookkeeping after Task 4 has deliberately disabled all
@@ -2155,9 +2155,16 @@ impl EntityInputHandler for EditorCore {
         if self.is_read_only() {
             return;
         }
-        self.marked = None;
+        let had_marked_text = self.marked.take().is_some();
         self.composition_base = None;
         self.composition_base_range = None;
+        // A note session intentionally ignores provisional IME updates.
+        // Unmarking is the production commit boundary it observes, so this
+        // notification must not be omitted or the composed text can remain
+        // forever dirty-but-unsaved until an unrelated repaint occurs.
+        if had_marked_text {
+            cx.notify();
+        }
     }
 
     fn replace_text_in_range(

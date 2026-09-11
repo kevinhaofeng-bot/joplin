@@ -835,16 +835,17 @@ impl LibraryRepository {
         let now = self.now();
         let html = input.document.to_canonical_html().as_str().to_owned();
         let text = input.document.search_text().as_str().to_owned();
+        let note_snippet = snippet(&text);
         if input.document.resource_ids() != input.resource_ids {
             return Err(LibraryError::InvalidSnapshot);
         }
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
-        let (notebook_id, current_revision, previous_updated): (String, i64, i64) = transaction
+        let (notebook_id, current_revision, previous_updated, created_time): (String, i64, i64, i64) = transaction
             .query_row(
-                "SELECT notebook_id, revision, updated_time FROM notes WHERE id = ?1 AND deleted_time = 0",
+                "SELECT notebook_id, revision, updated_time, created_time FROM notes WHERE id = ?1 AND deleted_time = 0",
                 [input.id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or(LibraryError::NotFound)?;
@@ -871,10 +872,10 @@ impl LibraryRepository {
              selected_thumbnail_id = ?6, updated_time = ?7, revision = ?8 WHERE id = ?1 AND revision = ?9",
             params![
                 input.id.as_str(),
-                input.title,
-                html,
-                text,
-                snippet(&input.document.search_text().as_str()),
+                &input.title,
+                &html,
+                &text,
+                &note_snippet,
                 thumbnail.as_ref().map(ResourceId::as_str),
                 now,
                 revision,
@@ -907,6 +908,34 @@ impl LibraryRepository {
             "save",
             now,
         )?;
+        // All fields that a caller needs after a successful commit are
+        // already available while this transaction is live. Construct the
+        // durable outcome here rather than doing a second fallible hydration
+        // after commit: a filesystem/SQLite fault after commit must not make
+        // the UI claim that a completed save failed.
+        let tag_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT tag_id FROM note_tags WHERE note_id = ?1 ORDER BY position, tag_id",
+            )?;
+            let rows = statement.query_map([input.id.as_str()], |row| {
+                TagId::parse(row.get::<_, String>(0)?).map_err(invalid_column)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let note = Note {
+            id: input.id.clone(),
+            title: input.title,
+            body_html: html,
+            body_text: text,
+            snippet: note_snippet,
+            notebook_id: NotebookId::parse(notebook_id).map_err(invalid_column)?,
+            resource_ids: input.resource_ids,
+            tag_ids,
+            created_time,
+            updated_time: now,
+            deleted_time: None,
+            revision,
+        };
         transaction.commit()?;
         drop(connection);
         self.publish(vec![
@@ -914,8 +943,7 @@ impl LibraryRepository {
             LibraryEvent::SearchProjectionQueued(input.id.clone()),
             LibraryEvent::SyncQueued(EntityRef::Note(input.id.clone())),
         ]);
-        let _ = notebook_id;
-        self.load_note(&input.id)?.ok_or(LibraryError::NotFound)
+        Ok(note)
     }
 
     pub fn list_notes(&self, query: ListQuery) -> Result<Vec<NoteProjection>, LibraryError> {
@@ -1229,6 +1257,35 @@ impl LibraryRepository {
         })?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Returns the most recent durable edit-journal payload for one live note.
+    /// The GPUI layer never opens SQLite itself: recovery is deliberately a
+    /// core-owned read so a crashed editor can reconstruct its latest readable
+    /// snapshot before the next settled flush compacts the journal.
+    pub fn latest_edit_journal(
+        &self,
+        note_id: &NoteId,
+    ) -> Result<Option<EditJournalEntry>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        connection
+            .query_row(
+                "SELECT note_id, generation, delta_utf8
+                 FROM edit_journal
+                 WHERE note_id = ?1
+                 ORDER BY generation DESC, created_time DESC, id DESC
+                 LIMIT 1",
+                [note_id.as_str()],
+                |row| {
+                    Ok(EditJournalEntry {
+                        note_id: NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                        generation: row.get(1)?,
+                        delta_utf8: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn flush_snapshot(&self, input: SaveNote) -> Result<SavedRevision, LibraryError> {

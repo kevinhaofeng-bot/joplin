@@ -141,6 +141,9 @@ pub enum BlockContent {
     },
     Image {
         resource_id: String,
+        /// Human-readable alternate label retained by the Task 4 canonical
+        /// codec. Image bytes and metadata ownership remain Task 5 work.
+        alt: String,
         natural_size: (u32, u32),
         display_width: Option<u32>,
     },
@@ -218,7 +221,9 @@ impl Block {
                         })
                         .sum::<usize>()
             }
-            BlockContent::Image { resource_id, .. } => resource_id.len(),
+            BlockContent::Image {
+                resource_id, alt, ..
+            } => resource_id.len() + alt.len(),
             BlockContent::Attachment {
                 resource_id,
                 filename,
@@ -2835,6 +2840,7 @@ impl Document {
                 kind: BlockKind::Image,
                 content: BlockContent::Image {
                     resource_id,
+                    alt: String::new(),
                     natural_size,
                     display_width: None,
                 },
@@ -2882,6 +2888,7 @@ impl Document {
                 kind: BlockKind::Image,
                 content: BlockContent::Image {
                     resource_id,
+                    alt: String::new(),
                     natural_size,
                     display_width: None,
                 },
@@ -2915,6 +2922,7 @@ impl Document {
                     kind: BlockKind::Image,
                     content: BlockContent::Image {
                         resource_id,
+                        alt: String::new(),
                         natural_size,
                         display_width: None,
                     },
@@ -2948,6 +2956,7 @@ impl Document {
                     kind: BlockKind::Image,
                     content: BlockContent::Image {
                         resource_id,
+                        alt: String::new(),
                         natural_size,
                         display_width: None,
                     },
@@ -3003,6 +3012,7 @@ impl Document {
             kind: BlockKind::Image,
             content: BlockContent::Image {
                 resource_id,
+                alt: String::new(),
                 natural_size,
                 display_width: None,
             },

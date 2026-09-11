@@ -9,6 +9,7 @@ gpui::actions!(
         ToggleNoteList,
         CycleListViewMode,
         CycleSort,
+        SyncCurrent,
     ]
 );
 
@@ -58,4 +59,5 @@ pub enum AppAction {
     ToggleNoteList,
     SetListViewMode(ListViewMode),
     SetSort(NoteSort),
+    ManualSync,
 }
