@@ -1,15 +1,19 @@
-use crate::resource::{DatabaseFile, ProfileDir, ResourceError, ResourceInput, ResourceStore};
+use crate::resource::{
+    DatabaseFile, ProfileDir, ResourceBlob, ResourceError, ResourceInput, ResourceStore,
+};
 use crate::schema::migrate_schema;
 use crate::{
-    BlobHash, CreateNote, EditJournalEntry, EntityRef, JournalOwnership, ListQuery, Note, NoteId,
-    NoteProjection, Notebook, NotebookId, ResourceId, SaveNote, SavedRevision, Stack, StackId, Tag,
-    TagId,
+    BlobHash, CanonicalDocument, CreateNote, EditJournalEntry, EntityRef, JournalOwnership,
+    ListQuery, Note, NoteId, NoteProjection, Notebook, NotebookId, ResourceId, SaveNote,
+    SavedRevision, Stack, StackId, Tag, TagId,
 };
 use rusqlite::hooks::{AuthAction, Authorization};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -265,6 +269,56 @@ pub enum LibraryEvent {
     SyncQueued(EntityRef),
 }
 
+/// A descriptor-safe blob that has been written to the content-addressed
+/// store but deliberately has no SQLite metadata or observable library event
+/// yet.  Task 5 uses this narrow staging state to prepare a native document
+/// before one transaction atomically makes the resource and its note
+/// relationship visible.  An abandoned stage is harmless content-addressed
+/// garbage and is never a user-visible orphan.
+#[derive(Debug)]
+pub struct StagedResource {
+    resource_id: ResourceId,
+    blob: ResourceBlob,
+    title: String,
+    mime: String,
+    file_extension: String,
+}
+
+impl StagedResource {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn sha256(&self) -> &BlobHash {
+        &self.blob.sha256
+    }
+
+    pub fn size(&self) -> usize {
+        self.blob.size
+    }
+
+    /// Metadata was validated together with the descriptor/bytes before this
+    /// invisible stage was created. The native document needs these exact
+    /// durable values while it prepares the single later snapshot transaction.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn mime(&self) -> &str {
+        &self.mime
+    }
+}
+
+/// The complete post-commit fact for a staged resource insertion.  `Note`
+/// intentionally does not duplicate projection-only fields, so returning the
+/// selected thumbnail explicitly prevents the GPUI shell from guessing from a
+/// stale pre-commit card projection in the same presentation cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedResourceSnapshotCommit {
+    pub note: Note,
+    pub selected_thumbnail_id: Option<ResourceId>,
+}
+
 pub struct LibraryRepository {
     connection: Mutex<Connection>,
     #[allow(dead_code)]
@@ -277,6 +331,8 @@ pub struct LibraryRepository {
     shell_state_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     next_note_load_failure: Mutex<Option<LibraryError>>,
+    #[cfg(test)]
+    next_staged_resource_snapshot_failure: Mutex<Option<LibraryError>>,
     #[allow(dead_code)]
     database_path: PathBuf,
     clock: Arc<dyn RepositoryClock>,
@@ -496,6 +552,8 @@ impl LibraryRepository {
             shell_state_read_hook: Mutex::new(None),
             #[cfg(test)]
             next_note_load_failure: Mutex::new(None),
+            #[cfg(test)]
+            next_staged_resource_snapshot_failure: Mutex::new(None),
             database_path: path,
             clock,
             id_source,
@@ -559,6 +617,24 @@ impl LibraryRepository {
         Err(LibraryError::IdCollisionExhausted)
     }
 
+    /// Select the opaque ID that a future resource transaction will publish.
+    /// Blob storage is intentionally content-addressed only: generating an
+    /// entity ID below that boundary would bypass this repository's injected
+    /// allocator and its deterministic collision probes.
+    ///
+    /// This commits no reservation row. A separate connection can still win
+    /// the same ID before a staged snapshot commits; that later transaction
+    /// then fails as one atomic unit, without events or outbox publication.
+    /// Reserving that interval would require a schema-level lease, which the
+    /// Task 2 durable-entity baseline does not have.
+    fn allocate_resource_id(&self) -> Result<ResourceId, LibraryError> {
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw_id = self.allocate_id(&transaction, "resources")?;
+        transaction.commit()?;
+        ResourceId::new(raw_id).map_err(Into::into)
+    }
+
     pub fn subscribe(&self) -> Receiver<LibraryEvent> {
         let (sender, receiver) = channel();
         self.events
@@ -594,6 +670,7 @@ impl LibraryRepository {
     /// Records actual resource-blob reads separately from SQLite card and
     /// complete-note hydration. A Task 3 projection or read-only selection
     /// must not touch blob bytes before Task 5 owns image resources.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn observe_resource_reads(&self) -> Receiver<BlobHash> {
         self.resource_store.observe_reads()
     }
@@ -612,6 +689,14 @@ impl LibraryRepository {
             .next_note_load_failure
             .lock()
             .expect("note-load failure mutex poisoned") = Some(error);
+    }
+
+    #[cfg(test)]
+    fn fail_next_staged_resource_snapshot_for_test(&self, error: LibraryError) {
+        *self
+            .next_staged_resource_snapshot_failure
+            .lock()
+            .expect("staged resource snapshot failure mutex poisoned") = Some(error);
     }
 
     /// Reads the complete application-owned library shell state. Corrupt pane
@@ -833,7 +918,8 @@ impl LibraryRepository {
     }
 
     pub fn save_note(&self, input: SaveNote) -> Result<Note, LibraryError> {
-        self.save_note_inner(input, false, None)
+        self.save_note_inner(input, false, None, None)
+            .map(|commit| commit.note)
     }
 
     fn save_note_inner(
@@ -841,13 +927,23 @@ impl LibraryRepository {
         input: SaveNote,
         clear_journal: bool,
         journal_ownership: Option<&JournalOwnership>,
-    ) -> Result<Note, LibraryError> {
+        staged_resource: Option<&StagedResource>,
+    ) -> Result<StagedResourceSnapshotCommit, LibraryError> {
         let now = self.now();
         let html = input.document.to_canonical_html().as_str().to_owned();
         let text = input.document.search_text().as_str().to_owned();
         let note_snippet = snippet(&text);
         if input.document.resource_ids() != input.resource_ids {
             return Err(LibraryError::InvalidSnapshot);
+        }
+        if let Some(staged) = staged_resource {
+            // A staged blob is not a general metadata import.  Its exact
+            // opaque ID must be referenced by the document that this one
+            // transaction commits, otherwise a failed/aborted editor action
+            // could expose an unattached resource row.
+            if !input.resource_ids.contains(staged.resource_id()) {
+                return Err(LibraryError::InvalidSnapshot);
+            }
         }
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         // Snapshot compaction must serialize with journal ownership transfer
@@ -904,6 +1000,22 @@ impl LibraryRepository {
                 .checked_add(1)
                 .ok_or(LibraryError::InvalidSnapshot)?,
         );
+        if let Some(staged) = staged_resource {
+            self.insert_staged_resource_metadata(&transaction, staged, now)?;
+            #[cfg(test)]
+            if let Some(error) = self
+                .next_staged_resource_snapshot_failure
+                .lock()
+                .expect("staged resource snapshot failure mutex poisoned")
+                .take()
+            {
+                // Returning while `transaction` is live is the important
+                // fault boundary: resource_blobs, resources, note_resources,
+                // search work and both outbox entries all roll back together,
+                // and publication is still below `commit`.
+                return Err(error);
+            }
+        }
         replace_note_resources(&transaction, &input.id, &input.resource_ids)?;
         let thumbnail = selected_thumbnail_id(
             &transaction,
@@ -990,12 +1102,21 @@ impl LibraryRepository {
         };
         transaction.commit()?;
         drop(connection);
-        self.publish(vec![
+        let mut events = vec![
             LibraryEvent::NoteProjectionChanged(input.id.clone()),
             LibraryEvent::SearchProjectionQueued(input.id.clone()),
-            LibraryEvent::SyncQueued(EntityRef::Note(input.id.clone())),
-        ]);
-        Ok(note)
+        ];
+        if let Some(staged) = staged_resource {
+            events.push(LibraryEvent::SyncQueued(EntityRef::Resource(
+                staged.resource_id().clone(),
+            )));
+        }
+        events.push(LibraryEvent::SyncQueued(EntityRef::Note(input.id.clone())));
+        self.publish(events);
+        Ok(StagedResourceSnapshotCommit {
+            note,
+            selected_thumbnail_id: thumbnail,
+        })
     }
 
     pub fn list_notes(&self, query: ListQuery) -> Result<Vec<NoteProjection>, LibraryError> {
@@ -1023,7 +1144,7 @@ impl LibraryRepository {
             let mut statement = connection.prepare(
                 "SELECT n.id, substr(n.title, 1, 120), substr(n.snippet, 1, 160), n.updated_time,
                         n.deleted_time, n.notebook_id,
-                        COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id = snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime IN ('image/png','image/jpeg'))),
+                        COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id = snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')),
                         (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
                          WHERE nr.note_id = n.id AND nr.is_associated = 1 AND r.deleted_time = 0
                            AND r.mime IN ('image/png', 'image/jpeg') ORDER BY nr.position, nr.resource_id LIMIT 1)),
@@ -1501,16 +1622,190 @@ impl LibraryRepository {
             .map_err(Into::into)
     }
 
+    /// Returns the occurrence-bounded resource provenance that a crash
+    /// checkpoint may restore for one exact durable note revision.
+    ///
+    /// This deliberately derives authority from the note's own committed
+    /// revision bodies, never from the journal's JSON `resource_ids` field.
+    /// A normal snapshot can remove a relation and a later Cmd-Z can restore
+    /// it before the following snapshot; retaining each resource's highest
+    /// durable occurrence count lets that valid undo recover after a crash
+    /// without granting unrelated global resources. The query is recovery
+    /// only, so normal note opens do not scan revision history.
+    pub fn durable_resource_provenance_for_recovery(
+        &self,
+        note_id: &NoteId,
+        expected_revision: i64,
+    ) -> Result<Vec<ResourceId>, LibraryError> {
+        if expected_revision < 1 {
+            return Err(LibraryError::InvalidSnapshot);
+        }
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let (current_html, current_revision): (String, i64) = connection
+            .query_row(
+                "SELECT body_html, revision FROM notes WHERE id = ?1 AND deleted_time = 0",
+                [note_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(LibraryError::NotFound)?;
+        if current_revision != expected_revision {
+            return Err(LibraryError::StaleRevision {
+                expected: expected_revision,
+                actual: current_revision,
+            });
+        }
+        let mut revision_html = vec![current_html];
+        let mut statement = connection.prepare(
+            "SELECT body_html FROM note_revisions
+             WHERE note_id = ?1 AND revision <= ?2
+             ORDER BY revision ASC",
+        )?;
+        revision_html.extend(
+            statement
+                .query_map(params![note_id.as_str(), expected_revision], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        drop(statement);
+
+        let mut maximum_occurrences = HashMap::<ResourceId, usize>::new();
+        let mut first_seen = Vec::<ResourceId>::new();
+        for body_html in revision_html {
+            let document = CanonicalDocument::parse_html(&body_html)?;
+            // Revisions are created only from canonical storage. Refusing a
+            // noncanonical historical row avoids treating a tampered legacy
+            // string as authority for a future crash checkpoint.
+            if document.to_canonical_html().as_str() != body_html {
+                return Err(LibraryError::InvalidSnapshot);
+            }
+            let mut occurrences = HashMap::<ResourceId, usize>::new();
+            for resource_id in document.resource_ids() {
+                if !maximum_occurrences.contains_key(&resource_id) {
+                    first_seen.push(resource_id.clone());
+                }
+                *occurrences.entry(resource_id).or_default() += 1;
+            }
+            for (resource_id, count) in occurrences {
+                maximum_occurrences
+                    .entry(resource_id)
+                    .and_modify(|known| *known = (*known).max(count))
+                    .or_insert(count);
+            }
+        }
+
+        for resource_id in &first_seen {
+            let exists: i64 = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE id = ?1 AND deleted_time = 0)",
+                [resource_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if exists != 1 {
+                return Err(LibraryError::NotFound);
+            }
+        }
+        let mut provenance = Vec::new();
+        for resource_id in first_seen {
+            let count = maximum_occurrences
+                .get(&resource_id)
+                .copied()
+                .ok_or(LibraryError::InvalidSnapshot)?;
+            provenance.extend(std::iter::repeat_n(resource_id, count));
+        }
+        Ok(provenance)
+    }
+
     pub fn flush_snapshot(
         &self,
         input: SaveNote,
         journal_ownership: Option<JournalOwnership>,
     ) -> Result<SavedRevision, LibraryError> {
-        let note = self.save_note_inner(input, true, journal_ownership.as_ref())?;
+        let note = self.flush_snapshot_note(input, journal_ownership)?;
         Ok(SavedRevision {
             revision: note.revision,
             saved_time: note.updated_time,
         })
+    }
+
+    /// Snapshot a note and return the complete durable outcome assembled in
+    /// the same SQLite transaction. Resource insertion uses this instead of a
+    /// post-commit `load_note`, so an already committed association cannot be
+    /// misreported as a failed UI operation if a later hydration faults.
+    pub fn flush_snapshot_note(
+        &self,
+        input: SaveNote,
+        journal_ownership: Option<JournalOwnership>,
+    ) -> Result<Note, LibraryError> {
+        self.save_note_inner(input, true, journal_ownership.as_ref(), None)
+            .map(|commit| commit.note)
+    }
+
+    /// Stage a resource blob without creating a `resources` row, sync outbox
+    /// item, or library event.  Callers that will put the resource into a
+    /// note must follow this with [`Self::commit_staged_resource_snapshot`];
+    /// abandoning the stage leaves only safe content-addressed bytes for a
+    /// later garbage collector.
+    pub fn stage_resource(
+        &self,
+        bytes: &[u8],
+        title: &str,
+        mime: &str,
+        extension: &str,
+    ) -> Result<StagedResource, LibraryError> {
+        let blob = self.resource_store.put(ResourceInput {
+            bytes,
+            title,
+            mime,
+            file_extension: extension,
+        })?;
+        let resource_id = self.allocate_resource_id()?;
+        Ok(StagedResource {
+            resource_id,
+            blob,
+            title: title.to_owned(),
+            mime: mime.to_owned(),
+            file_extension: extension.to_owned(),
+        })
+    }
+
+    /// Stream a descriptor/file source into an invisible stage.  The source
+    /// is copied and hashed with `ResourceStore`'s fixed buffer; no path is
+    /// retained or exposed to the UI and no full resource-sized `Vec` is
+    /// constructed for Finder/drop attachments.
+    pub fn stage_resource_reader<R: Read>(
+        &self,
+        reader: R,
+        size: usize,
+        title: &str,
+        mime: &str,
+        extension: &str,
+    ) -> Result<StagedResource, LibraryError> {
+        let blob = self
+            .resource_store
+            .put_reader(reader, size, title, mime, extension)?;
+        let resource_id = self.allocate_resource_id()?;
+        Ok(StagedResource {
+            resource_id,
+            blob,
+            title: title.to_owned(),
+            mime: mime.to_owned(),
+            file_extension: extension.to_owned(),
+        })
+    }
+
+    /// Atomically expose a prior staged blob together with its complete note
+    /// snapshot, resource ordering, thumbnail projection, search work, and
+    /// both sync-outbox records.  Events are published only after this one
+    /// SQLite commit, so a later snapshot failure cannot leak a resource event
+    /// or a visible orphan record.
+    pub fn commit_staged_resource_snapshot(
+        &self,
+        input: SaveNote,
+        journal_ownership: Option<JournalOwnership>,
+        staged: &StagedResource,
+    ) -> Result<StagedResourceSnapshotCommit, LibraryError> {
+        self.save_note_inner(input, true, journal_ownership.as_ref(), Some(staged))
     }
 
     pub fn import_image(
@@ -1520,36 +1815,128 @@ impl LibraryRepository {
         mime: &str,
         extension: &str,
     ) -> Result<ResourceId, LibraryError> {
-        let blob = self.resource_store.put(ResourceInput {
-            bytes,
-            title,
-            mime,
-            file_extension: extension,
-        })?;
+        self.import_resource(bytes, title, mime, extension)
+    }
+
+    /// Persist an opaque, content-addressed resource before it is associated
+    /// with a note snapshot.  The caller still has to complete the note
+    /// transaction (or explicitly roll this metadata back) before the
+    /// resource becomes visible in a document.
+    pub fn import_resource(
+        &self,
+        bytes: &[u8],
+        title: &str,
+        mime: &str,
+        extension: &str,
+    ) -> Result<ResourceId, LibraryError> {
+        let staged = self.stage_resource(bytes, title, mime, extension)?;
+        self.commit_staged_resource_metadata(&staged)?;
+        Ok(staged.resource_id().clone())
+    }
+
+    /// Stand-alone resource persistence remains available for import tools
+    /// that intentionally expose a resource without changing a note.  The
+    /// note-session route must use `stage_*` plus
+    /// `commit_staged_resource_snapshot` instead.
+    pub fn import_resource_reader<R: Read>(
+        &self,
+        reader: R,
+        size: usize,
+        title: &str,
+        mime: &str,
+        extension: &str,
+    ) -> Result<ResourceId, LibraryError> {
+        let staged = self.stage_resource_reader(reader, size, title, mime, extension)?;
+        self.commit_staged_resource_metadata(&staged)?;
+        Ok(staged.resource_id().clone())
+    }
+
+    fn commit_staged_resource_metadata(&self, staged: &StagedResource) -> Result<(), LibraryError> {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
-        // Blob persistence is content-addressed and may safely precede this
-        // transaction; the entity ID itself is allocated against SQLite so an
-        // astronomically unlikely CSPRNG collision is retried before exposure.
-        transaction.execute("INSERT OR IGNORE INTO resource_blobs (sha256, size, mime, relative_path, created_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, 1)", params![blob.sha256.as_str(), blob.size as i64, mime, format!("resources/blobs/{}", blob.sha256.as_str()), now])?;
-        let (raw_id, _) = self.insert_with_unique_id(&transaction, "resources", |candidate| {
-            transaction.execute("INSERT INTO resources (id, sha256, title, mime, file_extension, size, created_time, updated_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)", params![candidate, blob.sha256.as_str(), title, mime, extension, blob.size as i64, now])
-        })?;
-        let resource_id = ResourceId::new(raw_id).expect("validated generated ID is valid");
+        self.insert_staged_resource_metadata(&transaction, staged, now)?;
+        transaction.commit()?;
+        drop(connection);
+        self.publish(vec![LibraryEvent::SyncQueued(EntityRef::Resource(
+            staged.resource_id().clone(),
+        ))]);
+        Ok(())
+    }
+
+    fn insert_staged_resource_metadata(
+        &self,
+        transaction: &Transaction<'_>,
+        staged: &StagedResource,
+        now: i64,
+    ) -> Result<(), LibraryError> {
+        transaction.execute(
+            "INSERT OR IGNORE INTO resource_blobs (sha256, size, mime, relative_path, created_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                staged.blob.sha256.as_str(),
+                staged.blob.size as i64,
+                &staged.mime,
+                format!("resources/blobs/{}", staged.blob.sha256.as_str()),
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO resources (id, sha256, title, mime, file_extension, size, created_time, updated_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)",
+            params![
+                staged.resource_id().as_str(),
+                staged.blob.sha256.as_str(),
+                &staged.title,
+                &staged.mime,
+                &staged.file_extension,
+                staged.blob.size as i64,
+                now,
+            ],
+        )?;
         enqueue_sync(
-            &transaction,
+            transaction,
             self.id_source.as_ref(),
-            &EntityRef::Resource(resource_id.clone()),
+            &EntityRef::Resource(staged.resource_id().clone()),
             1,
             "create",
             now,
         )?;
-        transaction.commit()?;
-        self.publish(vec![LibraryEvent::SyncQueued(EntityRef::Resource(
-            resource_id.clone(),
-        ))]);
-        Ok(resource_id)
+        Ok(())
+    }
+
+    /// Read bytes only after resolving an already-validated resource record.
+    /// Projection paths never call this API; the narrow method keeps image
+    /// decoding and attachment preview materialization out of list/card
+    /// hydration.
+    pub fn read_resource_bytes(&self, id: &ResourceId) -> Result<Option<Vec<u8>>, LibraryError> {
+        let Some(resource) = self.resource_metadata(id)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.resource_store.read(&resource.sha256)?))
+    }
+
+    /// Resolve metadata and return a descriptor-safe, hash-verified stream of
+    /// the durable bytes. The profile pathname never escapes this boundary;
+    /// consumers can materialize one cache source at a time without turning a
+    /// note with many images into many simultaneous `Vec<u8>` allocations.
+    pub fn open_verified_resource_file(
+        &self,
+        id: &ResourceId,
+    ) -> Result<Option<(crate::StoredResource, File)>, LibraryError> {
+        let Some(resource) = self.resource_metadata(id)? else {
+            return Ok(None);
+        };
+        let file = self.resource_store.open_verified(&resource.sha256)?;
+        Ok(Some((resource, file)))
+    }
+
+    /// Observes descriptor-safe resource opens without exposing raw bytes.
+    /// This is deliberately a diagnostic seam rather than a projection API:
+    /// callers use it to guard against eager resource hydration on a detail
+    /// mount while normal application code keeps using
+    /// [`Self::open_verified_resource_file`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_verified_resource_opens(&self) -> std::sync::mpsc::Receiver<crate::BlobHash> {
+        self.resource_store.observe_verified_opens()
     }
 
     pub fn associate_resource(
@@ -1911,12 +2298,32 @@ fn selected_thumbnail_id(
     requested: Option<&ResourceId>,
 ) -> Result<Option<ResourceId>, LibraryError> {
     if let Some(requested) = requested {
-        let valid: i64 = transaction.query_row("SELECT EXISTS(SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=?1 AND nr.resource_id=?2 AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime IN ('image/png','image/jpeg'))", params![note_id.as_str(), requested.as_str()], |row| row.get(0))?;
+        let valid: i64 = transaction.query_row("SELECT EXISTS(SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=?1 AND nr.resource_id=?2 AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime LIKE 'image/%')", params![note_id.as_str(), requested.as_str()], |row| row.get(0))?;
         if valid == 1 {
             return Ok(Some(requested.clone()));
         }
     }
-    transaction.query_row("SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id = nr.resource_id WHERE nr.note_id = ?1 AND nr.is_associated = 1 AND r.deleted_time = 0 AND r.mime IN ('image/png', 'image/jpeg') ORDER BY nr.position, nr.resource_id LIMIT 1", [note_id.as_str()], |row| row.get::<_, String>(0)).optional()?.map(|id| ResourceId::new(id).map_err(LibraryError::from)).transpose()
+    // A selected thumbnail is independent note state, not "the most recently
+    // inserted image".  This runs after the relation replacement above, so a
+    // stale/deleted cover naturally falls through to the first still-valid
+    // image, while an existing valid cover survives ordinary body snapshots.
+    let current = transaction
+        .query_row(
+            "SELECT selected_thumbnail_id FROM notes WHERE id = ?1",
+            [note_id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .map(ResourceId::new)
+        .transpose()?;
+    if let Some(current) = current {
+        let valid: i64 = transaction.query_row("SELECT EXISTS(SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=?1 AND nr.resource_id=?2 AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime LIKE 'image/%')", params![note_id.as_str(), current.as_str()], |row| row.get(0))?;
+        if valid == 1 {
+            return Ok(Some(current));
+        }
+    }
+    transaction.query_row("SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id = nr.resource_id WHERE nr.note_id = ?1 AND nr.is_associated = 1 AND r.deleted_time = 0 AND r.mime LIKE 'image/%' ORDER BY nr.position, nr.resource_id LIMIT 1", [note_id.as_str()], |row| row.get::<_, String>(0)).optional()?.map(|id| ResourceId::new(id).map_err(LibraryError::from)).transpose()
 }
 fn queue_search(
     transaction: &Transaction<'_>,
@@ -2042,6 +2449,164 @@ mod tests {
             Some(created),
             "the committed record remains durable after the deliberately later load fault"
         );
+    }
+
+    #[test]
+    fn staged_resource_snapshot_rolls_back_without_events_then_publishes_one_commit() {
+        // Task 5 must not make a resource visible in its own transaction and
+        // then try to associate it in a second note snapshot.  If the latter
+        // fails, no subscriber may observe an orphan resource/sync event and
+        // every SQLite relation/outbox row must remain at its pre-insert
+        // generation.  The success half also catches a later regression back
+        // to two independently published commits.
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Duration;
+
+        let profile = tempdir().expect("temporary profile");
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open repository");
+        let note = repository
+            .create_note(CreateNote {
+                title: "atomic resource".into(),
+                notebook_id: None,
+                document: crate::CanonicalDocument::default(),
+            })
+            .expect("create note");
+        let events = repository.subscribe();
+        let before_outbox = repository.outbox_count().expect("outbox count");
+        let staged = repository
+            .stage_resource(
+                b"%PDF-1.7\natomic\n%%EOF\n",
+                "atomic.pdf",
+                "application/pdf",
+                "pdf",
+            )
+            .expect("stage opaque blob without SQLite publication");
+        let resource_id = staged.resource_id().clone();
+        let document =
+            crate::CanonicalDocument::from_blocks(vec![crate::document::Block::Attachment {
+                resource_id: resource_id.clone(),
+                filename: "atomic.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]);
+        let snapshot = SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title.clone(),
+            resource_ids: vec![resource_id.clone()],
+            document,
+            selected_thumbnail_id: None,
+        };
+
+        repository.fail_next_staged_resource_snapshot_for_test(LibraryError::InvalidSnapshot);
+        assert!(matches!(
+            repository.commit_staged_resource_snapshot(snapshot.clone(), None, &staged),
+            Err(LibraryError::InvalidSnapshot)
+        ));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_millis(30)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(repository.outbox_count().unwrap(), before_outbox);
+        {
+            let connection = repository.connection.lock().unwrap();
+            let resources: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM resources WHERE id=?1",
+                    [resource_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let blobs: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM resource_blobs WHERE sha256=?1",
+                    [staged.sha256().as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let relations: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM note_resources WHERE note_id=?1",
+                    [note.id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!((resources, blobs, relations), (0, 0, 0));
+        }
+
+        let committed = repository
+            .commit_staged_resource_snapshot(snapshot, None, &staged)
+            .expect("one transaction should publish metadata and note relation together");
+        assert_eq!(committed.note.resource_ids, vec![resource_id.clone()]);
+        assert_eq!(
+            [
+                events.recv().unwrap(),
+                events.recv().unwrap(),
+                events.recv().unwrap(),
+                events.recv().unwrap(),
+            ],
+            [
+                LibraryEvent::NoteProjectionChanged(note.id.clone()),
+                LibraryEvent::SearchProjectionQueued(note.id.clone()),
+                LibraryEvent::SyncQueued(EntityRef::Resource(resource_id)),
+                LibraryEvent::SyncQueued(EntityRef::Note(note.id)),
+            ]
+        );
+        assert_eq!(repository.outbox_count().unwrap(), before_outbox + 2);
+    }
+
+    #[test]
+    fn staged_snapshot_returns_the_new_thumbnail_after_replacing_an_old_cover() {
+        // The shell used to infer its card thumbnail from the projection that
+        // existed before the resource transaction.  When the snapshot drops
+        // old cover A and inserts B, that made the first rendered card show A
+        // even though SQLite had already selected B. The transaction outcome
+        // is now the sole same-frame source of truth.
+        let profile = tempdir().expect("temporary profile");
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open repository");
+        let old = repository
+            .import_resource(b"old image", "old.png", "image/png", "png")
+            .expect("persist old image");
+        let note = repository
+            .create_note(CreateNote {
+                title: "cover switch".into(),
+                notebook_id: None,
+                document: crate::CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Image {
+                        resource_id: old,
+                        alt: "old".into(),
+                        presentation: crate::document::ImagePresentation::default(),
+                    },
+                ]),
+            })
+            .expect("create note with old cover");
+        let staged = repository
+            .stage_resource(b"new image", "new.png", "image/png", "png")
+            .expect("stage new image");
+        let replacement = staged.resource_id().clone();
+        let document = crate::CanonicalDocument::from_blocks(vec![crate::document::Block::Image {
+            resource_id: replacement.clone(),
+            alt: "new".into(),
+            presentation: crate::document::ImagePresentation::default(),
+        }]);
+
+        let committed = repository
+            .commit_staged_resource_snapshot(
+                SaveNote {
+                    id: note.id,
+                    expected_revision: note.revision,
+                    title: note.title,
+                    document,
+                    resource_ids: vec![replacement.clone()],
+                    selected_thumbnail_id: None,
+                },
+                None,
+                &staged,
+            )
+            .expect("commit replacement image");
+
+        assert_eq!(committed.selected_thumbnail_id, Some(replacement));
     }
 }
 

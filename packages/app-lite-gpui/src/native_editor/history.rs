@@ -245,6 +245,75 @@ impl History {
         self.redo.len()
     }
 
+    /// The exact inverse batch that the next undo will apply. `EditorCore`
+    /// uses this only to map a handful of pending external-resource
+    /// selections; it never exposes history internals to UI callers.
+    pub(crate) fn next_undo_batch_for_mapping(&self) -> Option<TransactionBatch> {
+        self.undo.back().map(|entry| entry.inverse.clone())
+    }
+
+    /// The exact forward batch that the next redo will apply. See
+    /// [`Self::next_undo_batch_for_mapping`].
+    pub(crate) fn next_redo_batch_for_mapping(&self) -> Option<TransactionBatch> {
+        self.redo.back().map(|entry| entry.forward.clone())
+    }
+
+    /// Locate the still-undoable optimistic resource insertion by its unique
+    /// staged resource id.  A resource worker failure may arrive after later
+    /// typing; `EditorCore` temporarily unwinds those later entries, removes
+    /// this one entry, then reapplies the later entries against the original
+    /// text.  Keeping this lookup inside History avoids exposing entries to
+    /// UI code or trying to reconstruct a stale selection from a raw point.
+    pub(crate) fn undo_depth_for_resource_insert(&self, resource_id: &str) -> Option<usize> {
+        self.undo
+            .iter()
+            .rposition(|entry| {
+                entry.forward.0.iter().any(|transaction| {
+                    matches!(
+                        transaction,
+                        Transaction::InsertImage { resource_id: id, .. }
+                            | Transaction::InsertAttachment { resource_id: id, .. }
+                            if id == resource_id
+                    )
+                })
+            })
+            .map(|index| index.saturating_add(1))
+    }
+
+    /// Snapshot the original forward batches after an optimistic entry before
+    /// temporarily unwinding history. `undo_with_outcome` intentionally
+    /// rewrites redo payloads to exact local inverses; those rewritten batches
+    /// are not portable across the resource inverse's structural splice.
+    /// Replaying the original forward batches is the transaction-mapping
+    /// analogue of ProseMirror's mapped transaction replay.
+    pub(crate) fn forward_entries_after_depth(
+        &self,
+        depth: usize,
+    ) -> Vec<(Selection, TransactionBatch)> {
+        self.undo
+            .iter()
+            .skip(depth)
+            .map(|entry| (entry.before_selection, entry.forward.clone()))
+            .collect()
+    }
+
+    /// Drop exactly the redo entry that represents a failed optimistic
+    /// resource insertion.  It deliberately has no document effect: the
+    /// caller has already applied its inverse and must prevent a future Redo
+    /// from resurrecting a resource that never committed to SQLite.
+    pub(crate) fn discard_next_redo(&mut self) -> Result<(), DocumentError> {
+        let entry = self.redo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
+        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        Ok(())
+    }
+
+    /// If a person had manually undone the optimistic resource before its
+    /// worker failed, its redo entry is no longer a legal action. Dropping
+    /// redo is preferable to later recreating an undurable resource atom.
+    pub(crate) fn discard_redo(&mut self) {
+        self.clear_redo();
+    }
+
     pub fn len(&self) -> usize {
         self.undo.len()
     }

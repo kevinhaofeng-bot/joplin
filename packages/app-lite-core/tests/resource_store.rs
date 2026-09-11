@@ -23,6 +23,7 @@ fn put_publishes_sha256_addressed_bytes_that_read_back() {
     assert_eq!(store.read(&stored.sha256).unwrap(), b"evidence bytes");
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn read_observer_reports_the_exact_blob_that_was_hydrated() {
     // Pairs with the library projection's zero-read assertion: deleting the
@@ -47,7 +48,9 @@ fn put_keeps_duplicate_blobs_addressed_once_and_readable() {
     let first = store.put(png_input(b"same bytes")).unwrap();
     let second = store.put(png_input(b"same bytes")).unwrap();
 
-    assert_ne!(first.id, second.id);
+    // Blob storage deliberately has no entity ID. Durable ResourceIds are
+    // allocated by LibraryRepository when a stage is prepared, so duplicate
+    // bytes remain one content-addressed blob without bypassing that boundary.
     assert_eq!(first.sha256, second.sha256);
     assert_eq!(store.read(&first.sha256).unwrap(), b"same bytes");
     assert_eq!(

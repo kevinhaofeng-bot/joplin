@@ -7242,6 +7242,7 @@ dependencies = [
  "gpui",
  "gpui_sum_tree",
  "image",
+ "libc",
  "loro_fractional_index",
  "mermaid-rs-renderer",
  "objc",

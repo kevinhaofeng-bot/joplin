@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+- Every task must re-read the relevant entries and unpacked source named in `docs/research/evernote-11.32.5-core-product-behavior-map.md` before implementation and again before review.
+- Every task report must include an evidence crosswalk: Evernote unpacked source path and observed behavior → our independent implementation file/function → mutation-sensitive verification. A behavior without source evidence must be labeled as our own product/architecture decision, never as an Evernote reverse-engineering result.
 - The current `packages/app-lite-gpui/src/native_editor` transaction, input, selection, layout, image-cache, undo-budget, and memory-measurement paths are the stable baseline; replace them only after an equivalent real Release regression passes.
 - Do not initialize WebKit, Electron, Node, Tauri, or the legacy Joplin sidecar in the product path.
 - The retired `NSTextView` UI remains untouched; only its UI-independent SQLite, HTML, resource, preview, backup, and migration logic may be extracted.
@@ -319,23 +321,23 @@ git commit -m "Persist GPUI note editing sessions"
 - Consumes: `ResourceStore::put`, `LibraryRepository::associate_resource`, current `Selection`.
 - Produces: `NoteSession::insert_resource(ResourceImport, InsertIntent)` and `ThumbnailKey { resource_id, pixel_size, scale }`.
 
-- [ ] **Step 1: Reproduce the reported stale-image bug as a test**
+- [x] **Step 1: Reproduce the reported stale-image bug as a test**
 
 Mount the real AppModel, insert an image through the picker completion path, and assert in the same presentation cycle that: the active document contains the Image block; editor measured extent grows; the image cache has a pending/loaded key; and the selected card projection references the resource. The test must not select another note to pass.
 
-- [ ] **Step 2: Lock image-boundary behavior**
+- [x] **Step 2: Lock image-boundary behavior**
 
 Add real event-path tests for typing before and after an image, inserting two adjacent images, selecting across text-image-text, Backspace/Delete at both boundaries, undo/redo, IME composition beside an image, and long-image reflow. No sequence may hide typed text or move the document on alternating frames.
 
-- [ ] **Step 3: Implement one insert transaction**
+- [x] **Step 3: Implement one insert transaction**
 
 Import and validate the resource, insert at the saved DocPoint, update note-resource order, flush the note snapshot, emit one projection event, then schedule decode. On failure before association, roll back resource metadata; the content-addressed blob may remain for safe reuse/GC.
 
-- [ ] **Step 4: Add attachment cards**
+- [x] **Step 4: Add attachment cards**
 
 Images render inline. PDF, audio, video and other files render a filename/mime/size card with system preview/open actions. Attachment bytes never enter the document string or GPUI element state.
 
-- [ ] **Step 5: Perform M1 acceptance and commit**
+- [x] **Step 5: Perform M1 acceptance and commit**
 
 In a fresh temporary profile, create three notes; type Chinese titles/body; paste a screenshot; drag a JPEG; insert a PDF; type before and after images; switch rapidly; quit and reopen. Verify exact persistence and immediate display.
 

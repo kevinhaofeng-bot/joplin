@@ -24,6 +24,11 @@ const MAX_DOM_DEPTH: usize = 4096;
 const MAX_DOM_NODES: usize = 1_000_000;
 const MAX_LINK_LENGTH: usize = 8 * 1024;
 const MAX_RETAINED_LINK_BYTES: usize = 64 * 1024;
+// A decoded image's dimensions are bounded separately by the resource intake
+// path. This persistence bound keeps malformed HTML from manufacturing an
+// absurd first-frame layout while still accepting ordinary high-resolution
+// photographs and scanned pages.
+const MAX_PERSISTED_IMAGE_DIMENSION: u32 = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalHtml(String);
@@ -114,6 +119,7 @@ pub enum Block {
     Image {
         resource_id: ResourceId,
         alt: String,
+        presentation: ImagePresentation,
     },
     /// A resource-backed attachment card at block position.
     Attachment {
@@ -177,6 +183,15 @@ pub struct Marks {
     pub highlight: bool,
     pub link: Option<String>,
     pub inline_code: bool,
+}
+
+/// Presentation metadata retained by a structural image block. Resource bytes
+/// stay outside canonical HTML; these values reserve stable image space before
+/// visible-only resource hydration reaches the block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImagePresentation {
+    pub natural_size: Option<(u32, u32)>,
+    pub display_width: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,12 +310,18 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                 inlines,
                 &mut output,
             ),
-            Block::Image { resource_id, alt } => {
+            Block::Image {
+                resource_id,
+                alt,
+                presentation,
+            } => {
                 output.push_str("<img data-joplin-lite-block-image=\"true\" src=\":/");
                 escape_attribute(resource_id.as_str(), &mut output);
                 output.push_str("\" alt=\"");
                 escape_attribute(alt, &mut output);
-                output.push_str("\">");
+                output.push('\"');
+                serialize_image_presentation(presentation, &mut output);
+                output.push('>');
             }
             Block::Attachment {
                 resource_id,
@@ -514,7 +535,15 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 style: normalize_style(style),
                 inlines: normalize_inlines(inlines),
             },
-            Block::Image { resource_id, alt } => Block::Image { resource_id, alt },
+            Block::Image {
+                resource_id,
+                alt,
+                presentation,
+            } => Block::Image {
+                resource_id,
+                alt,
+                presentation: normalize_image_presentation(presentation),
+            },
             Block::Attachment {
                 resource_id,
                 filename,
@@ -547,6 +576,38 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
 fn normalize_style(mut style: BlockStyle) -> BlockStyle {
     style.indent = style.indent.min(8);
     style
+}
+
+fn normalize_image_presentation(presentation: ImagePresentation) -> ImagePresentation {
+    let natural_size = presentation.natural_size.filter(|&(width, height)| {
+        valid_persisted_image_dimension(width) && valid_persisted_image_dimension(height)
+    });
+    let display_width = presentation
+        .display_width
+        .filter(|&width| valid_persisted_image_dimension(width));
+    ImagePresentation {
+        natural_size,
+        display_width,
+    }
+}
+
+fn valid_persisted_image_dimension(value: u32) -> bool {
+    (1..=MAX_PERSISTED_IMAGE_DIMENSION).contains(&value)
+}
+
+fn serialize_image_presentation(presentation: &ImagePresentation, output: &mut String) {
+    if let Some((width, height)) = presentation.natural_size {
+        output.push_str(" data-joplin-lite-natural-width=\"");
+        output.push_str(&width.to_string());
+        output.push_str("\" data-joplin-lite-natural-height=\"");
+        output.push_str(&height.to_string());
+        output.push('\"');
+    }
+    if let Some(width) = presentation.display_width {
+        output.push_str(" data-joplin-lite-display-width=\"");
+        output.push_str(&width.to_string());
+        output.push('\"');
+    }
 }
 
 fn normalize_inlines(inlines: Vec<Inline>) -> Vec<Inline> {
@@ -1820,7 +1881,11 @@ impl Projection {
             return;
         };
         self.flush();
-        self.document.blocks.push(Block::Image { resource_id, alt });
+        self.document.blocks.push(Block::Image {
+            resource_id,
+            alt,
+            presentation: image_presentation(attrs),
+        });
         self.pending_space = false;
         self.pending_marks = None;
         self.flow_has_visible = false;
@@ -1867,6 +1932,36 @@ fn attribute(attrs: &[Attribute], name: &str) -> Option<String> {
         .iter()
         .find(|attribute| attribute.name.local.to_string().eq_ignore_ascii_case(name))
         .map(|attribute| attribute.value.to_string())
+}
+
+fn image_presentation(attrs: &[Attribute]) -> ImagePresentation {
+    let natural_size = match (
+        image_dimension_attribute(attrs, "data-joplin-lite-natural-width"),
+        image_dimension_attribute(attrs, "data-joplin-lite-natural-height"),
+    ) {
+        (Some(width), Some(height)) => Some((width, height)),
+        // Natural dimensions are atomic: accepting just one would invent an
+        // aspect ratio and reintroduce a layout jump on the first decode.
+        _ => None,
+    };
+    ImagePresentation {
+        natural_size,
+        display_width: image_dimension_attribute(attrs, "data-joplin-lite-display-width"),
+    }
+}
+
+fn image_dimension_attribute(attrs: &[Attribute], name: &str) -> Option<u32> {
+    let value = attribute(attrs, name)?;
+    if value.is_empty()
+        || value.len() > MAX_PERSISTED_IMAGE_DIMENSION.to_string().len()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|&value| valid_persisted_image_dimension(value))
 }
 
 fn valid_link(value: &str) -> bool {
@@ -2000,6 +2095,50 @@ mod tests {
             style: BlockStyle::default(),
             inlines,
         }
+    }
+
+    #[test]
+    fn block_image_dimensions_are_readable_reversible_and_fail_closed() {
+        // This catches a codec regression that either drops the dimensions
+        // needed for the first visible layout, or accepts hostile/invalid
+        // attribute values into the durable document model.
+        let resource_id = ResourceId::new(RESOURCE_ID).expect("fixture resource id");
+        let document = CanonicalDocument::from_blocks(vec![Block::Image {
+            resource_id,
+            alt: "宽图.png".into(),
+            presentation: ImagePresentation {
+                natural_size: Some((4032, 3024)),
+                display_width: Some(960),
+            },
+        }]);
+
+        let html = document.to_canonical_html();
+        assert_eq!(
+            html.as_str(),
+            "<img data-joplin-lite-block-image=\"true\" src=\":/0123456789abcdef0123456789abcdef\" alt=\"宽图.png\" data-joplin-lite-natural-width=\"4032\" data-joplin-lite-natural-height=\"3024\" data-joplin-lite-display-width=\"960\">"
+        );
+        assert_eq!(
+            CanonicalDocument::parse_html(html.as_str()).unwrap(),
+            document
+        );
+
+        let legacy = CanonicalDocument::parse_html(&format!(
+            "<img data-joplin-lite-block-image=\"true\" src=\":/{RESOURCE_ID}\" alt=\"旧图\">"
+        ))
+        .unwrap();
+        assert!(matches!(
+            legacy.blocks(),
+            [Block::Image { presentation, .. }] if *presentation == ImagePresentation::default()
+        ));
+
+        let invalid = CanonicalDocument::parse_html(&format!(
+            "<img data-joplin-lite-block-image=\"true\" src=\":/{RESOURCE_ID}\" data-joplin-lite-natural-width=\"0\" data-joplin-lite-natural-height=\"4294967296\" data-joplin-lite-display-width=\"0\">"
+        ))
+        .unwrap();
+        assert!(matches!(
+            invalid.blocks(),
+            [Block::Image { presentation, .. }] if *presentation == ImagePresentation::default()
+        ));
     }
 
     #[test]

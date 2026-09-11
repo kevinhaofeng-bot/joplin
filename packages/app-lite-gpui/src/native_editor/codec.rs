@@ -2,7 +2,8 @@
 //! the native editor model.
 
 use app_lite_core::document::{
-    Alignment, Block as CanonicalBlock, BlockStyle, HeadingLevel, Inline, ListKind, Marks,
+    Alignment, Block as CanonicalBlock, BlockStyle, HeadingLevel, ImagePresentation, Inline,
+    ListKind, Marks,
 };
 use app_lite_core::{CanonicalDocument, ResourceId};
 use smallvec::SmallVec;
@@ -199,7 +200,11 @@ pub fn import_canonical_with_resources(
                     block_index,
                 )?);
             }
-            CanonicalBlock::Image { resource_id, alt } => {
+            CanonicalBlock::Image {
+                resource_id,
+                alt,
+                presentation,
+            } => {
                 ensure_resource(resource_id, available_resources, block_index)?;
                 native.push(Block {
                     id: next_node_id(&mut next_id),
@@ -207,12 +212,12 @@ pub fn import_canonical_with_resources(
                     content: BlockContent::Image {
                         resource_id: resource_id.as_str().to_owned(),
                         alt: alt.clone(),
-                        // Task 4 does not decode/import image bytes. A small
-                        // non-zero placeholder lets the existing renderer
-                        // retain the structural node until Task 5 owns the
-                        // resource transaction and metadata extraction.
-                        natural_size: (1, 1),
-                        display_width: None,
+                        // Legacy HTML has no dimensions. It remains readable
+                        // and is refreshed by the resource hydrator, while a
+                        // persisted image uses its own first-frame extent.
+                        natural_size_known: presentation.natural_size.is_some(),
+                        natural_size: presentation.natural_size.unwrap_or((1024, 768)),
+                        display_width: presentation.display_width,
                     },
                     alignment: TextAlignment::Left,
                     revision: 0,
@@ -349,7 +354,11 @@ pub fn export_canonical_with_resources(
             }
             BlockKind::Image => {
                 let BlockContent::Image {
-                    resource_id, alt, ..
+                    resource_id,
+                    alt,
+                    natural_size_known,
+                    natural_size,
+                    display_width,
                 } = &block.content
                 else {
                     return Err(CanonicalExportError::InvalidTextContent { block_index });
@@ -359,6 +368,10 @@ pub fn export_canonical_with_resources(
                 output.push(CanonicalBlock::Image {
                     resource_id,
                     alt: alt.clone(),
+                    presentation: ImagePresentation {
+                        natural_size: (*natural_size_known).then_some(*natural_size),
+                        display_width: *display_width,
+                    },
                 });
             }
             BlockKind::Attachment => {
@@ -612,8 +625,8 @@ mod tests {
     use crate::native_editor::model::{BlockContent, BlockKind, Mark, TextAlignment};
     use app_lite_core::CanonicalDocument;
     use app_lite_core::document::{
-        Alignment, Block as CanonicalBlock, BlockStyle, HeadingLevel, Inline, ListItem, ListKind,
-        Marks,
+        Alignment, Block as CanonicalBlock, BlockStyle, HeadingLevel, ImagePresentation, Inline,
+        ListItem, ListKind, Marks,
     };
 
     #[test]
@@ -868,6 +881,7 @@ mod tests {
             CanonicalBlock::Image {
                 resource_id: resource_id.clone(),
                 alt: "截图.png".into(),
+                presentation: ImagePresentation::default(),
             },
             CanonicalBlock::Attachment {
                 resource_id: resource_id.clone(),
@@ -908,12 +922,46 @@ mod tests {
     }
 
     #[test]
+    fn block_image_presentation_round_trips_without_a_one_pixel_placeholder() {
+        // This fails if the canonical bridge reverts to its former fixed
+        // (1, 1) import placeholder, drops a user display width, or omits
+        // either value while serializing the durable note snapshot.
+        let resource_id = app_lite_core::ResourceId::new("0123456789abcdef0123456789abcdef")
+            .expect("valid resource id");
+        let canonical = CanonicalDocument::from_blocks(vec![CanonicalBlock::Image {
+            resource_id: resource_id.clone(),
+            alt: "首帧稳定.png".into(),
+            presentation: ImagePresentation {
+                natural_size: Some((4032, 3024)),
+                display_width: Some(960),
+            },
+        }]);
+
+        let imported = import_canonical_with_resources(&canonical, &[resource_id.clone()])
+            .expect("durable image imports");
+        assert!(matches!(
+            &imported.blocks()[0].content,
+            BlockContent::Image {
+                natural_size: (4032, 3024),
+                display_width: Some(960),
+                ..
+            }
+        ));
+        assert_eq!(
+            export_canonical_with_resources(&imported, Some(&[resource_id]))
+                .expect("durable image exports"),
+            canonical
+        );
+    }
+
+    #[test]
     fn structural_resources_fail_closed_without_an_existing_note_relation() {
         let resource_id = app_lite_core::ResourceId::new("0123456789abcdef0123456789abcdef")
             .expect("valid resource id");
         let document = CanonicalDocument::from_blocks(vec![CanonicalBlock::Image {
             resource_id: resource_id.clone(),
             alt: "不能偷偷导入".into(),
+            presentation: ImagePresentation::default(),
         }]);
         assert!(matches!(
             import_canonical_with_resources(&document, &[]),

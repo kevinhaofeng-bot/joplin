@@ -27,6 +27,10 @@ use super::transaction::StructuralSplice;
 
 pub const LAYOUT_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TEXT_HEIGHT: f32 = 24.0;
+/// Structural non-image resources render as a compact header/body card rather
+/// than borrowing an empty paragraph's extent. The renderer owns the visual
+/// chrome; the layout registry owns this stable document-coordinate height.
+pub(crate) const ATTACHMENT_CARD_HEIGHT: f32 = 76.0;
 const PREFETCH_VIEWPORTS: f32 = 1.0;
 const FALLBACK_GLYPH_WIDTH: f32 = 8.0;
 const CARET_WIDTH: f32 = 1.0;
@@ -109,6 +113,7 @@ fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
             display_width,
             ..
         } => image_layout_size(available_width, *natural_size, *display_width),
+        BlockContent::Attachment { .. } => (available_width, ATTACHMENT_CARD_HEIGHT),
         _ => (available_width, DEFAULT_TEXT_HEIGHT),
     };
     Bounds::new(
@@ -373,6 +378,10 @@ pub struct CachedBlockLayout {
     /// renderer records a paint only after the real GPUI background pass.
     pub(crate) shaped_background_run_count: usize,
     pub(crate) is_image: bool,
+    /// Image and attachment blocks share document-coordinate selection and
+    /// dead-zone semantics even though only images participate in the image
+    /// decoder/residency cache.
+    pub(crate) is_atomic: bool,
     pub(crate) line_height: Pixels,
     shape_key: ShapeKey,
 }
@@ -754,6 +763,7 @@ impl LayoutRegistry {
             let y = self.height_prefix(index);
             let height = self.height_prefix(index + 1) - y;
             let (before, after, is_image) = block_points(block);
+            let is_atomic = matches!(block.kind, BlockKind::Image | BlockKind::Attachment);
             let mut bounds = block_bounds(width, block);
             bounds.origin.y = px(y);
             bounds.size.height = px(height.max(1.0));
@@ -768,7 +778,7 @@ impl LayoutRegistry {
                 after,
             };
             self.visible.push(layout.clone());
-            self.register_geometry(block.revision, width, layout, is_image);
+            self.register_geometry(block.revision, width, layout, is_image, is_atomic);
         }
         self.enforce_budget();
     }
@@ -918,6 +928,7 @@ impl LayoutRegistry {
                     shape_key,
                     layout,
                     false,
+                    false,
                     visual.line_height,
                     0,
                     decoration_run_count,
@@ -959,6 +970,7 @@ impl LayoutRegistry {
         self.insert_shaped(
             ShapeKey::geometry(revision, width, line_height),
             layout,
+            is_image,
             is_image,
             line_height,
             selection_geometry_bytes,
@@ -1059,6 +1071,79 @@ impl LayoutRegistry {
         self.cache.get(&node_id).is_some_and(|entry| entry.is_image)
     }
 
+    pub fn is_atomic(&self, node_id: NodeId) -> bool {
+        self.cache
+            .get(&node_id)
+            .is_some_and(|entry| entry.is_atomic)
+    }
+
+    /// Return the atomic block directly under a pointer.  This deliberately
+    /// does not use `point_to_doc`: the latter resolves a useful before/after
+    /// caret, whereas an attachment card click is a NodeSelection-style
+    /// operation over the complete structural block.
+    pub(crate) fn atomic_block_at(&self, position: Point<Pixels>) -> Option<NodeId> {
+        self.visible
+            .iter()
+            .find(|layout| contains(layout.bounds, position) && self.is_atomic(layout.node_id))
+            .map(|layout| layout.node_id)
+    }
+
+    /// Return the document-side insertion point for a visual seam around
+    /// adjacent atomic blocks or below a final atomic block. Ordinary clicks
+    /// inside a resource card return `None` and remain atomic selections.
+    ///
+    /// The point is intentionally derived from the seam rather than from the
+    /// generic inclusive block hit-test: a click exactly on an atom's bottom
+    /// edge is structurally *after* that atom, even though painting bounds
+    /// include the edge. This mirrors the donor's section-wrapper dead-zone
+    /// behavior and lets the caller materialize a paragraph at the expected
+    /// document position before IME/input arrives.
+    pub(crate) fn atomic_dead_zone_point(&self, position: Point<Pixels>) -> Option<DocPoint> {
+        let seam_slop = px(3.0);
+        self.visible.iter().enumerate().find_map(|(index, layout)| {
+            let Some(entry) = self.cache.get(&layout.node_id) else {
+                return None;
+            };
+            if !entry.is_atomic {
+                return None;
+            }
+            let next = self.visible.get(index.saturating_add(1));
+            let below = position.y >= layout.bounds.bottom()
+                && match next {
+                    // The editor canvas extends below a short terminal card;
+                    // every point in that tail is the documented paragraph
+                    // insertion target, not only a three-pixel edge.
+                    None => true,
+                    Some(next) => {
+                        self.is_atomic(next.node_id)
+                            // Keep the full wrapper gap hot. A future card
+                            // margin may be much larger than the visual edge
+                            // tolerance, but its center is still the same
+                            // structural insertion seam.
+                            && position.y <= next.bounds.top()
+                    }
+                };
+            if below {
+                return Some(layout.after);
+            }
+            let above = position.y <= layout.bounds.top()
+                && layout.bounds.top() - position.y <= seam_slop
+                && index > 0
+                && self
+                    .visible
+                    .get(index - 1)
+                    .is_some_and(|previous| self.is_atomic(previous.node_id));
+            above.then_some(layout.before)
+        })
+    }
+
+    /// True only for an atomic wrapper seam or the area below a final atomic
+    /// block. See [`Self::atomic_dead_zone_point`] for the canonical document
+    /// position selected by the seam.
+    pub fn atomic_dead_zone_hit(&self, position: Point<Pixels>) -> bool {
+        self.atomic_dead_zone_point(position).is_some()
+    }
+
     pub fn line_height(&self, node_id: NodeId) -> Option<Pixels> {
         self.cache.get(&node_id).map(|entry| entry.line_height)
     }
@@ -1066,6 +1151,13 @@ impl LayoutRegistry {
     /// Map a pointer to the document position represented by the visible
     /// layout. Images expose explicit before/after affinity.
     pub fn point_to_doc(&mut self, position: Point<Pixels>) -> Option<DocPoint> {
+        // Resolve a wrapper seam before the inclusive block-bound hit test.
+        // Otherwise the exact lower edge of the preceding atom would map to
+        // its horizontal `Before` side and materialize a paragraph on the
+        // wrong side of the resource.
+        if let Some(point) = self.atomic_dead_zone_point(position) {
+            return Some(point);
+        }
         let layout = self
             .visible
             .iter()
@@ -1101,7 +1193,7 @@ impl LayoutRegistry {
         if position.y < layout.bounds.top() {
             return Some(layout.before);
         }
-        if cached.is_image {
+        if cached.is_atomic {
             return Some(image_side(layout.bounds, position, layout.node_id));
         }
         let line_height = cached.line_height;
@@ -1168,7 +1260,7 @@ impl LayoutRegistry {
         preferred_x: Option<Pixels>,
     ) -> Option<DocPoint> {
         let cached = self.cache.get(&caret.node_id)?;
-        if cached.is_image || cached.layout.text_lines.is_empty() {
+        if cached.is_atomic || cached.layout.text_lines.is_empty() {
             return None;
         }
         let (line_index, _hard_start, offset_in_line) =
@@ -1246,7 +1338,7 @@ impl LayoutRegistry {
     /// Return the start/end byte offset of the visual row containing a caret.
     pub fn visual_line_boundary(&self, caret: DocPoint, end: bool) -> Option<DocPoint> {
         let cached = self.cache.get(&caret.node_id)?;
-        if cached.is_image || cached.layout.text_lines.is_empty() {
+        if cached.is_atomic || cached.layout.text_lines.is_empty() {
             return None;
         }
         let (line_index, hard_start, offset_in_line) =
@@ -1293,7 +1385,7 @@ impl LayoutRegistry {
         last_row: bool,
     ) -> Option<DocPoint> {
         let cached = self.cache.get(&node_id)?;
-        if cached.is_image {
+        if cached.is_atomic {
             return Some(DocPoint::with_affinity(
                 node_id,
                 0,
@@ -1354,7 +1446,7 @@ impl LayoutRegistry {
         let Some(cached) = self.cache.get(&node_id) else {
             return Vec::new();
         };
-        if cached.is_image || range.start >= range.end {
+        if cached.is_atomic || range.start >= range.end {
             return Vec::new();
         }
         let mut segments = Vec::with_capacity(selection_segment_capacity(
@@ -1378,7 +1470,7 @@ impl LayoutRegistry {
     pub fn caret_bounds_for_point(&self, caret: DocPoint) -> Option<Bounds<Pixels>> {
         let cached = self.cache.get(&caret.node_id)?;
         let layout = &cached.layout;
-        if cached.is_image {
+        if cached.is_atomic {
             let height = self
                 .adjacent_text_line_height(caret.node_id)
                 .unwrap_or(cached.line_height);
@@ -1441,7 +1533,7 @@ impl LayoutRegistry {
         for layout in &self.visible {
             let before_key = self.point_key(layout.before);
             let after_key = self.point_key(layout.after);
-            if self.is_image(layout.node_id) {
+            if self.is_atomic(layout.node_id) {
                 if start_key <= self.point_key(layout.before)
                     && end_key >= self.point_key(layout.after)
                 {
@@ -1473,7 +1565,7 @@ impl LayoutRegistry {
         for layout in &self.visible {
             let before_key = self.point_key(layout.before);
             let after_key = self.point_key(layout.after);
-            if self.is_image(layout.node_id) {
+            if self.is_atomic(layout.node_id) {
                 if start_key <= self.point_key(layout.before)
                     && end_key >= self.point_key(layout.after)
                 {
@@ -1532,7 +1624,7 @@ impl LayoutRegistry {
             self.visible.get(index).and_then(|layout| {
                 self.cache
                     .get(&layout.node_id)
-                    .and_then(|entry| (!entry.is_image).then_some(entry.line_height))
+                    .and_then(|entry| (!entry.is_atomic).then_some(entry.line_height))
             })
         })
     }
@@ -1574,6 +1666,7 @@ impl LayoutRegistry {
                     )
                     .1
                 }
+                BlockContent::Attachment { .. } => ATTACHMENT_CARD_HEIGHT,
                 _ => DEFAULT_TEXT_HEIGHT,
             };
             this.estimated_heights.insert(block.id, height.max(1.0));
@@ -1974,6 +2067,7 @@ impl LayoutRegistry {
         width: f32,
         layout: BlockLayout,
         is_image: bool,
+        is_atomic: bool,
     ) {
         let node_id = layout.node_id;
         if let Some(cached) = self.cache.get_mut(&node_id)
@@ -1986,6 +2080,7 @@ impl LayoutRegistry {
             cached.layout.before = layout.before;
             cached.layout.after = layout.after;
             cached.is_image = is_image;
+            cached.is_atomic = is_atomic;
             self.touch(node_id);
             return;
         }
@@ -1993,6 +2088,7 @@ impl LayoutRegistry {
             ShapeKey::geometry(revision, width, px(DEFAULT_TEXT_HEIGHT)),
             layout,
             is_image,
+            is_atomic,
             px(DEFAULT_TEXT_HEIGHT),
             0,
             0,
@@ -2006,6 +2102,7 @@ impl LayoutRegistry {
         shape_key: ShapeKey,
         layout: BlockLayout,
         is_image: bool,
+        is_atomic: bool,
         default_line_height: Pixels,
         requested_selection_geometry_bytes: usize,
         decoration_run_count: usize,
@@ -2058,6 +2155,7 @@ impl LayoutRegistry {
                 decoration_line_run_counts,
                 shaped_background_run_count,
                 is_image,
+                is_atomic,
                 line_height: if line_height == px(0.0) {
                     default_line_height
                 } else {
@@ -2362,10 +2460,13 @@ fn row_index_for_y(row_count: usize, y: Pixels, line_height: Pixels) -> usize {
 }
 
 fn image_side(bounds: Bounds<Pixels>, position: Point<Pixels>, node_id: NodeId) -> DocPoint {
-    let relative_y = position.y - bounds.top();
     let relative_x = position.x - bounds.left();
-    let before = relative_y < bounds.size.height / 2.0
-        || (relative_y == bounds.size.height / 2.0 && relative_x < bounds.size.width / 2.0);
+    // The resource itself is a NodeSelection in the editable surface. These
+    // before/after coordinates still serve drag/input APIs and must be stable
+    // across device-scale rounding: horizontal edges express document order;
+    // vertical position belongs to the separate block-gap/tail dead-zone
+    // policy and must not silently reverse an image-side hit.
+    let before = relative_x < bounds.size.width / 2.0;
     DocPoint::with_affinity(
         node_id,
         0,
@@ -2685,6 +2786,40 @@ mod tests {
         assert!(layout.exact_cache_len() < document.block_count());
         let ids = layout.exact_cache_ids().collect::<HashSet<_>>();
         assert!(ids.len() <= layout.visible_range().len());
+    }
+
+    #[test]
+    fn atomic_dead_zone_covers_the_entire_visual_gap_not_only_the_edges() {
+        // Resource wrappers can gain margin/padding independently of their
+        // document blocks. The gap is still one atomic seam, so clicking its
+        // middle must materialize a paragraph just like a boundary click.
+        let document = Document::from_paragraphs(["first", "second"]);
+        let first = document.blocks()[0].id;
+        let second = document.blocks()[1].id;
+        let mut layout = LayoutRegistry::new();
+        for (node_id, top) in [(first, 0.0), (second, 80.0)] {
+            layout.register_exact(
+                1,
+                120.0,
+                BlockLayout {
+                    node_id,
+                    bounds: Bounds::new(point(px(0.0), px(top)), size(px(120.0), px(40.0))),
+                    text_inset: px(0.0),
+                    text_align: TextAlign::Left,
+                    text_lines: Vec::new(),
+                    before: DocPoint::with_affinity(node_id, 0, Affinity::Before),
+                    after: DocPoint::with_affinity(node_id, 0, Affinity::After),
+                },
+                0,
+                true,
+                px(24.0),
+            );
+        }
+
+        assert!(
+            layout.atomic_dead_zone_hit(point(px(24.0), px(60.0))),
+            "the 40px gap midpoint must be an atomic seam insertion target"
+        );
     }
 
     #[gpui::test]

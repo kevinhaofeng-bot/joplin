@@ -8,6 +8,7 @@ use app_lite_core::{
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::tempdir;
 
 struct SequenceClock(Mutex<VecDeque<i64>>);
@@ -388,6 +389,104 @@ fn resource_entity_ids_retry_database_collisions() {
             .unwrap()
             .as_str(),
         "b".repeat(32)
+    );
+}
+
+#[test]
+fn staged_resource_ids_skip_durable_rows_and_a_commit_race_publishes_nothing() {
+    // A stage must select its ResourceId through the same repository allocator
+    // as every other durable entity.  The second connection models the only
+    // remaining stage-to-commit race without a schema-level reservation: the
+    // selected ID becomes durable after staging but before the one snapshot
+    // transaction.  That transaction must fail atomically and emit nothing.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open_with_sources(
+        &path,
+        Arc::new(SequenceClock(Mutex::new(VecDeque::from([1, 2, 3])))),
+        fixture_ids(&['d', 'a', 'e', 'c', 'f', 'a', 'b']),
+    )
+    .unwrap();
+
+    let existing = repository
+        .import_image(b"already durable", "existing.png", "image/png", "png")
+        .unwrap();
+    assert_eq!(existing.as_str(), "a".repeat(32));
+    let note = repository
+        .create_note(CreateNote {
+            title: "stage race".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .unwrap();
+    let events = repository.subscribe();
+    let before_outbox = repository.outbox_count().unwrap();
+
+    let staged = repository
+        .stage_resource_reader(
+            std::io::Cursor::new(b"candidate"),
+            b"candidate".len(),
+            "candidate.png",
+            "image/png",
+            "png",
+        )
+        .unwrap();
+    assert_eq!(staged.resource_id().as_str(), "b".repeat(32));
+
+    // A second repository/connection can commit the selected ID after stage
+    // selection.  Do not make this a normal repository import: its direct
+    // write represents the cross-connection primary-key race precisely.
+    let competing = Connection::open(&path).unwrap();
+    competing
+        .execute(
+            "INSERT INTO resource_blobs (sha256, size, mime, relative_path, created_time, revision)
+             VALUES (?1, ?2, 'image/png', ?3, 4, 1)",
+            rusqlite::params![
+                staged.sha256().as_str(),
+                staged.size() as i64,
+                format!("resources/blobs/{}", staged.sha256().as_str()),
+            ],
+        )
+        .unwrap();
+    competing
+        .execute(
+            "INSERT INTO resources (id, sha256, title, mime, file_extension, size, created_time, updated_time, revision)
+             VALUES (?1, ?2, 'racer', 'image/png', 'png', ?3, 4, 4, 1)",
+            rusqlite::params![
+                staged.resource_id().as_str(),
+                staged.sha256().as_str(),
+                staged.size() as i64,
+            ],
+        )
+        .unwrap();
+    drop(competing);
+
+    let document = image_document(&[staged.resource_id().clone()]);
+    assert!(
+        repository
+            .commit_staged_resource_snapshot(
+                SaveNote {
+                    id: note.id.clone(),
+                    expected_revision: note.revision,
+                    title: note.title.clone(),
+                    resource_ids: vec![staged.resource_id().clone()],
+                    document,
+                    selected_thumbnail_id: None,
+                },
+                None,
+                &staged,
+            )
+            .is_err()
+    );
+    assert!(events.recv_timeout(Duration::from_millis(30)).is_err());
+    assert_eq!(repository.outbox_count().unwrap(), before_outbox);
+    assert!(
+        repository
+            .load_note(&note.id)
+            .unwrap()
+            .unwrap()
+            .resource_ids
+            .is_empty()
     );
 }
 

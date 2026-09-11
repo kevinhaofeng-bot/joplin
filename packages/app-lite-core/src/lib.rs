@@ -15,6 +15,7 @@ pub use journal::{
 pub use query::*;
 pub use repository::*;
 pub use resource::{
-    BlobHash, ResourceBlob, ResourceError, ResourceId, ResourceInput, ResourceStore,
+    BlobHash, MAX_IMAGE_BYTES, MAX_RESOURCE_BYTES, ResourceBlob, ResourceError, ResourceId,
+    ResourceInput, ResourceStore,
 };
 pub use revision::*;

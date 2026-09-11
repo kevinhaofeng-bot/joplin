@@ -6,6 +6,11 @@
 //! decides when a structural `InsertImage` transaction is committed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,11 +18,349 @@ use anyhow::anyhow;
 use base64::Engine as _;
 use futures::FutureExt;
 use gpui::{
-    App, AppContext, ClipboardEntry, ClipboardItem, Entity, Image, ImageCache, ImageCacheError,
-    ImageCacheItem, ImageFormat, RenderImage, Resource, WeakEntity, Window, hash,
+    App, AppContext, ClipboardEntry, ClipboardItem, Context, Entity, Image, ImageCache,
+    ImageCacheError, ImageCacheItem, ImageFormat, RenderImage, Resource, WeakEntity, Window, hash,
 };
 use image::{AnimationDecoder, ImageBuffer, codecs::gif::GifDecoder, imageops::FilterType};
 use smallvec::SmallVec;
+
+/// A resource's source stays separate from its presentation metadata. Bytes
+/// received from a clipboard are already process-owned and short-lived, while
+/// a Finder/picker file remains an opened descriptor until the repository
+/// stages it with a fixed-size copy buffer. Neither `Document` nor
+/// `EditorCore` retains either payload.
+#[derive(Debug)]
+pub(crate) enum ResourceSource {
+    Bytes(Vec<u8>),
+    File { file: File, size: usize },
+}
+
+impl ResourceSource {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::File { size, .. } => *size,
+        }
+    }
+}
+
+/// A file/clipboard resource normalized before it crosses into the durable
+/// note session.
+#[derive(Debug)]
+pub struct ResourceImport {
+    source: ResourceSource,
+    pub title: String,
+    pub mime: String,
+    pub extension: String,
+    pub kind: ResourceKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceKind {
+    Image {
+        format: ImageFormat,
+        natural_size: (u32, u32),
+    },
+    Attachment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceImportError {
+    UnsupportedFile,
+    UnsafeFile,
+    TooLarge,
+    InvalidImage,
+    Io(String),
+}
+
+impl fmt::Display for ResourceImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedFile => f.write_str("不支持的资源格式"),
+            Self::UnsafeFile => f.write_str("资源文件路径不安全"),
+            Self::TooLarge => f.write_str("资源文件超过允许大小"),
+            Self::InvalidImage => f.write_str("图片内容无法安全解码"),
+            Self::Io(message) => write!(f, "无法读取资源文件：{message}"),
+        }
+    }
+}
+
+impl std::error::Error for ResourceImportError {}
+
+impl ResourceImport {
+    pub fn from_path(path: &Path) -> Result<Self, ResourceImportError> {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| ResourceImportError::Io(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ResourceImportError::UnsafeFile);
+        }
+        if metadata.len() == 0 {
+            return Err(ResourceImportError::UnsupportedFile);
+        }
+        if metadata.len() > app_lite_core::MAX_RESOURCE_BYTES as u64 {
+            return Err(ResourceImportError::TooLarge);
+        }
+        let title = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .ok_or(ResourceImportError::UnsafeFile)?
+            .to_owned();
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .filter(|extension| valid_extension(extension))
+            .ok_or(ResourceImportError::UnsupportedFile)?;
+        let mime = mime_for_extension(&extension);
+        let mut file = open_checked_resource_source(path, &metadata)?;
+        let size = usize::try_from(metadata.len()).map_err(|_| ResourceImportError::TooLarge)?;
+        let kind = if let Some(format) = image_format_for_mime(&mime) {
+            if size > app_lite_core::MAX_IMAGE_BYTES {
+                return Err(ResourceImportError::TooLarge);
+            }
+            let inspection = file
+                .try_clone()
+                .map_err(|error| ResourceImportError::Io(error.to_string()))?;
+            let (_actual, natural_size) = inspect_persisted_image(inspection, &mime)?;
+            // `try_clone` shares the descriptor's file offset on Unix. Reset
+            // the source before handing it to the streaming repository.
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| ResourceImportError::Io(error.to_string()))?;
+            ResourceKind::Image {
+                format,
+                natural_size,
+            }
+        } else {
+            ResourceKind::Attachment
+        };
+        Ok(Self {
+            source: ResourceSource::File { file, size },
+            title,
+            mime,
+            extension,
+            kind,
+        })
+    }
+
+    pub fn from_image_payload(payload: ImagePayload) -> Result<Self, ResourceImportError> {
+        let extension = image_extension(payload.format).to_owned();
+        let title = payload.name.unwrap_or_else(|| format!("图片.{extension}"));
+        Self::from_bytes_inner(
+            payload.bytes,
+            title,
+            mime_for_image_format(payload.format).to_owned(),
+            extension,
+        )
+    }
+
+    pub fn from_bytes(
+        bytes: Vec<u8>,
+        title: impl Into<String>,
+        mime: impl Into<String>,
+        extension: impl Into<String>,
+    ) -> Result<Self, ResourceImportError> {
+        Self::from_bytes_inner(bytes, title.into(), mime.into(), extension.into())
+    }
+
+    fn from_bytes_inner(
+        bytes: Vec<u8>,
+        title: String,
+        mime: String,
+        extension: String,
+    ) -> Result<Self, ResourceImportError> {
+        if bytes.is_empty() || !valid_extension(&extension) || title.trim().is_empty() {
+            return Err(ResourceImportError::UnsupportedFile);
+        }
+        if bytes.len() > app_lite_core::MAX_RESOURCE_BYTES {
+            return Err(ResourceImportError::TooLarge);
+        }
+        let kind = if let Some(format) = image_format_for_mime(&mime) {
+            if bytes.len() > app_lite_core::MAX_IMAGE_BYTES {
+                return Err(ResourceImportError::TooLarge);
+            }
+            let natural_size =
+                image_dimensions(&bytes, format).ok_or(ResourceImportError::InvalidImage)?;
+            ResourceKind::Image {
+                format,
+                natural_size,
+            }
+        } else {
+            ResourceKind::Attachment
+        };
+        Ok(Self {
+            source: ResourceSource::Bytes(bytes),
+            title,
+            mime,
+            extension,
+            kind,
+        })
+    }
+
+    pub const fn is_image(&self) -> bool {
+        matches!(self.kind, ResourceKind::Image { .. })
+    }
+
+    pub(crate) fn into_parts(self) -> (ResourceSource, String, String, String, ResourceKind) {
+        (
+            self.source,
+            self.title,
+            self.mime,
+            self.extension,
+            self.kind,
+        )
+    }
+}
+
+/// Bind a regular local source through an opened descriptor before it crosses
+/// the resource-store boundary. The initial `symlink_metadata` validates the
+/// UI-visible path; `O_NOFOLLOW` and the post-open identity check make the
+/// descriptor authoritative against a replacement between that validation and
+/// the open. The repository never receives this external pathname.
+fn open_checked_resource_source(
+    path: &Path,
+    expected: &std::fs::Metadata,
+) -> Result<File, ResourceImportError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .map_err(|error| ResourceImportError::Io(error.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| ResourceImportError::Io(error.to_string()))?;
+    if !opened.is_file() || opened.len() != expected.len() {
+        return Err(ResourceImportError::UnsafeFile);
+    }
+    #[cfg(unix)]
+    if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return Err(ResourceImportError::UnsafeFile);
+    }
+    Ok(file)
+}
+
+fn valid_extension(extension: &str) -> bool {
+    !extension.is_empty()
+        && extension.len() <= 16
+        && extension
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn mime_for_extension(extension: &str) -> String {
+    match extension {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
+    .to_owned()
+}
+
+fn mime_for_image_format(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::Gif => "image/gif",
+        ImageFormat::Webp => "image/webp",
+        ImageFormat::Svg => "image/svg+xml",
+        ImageFormat::Bmp => "image/bmp",
+        ImageFormat::Tiff => "image/tiff",
+    }
+}
+
+fn image_format_for_mime(mime: &str) -> Option<ImageFormat> {
+    Some(match mime {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::Webp,
+        "image/svg+xml" => ImageFormat::Svg,
+        "image/bmp" => ImageFormat::Bmp,
+        "image/tiff" => ImageFormat::Tiff,
+        _ => return None,
+    })
+}
+
+fn image_dimensions(bytes: &[u8], format: ImageFormat) -> Option<(u32, u32)> {
+    if format == ImageFormat::Svg {
+        let tree = usvg::Tree::from_data(bytes, &usvg::Options::default()).ok()?;
+        let size = tree.size();
+        return Some((size.width().ceil() as u32, size.height().ceil() as u32));
+    }
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    if sniffed_raster_format(reader.format()?) != Some(format) {
+        return None;
+    }
+    reader.into_dimensions().ok()
+}
+
+/// Inspect one already-open, descriptor-safe resource stream. Raster formats
+/// stay fully streaming; SVG's parser accepts a byte slice, so it is the one
+/// bounded exception and is released before the next document node is
+/// inspected. Callers must not turn a whole note's images into `Vec`s first.
+pub fn inspect_persisted_image(
+    file: File,
+    mime: &str,
+) -> Result<(ImageFormat, (u32, u32)), ResourceImportError> {
+    let format = image_format_for_mime(mime).ok_or(ResourceImportError::InvalidImage)?;
+    if format == ImageFormat::Svg {
+        let mut limited = file.take(app_lite_core::MAX_IMAGE_BYTES as u64 + 1);
+        let mut bytes = Vec::new();
+        limited
+            .read_to_end(&mut bytes)
+            .map_err(|error| ResourceImportError::Io(error.to_string()))?;
+        if bytes.len() > app_lite_core::MAX_IMAGE_BYTES {
+            return Err(ResourceImportError::TooLarge);
+        }
+        let dimensions =
+            image_dimensions(&bytes, format).ok_or(ResourceImportError::InvalidImage)?;
+        return Ok((format, dimensions));
+    }
+    let reader = image::ImageReader::new(BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|_| ResourceImportError::InvalidImage)?;
+    if sniffed_raster_format(reader.format().ok_or(ResourceImportError::InvalidImage)?)
+        != Some(format)
+    {
+        return Err(ResourceImportError::InvalidImage);
+    }
+    let dimensions = reader
+        .into_dimensions()
+        .map_err(|_| ResourceImportError::InvalidImage)?;
+    Ok((format, dimensions))
+}
+
+/// File names and advertised MIME type are untrusted intake hints. The image
+/// cache ultimately decodes the managed path based on its extension, so do
+/// not persist an image unless the actual raster signature agrees with the
+/// declared native-editor format.
+fn sniffed_raster_format(format: image::ImageFormat) -> Option<ImageFormat> {
+    Some(match format {
+        image::ImageFormat::Png => ImageFormat::Png,
+        image::ImageFormat::Jpeg => ImageFormat::Jpeg,
+        image::ImageFormat::Gif => ImageFormat::Gif,
+        image::ImageFormat::WebP => ImageFormat::Webp,
+        image::ImageFormat::Bmp => ImageFormat::Bmp,
+        image::ImageFormat::Tiff => ImageFormat::Tiff,
+        _ => return None,
+    })
+}
 
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
 const DEFAULT_PROXY_MAX_EDGE: u32 = 1600;
@@ -150,6 +493,48 @@ impl ImagePayload {
     }
 }
 
+/// An HTML data URI stays encoded until the retained resource worker runs.
+/// The GPUI callback may retain only this bounded descriptor; it never creates
+/// a second decoded image buffer or decodes untrusted base64 inline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedImagePayload {
+    format: ImageFormat,
+    encoded: String,
+}
+
+impl EncodedImagePayload {
+    fn new(format: ImageFormat, encoded: String) -> Self {
+        Self { format, encoded }
+    }
+
+    pub(crate) fn decode_bounded(self) -> Result<ImagePayload, ResourceImportError> {
+        if self.encoded.is_empty() || self.encoded.len() > MAX_DATA_URI_ENCODED_BYTES {
+            return Err(ResourceImportError::TooLarge);
+        }
+        let decoded_upper_bound = self
+            .encoded
+            .len()
+            .checked_div(4)
+            .and_then(|quads| quads.checked_mul(3))
+            .ok_or(ResourceImportError::TooLarge)?;
+        if decoded_upper_bound > app_lite_core::MAX_IMAGE_BYTES {
+            return Err(ResourceImportError::TooLarge);
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(self.encoded)
+            .map_err(|_| ResourceImportError::InvalidImage)?;
+        if bytes.len() > app_lite_core::MAX_IMAGE_BYTES {
+            return Err(ResourceImportError::TooLarge);
+        }
+        Ok(ImagePayload::new(self.format, bytes))
+    }
+}
+
+const MAX_CLIPBOARD_IMAGE_CANDIDATE_BYTES: usize = 3 * app_lite_core::MAX_IMAGE_BYTES;
+const MAX_CLIPBOARD_PATH_CANDIDATES: usize = 8;
+const MAX_DATA_URI_ENCODED_BYTES: usize = ((app_lite_core::MAX_IMAGE_BYTES + 2) / 3) * 4;
+const MAX_HTML_IMAGE_DESCRIPTOR_BYTES: usize = MAX_DATA_URI_ENCODED_BYTES + 4096;
+
 /// Normalized clipboard representation.  macOS extraction fills `images`
 /// before `text`, because GPUI 0.2.2 itself returns public.utf8-plain-text
 /// before image UTTypes on that platform.
@@ -161,6 +546,10 @@ pub struct ClipboardPayload {
     pub html: Option<String>,
     pub rich_text: Option<String>,
     pub text: Option<String>,
+    /// Native AppKit saw image representations, but none could pass the
+    /// bounded ownership boundary. This is not the same as a missing native
+    /// representation: it blocks fallback to screenshot placeholder text.
+    pub native_image_rejected: bool,
 }
 
 impl ClipboardPayload {
@@ -182,6 +571,7 @@ impl ClipboardPayload {
                 ClipboardEntry::String(string) => payload.text = Some(string.text().to_owned()),
             }
         }
+        payload.images = bounded_image_candidates(std::mem::take(&mut payload.images));
         payload
     }
 
@@ -202,9 +592,26 @@ impl ClipboardPayload {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PasteIntent {
-    Image { payload: ImagePayload },
-    File { path: PathBuf, cleanup: bool },
-    Text { text: String },
+    Image {
+        payload: ImagePayload,
+    },
+    ImageCandidates {
+        candidates: Vec<ImagePayload>,
+    },
+    EncodedImage {
+        payload: EncodedImagePayload,
+    },
+    File {
+        path: PathBuf,
+        cleanup: bool,
+    },
+    FileCandidates {
+        paths: Vec<PathBuf>,
+        cleanup_paths: Vec<PathBuf>,
+    },
+    Text {
+        text: String,
+    },
     Unsupported,
 }
 
@@ -218,41 +625,58 @@ pub fn classify_clipboard(payload: ClipboardPayload) -> PasteIntent {
         html,
         rich_text,
         text,
+        native_image_rejected,
     } = payload;
-    if let Some(image) = images.into_iter().next() {
-        return PasteIntent::Image { payload: image };
+    if native_image_rejected {
+        return PasteIntent::Unsupported;
     }
-    if let Some(path) = file_urls.iter().find(|path| is_supported_image_path(path)) {
-        return PasteIntent::File {
-            path: path.clone(),
-            cleanup: temporary_files.iter().any(|temp| temp == path),
+    if !images.is_empty() {
+        let candidates = bounded_image_candidates(images);
+        return if candidates.is_empty() {
+            PasteIntent::Unsupported
+        } else if candidates.len() == 1 {
+            // Move the sole bounded payload through the callback boundary.
+            // Cloning it here would briefly double a 10 MiB clipboard image
+            // before the retained staging worker owns it.
+            PasteIntent::Image {
+                payload: candidates.into_iter().next().expect("one candidate"),
+            }
+        } else {
+            PasteIntent::ImageCandidates { candidates }
         };
     }
-    if let Some(html) = html.as_deref()
-        && html.to_ascii_lowercase().contains("<img")
-    {
-        if let Some((format, encoded)) = html.split_once("data:image/").and_then(|(_, value)| {
-            let (kind, data) = value.split_once(";base64,")?;
-            let format = match kind.to_ascii_lowercase().as_str() {
-                "png" => ImageFormat::Png,
-                "jpeg" | "jpg" => ImageFormat::Jpeg,
-                "gif" => ImageFormat::Gif,
-                "webp" => ImageFormat::Webp,
-                "bmp" => ImageFormat::Bmp,
-                "tiff" => ImageFormat::Tiff,
-                _ => return None,
-            };
-            Some((format, data.split(|ch| ch == '"' || ch == '\'').next()?))
-        }) {
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
-                return PasteIntent::Image {
-                    payload: ImagePayload::new(format, bytes),
-                };
-            }
+    // The actual importer validates the selected file. Do not discard a PDF
+    // or other supported attachment here merely because it is not an inline
+    // image; paste and Finder drop share one resource transaction.
+    let paths = file_urls
+        .into_iter()
+        .take(MAX_CLIPBOARD_PATH_CANDIDATES)
+        .collect::<Vec<_>>();
+    if !paths.is_empty() {
+        let cleanup_paths = temporary_files
+            .into_iter()
+            .filter(|temporary| paths.iter().any(|path| path == temporary))
+            .collect::<Vec<_>>();
+        return match paths.as_slice() {
+            [path] => PasteIntent::File {
+                path: path.clone(),
+                cleanup: cleanup_paths.iter().any(|temporary| temporary == path),
+            },
+            _ => PasteIntent::FileCandidates {
+                paths,
+                cleanup_paths,
+            },
+        };
+    }
+    if let Some(html) = html.as_deref() {
+        match parse_html_image_descriptor(html) {
+            HtmlImageDescriptor::DataUri(payload) => return PasteIntent::EncodedImage { payload },
+            // An HTML image with an unresolved remote/file source or an
+            // unsafe-sized/malformed encoded source must not become visible
+            // markup or a fake PNG node.
+            HtmlImageDescriptor::Rejected => return PasteIntent::Unsupported,
+            HtmlImageDescriptor::NoImage => {}
         }
-        // An HTML image with an unresolved remote/file source must not become
-        // visible markup or a fake PNG node.
-        return PasteIntent::Unsupported;
     }
     rich_text
         .as_ref()
@@ -260,6 +684,29 @@ pub fn classify_clipboard(payload: ClipboardPayload) -> PasteIntent {
         .map_or(PasteIntent::Unsupported, |text| PasteIntent::Text {
             text: text.clone(),
         })
+}
+
+/// Preserve input order while bounding only owned compressed bytes, rather
+/// than arbitrarily stopping at an early representation.  This lets a later
+/// small JPEG survive two corrupt PNG/TIFF candidates while keeping pasteboard
+/// duplication below the explicit 30 MiB intake budget.
+fn bounded_image_candidates(images: impl IntoIterator<Item = ImagePayload>) -> Vec<ImagePayload> {
+    let mut total_bytes = 0usize;
+    let mut candidates = Vec::new();
+    for image in images {
+        if image.bytes.is_empty() || image.bytes.len() > app_lite_core::MAX_IMAGE_BYTES {
+            continue;
+        }
+        let Some(next_total) = total_bytes.checked_add(image.bytes.len()) else {
+            continue;
+        };
+        if next_total > MAX_CLIPBOARD_IMAGE_CANDIDATE_BYTES {
+            continue;
+        }
+        total_bytes = next_total;
+        candidates.push(image);
+    }
+    candidates
 }
 
 /// Testable seam for the platform paste action. Native extraction is supplied
@@ -272,6 +719,12 @@ pub fn resolve_clipboard_payload(
     let Some(native) = native else {
         return gpui;
     };
+    if native.native_image_rejected {
+        return Some(ClipboardPayload {
+            native_image_rejected: true,
+            ..ClipboardPayload::default()
+        });
+    }
     let Some(gpui) = gpui else {
         return Some(native);
     };
@@ -280,13 +733,9 @@ pub fn resolve_clipboard_payload(
     // image-first policy is preserved instead of letting native plain text
     // suppress the image returned by GPUI.
     Some(ClipboardPayload {
-        // Prefer an owned native path over GPUI's duplicate byte payload so
-        // EXIF dimensions, ImageIO transform, and cleanup share one source.
-        images: if native
-            .file_urls
-            .iter()
-            .any(|path| is_supported_image_path(path))
-        {
+        // Prefer the AppKit-owned byte copy over GPUI's duplicate image
+        // representation; Finder file URLs still retain their own source.
+        images: if !native.file_urls.is_empty() {
             Vec::new()
         } else if native.images.is_empty() {
             gpui.images
@@ -306,18 +755,118 @@ pub fn resolve_clipboard_payload(
         html: native.html.or(gpui.html),
         rich_text: native.rich_text.or(gpui.rich_text),
         text: native.text.or(gpui.text),
+        native_image_rejected: false,
     })
 }
 
 pub fn classify_drop(paths: &[PathBuf]) -> PasteIntent {
-    paths
+    let candidates = paths
         .iter()
-        .find(|path| is_supported_image_path(path))
+        .take(MAX_CLIPBOARD_PATH_CANDIDATES)
         .cloned()
-        .map_or(PasteIntent::Unsupported, |path| PasteIntent::File {
-            path,
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [] => PasteIntent::Unsupported,
+        [path] => PasteIntent::File {
+            path: path.clone(),
             cleanup: false,
-        })
+        },
+        _ => PasteIntent::FileCandidates {
+            paths: candidates,
+            cleanup_paths: Vec::new(),
+        },
+    }
+}
+
+enum HtmlImageDescriptor {
+    NoImage,
+    DataUri(EncodedImagePayload),
+    Rejected,
+}
+
+/// Locate one `<img>` data URI without creating a lowercase copy of the
+/// complete HTML clipboard body. Every scan and copied encoded slice is
+/// bounded before the worker ever invokes a base64 decoder.
+fn parse_html_image_descriptor(html: &str) -> HtmlImageDescriptor {
+    if html.len() > MAX_HTML_IMAGE_DESCRIPTOR_BYTES {
+        return HtmlImageDescriptor::Rejected;
+    }
+    let bytes = html.as_bytes();
+    let Some(tag_start) = find_ascii_case_insensitive(bytes, b"<img") else {
+        return HtmlImageDescriptor::NoImage;
+    };
+    let tag_end = bytes[tag_start..]
+        .iter()
+        .position(|byte| *byte == b'>')
+        .map_or(bytes.len(), |offset| tag_start + offset);
+    let tag = &bytes[tag_start..tag_end];
+    let Some(data_start) = find_ascii_case_insensitive(tag, b"data:image/") else {
+        return HtmlImageDescriptor::Rejected;
+    };
+    let kind_start = data_start + b"data:image/".len();
+    let Some(kind_end_relative) = tag[kind_start..].iter().position(|byte| *byte == b';') else {
+        return HtmlImageDescriptor::Rejected;
+    };
+    let kind_end = kind_start + kind_end_relative;
+    let Some(format) = image_format_from_ascii_hint(&tag[kind_start..kind_end]) else {
+        return HtmlImageDescriptor::Rejected;
+    };
+    let marker = b";base64,";
+    if !ascii_slice_eq_ignore_case(tag.get(kind_end..kind_end + marker.len()), marker) {
+        return HtmlImageDescriptor::Rejected;
+    }
+    let encoded_start = kind_end + marker.len();
+    let encoded_end = tag[encoded_start..]
+        .iter()
+        .position(|byte| matches!(*byte, b'\'' | b'"' | b' ' | b'\t' | b'\r' | b'\n'))
+        .map_or(tag.len(), |offset| encoded_start + offset);
+    let encoded = &tag[encoded_start..encoded_end];
+    if encoded.is_empty() || encoded.len() > MAX_DATA_URI_ENCODED_BYTES {
+        return HtmlImageDescriptor::Rejected;
+    }
+    let Ok(encoded) = std::str::from_utf8(encoded) else {
+        return HtmlImageDescriptor::Rejected;
+    };
+    HtmlImageDescriptor::DataUri(EncodedImagePayload::new(format, encoded.to_owned()))
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|candidate| {
+        candidate
+            .iter()
+            .zip(needle)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+    })
+}
+
+fn ascii_slice_eq_ignore_case(actual: Option<&[u8]>, expected: &[u8]) -> bool {
+    actual.is_some_and(|actual| {
+        actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+    })
+}
+
+fn image_format_from_ascii_hint(hint: &[u8]) -> Option<ImageFormat> {
+    if ascii_slice_eq_ignore_case(Some(hint), b"png") {
+        Some(ImageFormat::Png)
+    } else if ascii_slice_eq_ignore_case(Some(hint), b"jpeg")
+        || ascii_slice_eq_ignore_case(Some(hint), b"jpg")
+    {
+        Some(ImageFormat::Jpeg)
+    } else if ascii_slice_eq_ignore_case(Some(hint), b"gif") {
+        Some(ImageFormat::Gif)
+    } else if ascii_slice_eq_ignore_case(Some(hint), b"webp") {
+        Some(ImageFormat::Webp)
+    } else if ascii_slice_eq_ignore_case(Some(hint), b"bmp") {
+        Some(ImageFormat::Bmp)
+    } else if ascii_slice_eq_ignore_case(Some(hint), b"tiff") {
+        Some(ImageFormat::Tiff)
+    } else {
+        None
+    }
 }
 
 pub fn image_format_from_path(path: &Path) -> Option<ImageFormat> {
@@ -333,10 +882,6 @@ pub fn image_format_from_path(path: &Path) -> Option<ImageFormat> {
             _ => None,
         }
     })
-}
-
-fn is_supported_image_path(path: &Path) -> bool {
-    path.is_file() && image_format_from_path(path).is_some()
 }
 
 fn image_extension(format: ImageFormat) -> &'static str {
@@ -435,14 +980,113 @@ impl Default for ImageStore {
             next_id: 1,
             images: HashMap::new(),
             by_resource_id: HashMap::new(),
-            resource_root: std::env::temp_dir().join("joplin-lite-native-images"),
+            // A store belongs to one retained EditorCore. Never share a
+            // process-global cache directory: closing a session must release
+            // its materialized sources without deleting another window's
+            // visible image files.
+            resource_root: std::env::temp_dir()
+                .join("joplin-lite-native-images")
+                .join(uuid::Uuid::new_v4().simple().to_string()),
         }
     }
+}
+
+impl Drop for ImageStore {
+    fn drop(&mut self) {
+        // `resource_root` is generated per store above, so this can never
+        // sweep the shared temp parent. Failure is intentionally best-effort:
+        // macOS may still have a decoder handle open briefly.
+        let _ = std::fs::remove_dir_all(&self.resource_root);
+    }
+}
+
+/// `ImageStore` roots live under the process temp directory, so the leaf must
+/// be explicitly private even when the host's umask is permissive. The root
+/// is generated per retained editor; rejecting a symlink prevents an old or
+/// hostile temp entry from redirecting a verified descriptor copy elsewhere.
+fn ensure_private_image_materialization_root(resource_root: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(resource_root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "image materialization root is not a private directory",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(resource_root)?;
+        }
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(resource_root, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Stream bytes into an editor-owned image source with no whole-file buffer
+/// and no window where a cache leaf receives the platform default 0644 mode.
+fn write_private_image_reader<R: Read>(
+    resource_root: &Path,
+    destination: &Path,
+    reader: &mut R,
+) -> std::io::Result<()> {
+    ensure_private_image_materialization_root(resource_root)?;
+    let filename = destination.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image materialization destination has no filename",
+        )
+    })?;
+    let temporary = resource_root.join(format!(
+        ".{}.{}.tmp",
+        filename.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let materialized = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut target = options.open(&temporary)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            target.write_all(&buffer[..count])?;
+        }
+        target.sync_all()?;
+        std::fs::rename(&temporary, destination)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if let Err(error) = materialized {
+        // Do not leave an arbitrary partial cache source behind. The durable
+        // repository blob remains authoritative and can be materialized again
+        // on a later decode attempt.
+        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
 }
 
 impl ImageStore {
     pub fn for_test() -> Self {
         Self::default()
+    }
+
+    /// A session-private controlled destination, used only by the retained
+    /// resource worker before this store adopts a matching materialization.
+    /// It is not a profile/resource-store path and cannot be supplied by UI
+    /// input.
+    pub(crate) fn materialization_root(&self) -> PathBuf {
+        self.resource_root.clone()
     }
 
     #[cfg(test)]
@@ -470,27 +1114,80 @@ impl ImageStore {
         self.insert_inner(metadata, bytes, Some(format))
     }
 
-    /// Copy an already materialized image into the managed resource directory
-    /// without first reading the source into a Rust `Vec`. This is the
-    /// production path for Finder drops and pasteboard temporary files.
-    pub fn insert_from_path(
+    /// Materialize a durable-resource image without retaining a second copy of
+    /// its compressed bytes in the editor entity. Unlike the spike's
+    /// best-effort clipboard helper, a write failure returns an error before
+    /// this store publishes any resource entry.
+    pub fn insert_durable_bytes(
         &mut self,
         metadata: ImageMetadata,
-        source_path: &Path,
+        bytes: &[u8],
         format: ImageFormat,
     ) -> std::io::Result<u64> {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        let source = self.resource_root.join(format!(
+        self.insert_durable_reader(metadata, std::io::Cursor::new(bytes), format)
+    }
+
+    /// Stream a descriptor-safe durable blob into this editor's private cache
+    /// directory. The temporary file is synced and atomically renamed before
+    /// an image entry becomes visible, so a failed materialization has no
+    /// half-readable source and no whole-resource allocation.
+    pub fn insert_durable_reader<R: Read>(
+        &mut self,
+        metadata: ImageMetadata,
+        reader: R,
+        format: ImageFormat,
+    ) -> std::io::Result<u64> {
+        let source =
+            Self::materialize_durable_reader_at(&self.resource_root, &metadata, reader, format)?;
+        self.register_materialized_durable_source(metadata, source, format)
+    }
+
+    /// Copy a verified reader to one editor-owned path without touching the
+    /// live image map.  Task 5 invokes this from the retained background
+    /// resource worker; the foreground later performs only the small map
+    /// registration after its SQLite snapshot has committed.
+    pub(crate) fn materialize_durable_reader_at<R: Read>(
+        resource_root: &Path,
+        metadata: &ImageMetadata,
+        mut reader: R,
+        format: ImageFormat,
+    ) -> std::io::Result<PathBuf> {
+        ensure_private_image_materialization_root(resource_root)?;
+        let source = resource_root.join(format!(
             "{}.{}",
             metadata.resource_id,
             image_extension(format)
         ));
-        std::fs::create_dir_all(&self.resource_root)?;
-        if let Err(error) = std::fs::copy(source_path, &source) {
-            let _ = std::fs::remove_file(&source);
-            return Err(error);
+        if source.is_file() {
+            return Ok(source);
         }
+        write_private_image_reader(resource_root, &source, &mut reader)?;
+        Ok(source)
+    }
+
+    /// Publish a source that `materialize_durable_reader_at` already copied
+    /// into this exact editor's private directory. External paths are never
+    /// accepted here: the caller must hand back the deterministic managed
+    /// filename for the resource and format.
+    pub(crate) fn register_materialized_durable_source(
+        &mut self,
+        metadata: ImageMetadata,
+        source: PathBuf,
+        format: ImageFormat,
+    ) -> std::io::Result<u64> {
+        let expected = self.resource_root.join(format!(
+            "{}.{}",
+            metadata.resource_id,
+            image_extension(format)
+        ));
+        if source != expected || !source.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "image source is not an editor-managed materialization",
+            ));
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
         self.by_resource_id.insert(metadata.resource_id.clone(), id);
         self.images.insert(
             id,
@@ -505,6 +1202,43 @@ impl ImageStore {
         Ok(id)
     }
 
+    /// Register a durable document image whose local bytes cannot currently
+    /// be opened. The image atom remains selectable and gets a stable failed
+    /// node state, but no compressed blob is retained or fabricated in the
+    /// editor process. A later explicit retry/reopen may materialize it from
+    /// the repository again.
+    pub fn insert_unavailable(&mut self, metadata: ImageMetadata) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let source_path = self
+            .resource_root
+            .join(format!("{}.unavailable", metadata.resource_id));
+        self.by_resource_id.insert(metadata.resource_id.clone(), id);
+        self.images.insert(
+            id,
+            StoredImage {
+                metadata,
+                compressed: None,
+                source_path,
+                state: ImageNodeState::Failed,
+                retryable: false,
+            },
+        );
+        id
+    }
+
+    /// Copy an already materialized image into the managed resource directory
+    /// without first reading the source into a Rust `Vec`. This is the
+    /// production path for Finder drops and pasteboard temporary files.
+    pub fn insert_from_path(
+        &mut self,
+        metadata: ImageMetadata,
+        source_path: &Path,
+        format: ImageFormat,
+    ) -> std::io::Result<u64> {
+        self.insert_durable_reader(metadata, File::open(source_path)?, format)
+    }
+
     fn insert_inner(
         &mut self,
         metadata: ImageMetadata,
@@ -517,9 +1251,12 @@ impl ImageStore {
         let source_path = self
             .resource_root
             .join(format!("{}.{}", metadata.resource_id, extension));
-        let resource_ready = std::fs::create_dir_all(&self.resource_root)
-            .and_then(|_| std::fs::write(&source_path, &bytes))
-            .is_ok();
+        let resource_ready = write_private_image_reader(
+            &self.resource_root,
+            &source_path,
+            &mut std::io::Cursor::new(bytes.as_slice()),
+        )
+        .is_ok();
         self.by_resource_id.insert(metadata.resource_id.clone(), id);
         self.images.insert(
             id,
@@ -572,10 +1309,12 @@ impl ImageStore {
             }
             return ready;
         };
-        let written =
-            std::fs::create_dir_all(source_path.parent().unwrap_or_else(|| Path::new(".")))
-                .and_then(|_| std::fs::write(&source_path, bytes))
-                .is_ok();
+        let written = write_private_image_reader(
+            source_path.parent().unwrap_or_else(|| Path::new(".")),
+            &source_path,
+            &mut std::io::Cursor::new(bytes.as_slice()),
+        )
+        .is_ok();
         if written {
             if let Some(image) = self.images.get_mut(&id) {
                 image.compressed = None;
@@ -857,6 +1596,48 @@ impl BudgetedImageCache {
         })
         .detach();
         entity
+    }
+
+    /// Context-local counterpart to [`Self::new_entity`]. LibraryShell is
+    /// created inside a retained view context, not directly from `App`; this
+    /// preserves the same release hook instead of constructing an untracked
+    /// cache that would leak GPU atlas entries when a library window closes.
+    pub fn new_entity_in_context<T>(cx: &mut Context<T>, budget_bytes: usize) -> Entity<Self>
+    where
+        T: 'static,
+    {
+        cx.new(move |cache_cx| {
+            let mut cache = Self::new(budget_bytes);
+            cache.weak_entity = Some(cache_cx.weak_entity());
+            cache_cx
+                .on_release(|cache, app| {
+                    for (_, mut entry) in std::mem::take(&mut cache.entries) {
+                        if let Some(Ok(image)) = entry.item.get() {
+                            cache.record_drop_image();
+                            app.drop_image(image, None);
+                        }
+                    }
+                    cache.lru.clear();
+                    cache.visible.clear();
+                    cache.deferred.clear();
+                    cache.in_flight = 0;
+                    cache.reserved_bytes = 0;
+                    cache.reservations.clear();
+                    cache.pending_retries.clear();
+                    cache.promotions.clear();
+                    cache.promotion_failures.clear();
+                    cache.promotion_deferred.clear();
+                    cache.requested_edges.clear();
+                    cache.harvested_generations.clear();
+                    #[cfg(test)]
+                    {
+                        cache.drop_image_calls = 0;
+                    }
+                    cache.used_bytes = 0;
+                })
+                .detach();
+            cache
+        })
     }
 
     pub fn used_bytes(&self) -> usize {
@@ -1920,29 +2701,25 @@ impl ImageCache for BudgetedImageCache {
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Default)]
 struct NativePasteboardSnapshot {
+    images: Vec<ImagePayload>,
     html: Option<String>,
     rich_text: Option<String>,
     text: Option<String>,
-    image_path: Option<PathBuf>,
     file_urls: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
 fn native_payload_from_snapshot(snapshot: NativePasteboardSnapshot) -> Option<ClipboardPayload> {
     let NativePasteboardSnapshot {
+        images,
         html,
         rich_text,
         text,
-        image_path,
         file_urls,
     } = snapshot;
-    if let Some(path) = image_path {
+    if !images.is_empty() {
         return Some(ClipboardPayload {
-            file_urls: vec![path.clone()],
-            temporary_files: vec![path],
-            html,
-            rich_text,
-            text,
+            images: bounded_image_candidates(images),
             ..Default::default()
         });
     }
@@ -1965,6 +2742,82 @@ fn native_payload_from_snapshot(snapshot: NativePasteboardSnapshot) -> Option<Cl
     } else {
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+const NATIVE_IMAGE_UTIS: &[(ImageFormat, &str)] = &[
+    (ImageFormat::Png, "public.png"),
+    (ImageFormat::Tiff, "public.tiff"),
+    (ImageFormat::Jpeg, "public.jpeg"),
+    (ImageFormat::Gif, "com.compuserve.gif"),
+    (ImageFormat::Webp, "org.webmproject.webp"),
+    (ImageFormat::Bmp, "com.microsoft.bmp"),
+    (ImageFormat::Svg, "public.svg-image"),
+];
+
+/// One macOS paste can expose the same visual content through several UTI
+/// encodings.  Probe every supported UTI in order, but keep no more than a
+/// 30 MiB process-owned compressed-byte budget.  A too-large earlier UTI does
+/// not stop a later, smaller valid representation from being considered.
+#[cfg(target_os = "macos")]
+const MAX_NATIVE_IMAGE_CANDIDATE_BYTES: usize = 3 * app_lite_core::MAX_IMAGE_BYTES;
+
+/// The AppKit bridge returns only process-owned payloads. This seam keeps the
+/// UTI preference independently testable without creating a pasteboard or
+/// permitting foreground storage access.
+#[cfg(target_os = "macos")]
+enum NativeImageRead {
+    Missing,
+    Rejected,
+    Payloads(Vec<ImagePayload>),
+}
+
+#[cfg(target_os = "macos")]
+fn native_image_candidates_from(
+    mut payload_for_uti: impl FnMut(ImageFormat, &str, usize) -> NativeImageRead,
+) -> NativeImageRead {
+    let mut any_rejected = false;
+    let mut candidates = Vec::new();
+    let mut total_bytes = 0usize;
+    for &(format, uti) in NATIVE_IMAGE_UTIS {
+        let remaining_budget = MAX_NATIVE_IMAGE_CANDIDATE_BYTES.saturating_sub(total_bytes);
+        match payload_for_uti(format, uti, remaining_budget) {
+            NativeImageRead::Missing => continue,
+            NativeImageRead::Rejected => any_rejected = true,
+            NativeImageRead::Payloads(payloads) => {
+                for payload in payloads {
+                    let Some(next_total) = total_bytes.checked_add(payload.bytes.len()) else {
+                        any_rejected = true;
+                        break;
+                    };
+                    if next_total > MAX_NATIVE_IMAGE_CANDIDATE_BYTES {
+                        any_rejected = true;
+                        break;
+                    }
+                    total_bytes = next_total;
+                    candidates.push(payload);
+                }
+            }
+        }
+    }
+    if !candidates.is_empty() {
+        NativeImageRead::Payloads(candidates)
+    } else if any_rejected {
+        NativeImageRead::Rejected
+    } else {
+        NativeImageRead::Missing
+    }
+}
+
+/// Copy a pasted image while AppKit owns the source bytes. A `Vec` is an
+/// explicit process-owned handoff to the existing background staging path;
+/// it is neither a temporary file nor a borrowed Foundation buffer.
+#[cfg(target_os = "macos")]
+fn copy_bounded_native_image_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.is_empty() || bytes.len() > app_lite_core::MAX_IMAGE_BYTES {
+        return None;
+    }
+    Some(bytes.to_vec())
 }
 
 #[cfg(target_os = "macos")]
@@ -2012,93 +2865,86 @@ unsafe fn native_rtf_string_value(data: cocoa::base::id) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn native_image_payload(
+    data: cocoa::base::id,
+    format: ImageFormat,
+    remaining_budget: usize,
+) -> NativeImageRead {
+    use cocoa::base::nil;
+    use objc::{msg_send, sel, sel_impl};
+
+    if data == nil {
+        return NativeImageRead::Missing;
+    }
+    let length: usize = unsafe { msg_send![data, length] };
+    if length == 0 || length > app_lite_core::MAX_IMAGE_BYTES || length > remaining_budget {
+        return NativeImageRead::Rejected;
+    }
+    let source: *const u8 = unsafe { msg_send![data, bytes] };
+    if source.is_null() {
+        return NativeImageRead::Rejected;
+    }
+    let source = unsafe { std::slice::from_raw_parts(source, length) };
+    copy_bounded_native_image_bytes(source)
+        .map(|bytes| NativeImageRead::Payloads(vec![ImagePayload::new(format, bytes)]))
+        .unwrap_or(NativeImageRead::Rejected)
+}
+
+#[cfg(target_os = "macos")]
 pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     // Narrow AppKit bridge: only pasteboard extraction happens here. The
     // editor model, layout, and rendering remain GPUI/native-editor owned.
-    use cocoa::appkit::{
-        NSFilenamesPboardType, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString,
-        NSPasteboardTypeTIFF,
-    };
-    use cocoa::base::{YES, nil};
-    use cocoa::foundation::{NSArray, NSAutoreleasePool, NSData, NSString};
+    use cocoa::appkit::{NSFilenamesPboardType, NSPasteboard, NSPasteboardTypeString};
+    use cocoa::base::nil;
+    use cocoa::foundation::{NSArray, NSAutoreleasePool, NSString};
 
     unsafe {
         let _pool = NSAutoreleasePool::new(nil);
         let pasteboard = NSPasteboard::generalPasteboard(nil);
-        let html_type = NSString::alloc(nil).init_str("public.html").autorelease();
-        let rtf_type = NSString::alloc(nil).init_str("public.rtf").autorelease();
-        let base = NativePasteboardSnapshot {
-            html: native_string_value(pasteboard.stringForType(html_type)),
-            rich_text: native_rtf_string_value(pasteboard.dataForType(rtf_type)),
-            text: native_string_value(pasteboard.stringForType(NSPasteboardTypeString)),
-            image_path: None,
-            file_urls: Vec::new(),
-        };
-        let image_types = [
-            (ImageFormat::Png, NSPasteboardTypePNG),
-            (ImageFormat::Tiff, NSPasteboardTypeTIFF),
-            (
-                ImageFormat::Jpeg,
-                NSString::alloc(nil).init_str("public.jpeg").autorelease(),
-            ),
-            (
-                ImageFormat::Gif,
-                NSString::alloc(nil)
-                    .init_str("com.compuserve.gif")
-                    .autorelease(),
-            ),
-            (
-                ImageFormat::Webp,
-                NSString::alloc(nil)
-                    .init_str("org.webmproject.webp")
-                    .autorelease(),
-            ),
-            (
-                ImageFormat::Bmp,
-                NSString::alloc(nil)
-                    .init_str("com.microsoft.bmp")
-                    .autorelease(),
-            ),
-            (
-                ImageFormat::Svg,
-                NSString::alloc(nil)
-                    .init_str("public.svg-image")
-                    .autorelease(),
-            ),
-        ];
-        for (format, ty) in image_types {
-            let data = pasteboard.dataForType(ty);
-            if data != nil {
-                let path = std::env::temp_dir().join(format!(
-                    "joplin-lite-pasteboard-{}.{}",
-                    uuid::Uuid::new_v4(),
-                    image_extension(format)
-                ));
-                let path_text = path.to_string_lossy();
-                let path_string = NSString::alloc(nil)
-                    .init_str(path_text.as_ref())
-                    .autorelease();
-                let wrote = data.writeToFile_atomically_(path_string, YES);
-                if !wrote {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                let mut snapshot = base.clone();
-                snapshot.image_path = Some(path);
-                return native_payload_from_snapshot(snapshot);
+        match native_image_candidates_from(|format, uti, remaining_budget| {
+            let ty = NSString::alloc(nil).init_str(uti).autorelease();
+            native_image_payload(pasteboard.dataForType(ty), format, remaining_budget)
+        }) {
+            NativeImageRead::Payloads(images) => {
+                return native_payload_from_snapshot(NativePasteboardSnapshot {
+                    images,
+                    ..Default::default()
+                });
             }
+            // A rejected image must not fall through to its accompanying
+            // screenshot placeholder text. The user can retry with a smaller
+            // image, while the foreground path remains bounded and disk-free.
+            NativeImageRead::Rejected => {
+                return Some(ClipboardPayload {
+                    native_image_rejected: true,
+                    ..ClipboardPayload::default()
+                });
+            }
+            NativeImageRead::Missing => {}
         }
         let files = pasteboard.propertyListForType(NSFilenamesPboardType);
         if files != nil {
-            let mut snapshot = base;
+            let mut snapshot = NativePasteboardSnapshot::default();
             for index in 0..files.count() {
                 if let Some(path) = native_string_value(files.objectAtIndex(index)) {
                     snapshot.file_urls.push(PathBuf::from(path));
                 }
             }
-            return native_payload_from_snapshot(snapshot);
+            if !snapshot.file_urls.is_empty() {
+                return native_payload_from_snapshot(snapshot);
+            }
         }
-        native_payload_from_snapshot(base)
+        // Textual forms are deliberately read only after every image UTI and
+        // file representation has been ruled out, so screenshot placeholder
+        // text can never suppress an actual image payload.
+        let html_type = NSString::alloc(nil).init_str("public.html").autorelease();
+        let rtf_type = NSString::alloc(nil).init_str("public.rtf").autorelease();
+        native_payload_from_snapshot(NativePasteboardSnapshot {
+            html: native_string_value(pasteboard.stringForType(html_type)),
+            rich_text: native_rtf_string_value(pasteboard.dataForType(rtf_type)),
+            text: native_string_value(pasteboard.stringForType(NSPasteboardTypeString)),
+            ..Default::default()
+        })
     }
 }
 
@@ -2119,6 +2965,18 @@ mod tests {
     use gpui::TestAppContext;
     use image::{ImageBuffer, Rgba};
 
+    fn fixture_jpeg_bytes() -> Vec<u8> {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            2,
+            3,
+            Rgba([0x11, 0x55, 0x99, 0xff]),
+        ))
+        .write_to(&mut encoded, image::ImageFormat::Jpeg)
+        .expect("encode JPEG fixture");
+        encoded.into_inner()
+    }
+
     #[test]
     fn bounded_decode_downsamples_before_render_image_creation() {
         let source = ImageBuffer::from_pixel(4096, 4096, Rgba([0x11, 0x22, 0x33, 0xff]));
@@ -2137,6 +2995,52 @@ mod tests {
     fn viewport_proxy_uses_device_pixels_without_retina_downsampling() {
         assert_eq!(proxy_max_edge_for_viewport(680.0, 2.0), 1360);
         assert_eq!(proxy_max_edge_for_viewport(680.0, 1.0), 680);
+    }
+
+    #[test]
+    fn resource_import_rejects_jpeg_bytes_renamed_as_png() {
+        // Without an actual-format check, this passed as an ImageFormat::Png
+        // because dimensions are guessed from the JPEG bytes. The later GPUI
+        // cache then receives a .png path with JPEG data and fails after the
+        // durable resource has already been associated.
+        let path = std::env::temp_dir().join(format!(
+            "joplin-lite-renamed-jpeg-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            2,
+            3,
+            Rgba([0x31, 0x52, 0x73, 0xff]),
+        ))
+        .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+        .expect("encode JPEG fixture");
+        std::fs::write(&path, jpeg.into_inner()).expect("write renamed fixture");
+
+        let result = ResourceImport::from_path(&path);
+        let _ = std::fs::remove_file(path);
+        assert!(matches!(result, Err(ResourceImportError::InvalidImage)));
+    }
+
+    #[test]
+    fn path_attachment_import_keeps_a_descriptor_instead_of_a_payload_vec() {
+        // A Finder-selected PDF may be tens of megabytes.  The intake object
+        // must retain a checked descriptor plus its exact length, not the
+        // entire file again before the repository's fixed-buffer stream can
+        // stage it.
+        let path = std::env::temp_dir().join(format!(
+            "joplin-lite-streaming-attachment-{}.pdf",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, vec![0x4a; 3 * 64 * 1024 + 7]).expect("write attachment fixture");
+
+        let import = ResourceImport::from_path(&path).expect("open checked attachment source");
+        let _ = std::fs::remove_file(path);
+
+        assert!(matches!(
+            import.source,
+            ResourceSource::File { size, .. } if size == 3 * 64 * 1024 + 7
+        ));
     }
 
     #[test]
@@ -2295,6 +3199,46 @@ mod tests {
     }
 
     #[test]
+    fn rejected_native_image_blocks_gpui_placeholder_and_duplicate_image_fallback() {
+        let native = ClipboardPayload {
+            native_image_rejected: true,
+            text: Some("截图占位文本".into()),
+            ..ClipboardPayload::default()
+        };
+        let gpui = ClipboardPayload::fixture_with_png_and_text("GPUI 伴随文本");
+        let merged = resolve_clipboard_payload(Some(native), Some(gpui))
+            .expect("native rejection remains an explicit payload state");
+        assert!(merged.native_image_rejected);
+        assert!(matches!(
+            classify_clipboard(merged),
+            PasteIntent::Unsupported
+        ));
+    }
+
+    #[test]
+    fn html_data_uri_classifier_retains_bounded_encoded_bytes_for_the_worker() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(fixture_png_bytes());
+        let intent = classify_clipboard(ClipboardPayload {
+            html: Some(format!("<IMG src='DATA:IMAGE/PNG;BASE64,{encoded}'>")),
+            ..ClipboardPayload::default()
+        });
+        let PasteIntent::EncodedImage { payload } = intent else {
+            panic!("the callback must retain an encoded descriptor, not decode an ImagePayload");
+        };
+        assert_eq!(payload.encoded, encoded);
+        assert_eq!(payload.format, ImageFormat::Png);
+
+        let over_bound = "A".repeat(MAX_DATA_URI_ENCODED_BYTES + 1);
+        assert!(matches!(
+            classify_clipboard(ClipboardPayload {
+                html: Some(format!("<img src='data:image/png;base64,{over_bound}'>")),
+                ..ClipboardPayload::default()
+            }),
+            PasteIntent::Unsupported
+        ));
+    }
+
+    #[test]
     fn retry_failed_resource_transitions_back_to_loading() {
         let mut store = ImageStore::for_test();
         let id = store.insert_with_format(
@@ -2343,8 +3287,8 @@ mod tests {
     }
 
     #[test]
-    fn production_clipboard_classification_moves_large_image_bytes() {
-        let bytes = vec![0x7f; 16 * 1024 * 1024];
+    fn production_clipboard_classification_moves_bounded_image_bytes() {
+        let bytes = vec![0x7f; app_lite_core::MAX_IMAGE_BYTES];
         let pointer = bytes.as_ptr();
         let payload = ClipboardPayload {
             images: vec![ImagePayload::new(ImageFormat::Png, bytes)],
@@ -2355,6 +3299,23 @@ mod tests {
             panic!("image payload should remain image-first");
         };
         assert_eq!(payload.bytes.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn production_clipboard_classification_rejects_over_limit_image_without_text_fallback() {
+        // The owned-buffer move contract applies only to a valid inline image.
+        // A payload over the explicit 10 MiB image bound must not become a
+        // placeholder string simply because the same pasteboard also exposed
+        // text.
+        let intent = classify_clipboard(ClipboardPayload {
+            images: vec![ImagePayload::new(
+                ImageFormat::Png,
+                vec![0x7f; app_lite_core::MAX_IMAGE_BYTES + 1],
+            )],
+            text: Some("不能降级成文本".into()),
+            ..ClipboardPayload::default()
+        });
+        assert!(matches!(intent, PasteIntent::Unsupported));
     }
 
     #[gpui::test]
@@ -3107,6 +4068,202 @@ mod tests {
         assert_eq!(std::fs::read(managed).expect("managed image"), original);
         assert_eq!(store.compressed_len(id), None);
         let _ = std::fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn session_private_materialized_sources_are_removed_when_store_drops() {
+        let source = fixture_png_bytes();
+        let managed = {
+            let mut store = ImageStore::for_test();
+            store
+                .insert_durable_reader(
+                    ImageMetadata::new("drop-private-source", 1, 1),
+                    std::io::Cursor::new(source),
+                    ImageFormat::Png,
+                )
+                .expect("stream source into private cache");
+            store
+                .source_path_for_resource("drop-private-source")
+                .expect("managed source")
+                .to_owned()
+        };
+        assert!(
+            !managed.exists(),
+            "dropping a retained editor must release its private image source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_image_materialization_uses_private_directory_and_leaf_modes() {
+        // This invokes the same stream-and-rename route used by persisted
+        // library image hydration, rather than a direct fixture write. A
+        // permissive umask must not make a note image readable from the shared
+        // temporary parent before GPUI decodes it.
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut store = ImageStore::for_test();
+        store
+            .insert_durable_reader(
+                ImageMetadata::new("private-durable-image", 1, 1),
+                std::io::Cursor::new(fixture_png_bytes()),
+                ImageFormat::Png,
+            )
+            .expect("stream durable image into editor-private cache");
+        let root = store.materialization_root();
+        let source = store
+            .source_path_for_resource("private-durable-image")
+            .expect("managed durable source");
+        assert_eq!(
+            std::fs::metadata(root)
+                .expect("private image root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the session image root must not retain default world traversal permissions"
+        );
+        assert_eq!(
+            std::fs::metadata(source)
+                .expect("private image source metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the streamed image leaf must not retain default world-read permissions"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_snapshot_prefers_an_owned_image_payload_without_a_temporary_file() {
+        let native = native_payload_from_snapshot(NativePasteboardSnapshot {
+            images: vec![ImagePayload::new(ImageFormat::Png, fixture_png_bytes())],
+            text: Some("图像占位符".into()),
+            ..Default::default()
+        })
+        .expect("native image snapshot should produce a payload");
+
+        assert!(matches!(
+            native.images.as_slice(),
+            [ImagePayload {
+                format: ImageFormat::Png,
+                bytes,
+                ..
+            }] if bytes == &fixture_png_bytes()
+        ));
+        assert!(native.file_urls.is_empty());
+        assert!(native.temporary_files.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_image_uti_seam_collects_bounded_ordered_candidates_before_textual_forms() {
+        let mut queried = Vec::new();
+        let image = native_image_candidates_from(|format, uti, _remaining_budget| {
+            queried.push(uti.to_owned());
+            match uti {
+                "public.png" => NativeImageRead::Payloads(vec![ImagePayload::new(
+                    format,
+                    vec![0x89, 0x50, 0x4e],
+                )]),
+                "public.tiff" => NativeImageRead::Payloads(vec![ImagePayload::new(
+                    format,
+                    vec![0x49, 0x49, 0x2a],
+                )]),
+                "public.jpeg" => {
+                    NativeImageRead::Payloads(vec![ImagePayload::new(format, fixture_jpeg_bytes())])
+                }
+                _ => NativeImageRead::Missing,
+            }
+        });
+
+        assert_eq!(
+            queried,
+            NATIVE_IMAGE_UTIS
+                .iter()
+                .map(|(_, uti)| (*uti).to_owned())
+                .collect::<Vec<_>>()
+        );
+        let NativeImageRead::Payloads(images) = image else {
+            panic!("the bridge should retain ordered UTI candidates");
+        };
+        assert_eq!(images.len(), 3);
+        assert_eq!(images[0].format, ImageFormat::Png);
+        assert_eq!(images[1].format, ImageFormat::Tiff);
+        assert_eq!(images[2].format, ImageFormat::Jpeg);
+        assert_eq!(
+            ResourceImport::from_image_payload(images[2].clone())
+                .expect("the third native candidate must really decode")
+                .kind,
+            ResourceKind::Image {
+                format: ImageFormat::Jpeg,
+                natural_size: (2, 3),
+            }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_image_uti_seam_rejection_stops_before_textual_fallback() {
+        let mut queried = Vec::new();
+        let image = native_image_candidates_from(|_, uti, _remaining_budget| {
+            queried.push(uti.to_owned());
+            NativeImageRead::Rejected
+        });
+
+        assert_eq!(
+            queried,
+            NATIVE_IMAGE_UTIS
+                .iter()
+                .map(|(_, uti)| (*uti).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(image, NativeImageRead::Rejected));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_image_uti_seam_uses_a_later_valid_image_after_a_rejected_representation() {
+        let mut queried = Vec::new();
+        let image = native_image_candidates_from(|format, uti, _remaining_budget| {
+            queried.push(uti.to_owned());
+            match uti {
+                "public.png" => NativeImageRead::Rejected,
+                "public.tiff" => {
+                    NativeImageRead::Payloads(vec![ImagePayload::new(format, fixture_png_bytes())])
+                }
+                _ => NativeImageRead::Missing,
+            }
+        });
+
+        assert_eq!(
+            queried,
+            NATIVE_IMAGE_UTIS
+                .iter()
+                .map(|(_, uti)| (*uti).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            image,
+            NativeImageRead::Payloads(images)
+                if matches!(images.as_slice(), [ImagePayload { format: ImageFormat::Tiff, .. }])
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_image_copy_seam_owns_at_most_ten_mib_without_a_file_handoff() {
+        let mut source = fixture_png_bytes();
+        let owned = copy_bounded_native_image_bytes(&source)
+            .expect("a small native image should copy into a process-owned payload");
+        source[0] ^= 0xff;
+        assert_eq!(owned, fixture_png_bytes());
+        assert!(
+            copy_bounded_native_image_bytes(&vec![0_u8; app_lite_core::MAX_IMAGE_BYTES + 1])
+                .is_none(),
+            "an oversized AppKit NSData must not cross the foreground boundary"
+        );
     }
 
     #[cfg(target_os = "macos")]

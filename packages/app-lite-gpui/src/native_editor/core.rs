@@ -1,9 +1,10 @@
 //! The single owner of native-editor focus, selection, IME composition,
 //! transactions, history, and document-wide commands.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     Bounds, Context, EntityInputHandler, FocusHandle, ImageFormat, Pixels, Point, UTF16Selection,
@@ -151,6 +152,76 @@ impl RawDocumentRange {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentMetadata {
+    resource_id: String,
+    size: u64,
+    available: bool,
+}
+
+/// Opaque handle for a pending picker, paste, or drop insertion point.
+///
+/// The editor alone owns the mutable point behind this token. UI code may
+/// retain the token while an asynchronous source is staged, but it cannot
+/// retain a bare `DocPoint` that becomes stale as the document changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ResourceInsertAnchor {
+    token: u64,
+    /// The document revision at capture time is carried with the handle so a
+    /// session intent has an explicit generation provenance. Resolution is
+    /// nevertheless based on the tracked mapping, not an unsafe equality
+    /// check against a later live revision.
+    captured_revision: u64,
+}
+
+impl ResourceInsertAnchor {
+    pub(crate) const fn captured_revision(self) -> u64 {
+        self.captured_revision
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingResourceInsertAnchor {
+    selection: Option<Selection>,
+}
+
+#[derive(Clone, Debug)]
+struct ResourceAnchorReplacement {
+    range: Range<usize>,
+    pre_document_len: usize,
+    anchors: Vec<(u64, (usize, Affinity), (usize, Affinity))>,
+}
+
+impl AttachmentMetadata {
+    fn ready(resource_id: impl Into<String>, size: u64) -> Self {
+        Self {
+            resource_id: resource_id.into(),
+            size,
+            available: true,
+        }
+    }
+
+    fn unavailable(resource_id: impl Into<String>) -> Self {
+        Self {
+            resource_id: resource_id.into(),
+            size: 0,
+            available: false,
+        }
+    }
+
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub const fn is_available(&self) -> bool {
+        self.available
+    }
+}
+
 pub struct EditorCore {
     pub(crate) focus: FocusHandle,
     access: EditorAccess,
@@ -167,10 +238,52 @@ pub struct EditorCore {
     last_input_error: Option<DocumentError>,
     history: History,
     image_store: ImageStore,
+    /// Pure in-memory source state for retained durable images. Rendering
+    /// consults this instead of probing `Path::is_file` every frame; the
+    /// session updates it only after an atomic materialization handoff.
+    materialized_image_ids: HashSet<String>,
+    /// Requests emitted only for image atoms in the renderer's visible or
+    /// prefetch residency set. A retained `NoteSession` drains this small
+    /// queue and verifies/materializes the blob off the GPUI thread.
+    pending_image_hydration: HashSet<String>,
+    active_image_hydration: HashSet<String>,
+    failed_image_hydration: HashSet<String>,
+    /// Attachment bytes are never held by the editor. This small metadata map
+    /// gives structural attachment nodes an honest filename/mime/size card;
+    /// the note session materializes a verified source only for an explicit
+    /// system-open request.
+    attachment_metadata: HashMap<String, AttachmentMetadata>,
+    /// Pending external insertion points only. This stays empty during normal
+    /// typing, and when it is non-empty every successful transaction maps the
+    /// few tracked points in place; no document clone or whole-note diff is
+    /// needed for a keystroke.
+    next_resource_insert_anchor: u64,
+    pending_resource_insert_anchors: HashMap<u64, PendingResourceInsertAnchor>,
     pub(crate) layout: LayoutRegistry,
     layout_offset: (f32, f32),
     #[cfg(test)]
     shape_calls: usize,
+    /// Test-only fault seam for the legacy post-commit `apply` path. Durable
+    /// resource insertion must not call that path after SQLite has committed.
+    #[cfg(test)]
+    next_apply_error_for_test: Option<DocumentError>,
+}
+
+/// A fully validated editor mutation prepared before an external durable
+/// transaction. It owns the resulting document and bounded inverse history,
+/// so installation after SQLite succeeds is an infallible state swap rather
+/// than a second mutable replay that can leave DB and session divergent.
+pub(crate) struct PreparedEditorCommit {
+    document: Document,
+    history: History,
+    outcome: ApplyOutcome,
+    resource_anchor_mapping: Option<ResourceAnchorReplacement>,
+}
+
+impl PreparedEditorCommit {
+    pub(crate) fn document(&self) -> &Document {
+        &self.document
+    }
 }
 
 /// Capability boundary for the single editor core.  The default constructor
@@ -180,6 +293,15 @@ pub struct EditorCore {
 pub enum EditorAccess {
     Editable,
     ReadOnly,
+}
+
+/// The pointer-facing identity of a section-level resource node. The shared
+/// surface uses this only to distinguish the attachment's platform open
+/// request; both variants are selected as one complete document atom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AtomicBlockHit {
+    Image,
+    Attachment { resource_id: String },
 }
 
 impl EditorCore {
@@ -316,10 +438,19 @@ impl EditorCore {
             last_input_error: None,
             history: History::new(1_000, 16 * 1024 * 1024),
             image_store: ImageStore::default(),
+            materialized_image_ids: HashSet::new(),
+            pending_image_hydration: HashSet::new(),
+            active_image_hydration: HashSet::new(),
+            failed_image_hydration: HashSet::new(),
+            attachment_metadata: HashMap::new(),
+            next_resource_insert_anchor: 1,
+            pending_resource_insert_anchors: HashMap::new(),
             layout: LayoutRegistry::new(),
             layout_offset: (0.0, 0.0),
             #[cfg(test)]
             shape_calls: 0,
+            #[cfg(test)]
+            next_apply_error_for_test: None,
         }
     }
 
@@ -351,6 +482,256 @@ impl EditorCore {
         self.selection
     }
 
+    /// Register a point that an asynchronous external resource completion
+    /// must later resolve against the then-current document.  This is a tiny
+    /// tracked selection, not a snapshot: only pending intents pay any
+    /// per-transaction mapping cost.
+    pub(crate) fn capture_resource_insert_anchor(
+        &mut self,
+        selection: Selection,
+    ) -> Result<ResourceInsertAnchor, DocumentError> {
+        self.document.validate_selection(selection)?;
+        let token = self.next_resource_insert_anchor;
+        self.next_resource_insert_anchor = self
+            .next_resource_insert_anchor
+            .checked_add(1)
+            .ok_or_else(|| {
+                DocumentError::InvalidOperation("resource insert anchor exhausted".into())
+            })?;
+        self.pending_resource_insert_anchors.insert(
+            token,
+            PendingResourceInsertAnchor {
+                selection: Some(selection),
+            },
+        );
+        Ok(ResourceInsertAnchor {
+            token,
+            captured_revision: self.document.revision(),
+        })
+    }
+
+    /// Resolve without consuming. This is deliberately test-visible so
+    /// structural mutations can prove that a pending intent is mapped before
+    /// its asynchronous source completes.
+    pub(crate) fn peek_resource_insert_anchor(
+        &self,
+        anchor: ResourceInsertAnchor,
+    ) -> Result<Selection, DocumentError> {
+        let selection = self
+            .pending_resource_insert_anchors
+            .get(&anchor.token)
+            .and_then(|anchor| anchor.selection)
+            .ok_or_else(|| {
+                DocumentError::InvalidOperation(
+                    "resource insertion position is no longer valid".into(),
+                )
+            })?;
+        self.document.validate_selection(selection)?;
+        Ok(selection)
+    }
+
+    /// Resolve and consume a pending external insertion point. A stale token
+    /// is an explicit error rather than a fallback to the live caret.
+    pub(crate) fn resolve_resource_insert_anchor(
+        &mut self,
+        anchor: ResourceInsertAnchor,
+    ) -> Result<Selection, DocumentError> {
+        let selection = self
+            .pending_resource_insert_anchors
+            .remove(&anchor.token)
+            .and_then(|anchor| anchor.selection)
+            .ok_or_else(|| {
+                DocumentError::InvalidOperation(
+                    "resource insertion position is no longer valid".into(),
+                )
+            })?;
+        self.document.validate_selection(selection)?;
+        Ok(selection)
+    }
+
+    pub(crate) fn discard_resource_insert_anchor(&mut self, anchor: ResourceInsertAnchor) {
+        self.pending_resource_insert_anchors.remove(&anchor.token);
+    }
+
+    fn resource_anchor_replacement_for_transaction(
+        &self,
+        transaction: &Transaction,
+    ) -> Option<ResourceAnchorReplacement> {
+        self.resource_anchor_replacement_for_range(
+            self.replacement_range_for_transaction(transaction)?,
+        )
+    }
+
+    fn resource_anchor_replacement_for_batch(
+        &self,
+        batch: &TransactionBatch,
+    ) -> Option<ResourceAnchorReplacement> {
+        let range = batch
+            .0
+            .iter()
+            .find_map(|transaction| self.replacement_range_for_transaction(transaction))?;
+        self.resource_anchor_replacement_for_range(range)
+    }
+
+    fn resource_anchor_replacement_for_range(
+        &self,
+        range: Range<usize>,
+    ) -> Option<ResourceAnchorReplacement> {
+        if self.pending_resource_insert_anchors.is_empty() {
+            return None;
+        }
+        let anchors = self
+            .pending_resource_insert_anchors
+            .iter()
+            .filter_map(|(token, anchor)| {
+                let selection = anchor.selection?;
+                let anchor_offset = self.document.flat_offset_for_point(selection.anchor)?;
+                let head_offset = self.document.flat_offset_for_point(selection.head)?;
+                Some((
+                    *token,
+                    (anchor_offset, selection.anchor.affinity),
+                    (head_offset, selection.head.affinity),
+                ))
+            })
+            .collect::<Vec<_>>();
+        (!anchors.is_empty()).then_some(ResourceAnchorReplacement {
+            range,
+            pre_document_len: self.document.flat_utf8_len(),
+            anchors,
+        })
+    }
+
+    /// Map every pending tracked selection through one document replacement.
+    /// The operation stores only offsets for outstanding resource intents;
+    /// normal typing retains the existing no-clone hot path.
+    fn apply_resource_anchor_replacement(&mut self, mapping: Option<ResourceAnchorReplacement>) {
+        let Some(mapping) = mapping else {
+            return;
+        };
+        let post_len = self.document.flat_utf8_len();
+        let removed_len = mapping.range.end.saturating_sub(mapping.range.start);
+        let inserted_len =
+            post_len.saturating_sub(mapping.pre_document_len.saturating_sub(removed_len));
+        for (token, (anchor_offset, anchor_affinity), (head_offset, head_affinity)) in
+            mapping.anchors
+        {
+            let mapped_anchor = map_resource_anchor_offset(
+                anchor_offset,
+                anchor_affinity,
+                mapping.range.clone(),
+                inserted_len,
+            );
+            let mapped_head = map_resource_anchor_offset(
+                head_offset,
+                head_affinity,
+                mapping.range.clone(),
+                inserted_len,
+            );
+            let selection = self
+                .document
+                .point_for_flat_utf8_offset(mapped_anchor, anchor_affinity)
+                .zip(
+                    self.document
+                        .point_for_flat_utf8_offset(mapped_head, head_affinity),
+                )
+                .map(|(anchor, head)| Selection::new(anchor, head));
+            if let Some(anchor) = self.pending_resource_insert_anchors.get_mut(&token) {
+                anchor.selection = selection;
+            }
+        }
+    }
+
+    fn replacement_range_for_transaction(&self, transaction: &Transaction) -> Option<Range<usize>> {
+        let selection_range = |selection: Selection| self.selection_flat_range(selection);
+        match transaction {
+            Transaction::InsertText { selection, .. }
+            | Transaction::DeleteRange { selection }
+            | Transaction::InsertImage { selection, .. }
+            | Transaction::InsertAttachment { selection, .. }
+            | Transaction::EnsureParagraph { selection } => Some(selection_range(*selection)),
+            Transaction::SplitBlock { at } => {
+                let offset = self.document.flat_offset_for_point(*at)?;
+                Some(offset..offset)
+            }
+            Transaction::MergeBlocks { left, right } => {
+                let left = self.document.block(*left)?;
+                let right = self.document.block(*right)?;
+                let left_end = self
+                    .document
+                    .flat_offset_for_point(DocPoint::with_affinity(
+                        left.id,
+                        left.content.as_text().map_or(0, str::len),
+                        Affinity::After,
+                    ))?;
+                let right_start = self
+                    .document
+                    .flat_offset_for_point(DocPoint::with_affinity(
+                        right.id,
+                        0,
+                        Affinity::Before,
+                    ))?;
+                Some(left_end..right_start)
+            }
+            Transaction::RemoveNode { node_id } => {
+                let index = self.document.node_index(*node_id).ok()?;
+                let (start, end) = if index + 1 < self.document.block_count() {
+                    (
+                        self.block_boundary_offset(index)?,
+                        self.block_boundary_offset(index + 1)?,
+                    )
+                } else if index > 0 {
+                    // Removing the terminal block also removes its preceding
+                    // document separator, so an anchor in it falls back to
+                    // the end of the prior stable text block.
+                    (
+                        self.block_end_offset(index - 1)?,
+                        self.document.flat_utf8_len(),
+                    )
+                } else {
+                    (0, self.document.flat_utf8_len())
+                };
+                Some(start..end)
+            }
+            Transaction::RestoreBlocks {
+                index,
+                remove_count,
+                ..
+            } => {
+                let start = self
+                    .block_boundary_offset(*index)
+                    .unwrap_or_else(|| self.document.flat_utf8_len());
+                let end_index = index.saturating_add(*remove_count);
+                let end = self
+                    .block_boundary_offset(end_index)
+                    .unwrap_or_else(|| self.document.flat_utf8_len());
+                Some(start..end)
+            }
+            Transaction::SetBlockKind { .. }
+            | Transaction::ToggleMark { .. }
+            | Transaction::SetLink { .. }
+            | Transaction::SetAlignment { .. }
+            | Transaction::IndentList { .. }
+            | Transaction::OutdentList { .. }
+            | Transaction::SetImageDisplayWidth { .. }
+            | Transaction::SetImageNaturalSize { .. } => None,
+        }
+    }
+
+    fn block_boundary_offset(&self, index: usize) -> Option<usize> {
+        let block = self.document.block_at_index(index)?;
+        self.document
+            .flat_offset_for_point(DocPoint::with_affinity(block.id, 0, Affinity::Before))
+    }
+
+    fn block_end_offset(&self, index: usize) -> Option<usize> {
+        let block = self.document.block_at_index(index)?;
+        self.document.flat_offset_for_point(DocPoint::with_affinity(
+            block.id,
+            block.content.as_text().map_or(0, str::len),
+            Affinity::After,
+        ))
+    }
+
     pub fn image_metadata(&self, resource_id: &str) -> Option<&ImageMetadata> {
         self.image_store.metadata_for_resource(resource_id)
     }
@@ -371,11 +752,122 @@ impl EditorCore {
     }
 
     pub fn retry_image_resource(&mut self, resource_id: &str) -> bool {
-        self.image_store.retry_resource(resource_id)
+        let retried = self.image_store.retry_resource(resource_id);
+        if retried {
+            self.failed_image_hydration.remove(resource_id);
+        }
+        retried
     }
 
     pub fn image_source_path(&self, resource_id: &str) -> Option<&std::path::Path> {
         self.image_store.source_path_for_resource(resource_id)
+    }
+
+    /// Queue only residency-selected persisted images for a retained session
+    /// worker. This performs no I/O; it records resource IDs that still occur
+    /// in the live document. A failed request stays failed until retry/reopen
+    /// rather than triggering a descriptor scan on every paint frame.
+    pub(crate) fn request_image_hydration<I>(&mut self, resource_ids: I) -> bool
+    where
+        I: IntoIterator<Item = String>,
+    {
+        // Keep at most one not-yet-started request. A render can run many
+        // times while a slow first descriptor is active; retaining every
+        // historical viewport would eventually stream an entire long note
+        // after one quick scroll. The active request is allowed to finish,
+        // while this slot always represents the newest resident/preload set.
+        let next = resource_ids.into_iter().find(|resource_id| {
+            let still_present = self.document.blocks().iter().any(|block| {
+                matches!(
+                    &block.content,
+                    BlockContent::Image { resource_id: candidate, .. }
+                        if candidate == resource_id
+                )
+            });
+            still_present
+                && !self.materialized_image_ids.contains(resource_id)
+                && !self.active_image_hydration.contains(resource_id)
+                && !self.failed_image_hydration.contains(resource_id)
+        });
+        let previous = self.pending_image_hydration.clone();
+        self.pending_image_hydration.clear();
+        if let Some(resource_id) = next {
+            self.pending_image_hydration.insert(resource_id);
+        }
+        self.pending_image_hydration != previous
+    }
+
+    /// Drain renderer-demanded IDs in document order. `active` prevents a
+    /// second paint before completion from starting another verified read for
+    /// the same resource.
+    pub(crate) fn take_pending_image_hydration_requests(&mut self) -> Vec<String> {
+        let Some(resource_id) = self.pending_image_hydration.drain().next() else {
+            return Vec::new();
+        };
+        let still_present = self.document.blocks().iter().any(|block| {
+            matches!(
+                &block.content,
+                BlockContent::Image { resource_id: candidate, .. }
+                    if candidate == &resource_id
+            )
+        });
+        if !still_present {
+            return Vec::new();
+        }
+        self.active_image_hydration.insert(resource_id.clone());
+        vec![resource_id]
+    }
+
+    /// Complete the worker handoff without mutating semantic document state.
+    /// The source registration happens separately after a successful worker;
+    /// failure keeps the atom a stable visible placeholder.
+    pub(crate) fn finish_image_hydration_request(&mut self, resource_id: &str, success: bool) {
+        self.active_image_hydration.remove(resource_id);
+        if success {
+            self.failed_image_hydration.remove(resource_id);
+        } else {
+            self.failed_image_hydration.insert(resource_id.to_owned());
+        }
+    }
+
+    pub fn attachment_metadata(&self, resource_id: &str) -> Option<&AttachmentMetadata> {
+        self.attachment_metadata.get(resource_id)
+    }
+
+    /// Register durable metadata only. Unlike images, attachments do not
+    /// pre-copy or decode their bytes during note mount; opening one is an
+    /// explicit, descriptor-safe operation owned by `NoteSession`.
+    pub fn register_attachment(
+        &mut self,
+        resource_id: &str,
+        size: u64,
+    ) -> Result<(), DocumentError> {
+        if resource_id.is_empty() {
+            return Err(DocumentError::InvalidOperation(
+                "an attachment resource id cannot be empty".into(),
+            ));
+        }
+        self.attachment_metadata.insert(
+            resource_id.to_owned(),
+            AttachmentMetadata::ready(resource_id, size),
+        );
+        Ok(())
+    }
+
+    pub fn register_unavailable_attachment(
+        &mut self,
+        resource_id: &str,
+    ) -> Result<(), DocumentError> {
+        if resource_id.is_empty() {
+            return Err(DocumentError::InvalidOperation(
+                "an attachment resource id cannot be empty".into(),
+            ));
+        }
+        self.attachment_metadata.insert(
+            resource_id.to_owned(),
+            AttachmentMetadata::unavailable(resource_id),
+        );
+        Ok(())
     }
 
     pub fn mark_image_loaded(&mut self, resource_id: &str) -> bool {
@@ -579,7 +1071,7 @@ impl EditorCore {
 
     pub fn set_caret_utf8(&mut self, offset: usize) {
         if let Some(block) = self.document.block(self.selection.head.node_id)
-            && block.kind == BlockKind::Image
+            && is_atomic_block_kind(&block.kind)
         {
             self.selection = Selection::caret(DocPoint::with_affinity(
                 block.id,
@@ -730,9 +1222,11 @@ impl EditorCore {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.image_store.remove_resource(&resource_id);
+                self.materialized_image_ids.remove(&resource_id);
                 return Err(error);
             }
         };
+        self.materialized_image_ids.insert(resource_id);
         self.selection = outcome.selection;
         Ok(())
     }
@@ -773,10 +1267,173 @@ impl EditorCore {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.image_store.remove_resource(&resource_id);
+                self.materialized_image_ids.remove(&resource_id);
                 return Err(error);
             }
         };
+        self.materialized_image_ids.insert(resource_id);
         self.selection = outcome.selection;
+        Ok(())
+    }
+
+    /// Attach a successfully committed repository image to this editor's
+    /// cache source. The document transaction itself is deliberately separate
+    /// and already durable at this point; this method stores no compressed
+    /// blob in `EditorCore` after success.
+    pub fn register_durable_image(
+        &mut self,
+        resource_id: &str,
+        natural_size: (u32, u32),
+        bytes: &[u8],
+        format: ImageFormat,
+    ) -> Result<(), DocumentError> {
+        self.register_durable_image_reader(
+            resource_id,
+            natural_size,
+            std::io::Cursor::new(bytes),
+            format,
+        )
+    }
+
+    /// Attach a durable repository image from a verified stream. This is the
+    /// library-session path: only the current image is copied into the
+    /// session-private cache source, rather than retaining every persisted
+    /// source byte in the prepared session.
+    pub fn register_durable_image_reader<R: std::io::Read>(
+        &mut self,
+        resource_id: &str,
+        natural_size: (u32, u32),
+        reader: R,
+        format: ImageFormat,
+    ) -> Result<(), DocumentError> {
+        if natural_size.0 == 0 || natural_size.1 == 0 {
+            return Err(DocumentError::InvalidOperation(
+                "a durable image requires non-zero dimensions".into(),
+            ));
+        }
+        self.image_store
+            .insert_durable_reader(
+                ImageMetadata::new(resource_id, natural_size.0, natural_size.1),
+                reader,
+                format,
+            )
+            .map_err(|error| {
+                DocumentError::InvalidOperation(format!(
+                    "unable to materialize durable image cache source: {error}"
+                ))
+            })?;
+        self.materialized_image_ids.insert(resource_id.to_owned());
+        Ok(())
+    }
+
+    /// Return this editor's session-private destination for a background
+    /// durable image materialization. The path is never exposed to UI code or
+    /// a caller-controlled resource; only `ImageStore` validates and adopts
+    /// the matching managed filename after the worker returns.
+    pub(crate) fn image_materialization_root(&self) -> PathBuf {
+        self.image_store.materialization_root()
+    }
+
+    /// Adopt a source that the resource worker already streamed, synced and
+    /// atomically renamed inside this exact editor's private cache directory.
+    /// No bytes are reread or copied on the GPUI callback.
+    pub(crate) fn register_materialized_durable_image(
+        &mut self,
+        resource_id: &str,
+        natural_size: (u32, u32),
+        source: PathBuf,
+        format: ImageFormat,
+    ) -> Result<(), DocumentError> {
+        if natural_size.0 == 0 || natural_size.1 == 0 {
+            return Err(DocumentError::InvalidOperation(
+                "a durable image requires non-zero dimensions".into(),
+            ));
+        }
+        self.image_store
+            .register_materialized_durable_source(
+                ImageMetadata::new(resource_id, natural_size.0, natural_size.1),
+                source,
+                format,
+            )
+            .map_err(|error| {
+                DocumentError::InvalidOperation(format!(
+                    "unable to register durable image cache source: {error}"
+                ))
+            })?;
+        self.pending_image_hydration.remove(resource_id);
+        self.active_image_hydration.remove(resource_id);
+        self.failed_image_hydration.remove(resource_id);
+        self.materialized_image_ids.insert(resource_id.to_owned());
+        Ok(())
+    }
+
+    /// Repair first-frame geometry for legacy image HTML only. This bypasses
+    /// `History` intentionally: a resource loader must not manufacture a
+    /// user undo step, yet the model revision/layout invalidation must still
+    /// be real so `NoteSession` captures and persists the repaired geometry.
+    pub(crate) fn repair_legacy_image_natural_sizes(
+        &mut self,
+        resource_id: &str,
+        node_ids: &[NodeId],
+        natural_size: (u32, u32),
+    ) -> Result<bool, DocumentError> {
+        if natural_size.0 == 0 || natural_size.1 == 0 {
+            return Err(DocumentError::InvalidOperation(
+                "legacy image natural size must be positive".into(),
+            ));
+        }
+        let transactions = node_ids
+            .iter()
+            .copied()
+            .filter(|node_id| {
+                matches!(
+                    self.document.block(*node_id).map(|block| &block.content),
+                    Some(BlockContent::Image { resource_id: candidate, .. })
+                        if candidate == resource_id
+                )
+            })
+            .map(|node_id| Transaction::SetImageNaturalSize {
+                node_id,
+                natural_size,
+            })
+            .collect::<Vec<_>>();
+        if transactions.is_empty() {
+            return Ok(false);
+        }
+        let outcome = self.document.apply_batch(TransactionBatch(transactions))?;
+        if outcome.changed_nodes.is_empty() {
+            return Ok(false);
+        }
+        self.layout.invalidate_nodes_with_delta(
+            &self.document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        Ok(true)
+    }
+
+    /// Keep a canonical image atom in the live document when this device
+    /// cannot hydrate its blob. The failed node has real selection/layout
+    /// geometry and the renderer paints an explicit unavailable state instead
+    /// of forcing the entire note through the unsupported-document route.
+    pub fn register_unavailable_image(
+        &mut self,
+        resource_id: &str,
+        natural_size: (u32, u32),
+    ) -> Result<(), DocumentError> {
+        if natural_size.0 == 0 || natural_size.1 == 0 {
+            return Err(DocumentError::InvalidOperation(
+                "an unavailable image requires non-zero fallback dimensions".into(),
+            ));
+        }
+        self.image_store.insert_unavailable(ImageMetadata::new(
+            resource_id,
+            natural_size.0,
+            natural_size.1,
+        ));
+        self.materialized_image_ids.remove(resource_id);
         Ok(())
     }
 
@@ -790,9 +1447,16 @@ impl EditorCore {
 
     pub fn apply(&mut self, transaction: Transaction) -> Result<ApplyOutcome, DocumentError> {
         self.ensure_editable()?;
+        #[cfg(test)]
+        if let Some(error) = self.next_apply_error_for_test.take() {
+            return Err(error);
+        }
+        let resource_anchor_mapping =
+            self.resource_anchor_replacement_for_transaction(&transaction);
         let outcome =
             self.history
                 .apply_with_selection(&mut self.document, self.selection, transaction)?;
+        self.apply_resource_anchor_replacement(resource_anchor_mapping);
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
@@ -806,14 +1470,72 @@ impl EditorCore {
         Ok(outcome)
     }
 
+    /// Produce the exact post-transaction document/history before a resource
+    /// association is allowed to commit. This intentionally clones only for
+    /// the infrequent cross-store resource boundary; ordinary typing keeps
+    /// the existing in-place history path.
+    pub(crate) fn prepare_durable_transaction(
+        &self,
+        transaction: Transaction,
+    ) -> Result<PreparedEditorCommit, DocumentError> {
+        self.ensure_editable()?;
+        let mut document = self.document.clone();
+        let mut history = self.history.clone();
+        let resource_anchor_mapping =
+            self.resource_anchor_replacement_for_transaction(&transaction);
+        let outcome = history.apply_with_selection(&mut document, self.selection, transaction)?;
+        Ok(PreparedEditorCommit {
+            document,
+            history,
+            outcome,
+            resource_anchor_mapping,
+        })
+    }
+
+    /// Install a [`PreparedEditorCommit`] after the matching SQLite snapshot
+    /// has succeeded. All fallible model/history work happened in
+    /// `prepare_durable_transaction`, making this a non-fallible swap while
+    /// preserving the exact undo entry, selection, and localized layout
+    /// invalidation that an in-place `apply` would have produced.
+    pub(crate) fn install_prepared_durable_commit(&mut self, prepared: PreparedEditorCommit) {
+        let PreparedEditorCommit {
+            document,
+            history,
+            outcome,
+            resource_anchor_mapping,
+        } = prepared;
+        self.document = document;
+        self.history = history;
+        self.apply_resource_anchor_replacement(resource_anchor_mapping);
+        self.selection = outcome.selection;
+        self.preferred_x = None;
+        self.clear_composition();
+        self.last_input_error = None;
+        self.layout.invalidate_nodes_with_delta(
+            &self.document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_apply_for_test(&mut self, error: DocumentError) {
+        self.next_apply_error_for_test = Some(error);
+    }
+
     fn apply_with_selection(
         &mut self,
         transaction: Transaction,
     ) -> Result<ApplyOutcome, DocumentError> {
         self.ensure_editable()?;
+        let resource_anchor_mapping =
+            self.resource_anchor_replacement_for_transaction(&transaction);
         let outcome =
             self.history
                 .apply_with_selection(&mut self.document, self.selection, transaction)?;
+        self.apply_resource_anchor_replacement(resource_anchor_mapping);
         self.preferred_x = None;
         self.layout.invalidate_nodes_with_delta(
             &self.document,
@@ -825,9 +1547,34 @@ impl EditorCore {
         Ok(outcome)
     }
 
+    /// The few editor commands that deliberately group several model
+    /// operations into one undo entry still map outstanding resource intents
+    /// once around the atomic batch. This keeps structural merge/split and
+    /// list-boundary shortcuts on the same tracked-selection contract as the
+    /// ordinary one-transaction paths.
+    fn apply_batch_with_selection(
+        &mut self,
+        before_selection: Selection,
+        batch: TransactionBatch,
+    ) -> Result<ApplyOutcome, DocumentError> {
+        self.ensure_editable()?;
+        let resource_anchor_mapping = self.resource_anchor_replacement_for_batch(&batch);
+        let outcome =
+            self.history
+                .apply_batch_with_selection(&mut self.document, before_selection, batch)?;
+        self.apply_resource_anchor_replacement(resource_anchor_mapping);
+        Ok(outcome)
+    }
+
     pub fn undo(&mut self) -> Result<(), DocumentError> {
         self.ensure_editable()?;
+        let resource_anchor_mapping = self
+            .history
+            .next_undo_batch_for_mapping()
+            .as_ref()
+            .and_then(|batch| self.resource_anchor_replacement_for_batch(batch));
         let outcome = self.history.undo_with_outcome(&mut self.document)?;
+        self.apply_resource_anchor_replacement(resource_anchor_mapping);
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
@@ -843,7 +1590,13 @@ impl EditorCore {
 
     pub fn redo(&mut self) -> Result<(), DocumentError> {
         self.ensure_editable()?;
+        let resource_anchor_mapping = self
+            .history
+            .next_redo_batch_for_mapping()
+            .as_ref()
+            .and_then(|batch| self.resource_anchor_replacement_for_batch(batch));
         let outcome = self.history.redo_with_outcome(&mut self.document)?;
+        self.apply_resource_anchor_replacement(resource_anchor_mapping);
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
@@ -896,6 +1649,8 @@ impl EditorCore {
             let history_before_selection = self.composition_base.unwrap_or(visible_selection);
             let replacement_text = new_text.to_owned();
             let mut actual_base_range = None;
+            let resource_anchor_mapping =
+                self.resource_anchor_replacement_for_range(marked_range.clone());
             let outcome = self.history.replace_last_with(
                 &mut self.document,
                 history_before_selection,
@@ -913,6 +1668,7 @@ impl EditorCore {
                     })
                 },
             )?;
+            self.apply_resource_anchor_replacement(resource_anchor_mapping);
             self.selection = outcome.selection;
             self.preferred_x = None;
             self.layout.invalidate_nodes_with_delta(
@@ -1035,7 +1791,10 @@ impl EditorCore {
         });
 
         if text.is_empty() {
+            let resource_anchor_mapping =
+                self.resource_anchor_replacement_for_range(marked_range.clone());
             let outcome = self.history.undo_with_outcome(&mut self.document)?;
+            self.apply_resource_anchor_replacement(resource_anchor_mapping);
             self.selection = outcome.selection;
             self.preferred_x = None;
             self.layout.invalidate_nodes_with_delta(
@@ -1051,6 +1810,8 @@ impl EditorCore {
 
         let history_before_selection = self.composition_base.unwrap_or(marked_selection);
         let replacement_text = text.to_owned();
+        let resource_anchor_mapping =
+            self.resource_anchor_replacement_for_range(marked_range.clone());
         let outcome = self.history.replace_last_with(
             &mut self.document,
             history_before_selection,
@@ -1067,6 +1828,7 @@ impl EditorCore {
                 })
             },
         )?;
+        self.apply_resource_anchor_replacement(resource_anchor_mapping);
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.layout.invalidate_nodes_with_delta(
@@ -1153,7 +1915,7 @@ impl EditorCore {
         let Some(index) = self.block_index(point.node_id) else {
             return;
         };
-        let next = if self.document.blocks()[index].kind == BlockKind::Image {
+        let next = if is_atomic_block_kind(&self.document.blocks()[index].kind) {
             if point.affinity == Affinity::After {
                 DocPoint::with_affinity(point.node_id, 0, Affinity::Before)
             } else {
@@ -1186,7 +1948,7 @@ impl EditorCore {
             return;
         };
         let block = &self.document.blocks()[index];
-        let next = if block.kind == BlockKind::Image {
+        let next = if is_atomic_block_kind(&block.kind) {
             if point.affinity == Affinity::Before {
                 DocPoint::with_affinity(point.node_id, 0, Affinity::After)
             } else {
@@ -1217,7 +1979,7 @@ impl EditorCore {
         if let Some(boundary) = self.layout.visual_line_boundary(point, false) {
             self.selection = Selection::caret(self.snap_layout_point(boundary));
         } else if let Some(block) = self.document.block(point.node_id) {
-            if block.kind == BlockKind::Image {
+            if is_atomic_block_kind(&block.kind) {
                 self.selection =
                     Selection::caret(DocPoint::with_affinity(block.id, 0, Affinity::Before));
             } else if let Some(text) = block.content.as_text() {
@@ -1240,7 +2002,7 @@ impl EditorCore {
         if let Some(boundary) = self.layout.visual_line_boundary(point, true) {
             self.selection = Selection::caret(self.snap_layout_point(boundary));
         } else if let Some(block) = self.document.block(point.node_id) {
-            if block.kind == BlockKind::Image {
+            if is_atomic_block_kind(&block.kind) {
                 self.selection =
                     Selection::caret(DocPoint::with_affinity(block.id, 0, Affinity::After));
             } else if let Some(text) = block.content.as_text() {
@@ -1513,7 +2275,7 @@ impl EditorCore {
         let Some(index) = self.block_index(point.node_id) else {
             return Err(DocumentError::NodeNotFound(point.node_id));
         };
-        let at = if self.document.blocks()[index].kind == BlockKind::Image {
+        let at = if is_atomic_block_kind(&self.document.blocks()[index].kind) {
             if point.affinity == Affinity::Before {
                 self.previous_text_point(index)
             } else {
@@ -1527,11 +2289,7 @@ impl EditorCore {
             transactions.push(Transaction::DeleteRange { selection });
         }
         transactions.push(Transaction::SplitBlock { at });
-        let outcome = self.history.apply_batch_with_selection(
-            &mut self.document,
-            selection,
-            TransactionBatch(transactions),
-        )?;
+        let outcome = self.apply_batch_with_selection(selection, TransactionBatch(transactions))?;
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
@@ -1545,6 +2303,169 @@ impl EditorCore {
         Ok(())
     }
 
+    /// Materialize a paragraph at the currently selected atomic seam before
+    /// input arrives. `EditorSurface` calls this only for a gap/below-tail
+    /// pointer hit; a regular click on an image or attachment remains an
+    /// atomic selection for resource interaction.
+    pub(crate) fn activate_atomic_dead_zone(&mut self) -> Result<bool, DocumentError> {
+        let outcome = self.apply(Transaction::EnsureParagraph {
+            selection: self.selection,
+        })?;
+        Ok(!outcome.changed_nodes.is_empty())
+    }
+
+    /// Select an image or attachment as one structural atom. This mirrors the
+    /// donor's NodeSelection behavior: a click inside rendered resource
+    /// content never fabricates a text caret; Delete/Backspace can therefore
+    /// delete the selected resource through the ordinary range path.
+    pub(crate) fn select_atomic_at(&mut self, position: Point<Pixels>) -> Option<AtomicBlockHit> {
+        let node_id = self.layout.atomic_block_at(position)?;
+        let index = self.block_index(node_id)?;
+        let hit = match &self.document.blocks()[index].content {
+            BlockContent::Image { .. } => AtomicBlockHit::Image,
+            BlockContent::Attachment { resource_id, .. } => AtomicBlockHit::Attachment {
+                resource_id: resource_id.clone(),
+            },
+            _ => return None,
+        };
+        self.selection = self.full_block_selection(index);
+        self.preferred_x = None;
+        self.clear_composition();
+        Some(hit)
+    }
+
+    /// Revert a resource atom whose optimistic cross-store commit failed
+    /// without restoring an old whole-document snapshot over later input.
+    ///
+    /// `InsertImage`/`InsertAttachment` can replace a real text selection,
+    /// so deleting the atom by node id would permanently discard that text.
+    /// Instead we find the exact history entry for this staged resource,
+    /// temporarily undo newer input, undo and discard the failed insertion,
+    /// then redo the newer input.  All operations remain localized history
+    /// transactions; the exceptional recovery path may clone once only to
+    /// restore the live state if a later operation cannot be replayed.
+    /// `Ok(false)` means the caller must retain the staged resource as a
+    /// visible retryable item rather than risk losing a person's edits.
+    pub(crate) fn rollback_failed_optimistic_resource(
+        &mut self,
+        resource_id: &str,
+    ) -> Result<bool, DocumentError> {
+        self.ensure_editable()?;
+        let resource_is_live = self.document.blocks().iter().any(|block| {
+            matches!(
+                &block.content,
+                BlockContent::Image { resource_id: id, .. }
+                    | BlockContent::Attachment { resource_id: id, .. }
+                    if id == resource_id
+            )
+        });
+        if !resource_is_live {
+            // A person may already have undone/deleted the atom before its
+            // background worker reports. Never leave its redo entry capable
+            // of recreating a resource that SQLite rejected.
+            self.history.discard_redo();
+            self.image_store.remove_resource(resource_id);
+            self.materialized_image_ids.remove(resource_id);
+            self.attachment_metadata.remove(resource_id);
+            return Ok(true);
+        }
+        let Some(resource_depth) = self.history.undo_depth_for_resource_insert(resource_id) else {
+            // The bounded history may have evicted a very old insertion while
+            // a worker was stalled. Keep the staged source retryable instead
+            // of approximating a destructive inverse from a raw point.
+            return Ok(false);
+        };
+        let later_entries = self.history.undo_depth().saturating_sub(resource_depth);
+        let later_forwards = self.history.forward_entries_after_depth(resource_depth);
+        let saved_document = self.document.clone();
+        let saved_history = self.history.clone();
+        let saved_selection = self.selection;
+        let saved_preferred_x = self.preferred_x;
+        let replay = (|| -> Result<Selection, DocumentError> {
+            for _ in 0..later_entries {
+                self.history.undo_with_outcome(&mut self.document)?;
+            }
+            // This inverse restores every original selected block/span, not
+            // merely the image node, which is essential for paste-over-text.
+            let mut selection = self
+                .history
+                .undo_with_outcome(&mut self.document)?
+                .selection;
+            // `undo_with_outcome` transforms entries into redo-local inverse
+            // batches. Those ranges refer to the resource-expanded document
+            // and cannot simply be redone after its inverse. Drop that redo
+            // suffix and replay the saved original transactions against the
+            // restored text, one normal history entry at a time.
+            self.history.discard_redo();
+            for (before_selection, forward) in later_forwards {
+                let before_selection =
+                    self.rebase_history_before_selection(before_selection, &forward)?;
+                selection = self
+                    .history
+                    .apply_batch_with_selection(&mut self.document, before_selection, forward)?
+                    .selection;
+            }
+            Ok(selection)
+        })();
+        let selection = match replay {
+            Ok(selection) => selection,
+            Err(_) => {
+                self.document = saved_document;
+                self.history = saved_history;
+                self.selection = saved_selection;
+                self.preferred_x = saved_preferred_x;
+                return Ok(false);
+            }
+        };
+        self.selection = selection;
+        self.preferred_x = None;
+        self.clear_composition();
+        // Replaying a compact history suffix has several intermediate
+        // structural deltas. The exceptional path trades a single cache
+        // rebuild for correctness instead of feeding stale intermediate
+        // splice coordinates into the retained layout index.
+        self.layout.clear_exact_cache();
+        if !self.document.blocks().iter().any(|block| {
+            matches!(
+                &block.content,
+                BlockContent::Image { resource_id: id, .. }
+                    | BlockContent::Attachment { resource_id: id, .. }
+                    if id == resource_id
+            )
+        }) {
+            self.image_store.remove_resource(resource_id);
+            self.materialized_image_ids.remove(resource_id);
+            self.attachment_metadata.remove(resource_id);
+        }
+        Ok(true)
+    }
+
+    /// Map a history entry's old editor selection through a removed resource
+    /// insertion. A normal text transaction carries its own exact selection;
+    /// use that as the transaction-mapped replacement when the history
+    /// bookkeeping selection pointed at a split-right node that the inverse
+    /// has intentionally removed. Structural transactions without a valid
+    /// mapped selection fail closed into NoteSession's staged-retry path.
+    fn rebase_history_before_selection(
+        &self,
+        before_selection: Selection,
+        forward: &TransactionBatch,
+    ) -> Result<Selection, DocumentError> {
+        if self.document.validate_selection(before_selection).is_ok() {
+            return Ok(before_selection);
+        }
+        forward
+            .0
+            .iter()
+            .find_map(Transaction::selection_hint)
+            .filter(|selection| self.document.validate_selection(*selection).is_ok())
+            .ok_or_else(|| {
+                DocumentError::InvalidOperation(
+                    "later edit cannot be safely mapped around failed resource insertion".into(),
+                )
+            })
+    }
+
     pub fn backspace(&mut self) -> Result<(), DocumentError> {
         self.ensure_editable()?;
         if !self.selection.is_caret() {
@@ -1554,7 +2475,7 @@ impl EditorCore {
         let Some(index) = self.block_index(point.node_id) else {
             return Ok(());
         };
-        if self.document.blocks()[index].kind == BlockKind::Image {
+        if is_atomic_block_kind(&self.document.blocks()[index].kind) {
             if point.affinity == Affinity::After {
                 let outcome = self.apply_with_selection(Transaction::RemoveNode {
                     node_id: point.node_id,
@@ -1598,11 +2519,8 @@ impl EditorCore {
                         alignment: TextAlignment::Left,
                     });
                 }
-                let outcome = self.history.apply_batch_with_selection(
-                    &mut self.document,
-                    self.selection,
-                    TransactionBatch(transactions),
-                )?;
+                let outcome = self
+                    .apply_batch_with_selection(self.selection, TransactionBatch(transactions))?;
                 self.selection = outcome.selection;
                 self.preferred_x = None;
                 self.clear_composition();
@@ -1618,7 +2536,7 @@ impl EditorCore {
             }
             return Ok(());
         } else if let Some(previous) = self.document.blocks().get(index - 1) {
-            if previous.kind == BlockKind::Image {
+            if is_atomic_block_kind(&previous.kind) {
                 let outcome = self.apply_with_selection(Transaction::RemoveNode {
                     node_id: previous.id,
                 })?;
@@ -1640,8 +2558,7 @@ impl EditorCore {
                             alignment: TextAlignment::Left,
                         });
                     }
-                    let outcome = self.history.apply_batch_with_selection(
-                        &mut self.document,
+                    let outcome = self.apply_batch_with_selection(
                         self.selection,
                         TransactionBatch(transactions),
                     )?;
@@ -1674,8 +2591,7 @@ impl EditorCore {
                         left: previous.id,
                         right: point.node_id,
                     });
-                    let outcome = self.history.apply_batch_with_selection(
-                        &mut self.document,
+                    let outcome = self.apply_batch_with_selection(
                         self.selection,
                         TransactionBatch(transactions),
                     )?;
@@ -1704,7 +2620,7 @@ impl EditorCore {
         let Some(index) = self.block_index(point.node_id) else {
             return Ok(());
         };
-        if self.document.blocks()[index].kind == BlockKind::Image {
+        if is_atomic_block_kind(&self.document.blocks()[index].kind) {
             if point.affinity == Affinity::Before {
                 let outcome = self.apply_with_selection(Transaction::RemoveNode {
                     node_id: point.node_id,
@@ -1727,7 +2643,7 @@ impl EditorCore {
             let outcome = self.apply_with_selection(Transaction::DeleteRange { selection })?;
             self.selection = outcome.selection;
         } else if let Some(next) = self.document.blocks().get(index + 1) {
-            if next.kind == BlockKind::Image {
+            if is_atomic_block_kind(&next.kind) {
                 let outcome =
                     self.apply_with_selection(Transaction::RemoveNode { node_id: next.id })?;
                 self.selection = outcome.selection;
@@ -1752,11 +2668,8 @@ impl EditorCore {
                     left: point.node_id,
                     right: next.id,
                 });
-                let outcome = self.history.apply_batch_with_selection(
-                    &mut self.document,
-                    self.selection,
-                    TransactionBatch(transactions),
-                )?;
+                let outcome = self
+                    .apply_batch_with_selection(self.selection, TransactionBatch(transactions))?;
                 self.selection = outcome.selection;
                 self.preferred_x = None;
                 self.clear_composition();
@@ -1930,7 +2843,7 @@ impl EditorCore {
         self.document
             .previous_navigation_block(current.id)
             .map(|candidate| {
-                if candidate.kind == BlockKind::Image {
+                if is_atomic_block_kind(&candidate.kind) {
                     DocPoint::with_affinity(candidate.id, 0, Affinity::After)
                 } else {
                     DocPoint::with_affinity(
@@ -2051,6 +2964,30 @@ fn flat_offset_for_point_in(document: &Document, point: DocPoint) -> usize {
     document
         .flat_offset_for_point(point)
         .unwrap_or_else(|| document.flat_utf8_len())
+}
+
+/// Map one side of a tracked selection through an explicit replacement. The
+/// affinity rule is the same one used for IME candidate remapping: a `Before`
+/// endpoint stays at the beginning of a replacement, while an `After`
+/// endpoint stays after its inserted content. This preserves range direction
+/// and makes a picker selection behave like the original editor selection.
+fn map_resource_anchor_offset(
+    offset: usize,
+    affinity: Affinity,
+    range: Range<usize>,
+    inserted_len: usize,
+) -> usize {
+    if offset < range.start || (offset == range.start && affinity == Affinity::Before) {
+        offset
+    } else if offset > range.end || (offset == range.end && affinity == Affinity::After) {
+        offset
+            .saturating_sub(range.end.saturating_sub(range.start))
+            .saturating_add(inserted_len)
+    } else if affinity == Affinity::Before {
+        range.start
+    } else {
+        range.start.saturating_add(inserted_len)
+    }
 }
 
 fn remap_candidate_selection_after_inverse(
@@ -2269,6 +3206,13 @@ impl EntityInputHandler for EditorCore {
                 .utf8_to_utf16_offset(self.flat_offset_for_point(point)),
         )
     }
+}
+
+/// Image and attachment blocks both occupy one document coordinate.  Keeping
+/// this predicate at the editor boundary prevents a rendered attachment card
+/// from accidentally becoming a text-like, uneditable dead zone.
+fn is_atomic_block_kind(kind: &BlockKind) -> bool {
+    matches!(kind, BlockKind::Image | BlockKind::Attachment)
 }
 
 fn block_points(block: &Block) -> (DocPoint, DocPoint) {

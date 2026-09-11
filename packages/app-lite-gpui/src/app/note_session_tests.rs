@@ -7,6 +7,8 @@
 
 use super::note_session::NoteSession;
 use super::save_coordinator::{FlushReason, ManualSaveClock, SaveState};
+use crate::native_editor::images::ResourceImport;
+use crate::native_editor::model::{Affinity, BlockContent, DocPoint, DocumentError};
 use app_lite_core::document::{Block, BlockStyle, Inline, Marks};
 use app_lite_core::{
     CanonicalDocument, CreateNote, EditJournalEntry, LibraryError, LibraryRepository, Note,
@@ -14,7 +16,10 @@ use app_lite_core::{
 };
 use gpui::{AppContext, EntityInputHandler};
 use rusqlite::Connection;
+use serde_json::json;
+use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 fn repository() -> (tempfile::TempDir, Arc<LibraryRepository>) {
@@ -51,6 +56,15 @@ fn create(repository: &LibraryRepository, title: &str, document: CanonicalDocume
         .expect("create note")
 }
 
+fn structural_png(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([0x2d, 0x86, 0x5f, 0xff]));
+    let mut encoded = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("encode structural PNG fixture");
+    encoded.into_inner()
+}
+
 fn session(
     note: Note,
     repository: Arc<LibraryRepository>,
@@ -60,6 +74,43 @@ fn session(
     cx.new(|session_cx| {
         NoteSession::open(note, repository, clock, session_cx).expect("open native note session")
     })
+}
+
+/// Produces the full-replacement shape of a hostile/reordered v2 checkpoint.
+/// Production creates deltas through `JournalPayload`; recovery must still
+/// validate this equivalent wire object because SQLite can retain corruption
+/// from a crashed or older process.
+fn replace_all_recovery_payload(
+    note: &Note,
+    writer_token: &str,
+    generation: i64,
+    document: &CanonicalDocument,
+) -> String {
+    let body_html = document.to_canonical_html().as_str().to_owned();
+    let resource_ids = document
+        .resource_ids()
+        .into_iter()
+        .map(|resource_id| resource_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    serde_json::to_string(&json!({
+        "version": 2,
+        "note_id": note.id.as_str(),
+        "expected_revision": note.revision,
+        "writer_token": writer_token,
+        "generation": generation,
+        "title": {
+            "start_byte": 0,
+            "remove_bytes": 0,
+            "insert": "",
+        },
+        "body": {
+            "start_byte": 0,
+            "remove_bytes": note.body_html.len(),
+            "insert": body_html,
+        },
+        "resource_ids": resource_ids,
+    }))
+    .expect("serialize complete recovery payload")
 }
 
 fn append_title_via_entity_input(
@@ -97,6 +148,112 @@ fn append_body_via_entity_input(
     });
 }
 
+#[gpui::test]
+async fn resource_insert_intent_rejects_a_note_identity_mismatch(cx: &mut gpui::TestAppContext) {
+    // A picker can return after a rapid note switch. The saved target must
+    // carry the originating NoteId rather than allowing its old DocPoint to
+    // be reinterpreted in the newly mounted document.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let first_note = create(&repository, "来源", rich_document("first"));
+    let second_note = create(&repository, "目标", rich_document("second"));
+    let clock = Arc::new(ManualSaveClock::default());
+    let first = session(first_note, Arc::clone(&repository), Arc::clone(&clock), cx);
+    let second = session(second_note.clone(), Arc::clone(&repository), clock, cx);
+    let intent = first
+        .update(cx, |session, session_cx| {
+            session.capture_resource_insert_intent(session_cx)
+        })
+        .expect("capture source note intent");
+    let import = ResourceImport::from_bytes(
+        b"%PDF-1.7\nidentity fixture\n%%EOF\n".to_vec(),
+        "跨笔记.pdf",
+        "application/pdf",
+        "pdf",
+    )
+    .expect("attachment fixture");
+    let error = match second.update(cx, |session, session_cx| {
+        session.insert_resource(import, intent, session_cx)
+    }) {
+        Ok(_) => panic!("a saved intent cannot cross into another note"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("不属于当前笔记"));
+    let durable = repository
+        .load_note(&second_note.id)
+        .expect("load second note")
+        .expect("second note remains");
+    assert!(durable.resource_ids.is_empty());
+    assert_eq!(durable.body_html, second_note.body_html);
+}
+
+#[gpui::test]
+async fn durable_resource_commit_swaps_prevalidated_editor_when_legacy_apply_would_fail(
+    cx: &mut gpui::TestAppContext,
+) {
+    // The old implementation called `editor.apply` after SQLite had already
+    // committed. This fault is consumed only by that legacy path: the
+    // resource must still leave DB and retained editor at the same revision.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let note = create(&repository, "原子资源", rich_document("正文"));
+    let clock = Arc::new(ManualSaveClock::default());
+    let session = session(note.clone(), Arc::clone(&repository), clock, cx);
+    let intent = session
+        .update(cx, |session, session_cx| {
+            session.capture_resource_insert_intent(session_cx)
+        })
+        .expect("capture durable attachment intent");
+    session.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, _| {
+            editor.fail_next_apply_for_test(DocumentError::InvalidOperation(
+                "legacy post-commit apply must not run".into(),
+            ));
+        });
+    });
+    let import = ResourceImport::from_bytes(
+        b"%PDF-1.7\natomic fixture\n%%EOF\n".to_vec(),
+        "原子证据.pdf",
+        "application/pdf",
+        "pdf",
+    )
+    .expect("valid attachment import");
+    let inserted = session
+        .update(cx, |session, session_cx| {
+            session.insert_resource(import, intent, session_cx)
+        })
+        .expect("prevalidated durable swap must not replay legacy apply");
+    let saved = repository
+        .load_note(&note.id)
+        .expect("load durable note")
+        .expect("note exists");
+    assert_eq!(saved.revision, inserted.note.revision);
+    assert_eq!(saved.resource_ids, vec![inserted.resource_id.clone()]);
+    let (body_resource, attachment_size, history_depth) = session.read_with(cx, |session, app| {
+        let editor = session.editor().read(app);
+        let resource = editor
+            .document()
+            .blocks()
+            .iter()
+            .find_map(|block| match &block.content {
+                BlockContent::Attachment { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            });
+        let size = resource.as_deref().and_then(|id| {
+            editor
+                .attachment_metadata(id)
+                .map(|metadata| metadata.size())
+        });
+        (resource, size, editor.undo_depth())
+    });
+    assert_eq!(
+        body_resource.as_deref(),
+        Some(inserted.resource_id.as_str())
+    );
+    assert_eq!(attachment_size, Some(30));
+    assert!(history_depth > 0, "swap preserves the inserted undo entry");
+}
+
 fn poll_and_drain(session: &gpui::Entity<NoteSession>, cx: &mut gpui::VisualTestContext) {
     session.update(cx, |session, session_cx| {
         session
@@ -122,6 +279,869 @@ fn flush_until_clean(
                 .expect("completion-confirmed lifecycle flush")
         });
     }
+}
+
+#[gpui::test]
+async fn deleting_a_persisted_image_then_undo_redo_journals_and_compacts_the_current_relation_set(
+    cx: &mut gpui::TestAppContext,
+) {
+    // The durable relation vector belongs to the immutable document snapshot,
+    // not to the session's opening note.  Removing a saved image through the
+    // actual editor Backspace path, then undoing and redoing it, must leave a
+    // crash journal that can recover the deletion and a later snapshot that
+    // removes the obsolete note_resources row and card thumbnail.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_resource(
+            &crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+                .images
+                .into_iter()
+                .next()
+                .expect("PNG fixture")
+                .bytes,
+            "已保存图片.png",
+            "image/png",
+            "png",
+        )
+        .expect("persist starting image");
+    let note = create(
+        &repository,
+        "删除持久图片",
+        CanonicalDocument::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "图片前".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Image {
+                resource_id: image.clone(),
+                alt: "要删除的图片".into(),
+                presentation: Default::default(),
+            },
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "图片后".into(),
+                    marks: Marks::default(),
+                }],
+            },
+        ]),
+    );
+    let clock = Arc::new(ManualSaveClock::default());
+    let active = session(
+        note.clone(),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    let image_node = active.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .find_map(|block| {
+                matches!(
+                    &block.content,
+                    BlockContent::Image { resource_id, .. } if resource_id == image.as_str()
+                )
+                .then_some(block.id)
+            })
+            .expect("mounted saved image")
+    });
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            editor.select_for_workload(DocPoint::with_affinity(image_node, 0, Affinity::After));
+            editor
+                .backspace()
+                .expect("Backspace removes selected image");
+            editor.undo().expect("undo restores image");
+            editor.redo().expect("redo removes image again");
+            editor_cx.notify();
+        });
+    });
+    assert!(active.read_with(cx, |session, app| {
+        !session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .any(|block| {
+                matches!(
+                    &block.content,
+                    BlockContent::Image { resource_id, .. } if resource_id == image.as_str()
+                )
+            })
+    }));
+
+    // The real entity observer records this semantic change before the
+    // 100ms deadline starts. Drive that same observer edge explicitly before
+    // advancing the deterministic clock.
+    poll_and_drain(&active, cx);
+    clock.advance(Duration::from_millis(100));
+    poll_and_drain(&active, cx);
+    assert!(
+        repository
+            .latest_edit_journal(&note.id)
+            .expect("read deletion checkpoint")
+            .is_some(),
+        "the 100ms crash journal must carry the deleted document's resource order"
+    );
+    drop(active);
+
+    let recovered_note = repository
+        .load_note(&note.id)
+        .expect("load still-uncompacted base")
+        .expect("note exists");
+    let recovered = session(
+        recovered_note,
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    assert!(
+        recovered.read_with(cx, |session, app| {
+            !session
+                .editor()
+                .read(app)
+                .document()
+                .blocks()
+                .iter()
+                .any(|block| {
+                    matches!(
+                        &block.content,
+                        BlockContent::Image { resource_id, .. } if resource_id == image.as_str()
+                    )
+                })
+        }),
+        "crash recovery must apply the deletion journal rather than reject it as a new relation set"
+    );
+
+    flush_until_clean(&recovered, FlushReason::ManualSync, cx);
+    drop(recovered);
+    let saved = repository
+        .load_note(&note.id)
+        .expect("load compacted note")
+        .expect("note remains");
+    assert!(saved.resource_ids.is_empty());
+    assert!(!saved.body_html.contains(image.as_str()));
+    assert!(
+        repository
+            .latest_edit_journal(&note.id)
+            .expect("journal compacts after snapshot")
+            .is_none()
+    );
+    assert!(
+        repository
+            .list_notes(Default::default())
+            .expect("projection after deletion")
+            .iter()
+            .find(|projection| projection.id == note.id)
+            .expect("note projection")
+            .selected_thumbnail_id
+            .is_none(),
+        "the last deleted image must not revive its old card thumbnail"
+    );
+
+    let restarted = session(saved, Arc::clone(&repository), clock, cx);
+    assert!(
+        restarted.read_with(cx, |session, app| {
+            !session
+                .editor()
+                .read(app)
+                .document()
+                .blocks()
+                .iter()
+                .any(|block| {
+                    matches!(
+                        &block.content,
+                        BlockContent::Image { resource_id, .. } if resource_id == image.as_str()
+                    )
+                })
+        }),
+        "a second restart must read the compacted relation set, not resurrect the image"
+    );
+}
+
+#[gpui::test]
+async fn undoing_a_durable_resource_deletion_keeps_the_original_id_authorized_for_the_next_snapshot(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A normal snapshot must replace note_resources from the current document
+    // without shrinking the session's resource authorization set. Otherwise
+    // Cmd-Z after a successful deletion snapshot resurrects a perfectly real
+    // node in memory but the next save rejects it as a fabricated resource.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_resource(
+            &crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+                .images
+                .into_iter()
+                .next()
+                .expect("PNG fixture")
+                .bytes,
+            "undoable.png",
+            "image/png",
+            "png",
+        )
+        .expect("persist starting image");
+    let note = create(
+        &repository,
+        "持久删除后撤销",
+        CanonicalDocument::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "左侧文本".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Image {
+                resource_id: image.clone(),
+                alt: "可撤销图片".into(),
+                presentation: Default::default(),
+            },
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "右侧文本".into(),
+                    marks: Marks::default(),
+                }],
+            },
+        ]),
+    );
+    let clock = Arc::new(ManualSaveClock::default());
+    let active = session(
+        note.clone(),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    let image_node = active.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .find(|block| matches!(&block.content, BlockContent::Image { resource_id, .. } if resource_id == image.as_str()))
+            .expect("mounted image")
+            .id
+    });
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            editor.select_for_workload(DocPoint::with_affinity(image_node, 0, Affinity::After));
+            editor.backspace().expect("delete image");
+            editor_cx.notify();
+        });
+    });
+    poll_and_drain(&active, cx);
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    assert!(
+        repository
+            .load_note(&note.id)
+            .expect("load deleted snapshot")
+            .expect("note")
+            .resource_ids
+            .is_empty()
+    );
+
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            editor.undo().expect("undo durable deletion");
+            editor_cx.notify();
+        });
+    });
+    poll_and_drain(&active, cx);
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    assert_eq!(
+        repository
+            .load_note(&note.id)
+            .expect("load restored snapshot")
+            .expect("note")
+            .resource_ids,
+        vec![image.clone()],
+        "the same persisted resource ID must become durable again after Cmd-Z"
+    );
+
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            editor.redo().expect("redo durable deletion");
+            editor_cx.notify();
+        });
+    });
+    poll_and_drain(&active, cx);
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    let saved = repository
+        .load_note(&note.id)
+        .expect("load re-deleted snapshot")
+        .expect("note");
+    assert!(saved.resource_ids.is_empty());
+    drop(active);
+    let restarted = session(saved, Arc::clone(&repository), clock, cx);
+    assert!(restarted.read_with(cx, |session, app| {
+        !session.editor().read(app).document().blocks().iter().any(|block| {
+            matches!(&block.content, BlockContent::Image { resource_id, .. } if resource_id == image.as_str())
+        })
+    }));
+}
+
+#[gpui::test]
+async fn crash_journal_recovers_an_ordered_a_b_a_resource_deletion_without_losing_writer_ownership(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A deletion journal is allowed to shrink A,B,A to B,A, but not to
+    // manufacture or reorder resources. This follows the exact recovery
+    // ownership handoff, then compacts and restarts again from the database.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture")
+        .bytes;
+    let a = repository
+        .import_resource(&bytes, "a.png", "image/png", "png")
+        .expect("persist A");
+    let b = repository
+        .import_resource(&bytes, "b.png", "image/png", "png")
+        .expect("persist B");
+    let note = create(
+        &repository,
+        "A B A 删除",
+        CanonicalDocument::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "开始".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Image {
+                resource_id: a.clone(),
+                alt: "first A".into(),
+                presentation: Default::default(),
+            },
+            Block::Image {
+                resource_id: b.clone(),
+                alt: "B".into(),
+                presentation: Default::default(),
+            },
+            Block::Image {
+                resource_id: a.clone(),
+                alt: "second A".into(),
+                presentation: Default::default(),
+            },
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "结束".into(),
+                    marks: Marks::default(),
+                }],
+            },
+        ]),
+    );
+    let clock = Arc::new(ManualSaveClock::default());
+    let active = session(
+        note.clone(),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    let first_a = active.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .find(|block| matches!(&block.content, BlockContent::Image { resource_id, alt, .. } if resource_id == a.as_str() && alt == "first A"))
+            .expect("first A")
+            .id
+    });
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            editor.select_for_workload(DocPoint::with_affinity(first_a, 0, Affinity::After));
+            editor.backspace().expect("delete only first A");
+            editor_cx.notify();
+        });
+    });
+    poll_and_drain(&active, cx);
+    clock.advance(Duration::from_millis(100));
+    poll_and_drain(&active, cx);
+    let checkpoint = repository
+        .latest_edit_journal(&note.id)
+        .expect("read deletion checkpoint")
+        .expect("checkpoint exists");
+    drop(active);
+
+    let recovered_note = repository
+        .load_note(&note.id)
+        .expect("load durable base")
+        .expect("note exists");
+    let recovered = session(
+        recovered_note,
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    let live_order = recovered.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .filter_map(|block| match &block.content {
+                BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        live_order,
+        vec![b.as_str().to_owned(), a.as_str().to_owned()]
+    );
+    let claimed = repository
+        .latest_edit_journal(&note.id)
+        .expect("read claimed checkpoint")
+        .expect("claimed checkpoint remains until compaction");
+    assert_eq!(claimed.sequence, checkpoint.sequence);
+    assert_ne!(claimed.writer_token, checkpoint.writer_token);
+
+    flush_until_clean(&recovered, FlushReason::ManualSync, cx);
+    drop(recovered);
+    let compacted = repository
+        .load_note(&note.id)
+        .expect("load compacted note")
+        .expect("note exists");
+    assert_eq!(compacted.resource_ids, vec![b.clone(), a.clone()]);
+    assert!(
+        repository
+            .latest_edit_journal(&note.id)
+            .expect("journal compacts")
+            .is_none()
+    );
+    let restarted = session(compacted, Arc::clone(&repository), clock, cx);
+    assert_eq!(
+        restarted.read_with(cx, |session, app| {
+            session
+                .editor()
+                .read(app)
+                .document()
+                .blocks()
+                .iter()
+                .filter_map(|block| match &block.content {
+                    BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        }),
+        vec![b.as_str().to_owned(), a.as_str().to_owned()]
+    );
+}
+
+#[gpui::test]
+async fn crash_journal_recovers_historical_a_b_a_after_durable_deletion_then_undo(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A saved deletion legitimately changes the current relation from A,B,A
+    // to B,A.  Cmd-Z can then restore the first A from the same note's
+    // durable revision history.  A crash before the next snapshot must not
+    // treat that recovered occurrence as a forged resource merely because it
+    // is absent from the current B,A base relation.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture")
+        .bytes;
+    let a = repository
+        .import_resource(&bytes, "undo-a.png", "image/png", "png")
+        .expect("persist A");
+    let b = repository
+        .import_resource(&bytes, "undo-b.png", "image/png", "png")
+        .expect("persist B");
+    let note = create(
+        &repository,
+        "A B A durable undo",
+        CanonicalDocument::from_blocks(vec![
+            Block::Image {
+                resource_id: a.clone(),
+                alt: "first A".into(),
+                presentation: Default::default(),
+            },
+            Block::Image {
+                resource_id: b.clone(),
+                alt: "B".into(),
+                presentation: Default::default(),
+            },
+            Block::Image {
+                resource_id: a.clone(),
+                alt: "second A".into(),
+                presentation: Default::default(),
+            },
+        ]),
+    );
+    let clock = Arc::new(ManualSaveClock::default());
+    let active = session(
+        note.clone(),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    let first_a = active.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .find(|block| {
+                matches!(&block.content, BlockContent::Image { resource_id, alt, .. } if resource_id == a.as_str() && alt == "first A")
+            })
+            .expect("first A")
+            .id
+    });
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            editor.select_for_workload(DocPoint::with_affinity(first_a, 0, Affinity::After));
+            editor.backspace().expect("delete first A");
+            editor_cx.notify();
+        });
+    });
+    poll_and_drain(&active, cx);
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    assert_eq!(
+        repository
+            .load_note(&note.id)
+            .expect("load B,A durable snapshot")
+            .expect("note exists")
+            .resource_ids,
+        vec![b.clone(), a.clone()]
+    );
+
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            editor.undo().expect("undo restores first A");
+            editor_cx.notify();
+        });
+    });
+    poll_and_drain(&active, cx);
+    clock.advance(Duration::from_millis(100));
+    poll_and_drain(&active, cx);
+    assert!(
+        repository
+            .latest_edit_journal(&note.id)
+            .expect("read undo checkpoint")
+            .is_some(),
+        "the restored A,B,A must reach the production crash journal"
+    );
+    drop(active);
+
+    let recovered = session(
+        repository
+            .load_note(&note.id)
+            .expect("load B,A crash base")
+            .expect("note exists"),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    let recovered_order = recovered.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .filter_map(|block| match &block.content {
+                BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        recovered_order,
+        vec![
+            a.as_str().to_owned(),
+            b.as_str().to_owned(),
+            a.as_str().to_owned()
+        ],
+        "recovery must use same-note durable provenance rather than only B,A"
+    );
+    flush_until_clean(&recovered, FlushReason::ManualSync, cx);
+    drop(recovered);
+
+    let compacted = repository
+        .load_note(&note.id)
+        .expect("load compacted A,B,A")
+        .expect("note exists");
+    assert_eq!(
+        compacted.resource_ids,
+        vec![a.clone(), b.clone(), a.clone()]
+    );
+    assert!(
+        repository
+            .latest_edit_journal(&note.id)
+            .expect("journal compacted after recovery snapshot")
+            .is_none()
+    );
+    let second_restart = session(compacted, Arc::clone(&repository), clock, cx);
+    let second_order = second_restart.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .filter_map(|block| match &block.content {
+                BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        second_order,
+        vec![
+            a.as_str().to_owned(),
+            b.as_str().to_owned(),
+            a.as_str().to_owned()
+        ],
+        "the compacted durable relation must survive a second restart"
+    );
+}
+
+#[gpui::test]
+async fn crash_journal_rejects_a_resource_outside_same_note_durable_provenance(
+    cx: &mut gpui::TestAppContext,
+) {
+    // The journal wire list is hostile input. A resource that happens to
+    // exist globally but has never appeared in this note's durable revision
+    // history must not become associated merely by forging a recovery delta.
+    let _cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture")
+        .bytes;
+    let associated = repository
+        .import_resource(&bytes, "associated.png", "image/png", "png")
+        .expect("persist associated resource");
+    let foreign = repository
+        .import_resource(&bytes, "foreign.png", "image/png", "png")
+        .expect("persist globally valid but unassociated resource");
+    let note = create(
+        &repository,
+        "durable provenance",
+        CanonicalDocument::from_blocks(vec![Block::Image {
+            resource_id: associated.clone(),
+            alt: "associated".into(),
+            presentation: Default::default(),
+        }]),
+    );
+    let forged_document = CanonicalDocument::from_blocks(vec![Block::Image {
+        resource_id: foreign.clone(),
+        alt: "forged foreign".into(),
+        presentation: Default::default(),
+    }]);
+    let writer_token = "forged-same-base-writer";
+    let forged_delta = replace_all_recovery_payload(&note, writer_token, 1, &forged_document);
+    repository
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: writer_token.into(),
+            sequence: 0,
+            generation: 1,
+            delta_utf8: forged_delta,
+        })
+        .expect("write hostile checkpoint exactly as crash recovery reads it");
+
+    let error = match NoteSession::prepare(
+        repository
+            .load_note(&note.id)
+            .expect("load durable base")
+            .expect("note exists"),
+        repository.as_ref(),
+    ) {
+        Ok(_) => panic!("foreign resource cannot be authorized by journal self-report"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("持久历史"),
+        "recovery must name the same-note provenance boundary: {error}"
+    );
+    assert_eq!(
+        repository
+            .load_note(&note.id)
+            .expect("read unmodified durable note")
+            .expect("note exists")
+            .resource_ids,
+        vec![associated],
+        "rejecting hostile recovery must not expose the foreign relation"
+    );
+}
+
+#[gpui::test]
+async fn crash_journal_recovers_a_same_note_resource_reorder_within_durable_counts(
+    cx: &mut gpui::TestAppContext,
+) {
+    // Resource order is document state, not authorization state. A durable
+    // B,A base may legally recover an A,B reorder as long as every occurrence
+    // came from the same note's committed history; the old current-order
+    // subsequence check falsely rejected this.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture")
+        .bytes;
+    let a = repository
+        .import_resource(&bytes, "reorder-a.png", "image/png", "png")
+        .expect("persist A");
+    let b = repository
+        .import_resource(&bytes, "reorder-b.png", "image/png", "png")
+        .expect("persist B");
+    let note = create(
+        &repository,
+        "B A reorder base",
+        CanonicalDocument::from_blocks(vec![
+            Block::Image {
+                resource_id: b.clone(),
+                alt: "B".into(),
+                presentation: Default::default(),
+            },
+            Block::Image {
+                resource_id: a.clone(),
+                alt: "A".into(),
+                presentation: Default::default(),
+            },
+        ]),
+    );
+    let reordered = CanonicalDocument::from_blocks(vec![
+        Block::Image {
+            resource_id: a.clone(),
+            alt: "A".into(),
+            presentation: Default::default(),
+        },
+        Block::Image {
+            resource_id: b.clone(),
+            alt: "B".into(),
+            presentation: Default::default(),
+        },
+    ]);
+    let writer_token = "same-note-reorder-writer";
+    repository
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: writer_token.into(),
+            sequence: 0,
+            generation: 1,
+            delta_utf8: replace_all_recovery_payload(&note, writer_token, 1, &reordered),
+        })
+        .expect("write same-note reordered crash checkpoint");
+
+    let clock = Arc::new(ManualSaveClock::default());
+    let recovered = session(
+        repository
+            .load_note(&note.id)
+            .expect("load B,A durable base")
+            .expect("note exists"),
+        Arc::clone(&repository),
+        clock,
+        cx,
+    );
+    let order = recovered.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .filter_map(|block| match &block.content {
+                BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(order, vec![a.as_str().to_owned(), b.as_str().to_owned()]);
+}
+
+#[gpui::test]
+async fn crash_journal_rejects_same_note_resource_occurrence_amplification(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A historical A occurrence authorizes at most one A. A forged A,A body
+    // is not made safe merely because the resource is real and same-note.
+    let _cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture")
+        .bytes;
+    let a = repository
+        .import_resource(&bytes, "one-a.png", "image/png", "png")
+        .expect("persist A");
+    let note = create(
+        &repository,
+        "one A provenance",
+        CanonicalDocument::from_blocks(vec![Block::Image {
+            resource_id: a.clone(),
+            alt: "only A".into(),
+            presentation: Default::default(),
+        }]),
+    );
+    let amplified = CanonicalDocument::from_blocks(vec![
+        Block::Image {
+            resource_id: a.clone(),
+            alt: "first A".into(),
+            presentation: Default::default(),
+        },
+        Block::Image {
+            resource_id: a.clone(),
+            alt: "forged second A".into(),
+            presentation: Default::default(),
+        },
+    ]);
+    let writer_token = "same-note-amplification-writer";
+    repository
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: writer_token.into(),
+            sequence: 0,
+            generation: 1,
+            delta_utf8: replace_all_recovery_payload(&note, writer_token, 1, &amplified),
+        })
+        .expect("write hostile amplified checkpoint");
+    let error = match NoteSession::prepare(
+        repository
+            .load_note(&note.id)
+            .expect("load durable note")
+            .expect("note exists"),
+        repository.as_ref(),
+    ) {
+        Ok(_) => panic!("one durable occurrence cannot authorize two recovered occurrences"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("放大了出现次数"));
 }
 
 #[gpui::test]
@@ -165,6 +1185,560 @@ async fn chinese_title_and_body_entity_input_round_trip_after_restart(
     assert!(format!("{document:?}").contains("Italic"));
     assert!(format!("{document:?}").contains("https://example.test/中文"));
     assert!(format!("{document:?}").contains("和正文"));
+}
+
+#[gpui::test]
+async fn opening_missing_persisted_image_keeps_other_body_editable_until_surface_requests_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    // Session preparation owns only canonical geometry and resource IDs. A
+    // missing blob must not reject surrounding text or trigger a descriptor
+    // read before the mounted renderer marks this atom resident; the mounted
+    // companion test covers that later per-image failed placeholder.
+    let cx = cx.add_empty_window();
+    let (profile, repository) = repository();
+    let resource = repository
+        .import_resource(
+            &crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+                .images
+                .into_iter()
+                .next()
+                .expect("PNG fixture")
+                .bytes,
+            "missing.png",
+            "image/png",
+            "png",
+        )
+        .expect("persist image metadata and bytes");
+    let note = create(
+        &repository,
+        "局部图片故障",
+        CanonicalDocument::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "图片前文字".into(),
+                    marks: Marks::default(),
+                }],
+            },
+            Block::Image {
+                resource_id: resource.clone(),
+                alt: "丢失的图片".into(),
+                presentation: Default::default(),
+            },
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "图片后文字".into(),
+                    marks: Marks::default(),
+                }],
+            },
+        ]),
+    );
+    let metadata = repository
+        .resource_metadata(&resource)
+        .expect("load resource metadata")
+        .expect("resource metadata exists");
+    std::fs::remove_file(
+        profile
+            .path()
+            .join("resources/blobs")
+            .join(metadata.sha256.as_str()),
+    )
+    .expect("simulate a missing local blob after a valid sync record");
+
+    let active = session(
+        note,
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+    let (image_state, warning, surrounding_text) = active.read_with(cx, |session, app| {
+        let editor = session.editor().read(app);
+        (
+            editor.image_state(resource.as_str()),
+            session.resource_load_warning().map(str::to_owned),
+            editor
+                .document()
+                .blocks()
+                .iter()
+                .filter_map(|block| block.content.as_text())
+                .collect::<String>(),
+        )
+    });
+    assert_eq!(
+        image_state, None,
+        "bare session construction must not eagerly open or decode a missing blob"
+    );
+    assert!(
+        warning.is_none(),
+        "no renderer request means no false load notice"
+    );
+    assert_eq!(surrounding_text, "图片前文字图片后文字");
+
+    append_body_via_entity_input(&active, "仍可编辑", cx);
+    assert!(
+        active.read_with(cx, |session, app| session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .filter_map(|block| block.content.as_text())
+            .collect::<String>()
+            .contains("仍可编辑")),
+        "a deferred image load must not turn the rest of the note into an unsupported document"
+    );
+}
+
+#[gpui::test]
+async fn opening_many_images_keeps_all_original_blobs_unverified_until_surface_residency(
+    cx: &mut gpui::TestAppContext,
+) {
+    // `hydrate_persisted_images` used to call `read_resource_bytes` for every
+    // block, retaining all source `Vec`s in PreparedNoteSession. Bare session
+    // construction now proves an even stronger contract: it does not cross
+    // either the allocating *or* verified descriptor boundary. The mounted
+    // visible-only test drives the eventual real surface request separately.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture")
+        .bytes;
+    let first = repository
+        .import_resource(&bytes, "first.png", "image/png", "png")
+        .expect("first durable image");
+    let second = repository
+        .import_resource(&bytes, "second.png", "image/png", "png")
+        .expect("second durable image");
+    let note = create(
+        &repository,
+        "流式图片",
+        CanonicalDocument::from_blocks(vec![
+            Block::Image {
+                resource_id: first.clone(),
+                alt: "一".into(),
+                presentation: Default::default(),
+            },
+            Block::Image {
+                resource_id: second.clone(),
+                alt: "二".into(),
+                presentation: Default::default(),
+            },
+        ]),
+    );
+    let reads = repository.observe_resource_reads();
+    let opens = repository.observe_verified_resource_opens();
+
+    let active = session(
+        note,
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+
+    let (first_cached, second_cached, first_bytes, second_bytes) =
+        active.read_with(cx, |session, app| {
+            let editor = session.editor().read(app);
+            (
+                editor
+                    .image_source_path(first.as_str())
+                    .is_some_and(|path| path.is_file()),
+                editor
+                    .image_source_path(second.as_str())
+                    .is_some_and(|path| path.is_file()),
+                editor.image_bytes(first.as_str()).is_none(),
+                editor.image_bytes(second.as_str()).is_none(),
+            )
+        });
+    assert!(!first_cached && !second_cached);
+    assert!(first_bytes && second_bytes);
+    assert!(matches!(reads.try_recv(), Err(TryRecvError::Empty)));
+    assert!(matches!(opens.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[gpui::test]
+async fn dropped_session_hydration_worker_never_recreates_its_image_cache_root(
+    cx: &mut gpui::TestAppContext,
+) {
+    // The retained worker may already hold an open verified descriptor when
+    // its editor/session is destroyed. It must write only to a task-owned
+    // sibling staging directory; otherwise a late materialization recreates
+    // the dropped ImageStore root after ImageStore::drop removed it.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture")
+        .bytes;
+    let image = repository
+        .import_resource(&bytes, "late.png", "image/png", "png")
+        .expect("persist image");
+    let note = create(
+        &repository,
+        "late hydration",
+        CanonicalDocument::from_blocks(vec![Block::Image {
+            resource_id: image.clone(),
+            alt: "late".into(),
+            presentation: Default::default(),
+        }]),
+    );
+    let active = session(
+        note,
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+    let root = active.read_with(cx, |session, app| {
+        session.editor().read(app).image_materialization_root()
+    });
+    assert!(
+        !root.exists(),
+        "a metadata-only open must not pre-create the editor image cache root"
+    );
+    let release = active.update(cx, |session, _| {
+        session.stall_next_image_hydration_for_test()
+    });
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            assert!(editor.request_image_hydration([image.as_str().to_owned()]));
+            editor_cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    drop(active);
+    release
+        .send(())
+        .expect("release the retained worker after drop");
+    cx.run_until_parked();
+    assert!(
+        !root.exists(),
+        "a late worker completion must never resurrect a dropped session cache root"
+    );
+}
+
+#[gpui::test]
+async fn hydration_scroll_coalesces_queued_work_to_the_latest_resident_image(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A gated first materialization simulates a slow visible image while the
+    // user rapidly scrolls across other image atoms. The worker may finish
+    // the already-active first image, but must not drain every stale viewport
+    // after it: only the final resident image may cross `open_verified`.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let first = repository
+        .import_resource(&structural_png(1200, 675), "first.png", "image/png", "png")
+        .expect("first durable image");
+    let stale = repository
+        .import_resource(&structural_png(675, 1200), "stale.png", "image/png", "png")
+        .expect("stale durable image");
+    let final_image = repository
+        .import_resource(&structural_png(800, 800), "final.png", "image/png", "png")
+        .expect("final durable image");
+    let hashes = [first.clone(), stale.clone(), final_image.clone()].map(|resource| {
+        repository
+            .resource_metadata(&resource)
+            .expect("read durable metadata")
+            .expect("metadata exists")
+            .sha256
+    });
+    let note = create(
+        &repository,
+        "bounded hydration",
+        CanonicalDocument::from_blocks(vec![
+            Block::Image {
+                resource_id: first.clone(),
+                alt: "first".into(),
+                presentation: Default::default(),
+            },
+            Block::Image {
+                resource_id: stale.clone(),
+                alt: "stale".into(),
+                presentation: Default::default(),
+            },
+            Block::Image {
+                resource_id: final_image.clone(),
+                alt: "final".into(),
+                presentation: Default::default(),
+            },
+        ]),
+    );
+    let opens = repository.observe_verified_resource_opens();
+    let active = session(
+        note,
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+    let release = active.update(cx, |session, _| {
+        session.stall_next_image_hydration_for_test()
+    });
+    for resources in [
+        vec![first.as_str().to_owned()],
+        vec![stale.as_str().to_owned()],
+        vec![final_image.as_str().to_owned()],
+    ] {
+        active.update(cx, |session, session_cx| {
+            session.editor().update(session_cx, |editor, editor_cx| {
+                editor.request_image_hydration(resources);
+                editor_cx.notify();
+            });
+        });
+        cx.run_until_parked();
+    }
+    release.send(()).expect("release first hydration");
+    cx.run_until_parked();
+
+    let opened = opens.try_iter().collect::<Vec<_>>();
+    assert!(
+        opened
+            .iter()
+            .all(|hash| hash == &hashes[0] || hash == &hashes[2]),
+        "an offscreen stale viewport must be pruned before it starts a verified read; opened={opened:?}"
+    );
+    assert!(
+        opened.iter().any(|hash| hash == &hashes[0]),
+        "the initially active resident remains allowed to finish"
+    );
+    assert!(
+        opened.iter().any(|hash| hash == &hashes[2]),
+        "the final resident request must replace stale queued work"
+    );
+    assert!(
+        !opened.iter().any(|hash| hash == &hashes[1]),
+        "the intermediate viewport must never be opened after scrolling away"
+    );
+}
+
+#[gpui::test]
+async fn visible_legacy_image_repairs_its_geometry_once_then_reopens_without_layout_jump(
+    cx: &mut gpui::TestAppContext,
+) {
+    // Old canonical HTML has no natural-size attributes. It gets a stable
+    // fallback first frame, then the first visible descriptor inspection may
+    // repair only that legacy node outside History. The ordinary snapshot
+    // persists the repaired geometry so a second open does not jump again.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_resource(
+            &structural_png(675, 1200),
+            "legacy-vertical.png",
+            "image/png",
+            "png",
+        )
+        .expect("persist vertical image");
+    let note = create(
+        &repository,
+        "legacy geometry",
+        CanonicalDocument::from_blocks(vec![Block::Image {
+            resource_id: image.clone(),
+            alt: "vertical".into(),
+            presentation: Default::default(),
+        }]),
+    );
+    let clock = Arc::new(ManualSaveClock::default());
+    let active = session(
+        note.clone(),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    let initial_size = active.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .find_map(|block| match &block.content {
+                BlockContent::Image { natural_size, .. } => Some(*natural_size),
+                _ => None,
+            })
+            .expect("legacy image atom")
+    });
+    assert_eq!(
+        initial_size,
+        (1024, 768),
+        "legacy fallback is stable before I/O"
+    );
+
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            assert!(editor.request_image_hydration([image.as_str().to_owned()]));
+            editor_cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let (repaired_size, undo_depth) = active.read_with(cx, |session, app| {
+        let editor = session.editor().read(app);
+        (
+            editor
+                .document()
+                .blocks()
+                .iter()
+                .find_map(|block| match &block.content {
+                    BlockContent::Image { natural_size, .. } => Some(*natural_size),
+                    _ => None,
+                })
+                .expect("repaired image atom"),
+            editor.undo_depth(),
+        )
+    });
+    assert_eq!(repaired_size, (675, 1200));
+    assert_eq!(
+        undo_depth, 0,
+        "loader geometry repair must not manufacture undo history"
+    );
+
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    drop(active);
+    let saved = repository
+        .load_note(&note.id)
+        .expect("load repaired note")
+        .expect("note exists");
+    assert!(
+        saved
+            .body_html
+            .contains("data-joplin-lite-natural-width=\"675\""),
+        "the ordinary semantic snapshot must persist the one-time legacy repair"
+    );
+    let reopened = session(saved, Arc::clone(&repository), clock, cx);
+    let reopened_size = reopened.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .find_map(|block| match &block.content {
+                BlockContent::Image { natural_size, .. } => Some(*natural_size),
+                _ => None,
+            })
+            .expect("reopened image atom")
+    });
+    assert_eq!(
+        reopened_size,
+        (675, 1200),
+        "new canonical presentation must reserve the same extent before a second hydration"
+    );
+}
+
+#[gpui::test]
+async fn offscreen_legacy_image_keeps_unknown_geometry_until_visible_repair(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A legacy image may remain outside the viewport while the user edits
+    // nearby text. That ordinary save must preserve the absence of durable
+    // dimensions: exporting the display fallback as a real presentation would
+    // permanently turn a vertical image into 4:3 before it ever hydrates.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_resource(
+            &structural_png(675, 1200),
+            "legacy-offscreen.png",
+            "image/png",
+            "png",
+        )
+        .expect("persist vertical legacy image");
+    let note = create(
+        &repository,
+        "legacy offscreen",
+        CanonicalDocument::from_blocks(vec![
+            Block::Image {
+                resource_id: image.clone(),
+                alt: "vertical".into(),
+                presentation: Default::default(),
+            },
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text {
+                    text: "正文".into(),
+                    marks: Marks::default(),
+                }],
+            },
+        ]),
+    );
+    let clock = Arc::new(ManualSaveClock::default());
+    let active = session(
+        note.clone(),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+
+    // No render residency request is made before this explicit text edit.
+    append_body_via_entity_input(&active, "仍在屏外保存", cx);
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    drop(active);
+
+    let after_text_save = repository
+        .load_note(&note.id)
+        .expect("load ordinary text snapshot")
+        .expect("note exists");
+    assert!(
+        !after_text_save
+            .body_html
+            .contains("data-joplin-lite-natural-width"),
+        "an offscreen legacy image must remain unknown until a real visible decode repairs it"
+    );
+
+    let reopened = session(
+        after_text_save,
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    // This is the first simulated scroll/residency request. Only now may the
+    // worker inspect bytes and turn the legacy fallback into durable geometry.
+    reopened.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            assert!(editor.request_image_hydration([image.as_str().to_owned()]));
+            editor_cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    flush_until_clean(&reopened, FlushReason::ManualSync, cx);
+    drop(reopened);
+
+    let repaired = repository
+        .load_note(&note.id)
+        .expect("load repaired snapshot")
+        .expect("note exists");
+    assert!(
+        repaired
+            .body_html
+            .contains("data-joplin-lite-natural-width=\"675\"")
+    );
+    assert!(
+        repaired
+            .body_html
+            .contains("data-joplin-lite-natural-height=\"1200\"")
+    );
+
+    let reopened_again = session(repaired, Arc::clone(&repository), clock, cx);
+    let natural_size = reopened_again.read_with(cx, |session, app| {
+        session
+            .editor()
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .find_map(|block| match &block.content {
+                BlockContent::Image { natural_size, .. } => Some(*natural_size),
+                _ => None,
+            })
+            .expect("repaired image atom")
+    });
+    assert_eq!(natural_size, (675, 1200));
 }
 
 #[gpui::test]

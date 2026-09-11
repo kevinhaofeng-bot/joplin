@@ -1,12 +1,19 @@
 use super::*;
 use crate::app::AppAction;
 use crate::app::save_coordinator::ManualSaveClock;
-use crate::components::{Copy, SelectAll};
+use crate::components::{Copy, Paste, SelectAll};
+use crate::native_editor::model::{Affinity, BlockKind, DocPoint, Mark};
 use app_lite_core::document::{Block, BlockStyle, Inline, Marks};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryShellState};
-use gpui::{AppContext, EntityInputHandler, Modifiers, TestAppContext, VisualTestContext};
-use std::sync::Arc;
+use gpui::{
+    AppContext, ClipboardItem, EntityInputHandler, Image, ImageFormat, Modifiers, TestAppContext,
+    VisualTestContext, point, px,
+};
+use std::io::Cursor;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn redraw(cx: &mut VisualTestContext) {
@@ -31,6 +38,18 @@ fn rich_document(text: &str) -> CanonicalDocument {
             marks: Default::default(),
         }],
     }])
+}
+
+/// A non-trivial real PNG for pointer tests. The common 1×1 clipboard fixture
+/// is intentionally tiny, but its display rect cannot distinguish a left or
+/// right image edge in a mounted high-DPI canvas.
+fn structural_png(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([0x1b, 0x7f, 0x46, 0xff]));
+    let mut encoded = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("encode structural PNG fixture");
+    encoded.into_inner()
 }
 
 fn mount_shell<'a>(
@@ -152,6 +171,1223 @@ async fn mounted_card_click_reaches_the_same_shell_action_reducer(cx: &mut TestA
             Some(&stored.id)
         );
         assert!(view.editor_surface.is_some());
+    });
+}
+
+#[gpui::test]
+async fn mounted_default_editor_shell_paints_every_evernote_primary_surface(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "白色编辑壳".into(),
+            notebook_id: None,
+            document: rich_document("标题和正文都必须落在明确的白色主表面上。"),
+        })
+        .expect("create selected note");
+    let (view, cx) = mount_shell(repository, cx);
+
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    assert_eq!(
+        view.read_with(cx, |shell, app| {
+            shell
+                .model
+                .read(app)
+                .navigation()
+                .selected_note_id()
+                .cloned()
+        }),
+        Some(note.id),
+        "the production card path must mount the actual title and editor pane before style assertions"
+    );
+
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell
+            .rendered_primary_surface_fills_for_test()),
+        [0xffffffff; 5],
+        "the mounted default route must pass Evernote's #fff primary fill through every root, main editor, toolbar, title, and editor-pane .bg call"
+    );
+    for selector in [
+        "library-shell",
+        "library-main-editor-shell",
+        "library-actions",
+        "library-note-title",
+        "library-native-editor-pane",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the rendered primary-surface style tree must include {selector}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn mounted_default_route_mounts_the_shared_editor_command_chrome(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "共享格式栏".into(),
+            notebook_id: None,
+            document: rich_document("默认资料库必须挂载与 spike 相同的格式命令组件。"),
+        })
+        .expect("create selected note");
+    let (_view, cx) = mount_shell(repository, cx);
+
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted selected-note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    assert!(
+        cx.debug_bounds("library-editor-command-chrome").is_some(),
+        "the default library route must mount the shared command chrome between its title and body"
+    );
+    assert!(
+        cx.debug_bounds("library-editor-command-toolbar").is_some(),
+        "the mounted shared chrome must expose its primary command row"
+    );
+    assert!(
+        cx.debug_bounds("Bold").is_some(),
+        "a visible formatting command must come from the mounted shared chrome rather than a second library-only toolbar"
+    );
+    let title = cx
+        .debug_bounds("library-note-title")
+        .expect("mounted library title input");
+    let chrome = cx
+        .debug_bounds("library-editor-command-chrome")
+        .expect("mounted shared Chrome");
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted shared editor body");
+    assert!(
+        title.bottom() <= chrome.top() && chrome.bottom() <= surface.top(),
+        "the production shared Chrome must sit between title and document body; title={title:?}, chrome={chrome:?}, surface={surface:?}"
+    );
+}
+
+#[gpui::test]
+async fn mounted_library_shared_chrome_clicks_bold_and_list_with_one_history_entry(
+    cx: &mut TestAppContext,
+) {
+    // This is deliberately a mounted command-row test, not a direct
+    // `CommandCatalogue` test. Removing the LibraryShell shared-Chrome mount
+    // or routing either button through a second handler makes its hit targets
+    // disappear and the mutation/history assertions fail.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "共享格式命令".into(),
+            notebook_id: None,
+            document: rich_document("第一段"),
+        })
+        .expect("create formatted note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    let (editor, selected) = view.update(cx, |shell, shell_cx| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .expect("active library session")
+            .read(shell_cx)
+            .editor()
+            .clone();
+        let selected = editor.update(shell_cx, |editor, editor_cx| {
+            let block = editor.document().blocks().first().expect("text block");
+            let end = block.content.as_text().expect("text content").len();
+            let selected = Selection::new(
+                DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                DocPoint::with_affinity(block.id, end, Affinity::After),
+            );
+            editor.set_selection_for_test(selected);
+            editor_cx.notify();
+            selected
+        });
+        (editor, selected)
+    });
+
+    let bold_history = editor.read_with(cx, |editor, _| editor.undo_depth());
+    let bold = cx.debug_bounds("Bold").expect("shared Bold button");
+    cx.simulate_click(bold.center(), Modifiers::default());
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection(), selected, "Bold must preserve selection");
+        assert_eq!(
+            editor.undo_depth(),
+            bold_history + 1,
+            "Bold is one transaction"
+        );
+        assert!(
+            editor.document().blocks()[0]
+                .content
+                .styles()
+                .expect("styled text")
+                .iter()
+                .any(|run| run.marks.contains(&Mark::Bold)),
+            "the real library Chrome Bold click must mutate the active EditorCore"
+        );
+    });
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.undo_depth(), bold_history, "one Undo reverts Bold");
+        assert!(
+            editor.document().blocks()[0]
+                .content
+                .styles()
+                .expect("styled text")
+                .iter()
+                .all(|run| !run.marks.contains(&Mark::Bold)),
+            "Undo must restore the unformatted document"
+        );
+    });
+
+    let list_history = editor.read_with(cx, |editor, _| editor.undo_depth());
+    let list = cx
+        .debug_bounds("Bulleted list")
+        .expect("wide shared toolbar exposes Bulleted list");
+    cx.simulate_click(list.center(), Modifiers::default());
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(
+            editor.selection(),
+            selected,
+            "list command preserves selection"
+        );
+        assert_eq!(
+            editor.undo_depth(),
+            list_history + 1,
+            "list is one transaction"
+        );
+        assert!(
+            matches!(
+                editor.document().blocks()[0].kind,
+                BlockKind::BulletItem { depth: 0 }
+            ),
+            "the shared Bulleted list button must mutate the same active EditorCore"
+        );
+    });
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert!(
+            matches!(editor.document().blocks()[0].kind, BlockKind::Paragraph),
+            "one Undo must restore the paragraph after the list command"
+        );
+    });
+
+    assert!(
+        repository.load_note(&note.id).expect("load note").is_some(),
+        "the test must stay on the default durable library route"
+    );
+}
+
+#[gpui::test]
+async fn mounted_library_chrome_format_manual_sync_switch_and_reopen_round_trips_canonical_html(
+    cx: &mut TestAppContext,
+) {
+    // The command must enter the existing Task-4 NoteSession observation
+    // path: a durable canonical snapshot is required before a different
+    // session decodes the note again. This rejects a library-only visual
+    // toggle that never reaches EditorCore history/save coordination.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "格式需要保存".into(),
+            notebook_id: None,
+            document: rich_document("可持久粗体"),
+        })
+        .expect("create first note");
+    let second = repository
+        .create_note(CreateNote {
+            title: "切换目标".into(),
+            notebook_id: None,
+            document: rich_document("另一篇正文"),
+        })
+        .expect("create second note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(first.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("first session")
+            .read(app)
+            .editor()
+            .clone()
+    });
+    editor.update(cx, |editor, editor_cx| {
+        let block = editor.document().blocks().first().expect("text block");
+        let selection = Selection::new(
+            DocPoint::with_affinity(block.id, 0, Affinity::Before),
+            DocPoint::with_affinity(
+                block.id,
+                block.content.as_text().expect("text").len(),
+                Affinity::After,
+            ),
+        );
+        editor.set_selection_for_test(selection);
+        editor_cx.notify();
+    });
+    let bold = cx.debug_bounds("Bold").expect("shared Bold button");
+    cx.simulate_click(bold.center(), Modifiers::default());
+    redraw(cx);
+
+    let save = cx
+        .debug_bounds("library-sync-current")
+        .expect("manual sync action");
+    cx.simulate_click(save.center(), Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    let persisted = repository
+        .load_note(&first.id)
+        .expect("load manually synced note")
+        .expect("first note remains");
+    assert!(
+        persisted.body_html.contains("<strong>可持久粗体</strong>"),
+        "ManualSync must persist the Chrome transaction as canonical rich HTML: {}",
+        persisted.body_html
+    );
+
+    // Switching away destroys the first session/chrome. Switching back must
+    // construct a new shared Chrome over a freshly decoded editor rather than
+    // retaining the old in-memory formatting state.
+    for target in [second.id.clone(), first.id.clone()] {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(AppAction::SelectNote(target.clone()), window, shell_cx)
+            });
+        });
+        redraw(cx);
+    }
+    view.read_with(cx, |shell, app| {
+        let reloaded = shell
+            .note_session
+            .as_ref()
+            .expect("reopened first session")
+            .read(app)
+            .editor()
+            .read(app);
+        assert!(
+            reloaded.document().blocks()[0]
+                .content
+                .styles()
+                .expect("reloaded text styles")
+                .iter()
+                .any(|run| run.marks.contains(&Mark::Bold)),
+            "switch/reopen must decode the saved canonical Bold mark"
+        );
+        assert!(
+            shell.command_chrome.is_some(),
+            "the reopened session must own the same shared formatting component"
+        );
+    });
+}
+
+#[gpui::test]
+async fn mounted_narrow_library_chrome_moves_list_command_into_shared_more_and_executes_it(
+    cx: &mut TestAppContext,
+) {
+    // The default route must use the same placement catalogue as Spike: this
+    // checks a command that becomes overflow-only at a narrow width, then
+    // drives its actual More row instead of a direct catalogue call.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "窄窗 More".into(),
+            notebook_id: None,
+            document: rich_document("窄宽列表"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(400.0), px(820.0)));
+    redraw(cx);
+    // At this deliberately narrow app width the two library navigation panes
+    // would consume the editor column entirely. A person can collapse them
+    // through the existing reducer; then the measured *editor* width (not
+    // the full window width) drives the shared placement calculation.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ToggleSidebar, window, shell_cx);
+            shell.apply_action(AppAction::ToggleNoteList, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .read(app)
+            .editor()
+            .clone()
+    });
+    editor.update(cx, |editor, editor_cx| {
+        let block = editor.document().blocks().first().expect("text block");
+        editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+            block.id,
+            0,
+            Affinity::Before,
+        )));
+        editor_cx.notify();
+    });
+    assert!(
+        cx.debug_bounds("Bulleted list").is_none(),
+        "at 400pt the list command must leave the primary row rather than be silently dropped"
+    );
+    let more = cx
+        .debug_bounds("library-editor-command-more-trigger")
+        .expect("narrow shared More trigger");
+    cx.simulate_click(more.center(), Modifiers::default());
+    redraw(cx);
+    let more_open = view.read_with(cx, |shell, app| {
+        shell
+            .command_chrome
+            .as_ref()
+            .expect("shared Chrome remains mounted")
+            .read(app)
+            .more_open_for_test()
+    });
+    assert!(
+        more_open,
+        "the actual narrow More trigger must reach the shared retained Chrome state"
+    );
+    assert!(
+        cx.debug_bounds("library-editor-command-more-menu")
+            .is_some(),
+        "the library must render the shared More overlay, not a local fallback menu"
+    );
+    let list = cx
+        .debug_bounds("Bulleted list")
+        .expect("More exposes the overflow list command");
+    cx.simulate_click(list.center(), Modifiers::default());
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert!(
+            matches!(
+                editor.document().blocks()[0].kind,
+                BlockKind::BulletItem { depth: 0 }
+            ),
+            "the narrow More row must execute against the current library EditorCore"
+        );
+    });
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome remains mounted")
+                .read(app)
+                .more_open_for_test(),
+            "a successful shared More command closes the single retained overlay"
+        );
+    });
+}
+
+#[gpui::test]
+async fn mounted_library_note_switch_discards_the_previous_shared_link_and_more_overlays(
+    cx: &mut TestAppContext,
+) {
+    // Link and More are retained state on the shared entity. A note change
+    // must remove that entity with its surface/session, otherwise a visible
+    // overlay could format the old editor while the title/body show a new
+    // note.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "链接来源".into(),
+            notebook_id: None,
+            document: rich_document("选中链接文字"),
+        })
+        .expect("create first note");
+    let second = repository
+        .create_note(CreateNote {
+            title: "切换目标".into(),
+            notebook_id: None,
+            document: rich_document("另一个正文"),
+        })
+        .expect("create second note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+
+    let select = |id: NoteId, cx: &mut VisualTestContext| {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(AppAction::SelectNote(id), window, shell_cx)
+            });
+        });
+        redraw(cx);
+    };
+    select(first.id.clone(), cx);
+    view.update(cx, |shell, shell_cx| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .expect("first session")
+            .read(shell_cx)
+            .editor()
+            .clone();
+        editor.update(shell_cx, |editor, editor_cx| {
+            let block = editor.document().blocks().first().expect("text block");
+            editor.set_selection_for_test(Selection::new(
+                DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                DocPoint::with_affinity(
+                    block.id,
+                    block.content.as_text().expect("text").len(),
+                    Affinity::After,
+                ),
+            ));
+            editor_cx.notify();
+        });
+        shell_cx.notify();
+    });
+    redraw(cx);
+    let link = cx.debug_bounds("Link").expect("shared Link command");
+    cx.simulate_click(link.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .has_link_popover(),
+            "the Link hit target must open state owned by the active shared Chrome"
+        );
+    });
+
+    select(second.id.clone(), cx);
+    view.read_with(cx, |shell, app| {
+        let chrome = shell
+            .command_chrome
+            .as_ref()
+            .expect("second Chrome")
+            .read(app);
+        assert!(
+            !chrome.has_open_overlay() && !chrome.has_link_popover(),
+            "switching notes must discard the old Link popover with its session"
+        );
+    });
+
+    let more = cx
+        .debug_bounds("library-editor-command-more-trigger")
+        .expect("shared More trigger for second note");
+    cx.simulate_click(more.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            shell
+                .command_chrome
+                .as_ref()
+                .expect("second Chrome")
+                .read(app)
+                .more_open_for_test(),
+            "the second session must own its own More state"
+        );
+    });
+    select(first.id.clone(), cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .expect("reopened first Chrome")
+                .read(app)
+                .has_open_overlay(),
+            "switching back must not resurrect the other note's More menu"
+        );
+    });
+}
+
+#[gpui::test]
+async fn mounted_library_chrome_insert_image_event_uses_the_saved_selection_durable_picker_route(
+    cx: &mut TestAppContext,
+) {
+    // The shared button is allowed to request an image, but it must not call
+    // the spike's direct path insertion. The event subscription must first
+    // capture the LibraryShell saved Selection; this test then invokes the
+    // same native-picker completion seam that stages one durable resource.
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "Chrome 插图".into(),
+            notebook_id: None,
+            document: rich_document("资源前正文"),
+        })
+        .expect("create note");
+    let picker_path = profile.path().join("chrome-picker.png");
+    std::fs::write(&picker_path, structural_png(7, 5)).expect("write picker PNG");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+
+    let insert_image = cx
+        .debug_bounds("Insert image")
+        .expect("shared Insert image command");
+    cx.simulate_click(insert_image.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        view.read_with(cx, |shell, _| shell.pending_resource_insert.is_some()),
+        "the typed Chrome event must synchronously capture the LibraryShell saved Selection before presenting a picker"
+    );
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .complete_resource_picker_path(picker_path.clone(), window, shell_cx)
+                .expect("the Chrome event must use the existing staged picker completion")
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let probe = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert!(
+        probe.has_image_block && probe.cache_has_resource,
+        "the durable picker completion must update the current mounted document/cache without a note switch"
+    );
+    let persisted = repository
+        .load_note(&note.id)
+        .expect("load chrome-inserted note")
+        .expect("note remains");
+    assert_eq!(
+        persisted.resource_ids.len(),
+        1,
+        "the event route must publish exactly one ordered note-resource relation"
+    );
+    assert!(
+        persisted.body_html.contains("<img"),
+        "the staged durable snapshot must contain the inserted image atom"
+    );
+}
+
+#[gpui::test]
+async fn mounted_library_shared_link_popover_keeps_selection_and_returns_editor_focus(
+    cx: &mut TestAppContext,
+) {
+    // Link is the Chrome exception to ordinary editor focus. It gets a real
+    // input owner temporarily, but the selected document range remains on
+    // the same EditorCore and focus comes back after Apply or Cancel.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "链接格式".into(),
+            notebook_id: None,
+            document: rich_document("需要链接的文字"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let (editor, selected, history_before) = view.update(cx, |shell, shell_cx| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .expect("mounted note session")
+            .read(shell_cx)
+            .editor()
+            .clone();
+        let selected = editor.update(shell_cx, |editor, editor_cx| {
+            let block = editor.document().blocks().first().expect("text block");
+            let selected = Selection::new(
+                DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                DocPoint::with_affinity(
+                    block.id,
+                    block.content.as_text().expect("text").len(),
+                    Affinity::After,
+                ),
+            );
+            editor.set_selection_for_test(selected);
+            editor_cx.notify();
+            selected
+        });
+        let history = editor.read(shell_cx).undo_depth();
+        (editor, selected, history)
+    });
+
+    let link = cx.debug_bounds("Link").expect("shared Link button");
+    cx.simulate_click(link.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let chrome = shell
+            .command_chrome
+            .as_ref()
+            .expect("shared Chrome")
+            .read(app);
+        assert!(chrome.has_link_popover(), "Link opens the shared popover");
+        assert_eq!(
+            editor.read(app).selection(),
+            selected,
+            "opening Link never collapses the document range"
+        );
+    });
+    cx.update(|window, app| {
+        view.read_with(app, |shell, app| {
+            let popover = shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .link_popover_for_test()
+                .expect("Link popover entity");
+            assert!(
+                popover.read(app).focus.is_focused(window),
+                "the real URL field must own focus while it is open"
+            );
+        });
+    });
+    cx.simulate_input("https://example.com");
+    redraw(cx);
+    let apply = cx
+        .debug_bounds("evernote-link-apply")
+        .expect("shared Link Apply button");
+    cx.simulate_click(apply.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .has_link_popover(),
+            "Apply closes the shared Link popover"
+        );
+        let editor = editor.read(app);
+        assert_eq!(
+            editor.selection(),
+            selected,
+            "Apply restores the original document selection"
+        );
+        assert_eq!(
+            editor.undo_depth(),
+            history_before + 1,
+            "Link Apply is one editor transaction"
+        );
+        assert!(
+            editor.document().blocks()[0]
+                .content
+                .styles()
+                .expect("link styles")
+                .iter()
+                .any(|run| run.marks.iter().any(|mark| {
+                    matches!(mark, Mark::Link(url) if url == "https://example.com")
+                })),
+            "Apply mutates the active editor rather than a Chrome-local URL state"
+        );
+    });
+    cx.update(|window, app| {
+        view.read_with(app, |_shell, app| {
+            assert!(
+                editor.read(app).focus_handle().is_focused(window),
+                "Apply returns keyboard focus to the active library editor"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn mounted_library_shared_more_outside_click_dismisses_without_mutating_selection_or_history(
+    cx: &mut TestAppContext,
+) {
+    // The Library surface has a capture-phase pointer handler. The shared
+    // Chrome therefore needs a real window-layer backdrop rather than merely
+    // relying on the More panel's own rectangle to receive the click. If the
+    // backdrop goes away, this body click collapses the range before More can
+    // close and this mounted test fails.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "More 外点".into(),
+            notebook_id: None,
+            document: rich_document("保留这段选中的正文"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted selected-note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    let (editor, selected, history_before) = view.update(cx, |shell, shell_cx| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .expect("mounted note session")
+            .read(shell_cx)
+            .editor()
+            .clone();
+        let selected = editor.update(shell_cx, |editor, editor_cx| {
+            let block = editor.document().blocks().first().expect("text block");
+            let selected = Selection::new(
+                DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                DocPoint::with_affinity(
+                    block.id,
+                    block.content.as_text().expect("text").len(),
+                    Affinity::After,
+                ),
+            );
+            editor.set_selection_for_test(selected);
+            editor_cx.notify();
+            selected
+        });
+        let history_before = editor.read(shell_cx).undo_depth();
+        (editor, selected, history_before)
+    });
+    let more = cx
+        .debug_bounds("library-editor-command-more-trigger")
+        .expect("shared More trigger");
+    cx.simulate_click(more.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        view.read_with(cx, |shell, app| {
+            shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .more_open_for_test()
+        }),
+        "the shared More overlay must be open before its outside click"
+    );
+
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted body surface");
+    let outside_menu = point(surface.left() + px(10.0), surface.bottom() - px(10.0));
+    cx.simulate_click(outside_menu, Modifiers::default());
+    redraw(cx);
+
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .has_open_overlay(),
+            "an outside body click must close More"
+        );
+        let editor = editor.read(app);
+        assert_eq!(
+            editor.selection(),
+            selected,
+            "the backdrop must occlude the body capture handler and preserve selection"
+        );
+        assert_eq!(
+            editor.undo_depth(),
+            history_before,
+            "closing More is presentation-only and cannot add history"
+        );
+    });
+    cx.update(|window, app| {
+        assert!(
+            editor.read(app).focus_handle().is_focused(window),
+            "outside dismissal returns focus to the document"
+        );
+    });
+}
+
+#[gpui::test]
+async fn mounted_library_shared_link_outside_click_dismisses_without_mutating_selection_or_history(
+    cx: &mut TestAppContext,
+) {
+    // Link's URL field owns focus, but its transparent full-window dismissal
+    // layer must still occlude the surface's capture listener. Ordinary
+    // pointer hit-testing alone is insufficient because the body listener
+    // runs in capture phase.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "链接外点".into(),
+            notebook_id: None,
+            document: rich_document("保留链接范围"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted selected-note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    let (editor, selected, history_before) = view.update(cx, |shell, shell_cx| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .expect("mounted note session")
+            .read(shell_cx)
+            .editor()
+            .clone();
+        let selected = editor.update(shell_cx, |editor, editor_cx| {
+            let block = editor.document().blocks().first().expect("text block");
+            let selected = Selection::new(
+                DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                DocPoint::with_affinity(
+                    block.id,
+                    block.content.as_text().expect("text").len(),
+                    Affinity::After,
+                ),
+            );
+            editor.set_selection_for_test(selected);
+            editor_cx.notify();
+            selected
+        });
+        let history_before = editor.read(shell_cx).undo_depth();
+        (editor, selected, history_before)
+    });
+    let link = cx.debug_bounds("Link").expect("shared Link command");
+    cx.simulate_click(link.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        view.read_with(cx, |shell, app| {
+            shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .has_link_popover()
+        }),
+        "Link must open before testing its outside dismissal"
+    );
+
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted body surface");
+    let outside_popover = point(surface.left() + px(10.0), surface.bottom() - px(10.0));
+    cx.simulate_click(outside_popover, Modifiers::default());
+    redraw(cx);
+
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .has_open_overlay(),
+            "an outside body click must close Link"
+        );
+        let editor = editor.read(app);
+        assert_eq!(
+            editor.selection(),
+            selected,
+            "Link dismissal must not let the body capture handler replace the saved range"
+        );
+        assert_eq!(
+            editor.undo_depth(),
+            history_before,
+            "Link dismissal cannot create a formatting transaction"
+        );
+    });
+    cx.update(|window, app| {
+        assert!(
+            editor.read(app).focus_handle().is_focused(window),
+            "outside Link dismissal returns focus to the document"
+        );
+    });
+}
+
+#[gpui::test]
+async fn mounted_library_shared_chrome_escape_dismisses_more_and_link_without_editor_mutation(
+    cx: &mut TestAppContext,
+) {
+    // Escape is routed by the host only to the shared chrome's one dismiss
+    // API. This proves the More path is not a library-local menu and that
+    // both overlay kinds return the same editor selection/focus/history.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "Escape 覆盖层".into(),
+            notebook_id: None,
+            document: rich_document("选择在 Escape 后仍应存在"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted selected-note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    let (editor, selected, history_before) = view.update(cx, |shell, shell_cx| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .expect("mounted note session")
+            .read(shell_cx)
+            .editor()
+            .clone();
+        let selected = editor.update(shell_cx, |editor, editor_cx| {
+            let block = editor.document().blocks().first().expect("text block");
+            let selected = Selection::new(
+                DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                DocPoint::with_affinity(
+                    block.id,
+                    block.content.as_text().expect("text").len(),
+                    Affinity::After,
+                ),
+            );
+            editor.set_selection_for_test(selected);
+            editor_cx.notify();
+            selected
+        });
+        let history_before = editor.read(shell_cx).undo_depth();
+        (editor, selected, history_before)
+    });
+
+    let more = cx
+        .debug_bounds("library-editor-command-more-trigger")
+        .expect("shared More trigger");
+    cx.simulate_click(more.center(), Modifiers::default());
+    redraw(cx);
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .has_open_overlay(),
+            "Escape must close the shared More overlay"
+        );
+        let editor = editor.read(app);
+        assert_eq!(editor.selection(), selected, "Escape preserves selection");
+        assert_eq!(
+            editor.undo_depth(),
+            history_before,
+            "Escape adds no history"
+        );
+    });
+    cx.update(|window, app| {
+        assert!(editor.read(app).focus_handle().is_focused(window));
+    });
+
+    let link = cx.debug_bounds("Link").expect("shared Link command");
+    cx.simulate_click(link.center(), Modifiers::default());
+    redraw(cx);
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .has_open_overlay(),
+            "Escape must close the shared Link overlay"
+        );
+        let editor = editor.read(app);
+        assert_eq!(editor.selection(), selected, "Escape preserves selection");
+        assert_eq!(
+            editor.undo_depth(),
+            history_before,
+            "Escape adds no history"
+        );
+    });
+    cx.update(|window, app| {
+        assert!(editor.read(app).focus_handle().is_focused(window));
+    });
+}
+
+#[gpui::test]
+async fn mounted_library_shared_more_closes_on_real_editor_selection_change_without_history_or_link_input_corruption(
+    cx: &mut TestAppContext,
+) {
+    // This runs through the production key route after a real More click.
+    // A Chrome observer that merely redraws on EditorCore notify leaves a
+    // stale menu above the new selection. Conversely, typing into the Link
+    // field must not look like an EditorCore selection mutation and close the
+    // pinned popover.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "选择变更关闭 More".into(),
+            notebook_id: None,
+            document: rich_document("从这里向右移动选择"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted selected-note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    let (editor, before_selection, history_before) = view.update(cx, |shell, shell_cx| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .expect("mounted note session")
+            .read(shell_cx)
+            .editor()
+            .clone();
+        let before_selection = editor.update(shell_cx, |editor, editor_cx| {
+            let block = editor.document().blocks().first().expect("text block");
+            let selection =
+                Selection::caret(DocPoint::with_affinity(block.id, 0, Affinity::Before));
+            editor.set_selection_for_test(selection);
+            editor_cx.notify();
+            selection
+        });
+        let history_before = editor.read(shell_cx).undo_depth();
+        (editor, before_selection, history_before)
+    });
+    let more = cx
+        .debug_bounds("library-editor-command-more-trigger")
+        .expect("shared More trigger");
+    cx.simulate_click(more.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        view.read_with(cx, |shell, app| {
+            shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .more_open_for_test()
+        }),
+        "More is open before the real editor navigation"
+    );
+
+    cx.simulate_keystrokes("right");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .more_open_for_test(),
+            "a changed EditorCore selection must dismiss stale More state"
+        );
+        let editor = editor.read(app);
+        assert_ne!(
+            editor.selection(),
+            before_selection,
+            "the test must reach the real surface keyboard selection route"
+        );
+        assert_eq!(
+            editor.undo_depth(),
+            history_before,
+            "selection navigation and stale-menu dismissal cannot add history"
+        );
+    });
+
+    // Link is intentionally disabled for a bare caret. Give its real command
+    // a selected range so this test exercises the focused URL input rather
+    // than treating a present-but-disabled toolbar hit target as an open
+    // popover.
+    let link_selection = editor.update(cx, |editor, editor_cx| {
+        let block = editor.document().blocks().first().expect("text block");
+        let selection = Selection::new(
+            DocPoint::with_affinity(block.id, 0, Affinity::Before),
+            DocPoint::with_affinity(block.id, 1, Affinity::After),
+        );
+        editor.set_selection_for_test(selection);
+        editor_cx.notify();
+        selection
+    });
+    redraw(cx);
+    let link = cx.debug_bounds("Link").expect("shared Link command");
+    cx.simulate_click(link.center(), Modifiers::default());
+    redraw(cx);
+    assert!(
+        view.read_with(cx, |shell, app| {
+            shell
+                .command_chrome
+                .as_ref()
+                .expect("shared Chrome")
+                .read(app)
+                .has_link_popover()
+        }),
+        "the enabled Link command must open its real URL input before typing"
+    );
+    cx.simulate_input("https://selection-stays.example");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(
+            editor.read(app).selection(),
+            link_selection,
+            "typing in Link must not mutate the saved EditorCore selection"
+        );
+        let chrome = shell
+            .command_chrome
+            .as_ref()
+            .expect("shared Chrome")
+            .read(app);
+        assert!(
+            chrome.has_link_popover(),
+            "URL-field input must not falsely close the Link popover whose document selection is pinned"
+        );
+        let editor = editor.read(app);
+        assert_ne!(editor.selection(), before_selection);
+        assert_eq!(editor.undo_depth(), history_before);
     });
 }
 
@@ -584,6 +1820,207 @@ async fn library_canvas_shapes_and_executes_the_shared_paint_entity_path(cx: &mu
 }
 
 #[gpui::test]
+async fn mounted_persisted_images_paint_before_only_visible_blob_hydrates(cx: &mut TestAppContext) {
+    // Opening a persisted multi-image note must not synchronously stream every
+    // original blob through the GPUI session. The actual shared surface first
+    // paints stable image atoms, asks EditorCore for only its resident image,
+    // then the retained session worker materializes that one verified source.
+    // Removing the residency queue (or restoring prepare/from_prepared's eager
+    // loops) makes either the offscreen source or its verified-open observer
+    // appear here.
+    let (_profile, repository) = repository();
+    let first_bytes = structural_png(1200, 675);
+    let second_bytes = structural_png(675, 1200);
+    let first = repository
+        .import_resource(&first_bytes, "visible.png", "image/png", "png")
+        .expect("store visible image");
+    let second = repository
+        .import_resource(&second_bytes, "offscreen.png", "image/png", "png")
+        .expect("store offscreen image");
+    let first_hash = repository
+        .resource_metadata(&first)
+        .expect("read visible metadata")
+        .expect("visible metadata")
+        .sha256;
+    let second_hash = repository
+        .resource_metadata(&second)
+        .expect("read offscreen metadata")
+        .expect("offscreen metadata")
+        .sha256;
+    let note = repository
+        .create_note(CreateNote {
+            title: "可见图片按需加载".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Image {
+                    resource_id: first.clone(),
+                    alt: "首屏".into(),
+                    presentation: Default::default(),
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "撑开首屏与下一张图片的实际正文\n".repeat(220),
+                        marks: Marks::default(),
+                    }],
+                },
+                Block::Image {
+                    resource_id: second.clone(),
+                    alt: "远处".into(),
+                    presentation: Default::default(),
+                },
+            ]),
+        })
+        .expect("create persisted image note");
+    let opens = repository.observe_verified_resource_opens();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    assert!(
+        cx.debug_bounds("native-editor-surface").is_some(),
+        "the note switch must paint the shared surface before any nonvisible hydration"
+    );
+    let (visible_materialized, offscreen_materialized) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().expect("mounted session");
+        let editor = session.read(app).editor().read(app);
+        (
+            editor
+                .image_source_path(first.as_str())
+                .is_some_and(|path| path.is_file()),
+            editor
+                .image_source_path(second.as_str())
+                .is_some_and(|path| path.is_file()),
+        )
+    });
+    assert!(
+        visible_materialized,
+        "the resident first image must eventually materialize without a SelectNote/reopen"
+    );
+    assert!(
+        !offscreen_materialized,
+        "the offscreen original must remain unread and unmaterialized after the first paint"
+    );
+    let mut opened = Vec::new();
+    loop {
+        match opens.try_recv() {
+            Ok(hash) => opened.push(hash),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+    assert!(
+        !opened.is_empty() && opened.iter().all(|hash| hash == &first_hash),
+        "only the visible image may cross the verified descriptor boundary on first paint; opened={opened:?}"
+    );
+    assert!(
+        !opened.iter().any(|hash| hash == &second_hash),
+        "the offscreen image must not be verified/read until it becomes resident"
+    );
+}
+
+#[gpui::test]
+async fn mounted_missing_persisted_image_fails_only_after_paint_and_keeps_the_note_surface(
+    cx: &mut TestAppContext,
+) {
+    // A bad persisted blob is a node-level presentation failure, not a codec
+    // failure for the entire note. Bare preparation intentionally avoids the
+    // descriptor; the real shared surface must request its visible atom,
+    // report a visible notice, and preserve the surrounding editable body.
+    let (profile, repository) = repository();
+    let resource = repository
+        .import_resource(
+            &structural_png(800, 400),
+            "missing-after-sync.png",
+            "image/png",
+            "png",
+        )
+        .expect("persist image metadata and blob");
+    let note = repository
+        .create_note(CreateNote {
+            title: "局部图片故障".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "图片前文字".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                Block::Image {
+                    resource_id: resource.clone(),
+                    alt: "丢失的图片".into(),
+                    presentation: Default::default(),
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "图片后文字".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+            ]),
+        })
+        .expect("create persisted note");
+    let metadata = repository
+        .resource_metadata(&resource)
+        .expect("load metadata")
+        .expect("metadata exists");
+    std::fs::remove_file(
+        profile
+            .path()
+            .join("resources/blobs")
+            .join(metadata.sha256.as_str()),
+    )
+    .expect("simulate missing local blob");
+
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    assert!(
+        cx.debug_bounds("native-editor-surface").is_some(),
+        "one missing image must never replace the full native document with unsupported UI"
+    );
+    let (failed_image, warning, surrounding_text) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().expect("mounted session");
+        let editor = session.read(app).editor().read(app);
+        (
+            editor.image_state(resource.as_str())
+                == Some(crate::native_editor::images::ImageNodeState::Failed),
+            shell.resource_notice_for_test(),
+            editor
+                .document()
+                .blocks()
+                .iter()
+                .filter_map(|block| block.content.as_text())
+                .collect::<String>(),
+        )
+    });
+    assert!(
+        failed_image,
+        "the requested missing atom must paint as failed"
+    );
+    assert!(
+        warning.is_some_and(|message| message.contains("图片")),
+        "the shell must surface the node-level failure instead of only logging it"
+    );
+    assert_eq!(surrounding_text, "图片前文字图片后文字");
+}
+
+#[gpui::test]
 async fn mounted_editable_session_uses_real_title_and_body_input_then_persists(
     cx: &mut TestAppContext,
 ) {
@@ -665,6 +2102,365 @@ async fn mounted_editable_session_uses_real_title_and_body_input_then_persists(
             Some(&stored.id),
             "input/save actions must not mutate library selection"
         );
+    });
+}
+
+#[gpui::test]
+async fn mounted_text_image_text_uses_surface_keys_for_atomic_boundaries_and_history(
+    cx: &mut TestAppContext,
+) {
+    // Keep this one compact, mounted matrix on the actual shared canvas. It
+    // deliberately does not call the editor's delete/history methods: an
+    // unbound `EditorSurface` action would leave every direct-model test
+    // green while these ordinary keyboard paths remain broken.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let image = structural_png(800, 400);
+    let image_id = repository
+        .import_resource(&image, "边界图.png", "image/png", "png")
+        .expect("import durable image");
+    let note = repository
+        .create_note(CreateNote {
+            title: "图片边界事件路径".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "前".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                Block::Image {
+                    resource_id: image_id.clone(),
+                    alt: "边界图".into(),
+                    presentation: Default::default(),
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "后".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+            ]),
+        })
+        .expect("create text-image-text note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let image_node = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .read(app)
+            .editor()
+            .read(app)
+            .document()
+            .blocks()[1]
+            .id
+    });
+
+    let bounds = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| {
+            let session = shell.note_session.as_ref().expect("mounted session");
+            let editor = session.read(app).editor().read(app);
+            let blocks = editor.document().blocks();
+            (
+                editor
+                    .layout()
+                    .block_layout(blocks[0].id)
+                    .expect("leading text layout")
+                    .bounds,
+                editor
+                    .layout()
+                    .block_layout(blocks[1].id)
+                    .expect("image layout")
+                    .bounds,
+                editor
+                    .layout()
+                    .block_layout(blocks[2].id)
+                    .expect("trailing text layout")
+                    .bounds,
+            )
+        })
+    };
+    let image_count = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| {
+            let session = shell.note_session.as_ref().expect("mounted session");
+            session
+                .read(app)
+                .editor()
+                .read(app)
+                .document()
+                .blocks()
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block.content,
+                        crate::native_editor::model::BlockContent::Image { .. }
+                    )
+                })
+                .count()
+        })
+    };
+
+    // Input on each real side of the atom must remain in its respective
+    // text block, rather than flattening the image into a temporary UI row.
+    let (leading, _, _) = bounds(cx);
+    cx.simulate_click(
+        point(leading.right() - px(2.0), leading.center().y),
+        Modifiers::default(),
+    );
+    cx.simulate_input("甲");
+    redraw(cx);
+    let (_, _, trailing) = bounds(cx);
+    cx.simulate_click(
+        point(trailing.left() + px(2.0), trailing.center().y),
+        Modifiers::default(),
+    );
+    cx.simulate_input("乙");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().expect("mounted session");
+        let editor = session.read(app).editor().read(app);
+        assert!(
+            editor.document().blocks()[0]
+                .content
+                .as_text()
+                .is_some_and(|text| text.contains('甲')),
+            "left-side surface input must stay in the paragraph before the image"
+        );
+        assert!(
+            editor.document().blocks()[2]
+                .content
+                .as_text()
+                .is_some_and(|text| text.contains('乙')),
+            "right-side surface input must stay in the paragraph after the image"
+        );
+    });
+
+    // Backspace after and Delete before are two different keyboard actions
+    // around an atomic block. Both must remove the same structural resource
+    // and both must round-trip through the *surface* undo/redo actions.
+    let (_, image_bounds, _) = bounds(cx);
+    let image_hit = point(image_bounds.right() - px(2.0), image_bounds.center().y);
+    view.read_with(cx, |shell, app| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .read(app)
+            .editor()
+            .read(app);
+        assert_eq!(
+            editor.layout().atomic_block_at(image_hit),
+            Some(image_node),
+            "the stored image geometry must use the same coordinate space as EditorSurface mouse hits; image_bounds={image_bounds:?}, hit={image_hit:?}"
+        );
+    });
+    cx.simulate_click(image_hit, Modifiers::default());
+    // GPUI delivers the surface mouse handler during the next presentation
+    // pass. Keep the assertion after that pass, just like the attachment
+    // interaction test, so it observes the production event result rather
+    // than the queued input event.
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let selection = shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .read(app)
+            .editor()
+            .read(app)
+            .selection();
+        assert!(
+            !selection.is_caret()
+                && selection.anchor.node_id == image_node
+                && selection.head.node_id == image_node,
+            "a click on an inline image must create one full atomic selection; selection={selection:?}, expected_image={image_node:?}"
+        );
+    });
+    cx.simulate_keystrokes("backspace");
+    redraw(cx);
+    assert_eq!(
+        image_count(cx),
+        0,
+        "Backspace after image must remove the atom"
+    );
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert_eq!(
+        image_count(cx),
+        1,
+        "surface Undo restores the image relation"
+    );
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    assert_eq!(image_count(cx), 0, "surface Redo reapplies atomic deletion");
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+
+    let (_, image_bounds, _) = bounds(cx);
+    cx.simulate_click(
+        point(image_bounds.left() + px(2.0), image_bounds.center().y),
+        Modifiers::default(),
+    );
+    redraw(cx);
+    cx.simulate_keystrokes("delete");
+    redraw(cx);
+    assert_eq!(
+        image_count(cx),
+        0,
+        "Delete before image must remove the atom"
+    );
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+
+    // Manual Sync gives this mounted history sequence a durable check: the
+    // same image relation and text edits must survive the real save
+    // coordinator rather than only the canvas's undo stack. Focused
+    // EditorCore/EntityInputHandler tests cover cross-block selection and
+    // IME mapping without creating a second, synthetic GPUI drag harness.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx);
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let persisted = repository
+        .load_note(&note.id)
+        .expect("load mounted event-path save")
+        .expect("note remains");
+    assert_eq!(persisted.resource_ids, vec![image_id]);
+    assert!(persisted.body_text.contains('甲'));
+    assert!(persisted.body_text.contains('乙'));
+}
+
+#[gpui::test]
+async fn mounted_atomic_gap_and_terminal_dead_zone_create_paragraphs_before_typing(
+    cx: &mut TestAppContext,
+) {
+    // This drives the actual shared EditorSurface mouse route.  It catches a
+    // canvas that leaves image/attachment gaps as fake after-caret positions
+    // until the first input event, which produces an observable layout jump
+    // and breaks adjacent IME composition.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let first = repository
+        .import_resource(
+            b"%PDF-1.7\nfirst\n%%EOF",
+            "first.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .expect("import first attachment");
+    let second = repository
+        .import_resource(
+            b"%PDF-1.7\nsecond\n%%EOF",
+            "second.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .expect("import second attachment");
+    let stored = repository
+        .create_note(CreateNote {
+            title: "原子块间隙".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Attachment {
+                    resource_id: first,
+                    filename: "first.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+                Block::Attachment {
+                    resource_id: second,
+                    filename: "second.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+            ]),
+        })
+        .expect("create adjacent attachment note");
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    let card = cx.debug_bounds("library-note-card").expect("mounted card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    let (first_bounds, second_bounds) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().expect("mounted session");
+        let editor = session.read(app).editor().read(app);
+        (
+            editor
+                .layout()
+                .block_layout(editor.document().blocks()[0].id)
+                .expect("first attachment layout")
+                .bounds,
+            editor
+                .layout()
+                .block_layout(editor.document().blocks()[1].id)
+                .expect("second attachment layout")
+                .bounds,
+        )
+    });
+    // This is exactly the shared-canvas seam: no text input has happened
+    // yet, and both resource cards are already painted/laid out.
+    cx.simulate_click(
+        point(first_bounds.left() + px(18.0), first_bounds.bottom()),
+        Modifiers::default(),
+    );
+    redraw(cx);
+    let inserted_between = view.read_with(cx, |shell, app| {
+        let session = shell
+            .note_session
+            .as_ref()
+            .expect("session remains mounted");
+        let editor = session.read(app).editor().read(app);
+        editor.document().blocks().len() == 3
+            && matches!(
+                editor.document().blocks()[1].kind,
+                crate::native_editor::model::BlockKind::Paragraph
+            )
+            && editor.document().blocks()[1].content.as_text() == Some("")
+            && editor.selection().head.node_id == editor.document().blocks()[1].id
+    });
+    assert!(
+        inserted_between,
+        "the resource gap must materialize a focused paragraph before typing"
+    );
+
+    // A click in the blank tail below the last atomic card is the same
+    // semantic operation, not a later first-character fallback.
+    cx.simulate_click(
+        point(
+            second_bounds.left() + px(18.0),
+            second_bounds.bottom() + px(30.0),
+        ),
+        Modifiers::default(),
+    );
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let session = shell
+            .note_session
+            .as_ref()
+            .expect("session remains mounted");
+        let editor = session.read(app).editor().read(app);
+        let tail = editor
+            .document()
+            .blocks()
+            .last()
+            .expect("terminal paragraph");
+        assert_eq!(tail.kind, crate::native_editor::model::BlockKind::Paragraph);
+        assert_eq!(tail.content.as_text(), Some(""));
+        assert_eq!(editor.selection().head.node_id, tail.id);
+        assert_eq!(shell.surface_note_id, Some(stored.id.clone()));
     });
 }
 
@@ -758,6 +2554,236 @@ async fn mounted_editor_keeps_painting_while_a_slow_background_journal_waits(
                 && durable_after_release.body_text.contains("后台慢写")),
         "releasing the worker should complete a durable retained save; state={state_after_release:?}, journal={journal_after_release:?}, durable={durable_after_release:?}"
     );
+}
+
+#[gpui::test]
+async fn mounted_cmd_v_after_typing_queues_saved_point_until_journal_worker_finishes(
+    cx: &mut TestAppContext,
+) {
+    // This is the real library Paste action, not a direct EditorCore image
+    // transaction. It catches the common path where Cmd-V lands immediately
+    // after typing and the 100ms journal worker already owns the generation.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "保存中的粘贴".into(),
+            notebook_id: None,
+            document: rich_document("正文"),
+        })
+        .expect("create note");
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+
+    let session = view.read_with(cx, |shell, _| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .clone()
+    });
+    let release = session.update(cx, |session, _| {
+        session.enable_deadline_tasks_for_test();
+        session.stall_next_background_save_for_test()
+    });
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted editable canvas");
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 刚输入");
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    assert!(matches!(
+        session.read_with(cx, |session, _| session.save_state()),
+        crate::app::save_coordinator::SaveState::Journaling
+    ));
+
+    let png = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture");
+    cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+        ImageFormat::Png,
+        png.bytes,
+    )));
+    cx.dispatch_action(Paste);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.queued_resource_inserts.len()),
+        1,
+        "Cmd-V during a writer must retain one real resource completion"
+    );
+    assert!(
+        repository
+            .load_note(&note.id)
+            .expect("read base while worker gated")
+            .expect("note exists")
+            .resource_ids
+            .is_empty(),
+        "no placeholder or half-associated resource may become visible before worker completion"
+    );
+
+    // Move the live caret after the paste event. The deferred completion must
+    // honor the point captured by Cmd-V, not this later user selection.
+    cx.simulate_keystrokes("home");
+    release.send(()).expect("release journal worker");
+    cx.run_until_parked();
+    redraw(cx);
+
+    let (queued, image_after_text, document, resource_ids) = view.read_with(cx, |shell, app| {
+        let session = shell
+            .note_session
+            .as_ref()
+            .expect("session remains mounted");
+        let editor = session.read(app).editor().read(app);
+        (
+            shell.queued_resource_inserts.len(),
+            matches!(
+                editor
+                    .document()
+                    .blocks()
+                    .get(1)
+                    .map(|block| &block.content),
+                Some(crate::native_editor::model::BlockContent::Image { .. })
+            ) && editor
+                .document()
+                .blocks()
+                .first()
+                .and_then(|block| block.content.as_text())
+                .is_some_and(|text| text.contains("正文 刚输入")),
+            format!("{:?}", editor.document().blocks()),
+            repository
+                .load_note(&note.id)
+                .expect("load durable inserted note")
+                .expect("note exists")
+                .resource_ids,
+        )
+    });
+    assert_eq!(queued, 0);
+    assert!(
+        image_after_text,
+        "deferred Cmd-V must use its saved end point rather than the later Home caret: {document}"
+    );
+    assert_eq!(resource_ids.len(), 1);
+}
+
+#[gpui::test]
+async fn mounted_finder_drop_completion_queues_through_the_same_saved_point_fence(
+    cx: &mut TestAppContext,
+) {
+    // GPUI 0.2.2 does not expose a public non-empty ExternalPaths constructor
+    // for tests. The call below is the production post-hit-test completion
+    // used by on_drop, with a real file and the same captured DocPoint.
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "保存中的拖放".into(),
+            notebook_id: None,
+            document: rich_document("拖放正文"),
+        })
+        .expect("create note");
+    let path = profile.path().join("finder-drop.png");
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .expect("PNG fixture")
+        .bytes;
+    std::fs::write(&path, bytes).expect("write Finder fixture");
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .clone()
+    });
+    let release = session.update(cx, |session, _| {
+        session.enable_deadline_tasks_for_test();
+        session.stall_next_background_save_for_test()
+    });
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted editable canvas");
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 刚输入");
+    let saved_drop_point = session
+        .update(cx, |session, session_cx| {
+            session.capture_resource_insert_intent(session_cx)
+        })
+        .expect("capture saved Finder-drop selection");
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .complete_resource_drop_paths(
+                    vec![path.clone()],
+                    saved_drop_point,
+                    window,
+                    shell_cx,
+                )
+                .expect("Finder completion must queue instead of reject during save")
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.queued_resource_inserts.len()),
+        1
+    );
+    cx.simulate_keystrokes("home");
+    release.send(()).expect("release journal worker");
+    cx.run_until_parked();
+    redraw(cx);
+
+    let (image_after_text, resource_count) = view.read_with(cx, |shell, app| {
+        let session = shell
+            .note_session
+            .as_ref()
+            .expect("session remains mounted");
+        let editor = session.read(app).editor().read(app);
+        (
+            matches!(
+                editor
+                    .document()
+                    .blocks()
+                    .get(1)
+                    .map(|block| &block.content),
+                Some(crate::native_editor::model::BlockContent::Image { .. })
+            ) && editor
+                .document()
+                .blocks()
+                .first()
+                .and_then(|block| block.content.as_text())
+                .is_some_and(|text| text.contains("拖放正文 刚输入")),
+            repository
+                .load_note(&note.id)
+                .expect("load dropped note")
+                .expect("note exists")
+                .resource_ids
+                .len(),
+        )
+    });
+    assert!(image_after_text);
+    assert_eq!(resource_count, 1);
 }
 
 #[gpui::test]
@@ -1781,4 +3807,421 @@ async fn uniform_list_does_not_truncate_the_101st_projection(cx: &mut TestAppCon
             "the 101st card must dispatch selection through LibraryShell"
         );
     });
+}
+
+#[gpui::test]
+async fn mounted_attachment_click_selects_the_whole_card_and_double_click_opens_a_verified_copy(
+    cx: &mut TestAppContext,
+) {
+    // This is intentionally an actual EditorSurface pointer route, not a
+    // direct editor mutation. Removing the atomic hit handling or the typed
+    // surface event makes the assertions below fail even though the card may
+    // still paint.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let resource_id = repository
+        .import_resource(
+            b"%PDF-1.7\nattachment opener fixture\n%%EOF",
+            "证据.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .expect("import durable attachment");
+    let note = repository
+        .create_note(CreateNote {
+            title: "附件交互".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource_id.clone(),
+                filename: "证据.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+        })
+        .expect("create attachment note");
+    let successor = repository
+        .create_note(CreateNote {
+            title: "关闭附件会话".into(),
+            notebook_id: None,
+            document: rich_document("successor"),
+        })
+        .expect("create successor note");
+    let before = repository
+        .load_note(&note.id)
+        .expect("load before open")
+        .expect("durable note before open");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-selected-note-card")
+        .expect("mounted selected attachment note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let opener: Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync> = {
+        let opened = Arc::clone(&opened);
+        Arc::new(move |path| {
+            opened
+                .lock()
+                .expect("opener result mutex")
+                .push(path.to_path_buf());
+            Ok(())
+        })
+    };
+    view.update(cx, |shell, shell_cx| {
+        shell.set_attachment_opener_for_test(opener, shell_cx);
+        shell_cx.notify();
+    });
+    let (attachment_bounds, attachment_node) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().expect("mounted note session");
+        let editor = session.read(app).editor().read(app);
+        let block = editor
+            .document()
+            .blocks()
+            .iter()
+            .find(|block| matches!(block.content, BlockContent::Attachment { .. }))
+            .expect("attachment block");
+        (
+            editor
+                .layout()
+                .block_layout(block.id)
+                .expect("attachment layout")
+                .bounds,
+            block.id,
+        )
+    });
+    let hit = point(
+        attachment_bounds.left() + px(18.0),
+        attachment_bounds.top() + px(18.0),
+    );
+
+    cx.simulate_click(hit, Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().expect("mounted note session");
+        let editor = session.read(app).editor().read(app);
+        let selection = editor.selection();
+        assert!(
+            !selection.is_caret()
+                && selection.anchor.node_id == attachment_node
+                && selection.head.node_id == attachment_node,
+            "a single card click must select the complete atomic attachment, not merely place a caret"
+        );
+    });
+
+    // Platform double-click is a second mouse-down carrying click_count=2.
+    // The surface emits a typed event; the shell then starts its retained
+    // worker, so no desktop opener runs from the draw/input callback itself.
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: hit,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: hit,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
+    redraw(cx);
+
+    let opened = opened.lock().expect("opener result mutex");
+    assert_eq!(
+        opened.len(),
+        1,
+        "double-click must call the injected opener once"
+    );
+    assert_eq!(
+        opened[0]
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("pdf")
+    );
+    assert!(
+        std::fs::read(&opened[0])
+            .expect("verified temporary copy remains readable")
+            .starts_with(b"%PDF-1.7"),
+        "the opener receives a materialized, verified copy rather than a profile path"
+    );
+    let materialized_path = opened[0].clone();
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(materialized_path.parent().expect("attachment lease root"))
+                .expect("attachment lease root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the controlled attachment lease directory must not be traversable by other users"
+        );
+        assert_eq!(
+            std::fs::metadata(&materialized_path)
+                .expect("materialized attachment metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the opener handoff file must not become world-readable in the shared temp directory"
+        );
+    }
+    drop(opened);
+    let after = repository
+        .load_note(&note.id)
+        .expect("load after open")
+        .expect("durable note after open");
+    assert_eq!(
+        after.revision, before.revision,
+        "opening must not save a document mutation"
+    );
+    assert_eq!(
+        after.body_html, before.body_html,
+        "opening must not change the document"
+    );
+
+    // The opener owns its OS hand-off, but the session owns the controlled
+    // cache path. Switching away drops the old editor/surface and must not
+    // retain an attachment copy in the global temp parent.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::SelectNote(successor.id.clone()),
+                window,
+                shell_cx,
+            )
+        });
+    });
+    redraw(cx);
+    assert!(
+        !materialized_path.exists(),
+        "switching the retained session must release the attachment temporary copy"
+    );
+}
+
+#[gpui::test]
+async fn mounted_attachment_open_lease_survives_a_switch_until_the_worker_returns(
+    cx: &mut TestAppContext,
+) {
+    // A session switch can happen after the verified copy is ready but before
+    // the platform opener has returned. The worker, not the old editor cache,
+    // owns that lease: deleting the session must neither erase the file under
+    // the opener nor leave it orphaned after the weak completion can no longer
+    // upgrade the old NoteSession.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let resource_id = repository
+        .import_resource(
+            b"%PDF-1.7\nattachment handoff fixture\n%%EOF",
+            "交接.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .expect("import durable attachment");
+    let note = repository
+        .create_note(CreateNote {
+            title: "附件交接".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource_id.clone(),
+                filename: "交接.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+        })
+        .expect("create attachment note");
+    let successor = repository
+        .create_note(CreateNote {
+            title: "后继笔记".into(),
+            notebook_id: None,
+            document: rich_document("successor"),
+        })
+        .expect("create successor note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+
+    let opener: Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync> =
+        Arc::new(|_| Ok(()));
+    let (release, materialized) = view.update(cx, |shell, shell_cx| {
+        shell.set_attachment_opener_for_test(opener, shell_cx);
+        shell.stall_next_attachment_open_for_test(shell_cx)
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.open_attachment_resource(resource_id.as_str().to_owned(), shell_cx);
+    });
+    cx.run_until_parked();
+    let materialized_path = materialized
+        .recv_timeout(Duration::from_secs(1))
+        .expect("the retained worker must expose its verified handoff only after materializing it");
+    assert!(
+        materialized_path.is_file(),
+        "the worker-owned handoff must remain readable while the opener is gated"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(materialized_path.parent().expect("lease root"))
+                .expect("lease root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the independent worker lease root must be private"
+        );
+        assert_eq!(
+            std::fs::metadata(&materialized_path)
+                .expect("lease leaf metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the independent worker lease leaf must be private"
+        );
+    }
+
+    // This is deliberately a normal reducer-driven note switch rather than a
+    // direct entity release. It catches a session-owned image-cache root being
+    // removed while the asynchronous platform handoff still owns the file.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::SelectNote(successor.id.clone()),
+                window,
+                shell_cx,
+            )
+        });
+    });
+    redraw(cx);
+    assert!(
+        materialized_path.is_file(),
+        "switching notes before opener return must not delete the worker-owned handoff"
+    );
+
+    release
+        .send(())
+        .expect("release attachment opener worker after switch");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        !materialized_path.exists(),
+        "a completion whose old session is gone must release its handoff lease instead of orphaning it"
+    );
+}
+
+#[gpui::test]
+async fn mounted_attachment_open_failure_is_visible_without_mutating_the_document(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let resource_id = repository
+        .import_resource(
+            b"%PDF-1.7\nfailed opener fixture\n%%EOF",
+            "失败.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .expect("import durable attachment");
+    let note = repository
+        .create_note(CreateNote {
+            title: "附件打开失败".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id,
+                filename: "失败.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+        })
+        .expect("create attachment note");
+    let before = repository
+        .load_note(&note.id)
+        .expect("load before failed open")
+        .expect("durable note before failed open");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted attachment note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+    let failed_handoff_path = Arc::new(Mutex::new(None));
+    let failing_opener: Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync> = {
+        let failed_handoff_path = Arc::clone(&failed_handoff_path);
+        Arc::new(move |path| {
+            *failed_handoff_path
+                .lock()
+                .expect("failed handoff path mutex") = Some(path.to_path_buf());
+            Err("系统默认应用拒绝打开测试附件".to_owned())
+        })
+    };
+    view.update(cx, |shell, shell_cx| {
+        shell.set_attachment_opener_for_test(failing_opener, shell_cx);
+        shell_cx.notify();
+    });
+    let attachment_bounds = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().expect("mounted note session");
+        let editor = session.read(app).editor().read(app);
+        let block = editor
+            .document()
+            .blocks()
+            .iter()
+            .find(|block| matches!(block.content, BlockContent::Attachment { .. }))
+            .expect("attachment block");
+        editor
+            .layout()
+            .block_layout(block.id)
+            .expect("attachment layout")
+            .bounds
+    });
+    let hit = point(
+        attachment_bounds.left() + px(18.0),
+        attachment_bounds.top() + px(18.0),
+    );
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: hit,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: hit,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("library-resource-notice").is_some(),
+        "open failure must become visible feedback rather than a stderr-only error"
+    );
+    let failed_handoff_path = failed_handoff_path
+        .lock()
+        .expect("failed handoff path mutex")
+        .clone()
+        .expect("the failing opener must receive the verified private handoff");
+    assert!(
+        !failed_handoff_path.exists(),
+        "a nonzero/injected opener failure must drop the worker lease instead of leaving a readable handoff behind"
+    );
+    let after = repository
+        .load_note(&note.id)
+        .expect("load after failed open")
+        .expect("durable note after failed open");
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.body_html, before.body_html);
 }

@@ -1,17 +1,24 @@
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::OnceLock;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::mpsc::{Receiver, Sender, channel};
 use thiserror::Error;
 
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Attachments need a separate upper bound from inline images.  Keeping the
+/// existing ten-megabyte image cap protects decode and layout work, while a
+/// bounded larger container lets the library preserve ordinary PDF/audio/video
+/// files without treating arbitrary unbounded input as a resource.
+pub const MAX_RESOURCE_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceId(String);
@@ -88,7 +95,6 @@ pub struct ResourceInput<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceBlob {
-    pub id: ResourceId,
     pub sha256: BlobHash,
     pub size: usize,
 }
@@ -100,7 +106,14 @@ pub struct ResourceStore {
     // removes a caller's pre-existing resources directory.
     cleanup_resources: Option<DirFd>,
     cleanup_profile: Option<DirFd>,
+    #[cfg(any(test, feature = "test-support"))]
     read_observers: Mutex<Vec<Sender<BlobHash>>>,
+    /// Kept separate from `read_observers`: a descriptor-safe caller may
+    /// stream a verified blob without allocating a `Vec`, but mounting a note
+    /// must still be able to prove that it did not eagerly cross this resource
+    /// boundary for every image.
+    #[cfg(any(test, feature = "test-support"))]
+    verified_open_observers: Mutex<Vec<Sender<BlobHash>>>,
 }
 
 /// A profile directory held open by descriptor. SQLite still needs a pathname,
@@ -147,7 +160,10 @@ impl ResourceStore {
             blobs_dir,
             cleanup_resources: None,
             cleanup_profile: None,
+            #[cfg(any(test, feature = "test-support"))]
             read_observers: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            verified_open_observers: Mutex::new(Vec::new()),
         })
     }
 
@@ -178,7 +194,10 @@ impl ResourceStore {
             blobs_dir,
             cleanup_resources,
             cleanup_profile,
+            #[cfg(any(test, feature = "test-support"))]
             read_observers: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            verified_open_observers: Mutex::new(Vec::new()),
         })
     }
 
@@ -188,20 +207,38 @@ impl ResourceStore {
     }
 
     pub fn put(&self, input: ResourceInput<'_>) -> Result<ResourceBlob, ResourceError> {
-        validate_import(&input)?;
+        self.put_reader(
+            std::io::Cursor::new(input.bytes),
+            input.bytes.len(),
+            input.title,
+            input.mime,
+            input.file_extension,
+        )
+    }
 
-        let digest = Sha256::digest(input.bytes);
-        let sha256 = BlobHash::new(hex_digest(&digest)).expect("SHA-256 digest is valid");
-        persist_blob(self.blobs_dir.0, input.bytes, sha256.as_str())?;
-        Ok(ResourceBlob {
-            id: ResourceId::new(new_resource_id()?).expect("generated resource id is valid"),
-            sha256,
-            size: input.bytes.len(),
-        })
+    /// Atomically stage a bounded resource from a caller-owned stream.
+    ///
+    /// Finder/drop input may name a large regular file.  Accepting a `Read`
+    /// boundary here keeps those bytes out of a second `Vec`: the only
+    /// working storage is a fixed 64KiB block while the SHA-256 and the
+    /// descriptor-relative temporary blob are produced together.  Clipboard
+    /// byte payloads still use [`Self::put`], but take this same path.
+    pub fn put_reader<R: Read>(
+        &self,
+        mut reader: R,
+        size: usize,
+        title: &str,
+        mime: &str,
+        file_extension: &str,
+    ) -> Result<ResourceBlob, ResourceError> {
+        validate_import_metadata(size, title, mime, file_extension)?;
+        let sha256 = persist_blob_from_reader(self.blobs_dir.0, &mut reader, size)?;
+        Ok(ResourceBlob { sha256, size })
     }
 
     /// Observes actual blob-byte reads. Projection/list consumers use this
     /// narrow diagnostic seam to prove they never hydrate Task-5 resources.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn observe_reads(&self) -> Receiver<BlobHash> {
         let (sender, receiver) = channel();
         self.read_observers
@@ -211,12 +248,60 @@ impl ResourceStore {
         receiver
     }
 
+    /// Observes a successful descriptor-safe verified open. This is narrower
+    /// than [`Self::observe_reads`]: it intentionally includes streaming
+    /// consumers so tests can ensure a list/detail mount does not hash and
+    /// materialize every resource before the renderer requests it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_verified_opens(&self) -> Receiver<BlobHash> {
+        let (sender, receiver) = channel();
+        self.verified_open_observers
+            .lock()
+            .expect("resource verified-open observer mutex poisoned")
+            .push(sender);
+        receiver
+    }
+
     pub fn read(&self, sha256: &BlobHash) -> Result<Vec<u8>, ResourceError> {
+        #[cfg(any(test, feature = "test-support"))]
         self.read_observers
             .lock()
             .expect("resource read observer mutex poisoned")
             .retain(|observer| observer.send(sha256.clone()).is_ok());
         self.read_blob(sha256.as_str())
+    }
+
+    /// Opens a descriptor-bound blob after streaming its digest validation.
+    ///
+    /// This deliberately does not use `read`: callers that need to materialize
+    /// a cache source can copy from the verified descriptor in bounded chunks
+    /// without allocating a second resource-sized `Vec`, and list/read
+    /// observers keep their useful meaning as a detector for eager hydration.
+    pub fn open_verified(&self, sha256: &BlobHash) -> Result<File, ResourceError> {
+        let Some(mut file) = open_blob(self.blobs_dir.0, sha256.as_str())? else {
+            return Err(ResourceError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )));
+        };
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        if hex_digest(&digest.finalize()) != sha256.as_str() {
+            return Err(ResourceError::CorruptBlob);
+        }
+        file.seek(SeekFrom::Start(0))?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.verified_open_observers
+            .lock()
+            .expect("resource verified-open observer mutex poisoned")
+            .retain(|observer| observer.send(sha256.clone()).is_ok());
+        Ok(file)
     }
 
     fn read_blob(&self, sha256: &str) -> Result<Vec<u8>, ResourceError> {
@@ -373,37 +458,74 @@ fn fd_display_path(fd: RawFd) -> Result<PathBuf, ResourceError> {
     }
 }
 
-fn validate_import(input: &ResourceInput<'_>) -> Result<(), ResourceError> {
-    if input.bytes.is_empty() || input.bytes.len() > MAX_IMAGE_BYTES {
+fn validate_import_metadata(
+    size: usize,
+    title: &str,
+    mime: &str,
+    file_extension: &str,
+) -> Result<(), ResourceError> {
+    if size == 0 {
         return Err(ResourceError::InvalidData);
     }
-    if !matches!(input.mime, "image/png" | "image/jpeg") {
+    if mime.starts_with("image/") {
+        if size > MAX_IMAGE_BYTES {
+            return Err(ResourceError::InvalidData);
+        }
+    } else if size > MAX_RESOURCE_BYTES {
         return Err(ResourceError::InvalidData);
     }
-    if !matches!(input.file_extension, "png" | "jpg" | "jpeg")
-        || input.file_extension.contains('/')
-        || input.file_extension.contains('\\')
-        || input.file_extension == "."
-        || input.file_extension == ".."
-    {
+    if !valid_mime(mime) || !valid_extension(file_extension) || !valid_title(title) {
         return Err(ResourceError::UnsafePath);
     }
     Ok(())
 }
 
-fn persist_blob(dir_fd: RawFd, bytes: &[u8], sha256: &str) -> Result<(), ResourceError> {
-    if let Some(mut existing) = open_blob(dir_fd, sha256)? {
-        let mut current = Vec::new();
-        existing.read_to_end(&mut current)?;
-        if hex_digest(&Sha256::digest(&current)) != sha256 {
-            return Err(ResourceError::CorruptBlob);
-        }
-        existing.sync_all()?;
-        fsync_fd(dir_fd)?;
-        return Ok(());
-    }
+fn valid_mime(mime: &str) -> bool {
+    let Some((kind, subtype)) = mime.split_once('/') else {
+        return false;
+    };
+    !kind.is_empty()
+        && !subtype.is_empty()
+        && mime.len() <= 127
+        && !subtype.contains('/')
+        && mime.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-' | b'/'
+                )
+        })
+}
 
-    let temp_name = format!(".{sha256}.{}.tmp", new_resource_id()?);
+fn valid_extension(extension: &str) -> bool {
+    !extension.is_empty()
+        && extension.len() <= 16
+        && extension
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn valid_title(title: &str) -> bool {
+    !title.trim().is_empty()
+        && title.len() <= 255
+        && !title
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+}
+
+/// Write a caller-owned stream to a private temporary file while deriving its
+/// content address.  The address is intentionally unknown until EOF, so a
+/// concurrent winner is handled after the temporary file is synced and is
+/// verified by descriptor rather than ever being read into memory.
+fn persist_blob_from_reader<R: Read>(
+    dir_fd: RawFd,
+    reader: &mut R,
+    expected_size: usize,
+) -> Result<BlobHash, ResourceError> {
+    const COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+    let temp_name = format!(".stream.{}.tmp", new_resource_id()?);
     let temp_fd = unsafe {
         let name =
             std::ffi::CString::new(temp_name.as_bytes()).map_err(|_| ResourceError::UnsafePath)?;
@@ -418,26 +540,73 @@ fn persist_blob(dir_fd: RawFd, bytes: &[u8], sha256: &str) -> Result<(), Resourc
         return Err(io_error());
     }
     let mut temp = unsafe { File::from_raw_fd(temp_fd) };
-    let result = temp.write_all(bytes).and_then(|_| temp.sync_all());
+    let mut digest = Sha256::new();
+    let mut copied = 0_usize;
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    let result = (|| -> Result<(), std::io::Error> {
+        while copied < expected_size {
+            let remaining = expected_size - copied;
+            let request = remaining.min(COPY_BUFFER_BYTES);
+            let count = reader.read(&mut buffer[..request])?;
+            if count == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            temp.write_all(&buffer[..count])?;
+            digest.update(&buffer[..count]);
+            copied += count;
+        }
+        // A mismatched `metadata.len()` must fail closed instead of allowing a
+        // truncated descriptor (or a racing replacement) to be published.
+        let mut extra = [0_u8; 1];
+        if reader.read(&mut extra)? != 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        temp.sync_all()
+    })();
     if let Err(error) = result {
         drop(temp);
         let _ = unlink_at(dir_fd, &temp_name);
         return Err(error.into());
     }
-    if let Err(error) = test_publish_hook(dir_fd, sha256) {
+    let sha256 = BlobHash::new(hex_digest(&digest.finalize())).expect("SHA-256 digest is valid");
+    if let Err(error) = test_publish_hook(dir_fd, sha256.as_str()) {
         drop(temp);
         let _ = unlink_at(dir_fd, &temp_name);
         return Err(error.into());
     }
     drop(temp);
-    let rename_result = rename_at(dir_fd, &temp_name, dir_fd, sha256);
+    let rename_result = rename_at(dir_fd, &temp_name, dir_fd, sha256.as_str());
     if let Err(error) = rename_result {
         let _ = unlink_at(dir_fd, &temp_name);
         if error.kind() == std::io::ErrorKind::AlreadyExists {
-            return persist_blob(dir_fd, bytes, sha256);
+            verify_existing_blob(dir_fd, sha256.as_str())?;
+            return Ok(sha256);
         }
         return Err(error.into());
     }
+    fsync_fd(dir_fd)?;
+    Ok(sha256)
+}
+
+fn verify_existing_blob(dir_fd: RawFd, sha256: &str) -> Result<(), ResourceError> {
+    let Some(mut existing) = open_blob(dir_fd, sha256)? else {
+        return Err(ResourceError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = existing.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    if hex_digest(&digest.finalize()) != sha256 {
+        return Err(ResourceError::CorruptBlob);
+    }
+    existing.sync_all()?;
     fsync_fd(dir_fd)?;
     Ok(())
 }
@@ -850,7 +1019,86 @@ mod tests {
         fail_next_publish_after_temp_sync, publish_existing_target_after_temp_sync,
     };
     use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::sync::mpsc::TryRecvError;
     use tempfile::tempdir;
+
+    #[test]
+    fn verified_open_streams_without_broadcasting_a_vec_read() {
+        // Session hydration must use the descriptor-safe streaming route. If
+        // it regresses to `ResourceStore::read`, this observer is notified;
+        // the production stream itself has only a fixed-size copy buffer.
+        let dir = tempdir().unwrap();
+        let store = ResourceStore::new(dir.path()).unwrap();
+        let bytes = vec![0x5a; 256 * 1024 + 3];
+        let blob = store
+            .put(ResourceInput {
+                bytes: &bytes,
+                title: "streamed.png",
+                mime: "image/png",
+                file_extension: "png",
+            })
+            .unwrap();
+        let reads = store.observe_reads();
+
+        let mut file = store.open_verified(&blob.sha256).unwrap();
+        let mut restored = Vec::new();
+        file.read_to_end(&mut restored).unwrap();
+
+        assert_eq!(restored, bytes);
+        assert!(matches!(reads.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn put_reader_hashes_and_publishes_with_a_fixed_read_buffer() {
+        // Finder/drop sources must not be eagerly read into a second payload
+        // Vec before they reach the content-addressed store.  This reader
+        // records every caller-supplied buffer; `read_to_end` (or another
+        // whole-file intake) eventually asks for a growing buffer and fails
+        // this contract.
+        struct ObservedReader {
+            bytes: Vec<u8>,
+            offset: usize,
+            largest_request: usize,
+        }
+
+        impl Read for ObservedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.largest_request = self.largest_request.max(buffer.len());
+                let remaining = &self.bytes[self.offset..];
+                let count = remaining.len().min(buffer.len());
+                buffer[..count].copy_from_slice(&remaining[..count]);
+                self.offset += count;
+                Ok(count)
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let store = ResourceStore::new(dir.path()).unwrap();
+        let bytes = vec![0x7d; 3 * 64 * 1024 + 19];
+        let mut reader = ObservedReader {
+            bytes: bytes.clone(),
+            offset: 0,
+            largest_request: 0,
+        };
+
+        let blob = store
+            .put_reader(
+                &mut reader,
+                bytes.len(),
+                "large-drop.pdf",
+                "application/pdf",
+                "pdf",
+            )
+            .expect("streamed resource should publish");
+
+        assert_eq!(blob.size, bytes.len());
+        assert!(reader.largest_request <= 64 * 1024);
+        let mut verified = store.open_verified(&blob.sha256).unwrap();
+        let mut restored = Vec::new();
+        verified.read_to_end(&mut restored).unwrap();
+        assert_eq!(restored, bytes);
+    }
 
     #[test]
     fn after_temp_sync_failure_does_not_publish_or_poison_a_later_put() {

@@ -5,8 +5,8 @@
 //! selection geometry, glyphs/images, then the caret.
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, ImageCache, Pixels, Resource,
-    SharedString, TextRun, Window, WrappedLine, fill, outline, point, px, rgba,
+    App, BorderStyle, Bounds, Corners, ElementInputHandler, Entity, FontWeight, ImageCache, Pixels,
+    Resource, SharedString, TextRun, Window, WrappedLine, fill, outline, point, px, rgba,
 };
 #[cfg(test)]
 use std::cell::RefCell;
@@ -37,6 +37,19 @@ struct RenderBlock {
     image_resource: Option<Resource>,
     image_resource_id: Option<String>,
     image_natural_max_edge: Option<u32>,
+    attachment: Option<AttachmentRenderInfo>,
+}
+
+/// The card contains presentation metadata only. Resource bytes stay in the
+/// descriptor-safe core store and are materialized only if the user asks to
+/// open the attachment.
+#[derive(Clone)]
+struct AttachmentRenderInfo {
+    resource_id: String,
+    filename: String,
+    media_type: String,
+    size: Option<u64>,
+    available: bool,
 }
 
 #[derive(Clone)]
@@ -83,6 +96,7 @@ struct TestRenderObservations {
     snapshot_clone_peak: usize,
     shaped_background_paints: usize,
     paint_entity_calls: usize,
+    attachment_card_paints: usize,
     image_residency: Option<TestImageResidencyObservation>,
 }
 
@@ -123,6 +137,11 @@ pub(crate) fn test_highlight_background_paints() -> usize {
 #[cfg(test)]
 pub(crate) fn test_paint_entity_calls() -> usize {
     TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow().paint_entity_calls)
+}
+
+#[cfg(test)]
+pub(crate) fn test_attachment_card_paints() -> usize {
+    TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow().attachment_card_paints)
 }
 
 #[cfg(test)]
@@ -231,6 +250,23 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 }
                 _ => None,
             });
+            let attachment = model_block.and_then(|block| match &block.content {
+                super::model::BlockContent::Attachment {
+                    resource_id,
+                    filename,
+                    media_type,
+                } => {
+                    let metadata = editor.attachment_metadata(resource_id);
+                    Some(AttachmentRenderInfo {
+                        resource_id: resource_id.clone(),
+                        filename: filename.clone(),
+                        media_type: media_type.clone(),
+                        size: metadata.map(|metadata| metadata.size()),
+                        available: metadata.is_some_and(|metadata| metadata.is_available()),
+                    })
+                }
+                _ => None,
+            });
             let shaped_background_run_count = layout
                 .cache
                 .get(&block.node_id)
@@ -252,6 +288,7 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 image_resource,
                 image_resource_id,
                 image_natural_max_edge,
+                attachment,
             }
         })
         .collect();
@@ -336,6 +373,23 @@ fn paint_snapshot(
     let residency = classify_image_residency(snapshot.blocks.as_slice(), content_mask);
     #[cfg(test)]
     observe_image_residency(snapshot, content_mask, &residency);
+    // An unresolved persisted image remains an honest stable placeholder in
+    // this frame. Rendering is the only layer with viewport residency, so it
+    // asks the retained session for just visible/prefetch resource IDs instead
+    // of letting note preparation stream every original blob on the GPUI
+    // thread.
+    if let Some(editor) = editor.as_ref() {
+        let resident_ids = residency
+            .resident_indices()
+            .into_iter()
+            .filter_map(|index| snapshot.blocks[index].image_resource_id.clone())
+            .collect::<Vec<_>>();
+        let _ = editor.update(cx, |editor, editor_cx| {
+            if editor.request_image_hydration(resident_ids) {
+                editor_cx.notify();
+            }
+        });
+    }
     if let Some(cache) = image_cache.as_ref() {
         let resident_indices = residency.resident_indices();
         let resident_resources = resident_indices
@@ -370,6 +424,17 @@ fn paint_snapshot(
         let mut quad = fill(block.layout.bounds, rgba(0x00000000));
         if block.is_image {
             quad.corner_radii = Corners::all(px(6.0));
+        } else if block.attachment.is_some() {
+            quad.corner_radii = Corners::all(px(7.0));
+            quad.background = if block
+                .attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.available)
+            {
+                rgba(0xf1f7f3ff).into()
+            } else {
+                rgba(0xfff3f1ff).into()
+            };
         }
         window.paint_quad(quad);
     }
@@ -433,6 +498,14 @@ fn paint_snapshot(
                 quad.corner_radii = Corners::all(px(6.0));
                 window.paint_quad(quad);
             }
+            continue;
+        }
+        if let Some(attachment) = block.attachment.as_ref() {
+            paint_attachment_card(attachment, block.layout.bounds, window, cx)?;
+            #[cfg(test)]
+            TEST_RENDER_OBSERVATIONS.with(|observations| {
+                observations.borrow_mut().attachment_card_paints += 1;
+            });
             continue;
         }
         let line_height = block.line_height.unwrap_or_else(|| window.line_height());
@@ -514,6 +587,89 @@ fn paint_snapshot(
         }
     }
     Ok(())
+}
+
+fn paint_attachment_card(
+    attachment: &AttachmentRenderInfo,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Result<()> {
+    let style = window.text_style();
+    let mut title_font = style.font();
+    title_font.weight = FontWeight::SEMIBOLD;
+    let title: SharedString = attachment.filename.clone().into();
+    let title_line = window.text_system().shape_line(
+        title.clone(),
+        px(14.0),
+        &[TextRun {
+            len: title.len(),
+            font: title_font,
+            color: rgba(0x25342bff).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }],
+        None,
+    );
+    title_line.paint(
+        point(bounds.left() + px(12.0), bounds.top() + px(13.0)),
+        px(20.0),
+        window,
+        cx,
+    )?;
+
+    let availability = if attachment.available {
+        "已加载 · 双击打开"
+    } else {
+        "资源不可用"
+    };
+    let detail: SharedString = format!(
+        "{} · {} · {}",
+        attachment.media_type,
+        attachment
+            .size
+            .map(format_attachment_size)
+            .unwrap_or_else(|| "大小未知".to_owned()),
+        availability,
+    )
+    .into();
+    let detail_line = window.text_system().shape_line(
+        detail.clone(),
+        px(12.0),
+        &[TextRun {
+            len: detail.len(),
+            font: style.font(),
+            color: if attachment.available {
+                rgba(0x637368ff).into()
+            } else {
+                rgba(0x9d4437ff).into()
+            },
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }],
+        None,
+    );
+    detail_line.paint(
+        point(bounds.left() + px(12.0), bounds.top() + px(40.0)),
+        px(18.0),
+        window,
+        cx,
+    )?;
+    Ok(())
+}
+
+fn format_attachment_size(size: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    if size >= MIB {
+        format!("{:.1} MB", size as f64 / MIB as f64)
+    } else if size >= KIB {
+        format!("{:.1} KB", size as f64 / KIB as f64)
+    } else {
+        format!("{size} B")
+    }
 }
 
 fn list_marker(kind: &BlockKind, ordered_number: Option<usize>) -> Option<String> {
@@ -650,6 +806,40 @@ mod tests {
         assert_eq!(image_request_edge(&wide, 2.0, false), PREFETCH_MAX_EDGE);
     }
 
+    #[gpui::test]
+    fn attachment_snapshot_exposes_filename_mime_and_durable_size(cx: &mut gpui::TestAppContext) {
+        let mut editor = EditorCore::for_test("前", cx);
+        let paragraph = editor.document().first_node_id().expect("paragraph");
+        editor
+            .apply(super::super::transaction::Transaction::InsertAttachment {
+                selection: Selection::caret(DocPoint::with_affinity(
+                    paragraph,
+                    "前".len(),
+                    Affinity::After,
+                )),
+                resource_id: "attachment".into(),
+                filename: "证据.pdf".into(),
+                media_type: "application/pdf".into(),
+            })
+            .expect("insert attachment");
+        editor
+            .register_attachment("attachment", 2_048)
+            .expect("register metadata");
+        let document = editor.document().clone();
+        editor.layout.layout_document(&document, 0.0, 640.0, 680.0);
+
+        let snapshot = snapshot(&editor);
+        let card = snapshot
+            .blocks
+            .iter()
+            .find_map(|block| block.attachment.as_ref())
+            .expect("attachment card snapshot");
+        assert_eq!(card.filename, "证据.pdf");
+        assert_eq!(card.media_type, "application/pdf");
+        assert_eq!(card.size, Some(2_048));
+        assert!(card.available);
+    }
+
     fn test_image_render_block(id: u64, top: f32) -> RenderBlock {
         let node_id = NodeId::new(id);
         RenderBlock {
@@ -670,6 +860,7 @@ mod tests {
             image_resource: None,
             image_resource_id: None,
             image_natural_max_edge: None,
+            attachment: None,
         }
     }
 

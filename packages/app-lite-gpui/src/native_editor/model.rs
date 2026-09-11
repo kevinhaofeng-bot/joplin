@@ -144,6 +144,11 @@ pub enum BlockContent {
         /// Human-readable alternate label retained by the Task 4 canonical
         /// codec. Image bytes and metadata ownership remain Task 5 work.
         alt: String,
+        /// `false` means this atom came from legacy canonical HTML that had
+        /// no durable dimensions. `natural_size` is then only a stable layout
+        /// fallback; it must not be serialized until a visible resource
+        /// hydration has measured and repaired the node.
+        natural_size_known: bool,
         natural_size: (u32, u32),
         display_width: Option<u32>,
     },
@@ -357,6 +362,94 @@ impl fmt::Display for DocumentError {
 }
 
 impl std::error::Error for DocumentError {}
+
+/// A resource-backed structural block prepared by a transaction. Keeping the
+/// resource bytes outside this value is intentional: the editor owns only a
+/// durable identifier plus the metadata needed for rendering and codec
+/// round-trips.
+#[derive(Clone, Debug)]
+enum StructuralInsert {
+    Image {
+        resource_id: String,
+        natural_size: (u32, u32),
+    },
+    Attachment {
+        resource_id: String,
+        filename: String,
+        media_type: String,
+    },
+}
+
+impl StructuralInsert {
+    fn validate(&self) -> Result<(), DocumentError> {
+        match self {
+            Self::Image {
+                resource_id,
+                natural_size,
+            } => {
+                if resource_id.is_empty() {
+                    return Err(DocumentError::InvalidOperation(
+                        "an image resource id cannot be empty".into(),
+                    ));
+                }
+                if natural_size.0 == 0 || natural_size.1 == 0 {
+                    return Err(DocumentError::InvalidOperation(
+                        "an image natural size must be non-zero".into(),
+                    ));
+                }
+            }
+            Self::Attachment {
+                resource_id,
+                filename,
+                media_type,
+            } => {
+                if resource_id.is_empty() || filename.trim().is_empty() || media_type.is_empty() {
+                    return Err(DocumentError::InvalidOperation(
+                        "an attachment requires resource metadata".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn block(&self, id: NodeId, alignment: TextAlignment, revision: u64) -> Block {
+        let (kind, content) = match self {
+            Self::Image {
+                resource_id,
+                natural_size,
+            } => (
+                BlockKind::Image,
+                BlockContent::Image {
+                    resource_id: resource_id.clone(),
+                    alt: String::new(),
+                    natural_size_known: true,
+                    natural_size: *natural_size,
+                    display_width: None,
+                },
+            ),
+            Self::Attachment {
+                resource_id,
+                filename,
+                media_type,
+            } => (
+                BlockKind::Attachment,
+                BlockContent::Attachment {
+                    resource_id: resource_id.clone(),
+                    filename: filename.clone(),
+                    media_type: media_type.clone(),
+                },
+            ),
+        };
+        Block {
+            id,
+            kind,
+            content,
+            alignment,
+            revision,
+        }
+    }
+}
 
 /// Semantic document data used by tests and round-trip checks.  Revision
 /// counters and the allocation cursor intentionally do not participate.
@@ -1643,7 +1736,8 @@ impl Document {
                 plan.inserted_count = 1;
                 Some(plan)
             }
-            Transaction::InsertImage { selection, .. } => {
+            Transaction::InsertImage { selection, .. }
+            | Transaction::InsertAttachment { selection, .. } => {
                 if let Some(index) = self.adjacent_structural_seam(*selection).ok()? {
                     plan.start_index = index;
                     plan.inserted_count = 1;
@@ -1670,6 +1764,36 @@ impl Document {
                         .map(|block| block.id),
                 );
                 plan.inserted_count = 3;
+                Some(plan)
+            }
+            Transaction::EnsureParagraph { selection } => {
+                if !selection.is_caret() {
+                    return None;
+                }
+                let index = self.node_index(selection.head.node_id).ok()?;
+                if is_text_block(&self.blocks[index]) {
+                    return None;
+                }
+                let insert_at = match selection.head.affinity {
+                    Affinity::Before => {
+                        if index > 0 && is_text_block(&self.blocks[index - 1]) {
+                            return None;
+                        }
+                        index
+                    }
+                    Affinity::After => {
+                        if self
+                            .blocks
+                            .get(index.saturating_add(1))
+                            .is_some_and(is_text_block)
+                        {
+                            return None;
+                        }
+                        index.saturating_add(1)
+                    }
+                };
+                plan.start_index = insert_at;
+                plan.inserted_count = 1;
                 Some(plan)
             }
             Transaction::RemoveNode { node_id } => {
@@ -1804,6 +1928,20 @@ impl Document {
                     self.apply_insert_image(selection, resource_id, natural_size)?;
                 (selection, changed_nodes, inverse, None)
             }
+            Transaction::InsertAttachment {
+                selection,
+                resource_id,
+                filename,
+                media_type,
+            } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_insert_attachment(selection, resource_id, filename, media_type)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::EnsureParagraph { selection } => {
+                let (selection, changed_nodes, inverse) = self.apply_ensure_paragraph(selection)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::RemoveNode { node_id } => {
                 let (selection, changed_nodes, inverse) = self.apply_remove_node(node_id)?;
                 (selection, changed_nodes, inverse, None)
@@ -1814,6 +1952,14 @@ impl Document {
             } => {
                 let (selection, changed_nodes, inverse) =
                     self.apply_set_image_width(node_id, display_width)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::SetImageNaturalSize {
+                node_id,
+                natural_size,
+            } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_set_image_natural_size(node_id, natural_size)?;
                 (selection, changed_nodes, inverse, None)
             }
             Transaction::RestoreBlocks {
@@ -2824,29 +2970,112 @@ impl Document {
         resource_id: String,
         natural_size: (u32, u32),
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
-        if resource_id.is_empty() {
+        self.apply_insert_structural(
+            selection,
+            StructuralInsert::Image {
+                resource_id,
+                natural_size,
+            },
+        )
+    }
+
+    fn apply_insert_attachment(
+        &mut self,
+        selection: Selection,
+        resource_id: String,
+        filename: String,
+        media_type: String,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        self.apply_insert_structural(
+            selection,
+            StructuralInsert::Attachment {
+                resource_id,
+                filename,
+                media_type,
+            },
+        )
+    }
+
+    /// Make an atomic block boundary immediately editable. Unlike an empty
+    /// `InsertText`, this intentionally creates the paragraph now so pointer
+    /// focus, selection and layout all agree before a keyboard or IME commit
+    /// reaches the document.
+    fn apply_ensure_paragraph(
+        &mut self,
+        selection: Selection,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        self.validate_selection(selection)?;
+        if !selection.is_caret() {
+            return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+        }
+        let point = selection.head;
+        let index = self.node_index(point.node_id)?;
+        if is_text_block(&self.blocks[index]) {
+            return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+        }
+        if !is_structural_block(&self.blocks[index]) {
             return Err(DocumentError::InvalidOperation(
-                "an image resource id cannot be empty".into(),
+                "cannot activate a paragraph beside this block".into(),
             ));
         }
-        if natural_size.0 == 0 || natural_size.1 == 0 {
-            return Err(DocumentError::InvalidOperation(
-                "an image natural size must be non-zero".into(),
-            ));
-        }
-        if let Some(insert_at) = self.adjacent_structural_seam(selection)? {
-            let image = Block {
-                id: self.new_node_id()?,
-                kind: BlockKind::Image,
-                content: BlockContent::Image {
-                    resource_id,
-                    alt: String::new(),
-                    natural_size,
-                    display_width: None,
-                },
-                alignment: TextAlignment::Left,
-                revision: 0,
+
+        let adjacent_text = match point.affinity {
+            Affinity::Before => index
+                .checked_sub(1)
+                .and_then(|previous| self.blocks.get(previous))
+                .filter(|block| is_text_block(block)),
+            Affinity::After => self
+                .blocks
+                .get(index.saturating_add(1))
+                .filter(|block| is_text_block(block)),
+        };
+        if let Some(text) = adjacent_text {
+            let offset = match point.affinity {
+                Affinity::Before => text.content.as_text().map_or(0, str::len),
+                Affinity::After => 0,
             };
+            return Ok((
+                Selection::caret(DocPoint::with_affinity(text.id, offset, point.affinity)),
+                SmallVec::new(),
+                TransactionBatch::default(),
+            ));
+        }
+
+        let insert_at = match point.affinity {
+            Affinity::Before => index,
+            Affinity::After => index.saturating_add(1),
+        };
+        let paragraph = Block::text(self.new_node_id()?, BlockKind::Paragraph, String::new());
+        let paragraph_id = paragraph.id;
+        self.blocks.insert(insert_at, paragraph);
+        let mut changed_nodes = SmallVec::new();
+        push_unique(&mut changed_nodes, paragraph_id);
+        Ok((
+            Selection::caret(DocPoint::with_affinity(
+                paragraph_id,
+                0,
+                match point.affinity {
+                    Affinity::Before => Affinity::After,
+                    Affinity::After => Affinity::Before,
+                },
+            )),
+            changed_nodes,
+            TransactionBatch(vec![Transaction::RestoreBlocks {
+                index: insert_at,
+                remove_count: 1,
+                blocks: Vec::new(),
+            }]),
+        ))
+    }
+
+    fn apply_insert_structural(
+        &mut self,
+        selection: Selection,
+        structural: StructuralInsert,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        structural.validate()?;
+        if let Some(insert_at) = self.adjacent_structural_seam(selection)? {
+            let image = structural.block(self.new_node_id()?, TextAlignment::Left, 0);
             let image_id = image.id;
             self.blocks.insert(insert_at, image);
             let mut changed_nodes = SmallVec::new();
@@ -2880,21 +3109,10 @@ impl Document {
             && end_offset == 0
             && selection.is_caret()
             && start_index > 0
-            && self.blocks[start_index - 1].kind == BlockKind::Image
+            && is_structural_block(&self.blocks[start_index - 1])
             && is_text_block(&self.blocks[start_index])
         {
-            let image = Block {
-                id: self.new_node_id()?,
-                kind: BlockKind::Image,
-                content: BlockContent::Image {
-                    resource_id,
-                    alt: String::new(),
-                    natural_size,
-                    display_width: None,
-                },
-                alignment: TextAlignment::Left,
-                revision: 0,
-            };
+            let image = structural.block(self.new_node_id()?, TextAlignment::Left, 0);
             let image_id = image.id;
             self.blocks.insert(start_index, image);
             let mut changed_nodes = SmallVec::new();
@@ -2917,18 +3135,7 @@ impl Document {
         if start_index == end_index && !is_text_block(&self.blocks[start_index]) {
             let original = self.blocks[start_index].clone();
             if selection.is_caret() {
-                let image = Block {
-                    id: self.new_node_id()?,
-                    kind: BlockKind::Image,
-                    content: BlockContent::Image {
-                        resource_id,
-                        alt: String::new(),
-                        natural_size,
-                        display_width: None,
-                    },
-                    alignment: TextAlignment::Left,
-                    revision: 0,
-                };
+                let image = structural.block(self.new_node_id()?, TextAlignment::Left, 0);
                 let image_id = image.id;
                 let insert_at = match selection.anchor.affinity {
                     Affinity::Before => start_index,
@@ -2951,18 +3158,7 @@ impl Document {
             let image_id = original.id;
             self.blocks.replace(
                 start_index,
-                Block {
-                    id: image_id,
-                    kind: BlockKind::Image,
-                    content: BlockContent::Image {
-                        resource_id,
-                        alt: String::new(),
-                        natural_size,
-                        display_width: None,
-                    },
-                    alignment: original.alignment,
-                    revision: original.revision,
-                },
+                structural.block(image_id, original.alignment, original.revision),
             );
             let mut changed_nodes = SmallVec::new();
             push_unique(&mut changed_nodes, image_id);
@@ -3007,18 +3203,7 @@ impl Document {
             alignment: original_block.alignment,
             revision: original_block.revision,
         };
-        let image = Block {
-            id: image_id,
-            kind: BlockKind::Image,
-            content: BlockContent::Image {
-                resource_id,
-                alt: String::new(),
-                natural_size,
-                display_width: None,
-            },
-            alignment: TextAlignment::Left,
-            revision: 0,
-        };
+        let image = structural.block(image_id, TextAlignment::Left, 0);
         let right = Block {
             id: right_id,
             kind: original_block.kind.clone(),
@@ -3097,6 +3282,47 @@ impl Document {
             ));
         }
         *current = display_width;
+        self.blocks.replace(index, updated);
+        let mut changed_nodes = SmallVec::new();
+        push_unique(&mut changed_nodes, node_id);
+        let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
+            index,
+            remove_count: 1,
+            blocks: vec![original],
+        }]);
+        Ok((self.selection_near_index(index), changed_nodes, inverse))
+    }
+
+    fn apply_set_image_natural_size(
+        &mut self,
+        node_id: NodeId,
+        natural_size: (u32, u32),
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        if natural_size.0 == 0 || natural_size.1 == 0 {
+            return Err(DocumentError::InvalidOperation(
+                "image natural size must be positive".into(),
+            ));
+        }
+        let index = self.node_index(node_id)?;
+        let original = self.blocks[index].clone();
+        let mut updated = original.clone();
+        let BlockContent::Image {
+            natural_size: current,
+            natural_size_known,
+            ..
+        } = &mut updated.content
+        else {
+            return Err(DocumentError::InvalidBlockContent(node_id));
+        };
+        if *current == natural_size && *natural_size_known {
+            return Ok((
+                self.selection_near_index(index),
+                SmallVec::new(),
+                TransactionBatch::default(),
+            ));
+        }
+        *current = natural_size;
+        *natural_size_known = true;
         self.blocks.replace(index, updated);
         let mut changed_nodes = SmallVec::new();
         push_unique(&mut changed_nodes, node_id);
@@ -3223,7 +3449,8 @@ fn is_text_block(block: &Block) -> bool {
 }
 
 fn is_navigation_block(block: &Block) -> bool {
-    block.content.as_text().is_some() || block.kind == BlockKind::Image
+    block.content.as_text().is_some()
+        || matches!(block.kind, BlockKind::Image | BlockKind::Attachment)
 }
 
 fn block_flat_lengths(block: &Block) -> (usize, usize) {

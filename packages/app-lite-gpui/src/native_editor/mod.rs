@@ -12,6 +12,7 @@ pub mod layout;
 pub mod model;
 pub mod render;
 pub mod surface;
+pub mod toolbar;
 pub mod transaction;
 
 #[cfg(test)]

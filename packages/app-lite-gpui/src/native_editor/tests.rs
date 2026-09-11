@@ -1439,6 +1439,7 @@ fn non_monotonic_node_ids_keep_selection_geometry_in_document_order() {
             content: BlockContent::Image {
                 resource_id: format!("image-{id}"),
                 alt: String::new(),
+                natural_size_known: true,
                 natural_size: (320, 200),
                 display_width: None,
             },
@@ -3116,6 +3117,25 @@ fn image_hit_testing_exposes_before_and_after_document_points() {
     assert_eq!(before.affinity, Affinity::Before);
     assert_eq!(after.node_id, image_id);
     assert_eq!(after.affinity, Affinity::After);
+
+    // The atomic block's horizontal visual boundary is the deterministic
+    // before/after affordance. A high DPI or fractional center-y coordinate
+    // must not turn a click on the right edge into a "before" caret merely
+    // because it falls in the top half of a tall image.
+    let top_right = layout
+        .point_to_doc(point(
+            image.bounds.right() - px(2.0),
+            image.bounds.top() + px(2.0),
+        ))
+        .expect("top-right image hit should resolve");
+    let bottom_left = layout
+        .point_to_doc(point(
+            image.bounds.left() + px(2.0),
+            image.bounds.bottom() - px(2.0),
+        ))
+        .expect("bottom-left image hit should resolve");
+    assert_eq!(top_right.affinity, Affinity::After);
+    assert_eq!(bottom_left.affinity, Affinity::Before);
 }
 
 #[test]
@@ -4298,6 +4318,140 @@ fn editing_commands_cross_block_boundaries(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn attachment_is_an_atomic_text_boundary_and_round_trips_undo(cx: &mut gpui::TestAppContext) {
+    // Attachments are document atoms, not a canvas-only card. This mirrors
+    // the image boundary contract: both sides of an atom can be reached,
+    // deleted, and restored without swallowing the neighboring text.
+    let mut editor = EditorCore::for_test("前", cx);
+    let left = editor.document().first_node_id().expect("left paragraph");
+    editor
+        .apply(Transaction::InsertAttachment {
+            selection: Selection::caret(DocPoint::with_affinity(left, "前".len(), Affinity::After)),
+            resource_id: "attachment".into(),
+            filename: "资料.pdf".into(),
+            media_type: "application/pdf".into(),
+        })
+        .expect("insert attachment");
+    let attachment = editor.document().blocks()[1].id;
+    assert_eq!(
+        editor.document().block_kinds(),
+        [
+            BlockKind::Paragraph,
+            BlockKind::Attachment,
+            BlockKind::Paragraph
+        ]
+    );
+
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        attachment,
+        0,
+        Affinity::After,
+    )));
+    editor.backspace().expect("backspace attachment");
+    assert_eq!(editor.visible_text(), "前\n");
+    assert_eq!(editor.document().block_count(), 2);
+    editor.undo().expect("restore attachment");
+    assert_eq!(editor.document().blocks()[1].kind, BlockKind::Attachment);
+
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        attachment,
+        0,
+        Affinity::Before,
+    )));
+    editor.delete_forward().expect("delete attachment");
+    assert_eq!(editor.visible_text(), "前\n");
+    assert_eq!(editor.document().block_count(), 2);
+    editor.undo().expect("restore attachment after delete");
+    assert_eq!(editor.document().blocks()[1].kind, BlockKind::Attachment);
+}
+
+#[gpui::test]
+fn atomic_tail_activates_a_real_paragraph_before_the_first_typed_character(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A click below the final resource block must not leave a synthetic
+    // after-attachment caret that only turns into a paragraph once IME/text
+    // arrives. The editor surface asks this same structural path to activate
+    // a dead-zone hit before it focuses the input handler.
+    let mut editor = EditorCore::for_test("前", cx);
+    let left = editor.document().first_node_id().expect("left paragraph");
+    editor
+        .apply(Transaction::InsertAttachment {
+            selection: Selection::caret(DocPoint::with_affinity(left, "前".len(), Affinity::After)),
+            resource_id: "terminal-attachment".into(),
+            filename: "尾部资料.pdf".into(),
+            media_type: "application/pdf".into(),
+        })
+        .expect("insert attachment");
+    let attachment = editor.document().blocks()[1].id;
+    let trailing = editor.document().blocks()[2].id;
+    editor
+        .apply(Transaction::RemoveNode { node_id: trailing })
+        .expect("remove fixture trailing paragraph");
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        attachment,
+        0,
+        Affinity::After,
+    )));
+
+    editor
+        .activate_atomic_dead_zone()
+        .expect("below-tail activation must create the paragraph immediately");
+
+    assert_eq!(editor.document().block_count(), 3);
+    let tail = editor
+        .document()
+        .blocks()
+        .last()
+        .expect("new tail paragraph");
+    assert_eq!(tail.kind, BlockKind::Paragraph);
+    assert_eq!(tail.content.as_text(), Some(""));
+    assert_eq!(editor.selection().head.node_id, tail.id);
+    assert_eq!(
+        editor.undo_depth(),
+        3,
+        "activation is a durable edit before typing"
+    );
+}
+
+#[gpui::test]
+async fn attachment_card_reserves_a_stable_visible_extent(cx: &mut gpui::TestAppContext) {
+    // The card needs its own measured extent. Reusing an empty paragraph's
+    // 24px height would make a filename/mime/size presentation overlap the
+    // following text and turn a structural node into a blank sliver.
+    let mut cx = cx.add_empty_window();
+    let mut document = Document::from_paragraph("前");
+    let paragraph = document.first_node_id().expect("paragraph");
+    document
+        .apply(Transaction::InsertAttachment {
+            selection: Selection::caret(DocPoint::with_affinity(
+                paragraph,
+                "前".len(),
+                Affinity::After,
+            )),
+            resource_id: "attachment".into(),
+            filename: "会议录音.m4a".into(),
+            media_type: "audio/mp4".into(),
+        })
+        .expect("insert attachment");
+    let attachment = document.blocks()[1].id;
+    let mut layout = LayoutRegistry::new();
+    let height = cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 640.0, 680.0, window);
+        layout
+            .block_layout(attachment)
+            .expect("attachment layout")
+            .bounds
+            .size
+            .height
+    });
+    assert!(
+        f32::from(height) >= 72.0,
+        "attachment card must reserve its header/body extent, got {height:?}"
+    );
+}
+
+#[gpui::test]
 async fn entity_input_uses_document_wide_utf16_coordinates(cx: &mut gpui::TestAppContext) {
     let mut cx = cx.add_empty_window();
     let editor = EditorCore::fixture_text_image_list("甲", "image", "乙", &mut cx);
@@ -4928,6 +5082,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             content: BlockContent::Image {
                 resource_id: "one".into(),
                 alt: String::new(),
+                natural_size_known: true,
                 natural_size: (100, 100),
                 display_width: None,
             },
@@ -4954,6 +5109,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             content: BlockContent::Image {
                 resource_id: "five".into(),
                 alt: String::new(),
+                natural_size_known: true,
                 natural_size: (100, 100),
                 display_width: None,
             },
@@ -6911,5 +7067,301 @@ async fn read_only_editor_rejects_document_history_ime_and_image_mutations(
     assert!(
         after.1 != before.1,
         "selection remains usable in read-only mode"
+    );
+}
+
+#[gpui::test]
+fn pending_resource_anchor_maps_prefix_insert_and_delete(cx: &mut gpui::TestAppContext) {
+    // A native picker/drop can remain outstanding while the user changes the
+    // same paragraph before its saved insertion point. The anchor is not a
+    // naked byte offset: edits before it must preserve the logical boundary.
+    let mut editor = EditorCore::for_test("abcdef", cx);
+    let paragraph = editor.document().first_node_id().expect("paragraph");
+    let saved = editor
+        .capture_resource_insert_anchor(Selection::caret(DocPoint::with_affinity(
+            paragraph,
+            4,
+            Affinity::After,
+        )))
+        .expect("capture pending picker point");
+    editor
+        .apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::with_affinity(paragraph, 0, Affinity::Before)),
+            text: "中文".into(),
+        })
+        .expect("prefix insert");
+    assert_eq!(
+        editor
+            .resolve_resource_insert_anchor(saved)
+            .expect("mapped prefix point"),
+        Selection::caret(DocPoint::with_affinity(
+            paragraph,
+            "中文".len() + 4,
+            Affinity::After
+        ))
+    );
+
+    let saved = editor
+        .capture_resource_insert_anchor(Selection::caret(DocPoint::with_affinity(
+            paragraph,
+            "中文".len() + 4,
+            Affinity::After,
+        )))
+        .expect("capture before prefix deletion");
+    editor
+        .apply(Transaction::DeleteRange {
+            selection: Selection::new(
+                DocPoint::with_affinity(paragraph, 0, Affinity::Before),
+                DocPoint::with_affinity(paragraph, "中文".len(), Affinity::After),
+            ),
+        })
+        .expect("prefix delete");
+    assert_eq!(
+        editor
+            .resolve_resource_insert_anchor(saved)
+            .expect("mapped deletion point"),
+        Selection::caret(DocPoint::with_affinity(paragraph, 4, Affinity::After))
+    );
+}
+
+#[gpui::test]
+fn pending_resource_anchor_maps_selected_range_replacement(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("abcdef", cx);
+    let paragraph = editor.document().first_node_id().expect("paragraph");
+    let saved = editor
+        .capture_resource_insert_anchor(Selection::new(
+            DocPoint::with_affinity(paragraph, 1, Affinity::Before),
+            DocPoint::with_affinity(paragraph, 4, Affinity::After),
+        ))
+        .expect("capture saved point");
+    editor
+        .apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::with_affinity(paragraph, 0, Affinity::Before)),
+            text: "中文".into(),
+        })
+        .expect("replace selected text");
+    let mapped = editor
+        .resolve_resource_insert_anchor(saved)
+        .expect("replacement-mapped selection");
+    assert_eq!(
+        mapped,
+        Selection::new(
+            DocPoint::with_affinity(paragraph, "中文".len() + 1, Affinity::Before),
+            DocPoint::with_affinity(paragraph, "中文".len() + 4, Affinity::After),
+        )
+    );
+    editor
+        .apply(Transaction::InsertAttachment {
+            selection: mapped,
+            resource_id: "mapped-selection".into(),
+            filename: "映射.pdf".into(),
+            media_type: "application/pdf".into(),
+        })
+        .expect("resource must replace the mapped original selection");
+    assert_eq!(
+        editor.document().blocks()[0].content.as_text(),
+        Some("中文a")
+    );
+    assert!(matches!(
+        editor.document().blocks()[1].content,
+        BlockContent::Attachment { .. }
+    ));
+    assert_eq!(editor.document().blocks()[2].content.as_text(), Some("ef"));
+}
+
+#[gpui::test]
+fn pending_resource_anchor_maps_split_merge_and_deleted_block_to_neighbor(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut editor = EditorCore::for_test_paragraphs(["first", "second"], cx);
+    let first = editor.document().blocks()[0].id;
+    let second = editor.document().blocks()[1].id;
+    let saved = editor
+        .capture_resource_insert_anchor(Selection::caret(DocPoint::with_affinity(
+            second,
+            4,
+            Affinity::After,
+        )))
+        .expect("capture second-block point");
+
+    editor
+        .apply(Transaction::SplitBlock {
+            at: DocPoint::with_affinity(second, 2, Affinity::After),
+        })
+        .expect("split pending-anchor block");
+    let split_right = editor.document().blocks()[2].id;
+    assert_eq!(
+        editor
+            .peek_resource_insert_anchor(saved)
+            .expect("split-mapped point"),
+        Selection::caret(DocPoint::with_affinity(split_right, 2, Affinity::After))
+    );
+    editor
+        .apply(Transaction::MergeBlocks {
+            left: second,
+            right: split_right,
+        })
+        .expect("merge pending-anchor block");
+    assert_eq!(
+        editor
+            .peek_resource_insert_anchor(saved)
+            .expect("merge-mapped point"),
+        Selection::caret(DocPoint::with_affinity(second, 4, Affinity::After))
+    );
+    editor
+        .apply(Transaction::RemoveNode { node_id: second })
+        .expect("delete saved block");
+    assert_eq!(
+        editor
+            .resolve_resource_insert_anchor(saved)
+            .expect("neighbor fallback"),
+        Selection::caret(DocPoint::with_affinity(
+            first,
+            "first".len(),
+            Affinity::After
+        ))
+    );
+}
+
+#[gpui::test]
+fn pending_resource_anchor_maps_history_undo_and_redo(cx: &mut gpui::TestAppContext) {
+    // A resource picker can remain open while the user corrects an edit with
+    // Cmd-Z/Cmd-Shift-Z. History applies RestoreBlocks, so this guards the
+    // non-live-caret mapping path rather than only direct typing.
+    let mut editor = EditorCore::for_test("abc", cx);
+    let paragraph = editor.document().first_node_id().expect("paragraph");
+    let saved = editor
+        .capture_resource_insert_anchor(Selection::caret(DocPoint::with_affinity(
+            paragraph,
+            3,
+            Affinity::After,
+        )))
+        .expect("capture pending picker point");
+    editor
+        .apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::with_affinity(paragraph, 0, Affinity::Before)),
+            text: "中".into(),
+        })
+        .expect("prefix edit");
+    editor.undo().expect("undo prefix edit");
+    assert_eq!(
+        editor
+            .peek_resource_insert_anchor(saved)
+            .expect("undo-mapped"),
+        Selection::caret(DocPoint::with_affinity(paragraph, 3, Affinity::After))
+    );
+    editor.redo().expect("redo prefix edit");
+    assert_eq!(
+        editor
+            .resolve_resource_insert_anchor(saved)
+            .expect("redo-mapped"),
+        Selection::caret(DocPoint::with_affinity(
+            paragraph,
+            "中".len() + 3,
+            Affinity::After,
+        ))
+    );
+}
+
+#[gpui::test]
+fn failed_optimistic_resource_replays_selected_text_and_later_input(cx: &mut gpui::TestAppContext) {
+    // A resource insertion replaces the complete saved selection, so failure
+    // recovery cannot simply delete its atom. This models an Evernote-style
+    // staged blob rejection after the user has continued typing in another
+    // block: unwind later transactions, inverse the resource transaction,
+    // then replay the later input without resurrecting a redoable atom.
+    let mut editor = EditorCore::for_test_paragraphs(["abcde", "独立后续位置"], cx);
+    let original = editor.document().blocks()[0].id;
+    let later = editor.document().blocks()[1].id;
+    let resource_id = "0123456789abcdef0123456789abcdef";
+    let selected_text = Selection::new(
+        DocPoint::with_affinity(original, 1, Affinity::Before),
+        DocPoint::with_affinity(original, 4, Affinity::After),
+    );
+    let prepared = editor
+        .prepare_durable_transaction(Transaction::InsertImage {
+            selection: selected_text,
+            resource_id: resource_id.to_owned(),
+            natural_size: (800, 400),
+        })
+        .expect("prepare optimistic replacement");
+    editor.install_prepared_durable_commit(prepared);
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        later,
+        0,
+        Affinity::Before,
+    )));
+    editor
+        .apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::with_affinity(later, 0, Affinity::Before)),
+            text: "后续输入".to_owned(),
+        })
+        .expect("type after optimistic replacement");
+    assert_eq!(
+        editor.undo_depth(),
+        2,
+        "resource replacement and later input must remain distinct history entries for rebase"
+    );
+
+    assert!(
+        editor
+            .rollback_failed_optimistic_resource(resource_id)
+            .expect("history rebase must be valid"),
+        "the selected-range insertion is still represented by one history entry"
+    );
+    assert_eq!(
+        editor.document().blocks()[0].content.as_text(),
+        Some("abcde")
+    );
+    assert_eq!(
+        editor.document().blocks()[1].content.as_text(),
+        Some("后续输入独立后续位置"),
+        "later typing must replay after original selected text is restored"
+    );
+    assert!(
+        !editor.document().blocks().iter().any(|block| matches!(
+            &block.content,
+            BlockContent::Image { resource_id: id, .. } if id == resource_id
+        )),
+        "a rejected staged blob must not remain as a live document atom"
+    );
+    editor.undo().expect("later text remains undoable");
+    assert_eq!(
+        editor.document().blocks()[1].content.as_text(),
+        Some("独立后续位置"),
+        "Cmd-Z after recovery must target the later input, not restored selected text"
+    );
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(DocPoint::with_affinity(later, 0, Affinity::Before)),
+        "replayed history retains the original suffix before-selection"
+    );
+    assert!(
+        !editor.document().blocks().iter().any(|block| matches!(
+            &block.content,
+            BlockContent::Image { resource_id: id, .. } if id == resource_id
+        )),
+        "discarding the failed transaction also removes its future redo path"
+    );
+    editor.redo().expect("later text remains redoable");
+    assert_eq!(
+        editor.document().blocks()[1].content.as_text(),
+        Some("后续输入独立后续位置")
+    );
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(DocPoint::with_affinity(
+            later,
+            "后续输入".len(),
+            Affinity::After,
+        )),
+        "Cmd-Shift-Z restores the suffix caret rather than a fabricated document-end caret"
+    );
+    assert!(
+        !editor.document().blocks().iter().any(|block| matches!(
+            &block.content,
+            BlockContent::Image { resource_id: id, .. } if id == resource_id
+        )),
+        "redo must never resurrect the rejected resource transaction"
     );
 }

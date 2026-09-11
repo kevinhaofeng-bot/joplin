@@ -55,12 +55,35 @@ pub enum Transaction {
         resource_id: String,
         natural_size: (u32, u32),
     },
+    /// Insert a non-image resource as one atomic attachment block. Its bytes
+    /// stay in the durable resource store; only display metadata is retained
+    /// by the document model.
+    InsertAttachment {
+        selection: Selection,
+        resource_id: String,
+        filename: String,
+        media_type: String,
+    },
+    /// Materialize the text insertion point represented by an atomic-block
+    /// seam. Pointer hits in the gap between resources and below a terminal
+    /// resource use this before focus/IME arrives, so the first character
+    /// never has to create a paragraph as a side effect.
+    EnsureParagraph {
+        selection: Selection,
+    },
     RemoveNode {
         node_id: NodeId,
     },
     SetImageDisplayWidth {
         node_id: NodeId,
         display_width: Option<u32>,
+    },
+    /// Internal presentation repair for a legacy durable image whose old
+    /// canonical HTML lacked natural dimensions. `EditorCore` applies this
+    /// directly to the model without adding a user-visible history entry.
+    SetImageNaturalSize {
+        node_id: NodeId,
+        natural_size: (u32, u32),
     },
     /// Internal inverse operation that restores only the affected contiguous
     /// block range.  It is intentionally not a document snapshot: history
@@ -85,11 +108,14 @@ impl Transaction {
             | Self::SetAlignment { selection, .. }
             | Self::IndentList { selection }
             | Self::OutdentList { selection }
-            | Self::InsertImage { selection, .. } => Some(*selection),
+            | Self::InsertImage { selection, .. }
+            | Self::InsertAttachment { selection, .. }
+            | Self::EnsureParagraph { selection } => Some(*selection),
             Self::SplitBlock { at } => Some(Selection::caret(*at)),
             Self::MergeBlocks { .. }
             | Self::RemoveNode { .. }
             | Self::SetImageDisplayWidth { .. }
+            | Self::SetImageNaturalSize { .. }
             | Self::RestoreBlocks { .. } => None,
         }
     }
@@ -101,6 +127,15 @@ impl Transaction {
             Self::InsertText { text, .. } => base.saturating_add(text.len()),
             Self::SetLink { url, .. } => base.saturating_add(url.as_ref().map_or(0, String::len)),
             Self::InsertImage { resource_id, .. } => base.saturating_add(resource_id.len()),
+            Self::InsertAttachment {
+                resource_id,
+                filename,
+                media_type,
+                ..
+            } => base
+                .saturating_add(resource_id.len())
+                .saturating_add(filename.len())
+                .saturating_add(media_type.len()),
             Self::ToggleMark { mark, .. } => base.saturating_add(mark.estimated_bytes()),
             Self::SetBlockKind { kind, .. } => base.saturating_add(kind.estimated_bytes()),
             Self::RestoreBlocks { blocks, .. } => base.saturating_add(

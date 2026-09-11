@@ -4,18 +4,20 @@
 //! below.  The library owns this `EditorSurface` entity, while the spike keeps
 //! its measurement callbacks around the same canvas helper.
 
-use super::core::EditorCore;
+use super::core::{AtomicBlockHit, EditorCore};
 use super::images::BudgetedImageCache;
 use super::model::DocPoint;
 use super::render;
 use crate::components::{
-    BlockDown, BlockUp, Copy, End, FocusNext, FocusPrev, Home, MoveLeft, MoveRight, SelectAll,
-    SelectEnd, SelectHome, SelectLeft, SelectRight, WordSelectLeft, WordSelectRight,
+    BlockDown, BlockUp, Copy, Delete, DeleteBack, End, FocusNext, FocusPrev, Home, MoveLeft,
+    MoveRight, Newline, Redo, SelectAll, SelectEnd, SelectHome, SelectLeft, SelectRight, Undo,
+    WordSelectLeft, WordSelectRight,
 };
 use gpui::{
-    App, ClipboardItem, Context, Entity, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
-    ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Window, canvas, div, px, rgba,
+    App, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Window, canvas, div,
+    px, rgba,
 };
 use std::sync::Arc;
 
@@ -26,6 +28,24 @@ macro_rules! bind_selection_action {
             let _ = action_editor.update(cx, |editor, editor_cx| {
                 editor.$method();
                 editor_cx.notify();
+            });
+            focus_editor(&action_editor, window, cx);
+        });
+    }};
+}
+
+// Structural editing actions are intentionally sent to `EditorCore` rather
+// than reimplemented in the GPUI surface. `EditorCore::ensure_editable` is
+// the single read-only gate, so the spike and library keep one real action
+// route while a Task 3 read-only surface remains side-effect free.
+macro_rules! bind_result_action {
+    ($surface:ident, $editor:expr, $action:ty, $method:ident) => {{
+        let action_editor = $editor.clone();
+        $surface = $surface.on_action(move |_action: &$action, window, cx| {
+            let _ = action_editor.update(cx, |editor, editor_cx| {
+                let result = editor.$method();
+                editor_cx.notify();
+                result
             });
             focus_editor(&action_editor, window, cx);
         });
@@ -73,6 +93,15 @@ impl Default for EditorSurfaceHooks {
     }
 }
 
+/// A resource action requested by the one shared canvas.  The surface owns
+/// hit testing and structural selection; the library shell owns repository
+/// access and platform effects, keeping profile paths and opener policy out
+/// of the native editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EditorSurfaceEvent {
+    OpenAttachment { resource_id: String },
+}
+
 /// One mounted document canvas. Its editor is the only input-handler owner;
 /// ordinary text elements never mirror or flatten document data.
 pub struct EditorSurface {
@@ -89,6 +118,8 @@ pub struct EditorSurface {
     accepts_pointer_input: bool,
     _editor_subscription: Subscription,
 }
+
+impl EventEmitter<EditorSurfaceEvent> for EditorSurface {}
 
 impl EditorSurface {
     pub fn new(
@@ -163,10 +194,65 @@ impl EditorSurface {
             cx.propagate();
             return;
         }
+        // Images and attachment cards are structural atoms in editing mode.
+        // A click must produce a full NodeSelection-style range, not an
+        // ambiguous before/after caret. The attachment's double-click is
+        // intentionally only a typed request: resolving a verified descriptor
+        // and launching the system application belongs to the retained
+        // library session.
+        // Resolve structural insertion seams before testing the inclusive card
+        // bounds. `contains` intentionally includes a block's bottom edge for
+        // painting/hit-testing, but that edge is also the wrapper dead-zone
+        // between two section-level atoms (or below a terminal atom).  The
+        // donor editor materializes/focuses a paragraph for that background
+        // seam; only an actual atom-content hit becomes a NodeSelection.
+        let activate_dead_zone = !event.modifiers.shift
+            && self
+                .editor
+                .read(cx)
+                .layout()
+                .atomic_dead_zone_hit(event.position);
+        let atomic = if !event.modifiers.shift && !activate_dead_zone {
+            self.editor.update(cx, |editor, editor_cx| {
+                let hit = editor.select_atomic_at(event.position);
+                if hit.is_some() {
+                    editor_cx.notify();
+                }
+                hit
+            })
+        } else {
+            None
+        };
+        if let Some(hit) = atomic {
+            self.pointer_anchor = None;
+            focus_editor(&self.editor, window, cx);
+            if event.click_count >= 2
+                && let AtomicBlockHit::Attachment { resource_id } = hit
+            {
+                cx.emit(EditorSurfaceEvent::OpenAttachment { resource_id });
+            }
+            cx.stop_propagation();
+            return;
+        }
         self.pointer_anchor = self.editor.update(cx, |editor, editor_cx| {
+            // The narrow gap between two atomic blocks (and the area below a
+            // terminal one) is a real insertion target. Materialize the
+            // paragraph before focus/IME sees it; a click inside the card or
+            // image itself remains an atomic selection for resource actions.
             let anchor = editor.begin_pointer_selection(event.position, event.modifiers.shift);
+            if activate_dead_zone {
+                if editor.activate_atomic_dead_zone().is_err() {
+                    // A stale/offscreen geometry hit must remain harmless:
+                    // fall back to ordinary pointer selection rather than
+                    // swallowing focus or inventing a partial document edit.
+                }
+            }
             editor_cx.notify();
-            anchor
+            if activate_dead_zone {
+                Some(editor.selection().anchor)
+            } else {
+                anchor
+            }
         });
         focus_editor(&self.editor, window, cx);
         cx.stop_propagation();
@@ -259,11 +345,16 @@ impl Render for EditorSurface {
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .capture_any_mouse_down(cx.listener(Self::on_mouse_down));
         }
-        // These are deliberately the non-mutating half of the donor action
-        // map. A Task 4 library surface must remain useful for keyboard
-        // selection and copying, while all mutation entry points stay behind
-        // `EditorCore::ensure_editable`. The editable spike can also receive
-        // these handlers through the same mounted entity.
+        // Preserve the donor's standard key context on the one shared
+        // document entity. Mutation permissions are deliberately enforced in
+        // `EditorCore`, not by leaving an alternate keyboard route unbound:
+        // a read-only surface gets harmless `ReadOnly` errors, while the
+        // editable library and spike use identical Delete/Undo behavior.
+        bind_result_action!(surface, editor, Newline, insert_paragraph_break);
+        bind_result_action!(surface, editor, DeleteBack, backspace);
+        bind_result_action!(surface, editor, Delete, delete_forward);
+        bind_result_action!(surface, editor, Undo, undo);
+        bind_result_action!(surface, editor, Redo, redo);
         bind_selection_action!(surface, editor, MoveLeft, move_left);
         bind_selection_action!(surface, editor, MoveRight, move_right);
         bind_selection_action!(surface, editor, Home, move_home);

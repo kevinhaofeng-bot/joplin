@@ -1,6 +1,8 @@
 use super::{AppAction, AppModel, AppStatus, ListViewMode, NoteSort, PaneState};
 use app_lite_core::document::{Block, BlockStyle, Inline};
-use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, LibraryShellState, NoteId};
+use app_lite_core::{
+    CanonicalDocument, CreateNote, LibraryRepository, LibraryShellState, NoteId, SaveNote,
+};
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 
@@ -335,6 +337,96 @@ fn selected_session_retains_the_loaded_note_not_just_its_id() {
     assert_eq!(note.title, "完整会话");
     assert_eq!(note.body_html, stored.body_html);
     assert_eq!(note.body_text, "来自 canonical HTML 的正文");
+}
+
+#[test]
+fn active_resource_commit_clears_a_removed_thumbnail_without_waiting_for_event_refresh() {
+    // This starts with an image cover, then commits an attachment-only
+    // snapshot. The SQLite transaction is the canonical same-frame outcome:
+    // deleting the unconditional projection assignment in
+    // `apply_active_resource_commit` leaves the old cover visible until an
+    // unrelated LibraryEvent happens to refresh the list.
+    let (_profile, repository) = repository();
+    let old_cover = repository
+        .import_resource(
+            &crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+                .images
+                .into_iter()
+                .next()
+                .expect("PNG fixture")
+                .bytes,
+            "old-cover.png",
+            "image/png",
+            "png",
+        )
+        .expect("persist old cover");
+    let note = repository
+        .create_note(CreateNote {
+            title: "cover removed".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Image {
+                resource_id: old_cover.clone(),
+                alt: "old cover".into(),
+                presentation: Default::default(),
+            }]),
+        })
+        .expect("create covered note");
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(note.id.clone()))
+        .expect("select covered note");
+    assert_eq!(
+        model
+            .projections()
+            .iter()
+            .find(|projection| projection.id == note.id)
+            .expect("active card")
+            .selected_thumbnail_id,
+        Some(old_cover),
+        "the fixture must begin with the prior image cover"
+    );
+
+    let staged = repository
+        .stage_resource(
+            b"%PDF-1.7\nattachment-only snapshot\n%%EOF\n",
+            "proof.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .expect("stage attachment");
+    let attachment = staged.resource_id().clone();
+    let committed = repository
+        .commit_staged_resource_snapshot(
+            SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: note.title.clone(),
+                document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                    resource_id: attachment.clone(),
+                    filename: "proof.pdf".into(),
+                    media_type: "application/pdf".into(),
+                }]),
+                resource_ids: vec![attachment],
+                selected_thumbnail_id: None,
+            },
+            None,
+            &staged,
+        )
+        .expect("one atomic attachment snapshot");
+    assert!(committed.selected_thumbnail_id.is_none());
+
+    model.apply_active_resource_commit(committed.note, committed.selected_thumbnail_id);
+
+    assert!(
+        model
+            .projections()
+            .iter()
+            .find(|projection| projection.id == note.id)
+            .expect("active card after commit")
+            .selected_thumbnail_id
+            .is_none(),
+        "the current card must clear its old cover before any later event polling"
+    );
 }
 
 #[test]

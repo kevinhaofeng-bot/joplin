@@ -8,7 +8,7 @@ pub use navigation::*;
 
 use app_lite_core::{
     CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
-    LibraryRepository, LibraryShellState, ListQuery, Note, NoteId, NoteProjection,
+    LibraryRepository, LibraryShellState, ListQuery, Note, NoteId, NoteProjection, ResourceId,
 };
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -381,6 +381,43 @@ impl AppModel {
     pub fn active_note(&self) -> Option<&Note> {
         self.active_session.as_ref().map(|session| &session.note)
     }
+
+    /// Install a complete note result already assembled by the same durable
+    /// snapshot transaction that changed the active session. This avoids a
+    /// second body load and makes the selected card truthful in the very frame
+    /// that the editor accepts a resource block; the normal projection event
+    /// later remains a projection-only reconciliation, not the visual trigger.
+    pub(crate) fn apply_active_resource_commit(
+        &mut self,
+        note: Note,
+        selected_thumbnail_id: Option<ResourceId>,
+    ) {
+        if self.navigation.selected_note_id() != Some(&note.id) {
+            return;
+        }
+        if let Some(active) = self.active_session.as_mut()
+            && active.note.id == note.id
+        {
+            active.note = note.clone();
+        }
+        if let Some(projection) = self
+            .projections
+            .iter_mut()
+            .find(|projection| projection.id == note.id)
+        {
+            projection.title_prefix = note.title.chars().take(120).collect();
+            projection.snippet = note.snippet.chars().take(160).collect();
+            projection.updated_time = note.updated_time;
+            projection.attachment_count = note.resource_ids.len() as i64;
+            // This is the canonical transaction outcome, not merely the ID
+            // of an image that happened to be inserted. `None` is equally
+            // meaningful: the transaction may have removed the old cover or
+            // committed an attachment-only document, and the currently
+            // mounted card must clear it in this same presentation cycle.
+            projection.selected_thumbnail_id = selected_thumbnail_id;
+        }
+        self.sort_projections();
+    }
     pub fn panes(&self) -> PaneState {
         self.panes
     }
@@ -468,6 +505,8 @@ impl AppModel {
     }
 }
 
+#[cfg(test)]
+mod image_flow_tests;
 #[cfg(test)]
 mod note_session_tests;
 #[cfg(test)]
