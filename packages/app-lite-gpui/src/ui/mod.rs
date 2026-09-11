@@ -170,6 +170,9 @@ pub struct LibraryShell {
     startup_notice: Option<String>,
     save_clock: Arc<dyn crate::app::save_coordinator::SaveClock>,
     focus_handle: FocusHandle,
+    /// Retained alongside the shell so the typed navigation tree can request
+    /// an offscreen route without eagerly constructing every notebook/tag row.
+    sidebar_scroll: UniformListScrollHandle,
     note_list_scroll: UniformListScrollHandle,
     _model_observation: Subscription,
     // Held by the entity so GPUI cancels the receiver loop when this window is
@@ -181,6 +184,11 @@ pub struct LibraryShell {
     rendered_note_range: Option<std::ops::Range<usize>>,
     #[cfg(test)]
     last_scroll_request: Option<usize>,
+    /// Test-only instrumentation is intentionally owned by this shell rather
+    /// than a process-global Atomic: GPUI mounted tests can draw independent
+    /// library windows concurrently.
+    #[cfg(test)]
+    sidebar_render_probe: SidebarRenderProbe,
     #[cfg(test)]
     library_surface_paint_hooks_for_test: Arc<LibrarySurfacePaintHooks>,
 }
@@ -194,6 +202,26 @@ struct LibrarySurfacePaintHooks {
     /// default-route shell. This lets the mounted regression test observe the
     /// actual structured style path rather than grep source text.
     primary_surface_fills: [AtomicU32; 5],
+}
+
+/// A per-mounted-shell observation of GPUI's actual sidebar uniform-list
+/// requests. It is deliberately unavailable to production so the virtualized
+/// sidebar has no cross-window mutable instrumentation.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SidebarRenderProbe {
+    pub(crate) request_count: usize,
+    pub(crate) largest_requested_range: usize,
+    pub(crate) last_requested_range: Option<std::ops::Range<usize>>,
+}
+
+#[cfg(test)]
+impl SidebarRenderProbe {
+    fn record(&mut self, range: std::ops::Range<usize>) {
+        self.request_count += 1;
+        self.largest_requested_range = self.largest_requested_range.max(range.len());
+        self.last_requested_range = Some(range);
+    }
 }
 
 /// A mounted-view observation rather than a repository-only assertion. The
@@ -400,6 +428,7 @@ impl LibraryShell {
             startup_notice,
             save_clock,
             focus_handle,
+            sidebar_scroll: UniformListScrollHandle::new(),
             note_list_scroll: UniformListScrollHandle::new(),
             _model_observation: observation,
             _event_task: event_task,
@@ -410,6 +439,8 @@ impl LibraryShell {
             #[cfg(test)]
             last_scroll_request: None,
             #[cfg(test)]
+            sidebar_render_probe: SidebarRenderProbe::default(),
+            #[cfg(test)]
             library_surface_paint_hooks_for_test: Arc::new(LibrarySurfacePaintHooks::default()),
         };
         shell.sync_editor_surface(cx);
@@ -418,6 +449,19 @@ impl LibraryShell {
         // card before the window has drawn for the first time.
         shell.scroll_selected_into_view(cx);
         shell
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_sidebar_uniform_list_range_for_test(
+        &mut self,
+        range: std::ops::Range<usize>,
+    ) {
+        self.sidebar_render_probe.record(range);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sidebar_render_probe_for_test(&self) -> SidebarRenderProbe {
+        self.sidebar_render_probe.clone()
     }
 
     fn spawn_event_bridge(
@@ -730,6 +774,14 @@ impl LibraryShell {
         match action {
             AppAction::CreateNote => active_id.map(|_| FlushReason::NoteSwitch),
             AppAction::SelectNote(id) if active_id.as_ref() != Some(id) => {
+                active_id.map(|_| FlushReason::NoteSwitch)
+            }
+            AppAction::NavigateTo {
+                selected_note_id, ..
+            } if active_id.as_ref() != selected_note_id.as_ref() => {
+                active_id.map(|_| FlushReason::NoteSwitch)
+            }
+            AppAction::NavigateBack | AppAction::NavigateForward => {
                 active_id.map(|_| FlushReason::NoteSwitch)
             }
             AppAction::TrashSelected => active_id.map(|_| FlushReason::Delete),
@@ -2039,7 +2091,7 @@ impl Render for LibraryShell {
         {
             fill.store(0, Ordering::Relaxed);
         }
-        let (items, selected, panes, status, mode, sort, active_note) =
+        let (items, selected, panes, status, mode, sort, active_note, navigation_index, route) =
             self.model.read_with(cx, |model, _| {
                 (
                     model.projections().to_vec(),
@@ -2049,6 +2101,8 @@ impl Render for LibraryShell {
                     model.list_view_mode(),
                     model.sort(),
                     model.active_note().cloned(),
+                    model.navigation_index().clone(),
+                    model.navigation().route().clone(),
                 )
             });
         let status_message = match status {
@@ -2082,6 +2136,27 @@ impl Render for LibraryShell {
             panes.list_visible,
             mode,
             cx,
+        );
+        let sidebar_shell = cx.weak_entity();
+        let sidebar = sidebar::render(
+            panes.sidebar_width,
+            panes.sidebar_visible,
+            &navigation_index,
+            &route,
+            self.sidebar_scroll.clone(),
+            cx,
+            move |route, window, app| {
+                let _ = sidebar_shell.update(app, |shell, shell_cx| {
+                    shell.apply_action(
+                        AppAction::NavigateTo {
+                            route,
+                            selected_note_id: None,
+                        },
+                        window,
+                        shell_cx,
+                    );
+                });
+            },
         );
         let mode_label = match mode {
             ListViewMode::Cards => "卡片",
@@ -2169,7 +2244,7 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::sync_current))
             .on_action(cx.listener(Self::paste_resource_or_text))
             .on_key_down(cx.listener(Self::on_shell_key_down))
-            .child(sidebar::render(panes.sidebar_width, panes.sidebar_visible))
+            .child(sidebar)
             .child(note_list)
             .child(
                 div()

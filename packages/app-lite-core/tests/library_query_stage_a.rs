@@ -5,7 +5,8 @@ use app_lite_core::{
     CanonicalDocument, CreateNote, LibraryError, LibraryRepository, LibraryRoute, ListQuery,
     ListQueryError, NoteId, RepositoryClock, RepositoryIdSource, SortSpec,
 };
-use std::collections::VecDeque;
+use rusqlite::Connection;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -434,4 +435,169 @@ fn each_route_starts_with_its_source_backed_updated_or_deleted_sort() {
         vec![newer, older],
         "Trash defaults to deleted descending independently of All Notes"
     );
+}
+
+#[test]
+fn navigation_index_exposes_only_typed_sidebar_metadata_in_stable_tree_order() {
+    // Mutation-sensitive: replacing the typed stack/notebook/tag rows with a
+    // card projection, including deleted entities, or discarding stack
+    // ownership changes this exact sidebar input before GPUI can render it.
+    let (_profile, repository) = repository();
+    let first_stack = repository.create_stack("Alpha stack").expect("first stack");
+    let second_stack = repository.create_stack("beta stack").expect("second stack");
+    let stacked_notebook = repository
+        .create_notebook("项目", Some(&second_stack.id))
+        .expect("stacked notebook");
+    let root_notebook = repository
+        .create_notebook("收件箱", None)
+        .expect("root notebook");
+    let default_notebook = repository.default_notebook().expect("default notebook");
+    let second_tag = repository.create_tag("beta").expect("second tag");
+    let first_tag = repository.create_tag("Alpha").expect("first tag");
+
+    let index = repository
+        .list_navigation_index()
+        .expect("lightweight navigation index");
+
+    assert_eq!(
+        index
+            .stacks
+            .iter()
+            .map(|stack| &stack.id)
+            .collect::<Vec<_>>(),
+        vec![&first_stack.id, &second_stack.id],
+        "stacks must stay typed and case-insensitively stable"
+    );
+    assert_eq!(
+        index
+            .notebooks
+            .iter()
+            .map(|notebook| (&notebook.id, notebook.stack_id.as_ref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (&stacked_notebook.id, Some(&second_stack.id)),
+            (&root_notebook.id, None),
+            (&default_notebook.id, None),
+        ],
+        "the sidebar must retain typed notebook-to-stack ownership instead of deriving it from note cards"
+    );
+    assert_eq!(
+        index.tags.iter().map(|tag| &tag.id).collect::<Vec<_>>(),
+        vec![&first_tag.id, &second_tag.id],
+        "tag navigation must retain its durable TagId ordering"
+    );
+}
+
+#[test]
+fn navigation_index_authorizer_rejects_body_blob_reads_and_soft_deleted_organization_rows() {
+    // Mutation-sensitive: adding even a discarded SELECT of notes.body_html,
+    // notes.body_text, notes.merge_state, or resource_blobs.bytes makes the
+    // authorizer allow-list fail. Dropping any of the three deleted_time
+    // predicates exposes the matching soft-deleted typed entity below.
+    let (profile, repository) = repository();
+    let active_stack = repository.create_stack("活动 Stack").expect("active stack");
+    let deleted_stack = repository
+        .create_stack("已删除 Stack")
+        .expect("deleted stack");
+    let active_notebook = repository
+        .create_notebook("活动 Notebook", Some(&active_stack.id))
+        .expect("active notebook");
+    let deleted_notebook = repository
+        .create_notebook("已删除 Notebook", None)
+        .expect("deleted notebook");
+    let active_tag = repository.create_tag("活动 Tag").expect("active tag");
+    let deleted_tag = repository.create_tag("已删除 Tag").expect("deleted tag");
+    create(&repository, "具有正文的卡片不能被 sidebar 读取", None);
+
+    let database = Connection::open(profile.path().join("library.sqlite"))
+        .expect("open fixture database for soft deletes");
+    for (table, id) in [
+        ("stacks", deleted_stack.id.as_str()),
+        ("notebooks", deleted_notebook.id.as_str()),
+        ("tags", deleted_tag.id.as_str()),
+    ] {
+        database
+            .execute(
+                &format!("UPDATE {table} SET deleted_time = 99 WHERE id = ?1"),
+                [id],
+            )
+            .expect("soft delete organization fixture");
+    }
+    drop(database);
+
+    let index = repository
+        .list_navigation_index()
+        .expect("navigation metadata snapshot");
+    assert!(index.stacks.iter().any(|stack| stack.id == active_stack.id));
+    assert!(
+        !index
+            .stacks
+            .iter()
+            .any(|stack| stack.id == deleted_stack.id),
+        "soft-deleted stacks cannot become sidebar routes"
+    );
+    assert!(
+        index
+            .notebooks
+            .iter()
+            .any(|notebook| notebook.id == active_notebook.id)
+    );
+    assert!(
+        !index
+            .notebooks
+            .iter()
+            .any(|notebook| notebook.id == deleted_notebook.id),
+        "soft-deleted notebooks cannot become sidebar routes"
+    );
+    assert!(index.tags.iter().any(|tag| tag.id == active_tag.id));
+    assert!(
+        !index.tags.iter().any(|tag| tag.id == deleted_tag.id),
+        "soft-deleted tags cannot become sidebar routes"
+    );
+
+    // The caller intentionally throws the index away. The SQL authorizer is
+    // the gate: it sees every physical Read action even if a future
+    // implementation prefetches a body/blob and discards its result.
+    let read_observer = repository.observe_next_navigation_index_query();
+    let _discarded = repository
+        .list_navigation_index()
+        .expect("discarded navigation metadata snapshot");
+    let reads = read_observer
+        .recv()
+        .expect("navigation query read observation");
+    let allowed = BTreeSet::from([
+        "stacks.id",
+        "stacks.title",
+        "stacks.revision",
+        "stacks.deleted_time",
+        "notebooks.id",
+        "notebooks.title",
+        "notebooks.stack_id",
+        "notebooks.revision",
+        "notebooks.is_default",
+        "notebooks.deleted_time",
+        "tags.id",
+        "tags.title",
+        "tags.revision",
+        "tags.deleted_time",
+    ]);
+    assert!(
+        !reads.is_empty(),
+        "the authorizer must observe the actual SQLite reads, not a mocked query"
+    );
+    assert!(
+        reads.iter().all(|column| allowed.contains(column.as_str())),
+        "navigation index read a non-metadata column: {reads:?}"
+    );
+    for forbidden in [
+        "notes.body_html",
+        "notes.body_text",
+        "notes.merge_state",
+        "resource_blobs.bytes",
+    ] {
+        assert!(
+            !reads.iter().any(|column| column == forbidden),
+            "navigation index must never read {forbidden}, even if it discards the result"
+        );
+    }
 }

@@ -4,8 +4,9 @@ use crate::resource::{
 use crate::schema::migrate_schema;
 use crate::{
     BlobHash, CanonicalDocument, CreateNote, EditJournalEntry, EntityRef, JournalOwnership,
-    ListQuery, ListQueryError, Note, NoteId, NoteProjection, Notebook, NotebookId, ResourceId,
-    SaveNote, SavedRevision, Stack, StackId, Tag, TagId, compile_note_list_query,
+    LibraryNavigationIndex, ListQuery, ListQueryError, Note, NoteId, NoteProjection, Notebook,
+    NotebookId, ResourceId, SaveNote, SavedRevision, Stack, StackId, Tag, TagId,
+    compile_note_list_query,
 };
 use rusqlite::hooks::{AuthAction, Authorization};
 use rusqlite::{
@@ -329,6 +330,8 @@ pub struct LibraryRepository {
     resource_store: ResourceStore,
     events: Mutex<Vec<Sender<LibraryEvent>>>,
     list_observers: Mutex<Vec<Sender<Vec<String>>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    navigation_index_observers: Mutex<Vec<Sender<Vec<String>>>>,
     note_load_observers: Mutex<Vec<Sender<NoteId>>>,
     #[cfg(test)]
     shell_state_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -550,6 +553,8 @@ impl LibraryRepository {
             resource_store,
             events: Mutex::new(Vec::new()),
             list_observers: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            navigation_index_observers: Mutex::new(Vec::new()),
             note_load_observers: Mutex::new(Vec::new()),
             #[cfg(test)]
             shell_state_read_hook: Mutex::new(None),
@@ -654,6 +659,22 @@ impl LibraryRepository {
         self.list_observers
             .lock()
             .expect("observer mutex poisoned")
+            .push(sender);
+        receiver
+    }
+
+    /// Reports actual SQLite `Read` actions for the next navigation-index
+    /// query. It is deliberately feature-gated so production navigation has
+    /// no observer lock or authorizer bookkeeping, while test-support builds
+    /// can reject future body/blob prefetches even when their result is thrown
+    /// away before reaching the UI.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_next_navigation_index_query(&self) -> Receiver<Vec<String>> {
+        let (sender, receiver) = channel();
+        self.navigation_index_observers
+            .lock()
+            .expect("navigation-index observer mutex poisoned")
             .push(sender);
         receiver
     }
@@ -808,6 +829,97 @@ impl LibraryRepository {
                 row_to_notebook,
             )
             .map_err(Into::into)
+    }
+
+    /// Returns only the durable organization metadata needed to render a
+    /// typed library sidebar. This has no note-card authority: note rows stay
+    /// exclusively behind `list_notes`, and this query intentionally never
+    /// touches bodies, snippets, thumbnails, or resource blobs.
+    pub fn list_navigation_index(&self) -> Result<LibraryNavigationIndex, LibraryError> {
+        #[cfg(any(test, feature = "test-support"))]
+        let observers = std::mem::take(
+            &mut *self
+                .navigation_index_observers
+                .lock()
+                .expect("navigation-index observer mutex poisoned"),
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        let columns = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        #[cfg(any(test, feature = "test-support"))]
+        if !observers.is_empty() {
+            let captured = Arc::clone(&columns);
+            connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if let AuthAction::Read {
+                    table_name,
+                    column_name,
+                } = context.action
+                {
+                    captured
+                        .lock()
+                        .expect("navigation-index column observer mutex poisoned")
+                        .insert(format!("{table_name}.{column_name}"));
+                }
+                Authorization::Allow
+            }));
+        }
+        let result = (|| -> Result<LibraryNavigationIndex, LibraryError> {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let stacks = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, title, revision
+                     FROM stacks
+                     WHERE deleted_time = 0
+                     ORDER BY title COLLATE NOCASE ASC, id ASC",
+                )?;
+                let rows = statement.query_map([], row_to_stack)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let notebooks = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, title, stack_id, revision, is_default
+                     FROM notebooks
+                     WHERE deleted_time = 0
+                     ORDER BY CASE WHEN stack_id IS NULL THEN 1 ELSE 0 END,
+                              title COLLATE NOCASE ASC,
+                              id ASC",
+                )?;
+                let rows = statement.query_map([], row_to_notebook)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let tags = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, title, revision
+                     FROM tags
+                     WHERE deleted_time = 0
+                     ORDER BY title COLLATE NOCASE ASC, id ASC",
+                )?;
+                let rows = statement.query_map([], row_to_tag)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            transaction.commit()?;
+            Ok(LibraryNavigationIndex {
+                notebooks,
+                stacks,
+                tags,
+            })
+        })();
+        #[cfg(any(test, feature = "test-support"))]
+        connection.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
+        #[cfg(any(test, feature = "test-support"))]
+        if !observers.is_empty() {
+            let fields = columns
+                .lock()
+                .expect("navigation-index column observer mutex poisoned")
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            for observer in observers {
+                let _ = observer.send(fields.clone());
+            }
+        }
+        result
     }
 
     pub fn create_note(&self, input: CreateNote) -> Result<Note, LibraryError> {
@@ -2600,6 +2712,22 @@ fn row_to_notebook(row: &rusqlite::Row<'_>) -> rusqlite::Result<Notebook> {
             .transpose()?,
         revision: row.get(3)?,
         is_default: row.get::<_, i64>(4)? != 0,
+    })
+}
+
+fn row_to_stack(row: &rusqlite::Row<'_>) -> rusqlite::Result<Stack> {
+    Ok(Stack {
+        id: StackId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
+        title: row.get(1)?,
+        revision: row.get(2)?,
+    })
+}
+
+fn row_to_tag(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
+    Ok(Tag {
+        id: TagId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
+        title: row.get(1)?,
+        revision: row.get(2)?,
     })
 }
 fn row_to_note_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {

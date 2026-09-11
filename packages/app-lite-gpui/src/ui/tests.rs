@@ -4,7 +4,7 @@ use crate::app::save_coordinator::ManualSaveClock;
 use crate::components::{Copy, Paste, SelectAll};
 use crate::native_editor::model::{Affinity, BlockKind, DocPoint, Mark};
 use app_lite_core::document::{Block, BlockStyle, Inline, Marks};
-use app_lite_core::{CanonicalDocument, CreateNote, LibraryShellState};
+use app_lite_core::{CanonicalDocument, CreateNote, LibraryRoute, LibraryShellState};
 use gpui::{
     AppContext, ClipboardItem, EntityInputHandler, Image, ImageFormat, Modifiers, TestAppContext,
     VisualTestContext, point, px,
@@ -172,6 +172,440 @@ async fn mounted_card_click_reaches_the_same_shell_action_reducer(cx: &mut TestA
         );
         assert!(view.editor_surface.is_some());
     });
+}
+
+#[gpui::test]
+async fn mounted_typed_sidebar_routes_use_durable_ids_without_hydrating_cards(
+    cx: &mut TestAppContext,
+) {
+    // Mutation-sensitive: replacing sidebar rows with labels/indexes, routing
+    // them around AppModel::NavigateTo, or loading a body while only changing
+    // a route makes a typed route, exact projection, or observer assertion
+    // below fail.
+    let (_profile, repository) = repository();
+    let stack = repository.create_stack("项目组").expect("create stack");
+    let notebook = repository
+        .create_notebook("客户端", Some(&stack.id))
+        .expect("create notebook");
+    let tag = repository.create_tag("紧急").expect("create tag");
+    let cover = repository
+        .import_resource(
+            &structural_png(48, 32),
+            "导航缩略图.png",
+            "image/png",
+            "png",
+        )
+        .expect("store thumbnail fixture");
+    let scoped = repository
+        .create_note(CreateNote {
+            title: "项目卡片".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: CanonicalDocument::from_blocks(vec![Block::Image {
+                resource_id: cover,
+                alt: "卡片缩略图只应作为 projection key".into(),
+                presentation: Default::default(),
+            }]),
+        })
+        .expect("create scoped note");
+    repository
+        .set_note_tags(&scoped.id, &[tag.id.clone()])
+        .expect("tag scoped note");
+    let trashed = repository
+        .create_note(CreateNote {
+            title: "废纸篓卡片".into(),
+            notebook_id: None,
+            document: rich_document("废纸篓正文也不是导航字段"),
+        })
+        .expect("create trash note");
+    repository.trash_note(&trashed.id).expect("trash note");
+
+    let body_loads = repository.observe_note_loads();
+    let resource_reads = repository.observe_resource_reads();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    let notebook_selector: &'static str = Box::leak(
+        format!("library-sidebar-route-notebook-{}", notebook.id.as_str()).into_boxed_str(),
+    );
+    let stack_selector: &'static str =
+        Box::leak(format!("library-sidebar-route-stack-{}", stack.id.as_str()).into_boxed_str());
+    let tag_selector: &'static str =
+        Box::leak(format!("library-sidebar-route-tag-{}", tag.id.as_str()).into_boxed_str());
+    for selector in [
+        "library-sidebar-route-all-notes",
+        notebook_selector,
+        stack_selector,
+        tag_selector,
+        "library-sidebar-route-trash",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the mounted typed sidebar must expose {selector}"
+        );
+    }
+
+    let assertions = [
+        (
+            notebook_selector,
+            LibraryRoute::Notebook(notebook.id.clone()),
+            vec![scoped.id.clone()],
+        ),
+        (
+            stack_selector,
+            LibraryRoute::Stack(stack.id.clone()),
+            vec![scoped.id.clone()],
+        ),
+        (
+            tag_selector,
+            LibraryRoute::tags(vec![tag.id.clone()]).expect("single-tag route"),
+            vec![scoped.id.clone()],
+        ),
+        (
+            "library-sidebar-route-trash",
+            LibraryRoute::Trash,
+            vec![trashed.id.clone()],
+        ),
+    ];
+    for (selector, route, ids) in assertions {
+        let hit = cx.debug_bounds(selector).expect("mounted sidebar row");
+        cx.simulate_click(hit.center(), Modifiers::default());
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("library-sidebar-selected-route").is_some(),
+            "the clicked typed route must paint the sidebar's selected state"
+        );
+        view.read_with(cx, |shell, app| {
+            let model = shell.model.read(app);
+            assert_eq!(model.navigation().route(), &route);
+            assert_eq!(
+                model
+                    .projections()
+                    .iter()
+                    .map(|projection| projection.id.clone())
+                    .collect::<Vec<_>>(),
+                ids,
+                "the clicked route must use the same typed projection authority"
+            );
+            assert!(
+                model.active_note().is_none(),
+                "route navigation without a selected NoteId must not hydrate a body"
+            );
+        });
+        assert_eq!(body_loads.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(resource_reads.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    let all_notes = cx
+        .debug_bounds("library-sidebar-route-all-notes")
+        .expect("mounted All Notes row");
+    cx.simulate_click(all_notes.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(model.navigation().route(), &LibraryRoute::AllNotes);
+        assert_eq!(
+            model
+                .projections()
+                .iter()
+                .map(|projection| projection.id.clone())
+                .collect::<Vec<_>>(),
+            vec![scoped.id.clone()],
+            "All Notes is a typed route, not a label-only reset of the current cards"
+        );
+    });
+    assert_eq!(body_loads.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(resource_reads.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[gpui::test]
+async fn mounted_sidebar_virtualizes_scale_fixture_and_reaches_tail_typed_routes(
+    cx: &mut TestAppContext,
+) {
+    // Mutation-sensitive: replacing the true scrollable uniform list with an
+    // eager h_full/overflow_hidden column leaves the tail rows either mounted
+    // outside the viewport or unreachable after the retained scroll request.
+    // Routing either tail row by label/index instead of its durable ID also
+    // changes the exact route assertions below.
+    let (_profile, repository) = repository();
+    for index in 0..30 {
+        let title = format!("规模笔记本 {index:02}");
+        repository
+            .create_notebook(&title, None)
+            .expect("create sidebar notebook fixture");
+    }
+    let tags = (0..64)
+        .map(|index| {
+            let title = format!("规模标签 {index:03}");
+            repository
+                .create_tag(&title)
+                .expect("create sidebar tag fixture")
+        })
+        .collect::<Vec<_>>();
+    let tail_tag = tags.last().expect("tail tag").clone();
+    let tail_tag_route = LibraryRoute::tags(vec![tail_tag.id.clone()]).expect("tail tag route");
+    let tail_tag_selector: &'static str =
+        Box::leak(format!("library-sidebar-route-tag-{}", tail_tag.id.as_str()).into_boxed_str());
+
+    let body_loads = repository.observe_note_loads();
+    let resource_reads = repository.observe_resource_reads();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1280.0), px(760.0)));
+    redraw(cx);
+
+    let initial_sidebar_probe = view.read_with(cx, |shell, app| {
+        assert_eq!(
+            shell.model.read(app).navigation_index().notebooks.len(),
+            31,
+            "the scale fixture includes the default plus thirty extra notebooks"
+        );
+        assert_eq!(
+            shell.model.read(app).navigation_index().tags.len(),
+            64,
+            "the scale fixture includes every durable tag"
+        );
+        assert!(
+            shell.sidebar_scroll.is_scrollable(),
+            "a 760px library sidebar must expose a real scroll viewport"
+        );
+        shell.sidebar_render_probe_for_test()
+    });
+    assert!(
+        initial_sidebar_probe.request_count > 0,
+        "the mounted shell must receive a real uniform-list request"
+    );
+    assert!(
+        initial_sidebar_probe.largest_requested_range < 80,
+        "first sidebar draw eagerly constructed {} rows in one request",
+        initial_sidebar_probe.largest_requested_range
+    );
+    assert!(
+        cx.debug_bounds(&tail_tag_selector).is_none(),
+        "the tail tag must not be falsely interactable before the virtual sidebar requests it"
+    );
+    assert!(
+        cx.debug_bounds("library-sidebar-route-trash").is_none(),
+        "Trash must initially remain below the 760px viewport in this scale fixture"
+    );
+
+    let (tail_tag_index, trash_index) = view.read_with(cx, |shell, app| {
+        let index = shell.model.read(app).navigation_index();
+        (
+            sidebar::route_index_for_test(index, &tail_tag_route).expect("tail tag row"),
+            sidebar::route_index_for_test(index, &LibraryRoute::Trash).expect("trash row"),
+        )
+    });
+    view.update(cx, |shell, _| {
+        shell
+            .sidebar_scroll
+            .scroll_to_item(tail_tag_index, gpui::ScrollStrategy::Center);
+    });
+    redraw(cx);
+    let tail_tag_sidebar_probe =
+        view.read_with(cx, |shell, _| shell.sidebar_render_probe_for_test());
+    assert!(
+        tail_tag_sidebar_probe.request_count > initial_sidebar_probe.request_count,
+        "the retained sidebar handle must request a new range for the tail tag"
+    );
+    assert!(
+        tail_tag_sidebar_probe
+            .last_requested_range
+            .as_ref()
+            .is_some_and(|range| range.contains(&tail_tag_index)),
+        "the single shell must request the tail-tag range rather than construct every row"
+    );
+    assert!(
+        tail_tag_sidebar_probe.largest_requested_range < 80,
+        "one sidebar request constructed {} rows instead of a bounded viewport range",
+        tail_tag_sidebar_probe.largest_requested_range
+    );
+    let tail_tag_bounds = cx
+        .debug_bounds(&tail_tag_selector)
+        .expect("tail tag is interactable after the true scroll request");
+    cx.simulate_click(tail_tag_bounds.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.model.read(app).navigation().route(), &tail_tag_route);
+    });
+    assert!(
+        cx.debug_bounds("library-sidebar-selected-route").is_some(),
+        "tail Tag navigation must paint the selected typed route"
+    );
+
+    view.update(cx, |shell, _| {
+        shell
+            .sidebar_scroll
+            .scroll_to_item(trash_index, gpui::ScrollStrategy::Bottom);
+    });
+    redraw(cx);
+    let trash_sidebar_probe = view.read_with(cx, |shell, _| shell.sidebar_render_probe_for_test());
+    assert!(
+        trash_sidebar_probe.request_count > tail_tag_sidebar_probe.request_count,
+        "the same shell must request a separate bounded range for Trash"
+    );
+    assert!(
+        trash_sidebar_probe
+            .last_requested_range
+            .as_ref()
+            .is_some_and(|range| range.contains(&trash_index)),
+        "the single shell must request the Trash range rather than reuse a process-global count"
+    );
+    assert!(
+        trash_sidebar_probe.largest_requested_range < 80,
+        "one sidebar processor request constructed {} rows instead of a bounded viewport range",
+        trash_sidebar_probe.largest_requested_range
+    );
+    let trash_bounds = cx
+        .debug_bounds("library-sidebar-route-trash")
+        .expect("Trash is interactable after the true scroll request");
+    cx.simulate_click(trash_bounds.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(
+            shell.model.read(app).navigation().route(),
+            &LibraryRoute::Trash
+        );
+        assert!(shell.model.read(app).active_note().is_none());
+    });
+    assert!(
+        cx.debug_bounds("library-sidebar-selected-route").is_some(),
+        "tail Trash navigation must paint the selected typed route"
+    );
+    assert_eq!(body_loads.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(resource_reads.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[gpui::test]
+async fn mounted_list_modes_and_pane_collapse_keep_one_projection_and_live_session(
+    cx: &mut TestAppContext,
+) {
+    // Mutation-sensitive: a second list authority, a card mode that reloads
+    // notes, or collapse rebuilding the session/editor makes identity/order
+    // or no-hydration assertions below fail.
+    let (_profile, repository) = repository();
+    let selected = repository
+        .create_note(CreateNote {
+            title: "第一篇".into(),
+            notebook_id: None,
+            document: rich_document("已挂载编辑器必须穿过三种列表模式"),
+        })
+        .expect("create selected note");
+    for title in ["第二篇", "第三篇"] {
+        repository
+            .create_note(CreateNote {
+                title: title.into(),
+                notebook_id: None,
+                document: rich_document("卡片正文永远不是列表数据"),
+            })
+            .expect("create list note");
+    }
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(selected.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+
+    let (projection_ids, session_id, surface_id) = view.read_with(cx, |shell, app| {
+        (
+            shell
+                .model
+                .read(app)
+                .projections()
+                .iter()
+                .map(|projection| projection.id.clone())
+                .collect::<Vec<_>>(),
+            shell
+                .note_session
+                .as_ref()
+                .expect("mounted NoteSession")
+                .entity_id(),
+            shell
+                .editor_surface
+                .as_ref()
+                .expect("mounted EditorSurface")
+                .entity_id(),
+        )
+    });
+    let body_loads = repository.observe_note_loads();
+    for (selector, mode) in [
+        ("library-note-card-snippets", ListViewMode::Snippets),
+        ("library-note-card-compact", ListViewMode::Compact),
+        ("library-note-card-cards", ListViewMode::Cards),
+    ] {
+        let control = cx
+            .debug_bounds("library-cycle-view")
+            .expect("real list-mode control");
+        cx.simulate_click(control.center(), Modifiers::default());
+        redraw(cx);
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the mounted card mode must change the real card presentation"
+        );
+        view.read_with(cx, |shell, app| {
+            let model = shell.model.read(app);
+            assert_eq!(model.list_view_mode(), mode);
+            assert_eq!(
+                model
+                    .projections()
+                    .iter()
+                    .map(|projection| projection.id.clone())
+                    .collect::<Vec<_>>(),
+                projection_ids,
+                "all visual modes must consume the same ordered projections"
+            );
+            assert_eq!(model.navigation().selected_note_id(), Some(&selected.id));
+            assert_eq!(
+                shell
+                    .note_session
+                    .as_ref()
+                    .expect("retained session")
+                    .entity_id(),
+                session_id,
+                "changing list presentation must not remount NoteSession"
+            );
+            assert_eq!(
+                shell
+                    .editor_surface
+                    .as_ref()
+                    .expect("retained surface")
+                    .entity_id(),
+                surface_id,
+                "changing list presentation must not recreate EditorCore's surface"
+            );
+        });
+        assert_eq!(body_loads.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    for action in [AppAction::ToggleSidebar, AppAction::ToggleNoteList] {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(action, window, shell_cx)
+            });
+        });
+        redraw(cx);
+        view.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell
+                    .note_session
+                    .as_ref()
+                    .expect("retained session")
+                    .entity_id(),
+                session_id,
+                "three/two/one-column collapse must retain the live NoteSession"
+            );
+            assert_eq!(
+                shell
+                    .editor_surface
+                    .as_ref()
+                    .expect("retained surface")
+                    .entity_id(),
+                surface_id,
+                "three/two/one-column collapse must retain the existing EditorCore"
+            );
+        });
+    }
+    assert_eq!(body_loads.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[gpui::test]
@@ -3585,6 +4019,7 @@ async fn uniform_list_constructs_only_requested_ranges_and_reaches_1662_tail(
             })
             .expect("create projection fixture");
     }
+    let body_loads = repository.observe_note_loads();
     let (view, cx) = mount_shell(repository, cx);
     note_list::reset_constructed_items_for_test();
     redraw(cx);
@@ -3592,6 +4027,11 @@ async fn uniform_list_constructs_only_requested_ranges_and_reaches_1662_tail(
     assert!(
         initial_constructed < 128,
         "uniform list eagerly built {initial_constructed} cards"
+    );
+    assert_eq!(
+        body_loads.try_recv(),
+        Err(TryRecvError::Empty),
+        "mounting a 1,662-card list must stay a projection-only operation until a NoteId is explicitly selected"
     );
     view.read_with(cx, |view, _| {
         assert!(

@@ -8,8 +8,8 @@ pub use navigation::*;
 
 use app_lite_core::{
     CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
-    LibraryRepository, LibraryShellState, ListQuery, Note, NoteId, NoteProjection, ResourceId,
-    SortDirection, SortField,
+    LibraryNavigationIndex, LibraryRepository, LibraryShellState, ListQuery, Note, NoteId,
+    NoteProjection, ResourceId, SortDirection, SortField,
 };
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -81,6 +81,7 @@ pub struct AppModel {
     repository: Arc<LibraryRepository>,
     navigation: NavigationState,
     projections: Vec<NoteProjection>,
+    navigation_index: LibraryNavigationIndex,
     active_session: Option<ActiveSession>,
     panes: PaneState,
     list_view_mode: ListViewMode,
@@ -112,6 +113,7 @@ impl AppModel {
         let saved_shell_state = repository.read_library_shell_state()?;
         let panes = PaneState::from_shell_state(&saved_shell_state);
         let navigation = NavigationState::default();
+        let navigation_index = repository.list_navigation_index()?;
         let projections = repository.list_notes(
             ListQuery::for_route(navigation.route().clone()).with_sort(navigation.sort()),
         )?;
@@ -119,6 +121,7 @@ impl AppModel {
             repository,
             navigation,
             projections,
+            navigation_index,
             active_session: None,
             panes,
             list_view_mode: ListViewMode::default(),
@@ -334,7 +337,8 @@ impl AppModel {
         &mut self,
         events: impl IntoIterator<Item = LibraryEvent>,
     ) -> Result<bool, LibraryError> {
-        let refresh_needed = events.into_iter().any(|event| {
+        let events = events.into_iter().collect::<Vec<_>>();
+        let refresh_needed = events.iter().any(|event| {
             matches!(
                 event,
                 LibraryEvent::NoteCreated(_)
@@ -351,7 +355,23 @@ impl AppModel {
         {
             self.projection_event_refreshes += 1;
         }
+        // Organization rows are not card projections. Prepare their typed
+        // snapshot before changing the visible list so a failed sidebar
+        // refresh cannot publish a half-updated three-column shell.
+        let prepared_navigation_index = if events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::OrganizationChanged))
+        {
+            Some(self.repository.list_navigation_index()?)
+        } else {
+            None
+        };
         let result = self.refresh_list();
+        if result.is_ok()
+            && let Some(navigation_index) = prepared_navigation_index
+        {
+            self.navigation_index = navigation_index;
+        }
         match &result {
             Ok(()) if self.status_origin != StatusOrigin::Action => {
                 self.status = AppStatus::Ready;
@@ -393,6 +413,12 @@ impl AppModel {
     }
     pub fn projections(&self) -> &[NoteProjection] {
         &self.projections
+    }
+    /// The metadata-only source for sidebar rows. It intentionally has a
+    /// different shape from note projections, so rendering navigation cannot
+    /// accidentally hydrate a note body or become a second card query.
+    pub fn navigation_index(&self) -> &LibraryNavigationIndex {
+        &self.navigation_index
     }
     pub fn active_session_note_id(&self) -> Option<&NoteId> {
         self.active_session.as_ref().map(|session| &session.note.id)

@@ -63,6 +63,18 @@ pub struct Tag {
     pub revision: i64,
 }
 
+/// The lightweight, typed input for a library navigation tree.
+///
+/// This is deliberately separate from `NoteProjection`: expanding a sidebar
+/// must never query a note body, snippet, thumbnail, or resource blob merely
+/// to learn which durable Notebook/Stack/Tag identities can be navigated to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LibraryNavigationIndex {
+    pub notebooks: Vec<Notebook>,
+    pub stacks: Vec<Stack>,
+    pub tags: Vec<Tag>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredResource {
     pub id: ResourceId,

@@ -18,6 +18,11 @@ pub fn render(projection: &NoteProjection, selected: bool, mode: ListViewMode) -
         &projection.title_prefix
     };
     let time = relative_time(projection.updated_time);
+    let mode_selector = match mode {
+        ListViewMode::Cards => "library-note-card-cards",
+        ListViewMode::Snippets => "library-note-card-snippets",
+        ListViewMode::Compact => "library-note-card-compact",
+    };
     let mut card = div()
         .id(("note-card", stable_element_id(projection.id.as_str())))
         .debug_selector(|| "library-note-card".to_owned())
@@ -35,6 +40,7 @@ pub fn render(projection: &NoteProjection, selected: bool, mode: ListViewMode) -
         .text_color(rgba(0x202720ff))
         .child(
             div()
+                .debug_selector(move || mode_selector.to_owned())
                 .text_size(px(15.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child(title.to_owned()),
