@@ -1001,6 +1001,188 @@ async fn two_recovery_candidates_can_claim_one_checkpoint_and_old_writer_cannot_
 }
 
 #[gpui::test]
+async fn prepared_recovery_rejects_a_gated_same_owner_checkpoint_replacement(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A restart candidate captures J1, then the crashed session's already
+    // dispatched worker publishes J2 with the same owner before the claim can
+    // begin. A claim tied only to token/revision would replace J2's durable
+    // bytes with the stale J1 payload; it must instead reject the stale
+    // prepared identity and leave J2 byte-for-byte intact.
+    let cx = cx.add_empty_window();
+    let (profile, repository_a) = repository();
+    let repository_b = Arc::new(
+        LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open independent recovery repository"),
+    );
+    let note = create(&repository_a, "准备后替换", rich_document("持久化基线"));
+    let clock_a = Arc::new(ManualSaveClock::default());
+    let crashed = session(
+        note.clone(),
+        Arc::clone(&repository_a),
+        Arc::clone(&clock_a),
+        cx,
+    );
+
+    append_body_via_entity_input(&crashed, " J1恢复内容", cx);
+    clock_a.advance(Duration::from_millis(100));
+    poll_and_drain(&crashed, cx);
+    let j1 = repository_a
+        .latest_edit_journal(&note.id)
+        .expect("read first checkpoint")
+        .expect("J1 exists");
+
+    let base_b = repository_b
+        .load_note(&note.id)
+        .expect("load restart base")
+        .expect("restart base exists");
+    let prepared = NoteSession::prepare(base_b, repository_b.as_ref())
+        .expect("prepare the exact J1 recovery identity");
+
+    append_body_via_entity_input(&crashed, " J2新检查点", cx);
+    let release_j2 = crashed.update(cx, |session, _| {
+        session.stall_next_background_save_for_test()
+    });
+    clock_a.advance(Duration::from_millis(100));
+    crashed.update(cx, |session, session_cx| {
+        session.dispatch_due_background_work_for_test(session_cx)
+    });
+    assert!(matches!(
+        crashed.read_with(cx, |session, _| session.save_state()),
+        SaveState::Journaling
+    ));
+    release_j2
+        .send(())
+        .expect("release the already-dispatched J2 worker");
+    cx.run_until_parked();
+    let j2 = repository_a
+        .latest_edit_journal(&note.id)
+        .expect("read newer checkpoint")
+        .expect("J2 replaces J1 under the crashed owner");
+    assert_eq!(j2.writer_token, j1.writer_token);
+    assert!(j2.sequence > j1.sequence);
+    assert!(j2.delta_utf8.contains("J2新检查点"));
+
+    let claim = match prepared.claim_recovery_ownership(repository_b.as_ref()) {
+        Ok(_) => panic!("a prepared J1 must not claim or overwrite newer J2"),
+        Err(error) => error,
+    };
+    assert!(claim.to_string().contains("writer"));
+    let surviving = repository_b
+        .latest_edit_journal(&note.id)
+        .expect("read checkpoint after rejected stale claim")
+        .expect("newer checkpoint remains");
+    assert_eq!(surviving.writer_token, j2.writer_token);
+    assert_eq!(surviving.sequence, j2.sequence);
+    assert_eq!(surviving.delta_utf8, j2.delta_utf8);
+}
+
+#[gpui::test]
+async fn claimed_recovery_rejects_a_gated_former_owner_snapshot_and_allows_the_new_owner(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A stale snapshot job has captured A's J1 lease before it blocks in the
+    // real background worker. B then claims J1 and publishes J2. Releasing A
+    // must neither advance the note revision nor compact B's checkpoint; B's
+    // own exact lease is the only one allowed to snapshot and clear J2.
+    let cx = cx.add_empty_window();
+    let (profile, repository_a) = repository();
+    let repository_b = Arc::new(
+        LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open independent recovery repository"),
+    );
+    let note = create(&repository_a, "旧快照所有权", rich_document("持久化基线"));
+    let clock_a = Arc::new(ManualSaveClock::default());
+    let former_owner = session(
+        note.clone(),
+        Arc::clone(&repository_a),
+        Arc::clone(&clock_a),
+        cx,
+    );
+
+    append_body_via_entity_input(&former_owner, " A的J1", cx);
+    clock_a.advance(Duration::from_millis(100));
+    poll_and_drain(&former_owner, cx);
+    let old_checkpoint = repository_a
+        .latest_edit_journal(&note.id)
+        .expect("read A checkpoint")
+        .expect("A J1 exists");
+
+    let release_old_snapshot = former_owner.update(cx, |session, _| {
+        session.stall_next_background_save_for_test()
+    });
+    clock_a.advance(Duration::from_millis(400));
+    former_owner.update(cx, |session, session_cx| {
+        session.dispatch_due_background_work_for_test(session_cx)
+    });
+    assert!(matches!(
+        former_owner.read_with(cx, |session, _| session.save_state()),
+        SaveState::Snapshotting
+    ));
+
+    let base_b = repository_b
+        .load_note(&note.id)
+        .expect("load recovery base")
+        .expect("recovery base exists");
+    let clock_b = Arc::new(ManualSaveClock::default());
+    let new_owner = session(base_b, Arc::clone(&repository_b), Arc::clone(&clock_b), cx);
+    let claimed = repository_b
+        .latest_edit_journal(&note.id)
+        .expect("read claimed checkpoint")
+        .expect("claim keeps J1 durable");
+    assert_ne!(claimed.writer_token, old_checkpoint.writer_token);
+    assert_eq!(claimed.sequence, old_checkpoint.sequence);
+
+    append_body_via_entity_input(&new_owner, " B的J2", cx);
+    clock_b.advance(Duration::from_millis(100));
+    poll_and_drain(&new_owner, cx);
+    let j2 = repository_b
+        .latest_edit_journal(&note.id)
+        .expect("read B checkpoint")
+        .expect("B extends the claimed checkpoint");
+    assert_eq!(j2.writer_token, claimed.writer_token);
+    assert!(j2.sequence > claimed.sequence);
+    assert!(j2.delta_utf8.contains("B的J2"));
+
+    release_old_snapshot
+        .send(())
+        .expect("release the stale A snapshot worker");
+    cx.run_until_parked();
+    assert!(matches!(
+        former_owner.read_with(cx, |session, _| session.save_state()),
+        SaveState::Failed(ref error) if error.contains("writer")
+    ));
+    let still_base = repository_a
+        .load_note(&note.id)
+        .expect("load note after rejected stale snapshot")
+        .expect("note remains");
+    assert_eq!(still_base.revision, note.revision);
+    let surviving = repository_a
+        .latest_edit_journal(&note.id)
+        .expect("read B checkpoint after old snapshot failure")
+        .expect("B checkpoint must survive");
+    assert_eq!(surviving.writer_token, j2.writer_token);
+    assert_eq!(surviving.sequence, j2.sequence);
+    assert_eq!(surviving.delta_utf8, j2.delta_utf8);
+
+    clock_b.advance(Duration::from_millis(400));
+    poll_and_drain(&new_owner, cx);
+    let saved = repository_b
+        .load_note(&note.id)
+        .expect("load new-owner snapshot")
+        .expect("new-owner snapshot exists");
+    assert_eq!(saved.revision, note.revision + 1);
+    assert!(saved.body_text.contains("B的J2"));
+    assert!(
+        repository_b
+            .latest_edit_journal(&note.id)
+            .expect("read compacted journal")
+            .is_none(),
+        "only the current owner may compact its own current checkpoint"
+    );
+}
+
+#[gpui::test]
 async fn v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_content(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -1014,14 +1196,17 @@ async fn v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_co
     let repository = Arc::new(LibraryRepository::open(&path).expect("open profile"));
     let note = create(&repository, "旧标题", rich_document("旧正文"));
     repository
-        .flush_snapshot(SaveNote {
-            id: note.id.clone(),
-            expected_revision: note.revision,
-            title: "revision two base".into(),
-            document: rich_document("持久化基线"),
-            resource_ids: Vec::new(),
-            selected_thumbnail_id: None,
-        })
+        .flush_snapshot(
+            SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: "revision two base".into(),
+                document: rich_document("持久化基线"),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            None,
+        )
         .expect("advance note to revision two");
     drop(repository);
 
@@ -1160,16 +1345,24 @@ async fn stale_repository_snapshot_failure_enters_failed_once_without_timer_retr
     append_body_via_entity_input(&active, "本窗口", cx);
     clock.advance(Duration::from_millis(100));
     poll_and_drain(&active, cx);
+    let active_ownership = repository
+        .latest_edit_journal(&note.id)
+        .expect("read active checkpoint")
+        .expect("active checkpoint exists")
+        .ownership();
 
     repository
-        .flush_snapshot(app_lite_core::SaveNote {
-            id: note.id.clone(),
-            expected_revision: note.revision,
-            title: note.title.clone(),
-            document: rich_document("另一窗口"),
-            resource_ids: Vec::new(),
-            selected_thumbnail_id: None,
-        })
+        .flush_snapshot(
+            app_lite_core::SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: note.title.clone(),
+                document: rich_document("另一窗口"),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            Some(active_ownership),
+        )
         .expect("external committed revision");
     clock.advance(Duration::from_millis(400));
     poll_and_drain(&active, cx);

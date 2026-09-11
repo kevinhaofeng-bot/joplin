@@ -1,8 +1,9 @@
 use crate::resource::{DatabaseFile, ProfileDir, ResourceError, ResourceInput, ResourceStore};
 use crate::schema::migrate_schema;
 use crate::{
-    BlobHash, CreateNote, EditJournalEntry, EntityRef, ListQuery, Note, NoteId, NoteProjection,
-    Notebook, NotebookId, ResourceId, SaveNote, SavedRevision, Stack, StackId, Tag, TagId,
+    BlobHash, CreateNote, EditJournalEntry, EntityRef, JournalOwnership, ListQuery, Note, NoteId,
+    NoteProjection, Notebook, NotebookId, ResourceId, SaveNote, SavedRevision, Stack, StackId, Tag,
+    TagId,
 };
 use rusqlite::hooks::{AuthAction, Authorization};
 use rusqlite::{
@@ -832,10 +833,15 @@ impl LibraryRepository {
     }
 
     pub fn save_note(&self, input: SaveNote) -> Result<Note, LibraryError> {
-        self.save_note_inner(input, false)
+        self.save_note_inner(input, false, None)
     }
 
-    fn save_note_inner(&self, input: SaveNote, clear_journal: bool) -> Result<Note, LibraryError> {
+    fn save_note_inner(
+        &self,
+        input: SaveNote,
+        clear_journal: bool,
+        journal_ownership: Option<&JournalOwnership>,
+    ) -> Result<Note, LibraryError> {
         let now = self.now();
         let html = input.document.to_canonical_html().as_str().to_owned();
         let text = input.document.search_text().as_str().to_owned();
@@ -844,7 +850,10 @@ impl LibraryRepository {
             return Err(LibraryError::InvalidSnapshot);
         }
         let mut connection = self.connection.lock().expect("library mutex poisoned");
-        let transaction = connection.transaction()?;
+        // Snapshot compaction must serialize with journal ownership transfer
+        // and replacement. A deferred transaction could read a lease, then
+        // let a foreign writer claim/replace it before the note update.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (notebook_id, current_revision, previous_updated, created_time): (String, i64, i64, i64) = transaction
             .query_row(
                 "SELECT notebook_id, revision, updated_time, created_time FROM notes WHERE id = ?1 AND deleted_time = 0",
@@ -858,6 +867,36 @@ impl LibraryRepository {
                 expected: input.expected_revision,
                 actual: current_revision,
             });
+        }
+        if clear_journal {
+            let current_journal: Option<(i64, String, i64)> = transaction
+                .query_row(
+                    "SELECT expected_revision, writer_token, sequence
+                     FROM edit_journal
+                     WHERE note_id = ?1
+                     ORDER BY sequence DESC
+                     LIMIT 1",
+                    [input.id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let owns_current_journal = match (journal_ownership, current_journal) {
+                (None, None) => true,
+                (Some(owner), Some((journal_revision, writer_token, sequence))) => {
+                    journal_revision == input.expected_revision
+                        && writer_token == owner.writer_token
+                        && sequence == owner.sequence
+                        && !owner.writer_token.is_empty()
+                        && owner.sequence > 0
+                }
+                _ => false,
+            };
+            if !owns_current_journal {
+                // Do this before any note/resource mutation. Returning from
+                // this IMMEDIATE transaction leaves both the durable note and
+                // the current owner's checkpoint untouched.
+                return Err(LibraryError::JournalOwnershipConflict);
+            }
         }
         let revision = current_revision + 1;
         let now = now.max(
@@ -899,10 +938,22 @@ impl LibraryRepository {
         )?;
         queue_search(&transaction, &input.id, now, "snapshot")?;
         if clear_journal {
-            transaction.execute(
-                "DELETE FROM edit_journal WHERE note_id = ?1",
-                [input.id.as_str()],
-            )?;
+            if let Some(owner) = journal_ownership {
+                let deleted = transaction.execute(
+                    "DELETE FROM edit_journal
+                     WHERE note_id = ?1 AND expected_revision = ?2
+                       AND writer_token = ?3 AND sequence = ?4",
+                    params![
+                        input.id.as_str(),
+                        input.expected_revision,
+                        owner.writer_token,
+                        owner.sequence
+                    ],
+                )?;
+                if deleted != 1 {
+                    return Err(LibraryError::JournalOwnershipConflict);
+                }
+            }
         }
         enqueue_sync(
             &transaction,
@@ -1244,7 +1295,10 @@ impl LibraryRepository {
         Ok(())
     }
 
-    pub fn append_edit_journal(&self, entry: EditJournalEntry) -> Result<(), LibraryError> {
+    pub fn append_edit_journal(
+        &self,
+        entry: EditJournalEntry,
+    ) -> Result<JournalOwnership, LibraryError> {
         let now = self.now();
         if entry.writer_token.is_empty() {
             return Err(LibraryError::InvalidSnapshot);
@@ -1298,6 +1352,10 @@ impl LibraryRepository {
             "UPDATE journal_sequence SET next_sequence = ?1 WHERE id = 1",
             [sequence],
         )?;
+        let ownership = JournalOwnership {
+            writer_token: entry.writer_token.clone(),
+            sequence,
+        };
         // The journal is a compact crash-recovery checkpoint, not an edit
         // history. Keeping precisely the newest same-base record bounds disk
         // use and makes a stale session unable to win by generation sorting.
@@ -1309,12 +1367,13 @@ impl LibraryRepository {
             transaction.execute("INSERT INTO edit_journal (id, note_id, expected_revision, writer_token, sequence, generation, delta_utf8, created_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![candidate, entry.note_id.as_str(), entry.expected_revision, entry.writer_token, sequence, entry.generation, entry.delta_utf8, now])
         })?;
         transaction.commit()?;
-        Ok(())
+        Ok(ownership)
     }
 
     /// Transfers one recovered crash checkpoint to a fresh retained-session
     /// owner. The checkpoint payload embeds its owner too, so both the SQL
-    /// column and JSON must be replaced by the same exact-old-token CAS.
+    /// column and JSON must be replaced by the same exact checkpoint-identity
+    /// CAS: note, revision, old token, and durable sequence.
     ///
     /// This intentionally preserves the checkpoint's durable sequence and
     /// generation: taking over after a process crash is not a new semantic
@@ -1324,11 +1383,13 @@ impl LibraryRepository {
         note_id: &NoteId,
         expected_revision: i64,
         previous_writer_token: &str,
+        expected_sequence: i64,
         writer_token: &str,
         delta_utf8: &str,
-    ) -> Result<(), LibraryError> {
+    ) -> Result<JournalOwnership, LibraryError> {
         if expected_revision < 1
             || previous_writer_token.is_empty()
+            || expected_sequence < 1
             || writer_token.is_empty()
             || previous_writer_token == writer_token
             || delta_utf8.is_empty()
@@ -1338,8 +1399,9 @@ impl LibraryRepository {
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         // The read and token transfer share one IMMEDIATE transaction. Two
         // restart candidates that read a crashed row before either transfer
-        // it can therefore have only one winner, and a late pre-crash worker
-        // remains unable to append with its former token.
+        // it can therefore have only one winner. A later checkpoint from the
+        // same pre-crash token changes the sequence and makes this prepared
+        // claim fail; it can never be overwritten by stale recovery data.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actual_revision: Option<i64> = transaction
             .query_row(
@@ -1359,8 +1421,13 @@ impl LibraryRepository {
             .query_row(
                 "SELECT id FROM edit_journal
                  WHERE note_id = ?1 AND expected_revision = ?2 AND writer_token = ?3
-                 ORDER BY sequence DESC LIMIT 1",
-                params![note_id.as_str(), expected_revision, previous_writer_token],
+                   AND sequence = ?4",
+                params![
+                    note_id.as_str(),
+                    expected_revision,
+                    previous_writer_token,
+                    expected_sequence
+                ],
                 |row| row.get(0),
             )
             .optional()?;
@@ -1368,19 +1435,26 @@ impl LibraryRepository {
         let changed = transaction.execute(
             "UPDATE edit_journal
              SET writer_token = ?2, delta_utf8 = ?3
-             WHERE id = ?1 AND writer_token = ?4",
+             WHERE id = ?1 AND note_id = ?4 AND expected_revision = ?5
+               AND writer_token = ?6 AND sequence = ?7",
             params![
                 checkpoint_id,
                 writer_token,
                 delta_utf8,
-                previous_writer_token
+                note_id.as_str(),
+                expected_revision,
+                previous_writer_token,
+                expected_sequence
             ],
         )?;
         if changed != 1 {
             return Err(LibraryError::JournalOwnershipConflict);
         }
         transaction.commit()?;
-        Ok(())
+        Ok(JournalOwnership {
+            writer_token: writer_token.to_owned(),
+            sequence: expected_sequence,
+        })
     }
 
     /// Returns the most recent durable edit-journal payload for one live note.
@@ -1426,8 +1500,12 @@ impl LibraryRepository {
             .map_err(Into::into)
     }
 
-    pub fn flush_snapshot(&self, input: SaveNote) -> Result<SavedRevision, LibraryError> {
-        let note = self.save_note_inner(input, true)?;
+    pub fn flush_snapshot(
+        &self,
+        input: SaveNote,
+        journal_ownership: Option<JournalOwnership>,
+    ) -> Result<SavedRevision, LibraryError> {
+        let note = self.save_note_inner(input, true, journal_ownership.as_ref())?;
         Ok(SavedRevision {
             revision: note.revision,
             saved_time: note.updated_time,

@@ -11,8 +11,8 @@ use crate::native_editor::codec::{
 };
 use crate::native_editor::core::EditorCore;
 use app_lite_core::{
-    CanonicalDocument, EditJournalEntry, LibraryError, LibraryRepository, Note, NoteId, ResourceId,
-    SaveNote, SavedRevision,
+    CanonicalDocument, EditJournalEntry, JournalOwnership, LibraryError, LibraryRepository, Note,
+    NoteId, ResourceId, SaveNote, SavedRevision,
 };
 use gpui::{AppContext, Context, Entity, Subscription, Task};
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,9 @@ struct NativeSessionSnapshot {
 }
 
 enum SaveCompletion {
-    Journal,
+    Journal {
+        ownership: JournalOwnership,
+    },
     Snapshot {
         saved: SavedRevision,
         snapshot: SessionSnapshot,
@@ -92,6 +94,10 @@ struct SaveJob {
     note_id: NoteId,
     expected_revision: i64,
     writer_token: String,
+    /// The exact checkpoint this snapshot worker is allowed to compact. A
+    /// token without its SQLite sequence is insufficient: the same owner may
+    /// have published a newer checkpoint after this job was queued.
+    journal_ownership: Option<JournalOwnership>,
     journal_base: SessionSnapshot,
     snapshot: NativeSessionSnapshot,
     repository: Arc<LibraryRepository>,
@@ -214,6 +220,10 @@ pub(crate) struct PreparedNoteSession {
     /// before entity construction. A recovered checkpoint must atomically
     /// install this exact value before any real input may schedule work.
     writer_token: String,
+    /// Set only after a recovery claim succeeds. The mounted session carries
+    /// this exact SQLite lease through its first snapshot rather than treating
+    /// a writer token as a broad permission to clear any checkpoint.
+    journal_ownership: Option<JournalOwnership>,
     recovery_ownership: Option<RecoveryOwnership>,
 }
 
@@ -223,6 +233,7 @@ pub(crate) struct PreparedNoteSession {
 struct RecoveryOwnership {
     expected_revision: i64,
     previous_writer_token: String,
+    sequence: i64,
 }
 
 /// `from_prepared` accepts only this consumed wrapper, so callers cannot
@@ -255,13 +266,15 @@ impl PreparedNoteSession {
             );
             let delta_utf8 = serde_json::to_string(&payload)
                 .map_err(|error| SaveError::new(format!("无法接管编辑日志: {error}")))?;
-            repository.claim_edit_journal_ownership(
+            let ownership = repository.claim_edit_journal_ownership(
                 &self.note.id,
                 recovery.expected_revision,
                 &recovery.previous_writer_token,
+                recovery.sequence,
                 &self.writer_token,
                 &delta_utf8,
             )?;
+            self.journal_ownership = Some(ownership);
         }
         Ok(ClaimedPreparedNoteSession(self))
     }
@@ -374,6 +387,10 @@ pub(crate) struct NoteSession {
     note_id: NoteId,
     expected_revision: i64,
     writer_token: String,
+    /// The current journal lease owned by this session. It changes every time
+    /// a journal append allocates a new sequence and is consumed only by the
+    /// exact snapshot that compacts that row.
+    journal_ownership: Option<JournalOwnership>,
     resource_ids: Vec<ResourceId>,
     title: Entity<TitleInput>,
     editor: Entity<EditorCore>,
@@ -421,11 +438,12 @@ impl NoteSession {
         };
         let journal_base = snapshot.clone();
         let mut recovered_generation = None;
+        let journal_ownership = None;
         let mut recovery_ownership = None;
         if let Some(entry) =
             repository.latest_edit_journal_for_revision(&note.id, Some(note.revision))?
         {
-            if entry.writer_token.is_empty() {
+            if entry.writer_token.is_empty() || entry.sequence < 1 {
                 return Err(SaveError::new("编辑日志缺少写入者身份"));
             }
             let version = serde_json::from_str::<serde_json::Value>(&entry.delta_utf8)
@@ -447,6 +465,7 @@ impl NoteSession {
             recovery_ownership = Some(RecoveryOwnership {
                 expected_revision: entry.expected_revision,
                 previous_writer_token: entry.writer_token,
+                sequence: entry.sequence,
             });
         }
         let native_document =
@@ -459,6 +478,7 @@ impl NoteSession {
             native_document,
             recovered_generation,
             writer_token: uuid::Uuid::new_v4().simple().to_string(),
+            journal_ownership,
             recovery_ownership,
         })
     }
@@ -476,6 +496,7 @@ impl NoteSession {
             native_document: document,
             recovered_generation,
             writer_token,
+            journal_ownership,
             recovery_ownership: _,
         } = prepared.0;
         let committed_snapshot = NativeSessionSnapshot {
@@ -509,6 +530,7 @@ impl NoteSession {
             note_id: note.id,
             expected_revision: note.revision,
             writer_token,
+            journal_ownership,
             resource_ids: snapshot.resource_ids,
             title,
             editor,
@@ -648,6 +670,7 @@ impl NoteSession {
             note_id: self.note_id.clone(),
             expected_revision: self.expected_revision,
             writer_token: self.writer_token.clone(),
+            journal_ownership: self.journal_ownership.clone(),
             journal_base: self.journal_base.clone(),
             snapshot: self.snapshot(),
             repository: Arc::clone(&self.repository),
@@ -698,7 +721,7 @@ impl NoteSession {
                 // second pretty-printed HTML body for every keystroke.
                 let delta_utf8 = serde_json::to_string(&payload)
                     .map_err(|error| SaveError::new(format!("无法编码编辑日志: {error}")))?;
-                job.repository.append_edit_journal(EditJournalEntry {
+                let ownership = job.repository.append_edit_journal(EditJournalEntry {
                     note_id: job.note_id,
                     expected_revision: job.expected_revision,
                     writer_token: job.writer_token,
@@ -706,18 +729,21 @@ impl NoteSession {
                     generation,
                     delta_utf8,
                 })?;
-                Ok(SaveCompletion::Journal)
+                Ok(SaveCompletion::Journal { ownership })
             }
             SaveWork::Snapshot { .. } => {
                 let snapshot = Self::encode_snapshot(job.snapshot, "保存快照")?;
-                let saved = job.repository.flush_snapshot(SaveNote {
-                    id: job.note_id,
-                    expected_revision: job.expected_revision,
-                    title: snapshot.title.clone(),
-                    document: snapshot.document.clone(),
-                    resource_ids: snapshot.resource_ids.clone(),
-                    selected_thumbnail_id: None,
-                })?;
+                let saved = job.repository.flush_snapshot(
+                    SaveNote {
+                        id: job.note_id,
+                        expected_revision: job.expected_revision,
+                        title: snapshot.title.clone(),
+                        document: snapshot.document.clone(),
+                        resource_ids: snapshot.resource_ids.clone(),
+                        selected_thumbnail_id: None,
+                    },
+                    job.journal_ownership,
+                )?;
                 Ok(SaveCompletion::Snapshot {
                     saved,
                     snapshot,
@@ -746,7 +772,8 @@ impl NoteSession {
         };
         let publishes_current_generation = self.save.is_current_generation(generation);
         let outcome = match result {
-            Ok(SaveCompletion::Journal) => {
+            Ok(SaveCompletion::Journal { ownership }) => {
+                self.journal_ownership = Some(ownership);
                 self.save.journaled(generation);
                 Ok(None)
             }
@@ -764,6 +791,7 @@ impl NoteSession {
                 self.expected_revision = saved.revision;
                 self.last_saved = saved.clone();
                 self.journal_base = snapshot;
+                self.journal_ownership = None;
                 self.save.snapshotted(generation);
                 // An old snapshot can advance the durable base while a newer
                 // input generation is already dirty. It must not cancel that

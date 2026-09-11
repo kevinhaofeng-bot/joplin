@@ -170,14 +170,17 @@ fn v4_legacy_journal_backfills_payload_revision_without_losing_recovery() {
         })
         .expect("create note");
     let revised = repository
-        .flush_snapshot(SaveNote {
-            id: created.id.clone(),
-            expected_revision: created.revision,
-            title: "迁移基线".into(),
-            document: CanonicalDocument::default(),
-            resource_ids: Vec::new(),
-            selected_thumbnail_id: None,
-        })
+        .flush_snapshot(
+            SaveNote {
+                id: created.id.clone(),
+                expected_revision: created.revision,
+                title: "迁移基线".into(),
+                document: CanonicalDocument::default(),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            None,
+        )
         .expect("advance durable note to revision two");
     assert_eq!(revised.revision, 2);
     drop(repository);

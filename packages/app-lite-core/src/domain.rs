@@ -112,6 +112,19 @@ pub struct AssociateResource {
     pub snapshot: SaveNote,
 }
 
+/// The exact durable journal row a retained session is allowed to compact.
+///
+/// A writer token alone identifies a session but not a particular checkpoint:
+/// the same session may publish a newer generation while an older worker is
+/// still queued. SQLite allocates `sequence` atomically with the checkpoint,
+/// so the pair is a lease over one concrete row rather than a broad writer
+/// permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalOwnership {
+    pub writer_token: String,
+    pub sequence: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditJournalEntry {
     pub note_id: NoteId,
@@ -126,6 +139,15 @@ pub struct EditJournalEntry {
     pub sequence: i64,
     pub generation: i64,
     pub delta_utf8: String,
+}
+
+impl EditJournalEntry {
+    pub fn ownership(&self) -> JournalOwnership {
+        JournalOwnership {
+            writer_token: self.writer_token.clone(),
+            sequence: self.sequence,
+        }
+    }
 }
 
 /// Durable Task 7 hand-off.  Delete jobs intentionally remain addressable

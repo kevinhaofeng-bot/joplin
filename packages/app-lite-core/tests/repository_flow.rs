@@ -287,7 +287,7 @@ fn flush_snapshot_compacts_crash_journal_with_the_next_durable_revision() {
             document: document("before"),
         })
         .unwrap();
-    repository
+    let journal_ownership = repository
         .append_edit_journal(EditJournalEntry {
             note_id: note.id.clone(),
             expected_revision: note.revision,
@@ -306,14 +306,17 @@ fn flush_snapshot_compacts_crash_journal_with_the_next_durable_revision() {
         1
     );
     let saved = repository
-        .flush_snapshot(SaveNote {
-            id: note.id,
-            expected_revision: note.revision,
-            title: "journal".into(),
-            document: document("after"),
-            resource_ids: Vec::new(),
-            selected_thumbnail_id: None,
-        })
+        .flush_snapshot(
+            SaveNote {
+                id: note.id,
+                expected_revision: note.revision,
+                title: "journal".into(),
+                document: document("after"),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            Some(journal_ownership),
+        )
         .unwrap();
     assert_eq!(saved.revision, 2);
     assert_eq!(
@@ -343,7 +346,7 @@ fn journal_writer_token_owns_the_checkpoint_against_cross_window_replay() {
         })
         .unwrap();
 
-    first
+    let first_ownership = first
         .append_edit_journal(EditJournalEntry {
             note_id: note.id.clone(),
             expected_revision: note.revision,
@@ -389,14 +392,17 @@ fn journal_writer_token_owns_the_checkpoint_against_cross_window_replay() {
     );
 
     let saved = first
-        .flush_snapshot(SaveNote {
-            id: note.id.clone(),
-            expected_revision: note.revision,
-            title: "two windows".into(),
-            document: document("revision two"),
-            resource_ids: Vec::new(),
-            selected_thumbnail_id: None,
-        })
+        .flush_snapshot(
+            SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: "two windows".into(),
+                document: document("revision two"),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            Some(first_ownership),
+        )
         .unwrap();
     assert_eq!(saved.revision, note.revision + 1);
     assert!(first.latest_edit_journal(&note.id).unwrap().is_none());
@@ -462,12 +468,17 @@ fn recovered_checkpoint_claim_is_atomic_and_rejects_the_crashed_writer() {
             delta_utf8: r#"{"writer_token":"crashed-writer","body":"checkpoint"}"#.into(),
         })
         .unwrap();
+    let crashed_checkpoint = first
+        .latest_edit_journal(&note.id)
+        .unwrap()
+        .expect("crashed checkpoint");
 
     first
         .claim_edit_journal_ownership(
             &note.id,
             note.revision,
             "crashed-writer",
+            crashed_checkpoint.sequence,
             "recovered-a",
             r#"{"writer_token":"recovered-a","body":"checkpoint"}"#,
         )
@@ -477,6 +488,7 @@ fn recovered_checkpoint_claim_is_atomic_and_rejects_the_crashed_writer() {
             &note.id,
             note.revision,
             "crashed-writer",
+            crashed_checkpoint.sequence,
             "recovered-b",
             r#"{"writer_token":"recovered-b","body":"checkpoint"}"#,
         )
