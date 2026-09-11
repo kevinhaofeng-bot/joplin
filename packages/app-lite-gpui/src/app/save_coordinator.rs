@@ -5,7 +5,9 @@
 //! compacts it into a canonical snapshot.  Keeping time behind this small
 //! seam gives production a monotonic clock while tests advance without sleeps.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const JOURNAL_DELAY: Duration = Duration::from_millis(100);
