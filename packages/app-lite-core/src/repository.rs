@@ -1242,18 +1242,50 @@ impl LibraryRepository {
 
     pub fn append_edit_journal(&self, entry: EditJournalEntry) -> Result<(), LibraryError> {
         let now = self.now();
-        let mut connection = self.connection.lock().expect("library mutex poisoned");
-        let transaction = connection.transaction()?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM notes WHERE id = ?1 AND deleted_time = 0)",
-            [entry.note_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(LibraryError::NotFound);
+        if entry.writer_token.is_empty() {
+            return Err(LibraryError::InvalidSnapshot);
         }
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        // A writable journal is a compare-and-swap against one concrete note
+        // revision. `IMMEDIATE` makes two retained windows serialize here, so
+        // a local generation from one window can never outrank a newer
+        // committed revision from another.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM notes WHERE id = ?1 AND deleted_time = 0",
+                [entry.note_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let actual_revision = actual_revision.ok_or(LibraryError::NotFound)?;
+        if actual_revision != entry.expected_revision {
+            return Err(LibraryError::StaleRevision {
+                expected: entry.expected_revision,
+                actual: actual_revision,
+            });
+        }
+        let sequence = transaction
+            .query_row(
+                "SELECT next_sequence FROM journal_sequence WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
+            .checked_add(1)
+            .ok_or(LibraryError::InvalidSnapshot)?;
+        transaction.execute(
+            "UPDATE journal_sequence SET next_sequence = ?1 WHERE id = 1",
+            [sequence],
+        )?;
+        // The journal is a compact crash-recovery checkpoint, not an edit
+        // history. Keeping precisely the newest same-base record bounds disk
+        // use and makes a stale session unable to win by generation sorting.
+        transaction.execute(
+            "DELETE FROM edit_journal WHERE note_id = ?1",
+            [entry.note_id.as_str()],
+        )?;
         self.insert_with_unique_id(&transaction, "edit_journal", |candidate| {
-            transaction.execute("INSERT INTO edit_journal (id, note_id, generation, delta_utf8, created_time) VALUES (?1, ?2, ?3, ?4, ?5)", params![candidate, entry.note_id.as_str(), entry.generation, entry.delta_utf8, now])
+            transaction.execute("INSERT INTO edit_journal (id, note_id, expected_revision, writer_token, sequence, generation, delta_utf8, created_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![candidate, entry.note_id.as_str(), entry.expected_revision, entry.writer_token, sequence, entry.generation, entry.delta_utf8, now])
         })?;
         transaction.commit()?;
         Ok(())
@@ -1267,23 +1299,37 @@ impl LibraryRepository {
         &self,
         note_id: &NoteId,
     ) -> Result<Option<EditJournalEntry>, LibraryError> {
+        self.latest_edit_journal_for_revision(note_id, None)
+    }
+
+    /// Reads only a crash checkpoint that was computed from the exact durable
+    /// revision being opened. A note may have accumulated stale rows before a
+    /// prior build was interrupted; recovery must never apply one across a
+    /// newer snapshot boundary.
+    pub fn latest_edit_journal_for_revision(
+        &self,
+        note_id: &NoteId,
+        expected_revision: Option<i64>,
+    ) -> Result<Option<EditJournalEntry>, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
-        connection
-            .query_row(
-                "SELECT note_id, generation, delta_utf8
-                 FROM edit_journal
-                 WHERE note_id = ?1
-                 ORDER BY generation DESC, created_time DESC, id DESC
-                 LIMIT 1",
-                [note_id.as_str()],
-                |row| {
-                    Ok(EditJournalEntry {
-                        note_id: NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
-                        generation: row.get(1)?,
-                        delta_utf8: row.get(2)?,
-                    })
-                },
-            )
+        let mut statement = connection.prepare(
+            "SELECT note_id, expected_revision, writer_token, sequence, generation, delta_utf8
+             FROM edit_journal
+             WHERE note_id = ?1 AND (?2 IS NULL OR expected_revision = ?2)
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )?;
+        statement
+            .query_row(params![note_id.as_str(), expected_revision], |row| {
+                Ok(EditJournalEntry {
+                    note_id: NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                    expected_revision: row.get(1)?,
+                    writer_token: row.get(2)?,
+                    sequence: row.get(3)?,
+                    generation: row.get(4)?,
+                    delta_utf8: row.get(5)?,
+                })
+            })
             .optional()
             .map_err(Into::into)
     }

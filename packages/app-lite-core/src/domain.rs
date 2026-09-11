@@ -115,6 +115,15 @@ pub struct AssociateResource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditJournalEntry {
     pub note_id: NoteId,
+    /// Durable revision the delta was computed against. A later snapshot must
+    /// reject an old writer rather than replaying it over a newer note.
+    pub expected_revision: i64,
+    /// Opaque retained-session identity. Local generations deliberately start
+    /// from one for every window, so they are not a database ordering key.
+    pub writer_token: String,
+    /// Assigned by SQLite under the append transaction; callers never choose
+    /// it and recovery orders only by this monotonic value.
+    pub sequence: i64,
     pub generation: i64,
     pub delta_utf8: String,
 }

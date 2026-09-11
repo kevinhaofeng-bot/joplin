@@ -290,6 +290,9 @@ fn flush_snapshot_compacts_crash_journal_with_the_next_durable_revision() {
     repository
         .append_edit_journal(EditJournalEntry {
             note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: "repository-flow".into(),
+            sequence: 0,
             generation: 7,
             delta_utf8: "replace before with after".into(),
         })
@@ -320,5 +323,111 @@ fn flush_snapshot_compacts_crash_journal_with_the_next_durable_revision() {
                 .get::<_, i64>(0))
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn journal_writer_token_sequence_and_revision_prevent_cross_window_replay() {
+    // Two retained windows intentionally start their local generation at one.
+    // This catches an implementation that orders a later old-window record by
+    // that local number or replays it over the next snapshot revision.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let first = LibraryRepository::open(&path).unwrap();
+    let second = LibraryRepository::open(&path).unwrap();
+    let note = first
+        .create_note(CreateNote {
+            title: "two windows".into(),
+            notebook_id: None,
+            document: document("base"),
+        })
+        .unwrap();
+
+    first
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: "first-window".into(),
+            sequence: 0,
+            generation: 99,
+            delta_utf8: "first checkpoint".into(),
+        })
+        .unwrap();
+    let first_checkpoint = first
+        .latest_edit_journal(&note.id)
+        .unwrap()
+        .expect("first checkpoint");
+
+    second
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: "second-window".into(),
+            sequence: 0,
+            generation: 1,
+            delta_utf8: "second checkpoint".into(),
+        })
+        .unwrap();
+    let latest = first
+        .latest_edit_journal(&note.id)
+        .unwrap()
+        .expect("latest checkpoint");
+    assert_eq!(latest.writer_token, "second-window");
+    assert!(latest.sequence > first_checkpoint.sequence);
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM edit_journal", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "the compact journal keeps one ordered checkpoint rather than a local-generation race"
+    );
+
+    let saved = first
+        .flush_snapshot(SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: "two windows".into(),
+            document: document("revision two"),
+            resource_ids: Vec::new(),
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    assert_eq!(saved.revision, note.revision + 1);
+    assert!(first.latest_edit_journal(&note.id).unwrap().is_none());
+
+    let stale = second
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: "first-window-late".into(),
+            sequence: 0,
+            generation: 1000,
+            delta_utf8: "late old base".into(),
+        })
+        .expect_err("a post-snapshot old base must fail closed");
+    assert!(matches!(
+        stale,
+        app_lite_core::LibraryError::StaleRevision { .. }
+    ));
+
+    // Model a stale row left by an older build/crash. Opening revision two
+    // must ignore it even though an unrestricted forensic read can still see
+    // the row; recovery calls the revision-scoped API.
+    let stale_id = "f".repeat(32);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO edit_journal (id, note_id, expected_revision, writer_token, sequence, generation, delta_utf8, created_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            rusqlite::params![stale_id, note.id.as_str(), note.revision, "legacy-window", 999_i64, 500_i64, "stale"],
+        )
+        .unwrap();
+    assert!(first.latest_edit_journal(&note.id).unwrap().is_some());
+    assert!(
+        first
+            .latest_edit_journal_for_revision(&note.id, Some(saved.revision))
+            .unwrap()
+            .is_none()
     );
 }

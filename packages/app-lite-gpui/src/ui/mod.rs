@@ -46,6 +46,11 @@ pub struct LibraryShell {
     surface_note_id: Option<NoteId>,
     unsupported_document: Option<String>,
     save_error: Option<String>,
+    /// True only for a lifecycle boundary that has started a background
+    /// snapshot. IME/canonical failures stay visible until an explicit
+    /// successful boundary, whereas this transient blocker clears on the
+    /// completion-confirmed Clean transition.
+    save_pending: bool,
     startup_notice: Option<String>,
     save_clock: Arc<dyn crate::app::save_coordinator::SaveClock>,
     focus_handle: FocusHandle,
@@ -54,7 +59,6 @@ pub struct LibraryShell {
     // Held by the entity so GPUI cancels the receiver loop when this window is
     // destroyed. The task captures only a WeakEntity and never blocks on recv.
     _event_task: Task<()>,
-    _save_task: Task<()>,
     #[cfg(test)]
     event_task_cancellation_receiver: Option<Receiver<()>>,
     #[cfg(test)]
@@ -215,7 +219,6 @@ impl LibraryShell {
         #[cfg(not(test))]
         let event_task_lifetime = EventTaskLifetime::unobserved();
         let event_task = Self::spawn_event_bridge(event_receiver, event_task_lifetime, cx);
-        let save_task = Self::spawn_save_tick(cx);
         let mut shell = Self {
             model,
             note_session: None,
@@ -224,13 +227,13 @@ impl LibraryShell {
             surface_note_id: None,
             unsupported_document: None,
             save_error: None,
+            save_pending: false,
             startup_notice,
             save_clock,
             focus_handle,
             note_list_scroll: UniformListScrollHandle::new(),
             _model_observation: observation,
             _event_task: event_task,
-            _save_task: save_task,
             #[cfg(test)]
             event_task_cancellation_receiver: Some(event_task_cancellation_receiver),
             #[cfg(test)]
@@ -284,33 +287,17 @@ impl LibraryShell {
         })
     }
 
-    fn spawn_save_tick(cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(50))
-                    .await;
-                if this
-                    .update(cx, |shell, shell_cx| shell.poll_active_session(shell_cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    }
-
     fn poll_active_session(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.note_session.clone() else {
             return;
         };
         let result = session.update(cx, |session, session_cx| session.poll(session_cx));
         match result {
-            Ok(()) => {
-                if matches!(session.read(cx).save_state(), SaveState::Clean) {
-                    self.save_error = None;
-                }
-            }
+            // A clean timer only says there is no currently-due automatic
+            // work. It must never erase a lifecycle blocker while macOS still
+            // owns marked IME text. `flush_active_session` is the explicit
+            // successful boundary that clears this visible warning.
+            Ok(()) => {}
             Err(error) => self.save_error = Some(format!("自动保存失败：{error}")),
         }
         cx.notify();
@@ -368,9 +355,15 @@ impl LibraryShell {
         match session.update(cx, |session, session_cx| session.flush(reason, session_cx)) {
             Ok(_) => {
                 self.save_error = None;
+                self.save_pending = false;
+                cx.notify();
                 true
             }
             Err(error) => {
+                self.save_pending = matches!(
+                    session.read(cx).save_state(),
+                    SaveState::Journaling | SaveState::Snapshotting
+                );
                 self.save_error = Some(format!("无法在 {reason:?} 前保存当前笔记：{error}"));
                 cx.notify();
                 false
@@ -465,7 +458,21 @@ impl LibraryShell {
                     )
                 });
                 let editor = session.read(cx).editor().clone();
-                self._note_session_observation = Some(cx.observe(&session, |_, _, cx| cx.notify()));
+                self._note_session_observation =
+                    Some(cx.observe(&session, |shell, session, cx| {
+                        match session.read(cx).save_state() {
+                            SaveState::Failed(error) => {
+                                shell.save_pending = false;
+                                shell.save_error = Some(format!("自动保存失败：{error}"));
+                            }
+                            SaveState::Clean if shell.save_pending => {
+                                shell.save_pending = false;
+                                shell.save_error = None;
+                            }
+                            _ => {}
+                        }
+                        cx.notify();
+                    }));
                 #[cfg(test)]
                 let before_shape = Arc::clone(&self.library_surface_paint_hooks_for_test);
                 #[cfg(test)]

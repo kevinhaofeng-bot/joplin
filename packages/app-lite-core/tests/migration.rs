@@ -1,4 +1,4 @@
-use app_lite_core::{LibraryError, LibraryRepository};
+use app_lite_core::{EditJournalEntry, LibraryError, LibraryRepository};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -28,8 +28,8 @@ impl RepositoryIdSource for FixedIds {
 }
 
 #[test]
-fn open_creates_clean_v4_database_idempotently() {
-    // Catches a fresh profile missing v4 schema/PRAGMAs or a second open changing it.
+fn open_creates_clean_v5_database_idempotently() {
+    // Catches a fresh profile missing v5 schema/PRAGMAs or a second open changing it.
     let profile = tempdir().unwrap();
     let path = profile.path().join("library.sqlite");
     LibraryRepository::open(&path).unwrap();
@@ -39,7 +39,7 @@ fn open_creates_clean_v4_database_idempotently() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         connection
@@ -109,6 +109,50 @@ fn v4_reopen_repairs_a_non_wal_profile_without_schema_writes() {
 }
 
 #[test]
+fn v4_journal_table_upgrades_before_its_v5_index_is_created() {
+    // A real v4 profile already has edit_journal without the Task-4 identity
+    // columns. The index must be delayed until those columns exist; otherwise
+    // SQLite rejects the whole migration before `ensure_column` can run.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE edit_journal (
+                id TEXT PRIMARY KEY NOT NULL,
+                note_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                delta_utf8 TEXT NOT NULL,
+                created_time INTEGER NOT NULL
+            );
+            PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    drop(connection);
+
+    drop(LibraryRepository::open(&path).expect("upgrade v4 journal shape"));
+    let check = Connection::open(&path).unwrap();
+    for column in ["expected_revision", "writer_token", "sequence"] {
+        let exists: i64 = check
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('edit_journal') WHERE name = ?1)",
+                [column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing v5 journal column {column}");
+    }
+    let index_exists: i64 = check
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'edit_journal_latest_idx')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_exists, 1);
+}
+
+#[test]
 fn v3_upgrade_is_atomic_and_does_not_enqueue_imported_history() {
     // Catches migration that partly commits, loses v3 readable data, or schedules legacy rows for upload.
     let profile = tempdir().unwrap();
@@ -125,6 +169,26 @@ fn v3_upgrade_is_atomic_and_does_not_enqueue_imported_history() {
     assert_eq!(migrated.body_html, "<p>body</p>");
     assert_eq!(repository.outbox_count().unwrap(), 0);
     assert_eq!(migrated.revision, 1);
+    // The v3 table rebuild happens after the generic v5 column-upgrade pass.
+    // Keep this mutation-sensitive: a rebuilt legacy-shaped journal table
+    // would otherwise advertise user_version=5 yet fail on the first crash
+    // checkpoint after an upgrade.
+    repository
+        .append_edit_journal(EditJournalEntry {
+            note_id: migrated.id.clone(),
+            expected_revision: migrated.revision,
+            writer_token: "v3-upgrade-checkpoint".into(),
+            sequence: 0,
+            generation: 1,
+            delta_utf8: "{\"version\":2}".into(),
+        })
+        .expect("v3 upgrade must produce the v5 journal write shape");
+    let checkpoint = repository
+        .latest_edit_journal_for_revision(&migrated.id, Some(migrated.revision))
+        .expect("read v5 checkpoint")
+        .expect("v5 checkpoint");
+    assert_eq!(checkpoint.writer_token, "v3-upgrade-checkpoint");
+    assert!(checkpoint.sequence > 0);
     assert_eq!(
         Connection::open(&path)
             .unwrap()
@@ -477,7 +541,7 @@ fn migration_gate_blocks_a_second_v3_writer_before_html_publication() {
         check
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         check
@@ -691,13 +755,13 @@ fn migration_commit_returns_bound_repository_when_selected_profile_is_replaced()
         published
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 
 #[cfg(all(feature = "test-support", unix))]
 #[test]
-fn profile_swaps_at_both_open_gaps_abort_before_v4_publication() {
+fn profile_swaps_at_both_open_gaps_abort_before_v5_publication() {
     // Catches pairing SQLite and resources with different profile directories.
     for phase in [
         OpenTestPhase::AfterProfileBound,

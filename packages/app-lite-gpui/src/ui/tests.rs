@@ -4,7 +4,7 @@ use crate::app::save_coordinator::ManualSaveClock;
 use crate::components::{Copy, SelectAll};
 use app_lite_core::document::{Block, BlockStyle, Inline, Marks};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryShellState};
-use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext};
+use gpui::{AppContext, EntityInputHandler, Modifiers, TestAppContext, VisualTestContext};
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
@@ -669,6 +669,91 @@ async fn mounted_editable_session_uses_real_title_and_body_input_then_persists(
 }
 
 #[gpui::test]
+async fn mounted_editor_keeps_painting_while_a_slow_background_journal_waits(
+    cx: &mut TestAppContext,
+) {
+    // The gate is inside the background SaveJob immediately before its
+    // codec/SQLite work.  If the save path ever moves back into a foreground
+    // entity callback, this mounted draw cannot make progress while the gate
+    // is held.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "慢写入仍可绘制".into(),
+            notebook_id: None,
+            document: rich_document("初始正文"),
+        })
+        .expect("create note");
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+
+    let session = view.read_with(cx, |shell, _| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .clone()
+    });
+    let release = session.update(cx, |session, _| {
+        session.enable_deadline_tasks_for_test();
+        session.stall_next_background_save_for_test()
+    });
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted editable canvas");
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 后台慢写");
+
+    let paints_before = view.read_with(cx, |shell, _| {
+        shell
+            .library_surface_paint_hooks_for_test
+            .paint
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    assert!(matches!(
+        session.read_with(cx, |session, _| session.save_state()),
+        crate::app::save_coordinator::SaveState::Journaling
+    ));
+
+    redraw(cx);
+    let paints_after = view.read_with(cx, |shell, _| {
+        shell
+            .library_surface_paint_hooks_for_test
+            .paint
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
+    assert!(
+        paints_after > paints_before,
+        "a mounted editor must keep painting while worker codec/SQLite is slow"
+    );
+    assert!(
+        repository.latest_edit_journal(&note.id).unwrap().is_none(),
+        "the background gate must still be holding the journal job"
+    );
+
+    release.send(()).expect("release slow background save");
+    cx.run_until_parked();
+    assert!(
+        repository
+            .latest_edit_journal(&note.id)
+            .expect("read journal")
+            .is_some(),
+        "releasing the worker should complete the retained 100ms checkpoint"
+    );
+}
+
+#[gpui::test]
 async fn stale_delayed_session_save_cannot_overwrite_the_newly_selected_note(
     cx: &mut TestAppContext,
 ) {
@@ -960,6 +1045,91 @@ async fn mounted_quit_lifecycle_flushes_the_current_edit_before_the_platform_req
             .expect("note retained")
             .body_text
             .contains("已编辑")
+    );
+}
+
+#[gpui::test]
+async fn mounted_ime_lifecycle_warning_survives_clean_ticks_until_commit_and_successful_flush(
+    cx: &mut TestAppContext,
+) {
+    // Removing the retained lifecycle-error branch in `poll_active_session`
+    // used to make the next clean 50ms tick hide this blocker while macOS was
+    // still presenting the candidate. This is a mounted UI test over the real
+    // EntityInputHandler, not a hand-written save-state transition.
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "组合提示".into(),
+            notebook_id: None,
+            document: rich_document("正文"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, shell_cx| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("retained note session")
+            .read(shell_cx)
+            .editor()
+            .clone()
+    });
+    let end = cx.update(|_window, app| editor.read(app).document().flat_utf16_len());
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(end..end),
+                "候选",
+                Some((end + 2)..(end + 2)),
+                window,
+                editor_cx,
+            );
+        });
+    });
+    assert!(!view.update(cx, |shell, shell_cx| {
+        shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx)
+    }));
+    redraw(cx);
+    assert!(cx.debug_bounds("library-save-error").is_some());
+
+    // Drive the same automatic polling entry point that normally runs on the
+    // timer. The warning must remain while composition has not resolved.
+    view.update(cx, |shell, shell_cx| shell.poll_active_session(shell_cx));
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("library-save-error").is_some(),
+        "a clean tick must not erase an unresolved IME lifecycle blocker"
+    );
+
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            <EditorCore as EntityInputHandler>::unmark_text(editor, window, editor_cx);
+        });
+    });
+    assert!(view.update(cx, |shell, shell_cx| {
+        shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx)
+    }));
+    redraw(cx);
+    let warning = view.read_with(cx, |shell, _| shell.save_error.clone());
+    assert!(
+        warning.is_none(),
+        "successful flush should clear warning: {warning:?}"
+    );
+    assert!(
+        repository
+            .load_note(&note.id)
+            .unwrap()
+            .expect("note")
+            .body_text
+            .contains("候选")
     );
 }
 

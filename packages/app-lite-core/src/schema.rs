@@ -1,7 +1,7 @@
 use crate::{CanonicalDocument, repository::LibraryError, resource::ResourceStore};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub(crate) fn migrate_schema(
     connection: &mut Connection,
@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS tags (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NU
 CREATE TABLE IF NOT EXISTS note_tags (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE, position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(note_id, tag_id));
 CREATE TABLE IF NOT EXISTS note_resources (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, position INTEGER NOT NULL, resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE RESTRICT, is_associated INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(note_id, position));
 CREATE TABLE IF NOT EXISTS note_revisions (note_id TEXT NOT NULL, revision INTEGER NOT NULL, title TEXT NOT NULL, body_html TEXT NOT NULL, body_text TEXT NOT NULL, created_time INTEGER NOT NULL, PRIMARY KEY(note_id, revision));
-CREATE TABLE IF NOT EXISTS edit_journal (id TEXT PRIMARY KEY NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, generation INTEGER NOT NULL, delta_utf8 TEXT NOT NULL, created_time INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS edit_journal (id TEXT PRIMARY KEY NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, expected_revision INTEGER NOT NULL DEFAULT 1, writer_token TEXT NOT NULL DEFAULT '', sequence INTEGER NOT NULL DEFAULT 0, generation INTEGER NOT NULL, delta_utf8 TEXT NOT NULL, created_time INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS journal_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), next_sequence INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS search_queue (note_id TEXT PRIMARY KEY NOT NULL, updated_time INTEGER NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sync_outbox (id TEXT PRIMARY KEY NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, entity_revision INTEGER NOT NULL, operation TEXT NOT NULL, created_time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sync_cursor (name TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL, updated_time INTEGER NOT NULL);
@@ -67,9 +68,17 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
         ("notes", "revision", "INTEGER NOT NULL DEFAULT 1"),
         ("resources", "revision", "INTEGER NOT NULL DEFAULT 1"),
         ("resource_blobs", "revision", "INTEGER NOT NULL DEFAULT 1"),
+        (
+            "edit_journal",
+            "expected_revision",
+            "INTEGER NOT NULL DEFAULT 1",
+        ),
+        ("edit_journal", "writer_token", "TEXT NOT NULL DEFAULT ''"),
+        ("edit_journal", "sequence", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         ensure_column(&transaction, table, column, definition)?;
     }
+    transaction.execute_batch("CREATE TABLE IF NOT EXISTS journal_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), next_sequence INTEGER NOT NULL); INSERT OR IGNORE INTO journal_sequence (id, next_sequence) VALUES (1, 0); UPDATE edit_journal SET sequence = rowid WHERE sequence = 0; UPDATE journal_sequence SET next_sequence = (SELECT COALESCE(MAX(sequence), 0) FROM edit_journal) WHERE id = 1; CREATE INDEX IF NOT EXISTS edit_journal_latest_idx ON edit_journal(note_id, expected_revision, sequence DESC);")?;
     let existing_default: Option<String> = transaction
         .query_row(
             "SELECT id FROM notebooks WHERE is_default = 1 AND deleted_time = 0 ORDER BY id LIMIT 1",
@@ -115,9 +124,14 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     if version == 3 {
         rebuild_occurrences(&transaction)?;
     }
+    // A v3 upgrade rebuilds `edit_journal` after the generic column pass
+    // above. Reapply the journal identity/ordering shape to that replacement
+    // before publishing v5, otherwise the first crash checkpoint after an
+    // apparently successful upgrade fails at runtime.
+    ensure_edit_journal_v5(&transaction)?;
     transaction.execute("INSERT OR IGNORE INTO note_revisions (note_id, revision, title, body_html, body_text, created_time) SELECT id, 1, title, body_html, body_text, updated_time FROM notes", [])?;
     transaction.execute("INSERT OR IGNORE INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-bootstrap' FROM notes", [])?;
-    transaction.execute_batch("PRAGMA user_version = 4")?;
+    transaction.execute_batch("PRAGMA user_version = 5")?;
     before_commit();
     // The test hook models the last pathname/descriptor race.  It must run
     // before the final identity check so a swapped profile aborts the still
@@ -220,6 +234,28 @@ fn rebuild_v3_notes(
     transaction.execute_batch("DROP TABLE notes_v3_source; CREATE TABLE note_tags (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE, position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(note_id,tag_id)); CREATE TABLE note_resources (note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, position INTEGER NOT NULL, resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE RESTRICT, is_associated INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(note_id,position)); CREATE TABLE edit_journal (id TEXT PRIMARY KEY NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, generation INTEGER NOT NULL, delta_utf8 TEXT NOT NULL, created_time INTEGER NOT NULL); CREATE TABLE search_queue (note_id TEXT PRIMARY KEY NOT NULL, updated_time INTEGER NOT NULL, reason TEXT NOT NULL);")?;
     Ok(())
 }
+/// Install the durable journal identity fields after every migration branch
+/// that may have recreated the table. `v3` does exactly that while rebuilding
+/// notes, so doing this only in the earlier generic pass would leave a profile
+/// claiming schema v5 with the legacy journal shape.
+fn ensure_edit_journal_v5(transaction: &Transaction<'_>) -> Result<(), LibraryError> {
+    for (column, definition) in [
+        ("expected_revision", "INTEGER NOT NULL DEFAULT 1"),
+        ("writer_token", "TEXT NOT NULL DEFAULT ''"),
+        ("sequence", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        ensure_column(transaction, "edit_journal", column, definition)?;
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS journal_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), next_sequence INTEGER NOT NULL);
+         INSERT OR IGNORE INTO journal_sequence (id, next_sequence) VALUES (1, 0);
+         UPDATE edit_journal SET sequence = rowid WHERE sequence = 0;
+         UPDATE journal_sequence SET next_sequence = (SELECT COALESCE(MAX(sequence), 0) FROM edit_journal) WHERE id = 1;
+         CREATE INDEX IF NOT EXISTS edit_journal_latest_idx ON edit_journal(note_id, expected_revision, sequence DESC);",
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     t: &Transaction<'_>,
     table: &str,

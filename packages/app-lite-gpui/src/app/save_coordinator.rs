@@ -96,6 +96,11 @@ pub(crate) struct SaveCoordinator {
     dirty_started_at: Option<Duration>,
     last_edit_at: Option<Duration>,
     journaled_generation: Option<i64>,
+    /// A platform IME owns marked text until it commits or cancels it.  A
+    /// timer is allowed to keep its already-captured generation, but it is
+    /// never allowed to run while that generation could otherwise reread a
+    /// provisional candidate from the live editor.
+    composing: bool,
 }
 
 impl SaveCoordinator {
@@ -107,6 +112,7 @@ impl SaveCoordinator {
             dirty_started_at: None,
             last_edit_at: None,
             journaled_generation: None,
+            composing: false,
         }
     }
 
@@ -114,15 +120,36 @@ impl SaveCoordinator {
         self.state.clone()
     }
 
+    /// Completion callbacks carry the generation captured before they left
+    /// the UI thread. A newer committed input makes an older callback stale
+    /// for state publication, even if its durable SQLite write itself was
+    /// valid for the previous revision.
+    pub(crate) fn is_current_generation(&self, generation: i64) -> bool {
+        self.generation == generation
+    }
+
     pub(crate) fn mark_dirty(&mut self) -> i64 {
         let now = self.clock.now();
         self.generation = self.generation.saturating_add(1).max(1);
-        if self.dirty_started_at.is_none() {
+        if self.dirty_started_at.is_none() || matches!(self.state, SaveState::Failed(_)) {
             self.dirty_started_at = Some(now);
+            self.journaled_generation = None;
         }
         self.last_edit_at = Some(now);
         self.state = SaveState::Dirty;
         self.generation
+    }
+
+    pub(crate) fn freeze_for_composition(&mut self) {
+        self.composing = true;
+    }
+
+    pub(crate) fn resolve_composition(&mut self) {
+        self.composing = false;
+    }
+
+    pub(crate) fn is_composing(&self) -> bool {
+        self.composing
     }
 
     /// A recovered journal contains the entire current document. It is dirty
@@ -138,7 +165,7 @@ impl SaveCoordinator {
     }
 
     pub(crate) fn due_work(&self) -> Option<SaveWork> {
-        if matches!(self.state, SaveState::Clean | SaveState::Failed(_)) {
+        if self.composing || !matches!(self.state, SaveState::Dirty) {
             return None;
         }
         let now = self.clock.now();
@@ -162,7 +189,23 @@ impl SaveCoordinator {
         let generation = match work {
             SaveWork::Journal { generation } | SaveWork::Snapshot { generation } => generation,
         };
-        if generation != self.generation || matches!(self.state, SaveState::Failed(_)) {
+        if generation != self.generation
+            || self.composing
+            || matches!(self.state, SaveState::Failed(_))
+        {
+            return false;
+        }
+        // `force_snapshot` reserves the work before calling the executor.
+        // Let that one executor enter its matching reserved state, while a
+        // timer can only reserve from Dirty through `due_work`.
+        if matches!(
+            (self.state.clone(), work),
+            (SaveState::Journaling, SaveWork::Journal { .. })
+                | (SaveState::Snapshotting, SaveWork::Snapshot { .. })
+        ) {
+            return true;
+        }
+        if !matches!(self.state, SaveState::Dirty) {
             return false;
         }
         self.state = match work {
@@ -195,7 +238,7 @@ impl SaveCoordinator {
     }
 
     pub(crate) fn force_snapshot(&mut self) -> Option<SaveWork> {
-        if matches!(self.state, SaveState::Clean) {
+        if self.composing || !matches!(self.state, SaveState::Dirty) {
             return None;
         }
         let work = SaveWork::Snapshot {
