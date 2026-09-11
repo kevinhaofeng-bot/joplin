@@ -403,3 +403,76 @@ Verification after that commit:
   undo 3,822, transaction p95 31 us, render-commit p95 9,306 us).
 - `cargo fmt --check` for core and GPUI manifests plus `git diff --check` —
   **PASS** after the report commit below.
+
+## Independent review repair round 6 — 2026-09-11
+
+This repair closes the final v4 corrupt-checkpoint migration data-loss path.
+It is deliberately limited to Task 4 crash-journal compatibility; it does not
+introduce Task 5 resource-byte import or editing behavior.
+
+- **T4-R6-C1:** `app-lite-core` now owns the strict version-1 wire boundary in
+  `journal::LegacyJournalPayload`. Its DTO rejects missing, wrongly typed, or
+  unknown fields, verifies the exact version/note/revision/generation contract
+  against the v4 SQL row, applies bounded title/body/resource-list wire ranges,
+  and requires canonical HTML to round-trip byte-for-byte through
+  `CanonicalDocument`.
+- Every v4 row is validated before it is allowed to participate in stale/current
+  routing or deterministic winner ranking. The payload resource list must equal
+  the note's live associated-resource relation in durable order, and the parsed
+  document's resource references must equal that same list. Invalid SQL IDs,
+  negative timestamps, future/missing note revisions, and invalid legacy writer
+  identities remain fail-closed.
+- Version-1 journal payloads did not store a writer token. Migration derives the
+  v5 lease token only after validating the opaque v4 journal ID with the legacy
+  32-lowercase-hex rule; malformed IDs cannot become a v5 owner. The validator
+  lives in core and has no GPUI dependency. GPUI v1 recovery now reuses that
+  exact validator rather than retaining a weaker local decoder.
+- The schema migration remains one transaction. A malformed row leaves
+  `user_version`, v4 table shape, and every original journal row untouched;
+  valid rows still compact deterministically only after the full row set is
+  safe to interpret.
+
+The repair was developed RED first. Before it, a valid readable J1 plus a
+newer current-base J2 missing `body_html` migrated successfully, deleted J1,
+and published v5 with only an unreadable checkpoint. It now returns
+`InvalidLegacyEditJournal` with a byte-for-byte unchanged v4 snapshot.
+
+Two new mutation-sensitive core migration test functions cover this boundary:
+
+- `v4_migration_rejects_a_malformed_newer_checkpoint_without_writing_the_profile`
+  is the reviewer reproduction: valid J1 plus later malformed J2 must preserve
+  both rows and schema version 4.
+- `v4_migration_rejects_every_unrecoverable_wire_field_without_mutating_legacy_rows`
+  runs a field matrix for wrong title/body/resource types, SQL/payload
+  generation mismatch, zero generation, noncanonical HTML, valid-but-unrelated
+  resource references, and an ID that cannot derive a writer token. Each case
+  starts with a readable J1 and asserts the exact raw v4 snapshot survives.
+  Existing valid multi-row compaction and v4 recovery/continuation cases remain
+  green.
+
+Implementation commit: `63fae07e5 Validate legacy journal migration payloads`.
+
+Verification after that commit:
+
+- `cargo test --no-fail-fast` in `packages/app-lite-core` — **PASS, 81
+  tests**; migration suite **13/13**.
+- `cargo test --no-fail-fast` in `packages/app-lite-native` — **PASS, 225
+  tests**.
+- `cargo test app::note_session_tests:: -- --nocapture` — **PASS, 22/22**;
+  the two v4 recovery/continuation tests are included.
+- `cargo test ui::tests:: -- --nocapture` — **PASS, 28/28**.
+- `cargo check --quiet --all-targets` in `packages/app-lite-gpui` — **PASS**.
+- Full GPUI binary suite with exactly the existing donor skip — **PASS,
+  1,081 tests**; 1 filtered donor test and no new skip.
+- `cargo build --quiet --release` in `packages/app-lite-gpui` — **PASS**.
+- Fresh absolute `JOPLIN_LITE_PROFILE` release smoke created an isolated
+  `library.sqlite`; `PRAGMA integrity_check` returned **`ok`** and its log was
+  empty. The smoke child was intentionally terminated after initialization.
+- Release `--evernote-spike --fixture empty` — **PASS**: exact readiness marker,
+  empty log, and diagnostics: texture 0, layout 9,672, undo 1,233,
+  transaction p95 6 us, render-commit p95 8,874 us.
+- Release `--evernote-spike --fixture typical` — **PASS**: exact readiness
+  marker, empty log, and diagnostics: texture 26,361,856, layout 1,009,056,
+  undo 3,822, transaction p95 32 us, render-commit p95 9,213 us.
+- `cargo fmt --check --all` for core and GPUI manifests plus `git diff --check`
+  — **PASS** after the final report commit below.
