@@ -9,7 +9,7 @@ deliberately outside this task.
 
 ## Evidence boundary
 
-The installed Evernote 11.32.5 package provides two different evidence levels:
+The installed Evernote 11.32.5 package provides three different evidence levels:
 
 - `common-editor.ce.js.map` contains original `sourcesContent`, so editor evidence
   can be tied to original TypeScript symbols.
@@ -17,11 +17,17 @@ The installed Evernote 11.32.5 package provides two different evidence levels:
   split and made readable, but minified local identifiers cannot be restored.
   Module IDs, exported names, strings, action types, SQL, and control flow below
   are direct evidence; inferred filenames are navigation aids, not original paths.
+- `app.asar` also contains the Boron renderer entry graph. The targeted readable
+  reconstruction at
+  `/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5/renderer-readable`
+  preserves webpack module IDs and readable component control flow. Its bundled
+  CSS source maps include original filenames and complete `sourcesContent`, which
+  gives direct evidence for sidebar, drawer, list, card, and motion styling.
 
-Task 6 must not claim that a GPUI visual component is a line-for-line port of an
-unavailable Evernote renderer component. State transitions, query semantics, and
-persisted layout behavior are source-backed. Exact native visuals and the 200 ms
-motion budget are our product implementation, checked against the running app.
+Task 6 must not claim that minified TypeScript local names were recovered or that
+a GPUI component is a line-for-line port. State transitions, query semantics,
+persisted layout behavior, and the mapped renderer CSS are source-backed. Native
+rendering remains our Rust implementation and is checked against the running app.
 
 ## Source-to-Rust behavior map
 
@@ -38,6 +44,9 @@ motion budget are our product implementation, checked against the running app.
 | `main-readable/src/modules/35172__module-35172.js` and `15502__show-nav-trash-context-menu.js`: Trash selection is a route; empty-trash first enumerates trash note IDs and emits one explicit operation. Online-only enablement is Evernote service policy, not a local-data requirement. | Move-to-trash, restore, permanent delete, and empty trash are separate repository commands. Local personal use must work offline; permanent deletion also obeys resource occurrence/GC rules from Tasks 2 and 5. | Offline trash/restore works. Empty trash is explicit, atomic at the command boundary, leaves non-trash notes untouched, and journal/resource recovery passes after forced interruption. |
 | `00951__note-menu-actions.js`: move, edit tags, and shortcut actions handle single- and multi-selection through the same dispatched operations. | Context menu, keyboard command, and future drag/drop all call the same typed application commands. | Invoke bulk move/tag/pin through two UI entry points and assert identical repository events and one undoable selection transition where applicable. |
 | `main-readable/src/modules/54193__module-54193.js`: application state exposes separate `canNavigateBack`/`canNavigateForward` flags and `NAVIGATE_TO` carries typed view plus note/notebook/stack identifiers. `62264__application-controller.js` delegates Back/Forward to the active Electron `webContents` history. | A pure GPUI app has no browser history to borrow, so `NavigationHistory` records typed route snapshots and selected `NoteId`. This is a source-backed UX contract with a native Rust mechanism, not an imitation of Electron internals. | Navigate All Notes → notebook → tag → note; Back/Forward restores route, filters, and selected IDs. A new navigation after Back truncates the forward branch. Repository/list refreshes do not create history entries. |
+| `renderer-readable/chunks/9093.js`, module `633704`, preserves `src/components/Nav/styles.css`: 60 px collapsed width, 30 px rows, 300 ms overall transition, 150 ms row transition, selected/hover states, and chevrons that replace the main icon on hover. Entry module `373454` renders typed All Notes, notebook/stack, tags, shortcuts, recent notes, and trash rows from stable IDs. | GPUI sidebar geometry and interaction states are explicit tokens. Expanded/collapsed motion changes width and opacity without remounting application/editor entities. | Mounted tests assert stable IDs and entity identity across collapse/expand. Release measurement checks the intended transition duration, hover chevron swap, and no editor/image rehydration during motion. |
+| `renderer-readable/chunks/9435.js`, modules `706930`, `911674`, and `610348`: DetailList uses a 400 ms container transition and separate 100 ms width transition; width is clamped to 280-880 px and constrained by navigation plus editor minimum width; cards are 168 px with two default columns and list virtualization overscans 40 rows. | `PaneLayout`, note-list viewport, and list virtualization use these source-backed constraints while keeping Rust residency bounded. | Resize/collapse/restore and restart preserve width. A 1,662-note fixture keeps mounted rows and thumbnail requests bounded; editor minimum width is never violated. |
+| `renderer-readable/chunks/9435.js`, modules `300044`, `157405`, and `144957`: top-list resize animates for 100 ms; card view supports sticky groups; cards use 13 px title/snippet, 600 title weight, thumbnail size variants, two-line title clamp, date/footer indicators, selected outline, and 150 ms hover transition. Entry module `373454` cycles Cards → Snippets → List → Top List and persists global/notebook/stack/trash options independently. | `ListViewMode` consumes one `NoteListItem` projection. Task 6 implements Cards/Snippets/Compact first, with route-scoped presentation options; Top List remains a later layout mode rather than a different data path. | Switching modes preserves ordering and selected `NoteId`, does not hydrate body/blob data, and does not duplicate thumbnail requests. Visual fixtures verify hierarchy, thumbnail fallback, selection, and date/indicator placement. |
 
 ## Architecture rulings before implementation
 

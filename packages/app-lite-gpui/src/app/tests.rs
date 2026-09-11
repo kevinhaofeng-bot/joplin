@@ -1,7 +1,8 @@
 use super::{AppAction, AppModel, AppStatus, ListViewMode, NoteSort, PaneState};
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{
-    CanonicalDocument, CreateNote, LibraryRepository, LibraryShellState, NoteId, SaveNote,
+    CanonicalDocument, CreateNote, LibraryEvent, LibraryRepository, LibraryRoute,
+    LibraryShellState, Note, NoteId, SaveNote,
 };
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
@@ -24,6 +25,60 @@ fn create(repository: &LibraryRepository, title: &str) -> NoteId {
         })
         .expect("create note")
         .id
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NavigationCommitProbe {
+    snapshot: super::NavigationSnapshot,
+    sort: NoteSort,
+    can_navigate_back: bool,
+    can_navigate_forward: bool,
+    history_len: usize,
+    projection_ids: Vec<NoteId>,
+    active_note: Option<Note>,
+}
+
+fn navigation_commit_probe(model: &AppModel) -> NavigationCommitProbe {
+    NavigationCommitProbe {
+        snapshot: model.navigation().snapshot(),
+        sort: model.sort(),
+        can_navigate_back: model.navigation().can_navigate_back(),
+        can_navigate_forward: model.navigation().can_navigate_forward(),
+        history_len: model.navigation().history_len_for_test(),
+        projection_ids: model
+            .projections()
+            .iter()
+            .map(|projection| projection.id.clone())
+            .collect(),
+        active_note: model.active_note().cloned(),
+    }
+}
+
+fn assert_navigation_commit_unchanged(model: &AppModel, before: &NavigationCommitProbe) {
+    assert_eq!(navigation_commit_probe(model), *before);
+}
+
+fn navigation_fixture() -> (
+    tempfile::TempDir,
+    Arc<LibraryRepository>,
+    app_lite_core::Notebook,
+    NoteId,
+    NoteId,
+) {
+    let (profile, repository) = repository();
+    let notebook = repository
+        .create_notebook("项目", None)
+        .expect("create notebook");
+    let all_note = create(&repository, "所有笔记");
+    let notebook_note = repository
+        .create_note(CreateNote {
+            title: "项目笔记".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: CanonicalDocument::default(),
+        })
+        .expect("create notebook note")
+        .id;
+    (profile, repository, notebook, all_note, notebook_note)
 }
 
 #[test]
@@ -529,4 +584,229 @@ fn committed_trash_failure_is_truthful_and_leaves_recovery_possible() {
         AppStatus::Error(message) if message.contains("移至废纸篓")
             && message.contains("资料库数据已提交")
     ));
+}
+
+#[test]
+fn navigate_to_refresh_failure_keeps_the_entire_live_navigation_commit() {
+    // Mutation-sensitive: committing the typed route/history before the
+    // candidate query returns produces a Trash/notebook route paired with the
+    // old cards and editor session.
+    let (_profile, repository, notebook, all_note, notebook_note) = navigation_fixture();
+    let mut model = AppModel::open(repository).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(all_note))
+        .expect("select All Notes session");
+    let before = navigation_commit_probe(&model);
+
+    model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+    assert!(
+        model
+            .dispatch(AppAction::NavigateTo {
+                route: LibraryRoute::Notebook(notebook.id),
+                selected_note_id: Some(notebook_note),
+            })
+            .is_err()
+    );
+
+    assert_navigation_commit_unchanged(&model, &before);
+}
+
+#[test]
+fn back_refresh_failure_keeps_the_entire_live_navigation_commit() {
+    // Mutation-sensitive: moving the history cursor before the candidate
+    // query makes a failed Back action silently abandon the selected notebook
+    // session.
+    let (_profile, repository, notebook, all_note, notebook_note) = navigation_fixture();
+    let mut model = AppModel::open(repository).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(all_note))
+        .expect("select All Notes session");
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Notebook(notebook.id),
+            selected_note_id: Some(notebook_note),
+        })
+        .expect("navigate notebook");
+    let before = navigation_commit_probe(&model);
+
+    model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+    assert!(model.dispatch(AppAction::NavigateBack).is_err());
+
+    assert_navigation_commit_unchanged(&model, &before);
+}
+
+#[test]
+fn forward_refresh_failure_keeps_the_entire_live_navigation_commit() {
+    // Mutation-sensitive: the Forward cursor/route may change only after its
+    // target query and selected note preparation both succeed.
+    let (_profile, repository, notebook, all_note, notebook_note) = navigation_fixture();
+    let mut model = AppModel::open(repository).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(all_note.clone()))
+        .expect("select All Notes session");
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Notebook(notebook.id),
+            selected_note_id: Some(notebook_note),
+        })
+        .expect("navigate notebook");
+    model
+        .dispatch(AppAction::NavigateBack)
+        .expect("back to All Notes");
+    assert_eq!(model.navigation().selected_note_id(), Some(&all_note));
+    let before = navigation_commit_probe(&model);
+
+    model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+    assert!(model.dispatch(AppAction::NavigateForward).is_err());
+
+    assert_navigation_commit_unchanged(&model, &before);
+}
+
+#[test]
+fn sort_refresh_failure_keeps_the_entire_live_navigation_commit() {
+    // Mutation-sensitive: changing route-scoped sort before the query returns
+    // would leave the sort label semantically ahead of the old card order.
+    let (_profile, repository, _notebook, all_note, _notebook_note) = navigation_fixture();
+    let mut model = AppModel::open(repository).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(all_note))
+        .expect("select All Notes session");
+    let before = navigation_commit_probe(&model);
+
+    model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+    assert!(
+        model
+            .dispatch(AppAction::SetSort(NoteSort::TitleAscending))
+            .is_err()
+    );
+
+    assert_navigation_commit_unchanged(&model, &before);
+}
+
+#[test]
+fn target_hydration_failure_keeps_the_entire_live_navigation_commit() {
+    // Mutation-sensitive: a candidate projection is not enough. Its selected
+    // note must hydrate before the model publishes the target route/session.
+    let (_profile, repository, notebook, all_note, notebook_note) = navigation_fixture();
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model
+        .dispatch(AppAction::SelectNote(all_note))
+        .expect("select All Notes session");
+    let before = navigation_commit_probe(&model);
+
+    repository.fail_next_note_load_for_test(app_lite_core::LibraryError::NotFound);
+    assert!(
+        model
+            .dispatch(AppAction::NavigateTo {
+                route: LibraryRoute::Notebook(notebook.id),
+                selected_note_id: Some(notebook_note),
+            })
+            .is_err()
+    );
+
+    assert_navigation_commit_unchanged(&model, &before);
+}
+
+#[test]
+fn typed_route_history_keeps_route_scoped_sorts_and_never_records_projection_refreshes() {
+    // Mutation-sensitive: replacing typed snapshots with a row index/global
+    // sort, appending history from refresh_projection_events, or failing to
+    // truncate Forward after a new navigation changes these assertions.
+    let (_profile, repository) = repository();
+    let notebook = repository
+        .create_notebook("项目", None)
+        .expect("create notebook");
+    let tag = repository.create_tag("紧急").expect("create tag");
+    let notebook_note = repository
+        .create_note(CreateNote {
+            title: "项目笔记".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: CanonicalDocument::default(),
+        })
+        .expect("create notebook note");
+    let tagged_note = create(&repository, "标签笔记");
+    repository
+        .set_note_tags(&tagged_note, &[tag.id.clone()])
+        .expect("set tag");
+
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Notebook(notebook.id.clone()),
+            selected_note_id: Some(notebook_note.id.clone()),
+        })
+        .expect("navigate notebook");
+    model
+        .dispatch(AppAction::SetSort(NoteSort::TitleAscending))
+        .expect("set notebook sort");
+    let notebook_snapshot = model.navigation().snapshot();
+    assert_eq!(notebook_snapshot.route, LibraryRoute::Notebook(notebook.id));
+    assert_eq!(notebook_snapshot.selected_note_id, Some(notebook_note.id));
+
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::tags(vec![tag.id]).expect("tag route"),
+            selected_note_id: Some(tagged_note.clone()),
+        })
+        .expect("navigate tag");
+    let tag_snapshot = model.navigation().snapshot();
+    let tag_sort = model.sort();
+    assert!(model.navigation().can_navigate_back());
+    assert!(!model.navigation().can_navigate_forward());
+
+    model
+        .dispatch(AppAction::NavigateBack)
+        .expect("back to notebook");
+    assert_eq!(model.navigation().snapshot(), notebook_snapshot);
+    assert_eq!(model.sort(), NoteSort::TitleAscending);
+    assert!(model.navigation().can_navigate_forward());
+    let history_len = model.navigation().history_len_for_test();
+    model
+        .refresh_projection_events([LibraryEvent::OrganizationChanged])
+        .expect("projection refresh");
+    assert_eq!(
+        model.navigation().history_len_for_test(),
+        history_len,
+        "a repository projection refresh must not become browser-style navigation"
+    );
+    assert!(
+        model.navigation().can_navigate_forward(),
+        "refresh must preserve the existing Forward branch"
+    );
+
+    model
+        .dispatch(AppAction::NavigateForward)
+        .expect("Forward restores the typed tag snapshot");
+    assert_eq!(model.navigation().snapshot(), tag_snapshot);
+    assert_eq!(model.navigation().selected_note_id(), Some(&tagged_note));
+    assert_eq!(model.active_session_note_id(), Some(&tagged_note));
+    assert_eq!(
+        model
+            .projections()
+            .iter()
+            .map(|projection| projection.id.clone())
+            .collect::<Vec<_>>(),
+        vec![tagged_note.clone()],
+        "Forward must restore the target route projection, not merely a history flag"
+    );
+    assert_eq!(model.sort(), tag_sort);
+
+    model
+        .dispatch(AppAction::NavigateBack)
+        .expect("Back before branching");
+    assert_eq!(model.navigation().snapshot(), notebook_snapshot);
+
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Trash,
+            selected_note_id: None,
+        })
+        .expect("new navigation truncates forward");
+    assert!(!model.navigation().can_navigate_forward());
+    assert_eq!(model.sort(), NoteSort::DeletedDescending);
+    model
+        .dispatch(AppAction::NavigateBack)
+        .expect("back restores notebook route state");
+    assert_eq!(model.navigation().snapshot(), notebook_snapshot);
+    assert_eq!(model.sort(), NoteSort::TitleAscending);
 }

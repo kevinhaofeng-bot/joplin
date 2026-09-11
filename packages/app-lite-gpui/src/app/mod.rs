@@ -9,6 +9,7 @@ pub use navigation::*;
 use app_lite_core::{
     CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
     LibraryRepository, LibraryShellState, ListQuery, Note, NoteId, NoteProjection, ResourceId,
+    SortDirection, SortField,
 };
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -83,7 +84,6 @@ pub struct AppModel {
     active_session: Option<ActiveSession>,
     panes: PaneState,
     list_view_mode: ListViewMode,
-    sort: NoteSort,
     status: AppStatus,
     status_origin: StatusOrigin,
     // A repository mutation can commit before the subsequent projection
@@ -97,19 +97,31 @@ pub struct AppModel {
     projection_event_refreshes: usize,
 }
 
+/// A fully prepared navigation/sort transition. Every field has already
+/// passed its fallible repository work before the live model is touched, so a
+/// failed target query, hydration, or selection persistence cannot publish a
+/// route that disagrees with the mounted cards/editor.
+struct PreparedNavigationCommit {
+    navigation: NavigationState,
+    projections: Vec<NoteProjection>,
+    active_session: Option<ActiveSession>,
+}
+
 impl AppModel {
     pub fn open(repository: Arc<LibraryRepository>) -> Result<Self, LibraryError> {
         let saved_shell_state = repository.read_library_shell_state()?;
         let panes = PaneState::from_shell_state(&saved_shell_state);
-        let projections = repository.list_notes(ListQuery::default())?;
+        let navigation = NavigationState::default();
+        let projections = repository.list_notes(
+            ListQuery::for_route(navigation.route().clone()).with_sort(navigation.sort()),
+        )?;
         let mut model = Self {
             repository,
-            navigation: NavigationState::default(),
+            navigation,
             projections,
             active_session: None,
             panes,
             list_view_mode: ListViewMode::default(),
-            sort: NoteSort::default(),
             status: AppStatus::Ready,
             status_origin: StatusOrigin::Neutral,
             partial_commit_message: None,
@@ -118,7 +130,6 @@ impl AppModel {
             #[cfg(test)]
             projection_event_refreshes: 0,
         };
-        model.sort_projections();
         if let Some(id) = saved_shell_state.selected_note_id {
             if model
                 .projections
@@ -146,6 +157,12 @@ impl AppModel {
         let result = match action {
             AppAction::CreateNote => self.create_note(),
             AppAction::SelectNote(id) => self.select_note(id),
+            AppAction::NavigateTo {
+                route,
+                selected_note_id,
+            } => self.navigate_to(route, selected_note_id),
+            AppAction::NavigateBack => self.navigate_history(false),
+            AppAction::NavigateForward => self.navigate_history(true),
             AppAction::TrashNote(id) => self.trash_note(id),
             AppAction::TrashSelected => self
                 .navigation
@@ -166,8 +183,10 @@ impl AppModel {
                 Ok(())
             }
             AppAction::SetSort(sort) => {
-                self.sort = sort;
-                self.sort_projections();
+                let mut candidate = self.navigation.clone();
+                candidate.set_sort_for_route(sort.sort_spec());
+                let prepared = self.prepare_navigation_commit(candidate)?;
+                self.commit_navigation(prepared);
                 Ok(())
             }
             // The retained UI session performs the blocking flush before it
@@ -292,12 +311,8 @@ impl AppModel {
     }
 
     pub fn refresh_list(&mut self) -> Result<(), LibraryError> {
-        #[cfg(test)]
-        if let Some(error) = self.next_refresh_failure.take() {
-            return Err(error);
-        }
-        self.projections = self.repository.list_notes(ListQuery::default())?;
-        self.sort_projections();
+        let navigation = self.navigation.clone();
+        self.projections = self.load_projections_for(&navigation)?;
         if self.navigation.selected_note_id().is_some_and(|id| {
             !self
                 .projections
@@ -360,13 +375,17 @@ impl AppModel {
     }
 
     pub fn persist_shell_state(&self) -> Result<(), LibraryError> {
+        self.persist_shell_state_for(&self.navigation)
+    }
+
+    fn persist_shell_state_for(&self, navigation: &NavigationState) -> Result<(), LibraryError> {
         self.repository
             .write_library_shell_state(&LibraryShellState {
                 sidebar_width: self.panes.sidebar_width,
                 list_width: self.panes.list_width,
                 sidebar_visible: self.panes.sidebar_visible,
                 list_visible: self.panes.list_visible,
-                selected_note_id: self.navigation.selected_note_id().cloned(),
+                selected_note_id: navigation.selected_note_id().cloned(),
             })
     }
     pub fn navigation(&self) -> &NavigationState {
@@ -428,7 +447,7 @@ impl AppModel {
         self.list_view_mode
     }
     pub fn sort(&self) -> NoteSort {
-        self.sort
+        NoteSort::from_sort_spec(self.navigation.sort())
     }
     pub fn set_search_query(&mut self, query: Option<String>) {
         self.navigation.set_search_query(query);
@@ -457,25 +476,140 @@ impl AppModel {
             .collect();
     }
 
+    fn navigate_to(
+        &mut self,
+        route: app_lite_core::LibraryRoute,
+        selected_note_id: Option<NoteId>,
+    ) -> Result<(), LibraryError> {
+        let mut candidate = self.navigation.clone();
+        candidate.navigate_to(NavigationSnapshot {
+            route,
+            selected_note_id,
+        });
+        let prepared = self.prepare_navigation_commit(candidate)?;
+        self.commit_navigation(prepared);
+        Ok(())
+    }
+
+    fn navigate_history(&mut self, forward: bool) -> Result<(), LibraryError> {
+        let mut candidate = self.navigation.clone();
+        let snapshot = if forward {
+            candidate.navigate_forward()
+        } else {
+            candidate.navigate_back()
+        };
+        if snapshot.is_none() {
+            return Ok(());
+        }
+        let prepared = self.prepare_navigation_commit(candidate)?;
+        self.commit_navigation(prepared);
+        Ok(())
+    }
+
+    fn prepare_navigation_commit(
+        &mut self,
+        mut navigation: NavigationState,
+    ) -> Result<PreparedNavigationCommit, LibraryError> {
+        let projections = self.load_projections_for(&navigation)?;
+        let active_session = match navigation.selected_note_id().cloned() {
+            Some(id) if projections.iter().any(|projection| projection.id == id) => {
+                match self.active_session.as_ref() {
+                    Some(active) if active.note.id == id => Some(active.clone()),
+                    _ => Some(ActiveSession {
+                        note: self
+                            .repository
+                            .load_note(&id)?
+                            .ok_or(LibraryError::NotFound)?,
+                    }),
+                }
+            }
+            Some(_) => {
+                navigation.select(None);
+                None
+            }
+            None => None,
+        };
+        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+            self.persist_shell_state_for(&navigation)?;
+        }
+        Ok(PreparedNavigationCommit {
+            navigation,
+            projections,
+            active_session,
+        })
+    }
+
+    fn load_projections_for(
+        &mut self,
+        navigation: &NavigationState,
+    ) -> Result<Vec<NoteProjection>, LibraryError> {
+        #[cfg(test)]
+        if let Some(error) = self.next_refresh_failure.take() {
+            return Err(error);
+        }
+        self.repository.list_notes(
+            ListQuery::for_route(navigation.route().clone()).with_sort(navigation.sort()),
+        )
+    }
+
+    fn commit_navigation(&mut self, prepared: PreparedNavigationCommit) {
+        self.navigation = prepared.navigation;
+        self.projections = prepared.projections;
+        self.active_session = prepared.active_session;
+    }
+
     fn sort_projections(&mut self) {
-        match self.sort {
-            NoteSort::UpdatedDescending => self.projections.sort_by(|left, right| {
-                right
-                    .updated_time
-                    .cmp(&left.updated_time)
-                    .then_with(|| left.id.cmp(&right.id))
-            }),
-            NoteSort::TitleAscending => self.projections.sort_by(|left, right| {
-                left.title_prefix
-                    .cmp(&right.title_prefix)
-                    .then_with(|| left.id.cmp(&right.id))
-            }),
-            NoteSort::TitleDescending => self.projections.sort_by(|left, right| {
-                right
-                    .title_prefix
-                    .cmp(&left.title_prefix)
-                    .then_with(|| left.id.cmp(&right.id))
-            }),
+        match (
+            self.navigation.sort().field(),
+            self.navigation.sort().direction(),
+        ) {
+            (SortField::Updated, SortDirection::Descending) => {
+                self.projections.sort_by(|left, right| {
+                    right
+                        .updated_time
+                        .cmp(&left.updated_time)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+            }
+            (SortField::Updated, SortDirection::Ascending) => {
+                self.projections.sort_by(|left, right| {
+                    left.updated_time
+                        .cmp(&right.updated_time)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+            }
+            (SortField::Deleted, SortDirection::Descending) => {
+                self.projections.sort_by(|left, right| {
+                    right
+                        .deleted_time
+                        .cmp(&left.deleted_time)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+            }
+            (SortField::Deleted, SortDirection::Ascending) => {
+                self.projections.sort_by(|left, right| {
+                    left.deleted_time
+                        .cmp(&right.deleted_time)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+            }
+            (SortField::Title, SortDirection::Ascending) => {
+                self.projections.sort_by(|left, right| {
+                    left.title_prefix
+                        .to_ascii_lowercase()
+                        .cmp(&right.title_prefix.to_ascii_lowercase())
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+            }
+            (SortField::Title, SortDirection::Descending) => {
+                self.projections.sort_by(|left, right| {
+                    right
+                        .title_prefix
+                        .to_ascii_lowercase()
+                        .cmp(&left.title_prefix.to_ascii_lowercase())
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+            }
         }
     }
 

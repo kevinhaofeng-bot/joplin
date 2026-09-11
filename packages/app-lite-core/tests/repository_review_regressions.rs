@@ -2,8 +2,8 @@
 
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{
-    AssociateResource, CanonicalDocument, CreateNote, DeletionScope, LibraryError,
-    LibraryRepository, ListQuery, RepositoryClock, RepositoryIdSource, SaveNote,
+    AssociateResource, CanonicalDocument, CreateNote, LibraryError, LibraryRepository,
+    LibraryRoute, ListQuery, RepositoryClock, RepositoryIdSource, SaveNote,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::VecDeque;
@@ -641,11 +641,15 @@ fn selected_thumbnail_and_trash_scope_are_persisted_without_body_hydration() {
     );
     repository.trash_note(&note.id).unwrap();
     let trash = repository
-        .list_notes(ListQuery {
-            deletion_scope: DeletionScope::Trash,
-            limit: Some(1),
-            ..Default::default()
-        })
+        .list_notes(
+            ListQuery::paged(
+                LibraryRoute::Trash,
+                LibraryRoute::Trash.default_sort(),
+                0,
+                1,
+            )
+            .unwrap(),
+        )
         .unwrap();
     assert_eq!(trash.len(), 1);
     assert_eq!(trash[0].id, note.id);

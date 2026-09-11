@@ -1,4 +1,4 @@
-use app_lite_core::NoteId;
+use app_lite_core::{LibraryRoute, NoteId, SortSpec};
 
 gpui::actions!(
     notes_library,
@@ -35,6 +35,7 @@ impl ListViewMode {
 pub enum NoteSort {
     #[default]
     UpdatedDescending,
+    DeletedDescending,
     TitleAscending,
     TitleDescending,
 }
@@ -45,6 +46,25 @@ impl NoteSort {
             Self::UpdatedDescending => Self::TitleAscending,
             Self::TitleAscending => Self::TitleDescending,
             Self::TitleDescending => Self::UpdatedDescending,
+            Self::DeletedDescending => Self::TitleAscending,
+        }
+    }
+
+    pub(crate) const fn sort_spec(self) -> SortSpec {
+        match self {
+            Self::UpdatedDescending => SortSpec::UPDATED_DESCENDING,
+            Self::DeletedDescending => SortSpec::DELETED_DESCENDING,
+            Self::TitleAscending => SortSpec::title_ascending(),
+            Self::TitleDescending => SortSpec::title_descending(),
+        }
+    }
+
+    pub(crate) fn from_sort_spec(sort: SortSpec) -> Self {
+        match sort {
+            SortSpec::DELETED_DESCENDING => Self::DeletedDescending,
+            SortSpec::UPDATED_DESCENDING => Self::UpdatedDescending,
+            sort if sort == SortSpec::title_ascending() => Self::TitleAscending,
+            _ => Self::TitleDescending,
         }
     }
 }
@@ -53,6 +73,12 @@ impl NoteSort {
 pub enum AppAction {
     CreateNote,
     SelectNote(NoteId),
+    NavigateTo {
+        route: LibraryRoute,
+        selected_note_id: Option<NoteId>,
+    },
+    NavigateBack,
+    NavigateForward,
     TrashNote(NoteId),
     TrashSelected,
     ToggleSidebar,

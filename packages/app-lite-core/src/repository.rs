@@ -4,12 +4,13 @@ use crate::resource::{
 use crate::schema::migrate_schema;
 use crate::{
     BlobHash, CanonicalDocument, CreateNote, EditJournalEntry, EntityRef, JournalOwnership,
-    ListQuery, Note, NoteId, NoteProjection, Notebook, NotebookId, ResourceId, SaveNote,
-    SavedRevision, Stack, StackId, Tag, TagId,
+    ListQuery, ListQueryError, Note, NoteId, NoteProjection, Notebook, NotebookId, ResourceId,
+    SaveNote, SavedRevision, Stack, StackId, Tag, TagId, compile_note_list_query,
 };
 use rusqlite::hooks::{AuthAction, Authorization};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    params_from_iter,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
@@ -256,6 +257,8 @@ pub enum LibraryError {
     InvalidLibraryShellState,
     #[error("generic settings access cannot address reserved library shell state")]
     ReservedLibraryShellSetting,
+    #[error("invalid note-list query")]
+    ListQuery(#[from] ListQueryError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,7 +332,7 @@ pub struct LibraryRepository {
     note_load_observers: Mutex<Vec<Sender<NoteId>>>,
     #[cfg(test)]
     shell_state_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     next_note_load_failure: Mutex<Option<LibraryError>>,
     #[cfg(test)]
     next_staged_resource_snapshot_failure: Mutex<Option<LibraryError>>,
@@ -550,7 +553,7 @@ impl LibraryRepository {
             note_load_observers: Mutex::new(Vec::new()),
             #[cfg(test)]
             shell_state_read_hook: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             next_note_load_failure: Mutex::new(None),
             #[cfg(test)]
             next_staged_resource_snapshot_failure: Mutex::new(None),
@@ -683,8 +686,9 @@ impl LibraryRepository {
             .expect("shell-state read hook mutex poisoned") = Some(Box::new(hook));
     }
 
-    #[cfg(test)]
-    fn fail_next_note_load_for_test(&self, error: LibraryError) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_next_note_load_for_test(&self, error: LibraryError) {
         *self
             .next_note_load_failure
             .lock()
@@ -879,7 +883,7 @@ impl LibraryRepository {
     }
 
     pub fn load_note(&self, id: &NoteId) -> Result<Option<Note>, LibraryError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(error) = self
             .next_note_load_failure
             .lock()
@@ -1141,34 +1145,10 @@ impl LibraryRepository {
             }));
         }
         let result = (|| {
-            let mut statement = connection.prepare(
-                "SELECT n.id, substr(n.title, 1, 120), substr(n.snippet, 1, 160), n.updated_time,
-                        n.deleted_time, n.notebook_id,
-                        COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id = snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')),
-                        (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id = nr.resource_id
-                         WHERE nr.note_id = n.id AND nr.is_associated = 1 AND r.deleted_time = 0
-                           AND r.mime IN ('image/png', 'image/jpeg') ORDER BY nr.position, nr.resource_id LIMIT 1)),
-                        (SELECT count(*) FROM note_resources nr WHERE nr.note_id = n.id AND nr.is_associated = 1)
-                 FROM notes n
-                 WHERE (?1 = 2 OR (?1 = 0 AND n.deleted_time = 0) OR (?1 = 1 AND n.deleted_time <> 0))
-                   AND (?2 IS NULL OR n.notebook_id = ?2)
-                   AND (?3 IS NULL OR EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND nt.tag_id = ?3))
-                 ORDER BY n.updated_time DESC, n.id ASC
-                 LIMIT COALESCE(?4, -1)",
-            )?;
-            let rows = statement.query_map(
-                params![
-                    match query.deletion_scope {
-                        crate::DeletionScope::Active => 0_i64,
-                        crate::DeletionScope::Trash => 1,
-                        crate::DeletionScope::All => 2,
-                    },
-                    query.notebook_id.as_ref().map(NotebookId::as_str),
-                    query.tag_id.as_ref().map(TagId::as_str),
-                    query.limit.map(|limit| limit as i64)
-                ],
-                row_to_projection,
-            )?;
+            let compiled = compile_note_list_query(&query)?;
+            let mut statement = connection.prepare(&compiled.sql)?;
+            let rows =
+                statement.query_map(params_from_iter(compiled.params.iter()), row_to_projection)?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(LibraryError::from)
         })();

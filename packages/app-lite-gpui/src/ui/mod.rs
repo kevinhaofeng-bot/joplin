@@ -2090,6 +2090,7 @@ impl Render for LibraryShell {
         };
         let sort_label = match sort {
             NoteSort::UpdatedDescending => "按更新时间",
+            NoteSort::DeletedDescending => "按删除时间",
             NoteSort::TitleAscending => "按标题 A-Z",
             NoteSort::TitleDescending => "按标题 Z-A",
         };
