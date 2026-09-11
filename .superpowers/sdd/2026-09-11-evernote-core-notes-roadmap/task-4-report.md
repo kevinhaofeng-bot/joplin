@@ -137,3 +137,60 @@ Task 4 deliberately does not add resource/image import or durable resource
 insertion.  The library now permits durable title/body editing; unsupported or
 unrelated resource blocks remain visibly fail-closed rather than being silently
 discarded.
+
+## Independent review repair round 2 — 2026-09-11
+
+This round closes the second review's in-flight boundary, legacy migration,
+deadline, ownership, and stale-warning findings without adding Task 5 resource
+work.
+
+- **T4-R2-C1:** a `FlushBarrier` records the exact local generation and durable
+  base revision requested by a lifecycle boundary. `Journaling` and
+  `Snapshotting` are never reported as an old successful `last_saved` result.
+  The retained production worker finishes the current job, then dispatches the
+  barrier's exact snapshot; only the matching generation/revision completion
+  clears it. Repeated switch, delete, close, quit, and manual-save attempts
+  stay visibly blocked until then.
+- **T4-R2-C2:** the v4 table shape is detected before adding v5 defaults.
+  Migration parses each version-1 payload in its transaction, validates its
+  note ID and live base revision, backfills `expected_revision`, assigns a
+  deterministic non-empty legacy writer token, and preserves a durable
+  sequence. Invalid/mismatched payloads abort migration instead of becoming
+  silently unrecoverable.
+- **T4-R2-I1:** the 100 ms journal timer is anchored to the first committed
+  edit not already checkpointed. Subsequent sub-100 ms input refreshes only
+  the immutable captured payload; it cannot cancel the promised crash journal.
+  The 500 ms settled timer remains an idle debounce and 15 s remains a hard
+  snapshot limit.
+- **T4-R2-I2:** journal replacement now verifies the existing writer token
+  inside the same `BEGIN IMMEDIATE` transaction as the revision CAS. A late
+  foreign writer fails visibly instead of deleting the checkpoint that won the
+  same-base race.
+- **T4-R2-I3:** `LibraryShell` distinguishes lifecycle blockers from an
+  automatic error tagged with its failed generation. A later durable `Clean`
+  generation clears only the automatic warning; lifecycle/IME errors remain
+  until their explicit successful boundary.
+
+Six new mutation-sensitive tests provide the direct regression coverage:
+
+- `v4_legacy_journal_backfills_payload_revision_without_losing_recovery`
+- `retained_journal_deadline_is_anchored_to_the_first_unjournaled_edit`
+- `gated_older_writer_cannot_replace_a_newer_same_note_checkpoint`
+- `v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_content`
+- `mounted_inflight_worker_blocks_switch_delete_close_and_quit_until_completion`
+- `mounted_corrected_generation_clears_only_its_automatic_save_error`
+
+The existing core two-writer test was also strengthened to assert the visible
+ownership conflict and retained checkpoint. The mounted action, close, quit,
+and IME tests now use the real asynchronous retained worker contract: first
+boundary blocks, completion is drained, then retry succeeds.
+
+Targeted verification before the broad release pass:
+
+- `cargo test --tests -- --nocapture` in `packages/app-lite-core` — **PASS,
+  77 tests**.
+- `cargo test app::note_session_tests:: -- --nocapture` in
+  `packages/app-lite-gpui` — **PASS, 17 tests**.
+- `cargo test ui::tests:: -- --nocapture` in `packages/app-lite-gpui` —
+  **PASS, 28 tests**.
+- `cargo fmt` for both manifests and `git diff --check` — **PASS**.

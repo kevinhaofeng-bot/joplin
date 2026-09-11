@@ -121,6 +121,7 @@ dependencies = [
  "html5ever",
  "libc",
  "rusqlite",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
 ]
@@ -7253,6 +7254,7 @@ dependencies = [
  "raw-window-handle",
  "reqwest",
  "resvg",
+ "rusqlite",
  "schemars",
  "semver",
  "serde",

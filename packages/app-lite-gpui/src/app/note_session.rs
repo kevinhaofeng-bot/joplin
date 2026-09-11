@@ -72,7 +72,18 @@ enum SaveCompletion {
     Snapshot {
         saved: SavedRevision,
         snapshot: SessionSnapshot,
+        expected_revision: i64,
     },
+}
+
+/// A lifecycle action is not allowed to cross this barrier until the exact
+/// captured generation has become a durable snapshot. It deliberately lives
+/// with the retained session rather than the UI so a second close/switch call
+/// cannot reinterpret an in-flight journal as the old `last_saved` success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FlushBarrier {
+    generation: i64,
+    expected_revision: i64,
 }
 
 #[derive(Clone)]
@@ -328,6 +339,7 @@ pub(crate) struct NoteSession {
     _settled_deadline_task: Option<Task<()>>,
     _hard_deadline_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
+    pending_flush: Option<FlushBarrier>,
     #[cfg(test)]
     deadline_tasks_enabled_for_test: bool,
     #[cfg(test)]
@@ -442,6 +454,7 @@ impl NoteSession {
             _settled_deadline_task: None,
             _hard_deadline_task: None,
             _save_task: None,
+            pending_flush: None,
             #[cfg(test)]
             deadline_tasks_enabled_for_test: false,
             #[cfg(test)]
@@ -476,6 +489,10 @@ impl NoteSession {
         self.save.state()
     }
 
+    pub(crate) fn save_generation(&self) -> i64 {
+        self.save.generation()
+    }
+
     fn observe_entities(
         &mut self,
         title: &Entity<TitleInput>,
@@ -505,9 +522,8 @@ impl NoteSession {
             // already fired while composition was frozen. Resume the retained
             // dirty generation immediately; otherwise it would remain dirty
             // forever until an unrelated user edit.
-            #[cfg(not(test))]
             if composition_was_active {
-                self.drive_due_work(cx);
+                self.drive_pending_flush_or_due_work(cx);
             }
             if composition_was_active {
                 cx.notify();
@@ -520,7 +536,14 @@ impl NoteSession {
         let starts_new_dirty_window =
             matches!(self.save.state(), SaveState::Clean | SaveState::Failed(_));
         self.committed_snapshot = next_snapshot;
-        self.save.mark_dirty();
+        let generation = self.save.mark_dirty();
+        if let Some(barrier) = self.pending_flush.as_mut() {
+            // A boundary remains a boundary for the latest committed input;
+            // it must not declare the pre-edit generation durable while the
+            // user is still typing in the retained session.
+            barrier.generation = generation;
+            barrier.expected_revision = self.expected_revision;
+        }
         self.arm_deadlines(starts_new_dirty_window, cx);
         cx.notify();
     }
@@ -624,7 +647,11 @@ impl NoteSession {
                     resource_ids: snapshot.resource_ids.clone(),
                     selected_thumbnail_id: None,
                 })?;
-                Ok(SaveCompletion::Snapshot { saved, snapshot })
+                Ok(SaveCompletion::Snapshot {
+                    saved,
+                    snapshot,
+                    expected_revision: job.expected_revision,
+                })
             }
         }
     }
@@ -652,7 +679,17 @@ impl NoteSession {
                 self.save.journaled(generation);
                 Ok(None)
             }
-            Ok(SaveCompletion::Snapshot { saved, snapshot }) => {
+            Ok(SaveCompletion::Snapshot {
+                saved,
+                snapshot,
+                expected_revision,
+            }) => {
+                let completes_pending_flush = self.pending_flush.is_some_and(|barrier| {
+                    publishes_current_generation
+                        && barrier.generation == generation
+                        && barrier.expected_revision == expected_revision
+                        && saved.revision == expected_revision.saturating_add(1)
+                });
                 self.expected_revision = saved.revision;
                 self.last_saved = saved.clone();
                 self.journal_base = snapshot;
@@ -664,6 +701,16 @@ impl NoteSession {
                     self._journal_deadline_task = None;
                     self._settled_deadline_task = None;
                     self._hard_deadline_task = None;
+                }
+                if completes_pending_flush {
+                    self.pending_flush = None;
+                } else if let Some(barrier) = self.pending_flush.as_mut() {
+                    // A prior-generation snapshot can legitimately commit
+                    // while later input is already dirty. Its new revision is
+                    // the required base for the still-blocked lifecycle
+                    // barrier; do not accidentally accept that earlier save.
+                    barrier.generation = self.save.generation();
+                    barrier.expected_revision = self.expected_revision;
                 }
                 Ok(Some(saved))
             }
@@ -684,26 +731,14 @@ impl NoteSession {
                 }
             }
         };
-        #[cfg(not(test))]
+        // The same retained/background dispatch is used in tests and
+        // production. A boundary queued during a journal starts its exact
+        // snapshot only after that worker completion has been observed.
         if outcome.is_ok() {
-            self.drive_due_work(cx);
+            self.drive_pending_flush_or_due_work(cx);
         }
         cx.notify();
         outcome
-    }
-
-    #[cfg(test)]
-    fn execute(
-        &mut self,
-        work: SaveWork,
-        cx: &mut Context<Self>,
-    ) -> Result<Option<SavedRevision>, SaveError> {
-        if !self.save.begin(work) {
-            return Ok(None);
-        }
-        let job = self.save_job(work);
-        let result = Self::perform_save(job);
-        self.finish_save(work, result, cx)
     }
 
     fn start_background_work(&mut self, work: SaveWork, cx: &mut Context<Self>) {
@@ -729,14 +764,33 @@ impl NoteSession {
         }
     }
 
+    fn drive_pending_flush_or_due_work(&mut self, cx: &mut Context<Self>) {
+        if self._save_task.is_some() {
+            return;
+        }
+        if self.pending_flush.is_some() {
+            if !matches!(self.save.state(), SaveState::Dirty) {
+                return;
+            }
+            if let Some(barrier) = self.pending_flush.as_mut() {
+                barrier.generation = self.save.generation();
+                barrier.expected_revision = self.expected_revision;
+            }
+            if let Some(work) = self.save.force_snapshot() {
+                self.start_background_work(work, cx);
+            }
+            return;
+        }
+        self.drive_due_work(cx);
+    }
+
     /// Exercises the exact production background dispatch path under the
-    /// deterministic clock. The synchronous `poll` seam remains useful for
-    /// deadline arithmetic, while this proves the immutable job handoff does
-    /// not read an entity after it has been queued to a worker.
+    /// deterministic clock, including lifecycle barriers. It never calls a
+    /// synchronous save shortcut or rereads an entity from a worker.
     #[cfg(test)]
     pub(crate) fn dispatch_due_background_work_for_test(&mut self, cx: &mut Context<Self>) {
         self.observe_current_entities(cx);
-        self.drive_due_work(cx);
+        self.drive_pending_flush_or_due_work(cx);
     }
 
     #[cfg(test)]
@@ -758,43 +812,45 @@ impl NoteSession {
         if !self.deadline_tasks_enabled_for_test {
             return;
         }
-        self._journal_deadline_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(100))
-                .await;
-            let _ = this.update(cx, |session, session_cx| session.drive_due_work(session_cx));
-        }));
+        if self._journal_deadline_task.is_none() && self.save.needs_journal_deadline() {
+            self._journal_deadline_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let _ = this.update(cx, |session, session_cx| {
+                    session._journal_deadline_task = None;
+                    session.drive_pending_flush_or_due_work(session_cx);
+                });
+            }));
+        }
+        // The settled snapshot is an idle debounce and therefore is allowed
+        // to move with every committed keystroke. Only the journal deadline
+        // above is a non-resettable durability promise.
         self._settled_deadline_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
-            let _ = this.update(cx, |session, session_cx| session.drive_due_work(session_cx));
+            let _ = this.update(cx, |session, session_cx| {
+                session._settled_deadline_task = None;
+                session.drive_pending_flush_or_due_work(session_cx);
+            });
         }));
-        if start_hard_deadline {
+        if start_hard_deadline && self._hard_deadline_task.is_none() {
             self._hard_deadline_task = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_secs(15))
                     .await;
-                let _ = this.update(cx, |session, session_cx| session.drive_due_work(session_cx));
+                let _ = this.update(cx, |session, session_cx| {
+                    session._hard_deadline_task = None;
+                    session.drive_pending_flush_or_due_work(session_cx);
+                });
             }));
         }
     }
 
     pub(crate) fn poll(&mut self, cx: &mut Context<Self>) -> Result<(), SaveError> {
         self.observe_current_entities(cx);
-        #[cfg(test)]
-        {
-            // Manual-clock tests drive exact deadline boundaries without wall
-            // sleeps; production always uses the retained deadline tasks.
-            for _ in 0..2 {
-                let Some(work) = self.save.due_work() else {
-                    break;
-                };
-                self.execute(work, cx)?;
-            }
-        }
-        #[cfg(not(test))]
-        self.drive_due_work(cx);
+        self.drive_pending_flush_or_due_work(cx);
         Ok(())
     }
 
@@ -815,23 +871,22 @@ impl NoteSession {
             )));
         }
         self.observe_current_entities(cx);
-        if let SaveState::Failed(error) = self.save.state() {
-            return Err(SaveError::new(format!("{reason:?} 前无法保存: {error}")));
-        }
-        let Some(work) = self.save.force_snapshot() else {
-            return Ok(self.last_saved.clone());
-        };
-        #[cfg(test)]
-        {
-            self.execute(work, cx)?;
-            Ok(self.last_saved.clone())
-        }
-        #[cfg(not(test))]
-        {
-            self.start_background_work(work, cx);
-            Err(SaveError::new(format!(
-                "{reason:?} 正在后台保存；完成前请保持当前窗口打开"
-            )))
+        match self.save.state() {
+            SaveState::Clean if self.pending_flush.is_none() => Ok(self.last_saved.clone()),
+            SaveState::Failed(error) => {
+                Err(SaveError::new(format!("{reason:?} 前无法保存: {error}")))
+            }
+            SaveState::Clean => Err(SaveError::new(format!("{reason:?} 的保存确认仍未完成"))),
+            SaveState::Dirty | SaveState::Journaling | SaveState::Snapshotting => {
+                self.pending_flush = Some(FlushBarrier {
+                    generation: self.save.generation(),
+                    expected_revision: self.expected_revision,
+                });
+                self.drive_pending_flush_or_due_work(cx);
+                Err(SaveError::new(format!(
+                    "{reason:?} 正在后台保存；完成前请保持当前窗口打开"
+                )))
+            }
         }
     }
 }

@@ -8,8 +8,9 @@
 use super::note_session::NoteSession;
 use super::save_coordinator::{FlushReason, ManualSaveClock, SaveState};
 use app_lite_core::document::{Block, BlockStyle, Inline, Marks};
-use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, Note};
+use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, Note, SaveNote};
 use gpui::{AppContext, EntityInputHandler};
+use rusqlite::Connection;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -93,6 +94,33 @@ fn append_body_via_entity_input(
     });
 }
 
+fn poll_and_drain(session: &gpui::Entity<NoteSession>, cx: &mut gpui::VisualTestContext) {
+    session.update(cx, |session, session_cx| {
+        session
+            .poll(session_cx)
+            .expect("dispatch due background work")
+    });
+    // Test timing is deterministic, but completion always uses the same
+    // retained/background worker handoff as production.
+    cx.run_until_parked();
+}
+
+fn flush_until_clean(
+    session: &gpui::Entity<NoteSession>,
+    reason: FlushReason,
+    cx: &mut gpui::VisualTestContext,
+) {
+    let first = session.update(cx, |session, session_cx| session.flush(reason, session_cx));
+    if first.is_err() {
+        cx.run_until_parked();
+        session.update(cx, |session, session_cx| {
+            session
+                .flush(reason, session_cx)
+                .expect("completion-confirmed lifecycle flush")
+        });
+    }
+}
+
 #[gpui::test]
 async fn chinese_title_and_body_entity_input_round_trip_after_restart(
     cx: &mut gpui::TestAppContext,
@@ -110,11 +138,7 @@ async fn chinese_title_and_body_entity_input_round_trip_after_restart(
 
     append_title_via_entity_input(&active, "中文标题", cx);
     append_body_via_entity_input(&active, "和正文", cx);
-    active.update(cx, |session, session_cx| {
-        session
-            .flush(FlushReason::ManualSync, session_cx)
-            .expect("flush")
-    });
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
     drop(active);
 
     let reloaded = repository
@@ -157,9 +181,7 @@ async fn journal_is_readable_at_100ms_and_snapshot_waits_for_500ms_settle(
 
     append_body_via_entity_input(&active, "可恢复", cx);
     clock.advance(Duration::from_millis(99));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("poll")
-    });
+    poll_and_drain(&active, cx);
     assert!(
         repository
             .latest_edit_journal(&note.id)
@@ -168,9 +190,7 @@ async fn journal_is_readable_at_100ms_and_snapshot_waits_for_500ms_settle(
     );
 
     clock.advance(Duration::from_millis(1));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("poll")
-    });
+    poll_and_drain(&active, cx);
     let journal = repository
         .latest_edit_journal(&note.id)
         .expect("read journal")
@@ -192,9 +212,7 @@ async fn journal_is_readable_at_100ms_and_snapshot_waits_for_500ms_settle(
     );
 
     clock.advance(Duration::from_millis(399));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("poll")
-    });
+    poll_and_drain(&active, cx);
     assert_eq!(
         repository
             .load_note(&note.id)
@@ -205,9 +223,7 @@ async fn journal_is_readable_at_100ms_and_snapshot_waits_for_500ms_settle(
     );
 
     clock.advance(Duration::from_millis(1));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("poll")
-    });
+    poll_and_drain(&active, cx);
     assert_eq!(
         repository
             .load_note(&note.id)
@@ -246,9 +262,7 @@ async fn journal_checkpoint_is_a_compact_readable_delta_not_a_second_full_docume
 
     append_body_via_entity_input(&active, "新", cx);
     clock.advance(Duration::from_millis(100));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("100ms checkpoint")
-    });
+    poll_and_drain(&active, cx);
     let journal = repository
         .latest_edit_journal(&note.id)
         .expect("read compact checkpoint")
@@ -305,6 +319,41 @@ async fn retained_deadline_task_dispatches_the_100ms_checkpoint_without_foregrou
 }
 
 #[gpui::test]
+async fn retained_journal_deadline_is_anchored_to_the_first_unjournaled_edit(
+    cx: &mut gpui::TestAppContext,
+) {
+    // Continuous typing must not keep postponing the crash-recovery
+    // checkpoint. Each input below lands before the previous 100ms deadline;
+    // only a timer anchored to the first unjournaled edit can publish a
+    // readable checkpoint before the 15s hard-snapshot ceiling.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let note = create(&repository, "连续日志", rich_document("基线"));
+    let clock = Arc::new(ManualSaveClock::default());
+    let active = session(
+        note.clone(),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    active.update(cx, |session, _| session.enable_deadline_tasks_for_test());
+
+    for _ in 0..12 {
+        append_body_via_entity_input(&active, "续", cx);
+        clock.advance(Duration::from_millis(50));
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+    }
+
+    let checkpoint = repository
+        .latest_edit_journal(&note.id)
+        .expect("read continuous-input checkpoint")
+        .expect("first 100ms deadline must not be reset by later input");
+    assert!(checkpoint.delta_utf8.contains("续"));
+    assert!(checkpoint.sequence > 0);
+}
+
+#[gpui::test]
 async fn continuous_edits_force_a_snapshot_at_fifteen_seconds_without_sleeping(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -322,9 +371,7 @@ async fn continuous_edits_force_a_snapshot_at_fifteen_seconds_without_sleeping(
     for _ in 0..37 {
         append_title_via_entity_input(&active, "续", cx);
         clock.advance(Duration::from_millis(400));
-        active.update(cx, |session, session_cx| {
-            session.poll(session_cx).expect("poll")
-        });
+        poll_and_drain(&active, cx);
     }
     assert_eq!(
         repository
@@ -337,9 +384,7 @@ async fn continuous_edits_force_a_snapshot_at_fifteen_seconds_without_sleeping(
     );
     append_title_via_entity_input(&active, "终", cx);
     clock.advance(Duration::from_millis(200));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("poll")
-    });
+    poll_and_drain(&active, cx);
     assert_eq!(
         repository
             .load_note(&note.id)
@@ -368,9 +413,7 @@ async fn journal_recovery_reconstructs_unsnapshotted_input_and_all_flush_reasons
     append_title_via_entity_input(&active, "后的标题", cx);
     append_body_via_entity_input(&active, "后的正文", cx);
     clock.advance(Duration::from_millis(100));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("journal")
-    });
+    poll_and_drain(&active, cx);
     drop(active);
 
     let base = repository
@@ -402,9 +445,7 @@ async fn journal_recovery_reconstructs_unsnapshotted_input_and_all_flush_reasons
         FlushReason::Delete,
         FlushReason::ManualSync,
     ] {
-        recovered.update(cx, |session, session_cx| {
-            session.flush(reason, session_cx).expect("explicit flush")
-        });
+        flush_until_clean(&recovered, reason, cx);
         assert!(
             repository
                 .latest_edit_journal(&note.id)
@@ -447,9 +488,7 @@ async fn chinese_ime_composition_blocks_lifecycle_flush_until_the_real_input_com
         });
     });
     clock.advance(Duration::from_secs(16));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("poll candidate")
-    });
+    poll_and_drain(&active, cx);
     assert!(
         repository
             .latest_edit_journal(&note.id)
@@ -483,11 +522,7 @@ async fn chinese_ime_composition_blocks_lifecycle_flush_until_the_real_input_com
         SaveState::Dirty,
         "the real input commit notification must reach the retained session"
     );
-    active.update(cx, |session, session_cx| {
-        session
-            .flush(FlushReason::WindowClose, session_cx)
-            .expect("flush committed IME text")
-    });
+    flush_until_clean(&active, FlushReason::WindowClose, cx);
     assert!(
         repository
             .load_note(&note.id)
@@ -533,9 +568,7 @@ async fn dirty_body_before_ime_candidate_never_serializes_the_provisional_text(
     });
 
     clock.advance(Duration::from_millis(100));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("journal deadline")
-    });
+    poll_and_drain(&active, cx);
     let journal = repository
         .latest_edit_journal(&note.id)
         .expect("read journal while marked");
@@ -547,13 +580,9 @@ async fn dirty_body_before_ime_candidate_never_serializes_the_provisional_text(
     );
 
     clock.advance(Duration::from_millis(400));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("settled snapshot deadline")
-    });
+    poll_and_drain(&active, cx);
     clock.advance(Duration::from_secs(15));
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("hard snapshot deadline")
-    });
+    poll_and_drain(&active, cx);
     let durable = repository
         .load_note(&note.id)
         .expect("load durable note")
@@ -577,9 +606,7 @@ async fn dirty_body_before_ime_candidate_never_serializes_the_provisional_text(
             );
         });
     });
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("cancelled candidate")
-    });
+    poll_and_drain(&active, cx);
     let after_cancel = repository
         .load_note(&note.id)
         .expect("reload after cancellation")
@@ -626,9 +653,7 @@ async fn dirty_title_before_ime_candidate_never_serializes_the_provisional_text(
         Duration::from_secs(15),
     ] {
         clock.advance(elapsed);
-        active.update(cx, |session, session_cx| {
-            session.poll(session_cx).expect("marked-title deadline")
-        });
+        poll_and_drain(&active, cx);
     }
     let journal = repository
         .latest_edit_journal(&note.id)
@@ -655,9 +680,7 @@ async fn dirty_title_before_ime_candidate_never_serializes_the_provisional_text(
             );
         });
     });
-    active.update(cx, |session, session_cx| {
-        session.poll(session_cx).expect("cancelled-title candidate")
-    });
+    poll_and_drain(&active, cx);
     let after_cancel = repository.load_note(&note.id).unwrap().expect("note");
     assert!(after_cancel.title.contains("已确认"));
     assert!(!after_cancel.title.contains("候选"));
@@ -725,6 +748,148 @@ async fn background_journal_job_uses_the_unmarked_snapshot_captured_before_ime(
     ));
 }
 
+#[gpui::test]
+async fn gated_older_writer_cannot_replace_a_newer_same_note_checkpoint(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A captures first, but its actual SQLite append is stopped in the
+    // production worker. B uses an independently opened repository/session
+    // and commits a same-revision checkpoint before A wakes. Writer identity
+    // must participate in the database CAS so A cannot delete B merely by
+    // completing later.
+    let cx = cx.add_empty_window();
+    let (profile, repository_a) = repository();
+    let repository_b = Arc::new(
+        LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open independent second repository"),
+    );
+    let note = create(&repository_a, "并发 journal", rich_document("基线"));
+    let note_a = repository_a
+        .load_note(&note.id)
+        .unwrap()
+        .expect("load A note");
+    let note_b = repository_b
+        .load_note(&note.id)
+        .unwrap()
+        .expect("load B note");
+    let clock_a = Arc::new(ManualSaveClock::default());
+    let clock_b = Arc::new(ManualSaveClock::default());
+    let a = session(note_a, Arc::clone(&repository_a), Arc::clone(&clock_a), cx);
+    let b = session(note_b, Arc::clone(&repository_b), Arc::clone(&clock_b), cx);
+    a.update(cx, |session, _| session.enable_deadline_tasks_for_test());
+    b.update(cx, |session, _| session.enable_deadline_tasks_for_test());
+
+    append_body_via_entity_input(&a, " A旧", cx);
+    let release_a = a.update(cx, |session, _| {
+        session.stall_next_background_save_for_test()
+    });
+    clock_a.advance(Duration::from_millis(100));
+    a.update(cx, |session, session_cx| {
+        session.dispatch_due_background_work_for_test(session_cx)
+    });
+    assert!(matches!(
+        a.read_with(cx, |session, _| session.save_state()),
+        SaveState::Journaling
+    ));
+
+    append_body_via_entity_input(&b, " B新", cx);
+    clock_b.advance(Duration::from_millis(100));
+    b.update(cx, |session, session_cx| {
+        session.dispatch_due_background_work_for_test(session_cx)
+    });
+    cx.run_until_parked();
+    let b_checkpoint = repository_b
+        .latest_edit_journal(&note.id)
+        .expect("read B checkpoint")
+        .expect("B writes while A remains gated");
+    assert!(b_checkpoint.delta_utf8.contains("B新"));
+
+    release_a.send(()).expect("wake late A worker");
+    cx.run_until_parked();
+    assert!(matches!(
+        a.read_with(cx, |session, _| session.save_state()),
+        SaveState::Failed(ref error) if error.contains("writer")
+    ));
+    let recovered = repository_a
+        .latest_edit_journal(&note.id)
+        .expect("read surviving checkpoint")
+        .expect("B checkpoint remains");
+    assert_eq!(recovered.writer_token, b_checkpoint.writer_token);
+    assert!(recovered.delta_utf8.contains("B新"));
+    assert!(!recovered.delta_utf8.contains("A旧"));
+}
+
+#[gpui::test]
+async fn v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_content(
+    cx: &mut gpui::TestAppContext,
+) {
+    // End-to-end release-profile fixture: the v4 SQL table has no v5 identity
+    // columns, but its v1 payload carries revision two. Migration must
+    // backfill that exact revision, then NoteSession::prepare must consume the
+    // recovered Chinese rich text rather than silently opening the old base.
+    let cx = cx.add_empty_window();
+    let profile = tempfile::tempdir().expect("temporary release profile");
+    let path = profile.path().join("library.sqlite");
+    let repository = Arc::new(LibraryRepository::open(&path).expect("open profile"));
+    let note = create(&repository, "旧标题", rich_document("旧正文"));
+    repository
+        .flush_snapshot(SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: "revision two base".into(),
+            document: rich_document("持久化基线"),
+            resource_ids: Vec::new(),
+            selected_thumbnail_id: None,
+        })
+        .expect("advance note to revision two");
+    drop(repository);
+
+    let connection = Connection::open(&path).expect("open v4 fixture sqlite");
+    connection
+        .execute_batch(
+            "DROP TABLE edit_journal;
+             CREATE TABLE edit_journal (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 note_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 delta_utf8 TEXT NOT NULL,
+                 created_time INTEGER NOT NULL
+             );
+             PRAGMA user_version = 4;",
+        )
+        .expect("seed v4 journal shape");
+    let payload = format!(
+        r#"{{"version":1,"note_id":"{}","expected_revision":2,"generation":9,"title":"迁移后中文标题","body_html":"<p><strong>中文加粗样式</strong>恢复正文</p>","resource_ids":[]}}"#,
+        note.id.as_str()
+    );
+    connection
+        .execute(
+            "INSERT INTO edit_journal (id, note_id, generation, delta_utf8, created_time)
+             VALUES (?1, ?2, 9, ?3, 1)",
+            rusqlite::params!["e".repeat(32), note.id.as_str(), payload],
+        )
+        .expect("seed v1 checkpoint");
+    drop(connection);
+
+    let migrated = Arc::new(LibraryRepository::open(&path).expect("migrate v4 profile"));
+    let durable = migrated
+        .load_note(&note.id)
+        .expect("load migrated durable base")
+        .expect("note exists");
+    assert_eq!(durable.revision, 2);
+    let clock = Arc::new(ManualSaveClock::default());
+    let restored = session(durable, Arc::clone(&migrated), clock, cx);
+    let (title, body) = restored.read_with(cx, |session, session_cx| {
+        (
+            session.title().read(session_cx).text().to_owned(),
+            session.editor().read(session_cx).visible_text(),
+        )
+    });
+    assert_eq!(title, "迁移后中文标题");
+    assert!(body.contains("中文加粗样式"));
+    assert!(body.contains("恢复正文"));
+}
+
 #[test]
 fn stale_timer_generation_cannot_snapshot_a_note_selected_after_its_session() {
     use super::save_coordinator::{SaveCoordinator, SaveWork};
@@ -765,11 +930,7 @@ async fn stale_repository_snapshot_failure_enters_failed_once_without_timer_retr
     );
     append_body_via_entity_input(&active, "本窗口", cx);
     clock.advance(Duration::from_millis(100));
-    active.update(cx, |session, session_cx| {
-        session
-            .poll(session_cx)
-            .expect("journal before external save")
-    });
+    poll_and_drain(&active, cx);
 
     repository
         .flush_snapshot(app_lite_core::SaveNote {
@@ -782,23 +943,14 @@ async fn stale_repository_snapshot_failure_enters_failed_once_without_timer_retr
         })
         .expect("external committed revision");
     clock.advance(Duration::from_millis(400));
-    let error = active.update(cx, |session, session_cx| {
-        session
-            .poll(session_cx)
-            .expect_err("stale snapshot must not escape before recording Failed")
-    });
-    assert!(error.to_string().contains("stale note revision"));
+    poll_and_drain(&active, cx);
     let failed = active.read_with(cx, |session, _| session.save_state());
     assert!(
         matches!(failed, SaveState::Failed(ref message) if message.contains("stale note revision"))
     );
 
     clock.advance(Duration::from_secs(1));
-    active.update(cx, |session, session_cx| {
-        session
-            .poll(session_cx)
-            .expect("a Failed session is stable rather than retrying every tick")
-    });
+    poll_and_drain(&active, cx);
     assert_eq!(
         active.read_with(cx, |session, _| session.save_state()),
         failed
@@ -848,22 +1000,13 @@ async fn unsupported_codec_save_failure_enters_failed_without_writing_a_journal(
     // observer itself. Drive that real boundary so this asserts the terminal
     // failure path rather than an implementation-detail timing shortcut.
     clock.advance(Duration::from_millis(100));
-    let error = active.update(cx, |session, session_cx| {
-        session
-            .poll(session_cx)
-            .expect_err("unsupported native content must fail the scheduled save")
-    });
-    assert!(error.to_string().contains("尚未支持的嵌套级别"));
+    poll_and_drain(&active, cx);
     let state = active.read_with(cx, |session, _| session.save_state());
     assert!(
         matches!(state, SaveState::Failed(ref message) if message.contains("尚未支持的嵌套级别"))
     );
     clock.advance(Duration::from_secs(20));
-    active.update(cx, |session, session_cx| {
-        session
-            .poll(session_cx)
-            .expect("failed codec work must remain terminal until real recovery")
-    });
+    poll_and_drain(&active, cx);
     assert_eq!(
         active.read_with(cx, |session, _| session.save_state()),
         state
@@ -926,17 +1069,9 @@ async fn stale_background_codec_failure_cannot_poison_a_newer_fixed_generation(
     ));
 
     clock.advance(Duration::from_millis(100));
-    active.update(cx, |session, session_cx| {
-        session
-            .poll(session_cx)
-            .expect("journal corrected generation")
-    });
+    poll_and_drain(&active, cx);
     clock.advance(Duration::from_millis(400));
-    active.update(cx, |session, session_cx| {
-        session
-            .poll(session_cx)
-            .expect("snapshot corrected generation")
-    });
+    poll_and_drain(&active, cx);
     assert_eq!(
         active.read_with(cx, |session, _| session.save_state()),
         SaveState::Clean

@@ -327,10 +327,10 @@ fn flush_snapshot_compacts_crash_journal_with_the_next_durable_revision() {
 }
 
 #[test]
-fn journal_writer_token_sequence_and_revision_prevent_cross_window_replay() {
+fn journal_writer_token_owns_the_checkpoint_against_cross_window_replay() {
     // Two retained windows intentionally start their local generation at one.
-    // This catches an implementation that orders a later old-window record by
-    // that local number or replays it over the next snapshot revision.
+    // A late worker from a different window must not delete the checkpoint
+    // that won the SQLite race just because both were based on revision one.
     let profile = tempdir().unwrap();
     let path = profile.path().join("library.sqlite");
     let first = LibraryRepository::open(&path).unwrap();
@@ -358,7 +358,7 @@ fn journal_writer_token_sequence_and_revision_prevent_cross_window_replay() {
         .unwrap()
         .expect("first checkpoint");
 
-    second
+    let ownership_conflict = second
         .append_edit_journal(EditJournalEntry {
             note_id: note.id.clone(),
             expected_revision: note.revision,
@@ -367,13 +367,17 @@ fn journal_writer_token_sequence_and_revision_prevent_cross_window_replay() {
             generation: 1,
             delta_utf8: "second checkpoint".into(),
         })
-        .unwrap();
+        .expect_err("a different retained writer must not replace an owned checkpoint");
+    assert!(
+        ownership_conflict.to_string().contains("writer"),
+        "ownership conflict must be visible rather than silently overwriting"
+    );
     let latest = first
         .latest_edit_journal(&note.id)
         .unwrap()
         .expect("latest checkpoint");
-    assert_eq!(latest.writer_token, "second-window");
-    assert!(latest.sequence > first_checkpoint.sequence);
+    assert_eq!(latest.writer_token, "first-window");
+    assert_eq!(latest.sequence, first_checkpoint.sequence);
     assert_eq!(
         Connection::open(&path)
             .unwrap()

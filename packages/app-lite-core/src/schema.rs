@@ -68,17 +68,9 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
         ("notes", "revision", "INTEGER NOT NULL DEFAULT 1"),
         ("resources", "revision", "INTEGER NOT NULL DEFAULT 1"),
         ("resource_blobs", "revision", "INTEGER NOT NULL DEFAULT 1"),
-        (
-            "edit_journal",
-            "expected_revision",
-            "INTEGER NOT NULL DEFAULT 1",
-        ),
-        ("edit_journal", "writer_token", "TEXT NOT NULL DEFAULT ''"),
-        ("edit_journal", "sequence", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         ensure_column(&transaction, table, column, definition)?;
     }
-    transaction.execute_batch("CREATE TABLE IF NOT EXISTS journal_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), next_sequence INTEGER NOT NULL); INSERT OR IGNORE INTO journal_sequence (id, next_sequence) VALUES (1, 0); UPDATE edit_journal SET sequence = rowid WHERE sequence = 0; UPDATE journal_sequence SET next_sequence = (SELECT COALESCE(MAX(sequence), 0) FROM edit_journal) WHERE id = 1; CREATE INDEX IF NOT EXISTS edit_journal_latest_idx ON edit_journal(note_id, expected_revision, sequence DESC);")?;
     let existing_default: Option<String> = transaction
         .query_row(
             "SELECT id FROM notebooks WHERE is_default = 1 AND deleted_time = 0 ORDER BY id LIMIT 1",
@@ -128,7 +120,7 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     // above. Reapply the journal identity/ordering shape to that replacement
     // before publishing v5, otherwise the first crash checkpoint after an
     // apparently successful upgrade fails at runtime.
-    ensure_edit_journal_v5(&transaction)?;
+    ensure_edit_journal_v5(&transaction, version)?;
     transaction.execute("INSERT OR IGNORE INTO note_revisions (note_id, revision, title, body_html, body_text, created_time) SELECT id, 1, title, body_html, body_text, updated_time FROM notes", [])?;
     transaction.execute("INSERT OR IGNORE INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-bootstrap' FROM notes", [])?;
     transaction.execute_batch("PRAGMA user_version = 5")?;
@@ -238,13 +230,25 @@ fn rebuild_v3_notes(
 /// that may have recreated the table. `v3` does exactly that while rebuilding
 /// notes, so doing this only in the earlier generic pass would leave a profile
 /// claiming schema v5 with the legacy journal shape.
-fn ensure_edit_journal_v5(transaction: &Transaction<'_>) -> Result<(), LibraryError> {
+fn ensure_edit_journal_v5(
+    transaction: &Transaction<'_>,
+    source_version: i64,
+) -> Result<(), LibraryError> {
+    // A v4 row is a version-1 JSON checkpoint that already contains its
+    // exact durable note revision. Detect the old table *before* adding the
+    // v5 DEFAULT 1 column, otherwise every revision-greater-than-one journal
+    // becomes logically invisible to exact-revision recovery.
+    let v4_legacy_shape =
+        source_version == 4 && !column_exists(transaction, "edit_journal", "expected_revision")?;
     for (column, definition) in [
         ("expected_revision", "INTEGER NOT NULL DEFAULT 1"),
         ("writer_token", "TEXT NOT NULL DEFAULT ''"),
         ("sequence", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         ensure_column(transaction, "edit_journal", column, definition)?;
+    }
+    if v4_legacy_shape {
+        backfill_v4_edit_journal(transaction)?;
     }
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS journal_sequence (id INTEGER PRIMARY KEY CHECK(id = 1), next_sequence INTEGER NOT NULL);
@@ -253,6 +257,63 @@ fn ensure_edit_journal_v5(transaction: &Transaction<'_>) -> Result<(), LibraryEr
          UPDATE journal_sequence SET next_sequence = (SELECT COALESCE(MAX(sequence), 0) FROM edit_journal) WHERE id = 1;
          CREATE INDEX IF NOT EXISTS edit_journal_latest_idx ON edit_journal(note_id, expected_revision, sequence DESC);",
     )?;
+    Ok(())
+}
+
+fn backfill_v4_edit_journal(transaction: &Transaction<'_>) -> Result<(), LibraryError> {
+    let mut statement = transaction.prepare(
+        "SELECT id, note_id, delta_utf8
+         FROM edit_journal
+         ORDER BY rowid ASC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (id, row_note_id, delta_utf8) in rows {
+        let payload: serde_json::Value = serde_json::from_str(&delta_utf8)
+            .map_err(|_| LibraryError::InvalidLegacyEditJournal)?;
+        let payload_note_id = payload
+            .get("note_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(LibraryError::InvalidLegacyEditJournal)?;
+        let payload_revision = payload
+            .get("expected_revision")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|revision| *revision > 0)
+            .ok_or(LibraryError::InvalidLegacyEditJournal)?;
+        if payload.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || payload_note_id != row_note_id
+        {
+            return Err(LibraryError::InvalidLegacyEditJournal);
+        }
+        let current_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM notes WHERE id = ?1 AND deleted_time = 0",
+                [row_note_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_revision != Some(payload_revision) {
+            // Refusing the entire migration is intentional. A mismatched
+            // delta cannot be replayed safely and silently skipping it would
+            // discard unsnapshotted user data without any visible notice.
+            return Err(LibraryError::InvalidLegacyEditJournal);
+        }
+        transaction.execute(
+            "UPDATE edit_journal
+             SET expected_revision = ?2, writer_token = ?3
+             WHERE id = ?1",
+            params![id, payload_revision, format!("legacy-v4-{id}")],
+        )?;
+    }
     Ok(())
 }
 

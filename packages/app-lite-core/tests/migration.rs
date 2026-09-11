@@ -1,4 +1,6 @@
-use app_lite_core::{EditJournalEntry, LibraryError, LibraryRepository};
+use app_lite_core::{
+    CanonicalDocument, CreateNote, EditJournalEntry, LibraryError, LibraryRepository, SaveNote,
+};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -150,6 +152,72 @@ fn v4_journal_table_upgrades_before_its_v5_index_is_created() {
         )
         .unwrap();
     assert_eq!(index_exists, 1);
+}
+
+#[test]
+fn v4_legacy_journal_backfills_payload_revision_without_losing_recovery() {
+    // A real v4 journal payload already carries the revision it was computed
+    // from. Adding v5's column with DEFAULT 1 must not make a checkpoint for
+    // a note that has reached revision 2 invisible after restart.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).expect("create release-shaped profile");
+    let created = repository
+        .create_note(CreateNote {
+            title: "迁移前".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("create note");
+    let revised = repository
+        .flush_snapshot(SaveNote {
+            id: created.id.clone(),
+            expected_revision: created.revision,
+            title: "迁移基线".into(),
+            document: CanonicalDocument::default(),
+            resource_ids: Vec::new(),
+            selected_thumbnail_id: None,
+        })
+        .expect("advance durable note to revision two");
+    assert_eq!(revised.revision, 2);
+    drop(repository);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE edit_journal;
+             CREATE TABLE edit_journal (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 note_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 delta_utf8 TEXT NOT NULL,
+                 created_time INTEGER NOT NULL
+             );
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    let payload = format!(
+        r#"{{"version":1,"note_id":"{}","expected_revision":2,"generation":7,"title":"迁移后标题","body_html":"<p><strong>中文样式</strong></p>","resource_ids":[]}}"#,
+        created.id.as_str()
+    );
+    connection
+        .execute(
+            "INSERT INTO edit_journal (id, note_id, generation, delta_utf8, created_time)
+             VALUES (?1, ?2, 7, ?3, 1)",
+            rusqlite::params!["b".repeat(32), created.id.as_str(), payload],
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = LibraryRepository::open(&path).expect("migrate v4 release profile");
+    let recovered = migrated
+        .latest_edit_journal_for_revision(&created.id, Some(2))
+        .expect("read migrated checkpoint")
+        .expect("revision-two legacy checkpoint remains recoverable");
+    assert_eq!(recovered.expected_revision, 2);
+    assert!(!recovered.writer_token.is_empty());
+    assert!(recovered.sequence > 0);
+    assert!(recovered.delta_utf8.contains("中文样式"));
 }
 
 #[test]

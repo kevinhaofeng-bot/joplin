@@ -36,6 +36,20 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShellSaveError {
+    Automatic { generation: i64, message: String },
+    Lifecycle { message: String },
+}
+
+impl ShellSaveError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Automatic { message, .. } | Self::Lifecycle { message } => message,
+        }
+    }
+}
+
 /// The product library shell. All user operations arrive at `apply_action`,
 /// which is also the only place that mutates the model from UI callbacks.
 pub struct LibraryShell {
@@ -45,7 +59,7 @@ pub struct LibraryShell {
     editor_surface: Option<Entity<EditorSurface>>,
     surface_note_id: Option<NoteId>,
     unsupported_document: Option<String>,
-    save_error: Option<String>,
+    save_error: Option<ShellSaveError>,
     /// True only for a lifecycle boundary that has started a background
     /// snapshot. IME/canonical failures stay visible until an explicit
     /// successful boundary, whereas this transient blocker clears on the
@@ -298,7 +312,12 @@ impl LibraryShell {
             // owns marked IME text. `flush_active_session` is the explicit
             // successful boundary that clears this visible warning.
             Ok(()) => {}
-            Err(error) => self.save_error = Some(format!("自动保存失败：{error}")),
+            Err(error) => {
+                self.save_error = Some(ShellSaveError::Automatic {
+                    generation: session.read(cx).save_generation(),
+                    message: format!("自动保存失败：{error}"),
+                });
+            }
         }
         cx.notify();
     }
@@ -364,7 +383,9 @@ impl LibraryShell {
                     session.read(cx).save_state(),
                     SaveState::Journaling | SaveState::Snapshotting
                 );
-                self.save_error = Some(format!("无法在 {reason:?} 前保存当前笔记：{error}"));
+                self.save_error = Some(ShellSaveError::Lifecycle {
+                    message: format!("无法在 {reason:?} 前保存当前笔记：{error}"),
+                });
                 cx.notify();
                 false
             }
@@ -462,12 +483,28 @@ impl LibraryShell {
                     Some(cx.observe(&session, |shell, session, cx| {
                         match session.read(cx).save_state() {
                             SaveState::Failed(error) => {
-                                shell.save_pending = false;
-                                shell.save_error = Some(format!("自动保存失败：{error}"));
+                                let message = format!("自动保存失败：{error}");
+                                if shell.save_pending {
+                                    shell.save_pending = false;
+                                    shell.save_error = Some(ShellSaveError::Lifecycle { message });
+                                } else {
+                                    shell.save_error = Some(ShellSaveError::Automatic {
+                                        generation: session.read(cx).save_generation(),
+                                        message,
+                                    });
+                                }
                             }
                             SaveState::Clean if shell.save_pending => {
                                 shell.save_pending = false;
                                 shell.save_error = None;
+                            }
+                            SaveState::Clean => {
+                                if let Some(ShellSaveError::Automatic { generation, .. }) =
+                                    shell.save_error.as_ref()
+                                    && session.read(cx).save_generation() > *generation
+                                {
+                                    shell.save_error = None;
+                                }
                             }
                             _ => {}
                         }
@@ -1055,7 +1092,7 @@ impl Render for LibraryShell {
                     .text_color(rgba(0xa34838ff))
                     .child(message)
             }))
-            .children(self.save_error.as_ref().map(|message| {
+            .children(self.save_error.as_ref().map(|error| {
                 div()
                     .id("library-save-error")
                     .debug_selector(|| "library-save-error".to_owned())
@@ -1065,7 +1102,7 @@ impl Render for LibraryShell {
                     .max_w(px(520.0))
                     .text_size(px(11.0))
                     .text_color(rgba(0xa34838ff))
-                    .child(message.clone())
+                    .child(error.message().to_owned())
             }))
             .children(self.startup_notice.as_ref().map(|notice| {
                 div()

@@ -241,6 +241,10 @@ pub enum LibraryError {
     LegacyRtfMigrationRequired,
     #[error("stale note revision: expected {expected}, actual {actual}")]
     StaleRevision { expected: i64, actual: i64 },
+    #[error("edit journal is owned by another active writer")]
+    JournalOwnershipConflict,
+    #[error("legacy edit journal payload cannot be recovered safely")]
+    InvalidLegacyEditJournal,
     #[error("could not allocate a unique opaque entity ID")]
     IdCollisionExhausted,
     #[error("library shell state contains invalid pane dimensions")]
@@ -1264,6 +1268,23 @@ impl LibraryRepository {
                 expected: entry.expected_revision,
                 actual: actual_revision,
             });
+        }
+        let existing_writer: Option<String> = transaction
+            .query_row(
+                "SELECT writer_token FROM edit_journal WHERE note_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                [entry.note_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_writer
+            .as_deref()
+            .is_some_and(|writer| writer != entry.writer_token)
+        {
+            // `sequence` records commit order, not semantic capture order.
+            // Once a writer has published this same-base checkpoint, a late
+            // worker from another retained session must fail closed instead
+            // of deleting the newer checkpoint it did not own.
+            return Err(LibraryError::JournalOwnershipConflict);
         }
         let sequence = transaction
             .query_row(

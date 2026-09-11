@@ -16,6 +16,7 @@ getrandom = { version = "0.2", features = ["std"] }
 html5ever = "0.38"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 

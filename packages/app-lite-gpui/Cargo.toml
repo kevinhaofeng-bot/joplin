@@ -120,6 +120,7 @@ gpui = { version = "0.2", features = ["test-support"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "html_reports"] }
 tempfile = "3"
 unicode-segmentation = "1.13"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Cargo auto-discovers each *.rs file in benches/ as its own bench binary.
 # Every Criterion bench needs `harness = false` so Cargo doesn't inject the

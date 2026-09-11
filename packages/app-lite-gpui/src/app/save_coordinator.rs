@@ -95,6 +95,11 @@ pub(crate) struct SaveCoordinator {
     generation: i64,
     dirty_started_at: Option<Duration>,
     last_edit_at: Option<Duration>,
+    /// The first committed edit not yet covered by a readable checkpoint.
+    /// This is deliberately independent from `last_edit_at`: journals are a
+    /// 100ms durability upper bound, whereas settled snapshots are a 500ms
+    /// idle debounce.
+    first_unjournaled_at: Option<Duration>,
     journaled_generation: Option<i64>,
     /// A platform IME owns marked text until it commits or cancels it.  A
     /// timer is allowed to keep its already-captured generation, but it is
@@ -111,6 +116,7 @@ impl SaveCoordinator {
             generation: 0,
             dirty_started_at: None,
             last_edit_at: None,
+            first_unjournaled_at: None,
             journaled_generation: None,
             composing: false,
         }
@@ -128,12 +134,29 @@ impl SaveCoordinator {
         self.generation == generation
     }
 
+    pub(crate) fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    pub(crate) fn needs_journal_deadline(&self) -> bool {
+        self.first_unjournaled_at.is_some()
+            && self.journaled_generation != Some(self.generation)
+            && !self.composing
+    }
+
     pub(crate) fn mark_dirty(&mut self) -> i64 {
         let now = self.clock.now();
         self.generation = self.generation.saturating_add(1).max(1);
         if self.dirty_started_at.is_none() || matches!(self.state, SaveState::Failed(_)) {
             self.dirty_started_at = Some(now);
             self.journaled_generation = None;
+            self.first_unjournaled_at = None;
+        }
+        // Do not turn the readable crash checkpoint into another idle
+        // debounce. Continuous <100ms input must leave the original deadline
+        // intact while replacing only the immutable snapshot that it writes.
+        if self.first_unjournaled_at.is_none() {
+            self.first_unjournaled_at = Some(now);
         }
         self.last_edit_at = Some(now);
         self.state = SaveState::Dirty;
@@ -160,6 +183,7 @@ impl SaveCoordinator {
         self.generation = self.generation.max(generation).max(1);
         self.dirty_started_at = Some(now);
         self.last_edit_at = Some(now);
+        self.first_unjournaled_at = None;
         self.journaled_generation = Some(self.generation);
         self.state = SaveState::Dirty;
     }
@@ -173,7 +197,9 @@ impl SaveCoordinator {
         let dirty_started_at = self.dirty_started_at?;
         let last_edit_at = self.last_edit_at?;
         if self.journaled_generation != Some(generation)
-            && now.saturating_sub(last_edit_at) >= JOURNAL_DELAY
+            && self
+                .first_unjournaled_at
+                .is_some_and(|first_edit| now.saturating_sub(first_edit) >= JOURNAL_DELAY)
         {
             return Some(SaveWork::Journal { generation });
         }
@@ -195,16 +221,6 @@ impl SaveCoordinator {
         {
             return false;
         }
-        // `force_snapshot` reserves the work before calling the executor.
-        // Let that one executor enter its matching reserved state, while a
-        // timer can only reserve from Dirty through `due_work`.
-        if matches!(
-            (self.state.clone(), work),
-            (SaveState::Journaling, SaveWork::Journal { .. })
-                | (SaveState::Snapshotting, SaveWork::Snapshot { .. })
-        ) {
-            return true;
-        }
         if !matches!(self.state, SaveState::Dirty) {
             return false;
         }
@@ -218,8 +234,13 @@ impl SaveCoordinator {
     pub(crate) fn journaled(&mut self, generation: i64) {
         if generation == self.generation {
             self.journaled_generation = Some(generation);
-            self.state = SaveState::Dirty;
+            self.first_unjournaled_at = None;
         }
+        // An older worker can complete after a later input generation was
+        // captured. Its checkpoint is still durable for its base, but it may
+        // never leave the coordinator stuck in Journaling or suppress the
+        // newer generation's pending checkpoint.
+        self.state = SaveState::Dirty;
     }
 
     pub(crate) fn snapshotted(&mut self, generation: i64) {
@@ -227,6 +248,7 @@ impl SaveCoordinator {
             self.state = SaveState::Clean;
             self.dirty_started_at = None;
             self.last_edit_at = None;
+            self.first_unjournaled_at = None;
             self.journaled_generation = None;
         } else {
             self.state = SaveState::Dirty;
@@ -241,10 +263,9 @@ impl SaveCoordinator {
         if self.composing || !matches!(self.state, SaveState::Dirty) {
             return None;
         }
-        let work = SaveWork::Snapshot {
+        Some(SaveWork::Snapshot {
             generation: self.generation,
-        };
-        self.begin(work).then_some(work)
+        })
     }
 }
 

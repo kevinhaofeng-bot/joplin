@@ -744,13 +744,244 @@ async fn mounted_editor_keeps_painting_while_a_slow_background_journal_waits(
 
     release.send(()).expect("release slow background save");
     cx.run_until_parked();
+    let state_after_release = session.read_with(cx, |session, _| session.save_state());
+    let journal_after_release = repository
+        .latest_edit_journal(&note.id)
+        .expect("read journal after release");
+    let durable_after_release = repository
+        .load_note(&note.id)
+        .expect("read note after release")
+        .expect("note after release");
     assert!(
-        repository
-            .latest_edit_journal(&note.id)
-            .expect("read journal")
-            .is_some(),
-        "releasing the worker should complete the retained 100ms checkpoint"
+        journal_after_release.is_some()
+            || (durable_after_release.revision > note.revision
+                && durable_after_release.body_text.contains("后台慢写")),
+        "releasing the worker should complete a durable retained save; state={state_after_release:?}, journal={journal_after_release:?}, durable={durable_after_release:?}"
     );
+}
+
+#[gpui::test]
+async fn mounted_inflight_worker_blocks_switch_delete_close_and_quit_until_completion(
+    cx: &mut TestAppContext,
+) {
+    // Both attempts travel through the mounted lifecycle seam. The second
+    // call used to see `Journaling`, return the old `last_saved`, and let a
+    // close/switch/delete/quit tear down a session whose only durable write
+    // was still stopped in a worker.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "in-flight 生命周期".into(),
+            notebook_id: None,
+            document: rich_document("基线"),
+        })
+        .expect("create note");
+    let other = repository
+        .create_note(CreateNote {
+            title: "目标笔记".into(),
+            notebook_id: None,
+            document: rich_document("另一篇"),
+        })
+        .expect("create alternate note");
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+
+    let session = view.read_with(cx, |shell, _| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .clone()
+    });
+    let release = session.update(cx, |session, _| {
+        session.enable_deadline_tasks_for_test();
+        session.stall_next_background_save_for_test()
+    });
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted editable surface");
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 未完成保存");
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    assert!(matches!(
+        session.read_with(cx, |session, _| session.save_state()),
+        crate::app::save_coordinator::SaveState::Journaling
+    ));
+
+    assert!(
+        !view.update(cx, |shell, shell_cx| {
+            shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx)
+        }),
+        "the first boundary queues an exact snapshot behind the journal"
+    );
+    let editor = session.read_with(cx, |session, _| session.editor().clone());
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            let end = editor.document().flat_utf16_len();
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor,
+                Some(end..end),
+                " 后续 generation",
+                window,
+                editor_cx,
+            );
+        });
+    });
+
+    for _ in 0..2 {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(AppAction::SelectNote(other.id.clone()), window, shell_cx)
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |shell, shell_cx| {
+                shell
+                    .model
+                    .read(shell_cx)
+                    .navigation()
+                    .selected_note_id()
+                    .cloned()
+            }),
+            Some(note.id.clone()),
+            "a repeated switch must not tear down the gated session"
+        );
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(AppAction::TrashSelected, window, shell_cx)
+            });
+        });
+        assert!(
+            repository
+                .load_note(&note.id)
+                .unwrap()
+                .expect("first note")
+                .deleted_time
+                .is_none(),
+            "a repeated delete must stay behind the exact save completion"
+        );
+        for reason in [FlushReason::WindowClose, FlushReason::Quit] {
+            assert!(
+                !view.update(cx, |shell, shell_cx| {
+                    shell.flush_for_lifecycle(reason, shell_cx)
+                }),
+                "{reason:?} must remain blocked until the exact worker completion"
+            );
+        }
+    }
+    assert_eq!(
+        repository
+            .load_note(&note.id)
+            .unwrap()
+            .expect("note")
+            .revision,
+        note.revision,
+        "a blocked lifecycle boundary must not claim the old revision is saved"
+    );
+
+    release.send(()).expect("release worker");
+    cx.run_until_parked();
+    assert!(view.update(cx, |shell, shell_cx| {
+        shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx)
+    }));
+    let completion_confirmed = repository
+        .load_note(&note.id)
+        .unwrap()
+        .expect("completion-confirmed note");
+    assert!(
+        completion_confirmed.body_text.contains("后续 generation"),
+        "the lifecycle barrier must wait for the newest captured generation, not the old journal: {completion_confirmed:?}"
+    );
+}
+
+#[gpui::test]
+async fn mounted_corrected_generation_clears_only_its_automatic_save_error(
+    cx: &mut TestAppContext,
+) {
+    // This is a mounted surface plus the real editor command path: an
+    // unsupported nested list fails its automatic checkpoint, then a user
+    // undo creates a newer valid generation. The old automatic warning must
+    // disappear only after that newer generation has durably snapshotted.
+    use crate::native_editor::commands::{CommandArgument, CommandCatalogue, EditorCommand};
+
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "自动错误恢复".into(),
+            notebook_id: None,
+            document: rich_document("正文"),
+        })
+        .expect("create note");
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .clone()
+    });
+    session.update(cx, |session, _| session.enable_deadline_tasks_for_test());
+    let editor = session.read_with(cx, |session, _| session.editor().clone());
+    editor.update(cx, |editor, editor_cx| {
+        let commands = CommandCatalogue::new();
+        commands
+            .execute(EditorCommand::BulletList, CommandArgument::None, editor)
+            .expect("real list command");
+        commands
+            .execute(EditorCommand::IndentList, CommandArgument::None, editor)
+            .expect("real unsupported nested list command");
+        editor_cx.notify();
+    });
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("library-save-error").is_some(),
+        "the actual codec failure must be visible"
+    );
+
+    editor.update(cx, |editor, editor_cx| {
+        editor.undo().expect("undo unsupported nesting");
+        editor_cx.notify();
+    });
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    clock.advance(Duration::from_millis(400));
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    redraw(cx);
+    redraw(cx);
+
+    let final_state = session.read_with(cx, |session, _| session.save_state());
+    let final_error = view.read_with(cx, |shell, _| shell.save_error.clone());
+    assert!(
+        final_error.is_none(),
+        "a newer successful automatic generation must clear only its own error; state={final_state:?}, error={final_error:?}"
+    );
+    let saved = repository.load_note(&note.id).unwrap().expect("saved note");
+    assert!(saved.body_html.contains("<ul>"));
+    assert_eq!(saved.revision, note.revision + 1);
 }
 
 #[gpui::test]
@@ -824,6 +1055,7 @@ async fn stale_delayed_session_save_cannot_overwrite_the_newly_selected_note(
             .poll(session_cx)
             .expect("delayed A work is contained")
     });
+    cx.run_until_parked();
 
     let saved_first = repository
         .load_note(&first.id)
@@ -867,8 +1099,13 @@ async fn mounted_window_close_flushes_the_current_edit_before_teardown(cx: &mut 
     // like Cmd-W/the titlebar control. `remove_window` is a programmatic
     // teardown primitive and intentionally bypasses that callback.
     assert!(
+        !cx.simulate_close(),
+        "the first platform close must remain blocked while its real background snapshot runs"
+    );
+    cx.run_until_parked();
+    assert!(
         cx.simulate_close(),
-        "successful flush permits the window close"
+        "retrying the platform close after the exact worker completion permits teardown"
     );
 
     let saved = repository
@@ -918,6 +1155,24 @@ async fn mounted_action_boundaries_flush_before_switch_new_manual_sync_and_delet
             shell.apply_action(AppAction::SelectNote(second.id.clone()), window, shell_cx)
         });
     });
+    assert_eq!(
+        view.read_with(cx, |shell, shell_cx| {
+            shell
+                .model
+                .read(shell_cx)
+                .navigation()
+                .selected_note_id()
+                .cloned()
+        }),
+        Some(first.id.clone()),
+        "the first switch click must wait for its retained background flush"
+    );
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(second.id.clone()), window, shell_cx)
+        });
+    });
     redraw(cx);
     assert!(
         repository
@@ -934,6 +1189,24 @@ async fn mounted_action_boundaries_flush_before_switch_new_manual_sync_and_delet
     let create = cx
         .debug_bounds("library-create-note")
         .expect("mounted create action");
+    cx.simulate_click(create.center(), Modifiers::default());
+    assert_eq!(
+        view.read_with(cx, |shell, shell_cx| {
+            shell
+                .model
+                .read(shell_cx)
+                .navigation()
+                .selected_note_id()
+                .cloned()
+        }),
+        Some(second.id.clone()),
+        "the first create click must wait for the active note snapshot"
+    );
+    cx.run_until_parked();
+    redraw(cx);
+    let create = cx
+        .debug_bounds("library-create-note")
+        .expect("mounted create action after save");
     cx.simulate_click(create.center(), Modifiers::default());
     redraw(cx);
     assert!(
@@ -963,6 +1236,12 @@ async fn mounted_action_boundaries_flush_before_switch_new_manual_sync_and_delet
         .debug_bounds("library-sync-current")
         .expect("manual-save action");
     cx.simulate_click(save.center(), Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    let save = cx
+        .debug_bounds("library-sync-current")
+        .expect("manual-save action after background completion");
+    cx.simulate_click(save.center(), Modifiers::default());
     redraw(cx);
     assert!(
         repository
@@ -981,6 +1260,21 @@ async fn mounted_action_boundaries_flush_before_switch_new_manual_sync_and_delet
     let trash = cx
         .debug_bounds("library-trash-selected")
         .expect("mounted trash action");
+    cx.simulate_click(trash.center(), Modifiers::default());
+    assert!(
+        repository
+            .load_note(&created_id)
+            .expect("load retained note while delete saves")
+            .expect("retained row")
+            .deleted_time
+            .is_none(),
+        "the first trash click must not delete before the retained worker completes"
+    );
+    cx.run_until_parked();
+    redraw(cx);
+    let trash = cx
+        .debug_bounds("library-trash-selected")
+        .expect("mounted trash action after save");
     cx.simulate_click(trash.center(), Modifiers::default());
     redraw(cx);
     let deleted = repository
@@ -1036,6 +1330,18 @@ async fn mounted_quit_lifecycle_flushes_the_current_edit_before_the_platform_req
 
     // Native-menu dispatch owns an App callback, not a nested window update.
     // Use the same context here so its root-window handle can be updated.
+    cx.cx
+        .update(|app| crate::library_menu::request_quit_library(app));
+    assert!(
+        !repository
+            .load_note(&note.id)
+            .expect("load while quit is waiting")
+            .expect("note retained")
+            .body_text
+            .contains("已编辑"),
+        "the first quit request must not claim the in-flight snapshot is durable"
+    );
+    cx.run_until_parked();
     cx.cx
         .update(|app| crate::library_menu::request_quit_library(app));
     assert!(
@@ -1114,6 +1420,10 @@ async fn mounted_ime_lifecycle_warning_survives_clean_ticks_until_commit_and_suc
             <EditorCore as EntityInputHandler>::unmark_text(editor, window, editor_cx);
         });
     });
+    assert!(!view.update(cx, |shell, shell_cx| {
+        shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx)
+    }));
+    cx.run_until_parked();
     assert!(view.update(cx, |shell, shell_cx| {
         shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx)
     }));
