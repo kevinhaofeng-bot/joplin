@@ -1,6 +1,6 @@
 # Task 5 格式 Chrome：共享接入证据报告
 
-状态：默认 `LibraryShell` 已接入和 Spike 同一个 `EditorCommandChrome`，本轮只改 UI composition 与 typed picker adapter。Task 5 fresh temporary-profile Release 手工验收已经完成；提交与推送在最终验证通过后执行。
+状态：默认 `LibraryShell` 已接入和 Spike 同一个 `EditorCommandChrome`，本轮只改 UI composition 与 typed picker adapter。Release 截图确认此前启动的是陈旧 local target；当前源码/共享 release 的浅色 route 已补齐，但 Task 5 fresh temporary-profile Release 手工验收**待重新执行**，提交与推送继续禁止。
 
 ## Evernote 源码 → Rust → mutation-sensitive 验证
 
@@ -60,4 +60,4 @@ git diff --check
 # PASS
 ```
 
-Task 5 Step 5 的 fresh temporary-profile Release 人工验收已通过；完整记录见 `task-5-report.md` 的“M1 Release 实机验收”一节。自动测试没有替代该门槛，提交与推送仍须等待本轮最终完整验证通过。
+Task 5 Step 5 的 fresh temporary-profile Release 人工验收待重新执行；完整更正记录见 `task-5-report.md` 的“M1 Release 实机验收”一节。自动测试没有替代该门槛，提交与推送仍须等待新的 shared-target Release 目视验收通过。

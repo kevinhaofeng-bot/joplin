@@ -663,6 +663,105 @@ async fn mounted_default_editor_shell_paints_every_evernote_primary_surface(
 }
 
 #[gpui::test]
+async fn mounted_default_light_route_keeps_every_editor_state_opaque_and_contrasted(
+    cx: &mut TestAppContext,
+) {
+    // This is intentionally a mounted production-style assertion.  The
+    // release regression left the body as a white island while an inherited
+    // transparent right shell exposed macOS's black backing.  It must fail if
+    // any concrete route state stops invoking its opaque surface/text token,
+    // not merely if a source string changes.
+    let (_empty_profile, empty_repository) = repository();
+    let (empty_shell, cx) = mount_shell(empty_repository, cx);
+    redraw(cx);
+    assert!(cx.debug_bounds("library-empty-state").is_some());
+    let empty = empty_shell.read_with(cx, |shell, _| {
+        shell.default_light_route_paint_contract_for_test()
+    });
+    assert!(empty.is_opaque_and_contrasted());
+    assert_eq!(
+        empty.background(LibraryPrimarySurface::EmptyState),
+        Some(EVERNOTE_LIGHT_PRIMARY_SURFACE),
+        "the empty-state background must not inherit the opaque black macOS window backing"
+    );
+
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "浅色正文与标题".into(),
+            notebook_id: None,
+            document: rich_document("正文文本必须与白色编辑面板保持可读对比。"),
+        })
+        .expect("create selected note");
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    assert!(cx.debug_bounds("library-no-selection").is_some());
+    let no_selection = view.read_with(cx, |shell, _| {
+        shell.default_light_route_paint_contract_for_test()
+    });
+    assert!(no_selection.is_opaque_and_contrasted());
+    assert_eq!(
+        no_selection.background(LibraryPrimarySurface::NoSelection),
+        Some(EVERNOTE_LIGHT_PRIMARY_SURFACE),
+        "the no-selection panel must stay opaque before a card is selected"
+    );
+
+    let card = cx
+        .debug_bounds("library-note-card")
+        .expect("mounted note card");
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, app| {
+            shell
+                .model
+                .read(app)
+                .navigation()
+                .selected_note_id()
+                .cloned()
+        }),
+        Some(note.id),
+    );
+    let selected = view.read_with(cx, |shell, app| {
+        (
+            shell.default_light_route_paint_contract_for_test(),
+            shell
+                .command_chrome
+                .as_ref()
+                .expect("selected library note owns the shared Chrome")
+                .read(app)
+                .library_surface_contract_for_test(),
+            shell
+                .editor_surface
+                .as_ref()
+                .expect("selected library note owns its native surface")
+                .read(app)
+                .light_surface_contract_for_test(),
+        )
+    });
+    assert!(selected.0.is_opaque_and_contrasted());
+    assert!(selected.1.is_opaque_and_contrasted());
+    assert!(selected.2.is_opaque_and_contrasted());
+    assert!(
+        selected.2.has_primary_foreground(),
+        "the Library body surface must explicitly request readable primary text rather than inheriting a native-window default"
+    );
+    for surface in [
+        LibraryPrimarySurface::Shell,
+        LibraryPrimarySurface::MainEditor,
+        LibraryPrimarySurface::Toolbar,
+        LibraryPrimarySurface::Title,
+        LibraryPrimarySurface::EditorPane,
+    ] {
+        assert_eq!(
+            selected.0.background(surface),
+            Some(EVERNOTE_LIGHT_PRIMARY_SURFACE),
+            "the selected editor's {surface:?} must use the opaque Evernote primary surface"
+        );
+    }
+}
+
+#[gpui::test]
 async fn mounted_default_route_mounts_the_shared_editor_command_chrome(cx: &mut TestAppContext) {
     let (_profile, repository) = repository();
     repository

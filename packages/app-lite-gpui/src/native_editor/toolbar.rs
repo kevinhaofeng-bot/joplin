@@ -72,6 +72,47 @@ impl EditorCommandChromeHost {
             Self::Library => "library-editor-command-overlay-backdrop",
         }
     }
+
+    /// The default library route is intentionally a light Evernote surface,
+    /// even when the surrounding app has selected a dark document theme.  The
+    /// spike keeps its established transparent chrome so this is not a second
+    /// toolbar implementation or a global theme override.
+    const fn surface_colors(self) -> CommandChromeSurfaceColors {
+        match self {
+            Self::Spike => CommandChromeSurfaceColors {
+                background: 0x00000000,
+                foreground: 0x172033ff,
+                border: 0x00000000,
+            },
+            Self::Library => CommandChromeSurfaceColors {
+                background: 0xffffffff,
+                foreground: 0x141414ff,
+                border: 0xf3f2f1ff,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CommandChromeSurfaceColors {
+    background: u32,
+    foreground: u32,
+    border: u32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EditorCommandChromeSurfaceContract {
+    background: u32,
+    foreground: u32,
+    border: u32,
+}
+
+#[cfg(test)]
+impl EditorCommandChromeSurfaceContract {
+    pub(crate) fn is_opaque_and_contrasted(self) -> bool {
+        self.background == 0xffffffff && self.foreground == 0x141414ff && self.border == 0xf3f2f1ff
+    }
 }
 
 /// A host consumes this typed request with its own platform adapter.  The
@@ -384,6 +425,11 @@ pub struct EditorCommandChrome {
     more_trigger_bounds: Option<Bounds<Pixels>>,
     insert_image_dispatch: Arc<dyn Fn(AnyWindowHandle, &mut App)>,
     _editor_subscription: Subscription,
+    /// Set only by the real Library-host `Div` style arguments during a draw.
+    /// This is per retained Chrome (not global) so mounted tests can prove a
+    /// missing opaque fill without cross-window contamination.
+    #[cfg(test)]
+    library_surface_paint_for_test: EditorCommandChromeSurfaceContract,
 }
 
 impl EventEmitter<EditorCommandChromeEvent> for EditorCommandChrome {}
@@ -418,6 +464,12 @@ impl EditorCommandChrome {
             more_trigger_bounds: None,
             insert_image_dispatch: Arc::new(insert_image_dispatch),
             _editor_subscription: subscription,
+            #[cfg(test)]
+            library_surface_paint_for_test: EditorCommandChromeSurfaceContract {
+                background: 0,
+                foreground: 0,
+                border: 0,
+            },
         }
     }
 
@@ -461,6 +513,38 @@ impl EditorCommandChrome {
     #[cfg(test)]
     pub(crate) fn catalogue_for_test(&self) -> CommandCatalogue {
         self.catalogue
+    }
+
+    #[cfg(test)]
+    pub(crate) fn library_surface_contract_for_test(&self) -> EditorCommandChromeSurfaceContract {
+        self.library_surface_paint_for_test
+    }
+
+    fn library_surface_background_fill(&mut self) -> gpui::Rgba {
+        let colors = self.host.surface_colors();
+        #[cfg(test)]
+        {
+            self.library_surface_paint_for_test.background = colors.background;
+        }
+        rgba(colors.background)
+    }
+
+    fn library_surface_foreground_fill(&mut self) -> gpui::Rgba {
+        let colors = self.host.surface_colors();
+        #[cfg(test)]
+        {
+            self.library_surface_paint_for_test.foreground = colors.foreground;
+        }
+        rgba(colors.foreground)
+    }
+
+    fn library_surface_border_fill(&mut self) -> gpui::Rgba {
+        let colors = self.host.surface_colors();
+        #[cfg(test)]
+        {
+            self.library_surface_paint_for_test.border = colors.border;
+        }
+        rgba(colors.border)
     }
 
     fn selected_link_url(&self, cx: &App) -> String {
@@ -1182,6 +1266,14 @@ impl EditorCommandChrome {
         content_mask: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> EditorCommandChromeRender {
+        #[cfg(test)]
+        {
+            self.library_surface_paint_for_test = EditorCommandChromeSurfaceContract {
+                background: 0,
+                foreground: 0,
+                border: 0,
+            };
+        }
         let placement = toolbar_placement(width);
         let mut primary_buttons = Vec::new();
         let mut previous_group = None;
@@ -1234,6 +1326,22 @@ impl EditorCommandChrome {
             .into_any_element();
         let toolbar_id = self.host.toolbar_id();
         let root_id = self.host.root_id();
+        let mut toolbar_content = div()
+            .id(toolbar_id)
+            .debug_selector(move || toolbar_id.to_owned())
+            .w_full()
+            .h_full()
+            .flex()
+            .items_center()
+            .children(primary_buttons)
+            .child(more_trigger);
+        if self.host == EditorCommandChromeHost::Library {
+            toolbar_content = toolbar_content
+                .bg(self.library_surface_background_fill())
+                .border_b_1()
+                .border_color(self.library_surface_border_fill())
+                .text_color(self.library_surface_foreground_fill());
+        }
         let toolbar = div()
             .id(root_id)
             .debug_selector(move || root_id.to_owned())
@@ -1243,17 +1351,7 @@ impl EditorCommandChrome {
             .flex_none()
             .h(px(44.0))
             .items_center()
-            .child(
-                div()
-                    .id(toolbar_id)
-                    .debug_selector(move || toolbar_id.to_owned())
-                    .w_full()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .children(primary_buttons)
-                    .child(more_trigger),
-            )
+            .child(toolbar_content)
             .into_any_element();
         let mut overlays = Vec::new();
         if self.has_open_overlay() {

@@ -21,6 +21,34 @@ use gpui::{
 };
 use std::sync::Arc;
 
+/// The ordinary library route is a white Evernote primary surface. The canvas
+/// owns its text shaping separately, but its host rectangle must stay opaque
+/// and carry the primary surface stroke rather than exposing the macOS window
+/// backing between title/chrome/body layers.
+const LIGHT_EDITOR_SURFACE_BACKGROUND: u32 = 0xffffffff;
+const LIGHT_EDITOR_SURFACE_BORDER: u32 = 0xf3f2f1ff;
+const LIGHT_EDITOR_SURFACE_FOREGROUND: u32 = 0x141414ff;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EditorSurfaceLightContract {
+    background: u32,
+    border: u32,
+    foreground: u32,
+}
+
+#[cfg(test)]
+impl EditorSurfaceLightContract {
+    pub(crate) fn is_opaque_and_contrasted(self) -> bool {
+        self.background == LIGHT_EDITOR_SURFACE_BACKGROUND
+            && self.border == LIGHT_EDITOR_SURFACE_BORDER
+    }
+
+    pub(crate) fn has_primary_foreground(self) -> bool {
+        self.foreground == LIGHT_EDITOR_SURFACE_FOREGROUND
+    }
+}
+
 macro_rules! bind_selection_action {
     ($surface:ident, $editor:expr, $action:ty, $method:ident) => {{
         let action_editor = $editor.clone();
@@ -117,6 +145,8 @@ pub struct EditorSurface {
     embedded_frame: Option<(f32, f32)>,
     accepts_pointer_input: bool,
     _editor_subscription: Subscription,
+    #[cfg(test)]
+    light_surface_paint_for_test: EditorSurfaceLightContract,
 }
 
 impl EventEmitter<EditorSurfaceEvent> for EditorSurface {}
@@ -162,6 +192,12 @@ impl EditorSurface {
             embedded_frame,
             accepts_pointer_input,
             _editor_subscription: subscription,
+            #[cfg(test)]
+            light_surface_paint_for_test: EditorSurfaceLightContract {
+                background: 0,
+                border: 0,
+                foreground: 0,
+            },
         }
     }
 
@@ -182,6 +218,35 @@ impl EditorSurface {
 
     pub fn set_paint_hooks(&mut self, hooks: EditorSurfaceHooks) {
         self.hooks = hooks;
+    }
+
+    fn light_surface_background(&mut self) -> gpui::Rgba {
+        #[cfg(test)]
+        {
+            self.light_surface_paint_for_test.background = LIGHT_EDITOR_SURFACE_BACKGROUND;
+        }
+        rgba(LIGHT_EDITOR_SURFACE_BACKGROUND)
+    }
+
+    fn light_surface_border(&mut self) -> gpui::Rgba {
+        #[cfg(test)]
+        {
+            self.light_surface_paint_for_test.border = LIGHT_EDITOR_SURFACE_BORDER;
+        }
+        rgba(LIGHT_EDITOR_SURFACE_BORDER)
+    }
+
+    fn light_surface_foreground(&mut self) -> gpui::Rgba {
+        #[cfg(test)]
+        {
+            self.light_surface_paint_for_test.foreground = LIGHT_EDITOR_SURFACE_FOREGROUND;
+        }
+        rgba(LIGHT_EDITOR_SURFACE_FOREGROUND)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn light_surface_contract_for_test(&self) -> EditorSurfaceLightContract {
+        self.light_surface_paint_for_test
     }
 
     fn on_mouse_down(
@@ -303,6 +368,14 @@ impl EditorSurface {
 
 impl Render for EditorSurface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.light_surface_paint_for_test = EditorSurfaceLightContract {
+                background: 0,
+                border: 0,
+                foreground: 0,
+            };
+        }
         let editor = self.editor.clone();
         let measured_height = editor.read(cx).layout().total_height().max(480.0);
         let (content_width, content_height, embedded) = self
@@ -331,7 +404,16 @@ impl Render for EditorSurface {
             .track_focus(editor.read(cx).focus_handle())
             .h(px(content_height))
             .rounded(px(7.0))
-            .bg(rgba(0xffffffff));
+            .bg(self.light_surface_background());
+        // The spike's established embedded canvas owns its surrounding page
+        // chrome. Only the ordinary LibraryShell needs the explicit boundary
+        // between an opaque editor pane and the document surface.
+        if !embedded {
+            surface = surface
+                .border_1()
+                .border_color(self.light_surface_border())
+                .text_color(self.light_surface_foreground());
+        }
         if embedded {
             surface = surface.w(px(content_width));
         } else {

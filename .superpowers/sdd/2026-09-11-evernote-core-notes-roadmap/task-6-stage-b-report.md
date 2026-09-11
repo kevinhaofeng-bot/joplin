@@ -44,3 +44,24 @@
 - `RUSTFLAGS='-Awarnings' cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype -- --skip editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores`：1,169 passed / 0 failed / 1 exact pre-existing donor skip。
 - `cargo check --quiet --manifest-path packages/app-lite-gpui/Cargo.toml --tests`、两个 crate 的 `cargo fmt -- --check`、`git diff --check`：PASS（check 仅有既有 objc macro warning）。
 - 本报告不会把 Task 6 或任何 Release step 标记完成；B1 已独立复审通过，但动画、CRUD/批量操作、shortcut/recent/search 与 Top List 仍明确不在本次范围。
+
+## Release fresh-profile 实机补充（2026-09-12）
+
+这不是 Evernote 行为复刻，而是本产品的发布交付/验收证据。此前黑色 editor
+shell 截图运行的是陈旧 worktree-local `target/release/velotype`；正确的 Cargo
+metadata target 产物已在 fresh profile 上重新验收。以下截图均来自该正确产物：
+
+- `/tmp/joplin-lite-b1-correct-empty.png`：三栏空态，sidebar/list/editor 的右侧主面连续浅色，空态标题和 CTA 可见。
+- `/tmp/joplin-lite-b1-correct-title2.png`、`/tmp/joplin-lite-b1-correct-body.png`：`Release smoke title` 和 `Release body text` 都以深色绘制在白色 title/chrome/body 上，绿色 caret/selection 仍保留。
+- `/tmp/joplin-lite-b1-correct-two-pane.png`、`/tmp/joplin-lite-b1-correct-one-pane.png`、`/tmp/joplin-lite-b1-correct-three.png`：三栏、两栏、一栏之间切换不暴露黑色窗口 backing，格式栏与正文持续可读。
+- `/tmp/joplin-lite-b1-correct-relaunch.png`：重开后 note card、标题和正文仍可见；同次 fresh-profile SQLite 检查确认上述标题/正文精确存在且 `PRAGMA integrity_check` 为 `ok`。
+
+本轮 Release review 的路径回归也已关闭：
+`packages/app-lite-gpui/scripts/create_macos_app_dist.sh` 的
+`MACOS_RESOURCES_DIR="$PROJECT_ROOT/resources/macos"` 是唯一 bundle resource
+authority，`Info.plist` 和 `velotype.icns` 不再依赖 caller cwd。实际从 worktree
+root、`scripts/` 目录、以及带空格的 `CARGO_TARGET_DIR` 三种上下文运行脚本均成功；
+每次均用 `cmp -s` 和 SHA-256 比较 bundle 的
+`Contents/MacOS/velotype` 与该次 Cargo metadata/fresh release binary，结果完全相同，
+且 `plutil -lint` 与 icon presence 都通过。该脚本修复不改变 B1 的 route/query/session
+权威，也不将后续 Task 6 范围标为完成。

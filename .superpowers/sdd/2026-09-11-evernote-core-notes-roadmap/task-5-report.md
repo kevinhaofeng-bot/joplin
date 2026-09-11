@@ -1,12 +1,14 @@
 # Task 5：图片与附件跨层事务 — 实现与证据报告
 
-状态：实现、定向验证、独立 GPUI 全量验证和 fresh-profile Release M1 手工验收均已完成。首次实机显示发现的右侧编辑壳/标题区透出黑底已按 Evernote primary-surface token 修复并在本轮 fresh profile 重验；提交与推送在本报告写回后的最终验证通过后执行。
+状态：实现与定向/全量自动验证完成；fresh-profile Release M1 手工验收**待重新执行**。本轮实机截图发现右侧编辑壳/标题区黑底后，已核实当时运行的是工作树中陈旧的 local `target/release/velotype`，不是 Cargo 当前共享 target 产物。源码、共享 Chrome/body surface 和分发脚本均已修正；在新 `.shared-target/release/velotype` 上重新目视验收前，不得把 Step 5 或发布状态标为完成。
 
 基线：`a91b842da97ee48db2f05e7bf0cacfd6e637a020`。本轮产物仍在共享脏工作树中。Task 5 只实现本地资源导入、持久关系、画布呈现、保存恢复和最小附件卡；没有扩展到 Task 6+ 的组织、搜索、同步或迁移功能。
 
 ## Release 实机回归：编辑壳黑底（2026-09-12）
 
-在 fresh profile 的默认 light route，右侧 editor shell、现有 actions 行和 title 周围原先依赖透明窗口默认值；正文 surface 和左侧列表虽为白色，但 title 的深色文字可透出黑底而不可见。已将整条主编辑样式树显式设为 Evernote primary light surface。本轮 Step 5 完整临时 profile 手工流程已重验空资料库、标题、正文、图片和重启恢复，没有再次出现黑底。
+在 fresh profile 的默认 light route，右侧 editor shell、现有 actions 行和 title 周围会透出黑底；正文 surface 和左侧列表虽为白色，但 title 的深色文字不可见。进程检查证明截图时实际启动的是 `packages/app-lite-gpui/target/release/velotype`（修改时间为前一天 13:04），而仓库 `.cargo/config.toml` 让 Cargo 将新 Release 写到 `/Users/kevinhao/Projects/joplin/.shared-target/release/velotype`。陈旧 local 二进制不含 `library-main-editor-shell` 或 shared Chrome 的当前样式字符串。
+
+生产修复将默认 route 的 shell、主编辑列、actions、title、editor pane、empty/no-selection/unsupported states、shared Library Chrome 和 native body surface 都设为显式不透明 primary surface，并为 title/empty-state 文本使用 Evernote primary/secondary text token；body surface 也有 primary stroke。`scripts/create_macos_app_dist.sh` 现在通过 `cargo metadata` 解析实际 target directory，避免 build 后重新打包陈旧 local binary。自动验证已通过，但完整临时 profile 手工流程必须以新 shared-target Release 重新执行。
 
 ## Brief 勾选表
 
@@ -14,7 +16,7 @@
 - [x] Step 2：图片前后输入、原子选择/删除、undo/redo、IME 相邻、长图/原子 gap 事件路径有 mutation-sensitive 覆盖。
 - [x] Step 3：资源暂存、受保存 Selection 映射的插入、关系/thumbnail/snapshot/outbox 单事务提交、失败回滚/重试和单次投影可见。
 - [x] Step 4：图片 inline；非图片为带文件名、mime、大小、状态和打开动作的 attachment card；字节不进入正文或 GPUI node state。
-- [x] Step 5：M1 Release 手工验收完成。fresh temporary profile 中创建三篇中文笔记，完成截图 paste、Finder JPEG drop、PDF picker、图片前后继续输入、快速切换、进程退出与同 profile 重启；重启后标题、正文和图片首帧恢复，数据库关系与 blob 哈希逐一核验通过。
+- [ ] Step 5：M1 Release 手工验收待重新执行。必须从 `cargo metadata` 指向的 shared-target Release 或修复后的 `.app` 启动全新临时 profile，重新完成三篇中文笔记、截图 paste、Finder JPEG drop、PDF picker、图片边界输入、快速切换与重启；在目视确认右侧 shell/title/chrome/body 全程浅色且可读前不得勾选。
 
 ## Evernote 源码 → Rust 实现 → 突变敏感验证
 
@@ -22,7 +24,7 @@
 
 | Evernote 源码路径、符号与观察行为 | 本产品 Rust 实现 | mutation-sensitive 验证与结果 |
 | --- | --- | --- |
-| `/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/content/commands/exportDesignTokens.generated.ts`：`--colors-grey-100: #fff`；`--color-background-fill-primary` 与 `--color-surface-fill-primary-enabled` 都解析到它。主编辑区不能依赖宿主窗口的透明/外观默认值。 | `packages/app-lite-gpui/src/ui/mod.rs::EVERNOTE_LIGHT_PRIMARY_SURFACE`、`LibraryShell::evernote_primary_surface_fill`，并直接作为 `library-shell`、`library-main-editor-shell`、`library-actions`、`library-note-title`、`library-native-editor-pane` 五个生产 `Div::bg` 的参数。 | `ui::tests::mounted_default_editor_shell_paints_every_evernote_primary_surface` PASS；实际 mount/card-select/redraw 后，结构化 render seam 记录五个 `.bg` 参数均为 `#ffffffff`，并确认五个 selector 都在样式树中。变异证明：临时删除标题 `.bg(...)` 后同一测试 RED 为 `[0xffffffff, 0xffffffff, 0xffffffff, 0, 0xffffffff]`；恢复后 GREEN。 |
+| `/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/content/commands/exportDesignTokens.generated.ts`：`--colors-grey-100: #fff`；`--color-background-fill-primary` 与 `--color-surface-fill-primary-enabled` 都解析到它；`--color-text-fill-primary-enabled` 解析到 `--colors-grey-8: #141414`，primary stroke 解析到 `--colors-grey-95: #f3f2f1`。主编辑区不能依赖宿主窗口的透明/外观默认值。 | `packages/app-lite-gpui/src/ui/mod.rs::{EVERNOTE_LIGHT_PRIMARY_SURFACE,EVERNOTE_LIGHT_PRIMARY_TEXT,EVERNOTE_LIGHT_MUTED_TEXT,EVERNOTE_LIGHT_PRIMARY_STROKE}` 和 `LibraryShell::{evernote_primary_surface_fill,evernote_primary_text_fill,evernote_muted_text_fill}` 作为 shell/main/actions/title/pane 以及 empty/no-selection/unsupported state 的真实样式参数；`native_editor/toolbar.rs::EditorCommandChrome::render_for_host` 给 Library（不改变 Spike）显式 white toolbar/stroke；`native_editor/surface.rs::EditorSurface::render` 给 body surface 显式 white/**#141414 foreground**/stroke。 | `ui::tests::mounted_default_light_route_keeps_every_editor_state_opaque_and_contrasted` PASS：空态、无选择态、已选笔记、共享 Chrome 与 body surface 都经 mount/redraw 读取实际样式调用记录，且 primary/muted text 与 white surface 的对比度达标；body contract 还要求真实调用 #141414 foreground。变异证明：暂时将生产 `EVERNOTE_LIGHT_PRIMARY_SURFACE` 改为 `#000000` 后同一测试 RED；恢复 `#ffffff` 后 GREEN。既有五 surface test 继续 PASS。 |
 | `/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/resource/image/imagecomponent.tsx::useRenderableUrl`：取得 renderable URL 后直接 `setNodeAttribute` 并 `dispatch`；标记 `user-generated=false`、`addToHistory=false`。资源 hash 改变会清旧 URL。`syncNaturalDims` 只在 fully rendered 后写真实 naturalWidth/naturalHeight，同样不进入用户历史。 | `packages/app-lite-gpui/src/app/note_session.rs::drain_image_hydration_requests/start_next_image_hydration/finish_image_hydration/apply_pending_legacy_image_repairs`；`native_editor/core.rs::request_image_hydration/repair_legacy_image_natural_sizes`；`native_editor/codec.rs::import_canonical_with_resources/export_canonical_with_resources`。持久格式已有尺寸的 hydration 只注册 source、不改 geometry；legacy `natural_size_known=false` 保留稳定 1024×768 fallback，成功可见 hydration 才作无 history 真实尺寸 repair。 | `mounted_persisted_images_paint_before_only_visible_blob_hydrates`、`visible_legacy_image_repairs_its_geometry_once_then_reopens_without_layout_jump`、`offscreen_legacy_image_keeps_unknown_geometry_until_visible_repair`、`task_four_codec_round_trips_every_structural_block_and_mark` 均 PASS。最后一项会杀死 `None` 跨 codec 的保留；offscreen 组合测试覆盖“普通文字保存/reopen 仍 None，首可见 decode 后才变真实竖图尺寸”。 |
 | 同文件 `ImageView`：node attrs/resource 是渲染源；loading/loaded 分支切换时重新挂 `ResizeObserver`，保留图片区空间以避免跳变。 | `native_editor/render.rs::shape_visible` 和 `layout.rs::image_layout_size` 按文档持久 presentation 先画 placeholder extent；`images.rs::ImageStore`/`BudgetedImageCache` 只为 current resident materialize/decode。 | `mounted_picker_completion_immediately_updates_surface_cache_and_selected_card` 断言当前 frame 的 block、extent、cache 与 projection 同时变化；`mounted_persisted_images_paint_before_only_visible_blob_hydrates` 断言首帧可画且非可见原图不读；`hydration_scroll_coalesces_queued_work_to_the_latest_resident_image` 断言 active + latest resident 有界。均 PASS。 |
 | `/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/clipboard/plugin.ts::state.apply`：保存完整 Selection 并持续映射；`.../modules/clipboard/commands/paste.ts::execCommand`：收集多表示、解析/transform/normalize 后，以一次 replace/dispatch 结束。 | `app/note_session.rs::capture_resource_insert_intent/capture_resource_insert_intent_at/start_staged_resource_commit/finish_resource_commit` 保存 note identity、完整 directional Selection 和编辑 mutation mapping；`ui/mod.rs::complete_resource_picker_path/paste_resource_or_text` 与 picker/paste/drop 复用这条路径。 | `pending_resource_anchor` 系列、`mounted_finder_drop_completion_queues_through_the_same_saved_point_fence`、`mounted_resource_commit_keeps_live_typing_while_the_sqlite_worker_is_gated`、`mounted_resource_commit_failure_at_default_right_caret_retries_without_losing_suffix_text` 均 PASS。覆盖 prefix insert/delete、selection replacement、节点删除/会话不匹配、后台期间继续中文输入与 retry。 |
@@ -48,17 +50,16 @@
 - 30 MiB native candidate 总预算、10 MiB inline image 上限、active + latest-resident hydration queue、0700/0600 private materialization：独立低内存/私密笔记安全策略。它们的正确性由上述 worker、queue 和 mode 测试验证。
 - canonical `selected_thumbnail_id` 作为事务 outcome 并在同一 frame 更新 card projection：独立的本地 repository/UI contract；不把 thumbnail 解释为编辑器 reload 的副作用。
 
-## M1 Release 实机验收（2026-09-12）
+## M1 Release 实机验收（2026-09-12，待重新执行）
 
-验收使用新编译的 Release 二进制 `/Users/kevinhao/Projects/joplin/.shared-target/release/velotype` 和全新临时 profile `/tmp/joplin-lite-m1-profile.7zu18l`，没有复用开发资料库。实际完成并观察到：
+此前记录的 fresh-profile 通过结论不再作为 Release 证据：04:56 的三张实机截图对应 PID 96389，命令为工作树相对路径 `packages/app-lite-gpui/target/release/velotype`；该文件修改时间为前一天 13:04，且 `strings` 不含当前 `library-main-editor-shell` 或 `library-editor-command-toolbar`。Cargo metadata 的实际 `target_directory` 是 `/Users/kevinhao/Projects/joplin/.shared-target`，并且修复后的分发脚本已经从该目录取 binary。
 
-- 空资料库默认 light route 为完整白色主 surface；新建三篇笔记后，标题分别为“第一篇中文笔记”“第二篇中文笔记”“第三篇多媒体验收”，标题和正文作为不同输入区即时保存。
-- 在第三篇笔记正文先输入中文，随后从 macOS 剪贴板粘贴 PNG；图片在当前编辑区同一轮立即显示，不需要切换笔记。图片后继续输入“图片后面的文字也能稳定输入，不闪跳。”，文字即时显示，未观察到交替帧跳动。
-- 从 Finder 将带 EXIF 方向的 JPEG 拖到编辑区，图片即时显示；通过原生 picker 选择 PDF。提交后 canonical `body_html` 顺序为首段、PNG、后续中文、JPEG、PDF attachment、尾段，`note_resources.position` 为 `0,1,2`。
-- 以约 150 ms 间隔在三张笔记卡间往返六次，回到多媒体笔记时首张图片立即出现；退出 Release 进程后用同一 profile 重启，默认恢复上次选中的第一篇笔记，再点回第三篇时标题、正文和首张图片立即恢复。
-- SQLite `PRAGMA integrity_check` 返回 `ok`。三篇笔记 revision 为 `4/3/7`；资源表和关系表均为 3 条。PNG、JPEG、PDF 的存储 blob SHA-256 分别为 `a65c3b0a3fb42a04f8c7232a556d9b7b8dbe4ba515766c6e00cb21d08eff840e`、`11a8c656ba8c3cd2b4d1bd349c254b3ea197d6550e3a62046a80987dbc8cb0f9`、`b0d6283e9330ac99ed1765b244713a7f10a393572017674a067baf7d519c5b0e`，逐一等于源文件哈希。
+重新验收必须以新的绝对 profile 和以下二者之一启动：
 
-这组手工证据闭合的是 Task 5/M1 日用纵切；它不宣称 Task 6–10 的组织、搜索、迁移、NAS 同步和最终性能打磨已经完成。
+- `/Users/kevinhao/Projects/joplin/.shared-target/release/velotype`；或
+- 运行修复后的 `packages/app-lite-gpui/scripts/create_macos_app_dist.sh` 生成的 `.app`。
+
+目视门槛：空态、无选择态和已选笔记三种状态中，`library-main-editor-shell`、actions、title、shared Chrome、正文周围都为连续浅色 primary surface；标题和正文文本可见，绿色 caret/selection/CTA 仍保留。随后才执行三篇中文笔记、PNG paste、JPEG Finder drop、PDF picker、图片前后输入、快速切换、退出/重开及 SQLite/hash 核验。完成前，本报告不声称 Step 5/M1 已闭合。
 
 ## 已执行验证
 
@@ -84,19 +85,31 @@ git diff --check
 # PASS
 ```
 
-Step 5 的 fresh-profile Release 人工流程已按上节完成；最终提交仍以本轮重新执行的 core、GPUI、Release build、fmt 和 diff 检查全部通过为门槛。
+Step 5 的 fresh-profile Release 人工流程尚未因本次黑底回归重新完成；最终提交仍以重新执行的 core、GPUI、Release build、fmt、diff 和上节实机门槛全部通过为前提。
 
 黑底修复后的额外定向验证：
 
 ```text
 RUSTFLAGS='-Awarnings' cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml \
   ui::tests::mounted_default_editor_shell_paints_every_evernote_primary_surface -- --exact --nocapture
-# PASS；并已用临时删除标题生产 .bg(...) 的 mutation run 观察到预期 RED
+# PASS
+
+RUSTFLAGS='-Awarnings' cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml \
+  ui::tests::mounted_default_light_route_keeps_every_editor_state_opaque_and_contrasted -- --exact --nocapture
+# PASS；空态、无选择、选中 note、shared Chrome、body surface 的实际样式调用均可读。
+# 将生产 primary-surface token 临时改为 #000000 后此测试 RED；恢复 #ffffff 后 GREEN。
+
+bash -n packages/app-lite-gpui/scripts/create_macos_app_dist.sh
+cargo metadata --manifest-path packages/app-lite-gpui/Cargo.toml --no-deps --format-version 1
+# PASS；脚本解析的 target directory 为 /Users/kevinhao/Projects/joplin/.shared-target，
+# 不再从陈旧 packages/app-lite-gpui/target/release 复制 binary。
 
 RUSTFLAGS='-Awarnings' cargo test --quiet --manifest-path packages/app-lite-gpui/Cargo.toml \
   ui::tests::mounted_card_click_reaches_the_same_shell_action_reducer -- --exact --nocapture
 # PASS
 ```
+
+本次修复后又以当前共享工作树复跑：`ui::tests` 53/53、`app::tests` 72/72、GPUI bin exact-donor-skip 1,170/0/1；`cargo check --tests`、两 crate 的 `cargo fmt -- --check`、`git diff --check` 与 `RUSTFLAGS='-Awarnings' cargo build --release --manifest-path packages/app-lite-gpui/Cargo.toml` 均 PASS。Release binary 已确认写入 Cargo metadata 的 `/Users/kevinhao/Projects/joplin/.shared-target/release/velotype`，并包含 `library-main-editor-shell` 和 `library-editor-command-toolbar`；这仍不替代下节规定的人工验收。
 
 ## 默认资料库共享格式 Chrome（2026-09-12）
 
@@ -114,4 +127,4 @@ RUSTFLAGS='-Awarnings' cargo test --quiet --manifest-path packages/app-lite-gpui
 
 本检查点随后运行完整 GPUI bin suite（仅跳过记录在案、未改动的 donor `editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores`）：**1,159 passed / 0 failed / 1 filtered**；`cargo check --tests`、两 crate 的 `cargo fmt -- --check` 和 `git diff --check` 均 PASS。
 
-本节只记录自动化接线证据；Task 5 Brief Step 5 另由上面的 fresh temporary-profile Release 实机流程闭合，没有用绿色测试替代人工门槛。
+本节只记录自动化接线证据；Task 5 Brief Step 5 仍由上面的 fresh temporary-profile Release 实机流程闭合，当前状态为待重新验收，不能用绿色测试替代。

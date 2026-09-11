@@ -81,14 +81,26 @@ const MAX_QUEUED_RESOURCE_INSERTS: usize = 1;
 /// background may be transparent or use a system appearance, so the editor
 /// shell must not inherit it accidentally.
 const EVERNOTE_LIGHT_PRIMARY_SURFACE: u32 = 0xffffffff;
+/// `--color-text-fill-primary-enabled` resolves to `--colors-grey-8` in the
+/// same exported Evernote token sheet.  Keeping title and empty-state text on
+/// this explicit token prevents a dark host appearance from turning text into
+/// an implicit, low-contrast default.
+const EVERNOTE_LIGHT_PRIMARY_TEXT: u32 = 0x141414ff;
+/// Evernote's secondary text color is based on `--colors-grey-40`.
+const EVERNOTE_LIGHT_MUTED_TEXT: u32 = 0x696564ff;
+/// `--color-surface-stroke-primary-enabled` resolves to `--colors-grey-95`.
+const EVERNOTE_LIGHT_PRIMARY_STROKE: u32 = 0xf3f2f1ff;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum LibraryPrimarySurface {
     Shell,
     MainEditor,
     Toolbar,
     Title,
     EditorPane,
+    EmptyState,
+    UnsupportedDocument,
+    NoSelection,
 }
 
 impl LibraryPrimarySurface {
@@ -100,6 +112,9 @@ impl LibraryPrimarySurface {
             Self::Toolbar => 2,
             Self::Title => 3,
             Self::EditorPane => 4,
+            Self::EmptyState => 5,
+            Self::UnsupportedDocument => 6,
+            Self::NoSelection => 7,
         }
     }
 }
@@ -201,7 +216,70 @@ struct LibrarySurfacePaintHooks {
     /// Filled only by the production `Div::bg` argument expressions for the
     /// default-route shell. This lets the mounted regression test observe the
     /// actual structured style path rather than grep source text.
-    primary_surface_fills: [AtomicU32; 5],
+    primary_surface_fills: [AtomicU32; 8],
+    primary_text: AtomicU32,
+    muted_text: AtomicU32,
+    primary_stroke: AtomicU32,
+}
+
+/// A structured, mounted-view record of the actual default-library palette
+/// expressions. It deliberately observes production `Div::bg`/`text_color`
+/// calls, so a missing fill or a black-on-black regression cannot be hidden by
+/// an otherwise present debug selector.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct DefaultLightRoutePaintContract {
+    backgrounds: [u32; 8],
+    primary_text: u32,
+    muted_text: u32,
+    primary_stroke: u32,
+}
+
+#[cfg(test)]
+impl DefaultLightRoutePaintContract {
+    fn background(&self, surface: LibraryPrimarySurface) -> Option<u32> {
+        let value = self.backgrounds[surface.index()];
+        (value != 0).then_some(value)
+    }
+
+    pub(crate) fn is_opaque_and_contrasted(&self) -> bool {
+        let backgrounds_are_opaque_primary = self
+            .backgrounds
+            .iter()
+            .filter(|background| **background != 0)
+            .all(|background| {
+                *background == EVERNOTE_LIGHT_PRIMARY_SURFACE && (*background & 0xff) == 0xff
+            });
+        let text_is_legible = [self.primary_text, self.muted_text]
+            .into_iter()
+            .filter(|text| *text != 0)
+            .all(|text| contrast_ratio(EVERNOTE_LIGHT_PRIMARY_SURFACE, text) >= 4.5);
+        backgrounds_are_opaque_primary
+            && text_is_legible
+            && self.primary_stroke == EVERNOTE_LIGHT_PRIMARY_STROKE
+    }
+}
+
+#[cfg(test)]
+fn contrast_ratio(background: u32, foreground: u32) -> f32 {
+    fn channel_luminance(channel: u8) -> f32 {
+        let normalized = f32::from(channel) / 255.0;
+        if normalized <= 0.04045 {
+            normalized / 12.92
+        } else {
+            ((normalized + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    fn luminance(color: u32) -> f32 {
+        let [red, green, blue, _] = color.to_be_bytes();
+        0.2126 * channel_luminance(red)
+            + 0.7152 * channel_luminance(green)
+            + 0.0722 * channel_luminance(blue)
+    }
+
+    let light = luminance(background).max(luminance(foreground));
+    let dark = luminance(background).min(luminance(foreground));
+    (light + 0.05) / (dark + 0.05)
 }
 
 /// A per-mounted-shell observation of GPUI's actual sidebar uniform-list
@@ -352,6 +430,30 @@ impl LibraryShell {
         #[cfg(not(test))]
         let _ = surface;
         rgba(EVERNOTE_LIGHT_PRIMARY_SURFACE)
+    }
+
+    fn evernote_primary_text_fill(&self) -> gpui::Rgba {
+        #[cfg(test)]
+        self.library_surface_paint_hooks_for_test
+            .primary_text
+            .store(EVERNOTE_LIGHT_PRIMARY_TEXT, Ordering::Relaxed);
+        rgba(EVERNOTE_LIGHT_PRIMARY_TEXT)
+    }
+
+    fn evernote_muted_text_fill(&self) -> gpui::Rgba {
+        #[cfg(test)]
+        self.library_surface_paint_hooks_for_test
+            .muted_text
+            .store(EVERNOTE_LIGHT_MUTED_TEXT, Ordering::Relaxed);
+        rgba(EVERNOTE_LIGHT_MUTED_TEXT)
+    }
+
+    fn evernote_primary_stroke(&self) -> gpui::Rgba {
+        #[cfg(test)]
+        self.library_surface_paint_hooks_for_test
+            .primary_stroke
+            .store(EVERNOTE_LIGHT_PRIMARY_STROKE, Ordering::Relaxed);
+        rgba(EVERNOTE_LIGHT_PRIMARY_STROKE)
     }
 
     fn new(
@@ -608,6 +710,31 @@ impl LibraryShell {
                 .primary_surface_fills[index]
                 .load(Ordering::Relaxed)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn default_light_route_paint_contract_for_test(
+        &self,
+    ) -> DefaultLightRoutePaintContract {
+        DefaultLightRoutePaintContract {
+            backgrounds: std::array::from_fn(|index| {
+                self.library_surface_paint_hooks_for_test
+                    .primary_surface_fills[index]
+                    .load(Ordering::Relaxed)
+            }),
+            primary_text: self
+                .library_surface_paint_hooks_for_test
+                .primary_text
+                .load(Ordering::Relaxed),
+            muted_text: self
+                .library_surface_paint_hooks_for_test
+                .muted_text
+                .load(Ordering::Relaxed),
+            primary_stroke: self
+                .library_surface_paint_hooks_for_test
+                .primary_stroke
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Test-only platform handoff.  It enters the same classifier and saved
@@ -1635,6 +1762,7 @@ impl LibraryShell {
     fn render_note_title(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let session = self.note_session.as_ref()?.clone();
         let title = session.read_with(cx, |session, _| session.title().clone());
+        let title_text_color = self.evernote_primary_text_fill();
         let paint_title = title.clone();
         let canvas_title = title.clone();
         let canvas = canvas(
@@ -1659,7 +1787,7 @@ impl LibraryShell {
                     &[TextRun {
                         len: entity.read(cx).text().len(),
                         font,
-                        color: rgba(0x172033ff).into(),
+                        color: title_text_color.into(),
                         background_color: None,
                         underline: None,
                         strikethrough: None,
@@ -1714,6 +1842,9 @@ impl LibraryShell {
                 .mb(px(8.0))
                 .h(px(40.0))
                 .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::Title))
+                .border_b_1()
+                .border_color(self.evernote_primary_stroke())
+                .text_color(self.evernote_primary_text_fill())
                 .key_context("LibraryNoteTitle")
                 .track_focus(title.read(cx).focus_handle())
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_title_mouse_down))
@@ -1915,16 +2046,19 @@ impl LibraryShell {
             return LibraryEditorRender::plain(
                 div()
                     .id("library-empty-state")
+                    .debug_selector(|| "library-empty-state".to_owned())
                     .flex_1()
                     .flex()
                     .flex_col()
                     .items_center()
                     .justify_center()
                     .gap(px(14.0))
+                    .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::EmptyState))
+                    .text_color(self.evernote_primary_text_fill())
                     .child(div().text_size(px(22.0)).child("从第一篇笔记开始"))
                     .child(
                         div()
-                            .text_color(rgba(0x718075ff))
+                            .text_color(self.evernote_muted_text_fill())
                             .child("资料库为空，所有内容都将保存在此设备。"),
                     )
                     .child(
@@ -1956,6 +2090,9 @@ impl LibraryShell {
                     .debug_selector(|| "unsupported-native-document".to_owned())
                     .flex_1()
                     .p(px(36.0))
+                    .bg(self
+                        .evernote_primary_surface_fill(LibraryPrimarySurface::UnsupportedDocument))
+                    .text_color(self.evernote_primary_text_fill())
                     .child(div().text_size(px(24.0)).child(title))
                     .child(
                         div()
@@ -1995,6 +2132,7 @@ impl LibraryShell {
                     .flex()
                     .flex_col()
                     .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::EditorPane))
+                    .text_color(self.evernote_primary_text_fill())
                     .can_drop(|dragged, _window, _cx| dragged.is::<ExternalPaths>())
                     .on_drag_move::<ExternalPaths>(cx.listener(Self::on_external_paths_drag_move))
                     .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
@@ -2008,9 +2146,11 @@ impl LibraryShell {
         LibraryEditorRender::plain(
             div()
                 .id("library-no-selection")
+                .debug_selector(|| "library-no-selection".to_owned())
                 .flex_1()
                 .p(px(36.0))
-                .text_color(rgba(0x718075ff))
+                .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::NoSelection))
+                .text_color(self.evernote_muted_text_fill())
                 .child("选择一篇笔记以查看正文")
                 .into_any_element(),
         )
@@ -2085,11 +2225,22 @@ fn cleanup_owned_temporary_paths(paths: &[PathBuf]) {
 impl Render for LibraryShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
-        for fill in &self
-            .library_surface_paint_hooks_for_test
-            .primary_surface_fills
         {
-            fill.store(0, Ordering::Relaxed);
+            for fill in &self
+                .library_surface_paint_hooks_for_test
+                .primary_surface_fills
+            {
+                fill.store(0, Ordering::Relaxed);
+            }
+            self.library_surface_paint_hooks_for_test
+                .primary_text
+                .store(0, Ordering::Relaxed);
+            self.library_surface_paint_hooks_for_test
+                .muted_text
+                .store(0, Ordering::Relaxed);
+            self.library_surface_paint_hooks_for_test
+                .primary_stroke
+                .store(0, Ordering::Relaxed);
         }
         let (items, selected, panes, status, mode, sort, active_note, navigation_index, route) =
             self.model.read_with(cx, |model, _| {
@@ -2179,8 +2330,9 @@ impl Render for LibraryShell {
             .gap(px(8.0))
             .px(px(12.0))
             .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::Toolbar))
+            .text_color(self.evernote_primary_text_fill())
             .border_b_1()
-            .border_color(rgba(0xe1e5e1ff))
+            .border_color(self.evernote_primary_stroke())
             .children([
                 library_resource_picker_button(cx),
                 library_action_button(
@@ -2256,6 +2408,7 @@ impl Render for LibraryShell {
                     .flex()
                     .flex_col()
                     .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::MainEditor))
+                    .text_color(self.evernote_primary_text_fill())
                     .child(toolbar)
                     .child(editor_pane),
             );
