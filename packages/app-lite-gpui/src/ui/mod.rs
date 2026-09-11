@@ -467,7 +467,9 @@ impl LibraryShell {
             return;
         };
         let repository = self.model.read_with(cx, |model, _| model.repository());
-        match NoteSession::prepare(note, repository.as_ref()) {
+        match NoteSession::prepare(note, repository.as_ref())
+            .and_then(|prepared| prepared.claim_recovery_ownership(repository.as_ref()))
+        {
             Ok(prepared) => {
                 let save_clock = Arc::clone(&self.save_clock);
                 let session = cx.new(move |session_cx| {

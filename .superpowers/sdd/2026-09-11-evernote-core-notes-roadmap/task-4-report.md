@@ -215,3 +215,42 @@ Broad verification after repair commit `8f6debc032059c4cfdee61ae5f3f0a2a4edb36b1
   diagnostics were emitted (texture 26,361,856, layout 1,009,056, undo 3,822,
   transaction p95 31 us, render-commit p95 9,169 us).
 - `cargo fmt --check` for core and GPUI plus `git diff --check` — **PASS**.
+
+## Independent review repair round 3 — 2026-09-11
+
+This narrow follow-up closes the recovered-journal writer ownership gap without
+adding resource, import, or Task 5 work.
+
+- **T4-R3-I1:** `PreparedNoteSession` now retains the validated crashed writer
+  token and its exact base revision. Before any entity is constructed, it
+  produces a fresh retained token and calls the core-owned
+  `claim_edit_journal_ownership` transaction. That `BEGIN IMMEDIATE` CAS
+  requires the exact old `(note_id, revision, writer_token)`, then changes the
+  database owner and compact payload owner together while retaining sequence
+  and generation. `ClaimedPreparedNoteSession` is a consumed type boundary:
+  `from_prepared` cannot mount recovered content without the successful claim.
+  A claim conflict becomes the existing visible document/session error rather
+  than a superficially editable session that will fail at its 100 ms deadline.
+- A v2 checkpoint is re-encoded with its new owner during claim; the migrated
+  v4 version-1 payload follows the same path, turning its deterministic
+  `legacy-v4-*` owner into a coherent v2 owner before continued input.
+- The existing append CAS still rejects the former pre-crash writer after the
+  transfer, so a delayed worker cannot reclaim the checkpoint.
+
+Three new mutation-sensitive tests and one strengthened v4 end-to-end test
+cover the repair:
+
+- `recovered_checkpoint_claim_is_atomic_and_rejects_the_crashed_writer`
+- `recovered_checkpoint_can_journal_new_chinese_input_then_snapshot_and_restart_exactly`
+- `two_recovery_candidates_can_claim_one_checkpoint_and_old_writer_cannot_retake_it`
+- strengthened `v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_content`
+  now continues real title/body input through 100 ms journal, 500 ms snapshot,
+  journal compaction, and a second exact restart.
+
+Targeted verification:
+
+- `cargo test --no-fail-fast` in `packages/app-lite-core` — **PASS, 78 tests**.
+- `cargo test app::note_session_tests:: -- --nocapture` in
+  `packages/app-lite-gpui` — **PASS, 19 tests**.
+- `cargo test ui::tests:: -- --nocapture` in `packages/app-lite-gpui` —
+  **PASS, 28 tests**.

@@ -435,3 +435,83 @@ fn journal_writer_token_owns_the_checkpoint_against_cross_window_replay() {
             .is_none()
     );
 }
+
+#[test]
+fn recovered_checkpoint_claim_is_atomic_and_rejects_the_crashed_writer() {
+    // Both restart candidates read the same crashed owner before either takes
+    // it over. Only the first exact old-token CAS may win; the former writer
+    // must not append over that winner after it wakes up.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let first = LibraryRepository::open(&path).unwrap();
+    let second = LibraryRepository::open(&path).unwrap();
+    let note = first
+        .create_note(CreateNote {
+            title: "recovery ownership".into(),
+            notebook_id: None,
+            document: document("base"),
+        })
+        .unwrap();
+    first
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: "crashed-writer".into(),
+            sequence: 0,
+            generation: 7,
+            delta_utf8: r#"{"writer_token":"crashed-writer","body":"checkpoint"}"#.into(),
+        })
+        .unwrap();
+
+    first
+        .claim_edit_journal_ownership(
+            &note.id,
+            note.revision,
+            "crashed-writer",
+            "recovered-a",
+            r#"{"writer_token":"recovered-a","body":"checkpoint"}"#,
+        )
+        .expect("the first restart candidate claims the crashed checkpoint");
+    let losing_claim = second
+        .claim_edit_journal_ownership(
+            &note.id,
+            note.revision,
+            "crashed-writer",
+            "recovered-b",
+            r#"{"writer_token":"recovered-b","body":"checkpoint"}"#,
+        )
+        .expect_err("a concurrent restart cannot claim an already-transferred owner");
+    assert!(matches!(
+        losing_claim,
+        app_lite_core::LibraryError::JournalOwnershipConflict
+    ));
+    let winner = first
+        .latest_edit_journal(&note.id)
+        .unwrap()
+        .expect("claimed checkpoint remains");
+    assert_eq!(winner.writer_token, "recovered-a");
+    assert!(winner.delta_utf8.contains("recovered-a"));
+
+    let old_writer = second
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: "crashed-writer".into(),
+            sequence: 0,
+            generation: 8,
+            delta_utf8: r#"{"writer_token":"crashed-writer","body":"late old"}"#.into(),
+        })
+        .expect_err("the pre-crash writer cannot reclaim the transferred checkpoint");
+    assert!(matches!(
+        old_writer,
+        app_lite_core::LibraryError::JournalOwnershipConflict
+    ));
+    assert_eq!(
+        first
+            .latest_edit_journal(&note.id)
+            .unwrap()
+            .expect("winner stays durable")
+            .writer_token,
+        "recovered-a"
+    );
+}

@@ -1312,6 +1312,77 @@ impl LibraryRepository {
         Ok(())
     }
 
+    /// Transfers one recovered crash checkpoint to a fresh retained-session
+    /// owner. The checkpoint payload embeds its owner too, so both the SQL
+    /// column and JSON must be replaced by the same exact-old-token CAS.
+    ///
+    /// This intentionally preserves the checkpoint's durable sequence and
+    /// generation: taking over after a process crash is not a new semantic
+    /// edit, and must not let a delayed former writer reorder recovery.
+    pub fn claim_edit_journal_ownership(
+        &self,
+        note_id: &NoteId,
+        expected_revision: i64,
+        previous_writer_token: &str,
+        writer_token: &str,
+        delta_utf8: &str,
+    ) -> Result<(), LibraryError> {
+        if expected_revision < 1
+            || previous_writer_token.is_empty()
+            || writer_token.is_empty()
+            || previous_writer_token == writer_token
+            || delta_utf8.is_empty()
+        {
+            return Err(LibraryError::InvalidSnapshot);
+        }
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        // The read and token transfer share one IMMEDIATE transaction. Two
+        // restart candidates that read a crashed row before either transfer
+        // it can therefore have only one winner, and a late pre-crash worker
+        // remains unable to append with its former token.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM notes WHERE id = ?1 AND deleted_time = 0",
+                [note_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let actual_revision = actual_revision.ok_or(LibraryError::NotFound)?;
+        if actual_revision != expected_revision {
+            return Err(LibraryError::StaleRevision {
+                expected: expected_revision,
+                actual: actual_revision,
+            });
+        }
+        let checkpoint_id: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM edit_journal
+                 WHERE note_id = ?1 AND expected_revision = ?2 AND writer_token = ?3
+                 ORDER BY sequence DESC LIMIT 1",
+                params![note_id.as_str(), expected_revision, previous_writer_token],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let checkpoint_id = checkpoint_id.ok_or(LibraryError::JournalOwnershipConflict)?;
+        let changed = transaction.execute(
+            "UPDATE edit_journal
+             SET writer_token = ?2, delta_utf8 = ?3
+             WHERE id = ?1 AND writer_token = ?4",
+            params![
+                checkpoint_id,
+                writer_token,
+                delta_utf8,
+                previous_writer_token
+            ],
+        )?;
+        if changed != 1 {
+            return Err(LibraryError::JournalOwnershipConflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Returns the most recent durable edit-journal payload for one live note.
     /// The GPUI layer never opens SQLite itself: recovery is deliberately a
     /// core-owned read so a crashed editor can reconstruct its latest readable

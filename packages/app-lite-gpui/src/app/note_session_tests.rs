@@ -8,7 +8,10 @@
 use super::note_session::NoteSession;
 use super::save_coordinator::{FlushReason, ManualSaveClock, SaveState};
 use app_lite_core::document::{Block, BlockStyle, Inline, Marks};
-use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, Note, SaveNote};
+use app_lite_core::{
+    CanonicalDocument, CreateNote, EditJournalEntry, LibraryError, LibraryRepository, Note,
+    SaveNote,
+};
 use gpui::{AppContext, EntityInputHandler};
 use rusqlite::Connection;
 use std::sync::Arc;
@@ -456,6 +459,100 @@ async fn journal_recovery_reconstructs_unsnapshotted_input_and_all_flush_reasons
 }
 
 #[gpui::test]
+async fn recovered_checkpoint_can_journal_new_chinese_input_then_snapshot_and_restart_exactly(
+    cx: &mut gpui::TestAppContext,
+) {
+    // Catches a recovered session that displays a valid checkpoint but starts
+    // its next 100ms journal with an unrelated writer token. The real
+    // repository CAS must let the recovered owner append, compact at the
+    // settled deadline, and survive another crash/restart without flattening
+    // the recovered rich text.
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let note = create(&repository, "初始标题", rich_document("加粗斜体基线"));
+    let clock = Arc::new(ManualSaveClock::default());
+    let crashed = session(
+        note.clone(),
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    append_title_via_entity_input(&crashed, "第一次恢复", cx);
+    append_body_via_entity_input(&crashed, "第一次正文", cx);
+    clock.advance(Duration::from_millis(100));
+    poll_and_drain(&crashed, cx);
+    let before_restart = repository
+        .latest_edit_journal(&note.id)
+        .expect("read first crash checkpoint")
+        .expect("first checkpoint exists");
+    assert!(before_restart.delta_utf8.contains("第一次正文"));
+    drop(crashed);
+
+    let recovered_base = repository
+        .load_note(&note.id)
+        .expect("load durable base after crash")
+        .expect("base exists");
+    let recovered = session(
+        recovered_base,
+        Arc::clone(&repository),
+        Arc::clone(&clock),
+        cx,
+    );
+    append_title_via_entity_input(&recovered, "继续中文", cx);
+    append_body_via_entity_input(&recovered, "继续正文", cx);
+    clock.advance(Duration::from_millis(100));
+    poll_and_drain(&recovered, cx);
+    let continued_checkpoint = repository
+        .latest_edit_journal(&note.id)
+        .expect("read continued checkpoint")
+        .expect("continued input must reach the 100ms journal");
+    assert!(continued_checkpoint.delta_utf8.contains("继续正文"));
+    assert_ne!(
+        continued_checkpoint.writer_token, before_restart.writer_token,
+        "recovery must claim rather than share the crashed writer token"
+    );
+    assert!(matches!(
+        recovered.read_with(cx, |session, _| session.save_state()),
+        SaveState::Dirty
+    ));
+
+    clock.advance(Duration::from_millis(400));
+    poll_and_drain(&recovered, cx);
+    assert!(
+        repository
+            .latest_edit_journal(&note.id)
+            .expect("read compacted journal")
+            .is_none(),
+        "the settled snapshot must compact the owned recovery journal"
+    );
+    drop(recovered);
+
+    let exact = repository
+        .load_note(&note.id)
+        .expect("load durable continued snapshot")
+        .expect("continued note exists");
+    let restarted = session(exact, Arc::clone(&repository), clock, cx);
+    let (title, visible, semantic) = restarted.read_with(cx, |session, session_cx| {
+        (
+            session.title().read(session_cx).text().to_owned(),
+            session.editor().read(session_cx).visible_text(),
+            session
+                .editor()
+                .read(session_cx)
+                .document()
+                .semantic_snapshot(),
+        )
+    });
+    assert_eq!(title, "初始标题第一次恢复继续中文");
+    assert!(visible.contains("第一次正文"));
+    assert!(visible.contains("继续正文"));
+    let semantic = format!("{semantic:?}");
+    assert!(semantic.contains("Bold"));
+    assert!(semantic.contains("Italic"));
+    assert!(semantic.contains("https://example.test/中文"));
+}
+
+#[gpui::test]
 async fn chinese_ime_composition_blocks_lifecycle_flush_until_the_real_input_commit(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -820,6 +917,90 @@ async fn gated_older_writer_cannot_replace_a_newer_same_note_checkpoint(
 }
 
 #[gpui::test]
+async fn two_recovery_candidates_can_claim_one_checkpoint_and_old_writer_cannot_retake_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    // Both candidates intentionally prepare from the same durable crashed
+    // journal before either transfer begins. The real SQLite CAS must allow
+    // exactly one future entity owner, while the old process token remains
+    // unable to append after it wakes up.
+    let cx = cx.add_empty_window();
+    let (profile, repository_a) = repository();
+    let repository_b = Arc::new(
+        LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open independent recovery repository"),
+    );
+    let note = create(&repository_a, "竞争恢复", rich_document("恢复基线"));
+    let clock = Arc::new(ManualSaveClock::default());
+    let crashed = session(
+        note.clone(),
+        Arc::clone(&repository_a),
+        Arc::clone(&clock),
+        cx,
+    );
+    append_body_via_entity_input(&crashed, "崩溃前内容", cx);
+    clock.advance(Duration::from_millis(100));
+    poll_and_drain(&crashed, cx);
+    let crashed_checkpoint = repository_a
+        .latest_edit_journal(&note.id)
+        .expect("read crashed checkpoint")
+        .expect("checkpoint exists");
+    drop(crashed);
+
+    let base_a = repository_a
+        .load_note(&note.id)
+        .expect("load candidate A base")
+        .expect("A base exists");
+    let base_b = repository_b
+        .load_note(&note.id)
+        .expect("load candidate B base")
+        .expect("B base exists");
+    let prepared_a = NoteSession::prepare(base_a, repository_a.as_ref())
+        .expect("prepare first recovery candidate");
+    let prepared_b = NoteSession::prepare(base_b, repository_b.as_ref())
+        .expect("prepare second recovery candidate");
+
+    let claimed_a = prepared_a
+        .claim_recovery_ownership(repository_a.as_ref())
+        .expect("first candidate claims the exact crashed owner");
+    let losing_claim = match prepared_b.claim_recovery_ownership(repository_b.as_ref()) {
+        Ok(_) => panic!("second candidate must not steal the already-transferred checkpoint"),
+        Err(error) => error,
+    };
+    assert!(losing_claim.to_string().contains("writer"));
+    let winner = repository_a
+        .latest_edit_journal(&note.id)
+        .expect("read claimed checkpoint")
+        .expect("winner checkpoint remains");
+    assert_ne!(winner.writer_token, crashed_checkpoint.writer_token);
+    assert!(winner.delta_utf8.contains(&winner.writer_token));
+
+    let old_writer = repository_b
+        .append_edit_journal(EditJournalEntry {
+            note_id: note.id.clone(),
+            expected_revision: note.revision,
+            writer_token: crashed_checkpoint.writer_token,
+            sequence: 0,
+            generation: crashed_checkpoint.generation + 1,
+            delta_utf8: crashed_checkpoint.delta_utf8,
+        })
+        .expect_err("the pre-crash writer cannot reclaim a transferred checkpoint");
+    assert!(matches!(old_writer, LibraryError::JournalOwnershipConflict));
+    assert_eq!(
+        repository_a
+            .latest_edit_journal(&note.id)
+            .expect("winner is still present")
+            .expect("winner checkpoint")
+            .writer_token,
+        winner.writer_token
+    );
+
+    let _mounted_winner = cx.new(move |session_cx| {
+        NoteSession::from_prepared(claimed_a, Arc::clone(&repository_a), clock, session_cx)
+    });
+}
+
+#[gpui::test]
 async fn v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_content(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -877,8 +1058,13 @@ async fn v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_co
         .expect("load migrated durable base")
         .expect("note exists");
     assert_eq!(durable.revision, 2);
+    let legacy_checkpoint = migrated
+        .latest_edit_journal(&note.id)
+        .expect("read migrated checkpoint")
+        .expect("migrated checkpoint remains until snapshot");
+    assert!(legacy_checkpoint.writer_token.starts_with("legacy-v4-"));
     let clock = Arc::new(ManualSaveClock::default());
-    let restored = session(durable, Arc::clone(&migrated), clock, cx);
+    let restored = session(durable, Arc::clone(&migrated), Arc::clone(&clock), cx);
     let (title, body) = restored.read_with(cx, |session, session_cx| {
         (
             session.title().read(session_cx).text().to_owned(),
@@ -888,6 +1074,49 @@ async fn v4_revision_two_journal_migrates_and_prepare_recovers_chinese_styled_co
     assert_eq!(title, "迁移后中文标题");
     assert!(body.contains("中文加粗样式"));
     assert!(body.contains("恢复正文"));
+    append_title_via_entity_input(&restored, "继续中文", cx);
+    append_body_via_entity_input(&restored, "恢复后二次正文", cx);
+    clock.advance(Duration::from_millis(100));
+    poll_and_drain(&restored, cx);
+    let continued_checkpoint = migrated
+        .latest_edit_journal(&note.id)
+        .expect("read continued migrated checkpoint")
+        .expect("continued v4 recovery reaches the 100ms journal");
+    assert_ne!(
+        continued_checkpoint.writer_token,
+        legacy_checkpoint.writer_token
+    );
+    assert!(continued_checkpoint.delta_utf8.contains("恢复后二次正文"));
+
+    clock.advance(Duration::from_millis(400));
+    poll_and_drain(&restored, cx);
+    assert!(
+        migrated
+            .latest_edit_journal(&note.id)
+            .expect("read compacted migrated journal")
+            .is_none()
+    );
+    drop(restored);
+    let exact = migrated
+        .load_note(&note.id)
+        .expect("load continued migrated snapshot")
+        .expect("continued migrated note exists");
+    let restarted = session(exact, Arc::clone(&migrated), clock, cx);
+    let (title, visible, semantic) = restarted.read_with(cx, |session, session_cx| {
+        (
+            session.title().read(session_cx).text().to_owned(),
+            session.editor().read(session_cx).visible_text(),
+            session
+                .editor()
+                .read(session_cx)
+                .document()
+                .semantic_snapshot(),
+        )
+    });
+    assert_eq!(title, "迁移后中文标题继续中文");
+    assert!(visible.contains("恢复后二次正文"));
+    let semantic = format!("{semantic:?}");
+    assert!(semantic.contains("Bold"));
 }
 
 #[test]

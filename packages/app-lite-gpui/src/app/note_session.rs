@@ -210,6 +210,61 @@ pub(crate) struct PreparedNoteSession {
     journal_base: SessionSnapshot,
     native_document: crate::native_editor::model::Document,
     recovered_generation: Option<i64>,
+    /// Every prepared session receives its future retained writer identity
+    /// before entity construction. A recovered checkpoint must atomically
+    /// install this exact value before any real input may schedule work.
+    writer_token: String,
+    recovery_ownership: Option<RecoveryOwnership>,
+}
+
+/// Identity read from a validated durable checkpoint. It is deliberately kept
+/// in the fallible pre-entity phase: a conflict must show a visible recovery
+/// error, never mount an apparently editable session with no write ownership.
+struct RecoveryOwnership {
+    expected_revision: i64,
+    previous_writer_token: String,
+}
+
+/// `from_prepared` accepts only this consumed wrapper, so callers cannot
+/// accidentally mount a recovered document before its SQLite owner transfer
+/// has completed.
+pub(crate) struct ClaimedPreparedNoteSession(PreparedNoteSession);
+
+impl PreparedNoteSession {
+    /// Moves one valid recovered journal from its crashed writer to this new
+    /// retained session. The JSON token and database token change in the same
+    /// IMMEDIATE transaction so the next restart validates one coherent owner.
+    pub(crate) fn claim_recovery_ownership(
+        mut self,
+        repository: &LibraryRepository,
+    ) -> Result<ClaimedPreparedNoteSession, SaveError> {
+        if let Some(recovery) = self.recovery_ownership.take() {
+            if recovery.expected_revision != self.note.revision {
+                return Err(SaveError::new("编辑日志的恢复版本不一致"));
+            }
+            let generation = self
+                .recovered_generation
+                .ok_or_else(|| SaveError::new("编辑日志缺少恢复代际"))?;
+            let payload = JournalPayload::from_snapshots(
+                &self.note.id,
+                self.note.revision,
+                self.writer_token.clone(),
+                generation,
+                &self.journal_base,
+                &self.snapshot,
+            );
+            let delta_utf8 = serde_json::to_string(&payload)
+                .map_err(|error| SaveError::new(format!("无法接管编辑日志: {error}")))?;
+            repository.claim_edit_journal_ownership(
+                &self.note.id,
+                recovery.expected_revision,
+                &recovery.previous_writer_token,
+                &self.writer_token,
+                &delta_utf8,
+            )?;
+        }
+        Ok(ClaimedPreparedNoteSession(self))
+    }
 }
 
 impl JournalPayload {
@@ -366,9 +421,13 @@ impl NoteSession {
         };
         let journal_base = snapshot.clone();
         let mut recovered_generation = None;
+        let mut recovery_ownership = None;
         if let Some(entry) =
             repository.latest_edit_journal_for_revision(&note.id, Some(note.revision))?
         {
+            if entry.writer_token.is_empty() {
+                return Err(SaveError::new("编辑日志缺少写入者身份"));
+            }
             let version = serde_json::from_str::<serde_json::Value>(&entry.delta_utf8)
                 .ok()
                 .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
@@ -385,6 +444,10 @@ impl NoteSession {
             };
             snapshot = recovered;
             recovered_generation = Some(generation.max(entry.generation));
+            recovery_ownership = Some(RecoveryOwnership {
+                expected_revision: entry.expected_revision,
+                previous_writer_token: entry.writer_token,
+            });
         }
         let native_document =
             import_canonical_with_resources(&snapshot.document, &snapshot.resource_ids)
@@ -395,19 +458,26 @@ impl NoteSession {
             journal_base,
             native_document,
             recovered_generation,
+            writer_token: uuid::Uuid::new_v4().simple().to_string(),
+            recovery_ownership,
         })
     }
 
     pub(crate) fn from_prepared(
-        prepared: PreparedNoteSession,
+        prepared: ClaimedPreparedNoteSession,
         repository: Arc<LibraryRepository>,
         clock: Arc<dyn SaveClock>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let note = prepared.note;
-        let snapshot = prepared.snapshot;
-        let journal_base = prepared.journal_base;
-        let document = prepared.native_document;
+        let PreparedNoteSession {
+            note,
+            snapshot,
+            journal_base,
+            native_document: document,
+            recovered_generation,
+            writer_token,
+            recovery_ownership: _,
+        } = prepared.0;
         let committed_snapshot = NativeSessionSnapshot {
             title: snapshot.title.clone(),
             document: document.clone(),
@@ -432,13 +502,13 @@ impl NoteSession {
             );
         });
         let mut save = SaveCoordinator::new(clock);
-        if let Some(generation) = prepared.recovered_generation {
+        if let Some(generation) = recovered_generation {
             save.restore_journaled(generation);
         }
         Self {
             note_id: note.id,
             expected_revision: note.revision,
-            writer_token: uuid::Uuid::new_v4().simple().to_string(),
+            writer_token,
             resource_ids: snapshot.resource_ids,
             title,
             editor,
@@ -474,6 +544,7 @@ impl NoteSession {
         cx: &mut Context<Self>,
     ) -> Result<Self, SaveError> {
         let prepared = Self::prepare(note, repository.as_ref())?;
+        let prepared = prepared.claim_recovery_ownership(repository.as_ref())?;
         Ok(Self::from_prepared(prepared, repository, clock, cx))
     }
 
