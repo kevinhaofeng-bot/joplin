@@ -66,7 +66,7 @@ This implementation adds **14 independent Task 4 tests**:
   behavior;
 - 1 core canonical marker compatibility test for Quote/Code versus legacy HTML.
 
-## Verification before release smoke
+## Verification
 
 - `cargo test --manifest-path packages/app-lite-core/Cargo.toml --no-fail-fast`
   — **PASS, 74 unit/integration tests**.
@@ -76,10 +76,20 @@ This implementation adds **14 independent Task 4 tests**:
   — **PASS, 1,061 passed; 1 exact pre-existing donor SIGSEGV test filtered**.
 - `cargo check --all-targets --manifest-path packages/app-lite-gpui/Cargo.toml`
   — **PASS** (existing upstream warnings only).
-
-Release build, fresh default-profile integrity, and empty/typical spike smoke
-are recorded after the implementation commit so the tested binary is exactly
-the reviewable tree.
+- `cargo build --release --manifest-path packages/app-lite-gpui/Cargo.toml`
+  — **PASS** at `781c520c2`.
+- A fresh absolute `JOPLIN_LITE_PROFILE` release smoke created isolated
+  `library.sqlite`, WAL, and SHM files; `PRAGMA integrity_check` returned
+  **`ok`**.  The exact smoke child was then intentionally terminated.
+- Release `--evernote-spike --fixture empty` — **PASS**: readiness and the
+  five-number diagnostics contract were written; texture 0, layout 9,672,
+  undo 1,233 bytes, transaction p95 6 μs, render-commit p95 8,711 μs.
+- Release `--evernote-spike --fixture typical` — **PASS**: readiness and the
+  diagnostics contract were written; texture 26,361,856, layout 1,009,056,
+  undo 3,822 bytes, transaction p95 31 μs, render-commit p95 9,110 μs.  Both
+  fixture gate sets passed with no child process and no WebKit link.
+- `cargo fmt --check` for core and GPUI manifests, plus `git diff --check`
+  — **PASS** after the final verification-record commit.
 
 ## Scope limits
 
