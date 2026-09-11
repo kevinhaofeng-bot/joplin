@@ -275,3 +275,63 @@ Targeted verification:
   `packages/app-lite-gpui` — **PASS, 19 tests**.
 - `cargo test ui::tests:: -- --nocapture` in `packages/app-lite-gpui` —
   **PASS, 28 tests**.
+
+## Independent review repair round 4 — 2026-09-11
+
+This narrowly closes the remaining recovery linearization critical without a
+schema bump or any Task 5 resource/import work. Schema v5 already persists the
+monotonic `edit_journal.sequence`; this round makes that existing sequence part
+of the owner lease everywhere it must be.
+
+- **T4-R4-C1:** `JournalOwnership` is the exact durable lease
+  `(writer_token, sequence)`, not a broad session permission. A recovered
+  `PreparedNoteSession` retains the validated journal sequence alongside its
+  base revision and old token. Its `BEGIN IMMEDIATE` claim matches
+  `note_id + expected_revision + old_writer_token + exact_sequence` in both
+  the read and update CAS. Thus a prepare of J1 followed by a same-token J2
+  cannot claim or overwrite J2.
+- Every `flush_snapshot` carries the captured optional lease through the
+  retained background job. In one `BEGIN IMMEDIATE` transaction it first
+  checks the note revision, then requires either no journal row or an exact
+  current `(expected_revision, writer_token, sequence)` match before any note
+  or resource mutation. It deletes only that exact row. A former worker that
+  was queued before a recovery claim therefore fails closed: it cannot advance
+  the note revision or remove the new owner's checkpoint. The new owner can
+  journal a new sequence and snapshot it normally.
+
+Two new mutation-sensitive, real retained-worker/gated tests cover the two
+required reverse orderings:
+
+- `prepared_recovery_rejects_a_gated_same_owner_checkpoint_replacement`:
+  prepare J1, release the crashed writer's gated J2, then assert the stale J1
+  claim conflicts and the J2 bytes remain durable.
+- `claimed_recovery_rejects_a_gated_former_owner_snapshot_and_allows_the_new_owner`:
+  queue A's snapshot, claim J1 as B, publish B J2, release A, assert A enters
+  `Failed` without changing the note or deleting J2, then assert B's own
+  leased snapshot succeeds and compacts J2.
+
+Verification after repair commit `e8e151359`:
+
+- `cargo test app::note_session_tests:: -- --nocapture` in
+  `packages/app-lite-gpui` — **PASS, 21 tests**.
+- `cargo test ui::tests:: -- --nocapture` in `packages/app-lite-gpui` —
+  **PASS, 28 tests**.
+- `cargo test --no-fail-fast` in `packages/app-lite-core` — **PASS, 78
+  tests**.
+- `cargo check --all-targets` in `packages/app-lite-gpui` — **PASS**.
+- `cargo test --no-fail-fast` in `packages/app-lite-native` — **PASS, 225
+  tests**.
+- Full GPUI binary suite with only the existing exact donor skip — **PASS,
+  1,080 tests**; 1 filtered donor test and no new skip.
+- `cargo build --release` in `packages/app-lite-gpui` — **PASS**.
+- Fresh absolute `JOPLIN_LITE_PROFILE` release smoke created isolated
+  `library.sqlite`, WAL, and SHM files; `PRAGMA integrity_check` returned
+  **`ok`**. The smoke child was intentionally terminated after initialization.
+- Release `--evernote-spike --fixture empty` — **PASS**: exact readiness marker
+  and diagnostics contract (texture 0, layout 9,672, undo 1,233,
+  transaction p95 6 us, render-commit p95 8,917 us).
+- Release `--evernote-spike --fixture typical` — **PASS**: exact readiness
+  marker and diagnostics contract (texture 26,361,856, layout 1,009,056,
+  undo 3,822, transaction p95 31 us, render-commit p95 9,177 us).
+- `cargo fmt --check` for core and GPUI manifests plus `git diff --check` —
+  **PASS** after the final report commit below.
