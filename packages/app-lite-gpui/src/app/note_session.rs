@@ -11,8 +11,8 @@ use crate::native_editor::codec::{
 };
 use crate::native_editor::core::EditorCore;
 use app_lite_core::{
-    CanonicalDocument, EditJournalEntry, JournalOwnership, LibraryError, LibraryRepository, Note,
-    NoteId, ResourceId, SaveNote, SavedRevision,
+    CanonicalDocument, EditJournalEntry, JournalOwnership, LegacyJournalPayload, LibraryError,
+    LibraryRepository, Note, NoteId, ResourceId, SaveNote, SavedRevision,
 };
 use gpui::{AppContext, Context, Entity, Subscription, Task};
 use serde::{Deserialize, Serialize};
@@ -199,17 +199,6 @@ struct JournalPayload {
     resource_ids: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct LegacyJournalPayload {
-    version: u8,
-    note_id: String,
-    expected_revision: i64,
-    generation: i64,
-    title: String,
-    body_html: String,
-    resource_ids: Vec<String>,
-}
-
 pub(crate) struct PreparedNoteSession {
     note: Note,
     snapshot: SessionSnapshot,
@@ -348,38 +337,6 @@ impl JournalPayload {
     }
 }
 
-impl LegacyJournalPayload {
-    fn into_snapshot(self, note: &Note) -> Result<(i64, SessionSnapshot), SaveError> {
-        if self.version != 1
-            || self.note_id != note.id.as_str()
-            || self.expected_revision != note.revision
-        {
-            return Err(SaveError::new("编辑日志与当前笔记版本不匹配"));
-        }
-        let resource_ids = self
-            .resource_ids
-            .into_iter()
-            .map(|raw| ResourceId::new(raw).map_err(|_| SaveError::new("编辑日志包含无效资源 ID")))
-            .collect::<Result<Vec<_>, _>>()?;
-        if resource_ids != note.resource_ids {
-            return Err(SaveError::new("编辑日志引用的资源与当前笔记不一致"));
-        }
-        let document = CanonicalDocument::parse_html(&self.body_html)
-            .map_err(|error| SaveError::new(format!("无法恢复编辑日志正文: {error}")))?;
-        if document.resource_ids() != resource_ids {
-            return Err(SaveError::new("编辑日志正文的资源关系不完整"));
-        }
-        Ok((
-            self.generation.max(1),
-            SessionSnapshot {
-                title: self.title,
-                document,
-                resource_ids,
-            },
-        ))
-    }
-}
-
 /// One active library note. The entity subscriptions observe real title/body
 /// input notifications, while a semantic snapshot comparison filters focus,
 /// selection and paint notifications that must never create false saves.
@@ -450,9 +407,30 @@ impl NoteSession {
                 .ok()
                 .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
             let (generation, recovered) = match version {
-                Some(1) => serde_json::from_str::<LegacyJournalPayload>(&entry.delta_utf8)
-                    .map_err(|error| SaveError::new(format!("无法读取旧编辑日志: {error}")))?
-                    .into_snapshot(&note)?,
+                Some(1) => {
+                    let payload = LegacyJournalPayload::parse_and_validate(
+                        &entry.delta_utf8,
+                        &entry.note_id,
+                        entry.generation,
+                        &note.resource_ids,
+                    )
+                    .map_err(|error| SaveError::new(format!("无法读取旧编辑日志: {error}")))?;
+                    if payload.expected_revision() != note.revision
+                        || payload.expected_revision() != entry.expected_revision
+                    {
+                        return Err(SaveError::new("编辑日志与当前笔记版本不匹配"));
+                    }
+                    let generation = payload.generation();
+                    let (title, document, resource_ids) = payload.into_parts();
+                    (
+                        generation,
+                        SessionSnapshot {
+                            title,
+                            document,
+                            resource_ids,
+                        },
+                    )
+                }
                 Some(version) if version == JOURNAL_SCHEMA_VERSION as u64 => {
                     serde_json::from_str::<JournalPayload>(&entry.delta_utf8)
                         .map_err(|error| SaveError::new(format!("无法读取编辑日志: {error}")))?

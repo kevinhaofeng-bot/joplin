@@ -1,4 +1,7 @@
-use crate::{CanonicalDocument, repository::LibraryError, resource::ResourceStore};
+use crate::{
+    CanonicalDocument, LegacyJournalPayload, NoteId, ResourceId,
+    legacy_writer_token_for_journal_id, repository::LibraryError, resource::ResourceStore,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 pub const SCHEMA_VERSION: i64 = 5;
@@ -289,6 +292,7 @@ fn backfill_v4_edit_journal(transaction: &Transaction<'_>) -> Result<(), Library
     struct Candidate {
         rowid: i64,
         id: String,
+        writer_token: String,
         expected_revision: i64,
         generation: i64,
         created_time: i64,
@@ -297,22 +301,11 @@ fn backfill_v4_edit_journal(transaction: &Transaction<'_>) -> Result<(), Library
     let mut winners = std::collections::BTreeMap::<String, Candidate>::new();
     let mut obsolete_ids = Vec::new();
     for (rowid, id, row_note_id, generation, delta_utf8, created_time) in rows {
-        let payload: serde_json::Value = serde_json::from_str(&delta_utf8)
-            .map_err(|_| LibraryError::InvalidLegacyEditJournal)?;
-        let payload_note_id = payload
-            .get("note_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(LibraryError::InvalidLegacyEditJournal)?;
-        let payload_revision = payload
-            .get("expected_revision")
-            .and_then(serde_json::Value::as_i64)
-            .filter(|revision| *revision > 0)
-            .ok_or(LibraryError::InvalidLegacyEditJournal)?;
-        if payload.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-            || payload_note_id != row_note_id
-        {
+        if created_time < 0 {
             return Err(LibraryError::InvalidLegacyEditJournal);
         }
+        let note_id =
+            NoteId::parse(&row_note_id).map_err(|_| LibraryError::InvalidLegacyEditJournal)?;
         let current_revision: Option<i64> = transaction
             .query_row(
                 "SELECT revision FROM notes WHERE id = ?1 AND deleted_time = 0",
@@ -323,6 +316,20 @@ fn backfill_v4_edit_journal(transaction: &Transaction<'_>) -> Result<(), Library
         let Some(current_revision) = current_revision else {
             return Err(LibraryError::InvalidLegacyEditJournal);
         };
+        let associated_resource_ids = legacy_note_resource_ids(transaction, &note_id)?;
+        // This must happen before stale/current routing and before a previous
+        // candidate is marked obsolete. A v4 payload cannot be safely skipped:
+        // otherwise malformed J2 could still make readable J1 disappear.
+        let payload = LegacyJournalPayload::parse_and_validate(
+            &delta_utf8,
+            &note_id,
+            generation,
+            &associated_resource_ids,
+        )
+        .map_err(|_| LibraryError::InvalidLegacyEditJournal)?;
+        let writer_token = legacy_writer_token_for_journal_id(&id)
+            .map_err(|_| LibraryError::InvalidLegacyEditJournal)?;
+        let payload_revision = payload.expected_revision();
         if payload_revision < current_revision {
             // This delta was already superseded by a durable note snapshot.
             // It cannot be replayed at the current base, so retaining it as
@@ -338,6 +345,7 @@ fn backfill_v4_edit_journal(transaction: &Transaction<'_>) -> Result<(), Library
         let candidate = Candidate {
             rowid,
             id,
+            writer_token,
             expected_revision: payload_revision,
             generation,
             created_time,
@@ -362,18 +370,39 @@ fn backfill_v4_edit_journal(transaction: &Transaction<'_>) -> Result<(), Library
     }
 
     for candidate in winners.into_values() {
-        let writer_token = format!("legacy-v4-{}", candidate.id);
         transaction.execute(
             "UPDATE edit_journal
              SET expected_revision = ?2, writer_token = ?3
              WHERE id = ?1",
-            params![candidate.id, candidate.expected_revision, writer_token],
+            params![
+                candidate.id,
+                candidate.expected_revision,
+                candidate.writer_token
+            ],
         )?;
     }
     for id in obsolete_ids {
         transaction.execute("DELETE FROM edit_journal WHERE id = ?1", [id])?;
     }
     Ok(())
+}
+
+fn legacy_note_resource_ids(
+    transaction: &Transaction<'_>,
+    note_id: &NoteId,
+) -> Result<Vec<ResourceId>, LibraryError> {
+    let mut statement = transaction.prepare(
+        "SELECT resource_id FROM note_resources
+         WHERE note_id = ?1 AND is_associated = 1
+         ORDER BY position, resource_id",
+    )?;
+    let raw_ids = statement
+        .query_map([note_id.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    raw_ids
+        .into_iter()
+        .map(|id| ResourceId::new(id).map_err(|_| LibraryError::InvalidLegacyEditJournal))
+        .collect()
 }
 
 fn ensure_column(

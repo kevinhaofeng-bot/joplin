@@ -2,6 +2,7 @@ use app_lite_core::{
     CanonicalDocument, CreateNote, EditJournalEntry, LibraryError, LibraryRepository, SaveNote,
 };
 use rusqlite::Connection;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
@@ -380,6 +381,344 @@ fn v4_migration_keeps_one_latest_current_checkpoint_per_note_without_touching_ot
             .all(|(_, _, _, _, _, _, delta)| !delta.contains("stale must not win")),
         "a stale base revision must never remain eligible after migration"
     );
+}
+
+#[test]
+fn v4_migration_rejects_a_malformed_newer_checkpoint_without_writing_the_profile() {
+    // Catches the R6 data-loss ordering: J2 has a later timestamp and looks
+    // current to the old three-field probe, but it omits body_html. Migration
+    // must reject the entire v4 profile before it can delete readable J1 or
+    // publish v5 columns/defaults.
+    let (profile, path, note_id) = v4_profile_with_revision_two_note();
+    let connection = Connection::open(&path).expect("open v4 fixture");
+    insert_v4_journal(
+        &connection,
+        &"a".repeat(32),
+        &note_id,
+        7,
+        legacy_v1_payload(
+            &note_id,
+            2,
+            7,
+            json!("readable J1"),
+            json!("<p>readable J1</p>"),
+            json!([]),
+        ),
+        100,
+    );
+    let mut malformed = serde_json::json!({
+        "version": 1,
+        "note_id": note_id,
+        "expected_revision": 2,
+        "generation": 8,
+        "title": "malformed J2",
+        "resource_ids": [],
+    });
+    malformed
+        .as_object_mut()
+        .expect("object payload")
+        .remove("body_html");
+    insert_v4_journal(
+        &connection,
+        &"b".repeat(32),
+        &note_id,
+        8,
+        malformed.to_string(),
+        200,
+    );
+    drop(connection);
+
+    let before = legacy_v4_journal_snapshot(&path);
+    assert!(matches!(
+        LibraryRepository::open(&path),
+        Err(LibraryError::InvalidLegacyEditJournal)
+    ));
+    assert_eq!(
+        legacy_v4_journal_snapshot(&path),
+        before,
+        "a corrupt newer J2 must not publish schema changes or delete readable J1"
+    );
+    drop(profile);
+}
+
+#[test]
+fn v4_migration_rejects_every_unrecoverable_wire_field_without_mutating_legacy_rows() {
+    // Each case names a production validation omission. If the migration
+    // returns to its former untyped Value probe, at least the body/resource,
+    // SQL-generation, noncanonical-body, and malformed-ID cases would again
+    // choose J2 and delete J1 while reporting success.
+    let unassociated_resource = "c".repeat(32);
+    let cases = vec![
+        (
+            "wrong typed title",
+            "b".repeat(32),
+            8_i64,
+            legacy_v1_payload(
+                "NOTE_ID",
+                2,
+                8,
+                json!(42),
+                json!("<p>wrong title type</p>"),
+                json!([]),
+            ),
+        ),
+        (
+            "wrong typed body",
+            "b".repeat(32),
+            8_i64,
+            legacy_v1_payload(
+                "NOTE_ID",
+                2,
+                8,
+                json!("wrong body type"),
+                json!(["not a string"]),
+                json!([]),
+            ),
+        ),
+        (
+            "wrong typed resource list",
+            "b".repeat(32),
+            8_i64,
+            legacy_v1_payload(
+                "NOTE_ID",
+                2,
+                8,
+                json!("wrong resource list"),
+                json!("<p>wrong resource list</p>"),
+                json!("not an array"),
+            ),
+        ),
+        (
+            "payload and SQL generation differ",
+            "b".repeat(32),
+            7_i64,
+            legacy_v1_payload(
+                "NOTE_ID",
+                2,
+                8,
+                json!("generation mismatch"),
+                json!("<p>generation mismatch</p>"),
+                json!([]),
+            ),
+        ),
+        (
+            "zero generation",
+            "b".repeat(32),
+            0_i64,
+            legacy_v1_payload(
+                "NOTE_ID",
+                2,
+                0,
+                json!("zero generation"),
+                json!("<p>zero generation</p>"),
+                json!([]),
+            ),
+        ),
+        (
+            "noncanonical unsafe body",
+            "b".repeat(32),
+            8_i64,
+            legacy_v1_payload(
+                "NOTE_ID",
+                2,
+                8,
+                json!("unsafe body"),
+                json!("<p onclick=\"x\">unsafe body</p>"),
+                json!([]),
+            ),
+        ),
+        (
+            "unassociated valid resource",
+            "b".repeat(32),
+            8_i64,
+            legacy_v1_payload(
+                "NOTE_ID",
+                2,
+                8,
+                json!("foreign resource"),
+                json!(format!(
+                    "<p><img src=\":/{unassociated_resource}\" alt=\"foreign\"></p>"
+                )),
+                json!([unassociated_resource]),
+            ),
+        ),
+        (
+            "invalid legacy journal id cannot form an owner token",
+            "not-an-opaque-journal-id".into(),
+            8_i64,
+            legacy_v1_payload(
+                "NOTE_ID",
+                2,
+                8,
+                json!("bad writer identity"),
+                json!("<p>bad writer identity</p>"),
+                json!([]),
+            ),
+        ),
+    ];
+
+    for (case, journal_id, sql_generation, template) in cases {
+        let (profile, path, note_id) = v4_profile_with_revision_two_note();
+        let connection = Connection::open(&path).expect("open v4 field fixture");
+        insert_v4_journal(
+            &connection,
+            &"a".repeat(32),
+            &note_id,
+            7,
+            legacy_v1_payload(
+                &note_id,
+                2,
+                7,
+                json!("readable J1"),
+                json!("<p>readable J1</p>"),
+                json!([]),
+            ),
+            100,
+        );
+        let malformed = template.to_string().replace("NOTE_ID", &note_id);
+        insert_v4_journal(
+            &connection,
+            &journal_id,
+            &note_id,
+            sql_generation,
+            malformed,
+            200,
+        );
+        drop(connection);
+
+        let before = legacy_v4_journal_snapshot(&path);
+        assert!(
+            matches!(
+                LibraryRepository::open(&path),
+                Err(LibraryError::InvalidLegacyEditJournal)
+            ),
+            "{case} must fail the migration before winner compaction"
+        );
+        assert_eq!(
+            legacy_v4_journal_snapshot(&path),
+            before,
+            "{case} must leave the v4 schema and both original journal bytes untouched"
+        );
+        drop(profile);
+    }
+}
+
+fn v4_profile_with_revision_two_note() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let profile = tempdir().expect("temporary v4 profile");
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).expect("create release-shaped profile");
+    let created = repository
+        .create_note(CreateNote {
+            title: "v4 durable title".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("create v4 fixture note");
+    let revision_two = repository
+        .flush_snapshot(
+            SaveNote {
+                id: created.id.clone(),
+                expected_revision: created.revision,
+                title: "v4 revision two base".into(),
+                document: CanonicalDocument::default(),
+                resource_ids: Vec::new(),
+                selected_thumbnail_id: None,
+            },
+            None,
+        )
+        .expect("advance fixture note to revision two");
+    assert_eq!(revision_two.revision, 2);
+    drop(repository);
+
+    let connection = Connection::open(&path).expect("replace journal with v4 shape");
+    connection
+        .execute_batch(
+            "DROP TABLE edit_journal;
+             DROP TABLE journal_sequence;
+             CREATE TABLE edit_journal (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 note_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 delta_utf8 TEXT NOT NULL,
+                 created_time INTEGER NOT NULL
+             );
+             PRAGMA user_version = 4;",
+        )
+        .expect("install real v4 journal schema");
+    drop(connection);
+    (profile, path, created.id.as_str().to_owned())
+}
+
+fn legacy_v1_payload(
+    note_id: &str,
+    expected_revision: i64,
+    generation: i64,
+    title: Value,
+    body_html: Value,
+    resource_ids: Value,
+) -> String {
+    json!({
+        "version": 1,
+        "note_id": note_id,
+        "expected_revision": expected_revision,
+        "generation": generation,
+        "title": title,
+        "body_html": body_html,
+        "resource_ids": resource_ids,
+    })
+    .to_string()
+}
+
+fn insert_v4_journal(
+    connection: &Connection,
+    id: &str,
+    note_id: &str,
+    generation: i64,
+    delta_utf8: String,
+    created_time: i64,
+) {
+    connection
+        .execute(
+            "INSERT INTO edit_journal (id, note_id, generation, delta_utf8, created_time)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, note_id, generation, delta_utf8, created_time],
+        )
+        .expect("insert real v4 checkpoint");
+}
+
+fn legacy_v4_journal_snapshot(
+    path: &std::path::Path,
+) -> (i64, String, Vec<(String, String, i64, String, i64)>) {
+    let connection = Connection::open(path).expect("inspect v4 profile after refusal");
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .expect("read v4 schema version");
+    let schema = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'edit_journal'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read v4 journal schema");
+    let rows = connection
+        .prepare(
+            "SELECT id, note_id, generation, delta_utf8, created_time
+             FROM edit_journal ORDER BY rowid",
+        )
+        .expect("prepare v4 raw journal snapshot")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .expect("read v4 raw journal rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect v4 raw journal rows");
+    (version, schema, rows)
 }
 
 #[test]
