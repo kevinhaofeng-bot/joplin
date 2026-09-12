@@ -9,6 +9,13 @@ that B2 is accepted.
   save_generation, expected_revision)`. `expected_revision` advances only on a
   durable note/resource commit, catching Dirty-to-Clean completion that keeps
   the same save generation.
+- A per-`LibraryShell`, one-shot test gate holds only after the ordinary
+  bounded packet read and before its foreground continuation. The test worker
+  runs that same repository query on an OS thread solely because GPUI's
+  deterministic executor cannot otherwise advance the concurrent save.
+- A journal that outlives an already-fired settled timer re-arms the settled
+  debounce only when no timer remains; ordinary fast journaling retains its
+  original 500ms snapshot deadline.
 - Search rows are direct children of the tracked GPUI scroll container;
   Up/Down uses `ScrollHandle::scroll_to_item`, hence uses measured child bounds
   rather than a made-up row height. The mounted regression exercises 500 real,
@@ -31,6 +38,8 @@ that B2 is accepted.
 | `renderer-readable/chunks/9435.js` search overlay behavior; source brief line 40 | `packages/app-lite-gpui/src/ui/mod.rs` palette rows/focus/Retry | `ui::tests::search_palette_keyboard_reveals_a_wrapping_tail_row_in_the_real_scroll_viewport`; `ui::tests::search_palette_escape_restores_an_open_organization_input_and_its_panel` |
 | `main-readable/src/modules/36175__module-36175.js` plus `41774` durable FTS queue; source brief line 34 | `packages/app-lite-gpui/src/ui/mod.rs` durable-revision fence; `packages/app-lite-core/src/repository.rs` queue query | core suite and GPUI suite listed below |
 | `83028__module-83028.js::searchNote`; source brief lines 35--36 | retained bounded `SearchHit`/`AppModel::projections` packet, no foreground fallback | 500 real `NoteId` mounted regression and full GPUI suite |
+| durable local revision plus search history restore | `ui/mod.rs` history coordinator and `app/note_session.rs` settled save | `ui::tests::history_search_discards_old_packet_after_same_generation_autosave` |
+| search refresh failure/recovery | `ui/mod.rs` Retry click handler and `AppModel::commit_search_refresh` | `ui::tests::mounted_search_refresh_error_retry_click_keeps_old_cards_then_recovers` |
 
 ## Commands and results
 
@@ -41,12 +50,16 @@ that B2 is accepted.
 - `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml --bin velotype 'ui::tests::search_palette_' -- --nocapture` — `3 passed; 0 failed`; this is fresh after the final Retry stale-route tightening.
 - `cargo check --manifest-path packages/app-lite-gpui/Cargo.toml` — success after final tightening.
 - `cargo build --manifest-path packages/app-lite-gpui/Cargo.toml --release` — final rebuild in progress at report write time.
+- `cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml` — success after the B2c follow-up.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml history_search_discards_old_packet_after_same_generation_autosave -- --nocapture` — `1 passed; 0 failed`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml mounted_search_refresh_error_retry_click_keeps_old_cards_then_recovers -- --nocapture` — `1 passed; 0 failed`.
 
 ## Limits / remaining evidence
 
 - No personal library was opened or accessed.
 - No macOS physical IME verification was performed; the existing real marked-text mounted test remains automated coverage only.
 - Disposable-profile Release smoke must use the final rebuilt binary under the Cargo metadata target directory, record its SHA, and verify normal exit. It was not claimed complete here.
-- The same-generation Dirty-to-Clean fence is implemented at the controller boundary; the dedicated mounted interleaving regression remains a required independent-review target.
+- History Retry direction is wired and independently needs a fault-injected Back/Forward click regression; this follow-up adds the active-refresh Retry click regression, not a claim of complete B2 acceptance.
 
-Commit hash: `2f20771bdcf3379ae23818b265acc38bc3eac1c6` (the report amendment that records the final targeted result is pending).
+Base corrective commit: `9c9116713664156b9d78d78ea334dbe40172fac1`.
+Follow-up implementation commit: `b72f58723cd51d0e3789141d71beac65854cda52`.
