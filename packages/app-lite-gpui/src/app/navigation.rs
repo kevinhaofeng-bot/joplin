@@ -4,15 +4,60 @@ use std::collections::BTreeMap;
 /// A history entry contains only stable identities and typed route state. A
 /// row index, hydrated note body, or UI entity never crosses this boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppDestination {
+    Library(LibraryRoute),
+    /// Global offline search is an application destination.  Its underlying
+    /// library container remains All Notes; the query itself is durable native
+    /// history state rather than an incidental text-field value.
+    SearchRoute {
+        query: String,
+    },
+}
+
+impl AppDestination {
+    fn library_route(&self) -> LibraryRoute {
+        match self {
+            Self::Library(route) => route.clone(),
+            Self::SearchRoute { .. } => LibraryRoute::AllNotes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NavigationSnapshot {
     pub route: LibraryRoute,
+    pub destination: AppDestination,
     pub selected_note_id: Option<NoteId>,
 }
 
 impl NavigationSnapshot {
+    pub fn library(route: LibraryRoute, selected_note_id: Option<NoteId>) -> Self {
+        Self {
+            route: route.clone(),
+            destination: AppDestination::Library(route),
+            selected_note_id,
+        }
+    }
+
+    pub fn search(query: String, selected_note_id: Option<NoteId>) -> Self {
+        Self {
+            route: LibraryRoute::AllNotes,
+            destination: AppDestination::SearchRoute { query },
+            selected_note_id,
+        }
+    }
+
+    fn normalized(mut self) -> Self {
+        // `route` remains a compatibility mirror for the existing container
+        // callers, but it is never an authority: destination derives it.
+        self.route = self.destination.library_route();
+        self
+    }
+
     fn initial() -> Self {
         Self {
             route: LibraryRoute::AllNotes,
+            destination: AppDestination::Library(LibraryRoute::AllNotes),
             selected_note_id: None,
         }
     }
@@ -38,10 +83,11 @@ impl Default for NavigationHistory {
 
 impl NavigationHistory {
     fn replace_current(&mut self, snapshot: NavigationSnapshot) {
-        self.entries[self.cursor] = snapshot;
+        self.entries[self.cursor] = snapshot.normalized();
     }
 
     fn push(&mut self, snapshot: NavigationSnapshot) {
+        let snapshot = snapshot.normalized();
         // A route action after Back is a new branch even when the selected
         // note happens to equal the current one.
         self.entries.truncate(self.cursor + 1);
@@ -73,8 +119,11 @@ impl NavigationHistory {
     /// navigation entity.
     fn replace_unavailable_routes(&mut self, available: impl Fn(&LibraryRoute) -> bool) {
         for snapshot in &mut self.entries {
-            if !available(&snapshot.route) {
-                snapshot.route = LibraryRoute::AllNotes;
+            if let AppDestination::Library(route) = &snapshot.destination {
+                if !available(route) {
+                    snapshot.destination = AppDestination::Library(LibraryRoute::AllNotes);
+                    snapshot.route = LibraryRoute::AllNotes;
+                }
             }
         }
     }
@@ -100,8 +149,8 @@ impl NavigationHistory {
 #[derive(Clone, Debug)]
 pub struct NavigationState {
     route: LibraryRoute,
+    destination: AppDestination,
     selected_note_id: Option<NoteId>,
-    search_query: Option<String>,
     route_sorts: BTreeMap<LibraryRoute, SortSpec>,
     history: NavigationHistory,
 }
@@ -110,8 +159,8 @@ impl Default for NavigationState {
     fn default() -> Self {
         Self {
             route: LibraryRoute::AllNotes,
+            destination: AppDestination::Library(LibraryRoute::AllNotes),
             selected_note_id: None,
-            search_query: None,
             route_sorts: BTreeMap::new(),
             history: NavigationHistory::default(),
         }
@@ -128,7 +177,10 @@ impl NavigationState {
     }
 
     pub fn search_query(&self) -> Option<&str> {
-        self.search_query.as_deref()
+        match &self.destination {
+            AppDestination::SearchRoute { query } => Some(query),
+            AppDestination::Library(_) => None,
+        }
     }
 
     pub fn sort(&self) -> SortSpec {
@@ -141,6 +193,7 @@ impl NavigationState {
     pub fn snapshot(&self) -> NavigationSnapshot {
         NavigationSnapshot {
             route: self.route.clone(),
+            destination: self.destination.clone(),
             selected_note_id: self.selected_note_id.clone(),
         }
     }
@@ -166,8 +219,8 @@ impl NavigationState {
     }
 
     pub(crate) fn navigate_to(&mut self, snapshot: NavigationSnapshot) {
-        self.route = snapshot.route;
-        self.selected_note_id = snapshot.selected_note_id;
+        let snapshot = snapshot.normalized();
+        self.apply_history_snapshot(&snapshot);
         self.history.push(self.snapshot());
     }
 
@@ -176,7 +229,8 @@ impl NavigationState {
     /// user navigation, so replace the current history snapshot instead of
     /// appending a phantom route which Back would immediately revisit.
     pub(crate) fn replace_current_route(&mut self, route: LibraryRoute) {
-        self.route = route;
+        self.route = route.clone();
+        self.destination = AppDestination::Library(route);
         self.selected_note_id = None;
         self.history.replace_current(self.snapshot());
     }
@@ -211,15 +265,25 @@ impl NavigationState {
     }
 
     pub(crate) fn set_search_query(&mut self, query: Option<String>) {
-        self.search_query = query.filter(|query| !query.trim().is_empty());
+        self.destination = query.filter(|query| !query.trim().is_empty()).map_or_else(
+            || AppDestination::Library(self.route.clone()),
+            |query| AppDestination::SearchRoute { query },
+        );
+        self.route = self.destination.library_route();
+        self.history.replace_current(self.snapshot());
     }
 
     pub(crate) fn clear_search(&mut self) {
-        self.search_query = None;
+        if matches!(self.destination, AppDestination::SearchRoute { .. }) {
+            self.destination = AppDestination::Library(LibraryRoute::AllNotes);
+            self.route = LibraryRoute::AllNotes;
+            self.history.replace_current(self.snapshot());
+        }
     }
 
     fn apply_history_snapshot(&mut self, snapshot: &NavigationSnapshot) {
-        self.route = snapshot.route.clone();
+        self.destination = snapshot.destination.clone();
+        self.route = self.destination.library_route();
         self.selected_note_id = snapshot.selected_note_id.clone();
     }
 }

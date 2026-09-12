@@ -2,7 +2,7 @@ use super::{AppAction, AppModel, AppStatus, ListViewMode, NoteSort, PaneState};
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{
     CanonicalDocument, CreateNote, LibraryEvent, LibraryRepository, LibraryRoute,
-    LibraryShellState, Note, NoteId, NotebookId, SaveNote,
+    LibraryShellState, Note, NoteId, NotebookId, SaveNote, SearchHit,
 };
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
@@ -416,6 +416,84 @@ fn creating_note_clears_search_context() {
         .expect("create action");
 
     assert_eq!(model.navigation().search_query(), None);
+}
+
+#[test]
+fn search_packet_is_typed_history_and_stale_completion_cannot_replace_cards() {
+    let (_profile, repository) = repository();
+    let first = create(&repository, "first result");
+    let second = create(&repository, "second result");
+    let mut model = AppModel::open(repository).expect("open model");
+    let projections = model.projections().to_vec();
+    let hit = |id: &NoteId| SearchHit {
+        note: projections
+            .iter()
+            .find(|row| &row.id == id)
+            .unwrap()
+            .clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+
+    let old_generation = model.begin_search("first");
+    let generation = model.begin_search("second");
+    assert!(
+        !model
+            .commit_search_results(
+                old_generation,
+                "first".into(),
+                vec![hit(&first)],
+                Some(first)
+            )
+            .expect("stale packet ignored")
+    );
+    assert!(
+        model
+            .commit_search_results(
+                generation,
+                "second".into(),
+                vec![hit(&second)],
+                Some(second.clone())
+            )
+            .expect("current packet committed")
+    );
+
+    assert_eq!(model.navigation().search_query(), Some("second"));
+    assert_eq!(model.navigation().route(), &LibraryRoute::AllNotes);
+    assert_eq!(
+        model
+            .projections()
+            .iter()
+            .map(|row| &row.id)
+            .collect::<Vec<_>>(),
+        vec![&second]
+    );
+    assert_eq!(model.active_session_note_id(), Some(&second));
+}
+
+#[test]
+fn search_packet_cannot_overwrite_a_route_change_after_it_started() {
+    let (_profile, repository) = repository();
+    let note = create(&repository, "result");
+    let mut model = AppModel::open(repository).expect("open model");
+    let hit = SearchHit {
+        note: model.projections().first().unwrap().clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+    let generation = model.begin_search("result");
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Trash,
+            selected_note_id: None,
+        })
+        .expect("navigate while worker runs");
+    assert!(
+        !model
+            .commit_search_results(generation, "result".into(), vec![hit], Some(note))
+            .expect("route-fenced packet ignored")
+    );
+    assert_eq!(model.navigation().route(), &LibraryRoute::Trash);
 }
 
 #[test]

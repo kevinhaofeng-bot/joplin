@@ -9,8 +9,8 @@ pub use navigation::*;
 use app_lite_core::{
     CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
     LibraryNavigationIndex, LibraryRepository, LibraryRoute, LibraryShellState, ListQuery, Note,
-    NoteId, NoteOrganizationState, NoteProjection, NotebookId, ResourceId, SortDirection,
-    SortField,
+    NoteId, NoteOrganizationState, NoteProjection, NotebookId, ResourceId, SearchHit,
+    SortDirection, SortField,
 };
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -102,10 +102,21 @@ struct CreateNoteDestination {
     route: LibraryRoute,
 }
 
+#[derive(Clone, Debug)]
+struct SearchRequestFence {
+    generation: u64,
+    query: String,
+    base_snapshot: NavigationSnapshot,
+}
+
 pub struct AppModel {
     repository: Arc<LibraryRepository>,
     navigation: NavigationState,
     projections: Vec<NoteProjection>,
+    /// Monotonic fence for retained background search work. A completed query
+    /// may only publish if it still names the currently requested search.
+    search_generation: u64,
+    search_request: Option<SearchRequestFence>,
     navigation_index: LibraryNavigationIndex,
     active_session: Option<ActiveSession>,
     panes: PaneState,
@@ -167,6 +178,8 @@ impl AppModel {
             repository,
             navigation,
             projections,
+            search_generation: 0,
+            search_request: None,
             navigation_index,
             active_session: None,
             panes,
@@ -602,6 +615,7 @@ impl AppModel {
         navigation.clear_search();
         navigation.navigate_to(NavigationSnapshot {
             route: destination_route.clone(),
+            destination: AppDestination::Library(destination_route.clone()),
             selected_note_id: Some(note_id.clone()),
         });
         let projections = self.load_projections_for(&navigation)?;
@@ -619,6 +633,7 @@ impl AppModel {
         fallback.clear_search();
         fallback.navigate_to(NavigationSnapshot {
             route: LibraryRoute::AllNotes,
+            destination: AppDestination::Library(LibraryRoute::AllNotes),
             selected_note_id: Some(note_id.clone()),
         });
         let projections = self.load_projections_for(&fallback)?;
@@ -638,6 +653,7 @@ impl AppModel {
         navigation.clear_search();
         navigation.navigate_to(NavigationSnapshot {
             route: LibraryRoute::AllNotes,
+            destination: AppDestination::Library(LibraryRoute::AllNotes),
             selected_note_id: None,
         });
         let projections = self.load_projections_for(&navigation)?;
@@ -1073,6 +1089,70 @@ impl AppModel {
     pub fn set_search_query(&mut self, query: Option<String>) {
         self.navigation.set_search_query(query);
     }
+
+    /// Begin an offline global-search request. This changes no projections and
+    /// performs no repository I/O, so callers can schedule the query on GPUI's
+    /// background executor while the editor remains mounted.
+    pub fn begin_search(&mut self, query: impl Into<String>) -> u64 {
+        let query = query.into();
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_request = Some(SearchRequestFence {
+            generation: self.search_generation,
+            query,
+            base_snapshot: self.navigation.snapshot(),
+        });
+        self.search_generation
+    }
+
+    /// Atomically publish a background FTS packet when it still belongs to the
+    /// active request. `projections` is intentionally the single card-list
+    /// authority; snippets stay transient to the palette renderer.
+    pub fn commit_search_results(
+        &mut self,
+        generation: u64,
+        query: String,
+        hits: Vec<SearchHit>,
+        selected_note_id: Option<NoteId>,
+    ) -> Result<bool, LibraryError> {
+        let Some(fence) = self.search_request.as_ref() else {
+            return Ok(false);
+        };
+        if generation != self.search_generation
+            || generation != fence.generation
+            || query != fence.query
+            || query.trim().is_empty()
+            || self.navigation.snapshot() != fence.base_snapshot
+        {
+            return Ok(false);
+        }
+        let mut navigation = self.navigation.clone();
+        navigation.navigate_to(NavigationSnapshot::search(query, selected_note_id));
+        let projections = hits.into_iter().map(|hit| hit.note).collect::<Vec<_>>();
+        let selected = navigation.selected_note_id().cloned();
+        let active_session = match selected {
+            Some(ref id) if projections.iter().any(|projection| &projection.id == id) => {
+                match self.active_session.as_ref() {
+                    Some(active) if &active.note.id == id => Some(active.clone()),
+                    _ => Some(ActiveSession {
+                        note: self
+                            .repository
+                            .load_note(id)?
+                            .ok_or(LibraryError::NotFound)?,
+                    }),
+                }
+            }
+            Some(_) => {
+                navigation.select(None);
+                None
+            }
+            None => None,
+        };
+        self.navigation = navigation;
+        self.projections = projections;
+        self.active_session = active_session;
+        self.search_request = None;
+        Ok(true)
+    }
     pub fn set_panes(&mut self, panes: PaneState) {
         self.panes = panes.normalized();
     }
@@ -1108,6 +1188,7 @@ impl AppModel {
     ) -> Result<(), LibraryError> {
         let mut candidate = self.navigation.clone();
         candidate.navigate_to(NavigationSnapshot {
+            destination: AppDestination::Library(route.clone()),
             route,
             selected_note_id,
         });
