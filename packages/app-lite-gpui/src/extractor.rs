@@ -60,13 +60,32 @@ pub fn run_pdf_child_for_verified_file_with_exe(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| PdfChildError::Spawn)?;
-    let mut stdout = child.stdout.take().ok_or(PdfChildError::Spawn)?;
-    let mut stderr = child.stderr.take().ok_or(PdfChildError::Spawn)?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = stop_child(&mut child);
+            return Err(PdfChildError::Spawn);
+        }
+    };
+    let mut stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = stop_child(&mut child);
+            return Err(PdfChildError::Spawn);
+        }
+    };
     let out = std::thread::spawn(move || drain_bounded(&mut stdout, MAX_OUTPUT_BYTES));
     let err = std::thread::spawn(move || drain_bounded(&mut stderr, 4096));
     let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().map_err(|_| PdfChildError::Io)? {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(_) => {
+                stop_and_join(&mut child, out, err);
+                return Err(PdfChildError::Io);
+            }
+        };
+        if let Some(status) = status {
             let out = out
                 .join()
                 .map_err(|_| PdfChildError::Io)?
@@ -87,13 +106,36 @@ pub fn run_pdf_child_for_verified_file_with_exe(
             return String::from_utf8(out.0).map_err(|_| PdfChildError::Utf8);
         }
         if start.elapsed() >= CHILD_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = out.join();
-            let _ = err.join();
+            stop_and_join(&mut child, out, err);
             return Err(PdfChildError::Timeout);
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Stop a child before joining pipe readers, so they always observe EOF. A
+/// successful `kill` is followed by `wait` to reap the child. If killing
+/// reports an error, only accept a concurrently-exited child; do not fall
+/// through to an unbounded `wait` on a process that might still be alive.
+fn stop_child(child: &mut std::process::Child) -> bool {
+    match child.kill() {
+        Ok(()) => child.wait().is_ok(),
+        Err(_) => matches!(child.try_wait(), Ok(Some(_))),
+    }
+}
+
+fn stop_and_join(
+    child: &mut std::process::Child,
+    out: std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+    err: std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+) {
+    // Do not join readers while the child could still own the write ends: that
+    // would turn a failed kill into an unbounded UI-adjacent wait. When an OS
+    // kill error races a child exit, `stop_child` confirms it was already
+    // reaped; otherwise the handles detach rather than blocking this caller.
+    if stop_child(child) {
+        let _ = out.join();
+        let _ = err.join();
     }
 }
 
