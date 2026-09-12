@@ -39,7 +39,7 @@ use crate::native_editor::toolbar::{
 use app_lite_core::CanonicalDocument;
 use app_lite_core::{
     LibraryEvent, LibraryRepository, LibraryRoute, Note, NoteId, NoteProjection, NotebookId,
-    ResourceId, StackId, TagId,
+    ResourceId, SearchHit, SearchQuery, StackId, TagId,
 };
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent,
@@ -75,6 +75,7 @@ gpui::actions!(
         ToggleLibraryToolbarMore,
         ToggleLibraryOrganizationPanel,
         OpenLibraryResourcePicker,
+        ToggleSearchPalette,
     ]
 );
 
@@ -503,6 +504,14 @@ pub struct LibraryShell {
     /// the active note title/session so cancelling an organization menu can
     /// never dirty a document.
     organization_input: Entity<TitleInput>,
+    search_input: Entity<TitleInput>,
+    _search_input_observation: Option<Subscription>,
+    search_palette_open: bool,
+    search_palette_results: Vec<SearchHit>,
+    search_palette_status: SearchPaletteStatus,
+    search_palette_generation: Option<u64>,
+    search_palette_selected: usize,
+    _search_task: Option<Task<()>>,
     organization_panel_open: bool,
     pending_destructive_action: Option<PendingDestructiveAction>,
     /// Retained alongside the shell so the typed navigation tree can request
@@ -544,6 +553,15 @@ pub struct LibraryShell {
     card_thumbnail_viewport_reconciliations: usize,
     #[cfg(test)]
     library_surface_paint_hooks_for_test: Arc<LibrarySurfacePaintHooks>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SearchPaletteStatus {
+    Idle,
+    Pending,
+    Empty,
+    Error(String),
+    Ready,
 }
 
 #[cfg(test)]
@@ -724,6 +742,7 @@ fn bind_library_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-alt-v", CycleListViewMode, Some("LibraryShell")),
         KeyBinding::new("cmd-alt-o", CycleSort, Some("LibraryShell")),
         KeyBinding::new("cmd-s", SyncCurrent, Some("LibraryShell")),
+        KeyBinding::new("cmd-k", ToggleSearchPalette, Some("LibraryShell")),
         // Compact-toolbar presentation commands deliberately remain scoped to
         // the library window. They do not introduce model mutations outside
         // the existing typed AppAction reducer.
@@ -846,6 +865,7 @@ impl LibraryShell {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         let organization_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
+        let search_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
         let image_cache = BudgetedImageCache::new_entity_in_context(cx, DECODED_IMAGE_CACHE_BUDGET);
         let card_thumbnail_cache =
             BudgetedImageCache::new_entity_in_context(cx, CARD_THUMBNAIL_CACHE_BUDGET);
@@ -906,6 +926,11 @@ impl LibraryShell {
             indexing_cancelled,
             cx,
         );
+        let search_input_observation = cx.observe(&search_input, |shell, _, cx| {
+            if shell.search_palette_open {
+                shell.schedule_search_from_input(cx);
+            }
+        });
         let mut shell = Self {
             model,
             note_session: None,
@@ -938,6 +963,14 @@ impl LibraryShell {
             save_clock,
             focus_handle,
             organization_input,
+            search_input,
+            _search_input_observation: Some(search_input_observation),
+            search_palette_open: false,
+            search_palette_results: Vec::new(),
+            search_palette_status: SearchPaletteStatus::Idle,
+            search_palette_generation: None,
+            search_palette_selected: 0,
+            _search_task: None,
             organization_panel_open: false,
             pending_destructive_action: None,
             sidebar_scroll: UniformListScrollHandle::new(),
@@ -1866,6 +1899,15 @@ impl LibraryShell {
         cx: &mut Context<Self>,
     ) {
         self.toggle_toolbar_more(window, cx);
+    }
+
+    fn toggle_search_palette(
+        &mut self,
+        _: &ToggleSearchPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_search_palette_visibility(window, cx);
     }
 
     fn toggle_library_organization_panel(
@@ -3285,6 +3327,127 @@ impl LibraryShell {
         }
     }
 
+    fn toggle_search_palette_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_palette_open = !self.search_palette_open;
+        if self.search_palette_open {
+            self.organization_panel_open = false;
+            self.toolbar_more_open = false;
+            self.search_input.read(cx).focus_handle().focus(window);
+            self.schedule_search_from_input(cx);
+        } else {
+            self._search_task = None;
+            self.search_palette_status = SearchPaletteStatus::Idle;
+            self.search_palette_results.clear();
+            self.search_palette_selected = 0;
+            self.focus_active_editor_or_shell(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn schedule_search_from_input(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).text().trim().to_owned();
+        self._search_task = None;
+        self.search_palette_generation = None;
+        self.search_palette_results.clear();
+        self.search_palette_selected = 0;
+        if query.is_empty() {
+            self.search_palette_status = SearchPaletteStatus::Idle;
+            cx.notify();
+            return;
+        }
+        let (repository, generation) = self.model.update(cx, |model, _| {
+            (model.repository(), model.begin_search(query.clone()))
+        });
+        self.search_palette_generation = Some(generation);
+        self.search_palette_status = SearchPaletteStatus::Pending;
+        let query_for_worker = query.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut parsed = SearchQuery::parse(&query_for_worker);
+                    // 500 is an explicit local product cap, not an assertion
+                    // about Evernote's distinct offset/window contract.
+                    parsed
+                        .set_page(0, SearchQuery::MAX_PAGE_SIZE)
+                        .expect("bounded search page");
+                    repository.search(parsed)
+                })
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                // A field may have been edited, dismissed, or superseded while
+                // SQLite was working. Only the exact retained generation gets
+                // transient preview ownership.
+                if !shell.search_palette_open
+                    || shell.search_input.read(shell_cx).text().trim() != query
+                    || shell.search_palette_generation != Some(generation)
+                {
+                    return;
+                }
+                match result {
+                    Ok(hits) if hits.is_empty() => {
+                        shell.search_palette_status = SearchPaletteStatus::Empty;
+                    }
+                    Ok(hits) => {
+                        shell.search_palette_results = hits;
+                        shell.search_palette_selected = 0;
+                        shell.search_palette_status = SearchPaletteStatus::Ready;
+                    }
+                    Err(error) => {
+                        shell.search_palette_status = SearchPaletteStatus::Error(error.to_string());
+                    }
+                }
+                // `generation` is deliberately carried through to the commit
+                // path. Previews never update the AppModel/card list.
+                let _ = generation;
+                shell_cx.notify();
+            });
+        });
+        self._search_task = Some(task);
+        cx.notify();
+    }
+
+    fn commit_search_result(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hit) = self.search_palette_results.get(index).cloned() else {
+            return;
+        };
+        let query = self.search_input.read(cx).text().trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        // Establish the existing lifecycle boundary before selecting a result.
+        // A dirty/marked-IME session must remain authoritative over a palette
+        // click just as it does for a normal card selection.
+        if !self.flush_active_session(FlushReason::NoteSwitch, cx) {
+            return;
+        }
+        let Some(generation) = self.search_palette_generation else {
+            return;
+        };
+        let packet = self.search_palette_results.clone();
+        let committed = self.model.update(cx, |model, _| {
+            model.commit_search_results(generation, query, packet, Some(hit.note.id.clone()))
+        });
+        match committed {
+            Ok(true) => {
+                self.search_palette_open = false;
+                self.search_palette_results.clear();
+                self.search_palette_selected = 0;
+                self.search_palette_status = SearchPaletteStatus::Idle;
+                self.search_palette_generation = None;
+                self.focus_active_editor_or_shell(window, cx);
+            }
+            Ok(false) => {
+                self.search_palette_status =
+                    SearchPaletteStatus::Error("搜索结果已过期，请重新输入".into());
+            }
+            Err(error) => {
+                self.search_palette_status = SearchPaletteStatus::Error(error.to_string())
+            }
+        }
+        cx.notify();
+    }
+
     fn toggle_toolbar_more(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toolbar_more_open = !self.toolbar_more_open;
         if self.toolbar_more_open {
@@ -4084,6 +4247,11 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.search_palette_open && event.keystroke.key == "escape" {
+            self.toggle_search_palette_visibility(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key != "escape" {
             return;
         }
@@ -4108,6 +4276,290 @@ impl LibraryShell {
         if dismissed {
             cx.stop_propagation();
         }
+    }
+
+    fn on_search_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.search_input.clone();
+        let modifiers = event.keystroke.modifiers;
+        let secondary = modifiers.secondary();
+        let handled = match event.keystroke.key.as_str() {
+            "escape" => {
+                self.toggle_search_palette_visibility(window, cx);
+                true
+            }
+            "enter" => {
+                self.commit_search_result(self.search_palette_selected, window, cx);
+                true
+            }
+            "down" => {
+                if !self.search_palette_results.is_empty() {
+                    self.search_palette_selected = (self.search_palette_selected + 1)
+                        .min(self.search_palette_results.len() - 1);
+                    cx.notify();
+                }
+                true
+            }
+            "up" => {
+                self.search_palette_selected = self.search_palette_selected.saturating_sub(1);
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                input.update(cx, |input, cx| {
+                    input.delete_backward();
+                    cx.notify();
+                });
+                true
+            }
+            "delete" => {
+                input.update(cx, |input, cx| {
+                    input.delete_forward();
+                    cx.notify();
+                });
+                true
+            }
+            "left" => {
+                input.update(cx, |input, cx| {
+                    input.move_horizontal(false, modifiers.shift);
+                    cx.notify();
+                });
+                true
+            }
+            "right" => {
+                input.update(cx, |input, cx| {
+                    input.move_horizontal(true, modifiers.shift);
+                    cx.notify();
+                });
+                true
+            }
+            "home" => {
+                input.update(cx, |input, cx| {
+                    input.move_to_edge(false, modifiers.shift);
+                    cx.notify();
+                });
+                true
+            }
+            "end" => {
+                input.update(cx, |input, cx| {
+                    input.move_to_edge(true, modifiers.shift);
+                    cx.notify();
+                });
+                true
+            }
+            "a" if secondary => {
+                input.update(cx, |input, cx| {
+                    input.select_all();
+                    cx.notify();
+                });
+                true
+            }
+            "v" if secondary => {
+                input.update(cx, |input, input_cx| input.paste_from_clipboard(input_cx));
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            cx.stop_propagation();
+        }
+    }
+
+    fn render_search_palette(
+        &self,
+        viewport_width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.search_palette_open {
+            return None;
+        }
+        let input = self.search_input.clone();
+        let canvas_input = input.clone();
+        let paint_input = input.clone();
+        let input_canvas = canvas(
+            move |bounds, _window, cx| {
+                let _ = canvas_input.update(cx, |input, _| input.record_bounds(bounds));
+                canvas_input.clone()
+            },
+            move |bounds, entity, window, cx| {
+                let (text, selection, focus) = entity.read_with(cx, |input, _| {
+                    (
+                        SharedString::from(input.text().to_owned()),
+                        input.selection().clone(),
+                        input.focus_handle().clone(),
+                    )
+                });
+                let line = window.text_system().shape_line(
+                    text,
+                    px(17.0),
+                    &[TextRun {
+                        len: entity.read(cx).text().len(),
+                        font: window.text_style().font(),
+                        color: rgba(0x202420ff).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+                entity.update(cx, |input, _| input.record_layout(bounds, line.clone()));
+                if focus.is_focused(window) && !selection.is_empty() {
+                    window.paint_quad(gpui::fill(
+                        Bounds::from_corners(
+                            point(
+                                bounds.left() + line.x_for_index(selection.start),
+                                bounds.top(),
+                            ),
+                            point(
+                                bounds.left() + line.x_for_index(selection.end),
+                                bounds.bottom(),
+                            ),
+                        ),
+                        rgba(0x00a82d33),
+                    ));
+                }
+                line.paint(bounds.origin, bounds.size.height, window, cx)
+                    .ok();
+                if focus.is_focused(window) && selection.is_empty() {
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(
+                            point(
+                                bounds.left() + line.x_for_index(selection.start),
+                                bounds.top(),
+                            ),
+                            size(px(1.0), bounds.size.height),
+                        ),
+                        rgba(EVERNOTE_GREEN),
+                    ));
+                }
+                if focus.is_focused(window) {
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(bounds, paint_input.clone()),
+                        cx,
+                    );
+                }
+            },
+        )
+        .w_full()
+        .h(px(34.0));
+        let status = match &self.search_palette_status {
+            SearchPaletteStatus::Idle => "输入关键词、短语或 tag:标签".to_owned(),
+            SearchPaletteStatus::Pending => "正在搜索本地资料库…".to_owned(),
+            SearchPaletteStatus::Empty => "没有找到匹配笔记".to_owned(),
+            SearchPaletteStatus::Ready
+                if self.search_palette_results.len() == SearchQuery::MAX_PAGE_SIZE =>
+            {
+                format!(
+                    "结果达到 {} 条显示上限；请缩小关键词（Enter 打开当前选中项）",
+                    SearchQuery::MAX_PAGE_SIZE
+                )
+            }
+            SearchPaletteStatus::Ready => format!(
+                "{} 条本地结果（上下键选择，Enter 打开）",
+                self.search_palette_results.len()
+            ),
+            SearchPaletteStatus::Error(message) => format!("搜索失败：{message}"),
+        };
+        let mut results = div()
+            .id("library-search-results")
+            .flex()
+            .flex_col()
+            .gap(px(4.0));
+        for (index, hit) in self.search_palette_results.iter().enumerate() {
+            let title = hit.note.title_prefix.clone();
+            let snippet = hit.snippet.clone();
+            results = results.child(
+                div()
+                    .id(SharedString::from(format!("library-search-result-{index}")))
+                    .cursor_pointer()
+                    .p(px(8.0))
+                    .rounded(px(5.0))
+                    .bg(if index == self.search_palette_selected {
+                        rgba(0x00a82d20)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .hover(|style| style.bg(rgba(0x00a82d14)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event, window, cx| {
+                            shell.commit_search_result(index, window, cx)
+                        }),
+                    )
+                    .child(div().text_size(px(14.0)).child(title))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgba(0x718075ff))
+                            .child(snippet),
+                    ),
+            );
+        }
+        let palette_width = viewport_width.clamp(280.0, 620.0);
+        let palette_left = ((viewport_width - palette_width) / 2.0).max(8.0);
+        Some(
+            div()
+                .id("library-search-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x10181033))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event, window, cx| {
+                        shell.toggle_search_palette_visibility(window, cx)
+                    }),
+                )
+                .child(
+                    div()
+                        .id("library-search-palette")
+                        .debug_selector(|| "library-search-palette".to_owned())
+                        .absolute()
+                        .top(px(72.0))
+                        .left(px(palette_left))
+                        .w(px(palette_width))
+                        .max_h(px(600.0))
+                        .p(px(14.0))
+                        .rounded(px(10.0))
+                        .bg(rgba(0xffffffff))
+                        .border_1()
+                        .border_color(rgba(0xd9e1d9ff))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_shell, _event, _window, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            div()
+                                .id("library-search-input")
+                                .border_b_1()
+                                .border_color(rgba(0xd9e1d9ff))
+                                .on_key_down(cx.listener(Self::on_search_key_down))
+                                .track_focus(input.read(cx).focus_handle())
+                                .child(input_canvas),
+                        )
+                        .child(
+                            div()
+                                .pt(px(8.0))
+                                .text_size(px(12.0))
+                                .text_color(rgba(0x718075ff))
+                                .child(status),
+                        )
+                        .child(
+                            div()
+                                .id("library-search-results-scroll")
+                                .flex()
+                                .flex_col()
+                                .h(px(420.0))
+                                .overflow_y_scroll()
+                                .child(results),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_editor_panel(
@@ -4284,6 +4736,7 @@ impl LibraryShell {
                 )
                 .into_any_element(),
             );
+            actions.push(self.render_search_toolbar_button(cx).into_any_element());
             if !matches!(route, LibraryRoute::Trash) {
                 actions.push(library_resource_picker_button(cx).into_any_element());
             }
@@ -4314,6 +4767,7 @@ impl LibraryShell {
                 self.render_toolbar_more_trigger(cx),
             ]);
         } else {
+            actions.push(self.render_search_toolbar_button(cx).into_any_element());
             if !matches!(route, LibraryRoute::Trash) {
                 actions.push(library_resource_picker_button(cx).into_any_element());
             }
@@ -4556,6 +5010,27 @@ impl LibraryShell {
             .into_any_element();
         vec![backdrop, menu]
     }
+
+    fn render_search_toolbar_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("library-open-search")
+            .debug_selector(|| "library-open-search".to_owned())
+            .flex_shrink_0()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(5.0))
+            .bg(rgba(0xf1f4f1ff))
+            .text_size(px(12.0))
+            .text_color(rgba(0x36413aff))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event, window, cx| {
+                    shell.toggle_search_palette_visibility(window, cx)
+                }),
+            )
+            .child("搜索 ⌘K")
+    }
 }
 
 /// Ask the native platform for one file, then return to the exact library
@@ -4769,6 +5244,7 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::cycle_list_view_mode))
             .on_action(cx.listener(Self::cycle_sort))
             .on_action(cx.listener(Self::sync_current))
+            .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_library_toolbar_more))
             .on_action(cx.listener(Self::toggle_library_organization_panel))
             .on_action(cx.listener(Self::open_library_resource_picker))
@@ -4797,6 +5273,8 @@ impl Render for LibraryShell {
         for overlay in editor_overlays {
             root = root.child(overlay);
         }
+        let search_palette =
+            self.render_search_palette(f32::from(window.viewport_size().width), cx);
         root.children(status_message.map(|message| {
             div()
                 .id("library-action-error")
@@ -4875,6 +5353,7 @@ impl Render for LibraryShell {
                 .text_color(rgba(0x725c19ff))
                 .child(notice.clone())
         }))
+        .children(search_palette)
     }
 }
 

@@ -1147,6 +1147,9 @@ impl AppModel {
             }
             None => None,
         };
+        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+            self.persist_shell_state_for(&navigation)?;
+        }
         self.navigation = navigation;
         self.projections = projections;
         self.active_session = active_session;
@@ -1216,6 +1219,12 @@ impl AppModel {
         &mut self,
         mut navigation: NavigationState,
     ) -> Result<PreparedNavigationCommit, LibraryError> {
+        // Search history has to be restored from an already-computed
+        // background packet. Never let a browser-style Forward action quietly
+        // reinterpret its All Notes container as a generic ListQuery.
+        if navigation.search_query().is_some() {
+            return Err(LibraryError::InvalidSnapshot);
+        }
         let projections = self.load_projections_for(&navigation)?;
         let active_session = match navigation.selected_note_id().cloned() {
             Some(id) if projections.iter().any(|projection| projection.id == id) => {

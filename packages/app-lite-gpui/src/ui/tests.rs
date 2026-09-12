@@ -387,6 +387,35 @@ fn mount_shell_with_save_clock<'a>(
     })
 }
 
+#[gpui::test]
+async fn cmd_k_palette_mounts_above_the_retained_editor_without_changing_session(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "可搜索".into(),
+            notebook_id: None,
+            document: rich_document("本地关键词"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let before = view.read_with(cx, |shell, _| shell.note_session.clone().expect("session"));
+    cx.dispatch_action(ToggleSearchPalette);
+    redraw(cx);
+    assert!(cx.debug_bounds("library-search-palette").is_some());
+    view.read_with(cx, |shell, _| {
+        assert!(shell.search_palette_open);
+        assert_eq!(shell.note_session.as_ref(), Some(&before));
+    });
+}
+
 #[test]
 fn pending_repository_events_coalesce_multi_batch_receiver_bursts_to_a_fixed_packet() {
     // Mutation-sensitive: a lifecycle barrier can hold an event packet for
