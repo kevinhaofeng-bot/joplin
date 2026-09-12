@@ -4,7 +4,9 @@ use crate::app::save_coordinator::ManualSaveClock;
 use crate::components::{Copy, Paste, SelectAll};
 use crate::native_editor::model::{Affinity, BlockKind, DocPoint, Mark};
 use app_lite_core::document::{Block, BlockStyle, ImagePresentation, Inline, Marks};
-use app_lite_core::{CanonicalDocument, CreateNote, LibraryRoute, LibraryShellState, ResourceId};
+use app_lite_core::{
+    CanonicalDocument, CreateNote, LibraryRoute, LibraryShellState, ResourceId, SaveNote,
+};
 use gpui::{
     AppContext, ClipboardItem, EntityInputHandler, Image, ImageFormat, KeyDownEvent, Keystroke,
     Modifiers, TestAppContext, VisualTestContext, point, px,
@@ -750,6 +752,256 @@ async fn search_palette_escape_restores_an_open_organization_input_and_its_panel
             .focus_handle()
             .is_focused(window)
     }));
+}
+
+#[gpui::test]
+async fn history_search_discards_old_packet_after_same_generation_autosave(
+    cx: &mut TestAppContext,
+) {
+    // This starts with a legal SearchRoute(A), returns to All Notes(A), then
+    // an external revision removes the old FTS match. The mounted editor is
+    // rehydrated at that revision and types the match back in. Thus the held
+    // packet genuinely omits A; removing expected_revision from the fence
+    // makes Forward clear the retained editor when this continuation resumes.
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "旧搜索包围栏".into(),
+            notebook_id: None,
+            document: rich_document("needle initial"),
+        })
+        .expect("create note");
+    repository
+        .process_search_jobs()
+        .expect("index initial match");
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+            shell.model.update(shell_cx, |model, _| {
+                let mut query = SearchQuery::parse("needle");
+                query.set_page(0, SearchQuery::MAX_PAGE_SIZE).unwrap();
+                let generation = model.begin_search("needle");
+                model
+                    .commit_search_results(
+                        generation,
+                        "needle".into(),
+                        repository.search(query).expect("initial FTS packet"),
+                        Some(note.id.clone()),
+                    )
+                    .expect("commit initial SearchRoute");
+                model
+                    .dispatch(AppAction::NavigateBack)
+                    .expect("back to All Notes");
+            });
+        });
+    });
+    redraw(cx);
+
+    let durable = repository.load_note(&note.id).unwrap().unwrap();
+    repository
+        .save_note(SaveNote {
+            id: note.id.clone(),
+            expected_revision: durable.revision,
+            title: durable.title,
+            document: rich_document("external content without match"),
+            resource_ids: durable.resource_ids,
+            selected_thumbnail_id: None,
+        })
+        .expect("external revision removes old FTS match");
+    repository
+        .process_search_jobs()
+        .expect("index removed match");
+    view.update(cx, |shell, shell_cx| {
+        shell.model.update(shell_cx, |model, model_cx| {
+            model
+                .reload_active_session_for_test()
+                .expect("rehydrate current All Notes session");
+            model_cx.notify();
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| {
+        shell.note_session.clone().expect("rehydrated session")
+    });
+    assert_eq!(
+        session.read_with(cx, |session, _| session.expected_revision()),
+        2,
+        "the external revision is rehydrated before the mounted edit"
+    );
+    let save_release = session.update(cx, |session, _| {
+        session.enable_deadline_tasks_for_test();
+        session.stall_next_background_save_for_test()
+    });
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" needle restored by mounted editor");
+    let (generation, revision, selection, undo_depth) = session.read_with(cx, |session, app| {
+        let editor = session.editor().read(app);
+        (
+            session.save_generation(),
+            session.expected_revision(),
+            editor.selection(),
+            editor.undo_depth(),
+        )
+    });
+    let (read_sender, read_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = futures::channel::oneshot::channel();
+    view.update(cx, |shell, _| {
+        shell.install_search_completion_gate_for_test(SearchCompletionGate {
+            read: read_sender,
+            release: release_receiver,
+        });
+    });
+    view.read_with(cx, |shell, app| {
+        assert_eq!(
+            shell.model.read(app).pending_history_search_query(true),
+            Some("needle".into()),
+            "the original committed SearchRoute must remain the Forward target"
+        );
+    });
+    view.update(cx, |shell, shell_cx| {
+        assert!(
+            shell.schedule_history_search(true, shell_cx),
+            "the real history worker accepts the retained Forward target"
+        );
+    });
+    cx.run_until_parked();
+    read_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("old FTS packet read before save completion");
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    save_release.send(()).expect("release journal save");
+    cx.run_until_parked();
+    clock.advance(Duration::from_millis(500));
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    let (after_generation, after_revision, state) = session.read_with(cx, |session, _| {
+        (
+            session.save_generation(),
+            session.expected_revision(),
+            session.save_state(),
+        )
+    });
+    assert_eq!(
+        after_generation, generation,
+        "autosave stays in the dirty generation"
+    );
+    assert!(
+        after_revision > revision,
+        "same generation durable save advances revision; before={revision}, after={after_revision}, state={state:?}"
+    );
+    assert!(matches!(
+        state,
+        crate::app::save_coordinator::SaveState::Clean
+    ));
+    release_sender
+        .send(())
+        .expect("release stale query completion");
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.model.read(app).navigation().search_query(), None);
+        assert_eq!(
+            shell.model.read(app).navigation().selected_note_id(),
+            Some(&note.id)
+        );
+        assert_eq!(
+            shell.note_session.as_ref().unwrap().entity_id(),
+            session.entity_id()
+        );
+        let editor = session.read(app).editor().read(app);
+        assert_eq!(editor.selection(), selection);
+        assert!(editor.undo_depth() >= undo_depth);
+    });
+}
+
+#[gpui::test]
+async fn mounted_search_refresh_error_retry_click_keeps_old_cards_then_recovers(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "retry packet".into(),
+            notebook_id: None,
+            document: rich_document("needle retry"),
+        })
+        .expect("create search note");
+    repository.process_search_jobs().expect("index search note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    view.update(cx, |shell, shell_cx| {
+        shell.model.update(shell_cx, |model, model_cx| {
+            let mut query = SearchQuery::parse("needle");
+            query.set_page(0, SearchQuery::MAX_PAGE_SIZE).unwrap();
+            let generation = model.begin_search("needle");
+            model
+                .commit_search_results(
+                    generation,
+                    "needle".into(),
+                    repository.search(query).expect("initial packet"),
+                    Some(note.id.clone()),
+                )
+                .expect("commit SearchRoute");
+            model_cx.notify();
+        });
+    });
+    redraw(cx);
+    repository
+        .trash_note(&note.id)
+        .expect("remove the refreshed hit");
+    repository.process_search_jobs().expect("index removed hit");
+    view.update(cx, |shell, shell_cx| {
+        shell.model.update(shell_cx, |model, model_cx| {
+            model
+                .refresh_projection_events([LibraryEvent::NoteTrashed(note.id.clone())])
+                .expect("mark SearchRoute refresh pending");
+            model.fail_next_shell_state_persist_for_test(app_lite_core::LibraryError::NotFound);
+            model_cx.notify();
+        });
+        shell.schedule_active_search_refresh(shell_cx);
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            shell
+                .history_search_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("本地搜索更新失败")),
+            "the actual failed commit must be visible"
+        );
+        assert_eq!(
+            shell.model.read(app).navigation().search_query(),
+            Some("needle")
+        );
+        assert_eq!(
+            shell.model.read(app).projections().len(),
+            1,
+            "old coherent card remains"
+        );
+    });
+    let retry = cx
+        .debug_bounds("library-search-refresh-retry")
+        .expect("visible Retry control");
+    cx.simulate_click(retry.center(), Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            shell.history_search_notice.is_none(),
+            "successful Retry clears notice"
+        );
+        assert!(
+            shell.model.read(app).projections().is_empty(),
+            "Retry installed new bounded packet"
+        );
+    });
 }
 
 #[test]

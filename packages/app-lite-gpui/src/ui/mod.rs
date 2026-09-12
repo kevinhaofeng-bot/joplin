@@ -103,6 +103,15 @@ struct IndexingWorkerGate {
     release: futures::channel::oneshot::Receiver<()>,
 }
 
+/// Per-shell one-shot gate after a bounded search packet is read but before
+/// the foreground continuation sees it. The OS thread is intentional: GPUI's
+/// deterministic test executor must remain free to drive the save completion.
+#[cfg(test)]
+struct SearchCompletionGate {
+    read: Sender<()>,
+    release: futures::channel::oneshot::Receiver<()>,
+}
+
 #[cfg(test)]
 static INDEXING_WORKER_GATE: Mutex<Option<IndexingWorkerGate>> = Mutex::new(None);
 
@@ -520,6 +529,8 @@ pub struct LibraryShell {
     _search_task: Option<Task<()>>,
     _history_search_task: Option<Task<()>>,
     _search_route_refresh_task: Option<Task<()>>,
+    #[cfg(test)]
+    search_completion_gate: Option<SearchCompletionGate>,
     history_search_notice: Option<String>,
     search_refresh_retry_available: bool,
     search_refresh_retry_history: Option<bool>,
@@ -987,6 +998,8 @@ impl LibraryShell {
             _search_task: None,
             _history_search_task: None,
             _search_route_refresh_task: None,
+            #[cfg(test)]
+            search_completion_gate: None,
             history_search_notice: None,
             search_refresh_retry_available: false,
             search_refresh_retry_history: None,
@@ -1484,6 +1497,14 @@ impl LibraryShell {
     #[cfg(test)]
     pub(crate) fn set_resource_notice_for_test(&mut self, notice: impl Into<String>) {
         self.resource_notice = Some(notice.into());
+    }
+
+    #[cfg(test)]
+    fn install_search_completion_gate_for_test(&mut self, gate: SearchCompletionGate) {
+        assert!(
+            self.search_completion_gate.replace(gate).is_none(),
+            "each mounted shell owns at most one search completion gate"
+        );
     }
 
     #[cfg(test)]
@@ -3535,7 +3556,53 @@ impl LibraryShell {
         let expected_session_fence = self.active_session_save_fence(cx);
         self.history_search_notice = Some("正在恢复本地搜索结果…".into());
         let query_for_worker = query.clone();
+        #[cfg(test)]
+        let completion_gate = self.search_completion_gate.take();
         let task = cx.spawn(async move |this, cx| {
+            #[cfg(test)]
+            let result = if let Some(gate) = completion_gate {
+                let thread_repository = Arc::clone(&repository);
+                let thread_query = query_for_worker.clone();
+                let (sender, receiver) = futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let mut parsed = SearchQuery::parse(&thread_query);
+                        parsed
+                            .set_page(0, SearchQuery::MAX_PAGE_SIZE)
+                            .expect("bounded history search page");
+                        if thread_repository.has_pending_search_jobs()? {
+                            Ok(None)
+                        } else {
+                            thread_repository.search(parsed).map(Some)
+                        }
+                    })();
+                    let _ = gate.read.send(());
+                    let result = if futures::executor::block_on(gate.release).is_ok() {
+                        result
+                    } else {
+                        Err(app_lite_core::LibraryError::InvalidSnapshot)
+                    };
+                    let _ = sender.send(result);
+                });
+                receiver
+                    .await
+                    .unwrap_or(Err(app_lite_core::LibraryError::InvalidSnapshot))
+            } else {
+                cx.background_executor()
+                    .spawn(async move {
+                        let mut parsed = SearchQuery::parse(&query_for_worker);
+                        parsed
+                            .set_page(0, SearchQuery::MAX_PAGE_SIZE)
+                            .expect("bounded history search page");
+                        if repository.has_pending_search_jobs()? {
+                            Ok(None)
+                        } else {
+                            repository.search(parsed).map(Some)
+                        }
+                    })
+                    .await
+            };
+            #[cfg(not(test))]
             let result = cx
                 .background_executor()
                 .spawn(async move {
@@ -3655,7 +3722,53 @@ impl LibraryShell {
         self._search_route_refresh_task = None;
         let expected_session_fence = self.active_session_save_fence(cx);
         let query_for_worker = query.clone();
+        #[cfg(test)]
+        let completion_gate = self.search_completion_gate.take();
         let task = cx.spawn(async move |this, cx| {
+            #[cfg(test)]
+            let result = if let Some(gate) = completion_gate {
+                let thread_repository = Arc::clone(&repository);
+                let thread_query = query_for_worker.clone();
+                let (sender, receiver) = futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let mut parsed = SearchQuery::parse(&thread_query);
+                        parsed
+                            .set_page(0, SearchQuery::MAX_PAGE_SIZE)
+                            .expect("bounded SearchRoute refresh page");
+                        if thread_repository.has_pending_search_jobs()? {
+                            Ok(None)
+                        } else {
+                            thread_repository.search(parsed).map(Some)
+                        }
+                    })();
+                    let _ = gate.read.send(());
+                    let result = if futures::executor::block_on(gate.release).is_ok() {
+                        result
+                    } else {
+                        Err(app_lite_core::LibraryError::InvalidSnapshot)
+                    };
+                    let _ = sender.send(result);
+                });
+                receiver
+                    .await
+                    .unwrap_or(Err(app_lite_core::LibraryError::InvalidSnapshot))
+            } else {
+                cx.background_executor()
+                    .spawn(async move {
+                        let mut parsed = SearchQuery::parse(&query_for_worker);
+                        parsed
+                            .set_page(0, SearchQuery::MAX_PAGE_SIZE)
+                            .expect("bounded SearchRoute refresh page");
+                        if repository.has_pending_search_jobs()? {
+                            Ok(None)
+                        } else {
+                            repository.search(parsed).map(Some)
+                        }
+                    })
+                    .await
+            };
+            #[cfg(not(test))]
             let result = cx
                 .background_executor()
                 .spawn(async move {

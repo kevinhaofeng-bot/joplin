@@ -1196,6 +1196,18 @@ impl AppModel {
         self.navigation.history_search_query(forward)
     }
 
+    #[cfg(test)]
+    pub(crate) fn reload_active_session_for_test(&mut self) -> Result<(), LibraryError> {
+        self.active_session = match self.navigation.selected_note_id() {
+            Some(id) => self
+                .repository
+                .load_note(id)?
+                .map(|note| ActiveSession { note }),
+            None => None,
+        };
+        Ok(())
+    }
+
     /// Read-only target for a background SearchRoute history restoration.
     /// Advancing the native cursor is intentionally deferred until its
     /// bounded repository packet is ready to install atomically.

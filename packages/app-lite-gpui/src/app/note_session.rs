@@ -3124,6 +3124,17 @@ impl NoteSession {
         // production. A boundary queued during a journal starts its exact
         // snapshot only after that worker completion has been observed.
         if outcome.is_ok() {
+            // A slow journal can outlive the settled debounce. Its timer may
+            // have observed Journaling and returned while the worker still
+            // owned SQLite; once that journal completes, re-arm the ordinary
+            // settled deadline so this same dirty generation still reaches a
+            // durable snapshot without requiring another keystroke.
+            if matches!(work, SaveWork::Journal { .. })
+                && matches!(self.save.state(), SaveState::Dirty)
+                && self._settled_deadline_task.is_none()
+            {
+                self.arm_deadlines(false, cx);
+            }
             // A staged picker/drop source owns a tracked Selection and must
             // get the first chance after the exact journal/snapshot fence
             // lifts. Starting another timer save first could unnecessarily
