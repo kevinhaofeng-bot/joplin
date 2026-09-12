@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use app_lite_core::{
-    DerivedTextFailure, DerivedTextJob, LibraryError, LibraryRepository, ResourceId,
+    DerivedTextFailure, DerivedTextJob, LibraryError, LibraryRepository, ResourceError, ResourceId,
 };
 
 const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
@@ -97,9 +97,14 @@ pub fn run_derived_text_pdf_job_with_exe(
     if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected.size) {
         return record_derived_failure(repository, job, DerivedTextFailure::TooLarge);
     }
-    let (resource, file) = match repository.open_verified_resource_file(&resource_id) {
+    let (resource, file) = match repository
+        .open_verified_resource_file_with_limit(&resource_id, MAX_INPUT_BYTES)
+    {
         Ok(Some(value)) => value,
         Ok(None) => return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id)),
+        Err(LibraryError::Resource(ResourceError::SizeLimitExceeded)) => {
+            return record_derived_failure(repository, job, DerivedTextFailure::TooLarge);
+        }
         Err(_) => return record_derived_failure(repository, job, DerivedTextFailure::Unavailable),
     };
     if resource.sha256 != expected.sha256

@@ -2736,6 +2736,23 @@ impl LibraryRepository {
         Ok(Some((resource, file)))
     }
 
+    /// Resolves resource metadata and opens a hash-verified descriptor with a
+    /// physical byte ceiling. This is for bounded extractors; existing image
+    /// and preview paths retain [`Self::open_verified_resource_file`].
+    pub fn open_verified_resource_file_with_limit(
+        &self,
+        id: &ResourceId,
+        maximum_bytes: usize,
+    ) -> Result<Option<(crate::StoredResource, File)>, LibraryError> {
+        let Some(resource) = self.resource_metadata(id)? else {
+            return Ok(None);
+        };
+        let file = self
+            .resource_store
+            .open_verified_with_limit(&resource.sha256, maximum_bytes)?;
+        Ok(Some((resource, file)))
+    }
+
     /// Observes descriptor-safe resource opens without exposing raw bytes.
     /// This is deliberately a diagnostic seam rather than a projection API:
     /// callers use it to guard against eager resource hydration on a detail

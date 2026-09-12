@@ -81,6 +81,8 @@ pub enum ResourceError {
     Symlink,
     #[error("resource blob is corrupt")]
     CorruptBlob,
+    #[error("resource blob exceeds the verified stream size limit")]
+    SizeLimitExceeded,
     #[error("resource ID entropy failed")]
     Entropy(#[source] getrandom::Error),
 }
@@ -278,17 +280,49 @@ impl ResourceStore {
     /// without allocating a second resource-sized `Vec`, and list/read
     /// observers keep their useful meaning as a detector for eager hydration.
     pub fn open_verified(&self, sha256: &BlobHash) -> Result<File, ResourceError> {
+        self.open_verified_inner(sha256, None)
+    }
+
+    /// Opens a descriptor-bound blob only when its physical contents remain
+    /// within `maximum_bytes`. The fd length is checked before hashing, then
+    /// the streaming digest checks the accumulated bytes again to reject a
+    /// blob that grows after `fstat`.
+    pub fn open_verified_with_limit(
+        &self,
+        sha256: &BlobHash,
+        maximum_bytes: usize,
+    ) -> Result<File, ResourceError> {
+        self.open_verified_inner(sha256, Some(maximum_bytes))
+    }
+
+    fn open_verified_inner(
+        &self,
+        sha256: &BlobHash,
+        maximum_bytes: Option<usize>,
+    ) -> Result<File, ResourceError> {
         let Some(mut file) = open_blob(self.blobs_dir.0, sha256.as_str())? else {
             return Err(ResourceError::Io(std::io::Error::from(
                 std::io::ErrorKind::NotFound,
             )));
         };
+        if let Some(maximum) = maximum_bytes {
+            if file.metadata()?.len() > maximum as u64 {
+                return Err(ResourceError::SizeLimitExceeded);
+            }
+        }
         let mut digest = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
+        let mut streamed = 0_usize;
         loop {
             let count = file.read(&mut buffer)?;
             if count == 0 {
                 break;
+            }
+            streamed = streamed
+                .checked_add(count)
+                .ok_or(ResourceError::SizeLimitExceeded)?;
+            if maximum_bytes.is_some_and(|maximum| streamed > maximum) {
+                return Err(ResourceError::SizeLimitExceeded);
             }
             digest.update(&buffer[..count]);
         }
@@ -1046,7 +1080,7 @@ mod tests {
         fail_next_publish_after_temp_sync, publish_existing_target_after_temp_sync,
     };
     use sha2::{Digest, Sha256};
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::mpsc::TryRecvError;
     use tempfile::tempdir;
 
@@ -1074,6 +1108,36 @@ mod tests {
 
         assert_eq!(restored, bytes);
         assert!(matches!(reads.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn bounded_verified_open_rejects_a_blob_that_grows_past_its_limit() {
+        let dir = tempdir().unwrap();
+        let store = ResourceStore::new(dir.path()).unwrap();
+        let blob = store
+            .put(ResourceInput {
+                bytes: b"small published blob",
+                title: "small.pdf",
+                mime: "application/pdf",
+                file_extension: "pdf",
+            })
+            .unwrap();
+        let limit = blob.size + 64;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(
+                dir.path()
+                    .join("resources/blobs")
+                    .join(blob.sha256.as_str()),
+            )
+            .unwrap();
+        file.write_all(&vec![b'x'; 65]).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(matches!(
+            store.open_verified_with_limit(&blob.sha256, limit),
+            Err(ResourceError::SizeLimitExceeded)
+        ));
     }
 
     #[test]

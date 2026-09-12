@@ -286,3 +286,48 @@ fn coordinator_marks_non_pdf_jobs_unsupported_without_launching_the_pdf_child() 
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     ));
 }
+
+#[test]
+fn coordinator_rejects_a_physically_grown_blob_even_when_database_size_is_small() {
+    let profile = tempfile::tempdir().unwrap();
+    let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let (resource, _) = associated_resource(
+        &repository,
+        include_bytes!("resources/extractor-fixture.pdf"),
+        "grown.pdf",
+        "application/pdf",
+        "pdf",
+    );
+    let metadata = repository.resource_metadata(&resource).unwrap().unwrap();
+    assert!(metadata.size < 20 * 1024 * 1024);
+    let mut blob = std::fs::OpenOptions::new()
+        .append(true)
+        .open(
+            profile
+                .path()
+                .join("resources/blobs")
+                .join(metadata.sha256.as_str()),
+        )
+        .unwrap();
+    blob.write_all(&vec![b'x'; 20 * 1024 * 1024]).unwrap();
+    blob.sync_all().unwrap();
+
+    assert_eq!(
+        extractor::run_one_derived_text_pdf_job_with_exe(
+            &repository,
+            std::path::PathBuf::from(env!("CARGO_BIN_EXE_velotype")),
+        )
+        .unwrap(),
+        extractor::DerivedTextCoordinatorOutcome::Failed(
+            resource.clone(),
+            DerivedTextFailure::TooLarge,
+        )
+    );
+    assert_eq!(
+        repository.derived_text_status(&resource).unwrap(),
+        Some(DerivedTextStatus::Failed {
+            failure: DerivedTextFailure::TooLarge,
+            attempts: 1,
+        })
+    );
+}
