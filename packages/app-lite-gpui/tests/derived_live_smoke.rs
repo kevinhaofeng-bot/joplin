@@ -4,6 +4,7 @@ use app_lite_core::document::Block;
 use app_lite_core::{
     CanonicalDocument, CreateNote, DerivedTextStatus, LibraryRepository, SearchQuery,
 };
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ struct RunningApp(Option<Child>);
 
 impl RunningApp {
     fn start(profile: &std::path::Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_velotype"))
+        let child = Command::new(smoke_executable())
             .env("JOPLIN_LITE_PROFILE", profile)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -44,6 +45,23 @@ impl RunningApp {
     fn pid(&self) -> u32 {
         self.0.as_ref().expect("app process is still owned").id()
     }
+}
+
+fn smoke_executable() -> PathBuf {
+    let executable = std::env::var_os("JOPLIN_LITE_LIVE_SMOKE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_velotype")));
+    assert!(
+        executable.is_absolute(),
+        "JOPLIN_LITE_LIVE_SMOKE_BIN must be an absolute executable path: {}",
+        executable.display()
+    );
+    assert!(
+        executable.is_file(),
+        "live smoke executable does not exist: {}",
+        executable.display()
+    );
+    executable
 }
 
 impl Drop for RunningApp {
@@ -83,7 +101,9 @@ fn direct_child_peak_rss_kib(parent: u32) -> Option<u64> {
 ///
 /// It never uses a personal profile: the app receives a newly-created absolute
 /// tempdir via `JOPLIN_LITE_PROFILE`. Run explicitly on a logged-in macOS GUI
-/// host with `cargo test --test derived_live_smoke -- --ignored`.
+/// host with `cargo test --test derived_live_smoke -- --ignored`. Set the
+/// test-only `JOPLIN_LITE_LIVE_SMOKE_BIN` to an absolute binary path to smoke
+/// a release build; it otherwise defaults to `CARGO_BIN_EXE_velotype`.
 #[test]
 #[ignore = "manual macOS WindowServer smoke"]
 fn ordinary_app_indexes_a_selectable_pdf_into_english_and_chinese_search() {
