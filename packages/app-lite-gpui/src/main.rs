@@ -15,8 +15,8 @@ mod app_menu;
 mod components;
 mod config;
 mod editor;
-mod extractor;
 mod export;
+mod extractor;
 mod file_url;
 mod i18n;
 mod library_menu;
@@ -146,7 +146,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // This must remain before all GPUI/profile initialization: the extractor
     // child receives only a bounded stdin stream and exits after one job.
-    if args.get(1).is_some_and(|arg| arg == "--extract-resource-text") {
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--extract-resource-text")
+    {
         std::process::exit(extractor::run_child(&args[2..]));
     }
     if let Some(request) = spike_app::global_help_or_version(&args[1..]) {
