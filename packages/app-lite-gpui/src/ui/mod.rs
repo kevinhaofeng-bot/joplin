@@ -1875,6 +1875,12 @@ impl LibraryShell {
         }
     }
 
+    fn active_session_has_unsaved_changes(&self, cx: &App) -> bool {
+        self.note_session
+            .as_ref()
+            .is_some_and(|session| !matches!(session.read(cx).save_state(), SaveState::Clean))
+    }
+
     /// Used by the native app lifecycle, whose close/quit callbacks operate
     /// outside ordinary element action dispatch. It shares the exact session
     /// boundary as note switches and the visible manual-save command.
@@ -3527,11 +3533,22 @@ impl LibraryShell {
                                 != expected_target.selected_note_id.as_ref()
                                 || !target_stays_selected
                         });
-                        if active_would_change
-                            && !shell.flush_active_session(FlushReason::NoteSwitch, shell_cx)
-                        {
-                            shell.retry_history_search(forward, shell_cx);
-                            return;
+                        if active_would_change {
+                            let saved_after_packet =
+                                shell.active_session_has_unsaved_changes(shell_cx);
+                            if !shell.flush_active_session(FlushReason::NoteSwitch, shell_cx) {
+                                shell.retry_history_search(forward, shell_cx);
+                                return;
+                            }
+                            if saved_after_packet {
+                                // The FTS packet was calculated before this
+                                // lifecycle save. Do not advance history with
+                                // a result that can omit the freshly saved
+                                // note; query again after the durable queue
+                                // has had a chance to drain.
+                                shell.retry_history_search(forward, shell_cx);
+                                return;
+                            }
                         }
                         shell.model.update(shell_cx, |model, _| {
                             model.commit_history_search_results(
@@ -3613,15 +3630,23 @@ impl LibraryShell {
                             .active_session_note_id()
                             .is_some_and(|id| !hits.iter().any(|hit| hit.note.id == *id))
                     });
-                    if active_would_disappear
-                        && !shell.flush_active_session(FlushReason::NoteSwitch, shell_cx)
-                    {
-                        // Composition/dirty-save ownership stays with the
-                        // retained editor. Keep the pending core fence and
-                        // retry after a short UI turn rather than unmounting
-                        // a session that acquired new input while FTS ran.
-                        shell.retry_active_search_refresh(shell_cx);
-                        return;
+                    if active_would_disappear {
+                        let saved_after_packet = shell.active_session_has_unsaved_changes(shell_cx);
+                        if !shell.flush_active_session(FlushReason::NoteSwitch, shell_cx) {
+                            // Composition/dirty-save ownership stays with the
+                            // retained editor. Keep the pending core fence and
+                            // retry after a short UI turn rather than unmounting
+                            // a session that acquired new input while FTS ran.
+                            shell.retry_active_search_refresh(shell_cx);
+                            return;
+                        }
+                        if saved_after_packet {
+                            // A successful flush may have queued a newer FTS
+                            // row. Discard this pre-save packet; the durable
+                            // queue/refresh-generation path will schedule the
+                            // next truthful read.
+                            return;
+                        }
                     }
                     let committed = shell.model.update(shell_cx, |model, _| {
                         model.commit_search_refresh(
