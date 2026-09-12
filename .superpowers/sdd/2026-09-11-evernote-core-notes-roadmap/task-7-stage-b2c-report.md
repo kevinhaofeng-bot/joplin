@@ -79,3 +79,20 @@ that B2 is accepted.
 
 Base corrective commit: `9c9116713664156b9d78d78ea334dbe40172fac1`.
 Follow-up implementation commit: `b72f58723cd51d0e3789141d71beac65854cda52`.
+
+## Round1 exact verification
+
+- `cargo fmt --manifest-path packages/app-lite-gpui/Cargo.toml` — success.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml mounted_search_refresh_error_retry_click_keeps_old_cards_then_recovers -- --nocapture` — `ui/tests.rs`, `1 passed; 0 failed`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml mounted_history_retry_click_reuses_forward_after_real_commit_failure -- --nocapture` — `ui/tests.rs`, `1 passed; 0 failed`; covers fault-injected history commit failure, visible Retry, real Forward Retry click, and successful same-direction restore.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml search_palette_preserves_link_popover_focus_on_escape_and_backdrop -- --nocapture` — `ui/tests.rs`, `1 passed; 0 failed`; covers Link focus/visibility, Escape and exposed-corner backdrop dismissal, retained session, selection and undo.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml search_palette_escape_and_backdrop_restore_the_original_focus_and_session -- --nocapture` — `ui/tests.rs`, `1 passed; 0 failed`.
+- `cargo test --manifest-path packages/app-lite-gpui/Cargo.toml search_palette_escape_restores_an_open_organization_input_and_its_panel -- --nocapture` — `ui/tests.rs`, `1 passed; 0 failed`.
+
+Round1 commits: `37dd66571cabfa24742752bc91f7586ba826d06e`,
+`db079032d5c9ff336a10ec1f7f80841b503fba29`, and
+`5ea454258f8dde38d3ba92082e9349200b27540a`.
+
+The latest complete suite, Release rebuild, and disposable-profile smoke remain
+controller-owned final-head gates; this section intentionally does not claim
+they were rerun here.
