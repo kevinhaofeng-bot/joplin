@@ -117,6 +117,10 @@ pub struct AppModel {
     /// may only publish if it still names the currently requested search.
     search_generation: u64,
     search_request: Option<SearchRequestFence>,
+    /// Repository events may invalidate a committed SearchRoute packet. They
+    /// are deliberately deferred to the shell's background FTS coordinator;
+    /// a generic All Notes refresh must never replace these cards in place.
+    search_refresh_pending: bool,
     navigation_index: LibraryNavigationIndex,
     active_session: Option<ActiveSession>,
     panes: PaneState,
@@ -180,6 +184,7 @@ impl AppModel {
             projections,
             search_generation: 0,
             search_request: None,
+            search_refresh_pending: false,
             navigation_index,
             active_session: None,
             panes,
@@ -830,6 +835,36 @@ impl AppModel {
         {
             self.projection_event_refreshes += 1;
         }
+        if self.navigation.search_query().is_some() {
+            // SearchRoute owns a bounded FTS packet, not `ListQuery(AllNotes)`.
+            // The retained shell observes this flag and recomputes the packet
+            // on its background executor with a snapshot fence.
+            if matches!(
+                self.reconciliation_pending,
+                Some(PendingReconciliation::CurrentRoute)
+            ) {
+                // Organization mutations still need their index/active-note
+                // metadata reconciled, but must not install an All Notes card
+                // packet while a typed SearchRoute is visible.
+                self.navigation_index = self.repository.list_navigation_index()?;
+                if let Some(active) = self.active_session.as_mut()
+                    && let Some(metadata) =
+                        self.repository.note_organization_state(&active.note.id)?
+                {
+                    active.note.notebook_id = metadata.notebook_id;
+                    active.note.tag_ids = metadata.tag_ids;
+                    active.note.updated_time = metadata.updated_time;
+                    active.note.deleted_time = metadata.deleted_time;
+                    active.note.revision = metadata.revision;
+                }
+                self.reconciliation_pending = None;
+                self.partial_commit_message = None;
+                self.status = AppStatus::Ready;
+                self.status_origin = StatusOrigin::Neutral;
+            }
+            self.search_refresh_pending = true;
+            return Ok(true);
+        }
         // Once any committed action is unreconciled, every relevant queued
         // event must retry the one full candidate, including NoteRestored and
         // NoteTrashed (which do not necessarily emit OrganizationChanged).
@@ -1104,6 +1139,134 @@ impl AppModel {
         self.search_generation
     }
 
+    /// Read-only history lookahead for the shell's background coordinator.
+    /// It never advances the cursor before FTS has produced a packet.
+    pub fn pending_history_search_query(&self, forward: bool) -> Option<String> {
+        self.navigation.history_search_query(forward)
+    }
+
+    /// Read-only target for a background SearchRoute history restoration.
+    /// Advancing the native cursor is intentionally deferred until its
+    /// bounded repository packet is ready to install atomically.
+    pub fn pending_history_search(&self, forward: bool) -> Option<(String, NavigationSnapshot)> {
+        self.navigation.history_search_snapshot(forward)
+    }
+
+    /// Returns an active SearchRoute packet that repository events have
+    /// invalidated. This is read-only: the UI must do the query off-thread and
+    /// call `commit_search_refresh` only after it has the bounded result set.
+    pub fn pending_search_refresh(&self) -> Option<(String, NavigationSnapshot)> {
+        if !self.search_refresh_pending {
+            return None;
+        }
+        Some((
+            self.navigation.search_query()?.to_owned(),
+            self.navigation.snapshot(),
+        ))
+    }
+
+    /// Atomically replace the cards of the already-active SearchRoute. It
+    /// never creates history and cannot turn the search view into All Notes.
+    pub fn commit_search_refresh(
+        &mut self,
+        query: &str,
+        expected_snapshot: &NavigationSnapshot,
+        hits: Vec<SearchHit>,
+    ) -> Result<bool, LibraryError> {
+        if !self.search_refresh_pending
+            || self.navigation.snapshot() != *expected_snapshot
+            || self.navigation.search_query() != Some(query)
+        {
+            return Ok(false);
+        }
+        let projections = hits.into_iter().map(|hit| hit.note).collect::<Vec<_>>();
+        let mut navigation = self.navigation.clone();
+        let active_session = match navigation.selected_note_id().cloned() {
+            Some(id) if projections.iter().any(|projection| projection.id == id) => {
+                match self.active_session.as_ref() {
+                    Some(active) if active.note.id == id => Some(active.clone()),
+                    _ => Some(ActiveSession {
+                        note: self
+                            .repository
+                            .load_note(&id)?
+                            .ok_or(LibraryError::NotFound)?,
+                    }),
+                }
+            }
+            Some(_) => {
+                navigation.select(None);
+                None
+            }
+            None => None,
+        };
+        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+            self.persist_shell_state_for(&navigation)?;
+        }
+        self.navigation = navigation;
+        self.projections = projections;
+        self.active_session = active_session;
+        self.search_refresh_pending = false;
+        Ok(true)
+    }
+
+    /// Publish an already-computed offline result packet into an existing
+    /// Back/Forward SearchRoute. Unlike `commit_search_results`, this moves
+    /// the current history cursor and never creates a new branch.
+    pub fn commit_history_search_results(
+        &mut self,
+        forward: bool,
+        query: &str,
+        expected_current: &NavigationSnapshot,
+        expected_target: &NavigationSnapshot,
+        hits: Vec<SearchHit>,
+    ) -> Result<bool, LibraryError> {
+        if &self.navigation.snapshot() != expected_current {
+            return Ok(false);
+        }
+        let mut navigation = self.navigation.clone();
+        let snapshot = if forward {
+            navigation.navigate_forward()
+        } else {
+            navigation.navigate_back()
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(false);
+        };
+        if &snapshot != expected_target || navigation.search_query() != Some(query) {
+            return Ok(false);
+        }
+        let projections = hits.into_iter().map(|hit| hit.note).collect::<Vec<_>>();
+        let active_session = match navigation.selected_note_id().cloned() {
+            Some(id) if projections.iter().any(|projection| projection.id == id) => {
+                match self.active_session.as_ref() {
+                    Some(active) if active.note.id == id => Some(active.clone()),
+                    _ => Some(ActiveSession {
+                        note: self
+                            .repository
+                            .load_note(&id)?
+                            .ok_or(LibraryError::NotFound)?,
+                    }),
+                }
+            }
+            Some(_) => {
+                navigation.select(None);
+                None
+            }
+            None => None,
+        };
+        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+            self.persist_shell_state_for(&navigation)?;
+        }
+        // `snapshot` is intentionally consumed only after all fallible work:
+        // a failed query must leave both cursor and mounted editor untouched.
+        let _ = snapshot;
+        self.navigation = navigation;
+        self.projections = projections;
+        self.active_session = active_session;
+        self.search_refresh_pending = false;
+        Ok(true)
+    }
+
     /// Atomically publish a background FTS packet when it still belongs to the
     /// active request. `projections` is intentionally the single card-list
     /// authority; snippets stay transient to the palette renderer.
@@ -1153,6 +1316,7 @@ impl AppModel {
         self.navigation = navigation;
         self.projections = projections;
         self.active_session = active_session;
+        self.search_refresh_pending = false;
         self.search_request = None;
         Ok(true)
     }

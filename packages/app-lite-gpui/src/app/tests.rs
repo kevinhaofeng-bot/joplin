@@ -497,6 +497,145 @@ fn search_packet_cannot_overwrite_a_route_change_after_it_started() {
 }
 
 #[test]
+fn history_search_packet_moves_cursor_only_after_matching_target_is_ready() {
+    let (_profile, repository) = repository();
+    let result = create(&repository, "history result");
+    let mut model = AppModel::open(repository).expect("open model");
+    let hit = SearchHit {
+        note: model
+            .projections()
+            .iter()
+            .find(|row| row.id == result)
+            .expect("result projection")
+            .clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+
+    let generation = model.begin_search("history");
+    assert!(
+        model
+            .commit_search_results(
+                generation,
+                "history".into(),
+                vec![hit.clone()],
+                Some(result)
+            )
+            .expect("commit search")
+    );
+    model
+        .dispatch(AppAction::NavigateBack)
+        .expect("ordinary back leaves search route");
+    let expected_current = model.navigation().snapshot();
+    let (query, expected_target) = model
+        .pending_history_search(true)
+        .expect("forward target is the retained search route");
+    assert_eq!(query, "history");
+
+    assert!(
+        model
+            .commit_history_search_results(
+                true,
+                &query,
+                &expected_current,
+                &expected_target,
+                vec![hit],
+            )
+            .expect("history packet commit")
+    );
+    assert_eq!(model.navigation().search_query(), Some("history"));
+    assert_eq!(model.navigation().snapshot(), expected_target);
+    assert_eq!(model.projections().len(), 1);
+}
+
+#[test]
+fn stale_history_search_packet_cannot_advance_cursor() {
+    let (_profile, repository) = repository();
+    let result = create(&repository, "history stale result");
+    let mut model = AppModel::open(repository).expect("open model");
+    let hit = SearchHit {
+        note: model
+            .projections()
+            .iter()
+            .find(|row| row.id == result)
+            .expect("result projection")
+            .clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+    let generation = model.begin_search("stale history");
+    assert!(
+        model
+            .commit_search_results(generation, "stale history".into(), vec![hit.clone()], None)
+            .expect("commit search")
+    );
+    model
+        .dispatch(AppAction::NavigateBack)
+        .expect("leave search route");
+    let expected_current = model.navigation().snapshot();
+    let (query, expected_target) = model
+        .pending_history_search(true)
+        .expect("forward search target");
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Trash,
+            selected_note_id: None,
+        })
+        .expect("change route while worker runs");
+
+    assert!(
+        !model
+            .commit_history_search_results(
+                true,
+                &query,
+                &expected_current,
+                &expected_target,
+                vec![hit],
+            )
+            .expect("stale packet is ignored")
+    );
+    assert_eq!(model.navigation().route(), &LibraryRoute::Trash);
+    assert_eq!(model.navigation().search_query(), None);
+}
+
+#[test]
+fn projection_events_never_replace_an_active_search_packet_with_all_notes() {
+    let (_profile, repository) = repository();
+    let matching = create(&repository, "only matching result");
+    let unrelated = create(&repository, "unrelated card");
+    let mut model = AppModel::open(repository).expect("open model");
+    let hit = SearchHit {
+        note: model
+            .projections()
+            .iter()
+            .find(|row| row.id == matching)
+            .expect("matching projection")
+            .clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+    let generation = model.begin_search("matching");
+    assert!(
+        model
+            .commit_search_results(generation, "matching".into(), vec![hit], None)
+            .expect("commit search")
+    );
+
+    assert!(
+        model
+            .refresh_projection_events([LibraryEvent::NoteProjectionChanged(unrelated)])
+            .expect("event is retained for background search refresh")
+    );
+    assert_eq!(model.navigation().search_query(), Some("matching"));
+    assert_eq!(model.projections().len(), 1);
+    assert_eq!(model.projections()[0].id, matching);
+    assert_eq!(
+        model.pending_search_refresh(),
+        Some(("matching".into(), model.navigation().snapshot()))
+    );
+}
+
+#[test]
 fn selection_uses_note_id_and_survives_sort_refresh() {
     let (_profile, repository) = repository();
     let first = create(&repository, "first");

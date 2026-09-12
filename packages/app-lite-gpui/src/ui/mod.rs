@@ -512,6 +512,9 @@ pub struct LibraryShell {
     search_palette_generation: Option<u64>,
     search_palette_selected: usize,
     _search_task: Option<Task<()>>,
+    _history_search_task: Option<Task<()>>,
+    _search_route_refresh_task: Option<Task<()>>,
+    history_search_notice: Option<String>,
     organization_panel_open: bool,
     pending_destructive_action: Option<PendingDestructiveAction>,
     /// Retained alongside the shell so the typed navigation tree can request
@@ -971,6 +974,9 @@ impl LibraryShell {
             search_palette_generation: None,
             search_palette_selected: 0,
             _search_task: None,
+            _history_search_task: None,
+            _search_route_refresh_task: None,
+            history_search_notice: None,
             organization_panel_open: false,
             pending_destructive_action: None,
             sidebar_scroll: UniformListScrollHandle::new(),
@@ -1145,6 +1151,15 @@ impl LibraryShell {
                             if this
                                 .update(cx, |shell, shell_cx| {
                                     shell.indexing_status = status;
+                                    // A note save emits its projection event
+                                    // before Stage B1 has committed its FTS
+                                    // row. Waiting for the queue to become
+                                    // idle ensures an active SearchRoute is
+                                    // refreshed from the new index, rather
+                                    // than immediately reading stale matches.
+                                    if !scheduled {
+                                        shell.schedule_active_search_refresh(shell_cx);
+                                    }
                                     shell_cx.notify();
                                 })
                                 .is_err()
@@ -1232,13 +1247,18 @@ impl LibraryShell {
         {
             return false;
         }
-        self.model
+        let refreshed = self
+            .model
             .update(cx, |model, model_cx| {
                 let result = model.refresh_projection_events(events.iter().cloned());
                 model_cx.notify();
                 result
             })
-            .is_ok()
+            .is_ok();
+        if refreshed {
+            self.schedule_active_search_refresh(cx);
+        }
+        refreshed
     }
 
     fn poll_active_session(&mut self, cx: &mut Context<Self>) {
@@ -1580,6 +1600,19 @@ impl LibraryShell {
             self.set_active_session_reconciliation_lock(true, cx);
             cx.notify();
             return false;
+        }
+        if let AppAction::NavigateBack | AppAction::NavigateForward = action {
+            let forward = matches!(action, AppAction::NavigateForward);
+            if self.model.read_with(cx, |model, _| {
+                model.pending_history_search_query(forward).is_some()
+            }) {
+                if let Some(reason) = self.flush_reason_for_action(&action)
+                    && !self.flush_active_session(reason, cx)
+                {
+                    return false;
+                }
+                return self.schedule_history_search(forward, cx);
+            }
         }
         // Restore and purge are the two lifecycle transitions which make a
         // Trash detail legal again or remove it forever. A deliberately
@@ -3404,6 +3437,103 @@ impl LibraryShell {
             });
         });
         self._search_task = Some(task);
+        cx.notify();
+    }
+
+    /// Back/Forward never advances into SearchRoute until this worker has a
+    /// bounded local packet to install. This preserves the retained editor
+    /// underneath the palette and prevents the generic list reducer from
+    /// treating a search destination as All Notes.
+    fn schedule_history_search(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some((repository, query, expected_current, expected_target)) =
+            self.model.read_with(cx, |model, _| {
+                model
+                    .pending_history_search(forward)
+                    .map(|(query, target)| {
+                        (
+                            model.repository(),
+                            query,
+                            model.navigation().snapshot(),
+                            target,
+                        )
+                    })
+            })
+        else {
+            return false;
+        };
+        self._history_search_task = None;
+        self.history_search_notice = Some("正在恢复本地搜索结果…".into());
+        let query_for_worker = query.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut parsed = SearchQuery::parse(&query_for_worker);
+                    parsed
+                        .set_page(0, SearchQuery::MAX_PAGE_SIZE)
+                        .expect("bounded history search page");
+                    repository.search(parsed)
+                })
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                let outcome = match result {
+                    Ok(hits) => shell.model.update(shell_cx, |model, _| {
+                        model.commit_history_search_results(
+                            forward,
+                            &query,
+                            &expected_current,
+                            &expected_target,
+                            hits,
+                        )
+                    }),
+                    Err(error) => Err(error),
+                };
+                shell.history_search_notice = match outcome {
+                    Ok(true) | Ok(false) => None,
+                    Err(error) => Some(format!("无法恢复搜索结果：{error}")),
+                };
+                shell_cx.notify();
+            });
+        });
+        self._history_search_task = Some(task);
+        cx.notify();
+        true
+    }
+
+    /// Repository events while SearchRoute is active must not synchronously
+    /// fall back to an All Notes list. Recompute the existing typed packet in
+    /// the background, fenced to this exact route snapshot.
+    fn schedule_active_search_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some((repository, query, expected_snapshot)) = self.model.read_with(cx, |model, _| {
+            model
+                .pending_search_refresh()
+                .map(|(query, snapshot)| (model.repository(), query, snapshot))
+        }) else {
+            return;
+        };
+        self._search_route_refresh_task = None;
+        let query_for_worker = query.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut parsed = SearchQuery::parse(&query_for_worker);
+                    parsed
+                        .set_page(0, SearchQuery::MAX_PAGE_SIZE)
+                        .expect("bounded SearchRoute refresh page");
+                    repository.search(parsed)
+                })
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                if let Ok(hits) = result {
+                    let _ = shell.model.update(shell_cx, |model, _| {
+                        model.commit_search_refresh(&query, &expected_snapshot, hits)
+                    });
+                }
+                shell_cx.notify();
+            });
+        });
+        self._search_route_refresh_task = Some(task);
         cx.notify();
     }
 
@@ -5337,6 +5467,17 @@ impl Render for LibraryShell {
                 .max_w(px(520.0))
                 .text_size(px(11.0))
                 .text_color(rgba(0xa34838ff))
+                .child(notice.clone())
+        }))
+        .children(self.history_search_notice.as_ref().map(|notice| {
+            div()
+                .id("library-history-search-status")
+                .absolute()
+                .bottom(px(106.0))
+                .right(px(14.0))
+                .max_w(px(520.0))
+                .text_size(px(11.0))
+                .text_color(rgba(0x536f59ff))
                 .child(notice.clone())
         }))
         .children(self.startup_notice.as_ref().map(|notice| {

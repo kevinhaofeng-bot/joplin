@@ -113,6 +113,15 @@ impl NavigationHistory {
         })
     }
 
+    fn peek(&self, forward: bool) -> Option<&NavigationSnapshot> {
+        let index = if forward {
+            self.cursor + 1
+        } else {
+            self.cursor.checked_sub(1)?
+        };
+        self.entries.get(index)
+    }
+
     /// A container/tag can be deleted while several typed snapshots still
     /// point at it. Keep user selection where All Notes can still resolve it,
     /// but never leave a Back/Forward entry that can resurrect a tombstoned
@@ -258,6 +267,25 @@ impl NavigationState {
         let snapshot = self.history.forward()?;
         self.apply_history_snapshot(&snapshot);
         Some(snapshot)
+    }
+
+    pub(crate) fn history_search_query(&self, forward: bool) -> Option<String> {
+        self.history_search_snapshot(forward)
+            .map(|(query, _)| query)
+    }
+
+    /// The shell must fence a deferred history worker against both ends of
+    /// the transition. The query alone is not enough: two snapshots can use
+    /// the same text while retaining different selected-note identities.
+    pub(crate) fn history_search_snapshot(
+        &self,
+        forward: bool,
+    ) -> Option<(String, NavigationSnapshot)> {
+        let snapshot = self.history.peek(forward)?.clone();
+        match &snapshot.destination {
+            AppDestination::SearchRoute { query } => Some((query.clone(), snapshot)),
+            AppDestination::Library(_) => None,
+        }
     }
 
     pub(crate) fn set_sort_for_route(&mut self, sort: SortSpec) {
