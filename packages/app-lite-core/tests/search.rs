@@ -803,6 +803,125 @@ fn filename_terms_support_short_long_cjk_phrases_and_negation() {
 }
 
 #[test]
+fn quoted_latin_filename_phrase_survives_trash_scope_and_detach() {
+    let (_profile, repo) = repository();
+    let resource = repo
+        .import_resource(
+            b"one",
+            "quarterly ledger report.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .unwrap();
+    let note = create(&repo, "neutral", "neutral");
+    let _associated = repo
+        .associate_resource(AssociateResource {
+            snapshot: SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: note.title.clone(),
+                document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                    resource_id: resource.clone(),
+                    filename: "display-name.pdf".into(),
+                    media_type: "application/pdf".into(),
+                }]),
+                resource_ids: vec![resource],
+                selected_thumbnail_id: None,
+            },
+        })
+        .unwrap();
+    let phrase = SearchQuery::parse("\"quarterly ledger\"");
+    assert_eq!(repo.search(phrase.clone()).unwrap().len(), 1);
+
+    repo.trash_note(&note.id).unwrap();
+    assert!(repo.search(phrase.clone()).unwrap().is_empty());
+    assert_eq!(
+        repo.search(SearchQuery::parse("trash:true \"quarterly ledger\""))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    repo.restore_note(&note.id).unwrap();
+    let restored_note = repo.load_note(&note.id).unwrap().unwrap();
+    let restored = repo
+        .save_note(SaveNote {
+            id: restored_note.id,
+            expected_revision: restored_note.revision,
+            title: restored_note.title,
+            document: doc("neutral"),
+            resource_ids: Vec::new(),
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    assert_eq!(restored.id, note.id);
+    assert!(repo.search(phrase).unwrap().is_empty());
+    assert!(
+        repo.search(SearchQuery::parse("ledger"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn restored_resource_repopulates_filename_fts() {
+    let (profile, repo) = repository();
+    let resource = repo
+        .import_resource(b"one", "restore-ledger.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = create(&repo, "neutral", "neutral");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "display-name.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    drop(repo);
+
+    let path = profile.path().join("library.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE resources SET deleted_time = 1 WHERE id = ?1",
+            [resource.as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM resource_filename_unicode",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    connection
+        .execute(
+            "UPDATE resources SET deleted_time = 0 WHERE id = ?1",
+            [resource.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = LibraryRepository::open(&path).unwrap();
+    let hits = reopened
+        .search(SearchQuery::parse("restore-ledger"))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_resource, Some(resource));
+}
+
+#[test]
 fn parser_keeps_unknown_operators_as_text_and_supports_escaped_quotes() {
     let parsed = SearchQuery::parse("unknown:value \"a \\\"quoted\\\" phrase\" tag:red tag:blue");
     assert!(
