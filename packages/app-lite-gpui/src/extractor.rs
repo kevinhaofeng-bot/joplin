@@ -32,6 +32,15 @@ pub fn run_pdf_child_for_verified_file(
     mut file: File,
     expected_size: i64,
 ) -> Result<String, PdfChildError> {
+    let exe = std::env::current_exe().map_err(|_| PdfChildError::Spawn)?;
+    run_pdf_child_for_verified_file_with_exe(file, expected_size, exe)
+}
+
+pub fn run_pdf_child_for_verified_file_with_exe(
+    mut file: File,
+    expected_size: i64,
+    exe: std::path::PathBuf,
+) -> Result<String, PdfChildError> {
     if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected_size) {
         return Err(PdfChildError::TooLarge);
     }
@@ -40,7 +49,6 @@ pub fn run_pdf_child_for_verified_file(
     }
     use std::io::Seek;
     file.rewind().map_err(|_| PdfChildError::Io)?;
-    let exe = std::env::current_exe().map_err(|_| PdfChildError::Spawn)?;
     let mut child = Command::new(exe)
         .args(["--extract-resource-text", "--mime", "application/pdf"])
         .stdin(Stdio::from(file))
