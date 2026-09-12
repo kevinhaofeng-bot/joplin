@@ -530,11 +530,12 @@ impl EditorCore {
         self.find.clear();
     }
 
-    pub(crate) fn find_matches_for_node(
+    pub(crate) fn find_matches_for_node_in_range(
         &self,
         node_id: NodeId,
+        utf8_range: Range<usize>,
     ) -> impl Iterator<Item = (&FindMatch, bool)> {
-        self.find.matches_for_node(node_id)
+        self.find.matches_for_node_in_range(node_id, utf8_range)
     }
 
     #[cfg(test)]
@@ -545,6 +546,11 @@ impl EditorCore {
     #[cfg(test)]
     pub(crate) fn find_matcher_compiles_for_test(&self) -> usize {
         self.find.matcher_compiles_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_structural_membership_work_for_test(&self) -> usize {
+        self.find.structural_membership_work_for_test()
     }
 
     /// Register a point that an asynchronous external resource completion
@@ -1094,6 +1100,7 @@ impl EditorCore {
             cached.layout.bounds.origin.x += offset_x_pixels;
             cached.layout.bounds.origin.y += offset_y_pixels;
         }
+        self.layout.translate_find_highlight_viewport(offset_y);
         self.layout_offset = (offset_x, offset_y);
     }
 
@@ -1112,6 +1119,7 @@ impl EditorCore {
             cached.layout.bounds.origin.x -= offset_x_pixels;
             cached.layout.bounds.origin.y -= offset_y_pixels;
         }
+        self.layout.translate_find_highlight_viewport(-offset_y);
         self.layout_offset = (0.0, 0.0);
     }
 

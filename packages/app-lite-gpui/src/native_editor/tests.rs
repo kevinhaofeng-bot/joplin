@@ -7249,6 +7249,70 @@ async fn find_paints_only_visible_match_geometry_for_long_notes(cx: &mut gpui::T
 }
 
 #[gpui::test]
+async fn find_dense_single_paragraph_only_materializes_viewport_highlights(
+    cx: &mut gpui::TestAppContext,
+) {
+    // One wrapped text block stays in `layout.visible()` for the whole
+    // viewport. This catches an implementation that only virtualizes by
+    // block and therefore turns every match in a long paragraph into paint
+    // geometry on every frame.
+    let mut cx = cx.add_empty_window();
+    let mut editor = EditorCore::for_test(&"needle ".repeat(2_400), &mut cx);
+    editor.set_find_query("needle", false).unwrap();
+    assert_eq!(editor.find_summary().total, 2_400);
+    let document = editor.document().clone();
+    cx.update(|window, _| {
+        editor
+            .layout
+            .shape_visible_with_window(&document, 0.0, 96.0, 48.0, window);
+    });
+    let top = render::find_highlights_for_test(&editor);
+    assert!(
+        !top.is_empty() && top.len() < 96,
+        "a dense single paragraph needs only viewport-sized highlight geometry, got {}",
+        top.len()
+    );
+
+    let tail_viewport_top = 8_000.0;
+    cx.update(|window, _| {
+        editor
+            .layout
+            .shape_visible_with_window(&document, tail_viewport_top, 96.0, 48.0, window);
+    });
+    let tail = render::find_highlights_for_test(&editor);
+    assert!(
+        !tail.is_empty() && tail.len() < 96,
+        "scrolling a dense paragraph keeps virtualized geometry"
+    );
+    assert!(
+        tail.iter()
+            .all(|highlight| highlight.bounds.bottom() >= px(tail_viewport_top - 48.0)),
+        "tail viewport must paint its own matches, rather than truncating the first matches"
+    );
+}
+
+#[gpui::test]
+fn find_structural_cache_pruning_is_linear_for_long_notes(cx: &mut gpui::TestAppContext) {
+    const BLOCKS: usize = 1_024;
+    let mut editor =
+        EditorCore::for_test_paragraphs((0..BLOCKS).map(|index| format!("needle {index}")), cx);
+    let first = editor.document().blocks()[0].id;
+    editor.set_find_query("needle", false).unwrap();
+    let work_before = editor.find_structural_membership_work_for_test();
+
+    editor
+        .apply(Transaction::SplitBlock {
+            at: DocPoint::new(first, 0),
+        })
+        .expect("split produces one structural text-node insertion");
+    assert_eq!(editor.find_summary().total, BLOCKS);
+    assert!(
+        editor.find_structural_membership_work_for_test() - work_before <= BLOCKS * 3,
+        "structural cache pruning must use O(N) membership work"
+    );
+}
+
+#[gpui::test]
 async fn offscreen_find_seek_refines_wrapped_prefix_before_using_exact_range(
     cx: &mut gpui::TestAppContext,
 ) {

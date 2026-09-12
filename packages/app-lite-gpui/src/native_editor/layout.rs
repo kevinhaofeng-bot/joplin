@@ -549,6 +549,11 @@ pub struct LayoutRegistry {
     peak_accounted_bytes: usize,
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
+    /// Actual canvas viewport plus a small visual overscan. This is distinct
+    /// from the larger block prefetch window: a single giant paragraph may be
+    /// retained as one visible block, while find highlights still need a
+    /// byte-range filter for the rows on screen.
+    find_highlight_viewport: Option<Range<f32>>,
     /// Stable fractional keys mirror the document sequence without keeping a
     /// second ordinal Vec/HashMap.  Structural invalidation updates only the
     /// removed/inserted keys; selection comparisons use these keys directly.
@@ -596,6 +601,7 @@ impl LayoutRegistry {
             peak_accounted_bytes: 0,
             first_visible: 0,
             last_visible: 0,
+            find_highlight_viewport: None,
             order_keys: TreeMap::default(),
             order_keys_revision: None,
             ordered_numbers: HashMap::new(),
@@ -661,6 +667,83 @@ impl LayoutRegistry {
 
     pub fn visible_range(&self) -> Range<usize> {
         self.first_visible..self.last_visible
+    }
+
+    /// Byte interval of this shaped text block that intersects the current
+    /// paint viewport (with a quarter-viewport overscan). The scan walks
+    /// shaped rows, not matches; callers can binary-search their sorted match
+    /// ranges and avoid building note-wide decoration geometry.
+    pub fn find_highlight_text_range(&self, node_id: NodeId) -> Option<Range<usize>> {
+        let viewport = self.find_highlight_viewport.as_ref()?;
+        let cached = self.cache.get(&node_id)?;
+        if cached.is_atomic || cached.layout.text_lines.is_empty() {
+            return None;
+        }
+        let mut line_top = cached.layout.bounds.top();
+        let mut utf8_offset = 0usize;
+        let mut visible_start = None;
+        let mut visible_end = 0usize;
+        for (index, line) in cached.layout.text_lines.iter().enumerate() {
+            let line_bottom = line_top + line.size(cached.line_height).height;
+            if f32::from(line_bottom) >= viewport.start && f32::from(line_top) <= viewport.end {
+                // GPUI's `WrappedLineLayout::size` and paint paths both use
+                // this raw boundary count to define visual y rows. Reaching
+                // two boundary offsets directly therefore follows the same
+                // row coordinate system without walking every soft row of a
+                // giant hard line merely to locate this viewport. The local
+                // `for_each_wrapped_row` is deliberately more defensive for
+                // selection geometry, but it is not the paint-row authority.
+                let row_count = line.wrap_boundaries().len().saturating_add(1).max(1);
+                let first_row = row_index_for_y(
+                    row_count,
+                    px((viewport.start - f32::from(line_top)).max(0.0)),
+                    cached.line_height,
+                );
+                let last_row = row_index_for_y(
+                    row_count,
+                    px((viewport.end - f32::from(line_top)).max(0.0)),
+                    cached.line_height,
+                );
+                let row_start = if first_row == 0 {
+                    0
+                } else {
+                    wrap_boundary_offset(line, first_row - 1).unwrap_or(0)
+                };
+                let row_end = if last_row + 1 >= row_count {
+                    line.len()
+                } else {
+                    wrap_boundary_offset(line, last_row).unwrap_or(line.len())
+                };
+                if row_end > row_start {
+                    visible_start.get_or_insert(utf8_offset.saturating_add(row_start));
+                    visible_end = utf8_offset.saturating_add(row_end);
+                }
+            }
+            line_top = line_bottom;
+            if visible_start.is_some() && f32::from(line_bottom) > viewport.end {
+                break;
+            }
+            utf8_offset = utf8_offset
+                .saturating_add(line.len())
+                .saturating_add(usize::from(index + 1 < cached.layout.text_lines.len()));
+        }
+        visible_start.map(|start| start..visible_end)
+    }
+
+    pub fn intersects_find_highlight_viewport(&self, bounds: Bounds<Pixels>) -> bool {
+        self.find_highlight_viewport
+            .as_ref()
+            .is_some_and(|viewport| {
+                f32::from(bounds.bottom()) >= viewport.start
+                    && f32::from(bounds.top()) <= viewport.end
+            })
+    }
+
+    pub(crate) fn translate_find_highlight_viewport(&mut self, offset_y: f32) {
+        if let Some(viewport) = &mut self.find_highlight_viewport {
+            viewport.start += offset_y;
+            viewport.end += offset_y;
+        }
     }
 
     /// Return the document-height-indexed block box even when the text block
@@ -754,6 +837,11 @@ impl LayoutRegistry {
     ) {
         let viewport_height = viewport_height.max(1.0);
         let viewport_bottom = viewport_top.max(0.0) + viewport_height;
+        let highlight_overscan = viewport_height * 0.25;
+        self.find_highlight_viewport = Some(
+            (viewport_top.max(0.0) - highlight_overscan).max(0.0)
+                ..viewport_bottom + highlight_overscan,
+        );
         let prefetch_top = (viewport_top.max(0.0) - viewport_height * PREFETCH_VIEWPORTS).max(0.0);
         let prefetch_bottom = viewport_bottom + viewport_height * PREFETCH_VIEWPORTS;
         let first = self
@@ -999,6 +1087,7 @@ impl LayoutRegistry {
 
     pub(crate) fn clear_exact_cache(&mut self) {
         self.visible.clear();
+        self.find_highlight_viewport = None;
         self.cache.clear();
         self.lru.clear();
         self.used_bytes = 0;

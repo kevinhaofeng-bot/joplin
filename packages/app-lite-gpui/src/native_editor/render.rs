@@ -305,13 +305,19 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
         .visible()
         .iter()
         .flat_map(|block| {
-            editor
-                .find_matches_for_node(block.node_id)
-                .flat_map(|(found, primary)| {
-                    layout
-                        .range_segment_bounds(found.node_id, found.utf8_range.clone())
-                        .into_iter()
-                        .map(move |bounds| FindHighlightGeometry { bounds, primary })
+            layout
+                .find_highlight_text_range(block.node_id)
+                .into_iter()
+                .flat_map(|visible_utf8_range| {
+                    editor
+                        .find_matches_for_node_in_range(block.node_id, visible_utf8_range)
+                        .flat_map(|(found, primary)| {
+                            layout
+                                .range_segment_bounds(found.node_id, found.utf8_range.clone())
+                                .into_iter()
+                                .filter(|bounds| layout.intersects_find_highlight_viewport(*bounds))
+                                .map(move |bounds| FindHighlightGeometry { bounds, primary })
+                        })
                 })
         })
         .collect();

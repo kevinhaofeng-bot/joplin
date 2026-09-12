@@ -3,7 +3,10 @@
 //! Find is presentation state, not part of [`Document`], so changing a query
 //! never creates a document revision or history entry.
 
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use regex::RegexBuilder;
 
@@ -73,6 +76,8 @@ pub struct FindState {
     scanned_blocks: usize,
     #[cfg(test)]
     matcher_compiles: usize,
+    #[cfg(test)]
+    structural_membership_work: usize,
 }
 
 impl FindState {
@@ -179,8 +184,15 @@ impl FindState {
         // path to the one changed block above. Structural edits are rarer and
         // may discard cached nodes; only they need a complete total refresh.
         if text_order_changed {
+            let retained_nodes = self.text_order.iter().copied().collect::<HashSet<_>>();
+            #[cfg(test)]
+            {
+                self.structural_membership_work = self
+                    .structural_membership_work
+                    .saturating_add(self.blocks.len());
+            }
             self.blocks
-                .retain(|node_id, _| self.text_order.contains(node_id));
+                .retain(|node_id, _| retained_nodes.contains(node_id));
             self.total = self
                 .text_order
                 .iter()
@@ -260,17 +272,33 @@ impl FindState {
         })
     }
 
-    pub fn matches_for_node(&self, node_id: NodeId) -> impl Iterator<Item = (&FindMatch, bool)> {
+    /// Return only the sorted literal matches which overlap a shaped byte
+    /// interval. Renderers use this for dense paragraphs so scrolling does
+    /// not create geometry for every note-wide match each frame.
+    pub fn matches_for_node_in_range(
+        &self,
+        node_id: NodeId,
+        utf8_range: Range<usize>,
+    ) -> impl Iterator<Item = (&FindMatch, bool)> {
         let primary = self.primary;
         self.blocks
             .get(&node_id)
             .into_iter()
             .flat_map(move |cached| {
+                let first = cached
+                    .matches
+                    .partition_point(|found| found.utf8_range.end <= utf8_range.start);
+                let last = cached
+                    .matches
+                    .partition_point(|found| found.utf8_range.start < utf8_range.end);
                 cached
                     .matches
-                    .iter()
+                    .get(first..last)
+                    .into_iter()
+                    .flatten()
                     .enumerate()
                     .map(move |(index, found)| {
+                        let index = first + index;
                         (found, primary == Some(FindCursor { node_id, index }))
                     })
             })
@@ -341,6 +369,11 @@ impl FindState {
     #[cfg(test)]
     pub(crate) fn matcher_compiles_for_test(&self) -> usize {
         self.matcher_compiles
+    }
+
+    #[cfg(test)]
+    pub(crate) fn structural_membership_work_for_test(&self) -> usize {
+        self.structural_membership_work
     }
 }
 
