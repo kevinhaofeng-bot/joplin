@@ -3,6 +3,18 @@
 Status: design boundary for the stage after D3a, 2026-09-13. No extractor is
 implemented or accepted by this brief.
 
+Source-first clarification from the unpacked Evernote 11.32.5 main bundle:
+`main-readable/src/modules/34309__module-34309.js::searchText` calls
+`di.quasar.queries.attachment.resourceSearchTextAndRecognition`, while
+`50177__module-50177.js::NOTE_RECOGNITIONS_AND_SEARCH` requests a resource's
+`recognition` and `searchText` from a GraphQL note response. The local
+`47391__module-47391.js::setSearchText` and migration `59009` persist/index
+that returned text. These paths support our derived-index data relationship;
+they **do not show an Evernote desktop PDFKit/OCR extraction algorithm**.
+Local macOS PDFKit/Vision extraction is an independent offline-first product
+decision for this single-user app, not a claim of reproducing their server
+implementation.
+
 Apple's PDFKit provides per-page [`PDFPage.string`](https://developer.apple.com/documentation/pdfkit/pdfpage/string?changes=_8&language=objc)
 for selectable PDF text. Vision provides [`VNRecognizeTextRequest`](https://developer.apple.com/documentation/vision/vnrecognizetextrequest?changes=_1&language=objc)
 and [`VNImageRequestHandler`](https://developer.apple.com/documentation/vision/vnimagerequesthandler?changes=_9_5)
@@ -19,6 +31,14 @@ stdout/stderr, and exits after one job. This isolates PDFKit/Vision transient
 allocations from the main app's steady RSS and makes child failure retryable;
 it is a hypothesis requiring measured parent/child peak RSS, not a performance
 claim.
+
+Because this is the **same executable**, an unconditional `-framework PDFKit`
+link can cause the GUI parent to load PDFKit at launch even if only the child
+calls its functions. Check the final binary's `otool -L` and actual parent
+startup images/RSS. Load PDFKit only after entering child mode (for example,
+through a child-only dynamic framework load) if the normal binary otherwise
+links it. Merely putting PDFKit calls behind an argument branch is not enough
+to prove idle-memory isolation.
 
 For PDF, spool the bounded verified stream into a 0600 short-lived file, open
 it with PDFKit, and read pages one at a time under autorelease pools. Enforce
