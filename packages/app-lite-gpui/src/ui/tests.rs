@@ -461,13 +461,25 @@ async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) 
             && panel.bottom() <= pane.bottom(),
         "900px window keeps the wrapped Find controls inside the editor pane: panel={panel:?}, pane={pane:?}"
     );
+    let input_bounds = cx
+        .debug_bounds("library-find-in-note-input")
+        .expect("find input viewport is mounted");
+    let canvas_bounds = cx
+        .debug_bounds("library-find-in-note-input-canvas")
+        .expect("find input canvas is mounted");
+    assert_eq!(input_bounds.size.width, canvas_bounds.size.width);
     let find_input = view.read_with(cx, |shell, _| shell.find_input.clone());
     let long_query = "长".repeat(80);
     cx.simulate_input(&long_query);
     redraw(cx);
     let visible_input = cx
-        .debug_bounds("library-find-in-note-panel")
+        .debug_bounds("library-find-in-note-input")
         .expect("find input viewport is mounted");
+    find_input.update(cx, |input, input_cx| {
+        input.move_horizontal(false, true);
+        input_cx.notify();
+    });
+    redraw(cx);
     let candidate_bounds = cx.update(|window, app| {
         find_input.update(app, |input, input_cx| {
             <TitleInput as EntityInputHandler>::bounds_for_range(
@@ -704,6 +716,44 @@ async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) 
         assert!(!shell.find_panel_open);
         assert!(shell.find_input.read(app).text().is_empty());
     });
+}
+
+#[gpui::test]
+async fn mounted_find_panel_shows_a_complete_ten_thousand_match_count(cx: &mut TestAppContext) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let body = "命中 ".repeat(10_000);
+    let note = repository
+        .create_note(CreateNote {
+            title: "大量命中".into(),
+            notebook_id: None,
+            document: rich_document(&body),
+        })
+        .expect("create 10k find fixture");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-f");
+    cx.simulate_input("命中");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone();
+        assert_eq!(editor.read(app).find_summary().total, 10_000);
+    });
+    let summary = cx
+        .debug_bounds("library-find-in-note-summary")
+        .expect("visible find summary");
+    assert!(summary.size.width >= px(90.0));
 }
 
 #[gpui::test]

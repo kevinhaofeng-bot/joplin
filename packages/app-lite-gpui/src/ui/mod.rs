@@ -5507,12 +5507,20 @@ impl LibraryShell {
                         .debug_selector(|| "library-find-in-note-input".to_owned())
                         .w(px(input_width))
                         .overflow_hidden()
-                        .child(input_canvas),
+                        .child(
+                            div()
+                                .id("library-find-in-note-input-canvas")
+                                .debug_selector(|| "library-find-in-note-input-canvas".to_owned())
+                                .w(px(input_width))
+                                .child(input_canvas),
+                        ),
                 )
                 .child(
                     div()
                         .id("library-find-in-note-summary")
+                        .debug_selector(|| "library-find-in-note-summary".to_owned())
                         .w(px(summary_width))
+                        .flex_none()
                         .text_size(px(11.0))
                         .text_color(rgba(0x718075ff))
                         .child(summary_text),
