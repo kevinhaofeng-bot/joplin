@@ -35,6 +35,9 @@ pub fn run_pdf_child_for_verified_file(
     if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected_size) {
         return Err(PdfChildError::TooLarge);
     }
+    if file.metadata().map_err(|_| PdfChildError::Io)?.len() != expected_size as u64 {
+        return Err(PdfChildError::Io);
+    }
     use std::io::Seek;
     file.rewind().map_err(|_| PdfChildError::Io)?;
     let exe = std::env::current_exe().map_err(|_| PdfChildError::Spawn)?;
@@ -47,17 +50,8 @@ pub fn run_pdf_child_for_verified_file(
         .map_err(|_| PdfChildError::Spawn)?;
     let mut stdout = child.stdout.take().ok_or(PdfChildError::Spawn)?;
     let mut stderr = child.stderr.take().ok_or(PdfChildError::Spawn)?;
-    let out = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        stdout
-            .take((MAX_OUTPUT_BYTES + 1) as u64)
-            .read_to_end(&mut v)
-            .map(|_| v)
-    });
-    let err = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        stderr.take(4097).read_to_end(&mut v).map(|_| v)
-    });
+    let out = std::thread::spawn(move || drain_bounded(&mut stdout, MAX_OUTPUT_BYTES));
+    let err = std::thread::spawn(move || drain_bounded(&mut stderr, 4096));
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait().map_err(|_| PdfChildError::Io)? {
@@ -69,16 +63,16 @@ pub fn run_pdf_child_for_verified_file(
                 .join()
                 .map_err(|_| PdfChildError::Io)?
                 .map_err(|_| PdfChildError::Io)?;
-            if out.len() > MAX_OUTPUT_BYTES {
+            if out.1 {
                 return Err(PdfChildError::OutputTooLarge);
             }
-            if err.len() > 4096 {
+            if err.1 {
                 return Err(PdfChildError::StderrTooLarge);
             }
             if !status.success() {
                 return Err(PdfChildError::Failed);
             }
-            return String::from_utf8(out).map_err(|_| PdfChildError::Utf8);
+            return String::from_utf8(out.0).map_err(|_| PdfChildError::Utf8);
         }
         if start.elapsed() >= CHILD_TIMEOUT {
             let _ = child.kill();
@@ -89,6 +83,23 @@ pub fn run_pdf_child_for_verified_file(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn drain_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut overflow = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(kept.len());
+        let take = remaining.min(read);
+        kept.extend_from_slice(&buffer[..take]);
+        overflow |= take != read;
+    }
+    Ok((kept, overflow))
 }
 
 pub fn run_child(args: &[String]) -> i32 {
