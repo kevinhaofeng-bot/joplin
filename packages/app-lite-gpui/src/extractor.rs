@@ -120,7 +120,10 @@ fn pdf_text(bytes: &[u8]) -> Result<String, &'static str> {
             }
         }
         let _: () = msg_send![document, release];
-        libc::dlclose(pdfkit);
+        // Deliberately retain the RTLD_LOCAL handle. This one-shot child exits
+        // immediately, whereas `dlclose` before the outer autorelease pool
+        // drains could unload PDFKit while its Foundation objects still live.
+        let _ = pdfkit;
         if out.trim().is_empty() {
             return Err("pdf-no-selectable-text");
         }
