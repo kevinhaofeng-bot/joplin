@@ -57,6 +57,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
@@ -104,11 +105,23 @@ struct IndexingWorkerGate {
 #[cfg(test)]
 static INDEXING_WORKER_GATE: Mutex<Option<IndexingWorkerGate>> = Mutex::new(None);
 
+/// The GPUI test executor is deterministic rather than a real thread pool.
+/// This narrow seam runs the *same shell scheduler worker call* on an OS
+/// thread when a transaction-level test must hold SQLite open while the test
+/// drives the mounted foreground window.
+#[cfg(test)]
+static INDEXING_WORKER_THREAD_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
 #[cfg(test)]
 pub(crate) fn install_indexing_worker_gate_for_test(gate: IndexingWorkerGate) {
     *INDEXING_WORKER_GATE
         .lock()
         .expect("indexing worker gate mutex poisoned") = Some(gate);
+}
+
+#[cfg(test)]
+pub(crate) fn run_indexing_worker_on_thread_for_test() {
+    INDEXING_WORKER_THREAD_FOR_TEST.store(true, Ordering::Release);
 }
 
 /// A bounded coalescing buffer between the repository's unbounded sender and
@@ -661,6 +674,7 @@ pub(crate) struct ImageFlowProbe {
 /// cancels the future immediately instead of merely letting a later weak-entity
 /// update notice the closed window.
 struct EventTaskLifetime {
+    cancelled: Arc<AtomicBool>,
     #[cfg(test)]
     cancellation_sender: Option<Sender<()>>,
 }
@@ -671,6 +685,7 @@ impl EventTaskLifetime {
         let (cancellation_sender, cancellation_receiver) = mpsc::channel();
         (
             Self {
+                cancelled: Arc::new(AtomicBool::new(false)),
                 cancellation_sender: Some(cancellation_sender),
             },
             cancellation_receiver,
@@ -678,13 +693,21 @@ impl EventTaskLifetime {
     }
 
     #[cfg(not(test))]
-    const fn unobserved() -> Self {
-        Self {}
+    fn unobserved() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
     }
 }
 
 impl Drop for EventTaskLifetime {
     fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
         #[cfg(test)]
         if let Some(cancellation_sender) = self.cancellation_sender.take() {
             let _ = cancellation_sender.send(());
@@ -874,11 +897,13 @@ impl LibraryShell {
         let event_task_lifetime = EventTaskLifetime::unobserved();
         #[cfg(not(test))]
         let indexing_task_lifetime = EventTaskLifetime::unobserved();
+        let indexing_cancelled = indexing_task_lifetime.cancellation_flag();
         let event_task = Self::spawn_event_bridge(event_receiver, event_task_lifetime, cx);
         let indexing_task = Self::spawn_index_scheduler(
             model.read(cx).repository(),
             indexing_receiver,
             indexing_task_lifetime,
+            indexing_cancelled,
             cx,
         );
         let mut shell = Self {
@@ -1011,6 +1036,7 @@ impl LibraryShell {
         repository: Arc<LibraryRepository>,
         receiver: Receiver<app_lite_core::LibraryEvent>,
         indexing_task_lifetime: EventTaskLifetime,
+        indexing_cancelled: Arc<AtomicBool>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         #[cfg(test)]
@@ -1018,6 +1044,8 @@ impl LibraryShell {
             .lock()
             .expect("indexing worker gate mutex poisoned")
             .take();
+        #[cfg(test)]
+        let worker_on_thread = INDEXING_WORKER_THREAD_FOR_TEST.swap(false, Ordering::AcqRel);
         cx.spawn(async move |this, cx| {
             let _indexing_task_lifetime = indexing_task_lifetime;
             // An open profile may already have durable work from a prior run.
@@ -1031,19 +1059,43 @@ impl LibraryShell {
                     // batch must run on GPUI's actual background executor so
                     // it cannot monopolize typing, navigation, or Cmd-Q.
                     let worker_repository = Arc::clone(&repository);
+                    let worker_cancelled = Arc::clone(&indexing_cancelled);
                     #[cfg(test)]
                     let gate = worker_gate.take();
+                    #[cfg(test)]
+                    let result = if worker_on_thread {
+                        let thread_repository = Arc::clone(&worker_repository);
+                        let thread_cancelled = Arc::clone(&worker_cancelled);
+                        let (sender, receiver) = futures::channel::oneshot::channel();
+                        std::thread::spawn(move || {
+                            let _ = sender.send(
+                                thread_repository
+                                    .process_search_jobs_until_cancelled(&thread_cancelled),
+                            );
+                        });
+                        receiver
+                            .await
+                            .unwrap_or(Err(app_lite_core::LibraryError::InvalidSnapshot))
+                    } else {
+                        cx.background_executor()
+                            .spawn(async move {
+                                #[cfg(test)]
+                                if let Some(gate) = gate {
+                                    let _ = gate.started.send(());
+                                    if gate.release.await.is_err() {
+                                        return Err(app_lite_core::LibraryError::InvalidSnapshot);
+                                    }
+                                }
+                                worker_repository
+                                    .process_search_jobs_until_cancelled(&worker_cancelled)
+                            })
+                            .await
+                    };
+                    #[cfg(not(test))]
                     let result = cx
                         .background_executor()
                         .spawn(async move {
-                            #[cfg(test)]
-                            if let Some(gate) = gate {
-                                let _ = gate.started.send(());
-                                if gate.release.await.is_err() {
-                                    return Err(app_lite_core::LibraryError::InvalidSnapshot);
-                                }
-                            }
-                            worker_repository.process_search_jobs()
+                            worker_repository.process_search_jobs_until_cancelled(&worker_cancelled)
                         })
                         .await;
                     match result {

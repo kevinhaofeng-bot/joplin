@@ -3,9 +3,10 @@
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{
     AssociateResource, CanonicalDocument, CreateNote, LibraryRepository, ListQuery,
-    RepositoryClock, RepositoryIdSource, SaveNote, SearchFilter, SearchQuery, SearchTerm,
+    RepositoryClock, RepositoryIdSource, SaveNote, SearchFilter, SearchIndexTestPhase, SearchQuery,
+    SearchTerm,
 };
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use tempfile::TempDir;
 
@@ -154,7 +155,13 @@ fn active_index_transaction_does_not_block_main_connection_note_load() {
     let (entered_sender, entered) = mpsc::channel();
     let (release_sender, release) = mpsc::channel();
     let release = Arc::new(Mutex::new(release));
-    repo.set_search_index_transaction_hook_for_test(Arc::new(move || {
+    let first_transaction = Arc::new(AtomicBool::new(true));
+    repo.set_search_index_transaction_hook_for_test(Arc::new(move |phase| {
+        if phase != SearchIndexTestPhase::TransactionStarted
+            || !first_transaction.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
         entered_sender.send(()).expect("signal active transaction");
         release
             .lock()
@@ -196,6 +203,73 @@ fn active_index_transaction_does_not_block_main_connection_note_load() {
             .id,
         first.id
     );
+}
+
+#[test]
+fn snapshot_save_waits_off_thread_for_an_active_index_transaction() {
+    let (_profile, repo) = repository();
+    create(&repo, "index writer", "holds the derived write transaction");
+    let editable = create(&repo, "editable", "before snapshot");
+    let (entered_sender, entered) = mpsc::channel();
+    let (release_sender, release) = mpsc::channel();
+    let release = Arc::new(Mutex::new(release));
+    let first_transaction = Arc::new(AtomicBool::new(true));
+    repo.set_search_index_transaction_hook_for_test(Arc::new(move |phase| {
+        if phase != SearchIndexTestPhase::TransactionStarted
+            || !first_transaction.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        entered_sender.send(()).expect("signal active transaction");
+        release
+            .lock()
+            .expect("release mutex")
+            .recv()
+            .expect("release index transaction");
+    }));
+    let index_repository = Arc::clone(&repo);
+    let index_worker = std::thread::spawn(move || index_repository.process_search_jobs());
+    entered
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("index transaction is active");
+
+    let (saved_sender, saved) = mpsc::channel();
+    let (save_started_sender, save_started) = mpsc::channel();
+    let save_repository = Arc::clone(&repo);
+    let expected_revision = editable.revision;
+    let editable_id = editable.id.clone();
+    let save_worker = std::thread::spawn(move || {
+        save_started_sender
+            .send(())
+            .expect("signal snapshot worker dispatch");
+        let outcome = save_repository.flush_snapshot_note(
+            SaveNote {
+                id: editable_id,
+                expected_revision,
+                title: "snapshot after index".into(),
+                document: doc("saved through the production snapshot entrypoint"),
+                resource_ids: vec![],
+                selected_thumbnail_id: None,
+            },
+            None,
+        );
+        saved_sender.send(outcome).expect("send snapshot result");
+    });
+    save_started
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("production snapshot worker dispatched");
+    assert!(
+        matches!(saved.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "the snapshot worker has no synchronous foreground result while the index write is held"
+    );
+    release_sender.send(()).expect("release index worker");
+    assert!(index_worker.join().expect("index worker").is_ok());
+    let saved = saved
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("snapshot finishes after bounded index transaction")
+        .expect("snapshot result");
+    save_worker.join().expect("snapshot worker");
+    assert_eq!(saved.title, "snapshot after index");
 }
 
 #[test]

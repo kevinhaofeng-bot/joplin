@@ -1,9 +1,24 @@
 use crate::{LibraryError, LibraryRepository};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Drains at most one bounded worker batch.  A failed document leaves its job
 /// untouched, so reopening the repository can retry without losing authority.
 pub fn process_search_jobs(repository: &LibraryRepository) -> Result<usize, LibraryError> {
+    process_search_jobs_with_cancellation(repository, None)
+}
+
+pub fn process_search_jobs_until_cancelled(
+    repository: &LibraryRepository,
+    cancelled: &AtomicBool,
+) -> Result<usize, LibraryError> {
+    process_search_jobs_with_cancellation(repository, Some(cancelled))
+}
+
+fn process_search_jobs_with_cancellation(
+    repository: &LibraryRepository,
+    cancelled: Option<&AtomicBool>,
+) -> Result<usize, LibraryError> {
     if let Some(error) = repository.take_search_job_failure() {
         return Err(error);
     }
@@ -11,13 +26,18 @@ pub fn process_search_jobs(repository: &LibraryRepository) -> Result<usize, Libr
         let jobs = crate::repository::take_search_jobs(connection, 100)?;
         let mut completed = 0;
         for job in jobs {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                break;
+            }
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // Test-only hook deliberately runs with the per-note SQLite write
             // transaction active. It proves foreground hydration uses its own
             // repository handle rather than merely parking before index work.
             #[cfg(any(test, feature = "test-support"))]
-            repository.notify_search_index_transaction_started_for_test();
+            repository.notify_search_index_transaction_for_test(
+                crate::repository::SearchIndexTestPhase::TransactionStarted,
+            );
             let source: Option<(String, String)> = transaction
                 .query_row(
                     "SELECT title, body_text FROM notes WHERE id=?1",
@@ -56,6 +76,10 @@ pub fn process_search_jobs(repository: &LibraryRepository) -> Result<usize, Libr
                 params![job.note_id.as_str(), job.updated_time, job.reason],
             )?;
             transaction.commit()?;
+            #[cfg(any(test, feature = "test-support"))]
+            repository.notify_search_index_transaction_for_test(
+                crate::repository::SearchIndexTestPhase::TransactionCommitted,
+            );
             completed += 1;
         }
         Ok(completed)

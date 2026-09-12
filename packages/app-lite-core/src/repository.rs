@@ -18,6 +18,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -163,6 +164,14 @@ pub enum OpenTestPhase {
 
 #[cfg(feature = "test-support")]
 pub type OpenTestHook = Arc<dyn Fn(OpenTestPhase) + Send + Sync>;
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum SearchIndexTestPhase {
+    TransactionStarted,
+    TransactionCommitted,
+}
 
 /// Supplies wall-clock milliseconds.  Kept at the repository boundary so a
 /// transaction can protect monotonic note timestamps even if the wall clock is
@@ -367,7 +376,7 @@ pub struct LibraryRepository {
     /// invocation so retry/reopen behavior remains observable.
     next_search_job_failure: Mutex<Option<LibraryError>>,
     #[cfg(any(test, feature = "test-support"))]
-    search_index_transaction_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    search_index_transaction_hook: Mutex<Option<Arc<dyn Fn(SearchIndexTestPhase) + Send + Sync>>>,
     #[cfg(test)]
     next_staged_resource_snapshot_failure: Mutex<Option<LibraryError>>,
     database_name: std::ffi::OsString,
@@ -810,7 +819,10 @@ impl LibraryRepository {
 
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
-    pub fn set_search_index_transaction_hook_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+    pub fn set_search_index_transaction_hook_for_test(
+        &self,
+        hook: Arc<dyn Fn(SearchIndexTestPhase) + Send + Sync>,
+    ) {
         *self
             .search_index_transaction_hook
             .lock()
@@ -818,14 +830,14 @@ impl LibraryRepository {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn notify_search_index_transaction_started_for_test(&self) {
+    pub(crate) fn notify_search_index_transaction_for_test(&self, phase: SearchIndexTestPhase) {
         let hook = self
             .search_index_transaction_hook
             .lock()
             .expect("search-index transaction hook mutex poisoned")
-            .take();
+            .clone();
         if let Some(hook) = hook {
-            hook();
+            hook(phase);
         }
     }
 
@@ -2806,6 +2818,16 @@ impl LibraryRepository {
     /// a note save is authoritative before this disposable projection exists.
     pub fn process_search_jobs(&self) -> Result<usize, LibraryError> {
         crate::search::process_search_jobs(self)
+    }
+
+    /// Stops only at a per-note transaction boundary. The current derived
+    /// projection either commits with its queue acknowledgement or rolls back;
+    /// no later queue identity is touched after cancellation is observed.
+    pub fn process_search_jobs_until_cancelled(
+        &self,
+        cancelled: &AtomicBool,
+    ) -> Result<usize, LibraryError> {
+        crate::search::process_search_jobs_until_cancelled(self, cancelled)
     }
 
     pub(crate) fn with_search_index_connection<T>(

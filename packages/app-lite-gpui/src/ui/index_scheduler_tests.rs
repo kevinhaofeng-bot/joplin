@@ -2,7 +2,8 @@ use super::*;
 use crate::app::AppAction;
 use crate::app::save_coordinator::ManualSaveClock;
 use app_lite_core::{
-    CanonicalDocument, CreateNote, LibraryError, LibraryRepository, SaveNote, SearchQuery,
+    CanonicalDocument, CreateNote, LibraryError, LibraryRepository, SaveNote, SearchIndexTestPhase,
+    SearchQuery,
 };
 use gpui::{TestAppContext, VisualTestContext};
 use std::sync::Arc;
@@ -357,7 +358,13 @@ async fn mounted_note_switch_and_shell_close_survive_an_active_index_transaction
     let (entered_sender, entered) = std::sync::mpsc::channel();
     let (release_sender, release) = std::sync::mpsc::channel();
     let release = Arc::new(std::sync::Mutex::new(release));
-    repository.set_search_index_transaction_hook_for_test(Arc::new(move || {
+    let first_transaction = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    repository.set_search_index_transaction_hook_for_test(Arc::new(move |phase| {
+        if phase != SearchIndexTestPhase::TransactionStarted
+            || !first_transaction.swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         entered_sender
             .send(())
             .expect("signal active index transaction");
@@ -406,5 +413,102 @@ async fn mounted_note_switch_and_shell_close_survive_an_active_index_transaction
             .expect("worker thread")
             .expect("worker result"),
         2
+    );
+}
+
+#[gpui::test]
+async fn mounted_scheduler_close_finishes_only_active_index_transaction(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "当前原子索引".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("first queued note");
+    let second = repository
+        .create_note(CreateNote {
+            title: "关窗后不得继续扫描".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("second queued note");
+    let third = repository
+        .create_note(CreateNote {
+            title: "保留队列身份".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("third queued note");
+    let queued_before_close = repository
+        .take_search_jobs(100)
+        .expect("capture deterministic queue order");
+    let active_id = queued_before_close[0].note_id.clone();
+    let remaining_ids = queued_before_close[1..]
+        .iter()
+        .map(|job| job.note_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let (started_sender, started) = std::sync::mpsc::channel();
+    let (release_sender, release) = std::sync::mpsc::channel();
+    let (committed_sender, committed) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Mutex::new(release));
+    repository.set_search_index_transaction_hook_for_test(Arc::new(move |phase| match phase {
+        SearchIndexTestPhase::TransactionStarted => {
+            started_sender.send(()).expect("signal active transaction");
+            release
+                .lock()
+                .expect("release mutex")
+                .recv()
+                .expect("release active transaction");
+        }
+        SearchIndexTestPhase::TransactionCommitted => {
+            committed_sender
+                .send(())
+                .expect("signal committed transaction");
+        }
+    }));
+    run_indexing_worker_on_thread_for_test();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.run_until_parked();
+    started
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("the shell scheduler entered BEGIN IMMEDIATE");
+
+    let cancelled = view.update(cx, |shell, _| {
+        shell.take_indexing_task_cancellation_receiver_for_test()
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(view);
+    cx.cx.update(|_| {});
+    cx.run_until_parked();
+    cancelled
+        .try_recv()
+        .expect("closing the shell cancels its retained scheduler task");
+
+    release_sender
+        .send(())
+        .expect("allow the active atomic transaction to finish");
+    committed
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("the current transaction committed exactly once");
+    let remaining = repository
+        .take_search_jobs(100)
+        .expect("remaining queue readable after scheduler close");
+    assert_eq!(
+        remaining.len(),
+        2,
+        "no later batch item may start after close"
+    );
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|job| job.note_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        remaining_ids,
+        "the exact later queue identities remain durable"
+    );
+    assert!(
+        !remaining.iter().any(|job| job.note_id == active_id),
+        "the active atomic note is acknowledged only after its committed projection"
     );
 }
