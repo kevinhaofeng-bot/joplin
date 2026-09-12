@@ -56,6 +56,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 #[cfg(test)]
@@ -89,6 +91,24 @@ pub(crate) enum IndexingStatus {
     Idle,
     Pending,
     Failed(String),
+}
+
+/// Test-only async barrier placed before the synchronous core batch. It proves
+/// that a running scheduler waits off the GPUI foreground executor.
+#[cfg(test)]
+struct IndexingWorkerGate {
+    started: Sender<()>,
+    release: futures::channel::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static INDEXING_WORKER_GATE: Mutex<Option<IndexingWorkerGate>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn install_indexing_worker_gate_for_test(gate: IndexingWorkerGate) {
+    *INDEXING_WORKER_GATE
+        .lock()
+        .expect("indexing worker gate mutex poisoned") = Some(gate);
 }
 
 /// A bounded coalescing buffer between the repository's unbounded sender and
@@ -993,6 +1013,11 @@ impl LibraryShell {
         indexing_task_lifetime: EventTaskLifetime,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        #[cfg(test)]
+        let mut worker_gate = INDEXING_WORKER_GATE
+            .lock()
+            .expect("indexing worker gate mutex poisoned")
+            .take();
         cx.spawn(async move |this, cx| {
             let _indexing_task_lifetime = indexing_task_lifetime;
             // An open profile may already have durable work from a prior run.
@@ -1002,7 +1027,26 @@ impl LibraryShell {
             loop {
                 if scheduled {
                     scheduled = false;
-                    match repository.process_search_jobs() {
+                    // `Context::spawn` is foreground-only. The SQLite/FTS
+                    // batch must run on GPUI's actual background executor so
+                    // it cannot monopolize typing, navigation, or Cmd-Q.
+                    let worker_repository = Arc::clone(&repository);
+                    #[cfg(test)]
+                    let gate = worker_gate.take();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            #[cfg(test)]
+                            if let Some(gate) = gate {
+                                let _ = gate.started.send(());
+                                if gate.release.await.is_err() {
+                                    return Err(app_lite_core::LibraryError::InvalidSnapshot);
+                                }
+                            }
+                            worker_repository.process_search_jobs()
+                        })
+                        .await;
+                    match result {
                         Ok(completed) => {
                             // A full batch means there may be more work, but
                             // yield before another bounded batch so typing and
@@ -1311,6 +1355,11 @@ impl LibraryShell {
     #[cfg(test)]
     pub(crate) fn indexing_status_for_test(&self) -> IndexingStatus {
         self.indexing_status.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resource_notice_for_test(&mut self, notice: impl Into<String>) {
+        self.resource_notice = Some(notice.into());
     }
 
     #[cfg(test)]
@@ -4720,9 +4769,20 @@ impl Render for LibraryShell {
                 .child(error.message().to_owned())
         }))
         .children(match &self.indexing_status {
-            // Pending is intentionally quiet: it is normal immediately after
-            // a save. Failure is separately visible and never reuses the
-            // save-error surface or its semantics.
+            // Index status has its own stable presentation slot: it never
+            // reuses local-save semantics or overlaps resource notices.
+            IndexingStatus::Pending => Some(
+                div()
+                    .id("library-indexing-status")
+                    .debug_selector(|| "library-indexing-status".to_owned())
+                    .absolute()
+                    .bottom(px(58.0))
+                    .right(px(14.0))
+                    .max_w(px(520.0))
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x536f59ff))
+                    .child("正在建立本地搜索索引…"),
+            ),
             IndexingStatus::Failed(message) => Some(
                 div()
                     .id("library-indexing-status")
@@ -4735,14 +4795,14 @@ impl Render for LibraryShell {
                     .text_color(rgba(0x8d6a27ff))
                     .child(message.clone()),
             ),
-            IndexingStatus::Idle | IndexingStatus::Pending => None,
+            IndexingStatus::Idle => None,
         })
         .children(self.resource_notice.as_ref().map(|notice| {
             div()
                 .id("library-resource-notice")
                 .debug_selector(|| "library-resource-notice".to_owned())
                 .absolute()
-                .bottom(px(58.0))
+                .bottom(px(82.0))
                 .right(px(14.0))
                 .max_w(px(520.0))
                 .text_size(px(11.0))

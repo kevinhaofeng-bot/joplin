@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::AppAction;
 use crate::app::save_coordinator::ManualSaveClock;
 use app_lite_core::{
     CanonicalDocument, CreateNote, LibraryError, LibraryRepository, SaveNote, SearchQuery,
@@ -224,4 +225,106 @@ async fn mounted_scheduler_task_is_cancelled_with_the_shell_without_losing_durab
             .note_id,
         note.id
     );
+}
+
+#[gpui::test]
+async fn mounted_indexing_pending_and_failure_are_visible_without_covering_resource_notice(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "状态提示".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("queue note");
+    repository.fail_next_search_jobs_for_test(LibraryError::InvalidSnapshot);
+    let (shell, cx) = mount_shell(repository, cx);
+
+    // The first actual mounted draw sees the honest startup Pending state,
+    // before the background worker returns its failure outcome.
+    cx.update(|window, app| window.draw(app).clear());
+    assert!(cx.debug_bounds("library-indexing-status").is_some());
+    cx.run_until_parked();
+    shell.update(cx, |shell, shell_cx| {
+        shell.set_resource_notice_for_test("资源导入提示");
+        shell_cx.notify();
+    });
+    cx.update(|window, app| window.draw(app).clear());
+    let indexing = cx
+        .debug_bounds("library-indexing-status")
+        .expect("failed index status is visible");
+    let resource = cx
+        .debug_bounds("library-resource-notice")
+        .expect("resource notice remains visible");
+    assert!(
+        resource.bottom() < indexing.top(),
+        "separate bottom slots must not overlap"
+    );
+}
+
+#[gpui::test]
+async fn mounted_background_index_worker_does_not_block_note_switch_or_shell_teardown(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "索引工作中 A".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("first queued note");
+    let second = repository
+        .create_note(CreateNote {
+            title: "索引工作中 B".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("second queued note");
+    let (started_sender, started) = std::sync::mpsc::channel();
+    let (release, release_receiver) = futures::channel::oneshot::channel();
+    install_indexing_worker_gate_for_test(IndexingWorkerGate {
+        started: started_sender,
+        release: release_receiver,
+    });
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.run_until_parked();
+    started
+        .try_recv()
+        .expect("the scheduler batch is now waiting on the background executor");
+
+    // This route executes on the mounted GPUI shell while the worker is
+    // deliberately parked. The old foreground implementation could not reach
+    // this action until its synchronous 100-note batch returned.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(second.id.clone()), window, shell_cx);
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(second.id.clone())
+    );
+
+    let cancelled = view.update(cx, |shell, _| {
+        shell.take_indexing_task_cancellation_receiver_for_test()
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(view);
+    cx.cx.update(|_| {});
+    cx.run_until_parked();
+    cancelled
+        .try_recv()
+        .expect("teardown cancels the retained foreground waiter");
+    assert!(
+        repository
+            .take_search_jobs(100)
+            .expect("durable queue after cancelled worker")
+            .iter()
+            .any(|job| job.note_id == first.id),
+        "cancelling before the barrier releases cannot acknowledge queued work"
+    );
+    drop(release);
 }
