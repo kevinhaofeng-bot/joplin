@@ -9,6 +9,10 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use app_lite_core::{
+    DerivedTextFailure, DerivedTextJob, LibraryError, LibraryRepository, ResourceId,
+};
+
 const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_PAGES: usize = 500;
@@ -28,6 +32,103 @@ pub enum PdfChildError {
     Locked,
     NoSelectableText,
     Unsupported,
+}
+
+/// A single durable PDF extraction outcome. This coordinator is deliberately
+/// synchronous and background-only: a later worker owns scheduling it off the
+/// GPUI foreground executor, never from a save or quit barrier.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DerivedTextCoordinatorOutcome {
+    Idle,
+    Indexed(ResourceId),
+    Failed(ResourceId, DerivedTextFailure),
+    Stale(ResourceId),
+}
+
+/// Takes and processes at most one durable D3a job. Call this only from a
+/// background worker; it can spend up to `CHILD_TIMEOUT` in the PDF child.
+pub fn run_one_derived_text_pdf_job(
+    repository: &LibraryRepository,
+) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    let job = match repository.take_derived_text_jobs(1)?.pop() {
+        Some(job) => job,
+        None => return Ok(DerivedTextCoordinatorOutcome::Idle),
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(_) => return record_derived_failure(repository, job, DerivedTextFailure::Unavailable),
+    };
+    run_derived_text_pdf_job_with_exe(repository, job, exe)
+}
+
+pub fn run_one_derived_text_pdf_job_with_exe(
+    repository: &LibraryRepository,
+    exe: std::path::PathBuf,
+) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    let job = match repository.take_derived_text_jobs(1)?.pop() {
+        Some(job) => job,
+        None => return Ok(DerivedTextCoordinatorOutcome::Idle),
+    };
+    run_derived_text_pdf_job_with_exe(repository, job, exe)
+}
+
+/// Processes a job identity already taken from D3a. Kept public as a narrow
+/// test seam; callers normally use `run_one_derived_text_pdf_job`.
+pub fn run_derived_text_pdf_job_with_exe(
+    repository: &LibraryRepository,
+    job: DerivedTextJob,
+    exe: std::path::PathBuf,
+) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    let resource_id = job.resource_id.clone();
+    let (resource, file) = match repository.open_verified_resource_file(&resource_id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id)),
+        Err(_) => return record_derived_failure(repository, job, DerivedTextFailure::Unavailable),
+    };
+    if resource.sha256 != job.sha256 {
+        return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id));
+    }
+    if resource.mime != "application/pdf" {
+        return record_derived_failure(repository, job, DerivedTextFailure::Unsupported);
+    }
+    match run_pdf_child_for_verified_file_with_exe(file, resource.size, exe) {
+        Ok(text) => {
+            if repository.publish_derived_text(&job, &text)? {
+                Ok(DerivedTextCoordinatorOutcome::Indexed(resource_id))
+            } else {
+                Ok(DerivedTextCoordinatorOutcome::Stale(resource_id))
+            }
+        }
+        Err(error) => record_derived_failure(repository, job, derived_failure_for_pdf(error)),
+    }
+}
+
+fn record_derived_failure(
+    repository: &LibraryRepository,
+    job: DerivedTextJob,
+    failure: DerivedTextFailure,
+) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    let resource_id = job.resource_id.clone();
+    if repository.fail_derived_text(&job, failure.clone())? {
+        Ok(DerivedTextCoordinatorOutcome::Failed(resource_id, failure))
+    } else {
+        Ok(DerivedTextCoordinatorOutcome::Stale(resource_id))
+    }
+}
+
+fn derived_failure_for_pdf(error: PdfChildError) -> DerivedTextFailure {
+    match error {
+        PdfChildError::Unsupported => DerivedTextFailure::Unsupported,
+        PdfChildError::TooLarge | PdfChildError::OutputTooLarge => DerivedTextFailure::TooLarge,
+        PdfChildError::Timeout => DerivedTextFailure::Timeout,
+        PdfChildError::Parse => DerivedTextFailure::Parse,
+        PdfChildError::Locked => DerivedTextFailure::Locked,
+        PdfChildError::NoSelectableText => DerivedTextFailure::NoSelectableText,
+        PdfChildError::Spawn | PdfChildError::Io => DerivedTextFailure::Unavailable,
+        PdfChildError::StderrTooLarge | PdfChildError::Failed | PdfChildError::Utf8 => {
+            DerivedTextFailure::Failed
+        }
+    }
 }
 
 /// Background-only bridge for an already hash-verified core descriptor. It

@@ -198,6 +198,11 @@ pub struct DerivedTextJob {
 pub enum DerivedTextFailure {
     Unsupported,
     Unavailable,
+    Parse,
+    Locked,
+    NoSelectableText,
+    TooLarge,
+    Timeout,
     Failed,
 }
 
@@ -206,6 +211,11 @@ impl DerivedTextFailure {
         match self {
             Self::Unsupported => "unsupported",
             Self::Unavailable => "unavailable",
+            Self::Parse => "parse",
+            Self::Locked => "locked",
+            Self::NoSelectableText => "no-selectable-text",
+            Self::TooLarge => "too-large",
+            Self::Timeout => "timeout",
             Self::Failed => "failed",
         }
     }
@@ -214,6 +224,11 @@ impl DerivedTextFailure {
         match value {
             "unsupported" => Some(Self::Unsupported),
             "unavailable" => Some(Self::Unavailable),
+            "parse" => Some(Self::Parse),
+            "locked" => Some(Self::Locked),
+            "no-selectable-text" => Some(Self::NoSelectableText),
+            "too-large" => Some(Self::TooLarge),
+            "timeout" => Some(Self::Timeout),
             "failed" => Some(Self::Failed),
             _ => None,
         }
