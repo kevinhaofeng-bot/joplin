@@ -65,6 +65,11 @@ that B2 is accepted.
   active SearchRoute target is still schedulable, otherwise it replaces the
   button with an explicit changed-context notice. The unpacked Evernote source
   authority is `/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5`.
+- The Round 1 mounted history regression uses a test-only AppModel seam only
+  to install a formerly-valid, now-stale SearchRoute(A) history entry. Its
+  query, commit-persistence fault, Retry click and successful same-direction
+  restore use the production history coordinator; no notice or worker error is
+  assigned by the test.
 
 Base corrective commit: `9c9116713664156b9d78d78ea334dbe40172fac1`.
 Follow-up implementation commit: `b72f58723cd51d0e3789141d71beac65854cda52`.

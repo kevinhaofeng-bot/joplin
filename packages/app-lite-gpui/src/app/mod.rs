@@ -1208,6 +1208,22 @@ impl AppModel {
         Ok(())
     }
 
+    /// Installs a historically valid SearchRoute target while retaining the
+    /// current All Notes selection. The repository is intentionally untouched:
+    /// mounted tests use it to model a query that matched when history was
+    /// written but no longer matches when the real worker reads it.
+    #[cfg(test)]
+    pub(crate) fn install_stale_search_history_for_test(&mut self, query: String) {
+        let selected = self.navigation.selected_note_id().cloned();
+        assert!(
+            selected.is_some(),
+            "stale history fixture needs an active note"
+        );
+        self.navigation
+            .navigate_to(NavigationSnapshot::search(query, selected));
+        self.navigation.navigate_back();
+    }
+
     /// Read-only target for a background SearchRoute history restoration.
     /// Advancing the native cursor is intentionally deferred until its
     /// bounded repository packet is ready to install atomically.

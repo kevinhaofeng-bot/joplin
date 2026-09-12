@@ -1004,6 +1004,65 @@ async fn mounted_search_refresh_error_retry_click_keeps_old_cards_then_recovers(
     });
 }
 
+#[gpui::test]
+async fn mounted_history_retry_click_reuses_forward_after_real_commit_failure(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "history retained editor".into(),
+            notebook_id: None,
+            document: rich_document("ordinary body"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.clone().unwrap());
+    view.update(cx, |shell, shell_cx| {
+        shell.model.update(shell_cx, |model, model_cx| {
+            model.install_stale_search_history_for_test("historical missing query".into());
+            model.fail_next_shell_state_persist_for_test(app_lite_core::LibraryError::NotFound);
+            model_cx.notify();
+        });
+        assert!(shell.schedule_history_search(true, shell_cx));
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.search_refresh_retry_history, Some(true));
+        assert!(
+            shell
+                .history_search_notice
+                .as_deref()
+                .is_some_and(|n| n.contains("无法恢复"))
+        );
+        assert_eq!(shell.model.read(app).navigation().search_query(), None);
+        assert_eq!(
+            shell.note_session.as_ref().unwrap().entity_id(),
+            session.entity_id()
+        );
+    });
+    let retry = cx.debug_bounds("library-search-refresh-retry").unwrap();
+    cx.simulate_click(retry.center(), Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(shell.history_search_notice.is_none());
+        assert_eq!(
+            shell.model.read(app).navigation().search_query(),
+            Some("historical missing query")
+        );
+        assert_eq!(shell.search_refresh_retry_history, None);
+    });
+}
+
 #[test]
 fn pending_repository_events_coalesce_multi_batch_receiver_bursts_to_a_fixed_packet() {
     // Mutation-sensitive: a lifecycle barrier can hold an event packet for
