@@ -775,6 +775,11 @@ fn bind_library_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-s", SyncCurrent, Some("LibraryShell")),
         KeyBinding::new("cmd-k", ToggleSearchPalette, Some("LibraryShell")),
         KeyBinding::new("cmd-f", ToggleFindInNote, Some("LibraryShell")),
+        KeyBinding::new("cmd-f", ToggleFindInNote, Some("LibrarySearchInput")),
+        // Find remains mounted while Cmd-K's backdrop is on top. Its context
+        // can still be present in GPUI's focus chain, so bind the same action
+        // there as well instead of letting the hidden panel shadow Cmd-F.
+        KeyBinding::new("cmd-f", ToggleFindInNote, Some("LibraryFindInNote")),
         KeyBinding::new("cmd-g", FindNextInNote, Some("LibraryShell")),
         KeyBinding::new("cmd-shift-g", FindPreviousInNote, Some("LibraryShell")),
         // Compact-toolbar presentation commands deliberately remain scoped to
@@ -3515,8 +3520,21 @@ impl LibraryShell {
     fn toggle_search_palette_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_palette_open = !self.search_palette_open;
         if self.search_palette_open {
-            self.search_palette_return_focus = window
-                .focused(cx)
+            // The palette owns keyboard focus while it is visible. Tear down
+            // Find directly (rather than its deferred close path), otherwise
+            // Find's old return focus can reclaim the newly opened palette.
+            let find_return_focus = if self.find_panel_open {
+                self.find_panel_open = false;
+                let return_focus = self.find_return_focus.take();
+                if let Some(surface) = self.editor_surface.as_ref() {
+                    let _ = surface.update(cx, |surface, _| surface.set_find_panel_open(false));
+                }
+                return_focus
+            } else {
+                None
+            };
+            self.search_palette_return_focus = find_return_focus
+                .or_else(|| window.focused(cx))
                 .or_else(|| Some(self.fallback_focus_before_search_palette(cx)));
             self.search_palette_return_organization_panel_open = self.organization_panel_open;
             self.organization_panel_open = false;
@@ -3549,21 +3567,47 @@ impl LibraryShell {
             return;
         }
         if self.find_panel_open {
+            if self.find_input.read(cx).marked_range().is_some() {
+                return;
+            }
             self.find_input.update(cx, |input, input_cx| {
                 input.select_all();
                 input_cx.notify();
             });
             self.find_input.read(cx).focus_handle().focus(window);
         } else {
+            // Cmd-F deliberately takes over from the global palette. Do not
+            // use its normal close path: its deferred focus restoration would
+            // steal focus back from this visible in-note input.
+            if self.search_palette_open {
+                // The currently focused palette input will disappear below.
+                // Keep the focus which opened the palette as Find's return
+                // target instead of retaining that soon-to-be-unmounted
+                // handle.
+                self.find_return_focus = self.search_palette_return_focus.take();
+                self.search_palette_open = false;
+                self._search_task = None;
+                self.search_palette_status = SearchPaletteStatus::Idle;
+                self.search_palette_results.clear();
+                self.search_palette_selected = 0;
+                self.organization_panel_open = self.search_palette_return_organization_panel_open;
+                self.search_palette_return_organization_panel_open = false;
+            }
             self.find_panel_open = true;
-            self.find_return_focus = window
-                .focused(cx)
-                .or_else(|| Some(self.fallback_focus_before_search_palette(cx)));
+            if self.find_return_focus.is_none() {
+                self.find_return_focus = window
+                    .focused(cx)
+                    .or_else(|| Some(self.fallback_focus_before_search_palette(cx)));
+            }
             self.find_error = None;
             self.refresh_find_in_note(cx);
             if let Some(surface) = self.editor_surface.as_ref() {
                 let _ = surface.update(cx, |surface, _| surface.set_find_panel_open(true));
             }
+            self.find_input.update(cx, |input, input_cx| {
+                input.select_all();
+                input_cx.notify();
+            });
             self.find_input.read(cx).focus_handle().focus(window);
         }
         cx.notify();
@@ -3596,6 +3640,9 @@ impl LibraryShell {
     }
 
     fn refresh_find_in_note(&mut self, cx: &mut Context<Self>) {
+        if self.find_input.read(cx).marked_range().is_some() {
+            return;
+        }
         let query = self.find_input.read(cx).text().to_owned();
         let Some(session) = self.note_session.as_ref() else {
             return;
@@ -3639,6 +3686,9 @@ impl LibraryShell {
     }
 
     fn toggle_find_case_sensitive(&mut self, cx: &mut Context<Self>) {
+        if self.find_input.read(cx).marked_range().is_some() {
+            return;
+        }
         self.find_case_sensitive = !self.find_case_sensitive;
         self.refresh_find_in_note(cx);
     }
@@ -4940,6 +4990,10 @@ impl LibraryShell {
         let modifiers = event.keystroke.modifiers;
         let secondary = modifiers.secondary();
         let handled = match event.keystroke.key.as_str() {
+            "f" if secondary => {
+                self.toggle_find_in_note_visibility(window, cx);
+                true
+            }
             "escape" | "esc" => {
                 self.toggle_search_palette_visibility(window, cx);
                 true
@@ -5209,6 +5263,8 @@ impl LibraryShell {
                         .child(
                             div()
                                 .id("library-search-input")
+                                .key_context("LibrarySearchInput")
+                                .on_action(cx.listener(Self::toggle_find_in_note))
                                 .border_b_1()
                                 .border_color(rgba(0xd9e1d9ff))
                                 .on_key_down(cx.listener(Self::on_search_key_down))
@@ -5322,7 +5378,8 @@ impl LibraryShell {
         // Keep every control independently hit-testable in a narrow editor
         // column. The row wraps below its natural compact width rather than
         // placing controls on top of the document or each other.
-        let input_width = (available_width - 172.0).clamp(48.0, 128.0);
+        let panel_width = (available_width - 32.0).clamp(1.0, 340.0);
+        let input_width = (panel_width - 196.0).clamp(48.0, 128.0);
         let canvas_input = input.clone();
         let paint_input = input.clone();
         let input_canvas = canvas(
@@ -5351,29 +5408,38 @@ impl LibraryShell {
                     }],
                     None,
                 );
-                entity.update(cx, |input, _| input.record_layout(bounds, line.clone()));
+                // This compact field is a horizontal viewport. Translate the
+                // shaped line far enough to expose its active end and record
+                // that same origin for TitleInput's pointer/IME conversion.
+                let caret_x = line.x_for_index(selection.end);
+                let scroll_x = (caret_x - bounds.size.width + px(4.0)).max(px(0.0));
+                let layout_bounds =
+                    Bounds::new(point(bounds.left() - scroll_x, bounds.top()), bounds.size);
+                entity.update(cx, |input, _| {
+                    input.record_layout(layout_bounds, line.clone())
+                });
                 if focus.is_focused(window) && !selection.is_empty() {
                     window.paint_quad(gpui::fill(
                         Bounds::from_corners(
                             point(
-                                bounds.left() + line.x_for_index(selection.start),
+                                layout_bounds.left() + line.x_for_index(selection.start),
                                 bounds.top(),
                             ),
                             point(
-                                bounds.left() + line.x_for_index(selection.end),
+                                layout_bounds.left() + line.x_for_index(selection.end),
                                 bounds.bottom(),
                             ),
                         ),
                         rgba(0x00a82d33),
                     ));
                 }
-                line.paint(bounds.origin, bounds.size.height, window, cx)
+                line.paint(layout_bounds.origin, bounds.size.height, window, cx)
                     .ok();
                 if focus.is_focused(window) && selection.is_empty() {
                     let x = line.x_for_index(selection.start);
                     window.paint_quad(gpui::fill(
                         Bounds::new(
-                            point(bounds.left() + x, bounds.top()),
+                            point(layout_bounds.left() + x, bounds.top()),
                             size(px(1.0), bounds.size.height),
                         ),
                         rgba(EVERNOTE_GREEN),
@@ -5395,7 +5461,7 @@ impl LibraryShell {
             editor.read(cx).find_summary()
         });
         let summary_text = if let Some(error) = &self.find_error {
-            error.clone()
+            "查找错误".to_owned()
         } else if let Some(summary) = summary {
             match summary.primary_index {
                 Some(index) => format!("{} / {}", index + 1, summary.total),
@@ -5416,6 +5482,7 @@ impl LibraryShell {
                 .absolute()
                 .top(px(10.0))
                 .right(px(16.0))
+                .w(px(panel_width))
                 .flex()
                 .flex_wrap()
                 .items_center()
@@ -5433,12 +5500,14 @@ impl LibraryShell {
                     div()
                         .id("library-find-in-note-input")
                         .w(px(input_width))
+                        .overflow_hidden()
                         .child(input_canvas),
                 )
                 .child(
                     div()
                         .id("library-find-in-note-summary")
-                        .w(px(42.0))
+                        .w(px(66.0))
+                        .overflow_hidden()
                         .text_size(px(11.0))
                         .text_color(rgba(0x718075ff))
                         .child(summary_text),

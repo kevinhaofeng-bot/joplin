@@ -448,6 +448,19 @@ async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) 
             );
         }
     }
+    let pane = cx
+        .debug_bounds("library-main-editor-shell")
+        .expect("editor pane is mounted");
+    let panel = cx
+        .debug_bounds("library-find-in-note-panel")
+        .expect("find panel stays in the editor pane");
+    assert!(
+        panel.left() >= pane.left()
+            && panel.right() <= pane.right()
+            && panel.top() >= pane.top()
+            && panel.bottom() <= pane.bottom(),
+        "900px window keeps the wrapped Find controls inside the editor pane: panel={panel:?}, pane={pane:?}"
+    );
     cx.simulate_input("会议");
     redraw(cx);
     let (editor, undo_depth) = view.read_with(cx, |shell, app| {
@@ -498,6 +511,27 @@ async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) 
         editor.read_with(cx, |editor, _| editor.find_summary().total),
         2,
         "IME marked text must not replace the live query or scroll"
+    );
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.toggle_find_case_sensitive(shell_cx);
+            shell.toggle_find_in_note_visibility(window, shell_cx);
+        });
+    });
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell.find_case_sensitive,
+            "Aa leaves provisional IME alone"
+        );
+        assert!(
+            shell.find_input.read(app).marked_range().is_some(),
+            "repeated Cmd-F cannot select away marked composition"
+        );
+    });
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().total),
+        2,
+        "central refresh guard keeps the committed find query while marked"
     );
     cx.update(|window, app| {
         find_input.update(app, |input, input_cx| {
@@ -554,8 +588,35 @@ async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) 
         cx.debug_bounds("library-search-palette").is_some(),
         "Cmd-K stays global search"
     );
-    view.read_with(cx, |shell, _| assert!(shell.find_panel_open));
+    view.read_with(cx, |shell, _| {
+        assert!(
+            !shell.find_panel_open,
+            "Cmd-K owns the visible input instead of leaving Find under its backdrop"
+        )
+    });
+    cx.simulate_keystrokes("cmd-f");
+    redraw(cx);
+    view.read_with(cx, |shell, _| {
+        assert!(
+            !shell.search_palette_open,
+            "Cmd-F removes the obscuring global palette"
+        );
+        assert!(shell.find_panel_open);
+    });
+    cx.simulate_input("g");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.find_input.read(app).text(), "g")
+    });
     cx.simulate_keystrokes("escape");
+    redraw(cx);
+    view.read_with(cx, |shell, _| assert!(!shell.find_panel_open));
+    cx.update(|window, app| {
+        assert!(
+            editor.read(app).focus_handle().is_focused(window),
+            "Find → Cmd-K → Cmd-F → Escape restores the original editor focus"
+        );
+    });
     redraw(cx);
 
     cx.update(|window, app| {
