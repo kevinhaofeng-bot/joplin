@@ -45,10 +45,10 @@ use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent,
     ElementInputHandler, Entity, ExternalPaths, FocusHandle, FontWeight, InteractiveElement,
     IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollStrategy, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, TextRun, UniformListDecoration,
-    UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div, point,
-    px, rgba, size, uniform_list,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TextRun,
+    UniformListDecoration, UniformListScrollHandle, Window, WindowBounds, WindowHandle,
+    WindowOptions, canvas, div, point, px, rgba, size, uniform_list,
 };
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
@@ -511,6 +511,7 @@ pub struct LibraryShell {
     search_palette_status: SearchPaletteStatus,
     search_palette_generation: Option<u64>,
     search_palette_selected: usize,
+    search_palette_scroll: ScrollHandle,
     /// The palette is an overlay, not a navigation event.  Preserve the
     /// precise native owner that had focus so Escape/backdrop can return to
     /// title, body, or an auxiliary field without inventing an editor move.
@@ -977,6 +978,7 @@ impl LibraryShell {
             search_palette_status: SearchPaletteStatus::Idle,
             search_palette_generation: None,
             search_palette_selected: 0,
+            search_palette_scroll: ScrollHandle::new(),
             search_palette_return_focus: None,
             _search_task: None,
             _history_search_task: None,
@@ -3699,10 +3701,9 @@ impl LibraryShell {
                 } else if let Err(error) = result {
                     // A search refresh is not a save failure, but silently
                     // leaving an old packet visible is misleading. Keep the
-                    // route intact, report the local retry, and try again.
-                    shell.history_search_notice =
-                        Some(format!("本地搜索更新失败，正在重试：{error}"));
-                    shell.retry_active_search_refresh(shell_cx);
+                    // route intact and surface the error; a later repository
+                    // event/index Idle edge is the bounded retry trigger.
+                    shell.history_search_notice = Some(format!("本地搜索更新失败：{error}"));
                 }
                 shell_cx.notify();
             });
@@ -4622,12 +4623,14 @@ impl LibraryShell {
                 if !self.search_palette_results.is_empty() {
                     self.search_palette_selected = (self.search_palette_selected + 1)
                         .min(self.search_palette_results.len() - 1);
+                    self.reveal_search_palette_selection();
                     cx.notify();
                 }
                 true
             }
             "up" => {
                 self.search_palette_selected = self.search_palette_selected.saturating_sub(1);
+                self.reveal_search_palette_selection();
                 cx.notify();
                 true
             }
@@ -4689,6 +4692,30 @@ impl LibraryShell {
         if handled {
             cx.stop_propagation();
         }
+    }
+
+    fn reveal_search_palette_selection(&self) {
+        // Each retained search row has two text lines plus padding. Keep the
+        // active keyboard row inside the 420px viewport without a second
+        // virtual result authority. `ScrollHandle` clamps against measured
+        // content once the list has mounted.
+        const ROW_HEIGHT: f32 = 58.0;
+        const VIEWPORT_HEIGHT: f32 = 420.0;
+        let top = self.search_palette_selected as f32 * ROW_HEIGHT;
+        let bottom = top + ROW_HEIGHT;
+        let current_top = -f32::from(self.search_palette_scroll.offset().y);
+        let current_bottom = current_top + VIEWPORT_HEIGHT;
+        let target_top = if top < current_top {
+            top
+        } else if bottom > current_bottom {
+            bottom - VIEWPORT_HEIGHT
+        } else {
+            return;
+        };
+        let max_y = self.search_palette_scroll.max_offset().height.max(px(0.0));
+        let mut offset = self.search_palette_scroll.offset();
+        offset.y = -px(target_top.max(0.0)).max(-max_y);
+        self.search_palette_scroll.set_offset(offset);
     }
 
     fn render_search_palette(
@@ -4880,6 +4907,7 @@ impl LibraryShell {
                                 .flex_col()
                                 .h(px(420.0))
                                 .overflow_y_scroll()
+                                .track_scroll(&self.search_palette_scroll)
                                 .child(results),
                         ),
                 )
