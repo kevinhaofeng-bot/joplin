@@ -571,6 +571,8 @@ pub struct LibraryShell {
     #[cfg(test)]
     indexing_task_cancellation_receiver: Option<Receiver<()>>,
     #[cfg(test)]
+    derived_text_task_cancellation_receiver: Option<Receiver<()>>,
+    #[cfg(test)]
     event_task_cancellation_receiver: Option<Receiver<()>>,
     #[cfg(test)]
     rendered_note_range: Option<std::ops::Range<usize>>,
@@ -961,7 +963,8 @@ impl LibraryShell {
         let (indexing_task_lifetime, indexing_task_cancellation_receiver) =
             EventTaskLifetime::observed();
         #[cfg(test)]
-        let (derived_text_task_lifetime, _) = EventTaskLifetime::observed();
+        let (derived_text_task_lifetime, derived_text_task_cancellation_receiver) =
+            EventTaskLifetime::observed();
         #[cfg(not(test))]
         let event_task_lifetime = EventTaskLifetime::unobserved();
         #[cfg(not(test))]
@@ -969,6 +972,7 @@ impl LibraryShell {
         #[cfg(not(test))]
         let derived_text_task_lifetime = EventTaskLifetime::unobserved();
         let indexing_cancelled = indexing_task_lifetime.cancellation_flag();
+        let derived_text_cancelled = derived_text_task_lifetime.cancellation_flag();
         let event_task = Self::spawn_event_bridge(event_receiver, event_task_lifetime, cx);
         let indexing_task = Self::spawn_index_scheduler(
             model.read(cx).repository(),
@@ -981,6 +985,7 @@ impl LibraryShell {
             model.read(cx).repository(),
             derived_text_receiver,
             derived_text_task_lifetime,
+            derived_text_cancelled,
             cx,
         );
         let search_input_observation = cx.observe(&search_input, |shell, _, cx| {
@@ -1061,6 +1066,8 @@ impl LibraryShell {
             indexing_status: IndexingStatus::Pending,
             #[cfg(test)]
             indexing_task_cancellation_receiver: Some(indexing_task_cancellation_receiver),
+            #[cfg(test)]
+            derived_text_task_cancellation_receiver: Some(derived_text_task_cancellation_receiver),
             #[cfg(test)]
             event_task_cancellation_receiver: Some(event_task_cancellation_receiver),
             #[cfg(test)]
@@ -1295,6 +1302,7 @@ impl LibraryShell {
         repository: Arc<LibraryRepository>,
         receiver: Receiver<app_lite_core::LibraryEvent>,
         derived_text_task_lifetime: EventTaskLifetime,
+        derived_text_cancelled: Arc<AtomicBool>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -1304,15 +1312,19 @@ impl LibraryShell {
                 if scheduled {
                     scheduled = false;
                     let worker_repository = Arc::clone(&repository);
+                    let worker_cancelled = Arc::clone(&derived_text_cancelled);
                     let result = cx
                         .background_executor()
                         .spawn(async move {
                             let Ok(_single_child) = DERIVED_TEXT_WORKER_LOCK.try_lock() else {
                                 return None;
                             };
-                            Some(crate::extractor::run_one_derived_text_pdf_job(
-                                &worker_repository,
-                            ))
+                            Some(
+                                crate::extractor::run_one_derived_text_pdf_job_with_cancellation(
+                                    &worker_repository,
+                                    &worker_cancelled,
+                                ),
+                            )
                         })
                         .await;
                     match result {
@@ -1320,6 +1332,7 @@ impl LibraryShell {
                             scheduled = !matches!(
                                 outcome,
                                 crate::extractor::DerivedTextCoordinatorOutcome::Idle
+                                    | crate::extractor::DerivedTextCoordinatorOutcome::Cancelled
                             );
                             if this
                                 .update(cx, |shell, shell_cx| {
@@ -1648,6 +1661,13 @@ impl LibraryShell {
         self.indexing_task_cancellation_receiver
             .take()
             .expect("indexing task cancellation receiver is taken only once per test")
+    }
+
+    #[cfg(test)]
+    fn take_derived_text_task_cancellation_receiver_for_test(&mut self) -> Receiver<()> {
+        self.derived_text_task_cancellation_receiver
+            .take()
+            .expect("derived task cancellation receiver is taken only once per test")
     }
 
     #[cfg(test)]

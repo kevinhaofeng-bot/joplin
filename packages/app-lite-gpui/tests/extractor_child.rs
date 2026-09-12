@@ -5,6 +5,9 @@ use app_lite_core::{
 };
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 #[path = "../src/extractor.rs"]
 mod extractor;
 
@@ -96,6 +99,86 @@ fn verified_file_runner_rejects_oversize_before_spawning_and_bad_pdf_after_child
     );
 }
 
+#[cfg(unix)]
+fn sleeping_child_script() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("sleeping-child.sh");
+    let pid_file = directory.path().join("child.pid");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (directory, executable, pid_file)
+}
+
+#[cfg(unix)]
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(path.exists(), "child did not record its pid");
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn assert_child_is_reaped(pid_file: &std::path::Path) {
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while process_is_alive(&pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!process_is_alive(&pid), "cancelled child must be reaped");
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellable_verified_file_runner_kills_and_reaps_a_running_child() {
+    let (_directory, executable, pid_file) = sleeping_child_script();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let runner_cancelled = Arc::clone(&cancelled);
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/resources/extractor-fixture.pdf"
+    );
+    let started = Instant::now();
+    let runner = std::thread::spawn(move || {
+        extractor::run_pdf_child_for_verified_file_with_exe_and_cancellation(
+            std::fs::File::open(fixture).unwrap(),
+            14890,
+            executable,
+            &runner_cancelled,
+        )
+    });
+    wait_for_file(&pid_file);
+    cancelled.store(true, Ordering::Release);
+    assert_eq!(
+        runner.join().unwrap(),
+        Err(extractor::PdfChildError::Cancelled)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cancellation must not wait for the child timeout"
+    );
+    assert_child_is_reaped(&pid_file);
+}
+
 fn associated_resource(
     repository: &LibraryRepository,
     bytes: &[u8],
@@ -118,6 +201,74 @@ fn associated_resource(
         })
         .expect("associate resource with live note");
     (resource, note)
+}
+
+#[test]
+fn cancelled_coordinator_leaves_the_durable_job_pending_without_spawning() {
+    let profile = tempfile::tempdir().unwrap();
+    let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let (resource, _) = associated_resource(
+        &repository,
+        include_bytes!("resources/extractor-fixture.pdf"),
+        "pending.pdf",
+        "application/pdf",
+        "pdf",
+    );
+    let cancelled = AtomicBool::new(true);
+
+    assert_eq!(
+        extractor::run_one_derived_text_pdf_job_with_exe_and_cancellation(
+            &repository,
+            std::path::PathBuf::from("must-not-spawn"),
+            &cancelled,
+        )
+        .unwrap(),
+        extractor::DerivedTextCoordinatorOutcome::Cancelled
+    );
+    assert_eq!(
+        repository.derived_text_status(&resource).unwrap(),
+        Some(DerivedTextStatus::Pending { attempts: 0 })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_a_running_coordinator_reaps_the_child_and_keeps_the_job_pending() {
+    let (_directory, executable, pid_file) = sleeping_child_script();
+    let profile = tempfile::tempdir().unwrap();
+    let repository =
+        Arc::new(LibraryRepository::open(profile.path().join("library.sqlite")).unwrap());
+    let (resource, _) = associated_resource(
+        &repository,
+        include_bytes!("resources/extractor-fixture.pdf"),
+        "running.pdf",
+        "application/pdf",
+        "pdf",
+    );
+    let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let runner_repository = Arc::clone(&repository);
+    let runner_cancelled = Arc::clone(&cancelled);
+    let runner = std::thread::spawn(move || {
+        extractor::run_derived_text_pdf_job_with_exe_and_cancellation(
+            &runner_repository,
+            job,
+            executable,
+            &runner_cancelled,
+        )
+    });
+    wait_for_file(&pid_file);
+    cancelled.store(true, Ordering::Release);
+    assert_eq!(
+        runner.join().unwrap().unwrap(),
+        extractor::DerivedTextCoordinatorOutcome::Cancelled
+    );
+    assert_child_is_reaped(&pid_file);
+    assert_eq!(
+        repository.derived_text_status(&resource).unwrap(),
+        Some(DerivedTextStatus::Pending { attempts: 0 }),
+        "cancellation must not become a durable extraction failure"
+    );
 }
 
 #[test]

@@ -377,6 +377,25 @@ async fn mounted_scheduler_task_is_cancelled_with_the_shell_without_losing_durab
 }
 
 #[gpui::test]
+async fn mounted_shell_drop_cancels_the_derived_worker_lifetime(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    let weak_shell = view.downgrade();
+    let cancelled = view.update(cx, |shell, _| {
+        shell.take_derived_text_task_cancellation_receiver_for_test()
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(view);
+    assert!(weak_shell.upgrade().is_none());
+    cx.cx.update(|_| {});
+    cx.run_until_parked();
+    cancelled
+        .try_recv()
+        .expect("dropping the mounted shell cancels the derived worker lifetime");
+}
+
+#[gpui::test]
 async fn mounted_indexing_pending_and_failure_are_visible_without_covering_resource_notice(
     cx: &mut TestAppContext,
 ) {

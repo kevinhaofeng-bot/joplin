@@ -7,6 +7,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use app_lite_core::{
@@ -22,6 +23,7 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum PdfChildError {
     TooLarge,
     Spawn,
+    Cancelled,
     Timeout,
     OutputTooLarge,
     StderrTooLarge,
@@ -40,6 +42,9 @@ pub enum PdfChildError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum DerivedTextCoordinatorOutcome {
     Idle,
+    /// The mounted worker was torn down. The durable job remains pending for
+    /// a future library open; cancellation is never an extraction failure.
+    Cancelled,
     Indexed(ResourceId),
     Failed(ResourceId, DerivedTextFailure),
     Stale(ResourceId),
@@ -50,26 +55,66 @@ pub enum DerivedTextCoordinatorOutcome {
 pub fn run_one_derived_text_pdf_job(
     repository: &LibraryRepository,
 ) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    let cancelled = AtomicBool::new(false);
+    run_one_derived_text_pdf_job_with_cancellation(repository, &cancelled)
+}
+
+/// Cancellable background-only variant used by the retained GPUI worker.
+/// A pre-cancelled worker deliberately does not take a durable job, and a
+/// later cancellation preserves the job's pending state for reopen/retry.
+pub fn run_one_derived_text_pdf_job_with_cancellation(
+    repository: &LibraryRepository,
+    cancelled: &AtomicBool,
+) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(DerivedTextCoordinatorOutcome::Cancelled);
+    }
     let job = match repository.take_derived_text_jobs(1)?.pop() {
         Some(job) => job,
         None => return Ok(DerivedTextCoordinatorOutcome::Idle),
     };
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(DerivedTextCoordinatorOutcome::Cancelled);
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
-        Err(_) => return record_derived_failure(repository, job, DerivedTextFailure::Unavailable),
+        Err(_) => {
+            return record_derived_failure_or_cancel(
+                repository,
+                job,
+                DerivedTextFailure::Unavailable,
+                cancelled,
+            );
+        }
     };
-    run_derived_text_pdf_job_with_exe(repository, job, exe)
+    run_derived_text_pdf_job_with_exe_and_cancellation(repository, job, exe, cancelled)
 }
 
 pub fn run_one_derived_text_pdf_job_with_exe(
     repository: &LibraryRepository,
     exe: std::path::PathBuf,
 ) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    let cancelled = AtomicBool::new(false);
+    run_one_derived_text_pdf_job_with_exe_and_cancellation(repository, exe, &cancelled)
+}
+
+/// Narrow test/background seam for a specific executable with cancellation.
+pub fn run_one_derived_text_pdf_job_with_exe_and_cancellation(
+    repository: &LibraryRepository,
+    exe: std::path::PathBuf,
+    cancelled: &AtomicBool,
+) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(DerivedTextCoordinatorOutcome::Cancelled);
+    }
     let job = match repository.take_derived_text_jobs(1)?.pop() {
         Some(job) => job,
         None => return Ok(DerivedTextCoordinatorOutcome::Idle),
     };
-    run_derived_text_pdf_job_with_exe(repository, job, exe)
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(DerivedTextCoordinatorOutcome::Cancelled);
+    }
+    run_derived_text_pdf_job_with_exe_and_cancellation(repository, job, exe, cancelled)
 }
 
 /// Processes a job identity already taken from D3a. Kept public as a narrow
@@ -79,7 +124,23 @@ pub fn run_derived_text_pdf_job_with_exe(
     job: DerivedTextJob,
     exe: std::path::PathBuf,
 ) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    let cancelled = AtomicBool::new(false);
+    run_derived_text_pdf_job_with_exe_and_cancellation(repository, job, exe, &cancelled)
+}
+
+/// Processes a previously taken job while honouring a shell-lifetime
+/// cancellation flag. It is intentionally not a failure path: the caller
+/// leaves D3a's pending identity untouched when the shell closes.
+pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
+    repository: &LibraryRepository,
+    job: DerivedTextJob,
+    exe: std::path::PathBuf,
+    cancelled: &AtomicBool,
+) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
     let resource_id = job.resource_id.clone();
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(DerivedTextCoordinatorOutcome::Cancelled);
+    }
     // Metadata is cheap and authoritative enough to reject a MIME we do not
     // support or a file outside this worker's parent-I/O budget. Do this
     // before `open_verified_resource_file`, whose SHA verification streams
@@ -92,21 +153,45 @@ pub fn run_derived_text_pdf_job_with_exe(
         return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id));
     }
     if expected.mime != "application/pdf" {
-        return record_derived_failure(repository, job, DerivedTextFailure::Unsupported);
+        return record_derived_failure_or_cancel(
+            repository,
+            job,
+            DerivedTextFailure::Unsupported,
+            cancelled,
+        );
     }
     if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected.size) {
-        return record_derived_failure(repository, job, DerivedTextFailure::TooLarge);
+        return record_derived_failure_or_cancel(
+            repository,
+            job,
+            DerivedTextFailure::TooLarge,
+            cancelled,
+        );
     }
-    let (resource, file) = match repository
-        .open_verified_resource_file_with_limit(&resource_id, MAX_INPUT_BYTES)
-    {
-        Ok(Some(value)) => value,
-        Ok(None) => return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id)),
-        Err(LibraryError::Resource(ResourceError::SizeLimitExceeded)) => {
-            return record_derived_failure(repository, job, DerivedTextFailure::TooLarge);
-        }
-        Err(_) => return record_derived_failure(repository, job, DerivedTextFailure::Unavailable),
-    };
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(DerivedTextCoordinatorOutcome::Cancelled);
+    }
+    let (resource, file) =
+        match repository.open_verified_resource_file_with_limit(&resource_id, MAX_INPUT_BYTES) {
+            Ok(Some(value)) => value,
+            Ok(None) => return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id)),
+            Err(LibraryError::Resource(ResourceError::SizeLimitExceeded)) => {
+                return record_derived_failure_or_cancel(
+                    repository,
+                    job,
+                    DerivedTextFailure::TooLarge,
+                    cancelled,
+                );
+            }
+            Err(_) => {
+                return record_derived_failure_or_cancel(
+                    repository,
+                    job,
+                    DerivedTextFailure::Unavailable,
+                    cancelled,
+                );
+            }
+        };
     if resource.sha256 != expected.sha256
         || resource.mime != expected.mime
         || resource.size != expected.size
@@ -114,15 +199,29 @@ pub fn run_derived_text_pdf_job_with_exe(
     {
         return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id));
     }
-    match run_pdf_child_for_verified_file_with_exe(file, resource.size, exe) {
+    match run_pdf_child_for_verified_file_with_exe_and_cancellation(
+        file,
+        resource.size,
+        exe,
+        cancelled,
+    ) {
         Ok(text) => {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(DerivedTextCoordinatorOutcome::Cancelled);
+            }
             if repository.publish_derived_text(&job, &text)? {
                 Ok(DerivedTextCoordinatorOutcome::Indexed(resource_id))
             } else {
                 Ok(DerivedTextCoordinatorOutcome::Stale(resource_id))
             }
         }
-        Err(error) => record_derived_failure(repository, job, derived_failure_for_pdf(error)),
+        Err(PdfChildError::Cancelled) => Ok(DerivedTextCoordinatorOutcome::Cancelled),
+        Err(error) => record_derived_failure_or_cancel(
+            repository,
+            job,
+            derived_failure_for_pdf(error),
+            cancelled,
+        ),
     }
 }
 
@@ -139,6 +238,18 @@ fn record_derived_failure(
     }
 }
 
+fn record_derived_failure_or_cancel(
+    repository: &LibraryRepository,
+    job: DerivedTextJob,
+    failure: DerivedTextFailure,
+    cancelled: &AtomicBool,
+) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(DerivedTextCoordinatorOutcome::Cancelled);
+    }
+    record_derived_failure(repository, job, failure)
+}
+
 fn derived_failure_for_pdf(error: PdfChildError) -> DerivedTextFailure {
     match error {
         PdfChildError::Unsupported => DerivedTextFailure::Unsupported,
@@ -148,6 +259,7 @@ fn derived_failure_for_pdf(error: PdfChildError) -> DerivedTextFailure {
         PdfChildError::Locked => DerivedTextFailure::Locked,
         PdfChildError::NoSelectableText => DerivedTextFailure::NoSelectableText,
         PdfChildError::Spawn | PdfChildError::Io => DerivedTextFailure::Unavailable,
+        PdfChildError::Cancelled => unreachable!("cancelled extraction is not a failure"),
         PdfChildError::StderrTooLarge | PdfChildError::Failed | PdfChildError::Utf8 => {
             DerivedTextFailure::Failed
         }
@@ -169,6 +281,21 @@ pub fn run_pdf_child_for_verified_file_with_exe(
     expected_size: i64,
     exe: std::path::PathBuf,
 ) -> Result<String, PdfChildError> {
+    let cancelled = AtomicBool::new(false);
+    run_pdf_child_for_verified_file_with_exe_and_cancellation(file, expected_size, exe, &cancelled)
+}
+
+/// Same descriptor-safe child bridge, with a shell-lifetime cancellation
+/// token. It only runs on a background executor.
+pub fn run_pdf_child_for_verified_file_with_exe_and_cancellation(
+    mut file: File,
+    expected_size: i64,
+    exe: std::path::PathBuf,
+    cancelled: &AtomicBool,
+) -> Result<String, PdfChildError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(PdfChildError::Cancelled);
+    }
     if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected_size) {
         return Err(PdfChildError::TooLarge);
     }
@@ -177,6 +304,9 @@ pub fn run_pdf_child_for_verified_file_with_exe(
     }
     use std::io::Seek;
     file.rewind().map_err(|_| PdfChildError::Io)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(PdfChildError::Cancelled);
+    }
     let mut child = Command::new(exe)
         .args(["--extract-resource-text", "--mime", "application/pdf"])
         .stdin(Stdio::from(file))
@@ -202,6 +332,10 @@ pub fn run_pdf_child_for_verified_file_with_exe(
     let err = std::thread::spawn(move || drain_bounded(&mut stderr, 4096));
     let start = Instant::now();
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            stop_and_join(&mut child, out, err);
+            return Err(PdfChildError::Cancelled);
+        }
         let status = match child.try_wait() {
             Ok(status) => status,
             Err(_) => {
