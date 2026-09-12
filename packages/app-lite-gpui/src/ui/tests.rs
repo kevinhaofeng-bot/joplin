@@ -417,6 +417,69 @@ async fn cmd_k_palette_mounts_above_the_retained_editor_without_changing_session
 }
 
 #[gpui::test]
+async fn search_palette_escape_and_backdrop_restore_the_original_focus_and_session(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "焦点笔记".into(),
+            notebook_id: None,
+            document: rich_document("保持会话"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let (session_id, title) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().unwrap();
+        (session.entity_id(), session.read(app).title().clone())
+    });
+    cx.update(|window, app| title.read(app).focus_handle().focus(window));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.toggle_search_palette_visibility(window, shell_cx);
+        });
+    });
+    redraw(cx);
+    assert!(cx.debug_bounds("library-search-palette").is_some());
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(!shell.search_palette_open);
+        assert_eq!(shell.note_session.as_ref().unwrap().entity_id(), session_id);
+        let _ = app;
+    });
+    assert!(cx.update(|window, app| title.read(app).focus_handle().is_focused(window)));
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.toggle_search_palette_visibility(window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let backdrop = cx.debug_bounds("library-search-backdrop").unwrap();
+    // The palette is centered inside its backdrop; click an exposed corner,
+    // not its center, so this exercises the actual backdrop handler.
+    cx.simulate_click(
+        point(backdrop.left() + px(4.0), backdrop.top() + px(4.0)),
+        Modifiers::default(),
+    );
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(!shell.search_palette_open);
+        assert_eq!(shell.note_session.as_ref().unwrap().entity_id(), session_id);
+        let _ = app;
+    });
+    assert!(cx.update(|window, app| title.read(app).focus_handle().is_focused(window)));
+}
+
+#[gpui::test]
 async fn mounted_cmd_k_search_ignores_marked_enter_and_opens_the_thirteenth_result(
     cx: &mut TestAppContext,
 ) {

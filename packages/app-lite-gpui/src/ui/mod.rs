@@ -3429,6 +3429,11 @@ impl LibraryShell {
             self.search_palette_selected = 0;
             if let Some(focus) = self.search_palette_return_focus.take() {
                 focus.focus(window);
+                // A backdrop pointer event can claim focus after its handler
+                // returns. Restore once more at the end of this window turn
+                // so mouse dismissal has the same exact focus contract as
+                // Escape without remounting the retained note session.
+                window.defer(cx, move |window, _app| focus.focus(window));
             } else {
                 self.focus_active_editor_or_shell(window, cx);
             }
@@ -4857,6 +4862,7 @@ impl LibraryShell {
         Some(
             div()
                 .id("library-search-backdrop")
+                .debug_selector(|| "library-search-backdrop".to_owned())
                 .absolute()
                 .inset_0()
                 .bg(rgba(0x10181033))
