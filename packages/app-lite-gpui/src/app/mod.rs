@@ -617,7 +617,9 @@ impl AppModel {
         destination_route: LibraryRoute,
     ) -> Result<(NavigationState, Vec<NoteProjection>), LibraryError> {
         let mut navigation = self.navigation.clone();
-        navigation.clear_search();
+        // Creating a note leaves the current visible destination, but must
+        // append that ordinary route after (not overwrite) SearchRoute. Back
+        // must still be able to restore the exact committed search query.
         navigation.navigate_to(NavigationSnapshot {
             route: destination_route.clone(),
             destination: AppDestination::Library(destination_route.clone()),

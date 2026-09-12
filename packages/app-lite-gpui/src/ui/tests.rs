@@ -6,8 +6,8 @@ use crate::native_editor::model::{Affinity, BlockKind, DocPoint, Mark};
 use app_lite_core::document::{Block, BlockStyle, ImagePresentation, Inline, Marks};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryRoute, LibraryShellState, ResourceId};
 use gpui::{
-    AppContext, ClipboardItem, EntityInputHandler, Image, ImageFormat, Modifiers, TestAppContext,
-    VisualTestContext, point, px,
+    AppContext, ClipboardItem, EntityInputHandler, Image, ImageFormat, KeyDownEvent, Keystroke,
+    Modifiers, TestAppContext, VisualTestContext, point, px,
 };
 use rusqlite::{Connection, params};
 use std::io::Cursor;
@@ -413,6 +413,129 @@ async fn cmd_k_palette_mounts_above_the_retained_editor_without_changing_session
     view.read_with(cx, |shell, _| {
         assert!(shell.search_palette_open);
         assert_eq!(shell.note_session.as_ref(), Some(&before));
+    });
+}
+
+#[gpui::test]
+async fn mounted_cmd_k_search_ignores_marked_enter_and_opens_the_thirteenth_result(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let retained = repository
+        .create_note(CreateNote {
+            title: "保持编辑器会话".into(),
+            notebook_id: None,
+            document: rich_document("原笔记正文"),
+        })
+        .expect("create retained note");
+    for index in 0..15 {
+        repository
+            .create_note(CreateNote {
+                title: format!("needle result {index:02}"),
+                notebook_id: None,
+                document: rich_document("needle local body"),
+            })
+            .expect("create searchable fixture");
+    }
+    repository
+        .process_search_jobs()
+        .expect("index fixtures before mounted search");
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(retained.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let session_before = view.read_with(cx, |shell, _| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("retained session")
+            .entity_id()
+    });
+
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    redraw(cx);
+    let input = view.read_with(cx, |shell, _| shell.search_input.clone());
+    cx.update(|window, app| {
+        input.update(app, |input, input_cx| {
+            let end = input.text().encode_utf16().count();
+            <TitleInput as EntityInputHandler>::replace_and_mark_text_in_range(
+                input,
+                Some(end..end),
+                "候选",
+                Some(2..2),
+                window,
+                input_cx,
+            );
+        });
+    });
+    assert!(
+        input.read_with(cx, |input, _| input.marked_range().is_some()),
+        "test must install a real marked native-input range"
+    );
+    let marked_enter = KeyDownEvent {
+        keystroke: Keystroke::parse("enter").expect("valid Enter"),
+        is_held: false,
+    };
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.on_search_key_down(&marked_enter, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            shell.search_palette_open,
+            "marked Enter must stay in the palette"
+        );
+        assert_eq!(shell.model.read(app).navigation().search_query(), None);
+        assert_eq!(
+            shell
+                .note_session
+                .as_ref()
+                .expect("same session")
+                .entity_id(),
+            session_before,
+            "opening/composing in search must not remount the editor"
+        );
+    });
+
+    cx.update(|window, app| {
+        input.update(app, |input, input_cx| {
+            <TitleInput as EntityInputHandler>::unmark_text(input, window, input_cx);
+            input.select_all();
+            <TitleInput as EntityInputHandler>::replace_text_in_range(
+                input, None, "needle", window, input_cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    for _ in 0..13 {
+        cx.simulate_keystrokes("down");
+    }
+    let expected = view.read_with(cx, |shell, _| {
+        assert!(
+            shell.search_palette_results.len() >= 14,
+            "all results are navigable"
+        );
+        assert_eq!(shell.search_palette_selected, 13);
+        shell.search_palette_results[13].note.id.clone()
+    });
+    cx.simulate_keystrokes("enter");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(!shell.search_palette_open);
+        let model = shell.model.read(app);
+        assert_eq!(model.navigation().search_query(), Some("needle"));
+        assert_eq!(model.navigation().selected_note_id(), Some(&expected));
     });
 }
 

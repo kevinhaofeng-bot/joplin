@@ -1255,9 +1255,9 @@ impl LibraryShell {
                 result
             })
             .is_ok();
-        if refreshed {
-            self.schedule_active_search_refresh(cx);
-        }
+        // SearchProjectionQueued reaches the Stage B1 scheduler separately.
+        // Do not query here: the save event precedes its FTS transaction, and
+        // an early completion could consume the pending fence before Idle.
         refreshed
     }
 
@@ -3477,15 +3477,27 @@ impl LibraryShell {
                 .await;
             let _ = this.update(cx, |shell, shell_cx| {
                 let outcome = match result {
-                    Ok(hits) => shell.model.update(shell_cx, |model, _| {
-                        model.commit_history_search_results(
-                            forward,
-                            &query,
-                            &expected_current,
-                            &expected_target,
-                            hits,
-                        )
-                    }),
+                    Ok(hits) => {
+                        let active_would_change = shell.model.read_with(shell_cx, |model, _| {
+                            model.active_session_note_id()
+                                != expected_target.selected_note_id.as_ref()
+                        });
+                        if active_would_change
+                            && !shell.flush_active_session(FlushReason::NoteSwitch, shell_cx)
+                        {
+                            shell.retry_history_search(forward, shell_cx);
+                            return;
+                        }
+                        shell.model.update(shell_cx, |model, _| {
+                            model.commit_history_search_results(
+                                forward,
+                                &query,
+                                &expected_current,
+                                &expected_target,
+                                hits,
+                            )
+                        })
+                    }
                     Err(error) => Err(error),
                 };
                 shell.history_search_notice = match outcome {
@@ -3498,6 +3510,19 @@ impl LibraryShell {
         self._history_search_task = Some(task);
         cx.notify();
         true
+    }
+
+    fn retry_history_search(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                let _ = shell.schedule_history_search(forward, shell_cx);
+            });
+        });
+        self._history_search_task = Some(task);
+        cx.notify();
     }
 
     /// Repository events while SearchRoute is active must not synchronously
@@ -3526,11 +3551,39 @@ impl LibraryShell {
                 .await;
             let _ = this.update(cx, |shell, shell_cx| {
                 if let Ok(hits) = result {
+                    let active_would_disappear = shell.model.read_with(shell_cx, |model, _| {
+                        model
+                            .active_session_note_id()
+                            .is_some_and(|id| !hits.iter().any(|hit| hit.note.id == *id))
+                    });
+                    if active_would_disappear
+                        && !shell.flush_active_session(FlushReason::NoteSwitch, shell_cx)
+                    {
+                        // Composition/dirty-save ownership stays with the
+                        // retained editor. Keep the pending core fence and
+                        // retry after a short UI turn rather than unmounting
+                        // a session that acquired new input while FTS ran.
+                        shell.retry_active_search_refresh(shell_cx);
+                        return;
+                    }
                     let _ = shell.model.update(shell_cx, |model, _| {
                         model.commit_search_refresh(&query, &expected_snapshot, hits)
                     });
                 }
                 shell_cx.notify();
+            });
+        });
+        self._search_route_refresh_task = Some(task);
+        cx.notify();
+    }
+
+    fn retry_active_search_refresh(&mut self, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                shell.schedule_active_search_refresh(shell_cx);
             });
         });
         self._search_route_refresh_task = Some(task);
@@ -4423,7 +4476,12 @@ impl LibraryShell {
                 true
             }
             "enter" => {
-                self.commit_search_result(self.search_palette_selected, window, cx);
+                // macOS may deliver Enter while the native input bridge still
+                // owns marked CJK composition. It finalizes that composition,
+                // never opens a transient result underneath it.
+                if input.read(cx).marked_range().is_none() {
+                    self.commit_search_result(self.search_palette_selected, window, cx);
+                }
                 true
             }
             "down" => {
@@ -4600,7 +4658,16 @@ impl LibraryShell {
             .flex()
             .flex_col()
             .gap(px(4.0));
-        for (index, hit) in self.search_palette_results.iter().enumerate() {
+        // Keep keyboard selection visible without mounting hundreds of cards.
+        // This is a retained window over the bounded packet, not a second
+        // result authority; Up/Down can still visit every local hit.
+        let result_window_start = self.search_palette_selected.saturating_sub(5);
+        let result_window_end = (result_window_start + 12).min(self.search_palette_results.len());
+        for (index, hit) in self.search_palette_results[result_window_start..result_window_end]
+            .iter()
+            .enumerate()
+            .map(|(offset, hit)| (result_window_start + offset, hit))
+        {
             let title = hit.note.title_prefix.clone();
             let snippet = hit.snippet.clone();
             results = results.child(
@@ -4630,8 +4697,8 @@ impl LibraryShell {
                     ),
             );
         }
-        let palette_width = viewport_width.clamp(280.0, 620.0);
-        let palette_left = ((viewport_width - palette_width) / 2.0).max(8.0);
+        let palette_width = (viewport_width - 16.0).max(1.0).min(620.0);
+        let palette_left = (viewport_width - palette_width) / 2.0;
         Some(
             div()
                 .id("library-search-backdrop")

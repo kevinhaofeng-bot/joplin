@@ -419,6 +419,37 @@ fn creating_note_clears_search_context() {
 }
 
 #[test]
+fn creating_note_after_search_preserves_the_search_history_snapshot() {
+    let (_profile, repository) = repository();
+    let result = create(&repository, "search history survives create");
+    let mut model = AppModel::open(repository).expect("open model");
+    let hit = SearchHit {
+        note: model
+            .projections()
+            .iter()
+            .find(|row| row.id == result)
+            .expect("result projection")
+            .clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+    let generation = model.begin_search("survives");
+    assert!(
+        model
+            .commit_search_results(generation, "survives".into(), vec![hit], None)
+            .expect("commit search")
+    );
+    model.dispatch(AppAction::CreateNote).expect("create note");
+
+    assert_eq!(model.navigation().search_query(), None);
+    assert_eq!(
+        model.pending_history_search(false).map(|(query, _)| query),
+        Some("survives".into()),
+        "creating a note must append after the search rather than replacing its history entry"
+    );
+}
+
+#[test]
 fn search_packet_is_typed_history_and_stale_completion_cannot_replace_cards() {
     let (_profile, repository) = repository();
     let first = create(&repository, "first result");
