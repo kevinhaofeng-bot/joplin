@@ -113,7 +113,12 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
         "UPDATE notes SET notebook_id = ?1 WHERE notebook_id = ''",
         [&notebook],
     )?;
-    canonicalize_notes(&transaction)?;
+    // v8 already has the canonical note body representation.  D2 adds only
+    // a disposable resource-title projection, so re-reading/re-writing every
+    // body during a v8 -> v9 upgrade would be both needless and unsafe.
+    if version < 8 {
+        canonicalize_notes(&transaction)?;
+    }
     if version == 3 {
         rebuild_v3_notes(&transaction, &notebook)?;
     }
@@ -140,7 +145,10 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
         transaction.execute("INSERT INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-v7-bootstrap' FROM notes WHERE true ON CONFLICT(note_id) DO NOTHING", [])?;
     }
     if version < 9 {
-        transaction.execute_batch("CREATE TABLE IF NOT EXISTS resource_search_rows (fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT, resource_id TEXT NOT NULL UNIQUE); CREATE VIRTUAL TABLE IF NOT EXISTS resource_filename_unicode USING fts5(resource_id UNINDEXED, filename, tokenize='unicode61'); CREATE VIRTUAL TABLE IF NOT EXISTS resource_filename_trigram USING fts5(resource_id UNINDEXED, filename, tokenize='trigram'); INSERT OR IGNORE INTO resource_search_rows(resource_id) SELECT id FROM resources; INSERT INTO resource_filename_unicode(rowid,resource_id,filename) SELECT rsr.fts_rowid,r.id,r.title FROM resources r JOIN resource_search_rows rsr ON rsr.resource_id=r.id; INSERT INTO resource_filename_trigram(rowid,resource_id,filename) SELECT rsr.fts_rowid,r.id,r.title FROM resources r JOIN resource_search_rows rsr ON rsr.resource_id=r.id;")?;
+        // The projection is fully disposable.  Rebuild it from the live
+        // authoritative resource rows so an interrupted/pre-release v9
+        // artifact cannot leave stale filenames or duplicate FTS rows.
+        transaction.execute_batch("DROP TRIGGER IF EXISTS resource_filename_search_insert; DROP TRIGGER IF EXISTS resource_filename_search_update; DROP TRIGGER IF EXISTS resource_filename_search_delete; DROP TABLE IF EXISTS resource_filename_unicode; DROP TABLE IF EXISTS resource_filename_trigram; DROP TABLE IF EXISTS resource_search_rows; CREATE TABLE resource_search_rows (fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT, resource_id TEXT NOT NULL UNIQUE); CREATE VIRTUAL TABLE resource_filename_unicode USING fts5(resource_id UNINDEXED, filename, tokenize='unicode61'); CREATE VIRTUAL TABLE resource_filename_trigram USING fts5(resource_id UNINDEXED, filename, tokenize='trigram'); INSERT INTO resource_search_rows(resource_id) SELECT id FROM resources WHERE deleted_time=0; INSERT INTO resource_filename_unicode(rowid,resource_id,filename) SELECT rsr.fts_rowid,r.id,r.title FROM resources r JOIN resource_search_rows rsr ON rsr.resource_id=r.id WHERE r.deleted_time=0; INSERT INTO resource_filename_trigram(rowid,resource_id,filename) SELECT rsr.fts_rowid,r.id,r.title FROM resources r JOIN resource_search_rows rsr ON rsr.resource_id=r.id WHERE r.deleted_time=0; CREATE TRIGGER resource_filename_search_insert AFTER INSERT ON resources WHEN NEW.deleted_time=0 BEGIN INSERT OR IGNORE INTO resource_search_rows(resource_id) VALUES(NEW.id); INSERT INTO resource_filename_unicode(rowid,resource_id,filename) SELECT fts_rowid,NEW.id,NEW.title FROM resource_search_rows WHERE resource_id=NEW.id; INSERT INTO resource_filename_trigram(rowid,resource_id,filename) SELECT fts_rowid,NEW.id,NEW.title FROM resource_search_rows WHERE resource_id=NEW.id; END; CREATE TRIGGER resource_filename_search_update AFTER UPDATE OF title,deleted_time ON resources BEGIN DELETE FROM resource_filename_unicode WHERE rowid IN (SELECT fts_rowid FROM resource_search_rows WHERE resource_id=OLD.id); DELETE FROM resource_filename_trigram WHERE rowid IN (SELECT fts_rowid FROM resource_search_rows WHERE resource_id=OLD.id); INSERT OR IGNORE INTO resource_search_rows(resource_id) SELECT NEW.id WHERE NEW.deleted_time=0; INSERT INTO resource_filename_unicode(rowid,resource_id,filename) SELECT fts_rowid,NEW.id,NEW.title FROM resource_search_rows WHERE resource_id=NEW.id AND NEW.deleted_time=0; INSERT INTO resource_filename_trigram(rowid,resource_id,filename) SELECT fts_rowid,NEW.id,NEW.title FROM resource_search_rows WHERE resource_id=NEW.id AND NEW.deleted_time=0; END; CREATE TRIGGER resource_filename_search_delete AFTER DELETE ON resources BEGIN DELETE FROM resource_filename_unicode WHERE rowid IN (SELECT fts_rowid FROM resource_search_rows WHERE resource_id=OLD.id); DELETE FROM resource_filename_trigram WHERE rowid IN (SELECT fts_rowid FROM resource_search_rows WHERE resource_id=OLD.id); DELETE FROM resource_search_rows WHERE resource_id=OLD.id; END;")?;
     }
     transaction.execute_batch("PRAGMA user_version = 9")?;
     before_commit();

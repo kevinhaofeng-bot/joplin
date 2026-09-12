@@ -2694,31 +2694,6 @@ impl LibraryRepository {
                 now,
             ],
         )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO resource_search_rows (resource_id) VALUES (?1)",
-            [staged.resource_id().as_str()],
-        )?;
-        let rowid: i64 = transaction.query_row(
-            "SELECT fts_rowid FROM resource_search_rows WHERE resource_id=?1",
-            [staged.resource_id().as_str()],
-            |row| row.get(0),
-        )?;
-        transaction.execute(
-            "DELETE FROM resource_filename_unicode WHERE rowid=?1",
-            [rowid],
-        )?;
-        transaction.execute(
-            "DELETE FROM resource_filename_trigram WHERE rowid=?1",
-            [rowid],
-        )?;
-        transaction.execute(
-            "INSERT INTO resource_filename_unicode (rowid,resource_id,filename) VALUES (?1,?2,?3)",
-            params![rowid, staged.resource_id().as_str(), &staged.title],
-        )?;
-        transaction.execute(
-            "INSERT INTO resource_filename_trigram (rowid,resource_id,filename) VALUES (?1,?2,?3)",
-            params![rowid, staged.resource_id().as_str(), &staged.title],
-        )?;
         enqueue_sync(
             transaction,
             self.id_source.as_ref(),
@@ -2931,7 +2906,7 @@ impl LibraryRepository {
         let mut values = Vec::<rusqlite::types::Value>::new();
         let mut filename_provenance = None;
         let mut mime_provenance = None;
-        let mut ordinary_filename_provenance = None;
+        let mut ordinary_filename_provenance = Vec::new();
         let trash = query
             .filters
             .iter()
@@ -2980,7 +2955,7 @@ impl LibraryRepository {
                 SearchTerm::NegatedText(text) | SearchTerm::NegatedPhrase(text) => (text, true),
             };
             if !negated {
-                ordinary_filename_provenance.get_or_insert_with(|| text.clone());
+                ordinary_filename_provenance.push(text.clone());
             }
             let condition = if contains_short_cjk(text) {
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
@@ -3008,17 +2983,30 @@ impl LibraryRepository {
         // the first filename filter when present, otherwise the first mime
         // filter; within either candidate set, relation order is stable.
         let mut provenance_values = Vec::<rusqlite::types::Value>::new();
-        let matched_resource = if let Some(value) = filename_provenance {
+        let matched_resource: String = if let Some(value) = filename_provenance {
             provenance_values.push(rusqlite::types::Value::Text(like_contains(&value)));
-            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.title LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)"
+            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.title LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)".into()
         } else if let Some(value) = mime_provenance {
             provenance_values.push(rusqlite::types::Value::Text(like_contains(&value)));
-            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)"
-        } else if let Some(value) = ordinary_filename_provenance {
-            provenance_values.push(rusqlite::types::Value::Text(like_contains(&value)));
-            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.title LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)"
+            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)".into()
+        } else if !ordinary_filename_provenance.is_empty() {
+            let mut matches = Vec::new();
+            for term in &ordinary_filename_provenance {
+                let (subquery, value) = filename_provenance_subquery(term);
+                matches.push(subquery);
+                provenance_values.push(value);
+            }
+            // COALESCE walks positive terms in query order. Each subquery
+            // applies the same unicode/trigram semantics as the candidate
+            // predicate, then relation order makes the chosen attachment
+            // deterministic.
+            if matches.len() == 1 {
+                matches.pop().expect("one filename provenance predicate")
+            } else {
+                format!("COALESCE({})", matches.join(","))
+            }
         } else {
-            "NULL"
+            "NULL".into()
         };
         provenance_values.append(&mut values);
         let mut values = provenance_values;
@@ -3652,6 +3640,38 @@ fn like_contains(value: &str) -> String {
             .replace('\\', "\\\\")
             .replace('%', "\\%")
             .replace('_', "\\_")
+    )
+}
+
+/// A filename-only provenance lookup mirrors the ordinary-term candidate
+/// branch.  In particular, Latin terms remain token-boundary FTS matches,
+/// rather than silently becoming substring `LIKE` matches while selecting an
+/// attachment for the UI.
+fn filename_provenance_subquery(term: &str) -> (String, rusqlite::types::Value) {
+    let (table, predicate, value) = if contains_short_cjk(term) {
+        (
+            "resource_filename_trigram",
+            "rf.filename LIKE ? ESCAPE '\\'",
+            rusqlite::types::Value::Text(like_contains(term)),
+        )
+    } else if contains_cjk(term) {
+        (
+            "resource_filename_trigram",
+            "resource_filename_trigram MATCH ?",
+            rusqlite::types::Value::Text(fts_literal(term)),
+        )
+    } else {
+        (
+            "resource_filename_unicode",
+            "resource_filename_unicode MATCH ?",
+            rusqlite::types::Value::Text(fts_literal(term)),
+        )
+    };
+    (
+        format!(
+            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN {table} rf ON rf.rowid=rsr.fts_rowid WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND {predicate} ORDER BY nr.position,nr.resource_id LIMIT 1)"
+        ),
+        value,
     )
 }
 

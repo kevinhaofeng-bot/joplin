@@ -1,5 +1,7 @@
+use app_lite_core::document::Block;
 use app_lite_core::{
-    CanonicalDocument, CreateNote, EditJournalEntry, LibraryError, LibraryRepository, SaveNote,
+    AssociateResource, CanonicalDocument, CreateNote, EditJournalEntry, LibraryError,
+    LibraryRepository, SaveNote,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -90,6 +92,93 @@ fn open_creates_clean_v9_database_idempotently() {
             "missing {table}"
         );
     }
+}
+
+#[test]
+fn v8_to_v9_does_not_rewrite_existing_note_bodies() {
+    // D2 only adds a disposable resource-title projection.  An already-v8
+    // profile must not parse or canonicalize every note body just to install
+    // it: that is both needless I/O and an unsafe content rewrite.
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repo = LibraryRepository::open(&path).unwrap();
+    let body_note = repo
+        .create_note(app_lite_core::CreateNote {
+            title: "migration body".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html("<p>initial</p>").unwrap(),
+        })
+        .unwrap();
+    let resource = repo
+        .import_resource(b"old", "v8-ledger.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = repo
+        .create_note(CreateNote {
+            title: "resource migration".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html("<p>neutral</p>").unwrap(),
+        })
+        .unwrap();
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "display-name.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    repo.process_search_jobs().unwrap();
+    drop(repo);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE notes SET body_html = ?1, body_text = ?2, snippet = ?3 WHERE id = ?4",
+            rusqlite::params![
+                "<p>  preserve  </p>",
+                "preserve original text",
+                "original snippet",
+                body_note.id.as_str()
+            ],
+        )
+        .unwrap();
+    connection.execute_batch("DROP TRIGGER resource_filename_search_insert; DROP TRIGGER resource_filename_search_update; DROP TRIGGER resource_filename_search_delete; DROP TABLE resource_filename_unicode; DROP TABLE resource_filename_trigram; DROP TABLE resource_search_rows; PRAGMA user_version = 8;").unwrap();
+    drop(connection);
+
+    let reopened = LibraryRepository::open(&path).unwrap();
+    let hits = reopened
+        .search(app_lite_core::SearchQuery::parse("ledger"))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_resource, Some(resource));
+    drop(reopened);
+    let check = Connection::open(&path).unwrap();
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT body_html FROM notes WHERE id = ?1",
+                [body_note.id.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "<p>  preserve  </p>"
+    );
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT body_text FROM notes WHERE id = ?1",
+                [body_note.id.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "preserve original text"
+    );
 }
 
 #[test]

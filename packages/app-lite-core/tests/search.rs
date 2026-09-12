@@ -536,10 +536,270 @@ fn ordinary_terms_find_live_attachment_filenames_with_provenance() {
     .unwrap();
     repo.process_search_jobs().unwrap();
 
+    let blob_reads = repo.observe_resource_reads();
+    let columns = repo.observe_next_search_query();
     let hits = repo.search(SearchQuery::parse("ledger")).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].note.id, note.id);
     assert_eq!(hits[0].matched_resource, Some(resource));
+    assert!(blob_reads.try_recv().is_err());
+    let reads = columns.recv().unwrap();
+    assert!(
+        !reads.iter().any(|field| matches!(
+            field.as_str(),
+            "notes.body_html" | "notes.body_text" | "resource_blobs.bytes"
+        )),
+        "ordinary filename search must stay on derived projections: {reads:?}"
+    );
+}
+
+#[test]
+fn ordinary_filename_provenance_uses_fts_word_boundaries() {
+    // `LIKE '%cat%'` would incorrectly attribute this `cat` match to the
+    // first attachment (`education.pdf`).  Provenance must use the same FTS
+    // semantics as the positive ordinary-term predicate.
+    let (_profile, repo) = repository();
+    let misleading = repo
+        .import_resource(b"one", "education.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let matching = repo
+        .import_resource(b"two", "cat-report.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = create(&repo, "neutral", "neutral");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Attachment {
+                    resource_id: misleading.clone(),
+                    filename: "education.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+                Block::Attachment {
+                    resource_id: matching.clone(),
+                    filename: "cat-report.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+            ]),
+            resource_ids: vec![misleading, matching.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+
+    repo.process_search_jobs().unwrap();
+
+    let hits = repo.search(SearchQuery::parse("cat")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_resource, Some(matching));
+}
+
+#[test]
+fn ordinary_filename_provenance_skips_body_terms_and_like_false_positives() {
+    // `cat` is satisfied by body text. `education.pdf` must not be presented
+    // as provenance merely because the old LIKE-based attribution saw `cat`
+    // inside "education".
+    let (_profile, repo) = repository();
+    let resource = repo
+        .import_resource(b"one", "education.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = create(&repo, "neutral", "a cat in the body");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "a cat in the body".into(),
+                        marks: Default::default(),
+                    }],
+                },
+                Block::Attachment {
+                    resource_id: resource.clone(),
+                    filename: "education.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+            ]),
+            resource_ids: vec![resource],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+
+    repo.process_search_jobs().unwrap();
+
+    let hits = repo.search(SearchQuery::parse("cat")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_resource, None);
+}
+
+#[test]
+fn ordinary_filename_provenance_uses_first_positive_term_that_hits_a_filename() {
+    let (_profile, repo) = repository();
+    let resource = repo
+        .import_resource(b"one", "quarterly-ledger.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = create(&repo, "neutral", "neutral body only");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "quarterly-ledger.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+
+    repo.process_search_jobs().unwrap();
+
+    let hits = repo.search(SearchQuery::parse("neutral ledger")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_resource, Some(resource));
+}
+
+#[test]
+fn filename_projection_triggers_follow_title_soft_delete_and_hard_delete() {
+    let (profile, repo) = repository();
+    let resource = repo
+        .import_resource(b"one", "initial-ledger.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let orphan = repo
+        .import_resource(b"two", "orphan-ledger.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = create(&repo, "neutral", "neutral");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "display-name.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    assert_eq!(
+        repo.search(SearchQuery::parse("initial-ledger"))
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(repo);
+
+    let path = profile.path().join("library.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE resources SET title = 'renamed-file.pdf' WHERE id = ?1",
+            [resource.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute("DELETE FROM resources WHERE id = ?1", [orphan.as_str()])
+        .unwrap();
+    drop(connection);
+
+    let reopened = LibraryRepository::open(&path).unwrap();
+    assert!(
+        reopened
+            .search(SearchQuery::parse("initial-ledger"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .search(SearchQuery::parse("renamed-file"))
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(reopened);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE resources SET deleted_time = 1 WHERE id = ?1",
+            [resource.as_str()],
+        )
+        .unwrap();
+    let rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM resource_search_rows WHERE resource_id IN (?1, ?2)",
+            [resource.as_str(), orphan.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "soft delete retains stable row identity; hard delete removes it"
+    );
+    let indexed: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM resource_filename_unicode",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed, 0, "soft-deleted titles leave both FTS projections");
+    drop(connection);
+
+    assert!(
+        LibraryRepository::open(&path)
+            .unwrap()
+            .search(SearchQuery::parse("renamed-file"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn filename_terms_support_short_long_cjk_phrases_and_negation() {
+    let (_profile, repo) = repository();
+    let resource = repo
+        .import_resource(b"one", "北京朝阳季度报告.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = create(&repo, "neutral", "neutral");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "display-name.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+
+    for query in ["北", "北京", "北京朝阳", "\"北京朝阳\""] {
+        let hits = repo.search(SearchQuery::parse(query)).unwrap();
+        assert_eq!(hits.len(), 1, "filename term {query:?}");
+        assert_eq!(hits[0].matched_resource, Some(resource.clone()));
+    }
+    assert!(
+        repo.search(SearchQuery::parse("-\"北京朝阳\""))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
