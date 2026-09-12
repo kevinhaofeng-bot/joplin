@@ -1,0 +1,21 @@
+# Task 7 Stage B2c — SearchRoute safety and interaction closure
+
+This is a fresh bounded corrective task following the five-round B2 breaker at `6763004e8`, not a declaration that B2 passed. The binding findings and controller rulings are in `task-7-stage-b2-review.md` (Round 5) and `progress.md` (B2 breaker). Keep the stable B1 scheduler and one `AppModel::projections` result authority. No suggestions, Cmd-F, OCR/PDF, new sync, personal-library access, tag, push or deployment.
+
+Before edits, re-read `task-7-source-brief.md` and the actual Evernote search modules mapped there. The fixes below are Rust implementation correctness, not claims that Evernote uses GPUI. Preserve the source→Rust→test crosswalk in the report.
+
+## Required corrections
+
+1. **In-flight save fence.** `NoteSession::save_generation()` advances at `mark_dirty`, not at save completion. A query can begin with Dirty + empty durable search queue, then the same generation becomes Clean while old FTS hits return. Fence both history and active refresh against actual durable save completion (`expected_revision()` is one existing candidate; inspect all save/resource paths) as well as edits and request generation. If a flush/save occurred after the packet was read, discard the packet, retain editor/undo/selection, and retry only after the durable queue has drained. Test the exact Dirty→Clean *same save_generation* interleaving; include the selected-note-absent history packet case. Do not add a foreground body/FTS query.
+
+2. **Real keyboard visibility.** Remove the `selected_index * 58px` estimate. GPUI 0.2.2 `ScrollHandle::scroll_to_item(ix)` and `bounds_for_item(ix)` exist in `elements/div.rs:3136-3148`, but they index immediate children of the tracked scroll container; the current container wraps all rows in one `results` child. Make at most 500 rows directly measurable/reachable (or choose another actual-geometry solution), preserving mouse wheel/click access and no second result authority. A mounted test at narrow width with wrapping title/snippet and a far selected row (including near 500) must assert its painted bounds intersect the viewport after Up/Down, not merely that Enter opens it. Check both keyboard and mouse tail access.
+
+3. **Coherent error and explicit recovery.** `commit_search_refresh` returns `Result<bool, LibraryError>`; do not swallow `Err`. Keep the old coherent SearchRoute packet, show an exact search-specific error separate from save/index errors, and offer a visible Retry action that re-issues a bounded background refresh. Handle stale `Ok(false)` by checking the current route/generation and ensuring the latest pending request is scheduled, without turning stale completions into an endless loop. Queue/FTS failures also need an explicit retry path; no silent permanent stale view, no hot 500ms retry loop.
+
+4. **Exact prior focus.** `Window::focused(&App) -> Option<FocusHandle>` exists in GPUI 0.2.2 `window.rs:1380`. Capture the real focus when opening Cmd-K. Preserve or restore the visibility of the containing organization/command control before refocusing; never focus a hidden field or collapse the original panel and fall back to shell. Verify Escape and backdrop from title plus at least one organization input and one other currently focusable search-entry context. Opening/closing still must not flush/remount/reset the NoteSession.
+
+5. Fix the core formatting failure at `packages/app-lite-core/src/repository.rs:2807` with `cargo fmt` (the previous suite passed but fmt did not).
+
+## Delivery gate
+
+Write RED tests before production changes where feasible, then targeted GREEN tests. Run core `cargo test --features test-support`, GPUI tests with only the documented donor `cross_block_cut_writes_markdown_deletes_range_and_undo_restores` skip, both fmt checks, diff check, GPUI Release build, and a disposable-profile UI smoke. The last two may be reported as pending if time/automation prevents them, but do not claim B2 visual acceptance without them. Commit local changes; append exact commands/results, source crosswalk, caveats and commit hash to `task-7-stage-b2c-report.md`. Do not commit or touch unrelated dirty files. Return a concise implementation summary for independent review.
