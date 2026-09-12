@@ -2904,6 +2904,8 @@ impl LibraryRepository {
     pub fn search(&self, query: SearchQuery) -> Result<Vec<SearchHit>, LibraryError> {
         let mut predicates = Vec::<String>::new();
         let mut values = Vec::<rusqlite::types::Value>::new();
+        let mut filename_provenance = None;
+        let mut mime_provenance = None;
         let trash = query
             .filters
             .iter()
@@ -2929,8 +2931,16 @@ impl LibraryRepository {
                 SearchFilter::Created(range) => add_range(&mut predicates, &mut values, "n.created_time", range),
                 SearchFilter::Updated(range) => add_range(&mut predicates, &mut values, "n.updated_time", range),
                 SearchFilter::HasAttachment(value) => predicates.push(if *value { "EXISTS (SELECT 1 FROM note_resources nr WHERE nr.note_id=n.id AND nr.is_associated=1)" } else { "NOT EXISTS (SELECT 1 FROM note_resources nr WHERE nr.note_id=n.id AND nr.is_associated=1)" }.into()),
-                SearchFilter::Filename(value) => { predicates.push("EXISTS (SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND r.title LIKE ? ESCAPE '\\')".into()); values.push(rusqlite::types::Value::Text(like_contains(value))); }
-                SearchFilter::Mime(value) => { predicates.push("EXISTS (SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND r.mime LIKE ? ESCAPE '\\')".into()); values.push(rusqlite::types::Value::Text(like_contains(value))); }
+                SearchFilter::Filename(value) => {
+                    filename_provenance.get_or_insert_with(|| value.clone());
+                    predicates.push("EXISTS (SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.title LIKE ? ESCAPE '\\')".into());
+                    values.push(rusqlite::types::Value::Text(like_contains(value)));
+                }
+                SearchFilter::Mime(value) => {
+                    mime_provenance.get_or_insert_with(|| value.clone());
+                    predicates.push("EXISTS (SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime LIKE ? ESCAPE '\\')".into());
+                    values.push(rusqlite::types::Value::Text(like_contains(value)));
+                }
                 SearchFilter::Not(inner) => match inner.as_ref() {
                     SearchFilter::Tag(value) => { predicates.push("n.id NOT IN (SELECT nt.note_id FROM note_tags nt JOIN tags t ON t.id=nt.tag_id WHERE t.id=? OR t.title COLLATE NOCASE=?)".into()); values.push(rusqlite::types::Value::Text(value.clone())); values.push(rusqlite::types::Value::Text(value.clone())); }
                     SearchFilter::Notebook(value) => { predicates.push("n.notebook_id NOT IN (SELECT id FROM notebooks WHERE id=? OR title COLLATE NOCASE=?)".into()); values.push(rusqlite::types::Value::Text(value.clone())); values.push(rusqlite::types::Value::Text(value.clone())); }
@@ -2961,6 +2971,22 @@ impl LibraryRepository {
                 condition
             });
         }
+        // Filters remain note-level AND predicates: filename and mime may be
+        // satisfied by different current attachments. For UI provenance, use
+        // the first filename filter when present, otherwise the first mime
+        // filter; within either candidate set, relation order is stable.
+        let mut provenance_values = Vec::<rusqlite::types::Value>::new();
+        let matched_resource = if let Some(value) = filename_provenance {
+            provenance_values.push(rusqlite::types::Value::Text(like_contains(&value)));
+            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.title LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)"
+        } else if let Some(value) = mime_provenance {
+            provenance_values.push(rusqlite::types::Value::Text(like_contains(&value)));
+            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)"
+        } else {
+            "NULL"
+        };
+        provenance_values.append(&mut values);
+        let mut values = provenance_values;
         let limit =
             i64::try_from(query.limit()).map_err(|_| SearchQueryError::SqlIntegerOverflow)?;
         let offset =
@@ -2968,8 +2994,8 @@ impl LibraryRepository {
         values.push(rusqlite::types::Value::Integer(limit));
         values.push(rusqlite::types::Value::Integer(offset));
         let sql = format!(
-            "SELECT n.id, substr(n.title,1,120), substr(n.snippet,1,160), n.updated_time, n.deleted_time, n.notebook_id, COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id=snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')), (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime IN ('image/png','image/jpeg') ORDER BY nr.position,nr.resource_id LIMIT 1)), (SELECT count(*) FROM note_resources nr WHERE nr.note_id=n.id AND nr.is_associated=1) FROM notes n WHERE {} ORDER BY n.updated_time DESC, n.id ASC LIMIT ? OFFSET ?",
-            predicates.join(" AND ")
+            "SELECT n.id, substr(n.title,1,120), substr(n.snippet,1,160), n.updated_time, n.deleted_time, n.notebook_id, COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id=snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')), (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime IN ('image/png','image/jpeg') ORDER BY nr.position,nr.resource_id LIMIT 1)), (SELECT count(*) FROM note_resources nr WHERE nr.note_id=n.id AND nr.is_associated=1), {matched_resource} FROM notes n WHERE {} ORDER BY n.updated_time DESC, n.id ASC LIMIT ? OFFSET ?",
+            predicates.join(" AND "),
         );
         #[cfg(any(test, feature = "test-support"))]
         let observers = std::mem::take(
@@ -3005,7 +3031,11 @@ impl LibraryRepository {
                     Ok(SearchHit {
                         note: row_to_projection(row)?,
                         snippet: row.get(2)?,
-                        matched_resource: None,
+                        matched_resource: row
+                            .get::<_, Option<String>>(8)?
+                            .map(ResourceId::new)
+                            .transpose()
+                            .map_err(invalid_column)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?)

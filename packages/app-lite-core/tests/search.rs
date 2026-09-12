@@ -310,6 +310,188 @@ fn filters_tag_intersection_trash_and_paging_return_only_projections() {
 }
 
 #[test]
+fn resource_filters_require_current_attachments_and_report_deterministic_provenance() {
+    // This fails if search stops joining current note_resources, ignores a
+    // deleted resource, or omits/chooses the wrong attachment provenance.
+    let (profile, repo) = repository();
+    let pdf = repo
+        .import_resource(b"%PDF-1.7", "separate-report.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let image = repo
+        .import_image(b"png", "separate-image.png", "image/png", "png")
+        .unwrap();
+    let first_report = repo
+        .import_resource(b"first", "first-report.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let second_report = repo
+        .import_resource(b"second", "second-report.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let mixed_image = repo
+        .import_image(b"mixed", "mixed-image.png", "image/png", "png")
+        .unwrap();
+    repo.import_resource(b"orphan", "standalone-report.pdf", "application/pdf", "pdf")
+        .unwrap();
+
+    let pdf_note = create(
+        &repo,
+        "PDF title remains searchable",
+        "PDF body remains searchable",
+    );
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: pdf_note.id.clone(),
+            expected_revision: pdf_note.revision,
+            title: pdf_note.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "PDF body remains searchable".into(),
+                        marks: Default::default(),
+                    }],
+                },
+                Block::Attachment {
+                    resource_id: pdf.clone(),
+                    filename: "separate-report.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+            ]),
+            resource_ids: vec![pdf.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    let image_note = create(&repo, "Image note", "image-only body");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: image_note.id.clone(),
+            expected_revision: image_note.revision,
+            title: image_note.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Image {
+                    resource_id: image.clone(),
+                    alt: "separate image".into(),
+                }],
+            }]),
+            resource_ids: vec![image.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    let mixed_note = create(&repo, "Mixed attachments", "mixed body");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: mixed_note.id.clone(),
+            expected_revision: mixed_note.revision,
+            title: mixed_note.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Attachment {
+                    resource_id: first_report.clone(),
+                    filename: "first-report.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+                Block::Attachment {
+                    resource_id: second_report.clone(),
+                    filename: "second-report.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Image {
+                        resource_id: mixed_image.clone(),
+                        alt: "mixed image".into(),
+                    }],
+                },
+            ]),
+            resource_ids: vec![first_report.clone(), second_report, mixed_image],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    repo.process_search_jobs().unwrap();
+
+    let blob_reads = repo.observe_resource_reads();
+    let columns = repo.observe_next_search_query();
+    let pdf_hits = repo
+        .search(SearchQuery::parse("filename:separate-report"))
+        .unwrap();
+    assert_eq!(pdf_hits.len(), 1);
+    assert_eq!(pdf_hits[0].note.id, pdf_note.id);
+    assert_eq!(pdf_hits[0].matched_resource, Some(pdf.clone()));
+    assert!(
+        blob_reads.try_recv().is_err(),
+        "filtering must not read blob bytes"
+    );
+    let reads = columns.recv().unwrap();
+    assert!(
+        !reads.iter().any(|field| matches!(
+            field.as_str(),
+            "notes.body_html" | "notes.body_text" | "resource_blobs.bytes"
+        )),
+        "resource filters must stay on card and attachment metadata: {reads:?}"
+    );
+    let image_hits = repo.search(SearchQuery::parse("mime:image/png")).unwrap();
+    assert_eq!(image_hits.len(), 2);
+    assert!(image_hits.iter().any(|hit| {
+        hit.note.id == image_note.id && hit.matched_resource == Some(image.clone())
+    }));
+    let provenance = repo
+        .search(SearchQuery::parse("filename:report mime:image/png"))
+        .unwrap();
+    assert_eq!(provenance.len(), 1);
+    assert_eq!(provenance[0].note.id, mixed_note.id);
+    assert_eq!(provenance[0].matched_resource, Some(first_report.clone()));
+    assert!(
+        repo.search(SearchQuery::parse("filename:standalone-report"))
+            .unwrap()
+            .is_empty(),
+        "a standalone resource is not an attachment search result"
+    );
+
+    drop(repo);
+    let connection = rusqlite::Connection::open(profile.path().join("library.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE note_resources SET is_associated = 0 WHERE note_id = ?1 AND resource_id = ?2",
+            rusqlite::params![pdf_note.id.as_str(), pdf.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE resources SET deleted_time = 1 WHERE id = ?1",
+            [image.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    assert!(
+        reopened
+            .search(SearchQuery::parse("filename:separate-report"))
+            .unwrap()
+            .is_empty(),
+        "an unassociated historical relation must disappear from attachment search"
+    );
+    assert!(
+        reopened
+            .search(SearchQuery::parse("filename:separate-image"))
+            .unwrap()
+            .is_empty(),
+        "a deleted resource must disappear from attachment search"
+    );
+    for query in [
+        "PDF title remains searchable",
+        "PDF body remains searchable",
+    ] {
+        let hits = reopened.search(SearchQuery::parse(query)).unwrap();
+        assert_eq!(hits.len(), 1, "ordinary search must retain {query:?}");
+        assert_eq!(hits[0].note.id, pdf_note.id);
+        assert_eq!(hits[0].matched_resource, None);
+    }
+}
+
+#[test]
 fn parser_keeps_unknown_operators_as_text_and_supports_escaped_quotes() {
     let parsed = SearchQuery::parse("unknown:value \"a \\\"quoted\\\" phrase\" tag:red tag:blue");
     assert!(
