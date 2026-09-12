@@ -31,7 +31,7 @@ impl RepositoryIdSource for FixedIds {
 }
 
 #[test]
-fn open_creates_clean_v8_database_idempotently() {
+fn open_creates_clean_v9_database_idempotently() {
     // Catches a fresh profile missing v7 schema/PRAGMAs or a second open changing it.
     let profile = tempdir().unwrap();
     let path = profile.path().join("library.sqlite");
@@ -42,7 +42,7 @@ fn open_creates_clean_v8_database_idempotently() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         connection
@@ -75,6 +75,8 @@ fn open_creates_clean_v8_database_idempotently() {
         "settings",
         "search_unicode",
         "search_trigram",
+        "resource_filename_unicode",
+        "resource_filename_trigram",
     ] {
         assert_eq!(
             connection
@@ -1113,7 +1115,7 @@ fn migration_gate_blocks_a_second_v3_writer_before_html_publication() {
         check
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         check
@@ -1327,7 +1329,7 @@ fn migration_commit_returns_bound_repository_when_selected_profile_is_replaced()
         published
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
 }
 

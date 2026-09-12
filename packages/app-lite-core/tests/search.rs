@@ -506,6 +506,43 @@ fn resource_filters_require_current_attachments_and_report_deterministic_provena
 }
 
 #[test]
+fn ordinary_terms_find_live_attachment_filenames_with_provenance() {
+    // This fails if ordinary terms only search the note-owned title/body FTS
+    // instead of the bounded resource-owned filename projection.
+    let (_profile, repo) = repository();
+    let resource = repo
+        .import_resource(
+            b"%PDF-1.7",
+            "quarterly-ledger.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .unwrap();
+    let note = create(&repo, "Neutral title", "neutral body");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "display-name.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    repo.process_search_jobs().unwrap();
+
+    let hits = repo.search(SearchQuery::parse("ledger")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].note.id, note.id);
+    assert_eq!(hits[0].matched_resource, Some(resource));
+}
+
+#[test]
 fn parser_keeps_unknown_operators_as_text_and_supports_escaped_quotes() {
     let parsed = SearchQuery::parse("unknown:value \"a \\\"quoted\\\" phrase\" tag:red tag:blue");
     assert!(

@@ -2694,6 +2694,31 @@ impl LibraryRepository {
                 now,
             ],
         )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO resource_search_rows (resource_id) VALUES (?1)",
+            [staged.resource_id().as_str()],
+        )?;
+        let rowid: i64 = transaction.query_row(
+            "SELECT fts_rowid FROM resource_search_rows WHERE resource_id=?1",
+            [staged.resource_id().as_str()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "DELETE FROM resource_filename_unicode WHERE rowid=?1",
+            [rowid],
+        )?;
+        transaction.execute(
+            "DELETE FROM resource_filename_trigram WHERE rowid=?1",
+            [rowid],
+        )?;
+        transaction.execute(
+            "INSERT INTO resource_filename_unicode (rowid,resource_id,filename) VALUES (?1,?2,?3)",
+            params![rowid, staged.resource_id().as_str(), &staged.title],
+        )?;
+        transaction.execute(
+            "INSERT INTO resource_filename_trigram (rowid,resource_id,filename) VALUES (?1,?2,?3)",
+            params![rowid, staged.resource_id().as_str(), &staged.title],
+        )?;
         enqueue_sync(
             transaction,
             self.id_source.as_ref(),
@@ -2906,6 +2931,7 @@ impl LibraryRepository {
         let mut values = Vec::<rusqlite::types::Value>::new();
         let mut filename_provenance = None;
         let mut mime_provenance = None;
+        let mut ordinary_filename_provenance = None;
         let trash = query
             .filters
             .iter()
@@ -2953,17 +2979,23 @@ impl LibraryRepository {
                 SearchTerm::Text(text) | SearchTerm::Phrase(text) => (text, false),
                 SearchTerm::NegatedText(text) | SearchTerm::NegatedPhrase(text) => (text, true),
             };
+            if !negated {
+                ordinary_filename_provenance.get_or_insert_with(|| text.clone());
+            }
             let condition = if contains_short_cjk(text) {
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
-                "n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE st.title LIKE ? ESCAPE '\\' OR st.body LIKE ? ESCAPE '\\')".to_owned()
+                values.push(rusqlite::types::Value::Text(like_contains(text)));
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE st.title LIKE ? ESCAPE '\\' OR st.body LIKE ? ESCAPE '\\') OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND rf.filename LIKE ? ESCAPE '\\'))".to_owned()
             } else if contains_cjk(text) {
                 values.push(rusqlite::types::Value::Text(fts_literal(text)));
-                "n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE search_trigram MATCH ?)".to_owned()
+                values.push(rusqlite::types::Value::Text(fts_literal(text)));
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE search_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_trigram MATCH ?))".to_owned()
             } else {
                 let fts = fts_literal(text);
+                values.push(rusqlite::types::Value::Text(fts.clone()));
                 values.push(rusqlite::types::Value::Text(fts));
-                "n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?)".to_owned()
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_unicode rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_unicode MATCH ?))".to_owned()
             };
             predicates.push(if negated {
                 format!("NOT ({condition})")
@@ -2982,6 +3014,9 @@ impl LibraryRepository {
         } else if let Some(value) = mime_provenance {
             provenance_values.push(rusqlite::types::Value::Text(like_contains(&value)));
             "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)"
+        } else if let Some(value) = ordinary_filename_provenance {
+            provenance_values.push(rusqlite::types::Value::Text(like_contains(&value)));
+            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.title LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)"
         } else {
             "NULL"
         };

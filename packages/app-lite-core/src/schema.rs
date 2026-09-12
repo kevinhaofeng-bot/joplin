@@ -4,7 +4,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub(crate) fn migrate_schema(
     connection: &mut Connection,
@@ -139,7 +139,10 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
         transaction.execute_batch("CREATE TABLE IF NOT EXISTS search_index_rows (fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT, note_id TEXT NOT NULL UNIQUE); CREATE VIRTUAL TABLE IF NOT EXISTS search_unicode USING fts5(note_id UNINDEXED, title, body, tokenize='unicode61'); CREATE VIRTUAL TABLE IF NOT EXISTS search_trigram USING fts5(note_id UNINDEXED, title, body, tokenize='trigram');")?;
         transaction.execute("INSERT INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-v7-bootstrap' FROM notes WHERE true ON CONFLICT(note_id) DO NOTHING", [])?;
     }
-    transaction.execute_batch("PRAGMA user_version = 8")?;
+    if version < 9 {
+        transaction.execute_batch("CREATE TABLE IF NOT EXISTS resource_search_rows (fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT, resource_id TEXT NOT NULL UNIQUE); CREATE VIRTUAL TABLE IF NOT EXISTS resource_filename_unicode USING fts5(resource_id UNINDEXED, filename, tokenize='unicode61'); CREATE VIRTUAL TABLE IF NOT EXISTS resource_filename_trigram USING fts5(resource_id UNINDEXED, filename, tokenize='trigram'); INSERT OR IGNORE INTO resource_search_rows(resource_id) SELECT id FROM resources; INSERT INTO resource_filename_unicode(rowid,resource_id,filename) SELECT rsr.fts_rowid,r.id,r.title FROM resources r JOIN resource_search_rows rsr ON rsr.resource_id=r.id; INSERT INTO resource_filename_trigram(rowid,resource_id,filename) SELECT rsr.fts_rowid,r.id,r.title FROM resources r JOIN resource_search_rows rsr ON rsr.resource_id=r.id;")?;
+    }
+    transaction.execute_batch("PRAGMA user_version = 9")?;
     before_commit();
     // The test hook models the last pathname/descriptor race.  It must run
     // before the final identity check so a swapped profile aborts the still
