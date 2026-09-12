@@ -41,8 +41,8 @@ fn pdf_child_extracts_the_static_english_and_chinese_fixture() {
 }
 
 #[test]
-fn pdf_child_rejects_wrong_mime_and_corrupt_input() {
-    let mime = child("image/png", b"not used");
+fn resource_text_child_rejects_unsupported_mime_and_corrupt_input() {
+    let mime = child("application/octet-stream", b"not used");
     assert!(!mime.status.success());
     assert!(String::from_utf8_lossy(&mime.stderr).contains("unsupported-mime"));
     let corrupt = child("application/pdf", b"not a PDF");
@@ -51,8 +51,49 @@ fn pdf_child_rejects_wrong_mime_and_corrupt_input() {
 }
 
 #[test]
-fn pdf_child_rejects_input_above_its_stream_budget() {
-    let output = child("application/pdf", &vec![b'x'; 20 * 1024 * 1024 + 1]);
+fn image_child_extracts_real_english_and_chinese_fixtures() {
+    for fixture in [
+        (
+            "ocr-english.png",
+            "image/png",
+            include_bytes!("resources/ocr-english.png").as_slice(),
+            "Vision OCR English",
+        ),
+        (
+            "ocr-chinese.png",
+            "image/png",
+            include_bytes!("resources/ocr-chinese.png").as_slice(),
+            "中文视觉文字识别",
+        ),
+        (
+            "ocr-english.jpg",
+            "image/jpeg",
+            include_bytes!("resources/ocr-english.jpg").as_slice(),
+            "Vision OCR English",
+        ),
+    ] {
+        let output = child(fixture.1, fixture.2);
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            fixture.0,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(fixture.3),
+            "{}: {}",
+            fixture.0,
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[test]
+fn image_child_rejects_corrupt_and_oversize_input() {
+    let corrupt = child("image/png", b"not an image");
+    assert!(!corrupt.status.success());
+    assert!(String::from_utf8_lossy(&corrupt.stderr).contains("joplin-lite-extractor:image-"));
+    let output = child("image/jpeg", &vec![b'x'; 20 * 1024 * 1024 + 1]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("input-too-large"));
 }

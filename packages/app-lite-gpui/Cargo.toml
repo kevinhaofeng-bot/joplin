@@ -113,7 +113,7 @@ tree-sitter-toml = { package = "adot-tree-sitter-toml", version = "0.1", optiona
 cocoa = "0.26"
 objc = "0.2.7"
 raw-window-handle = "0.6"
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFData", "CFDictionary", "CFNumber", "CFURL", "objc2"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFData", "CFDictionary", "CFNumber", "CFString", "CFURL", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage", "objc2"] }
 objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "CGImageProperties", "objc2-core-graphics", "objc2"] }
 

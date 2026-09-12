@@ -18,6 +18,8 @@ const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_PAGES: usize = 500;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_IMAGE_EDGE: u32 = 2048;
+const MAX_IMAGE_PIXELS: usize = 4_000_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PdfChildError {
@@ -450,9 +452,6 @@ pub fn run_child(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    if mime != Some("application/pdf") {
-        return fail("unsupported-mime");
-    }
     let mut input = Vec::new();
     if std::io::stdin()
         .take((MAX_INPUT_BYTES + 1) as u64)
@@ -466,20 +465,172 @@ pub fn run_child(args: &[String]) -> i32 {
         return fail("input-too-large");
     }
     #[cfg(target_os = "macos")]
-    match pdf_text(&input) {
-        Ok(text) => match std::io::stdout()
-            .write_all(text.as_bytes())
-            .and_then(|_| std::io::stdout().flush())
-        {
+    {
+        let result = match mime {
+            Some("application/pdf") => pdf_text(&input),
+            Some("image/png") | Some("image/jpeg") => image_text(&input, mime.unwrap()),
+            _ => Err("unsupported-mime"),
+        };
+        match result.and_then(|text| {
+            match std::io::stdout()
+                .write_all(text.as_bytes())
+                .and_then(|_| std::io::stdout().flush())
+            {
+                Ok(()) => Ok(()),
+                Err(_) => Err("output-write-failed"),
+            }
+        }) {
             Ok(()) => 0,
-            Err(_) => fail("output-write-failed"),
-        },
-        Err(kind) => fail(kind),
+            Err(kind) => fail(kind),
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = input;
         fail("platform-unsupported")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn image_text(bytes: &[u8], mime: &str) -> Result<String, &'static str> {
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSAutoreleasePool, NSString};
+    use objc::{class, msg_send, sel, sel_impl};
+    use objc2_core_foundation::{CFBoolean, CFData, CFDictionary, CFNumber, CFString, CFType};
+    use objc2_core_graphics::CGImage;
+    use objc2_image_io::{
+        CGImageSource, kCGImageSourceCreateThumbnailFromImageAlways,
+        kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceShouldCache,
+        kCGImageSourceThumbnailMaxPixelSize,
+    };
+
+    unsafe {
+        // Vision must remain absent from the ordinary GUI process. ImageIO is
+        // already used by the native image renderer, but this child creates no
+        // editor cache and retains only the bounded thumbnail below.
+        let vision = libc::dlopen(
+            c"/System/Library/Frameworks/Vision.framework/Vision".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
+        if vision.is_null() {
+            return Err("vision-unavailable");
+        }
+        let _pool = NSAutoreleasePool::new(nil);
+        let data = CFData::from_bytes(bytes);
+        let source = CGImageSource::with_data(&data, None).ok_or("image-decode-failed")?;
+        let image_type = source.r#type().map(|value| (&*value).to_string());
+        let expected_type = match mime {
+            "image/png" => "public.png",
+            "image/jpeg" => "public.jpeg",
+            _ => return Err("unsupported-mime"),
+        };
+        if image_type.as_deref() != Some(expected_type) {
+            return Err(if image_type.as_deref() == Some("public.data") {
+                "image-decode-failed"
+            } else {
+                "image-type-mismatch"
+            });
+        }
+        if source.count() == 0 {
+            return Err("image-decode-failed");
+        }
+
+        // 2000 is the largest square edge that also fits the 4M-pixel cap;
+        // it is intentionally no greater than the public 2048px edge limit.
+        let thumbnail_edge = MAX_IMAGE_EDGE.min((MAX_IMAGE_PIXELS as f64).sqrt() as u32);
+        let create_thumbnail = CFBoolean::new(true);
+        let transform = CFBoolean::new(true);
+        let should_cache = CFBoolean::new(false);
+        let max_pixel_size = CFNumber::new_i32(thumbnail_edge as i32);
+        let keys: [&CFString; 4] = [
+            kCGImageSourceCreateThumbnailFromImageAlways,
+            kCGImageSourceCreateThumbnailWithTransform,
+            kCGImageSourceShouldCache,
+            kCGImageSourceThumbnailMaxPixelSize,
+        ];
+        let values: [&CFType; 4] = [
+            create_thumbnail.as_ref(),
+            transform.as_ref(),
+            should_cache.as_ref(),
+            max_pixel_size.as_ref(),
+        ];
+        let options =
+            CFDictionary::<CFType, CFType>::from_slices(&keys.map(|key| key as &CFType), &values);
+        let image = source
+            .thumbnail_at_index(0, Some(options.as_ref()))
+            .ok_or("image-decode-failed")?;
+        let width = CGImage::width(Some(&image));
+        let height = CGImage::height(Some(&image));
+        let pixels = width.checked_mul(height).ok_or("image-limit")?;
+        if width == 0
+            || height == 0
+            || width > MAX_IMAGE_EDGE as usize
+            || height > MAX_IMAGE_EDGE as usize
+            || pixels > MAX_IMAGE_PIXELS
+        {
+            return Err("image-limit");
+        }
+
+        let handler: id = msg_send![class!(VNImageRequestHandler), alloc];
+        let handler: id = msg_send![handler, initWithCGImage: &*image options: nil];
+        if handler == nil {
+            return Err("image-decode-failed");
+        }
+        let request: id = msg_send![class!(VNRecognizeTextRequest), alloc];
+        let request: id = msg_send![request, init];
+        if request == nil {
+            return Err("vision-unavailable");
+        }
+        let languages = [
+            NSString::alloc(nil).init_str("en-US"),
+            NSString::alloc(nil).init_str("zh-Hans"),
+        ];
+        let languages: id =
+            msg_send![class!(NSArray), arrayWithObjects: languages.as_ptr() count: languages.len()];
+        let _: () = msg_send![request, setRecognitionLanguages: languages];
+        let _: () = msg_send![request, setUsesLanguageCorrection: true];
+        if msg_send![request, respondsToSelector: sel!(setAutomaticallyDetectsLanguage:)] {
+            let _: () = msg_send![request, setAutomaticallyDetectsLanguage: true];
+        }
+        let requests: id = msg_send![class!(NSArray), arrayWithObject: request];
+        let mut error: id = nil;
+        let succeeded: bool = msg_send![handler, performRequests: requests error: &mut error];
+        if !succeeded {
+            return Err("vision-failed");
+        }
+        let observations: id = msg_send![request, results];
+        let count: usize = msg_send![observations, count];
+        let mut text = String::new();
+        for index in 0..count {
+            let observation: id = msg_send![observations, objectAtIndex: index];
+            let candidates: id = msg_send![observation, topCandidates: 1usize];
+            let candidate_count: usize = msg_send![candidates, count];
+            if candidate_count == 0 {
+                continue;
+            }
+            let candidate: id = msg_send![candidates, objectAtIndex: 0usize];
+            let value: id = msg_send![candidate, string];
+            if value == nil {
+                continue;
+            }
+            let utf8_len: usize = msg_send![value, lengthOfBytesUsingEncoding: 4usize];
+            if text.len().saturating_add(utf8_len).saturating_add(1) > MAX_OUTPUT_BYTES {
+                return Err("output-limit");
+            }
+            let pointer = NSString::UTF8String(value);
+            if !pointer.is_null() {
+                text.push_str(&std::ffi::CStr::from_ptr(pointer).to_string_lossy());
+                text.push('\n');
+            }
+        }
+        source.remove_cache_at_index(0);
+        // See the PDF child: retaining a RTLD_LOCAL framework handle until
+        // one-shot process exit avoids unloading live autorelease objects.
+        let _ = vision;
+        if text.trim().is_empty() {
+            return Err("image-no-text");
+        }
+        Ok(text)
     }
 }
 
