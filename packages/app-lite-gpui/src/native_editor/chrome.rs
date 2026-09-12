@@ -103,6 +103,12 @@ impl TitleInput {
         &self.selection
     }
 
+    /// The active end of a possibly reversed selection, used by compact
+    /// single-line viewports to keep the real insertion side visible.
+    pub fn selection_head(&self) -> usize {
+        self.selection_head_index()
+    }
+
     pub fn marked_range(&self) -> Option<&Range<usize>> {
         self.marked_range.as_ref()
     }
@@ -157,7 +163,7 @@ impl TitleInput {
             self.marked_range = None;
             return;
         }
-        let index = self.selection_head();
+        let index = self.selection_head_index();
         let next = if right {
             next_grapheme_boundary(&self.text, index)
         } else {
@@ -256,7 +262,7 @@ impl TitleInput {
         Some(line.closest_index_for_x(x).min(self.text.len()))
     }
 
-    fn selection_head(&self) -> usize {
+    fn selection_head_index(&self) -> usize {
         if self.selection_reversed {
             self.selection.start
         } else {

@@ -5382,7 +5382,22 @@ impl LibraryShell {
         // column. The row wraps below its natural compact width rather than
         // placing controls on top of the document or each other.
         let panel_width = (available_width - 32.0).clamp(1.0, 340.0);
-        let canvas_input_width = (panel_width - 242.0).clamp(48.0, 128.0);
+        let summary = self.note_session.as_ref().map(|session| {
+            let editor = session.read(cx).editor().clone();
+            editor.read(cx).find_summary()
+        });
+        let summary_text = if self.find_error.is_some() {
+            "查找错误".to_owned()
+        } else if let Some(summary) = summary {
+            match summary.primary_index {
+                Some(index) => format!("{} / {}", index + 1, summary.total),
+                None => "无结果".to_owned(),
+            }
+        } else {
+            "无结果".to_owned()
+        };
+        let summary_width = (summary_text.chars().count() as f32 * 7.0 + 8.0).clamp(42.0, 112.0);
+        let input_width = (panel_width - 130.0 - summary_width).clamp(48.0, 128.0);
         let canvas_input = input.clone();
         let paint_input = input.clone();
         let input_canvas = canvas(
@@ -5391,10 +5406,11 @@ impl LibraryShell {
                 canvas_input.clone()
             },
             move |bounds, entity, window, cx| {
-                let (text, selection, focus) = entity.read_with(cx, |input, _| {
+                let (text, selection, selection_head, focus) = entity.read_with(cx, |input, _| {
                     (
                         SharedString::from(input.text().to_owned()),
                         input.selection().clone(),
+                        input.selection_head(),
                         input.focus_handle().clone(),
                     )
                 });
@@ -5414,7 +5430,7 @@ impl LibraryShell {
                 // This compact field is a horizontal viewport. Translate the
                 // shaped line far enough to expose its active end and record
                 // that same origin for TitleInput's pointer/IME conversion.
-                let caret_x = line.x_for_index(selection.end);
+                let caret_x = line.x_for_index(selection_head);
                 let scroll_x = (caret_x - bounds.size.width + px(4.0)).max(px(0.0));
                 let layout_bounds =
                     Bounds::new(point(bounds.left() - scroll_x, bounds.top()), bounds.size);
@@ -5457,27 +5473,8 @@ impl LibraryShell {
                 }
             },
         )
-        .w(px(canvas_input_width))
+        .w(px(input_width))
         .h(px(30.0));
-        let summary = self.note_session.as_ref().map(|session| {
-            let editor = session.read(cx).editor().clone();
-            editor.read(cx).find_summary()
-        });
-        let summary_text = if let Some(error) = &self.find_error {
-            "查找错误".to_owned()
-        } else if let Some(summary) = summary {
-            match summary.primary_index {
-                Some(index) => format!("{} / {}", index + 1, summary.total),
-                None => "无结果".to_owned(),
-            }
-        } else {
-            "无结果".to_owned()
-        };
-        // Counts are information, not decoration: 10000 / 10000 must remain
-        // readable. The row can wrap at narrow widths, so reserve just enough
-        // space for its complete current label rather than clipping it.
-        let summary_width = (summary_text.chars().count() as f32 * 7.0 + 8.0).clamp(42.0, 112.0);
-        let input_width = (panel_width - 130.0 - summary_width).clamp(48.0, 128.0);
         let case_background = if self.find_case_sensitive {
             rgba(0x00a82d20)
         } else {
@@ -5507,6 +5504,7 @@ impl LibraryShell {
                 .child(
                     div()
                         .id("library-find-in-note-input")
+                        .debug_selector(|| "library-find-in-note-input".to_owned())
                         .w(px(input_width))
                         .overflow_hidden()
                         .child(input_canvas),
