@@ -1230,19 +1230,6 @@ impl LibraryShell {
         events: &[app_lite_core::LibraryEvent],
         cx: &mut Context<Self>,
     ) -> bool {
-        // Metadata-only organization changes (for example a tag rename) do
-        // not enqueue an FTS job.  They still invalidate the SearchRoute
-        // packet's displayed metadata, so they need their own background
-        // refresh instead of waiting forever for a nonexistent Idle edge.
-        let refresh_search_without_index_job = events
-            .iter()
-            .any(|event| matches!(event, app_lite_core::LibraryEvent::OrganizationChanged))
-            && !events.iter().any(|event| {
-                matches!(
-                    event,
-                    app_lite_core::LibraryEvent::SearchProjectionQueued(_)
-                )
-            });
         let reconciliation_pending = self
             .model
             .read_with(cx, |model, _| model.reconciliation_pending());
@@ -1273,10 +1260,13 @@ impl LibraryShell {
                 result
             })
             .is_ok();
-        // SearchProjectionQueued reaches the Stage B1 scheduler separately.
-        // Do not query here: the save event precedes its FTS transaction, and
-        // an early completion could consume the pending fence before Idle.
-        if refreshed && refresh_search_without_index_job {
+        // Consult the durable queue in the background coordinator. The
+        // coalesced UI event packet intentionally does not retain every
+        // SearchProjectionQueued event, so event shape cannot safely decide
+        // whether FTS is already current. A queued row defers the reread to
+        // the index worker's next Idle edge; an empty queue (tag rename) reads
+        // immediately.
+        if refreshed {
             self.schedule_active_search_refresh(cx);
         }
         refreshed
@@ -3382,11 +3372,12 @@ impl LibraryShell {
     }
 
     fn focus_before_search_palette(&self, window: &Window, cx: &App) -> FocusHandle {
-        if self
-            .organization_input
-            .read(cx)
-            .focus_handle()
-            .is_focused(window)
+        if !self.organization_panel_open
+            && self
+                .organization_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
         {
             return self.organization_input.read(cx).focus_handle().clone();
         }
@@ -3587,11 +3578,15 @@ impl LibraryShell {
     /// fall back to an All Notes list. Recompute the existing typed packet in
     /// the background, fenced to this exact route snapshot.
     fn schedule_active_search_refresh(&mut self, cx: &mut Context<Self>) {
-        let Some((repository, query, expected_snapshot)) = self.model.read_with(cx, |model, _| {
-            model
-                .pending_search_refresh()
-                .map(|(query, snapshot)| (model.repository(), query, snapshot))
-        }) else {
+        let Some((repository, query, expected_snapshot, expected_generation)) =
+            self.model.read_with(cx, |model, _| {
+                model
+                    .pending_search_refresh()
+                    .map(|(query, snapshot, generation)| {
+                        (model.repository(), query, snapshot, generation)
+                    })
+            })
+        else {
             return;
         };
         self._search_route_refresh_task = None;
@@ -3604,11 +3599,15 @@ impl LibraryShell {
                     parsed
                         .set_page(0, SearchQuery::MAX_PAGE_SIZE)
                         .expect("bounded SearchRoute refresh page");
-                    repository.search(parsed)
+                    if repository.has_pending_search_jobs()? {
+                        Ok(None)
+                    } else {
+                        repository.search(parsed).map(Some)
+                    }
                 })
                 .await;
             let _ = this.update(cx, |shell, shell_cx| {
-                if let Ok(hits) = result {
+                if let Ok(Some(hits)) = result {
                     let active_would_disappear = shell.model.read_with(shell_cx, |model, _| {
                         model
                             .active_session_note_id()
@@ -3624,9 +3623,17 @@ impl LibraryShell {
                         shell.retry_active_search_refresh(shell_cx);
                         return;
                     }
-                    let _ = shell.model.update(shell_cx, |model, _| {
-                        model.commit_search_refresh(&query, &expected_snapshot, hits)
+                    let committed = shell.model.update(shell_cx, |model, _| {
+                        model.commit_search_refresh(
+                            &query,
+                            &expected_snapshot,
+                            expected_generation,
+                            hits,
+                        )
                     });
+                    if matches!(committed, Ok(true)) {
+                        shell.history_search_notice = None;
+                    }
                 } else if let Err(error) = result {
                     // A search refresh is not a save failure, but silently
                     // leaving an old packet visible is misleading. Keep the

@@ -662,7 +662,7 @@ fn projection_events_never_replace_an_active_search_packet_with_all_notes() {
     assert_eq!(model.projections()[0].id, matching);
     assert_eq!(
         model.pending_search_refresh(),
-        Some(("matching".into(), model.navigation().snapshot()))
+        Some(("matching".into(), model.navigation().snapshot(), 1))
     );
 }
 
@@ -734,17 +734,53 @@ fn pending_search_refresh_replaces_only_the_active_search_packet() {
     model
         .refresh_projection_events([LibraryEvent::NoteProjectionChanged(replacement.clone())])
         .expect("mark the route stale");
-    let (query, snapshot) = model.pending_search_refresh().expect("pending packet");
+    let (query, snapshot, generation) = model.pending_search_refresh().expect("pending packet");
 
     assert!(
         model
-            .commit_search_refresh(&query, &snapshot, vec![hit_for(&replacement)])
+            .commit_search_refresh(&query, &snapshot, generation, vec![hit_for(&replacement)])
             .expect("refresh active packet")
     );
     assert_eq!(model.navigation().search_query(), Some("refresh match"));
     assert_eq!(model.projections().len(), 1);
     assert_eq!(model.projections()[0].id, replacement);
     assert_eq!(model.pending_search_refresh(), None);
+}
+
+#[test]
+fn newer_search_invalidation_rejects_an_older_refresh_packet() {
+    let (_profile, repository) = repository();
+    let original = create(&repository, "epoch original");
+    let replacement = create(&repository, "epoch replacement");
+    let mut model = AppModel::open(repository).expect("open model");
+    let projections = model.projections().to_vec();
+    let hit_for = |id: &NoteId| SearchHit {
+        note: projections
+            .iter()
+            .find(|row| &row.id == id)
+            .unwrap()
+            .clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+    let generation = model.begin_search("epoch");
+    model
+        .commit_search_results(generation, "epoch".into(), vec![hit_for(&original)], None)
+        .expect("commit search");
+    model
+        .refresh_projection_events([LibraryEvent::NoteProjectionChanged(replacement.clone())])
+        .expect("first invalidation");
+    let (query, snapshot, old_generation) = model.pending_search_refresh().unwrap();
+    model
+        .refresh_projection_events([LibraryEvent::NoteProjectionChanged(replacement)])
+        .expect("newer invalidation");
+
+    assert!(
+        !model
+            .commit_search_refresh(&query, &snapshot, old_generation, vec![hit_for(&original)])
+            .expect("old completion rejected")
+    );
+    assert!(model.pending_search_refresh().is_some());
 }
 
 #[test]

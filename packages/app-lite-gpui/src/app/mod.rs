@@ -121,6 +121,10 @@ pub struct AppModel {
     /// are deliberately deferred to the shell's background FTS coordinator;
     /// a generic All Notes refresh must never replace these cards in place.
     search_refresh_pending: bool,
+    /// Monotonic fence for background SearchRoute refreshes. Repository
+    /// events may arrive after an index worker becomes idle; a completion may
+    /// clear pending only if no newer invalidation occurred meanwhile.
+    search_refresh_generation: u64,
     navigation_index: LibraryNavigationIndex,
     active_session: Option<ActiveSession>,
     panes: PaneState,
@@ -185,6 +189,7 @@ impl AppModel {
             search_generation: 0,
             search_request: None,
             search_refresh_pending: false,
+            search_refresh_generation: 0,
             navigation_index,
             active_session: None,
             panes,
@@ -822,7 +827,9 @@ impl AppModel {
         // The candidate above deliberately preserved the old bounded packet.
         // Its FTS replacement is owned by the retained shell worker, never by
         // `load_projections_for(AllNotes)` on this foreground mutation path.
-        self.search_refresh_pending |= search_route_remains_active;
+        if search_route_remains_active {
+            self.mark_search_refresh_pending();
+        }
         if self.reconciliation_pending.take().is_some() {
             self.partial_commit_message = None;
         }
@@ -906,7 +913,7 @@ impl AppModel {
                 self.status = AppStatus::Ready;
                 self.status_origin = StatusOrigin::Neutral;
             }
-            self.search_refresh_pending = true;
+            self.mark_search_refresh_pending();
             return Ok(true);
         }
         // Once any committed action is unreconciled, every relevant queued
@@ -1199,13 +1206,14 @@ impl AppModel {
     /// Returns an active SearchRoute packet that repository events have
     /// invalidated. This is read-only: the UI must do the query off-thread and
     /// call `commit_search_refresh` only after it has the bounded result set.
-    pub fn pending_search_refresh(&self) -> Option<(String, NavigationSnapshot)> {
+    pub fn pending_search_refresh(&self) -> Option<(String, NavigationSnapshot, u64)> {
         if !self.search_refresh_pending {
             return None;
         }
         Some((
             self.navigation.search_query()?.to_owned(),
             self.navigation.snapshot(),
+            self.search_refresh_generation,
         ))
     }
 
@@ -1215,11 +1223,13 @@ impl AppModel {
         &mut self,
         query: &str,
         expected_snapshot: &NavigationSnapshot,
+        expected_generation: u64,
         hits: Vec<SearchHit>,
     ) -> Result<bool, LibraryError> {
         if !self.search_refresh_pending
             || self.navigation.snapshot() != *expected_snapshot
             || self.navigation.search_query() != Some(query)
+            || self.search_refresh_generation != expected_generation
         {
             return Ok(false);
         }
@@ -1251,6 +1261,11 @@ impl AppModel {
         self.active_session = active_session;
         self.search_refresh_pending = false;
         Ok(true)
+    }
+
+    fn mark_search_refresh_pending(&mut self) {
+        self.search_refresh_pending = true;
+        self.search_refresh_generation = self.search_refresh_generation.wrapping_add(1);
     }
 
     /// Publish an already-computed offline result packet into an existing

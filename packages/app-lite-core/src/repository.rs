@@ -2801,6 +2801,16 @@ impl LibraryRepository {
         take_search_jobs(&connection, limit)
     }
 
+    /// True while a durable FTS projection transaction is still queued. The
+    /// UI uses this only from its background refresh coordinator: it is the
+    /// ordering authority between a saved note and a SearchRoute reread.
+    pub fn has_pending_search_jobs(&self) -> Result<bool, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM search_queue)", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
     pub fn ack_search_jobs(&self, jobs: &[crate::SearchJob]) -> Result<(), LibraryError> {
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
