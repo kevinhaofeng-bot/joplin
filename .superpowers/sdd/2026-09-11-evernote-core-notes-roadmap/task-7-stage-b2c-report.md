@@ -60,6 +60,11 @@ that B2 is accepted.
 - No macOS physical IME verification was performed; the existing real marked-text mounted test remains automated coverage only.
 - Disposable-profile Release smoke must use the final rebuilt binary under the Cargo metadata target directory, record its SHA, and verify normal exit. It was not claimed complete here.
 - History Retry direction is wired and independently needs a fault-injected Back/Forward click regression; this follow-up adds the active-refresh Retry click regression, not a claim of complete B2 acceptance.
+- Round 1 follow-up: stale history `Ok(false)` now rechecks and schedules only
+  the latest same-direction pending target; Retry verifies that its history or
+  active SearchRoute target is still schedulable, otherwise it replaces the
+  button with an explicit changed-context notice. The unpacked Evernote source
+  authority is `/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5`.
 
 Base corrective commit: `9c9116713664156b9d78d78ea334dbe40172fac1`.
 Follow-up implementation commit: `b72f58723cd51d0e3789141d71beac65854cda52`.

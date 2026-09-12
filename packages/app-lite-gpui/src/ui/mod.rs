@@ -3672,7 +3672,19 @@ impl LibraryShell {
                     Err(error) => Err(error),
                 };
                 shell.history_search_notice = match outcome {
-                    Ok(true) | Ok(false) => None,
+                    Ok(true) => None,
+                    Ok(false) => {
+                        // This packet lost its exact history fence. Only ask
+                        // the model for the currently pending target; never
+                        // revive the captured (possibly opposite) target.
+                        if shell.model.read_with(shell_cx, |model, _| {
+                            model.pending_history_search(forward).is_some()
+                        }) {
+                            shell.retry_history_search(forward, shell_cx);
+                            return;
+                        }
+                        None
+                    }
                     Err(error) => {
                         shell.search_refresh_retry_available = true;
                         shell.search_refresh_retry_history = Some(forward);
@@ -5839,13 +5851,23 @@ impl Render for LibraryShell {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |shell, _event, _window, cx| {
-                                shell.search_refresh_retry_available = false;
-                                shell.history_search_notice = Some("正在重试本地搜索更新…".into());
-                                if let Some(forward) = retry_history {
-                                    let _ = shell.schedule_history_search(forward, cx);
-                                } else {
+                                let scheduled = if let Some(forward) = retry_history {
+                                    shell.schedule_history_search(forward, cx)
+                                } else if shell.model.read_with(cx, |model, _| {
+                                    model.pending_search_refresh().is_some()
+                                }) {
                                     shell.schedule_active_search_refresh(cx);
-                                }
+                                    true
+                                } else {
+                                    false
+                                };
+                                shell.search_refresh_retry_available = false;
+                                shell.search_refresh_retry_history = None;
+                                shell.history_search_notice = if scheduled {
+                                    Some("正在重试本地搜索更新…".into())
+                                } else {
+                                    Some("搜索上下文已变化，请重新打开搜索。".into())
+                                };
                                 cx.notify();
                             }),
                         )
