@@ -480,6 +480,20 @@ fn resource_filters_require_current_attachments_and_report_deterministic_provena
             .is_empty(),
         "a deleted resource must disappear from attachment search"
     );
+    let live_attachments = reopened
+        .search(SearchQuery::parse("hasattachment:true"))
+        .unwrap();
+    assert_eq!(live_attachments.len(), 1);
+    assert_eq!(live_attachments[0].note.id, mixed_note.id);
+    assert_eq!(live_attachments[0].note.attachment_count, 3);
+    let no_live_attachments = reopened
+        .search(SearchQuery::parse("hasattachment:false"))
+        .unwrap();
+    assert_eq!(no_live_attachments.len(), 2);
+    assert!(no_live_attachments.iter().all(|hit| {
+        (hit.note.id == pdf_note.id || hit.note.id == image_note.id)
+            && hit.note.attachment_count == 0
+    }));
     for query in [
         "PDF title remains searchable",
         "PDF body remains searchable",
