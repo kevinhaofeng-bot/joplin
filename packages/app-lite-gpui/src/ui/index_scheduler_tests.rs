@@ -1,9 +1,10 @@
 use super::*;
 use crate::app::AppAction;
 use crate::app::save_coordinator::ManualSaveClock;
+use app_lite_core::document::Block;
 use app_lite_core::{
-    CanonicalDocument, CreateNote, LibraryError, LibraryRepository, SaveNote, SearchIndexTestPhase,
-    SearchQuery,
+    CanonicalDocument, CreateNote, DerivedTextFailure, DerivedTextStatus, LibraryError,
+    LibraryRepository, SaveNote, SearchIndexTestPhase, SearchQuery,
 };
 use gpui::{TestAppContext, VisualTestContext};
 use std::sync::Arc;
@@ -68,6 +69,60 @@ async fn mounted_open_drains_existing_search_work_without_opening_search(cx: &mu
             .len(),
         1,
         "opening the mounted library must retain a background index scheduler"
+    );
+}
+
+#[gpui::test]
+async fn mounted_scheduler_advances_a_derived_job_saved_after_open(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "PDF owner".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("create ordinary note");
+    let resource = repository
+        .import_resource(b"future vision source", "fixture.png", "image/png", "png")
+        .expect("import selectable PDF fixture");
+    let (_shell, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    assert!(
+        repository
+            .take_derived_text_jobs(1)
+            .expect("derived job queued")
+            .len()
+            == 0,
+        "a stand-alone resource is not associated yet"
+    );
+
+    repository
+        .save_note(SaveNote {
+            id: note.id,
+            expected_revision: note.revision,
+            title: note.title,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "fixture.png".into(),
+                media_type: "image/png".into(),
+            }]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        })
+        .expect("ordinary save associates fixture");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(50));
+    redraw(cx);
+
+    assert_eq!(
+        repository
+            .derived_text_status(&resource)
+            .expect("derived status"),
+        Some(DerivedTextStatus::Failed {
+            failure: DerivedTextFailure::Unsupported,
+            attempts: 1,
+        }),
+        "the mounted scheduler consumes the durable job without any foreground save path"
     );
 }
 

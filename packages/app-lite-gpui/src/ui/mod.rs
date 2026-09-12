@@ -54,15 +54,13 @@ use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 #[cfg(test)]
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // These are presentation-only library actions. They intentionally do not
@@ -97,6 +95,11 @@ pub(crate) enum IndexingStatus {
     Pending,
     Failed(String),
 }
+
+// The child itself is process-wide; separate library windows must not launch
+// competing PDFKit helpers. A busy window leaves its durable job pending and
+// retries on a later bounded scheduler turn.
+static DERIVED_TEXT_WORKER_LOCK: Mutex<()> = Mutex::new(());
 
 /// Test-only async barrier placed before the synchronous core batch. It proves
 /// that a running scheduler waits off the GPUI foreground executor.
@@ -561,6 +564,7 @@ pub struct LibraryShell {
     /// owns no note body or second repository state; the SQLite queue remains
     /// the restart-safe authority.
     _indexing_task: Task<()>,
+    _derived_text_task: Task<()>,
     indexing_status: IndexingStatus,
     #[cfg(test)]
     indexing_task_cancellation_receiver: Option<Receiver<()>>,
@@ -948,15 +952,20 @@ impl LibraryShell {
         });
         let event_receiver = model.read(cx).subscribe_library_events();
         let indexing_receiver = model.read(cx).subscribe_library_events();
+        let derived_text_receiver = model.read(cx).subscribe_library_events();
         #[cfg(test)]
         let (event_task_lifetime, event_task_cancellation_receiver) = EventTaskLifetime::observed();
         #[cfg(test)]
         let (indexing_task_lifetime, indexing_task_cancellation_receiver) =
             EventTaskLifetime::observed();
+        #[cfg(test)]
+        let (derived_text_task_lifetime, _) = EventTaskLifetime::observed();
         #[cfg(not(test))]
         let event_task_lifetime = EventTaskLifetime::unobserved();
         #[cfg(not(test))]
         let indexing_task_lifetime = EventTaskLifetime::unobserved();
+        #[cfg(not(test))]
+        let derived_text_task_lifetime = EventTaskLifetime::unobserved();
         let indexing_cancelled = indexing_task_lifetime.cancellation_flag();
         let event_task = Self::spawn_event_bridge(event_receiver, event_task_lifetime, cx);
         let indexing_task = Self::spawn_index_scheduler(
@@ -964,6 +973,12 @@ impl LibraryShell {
             indexing_receiver,
             indexing_task_lifetime,
             indexing_cancelled,
+            cx,
+        );
+        let derived_text_task = Self::spawn_derived_text_scheduler(
+            model.read(cx).repository(),
+            derived_text_receiver,
+            derived_text_task_lifetime,
             cx,
         );
         let search_input_observation = cx.observe(&search_input, |shell, _, cx| {
@@ -1040,6 +1055,7 @@ impl LibraryShell {
             _model_observation: observation,
             _event_task: event_task,
             _indexing_task: indexing_task,
+            _derived_text_task: derived_text_task,
             indexing_status: IndexingStatus::Pending,
             #[cfg(test)]
             indexing_task_cancellation_receiver: Some(indexing_task_cancellation_receiver),
@@ -1265,6 +1281,88 @@ impl LibraryShell {
                     {
                         break;
                     }
+                }
+            }
+        })
+    }
+
+    /// Independent from the stable note/title FTS scheduler: one durable D3a
+    /// job may run a bounded PDFKit child, so it must never delay ordinary
+    /// search projection work or a foreground save/quit lifecycle callback.
+    fn spawn_derived_text_scheduler(
+        repository: Arc<LibraryRepository>,
+        receiver: Receiver<app_lite_core::LibraryEvent>,
+        derived_text_task_lifetime: EventTaskLifetime,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let _derived_text_task_lifetime = derived_text_task_lifetime;
+            let mut scheduled = true;
+            loop {
+                if scheduled {
+                    scheduled = false;
+                    let worker_repository = Arc::clone(&repository);
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let Ok(_single_child) = DERIVED_TEXT_WORKER_LOCK.try_lock() else {
+                                return None;
+                            };
+                            Some(crate::extractor::run_one_derived_text_pdf_job(
+                                &worker_repository,
+                            ))
+                        })
+                        .await;
+                    match result {
+                        Some(Ok(outcome)) => {
+                            scheduled = !matches!(
+                                outcome,
+                                crate::extractor::DerivedTextCoordinatorOutcome::Idle
+                            );
+                            if this
+                                .update(cx, |shell, shell_cx| {
+                                    // A successful publish is a search-only
+                                    // projection event. Reuse the fenced route
+                                    // refresh, which never edits history or a
+                                    // retained dirty session.
+                                    if matches!(
+                                        outcome,
+                                        crate::extractor::DerivedTextCoordinatorOutcome::Indexed(_)
+                                    ) {
+                                        shell.schedule_active_search_refresh(shell_cx);
+                                    }
+                                    shell_cx.notify();
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some(Err(_)) => {
+                            // Leave the durable identity untouched for a
+                            // later event/reopen; do not turn worker trouble
+                            // into a note-save failure or spin immediately.
+                        }
+                        None => {
+                            // Another window owns the sole child. Keep the
+                            // job durable and retry after a modest yield.
+                            scheduled = true;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(250))
+                                .await;
+                        }
+                    }
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                if receiver.try_iter().take(128).any(|event| {
+                    matches!(
+                        event,
+                        app_lite_core::LibraryEvent::SearchProjectionQueued(_)
+                    )
+                }) {
+                    scheduled = true;
                 }
             }
         })
