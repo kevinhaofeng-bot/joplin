@@ -15,25 +15,51 @@ pub fn run_child(args: &[String]) -> i32 {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--mime" => { i += 1; mime = args.get(i).map(String::as_str); }
+            "--mime" => {
+                i += 1;
+                mime = args.get(i).map(String::as_str);
+            }
             _ => return fail("invalid-arguments"),
         }
         i += 1;
     }
-    if mime != Some("application/pdf") { return fail("unsupported-mime"); }
+    if mime != Some("application/pdf") {
+        return fail("unsupported-mime");
+    }
     let mut input = Vec::new();
-    if std::io::stdin().take((MAX_INPUT_BYTES + 1) as u64).read_to_end(&mut input).is_err() || input.is_empty() { return fail("input-read-failed"); }
-    if input.len() > MAX_INPUT_BYTES { return fail("input-too-large"); }
+    if std::io::stdin()
+        .take((MAX_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .is_err()
+        || input.is_empty()
+    {
+        return fail("input-read-failed");
+    }
+    if input.len() > MAX_INPUT_BYTES {
+        return fail("input-too-large");
+    }
     #[cfg(target_os = "macos")]
     match pdf_text(&input) {
-        Ok(text) => { let _ = std::io::stdout().write_all(text.as_bytes()); 0 }
+        Ok(text) => match std::io::stdout()
+            .write_all(text.as_bytes())
+            .and_then(|_| std::io::stdout().flush())
+        {
+            Ok(()) => 0,
+            Err(_) => fail("output-write-failed"),
+        },
         Err(kind) => fail(kind),
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = input; fail("platform-unsupported") }
+    {
+        let _ = input;
+        fail("platform-unsupported")
+    }
 }
 
-fn fail(kind: &str) -> i32 { eprintln!("joplin-lite-extractor:{kind}"); 2 }
+fn fail(kind: &str) -> i32 {
+    eprintln!("joplin-lite-extractor:{kind}");
+    2
+}
 
 #[cfg(target_os = "macos")]
 fn pdf_text(bytes: &[u8]) -> Result<String, &'static str> {
@@ -47,24 +73,50 @@ fn pdf_text(bytes: &[u8]) -> Result<String, &'static str> {
         let data: id = msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() length: bytes.len()];
         let document: id = msg_send![class!(PDFDocument), alloc];
         let document: id = msg_send![document, initWithData: data];
-        if document == nil { return Err("pdf-parse-failed"); }
+        if document == nil {
+            return Err("pdf-parse-failed");
+        }
+        let locked: bool = msg_send![document, isLocked];
+        if locked {
+            let _: () = msg_send![document, release];
+            return Err("pdf-locked");
+        }
         let pages: usize = msg_send![document, pageCount];
-        if pages > MAX_PAGES { let _: () = msg_send![document, release]; return Err("page-limit"); }
+        if pages == 0 {
+            let _: () = msg_send![document, release];
+            return Err("pdf-empty");
+        }
+        if pages > MAX_PAGES {
+            let _: () = msg_send![document, release];
+            return Err("page-limit");
+        }
         let mut out = String::new();
         for index in 0..pages {
+            // Drain Foundation temporaries per page instead of retaining a
+            // whole long PDF's NSStrings until this one-shot child exits.
+            let _page_pool = NSAutoreleasePool::new(nil);
             let page: id = msg_send![document, pageAtIndex: index];
             let value: id = msg_send![page, string];
             if value != nil {
+                // UTF-8 byte length is checked before CStr/lossy conversion
+                // allocates a Rust-owned copy; include a joining newline.
+                let utf8_len: usize = msg_send![value, lengthOfBytesUsingEncoding: 4usize];
+                if out.len().saturating_add(utf8_len).saturating_add(1) > MAX_OUTPUT_BYTES {
+                    let _: () = msg_send![document, release];
+                    return Err("output-limit");
+                }
                 let pointer = value.UTF8String();
                 if !pointer.is_null() {
                     let value = std::ffi::CStr::from_ptr(pointer).to_string_lossy();
-                    if out.len().saturating_add(value.len()) > MAX_OUTPUT_BYTES { let _: () = msg_send![document, release]; return Err("output-limit"); }
                     out.push_str(&value);
                     out.push('\n');
                 }
             }
         }
         let _: () = msg_send![document, release];
+        if out.trim().is_empty() {
+            return Err("pdf-no-selectable-text");
+        }
         Ok(out)
     }
 }
