@@ -844,19 +844,28 @@ impl AppModel {
                 Some(PendingReconciliation::CurrentRoute)
             ) {
                 // Organization mutations still need their index/active-note
-                // metadata reconciled, but must not install an All Notes card
-                // packet while a typed SearchRoute is visible.
-                self.navigation_index = self.repository.list_navigation_index()?;
-                if let Some(active) = self.active_session.as_mut()
-                    && let Some(metadata) =
-                        self.repository.note_organization_state(&active.note.id)?
-                {
-                    active.note.notebook_id = metadata.notebook_id;
-                    active.note.tag_ids = metadata.tag_ids;
-                    active.note.updated_time = metadata.updated_time;
-                    active.note.deleted_time = metadata.deleted_time;
-                    active.note.revision = metadata.revision;
+                // state reconciled, but must not install an All Notes card
+                // packet while a typed SearchRoute is visible. Prepare every
+                // fallible read first: never pair a retained old body with a
+                // newer revision, and never partly publish the index.
+                let navigation_index = self.repository.list_navigation_index()?;
+                let active_session = match self.active_session.as_ref() {
+                    Some(active) => self
+                        .repository
+                        .load_note(&active.note.id)?
+                        .map(|note| ActiveSession { note }),
+                    None => None,
+                };
+                let mut navigation = self.navigation.clone();
+                if active_session.is_none() {
+                    navigation.select(None);
                 }
+                if navigation.selected_note_id() != self.navigation.selected_note_id() {
+                    self.persist_shell_state_for(&navigation)?;
+                }
+                self.navigation_index = navigation_index;
+                self.active_session = active_session;
+                self.navigation = navigation;
                 self.reconciliation_pending = None;
                 self.partial_commit_message = None;
                 self.status = AppStatus::Ready;

@@ -636,6 +636,49 @@ fn projection_events_never_replace_an_active_search_packet_with_all_notes() {
 }
 
 #[test]
+fn pending_search_refresh_replaces_only_the_active_search_packet() {
+    let (_profile, repository) = repository();
+    let original = create(&repository, "refresh match one");
+    let replacement = create(&repository, "refresh match two");
+    let mut model = AppModel::open(repository).expect("open model");
+    let projections = model.projections().to_vec();
+    let hit_for = |id: &NoteId| SearchHit {
+        note: projections
+            .iter()
+            .find(|row| &row.id == id)
+            .expect("fixture projection")
+            .clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+    let generation = model.begin_search("refresh match");
+    assert!(
+        model
+            .commit_search_results(
+                generation,
+                "refresh match".into(),
+                vec![hit_for(&original)],
+                None,
+            )
+            .expect("commit search")
+    );
+    model
+        .refresh_projection_events([LibraryEvent::NoteProjectionChanged(replacement.clone())])
+        .expect("mark the route stale");
+    let (query, snapshot) = model.pending_search_refresh().expect("pending packet");
+
+    assert!(
+        model
+            .commit_search_refresh(&query, &snapshot, vec![hit_for(&replacement)])
+            .expect("refresh active packet")
+    );
+    assert_eq!(model.navigation().search_query(), Some("refresh match"));
+    assert_eq!(model.projections().len(), 1);
+    assert_eq!(model.projections()[0].id, replacement);
+    assert_eq!(model.pending_search_refresh(), None);
+}
+
+#[test]
 fn selection_uses_note_id_and_survives_sort_refresh() {
     let (_profile, repository) = repository();
     let first = create(&repository, "first");
