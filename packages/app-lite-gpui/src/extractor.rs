@@ -24,6 +24,10 @@ pub enum PdfChildError {
     Failed,
     Utf8,
     Io,
+    Parse,
+    Locked,
+    NoSelectableText,
+    Unsupported,
 }
 
 /// Background-only bridge for an already hash-verified core descriptor. It
@@ -78,7 +82,7 @@ pub fn run_pdf_child_for_verified_file_with_exe(
                 return Err(PdfChildError::StderrTooLarge);
             }
             if !status.success() {
-                return Err(PdfChildError::Failed);
+                return Err(classify_child_failure(&err.0));
             }
             return String::from_utf8(out.0).map_err(|_| PdfChildError::Utf8);
         }
@@ -90,6 +94,24 @@ pub fn run_pdf_child_for_verified_file_with_exe(
             return Err(PdfChildError::Timeout);
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn classify_child_failure(stderr: &[u8]) -> PdfChildError {
+    let marker = std::str::from_utf8(stderr).ok().and_then(|stderr| {
+        let mut markers = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("joplin-lite-extractor:"));
+        let marker = markers.next()?;
+        markers.next().is_none().then_some(marker)
+    });
+    match marker {
+        Some("pdf-parse-failed") => PdfChildError::Parse,
+        Some("pdf-locked") => PdfChildError::Locked,
+        Some("pdf-no-selectable-text") => PdfChildError::NoSelectableText,
+        Some("unsupported-mime") => PdfChildError::Unsupported,
+        Some("input-too-large") | Some("output-limit") => PdfChildError::OutputTooLarge,
+        _ => PdfChildError::Failed,
     }
 }
 

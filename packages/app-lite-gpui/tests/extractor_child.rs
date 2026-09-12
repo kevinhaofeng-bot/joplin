@@ -87,6 +87,6 @@ fn verified_file_runner_rejects_oversize_before_spawning_and_bad_pdf_after_child
             9,
             std::path::PathBuf::from(env!("CARGO_BIN_EXE_velotype"))
         ),
-        Err(extractor::PdfChildError::Failed)
+        Err(extractor::PdfChildError::Parse)
     );
 }
