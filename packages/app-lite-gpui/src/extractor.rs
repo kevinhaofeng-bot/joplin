@@ -129,8 +129,11 @@ pub fn run_derived_text_pdf_job_with_exe(
 }
 
 /// Processes a previously taken job while honouring a shell-lifetime
-/// cancellation flag. It is intentionally not a failure path: the caller
-/// leaves D3a's pending identity untouched when the shell closes.
+/// cancellation flag. It is intentionally not a failure path: if cancellation
+/// is observed before the final publish/fail decision, the caller leaves D3a's
+/// pending identity untouched when the shell closes. This is best-effort: a
+/// concurrent durable decision already in progress may finish rather than
+/// making window close wait on SQLite or a global cancellation lock.
 pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
     repository: &LibraryRepository,
     job: DerivedTextJob,
@@ -244,6 +247,8 @@ fn record_derived_failure_or_cancel(
     failure: DerivedTextFailure,
     cancelled: &AtomicBool,
 ) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
+    // See the coordinator contract above: this is the last non-blocking
+    // cancellation fence before starting a durable failure decision.
     if cancelled.load(Ordering::Acquire) {
         return Ok(DerivedTextCoordinatorOutcome::Cancelled);
     }
@@ -269,7 +274,7 @@ fn derived_failure_for_pdf(error: PdfChildError) -> DerivedTextFailure {
 /// Background-only bridge for an already hash-verified core descriptor. It
 /// never receives a profile path or materializes the PDF in parent memory.
 pub fn run_pdf_child_for_verified_file(
-    mut file: File,
+    file: File,
     expected_size: i64,
 ) -> Result<String, PdfChildError> {
     let exe = std::env::current_exe().map_err(|_| PdfChildError::Spawn)?;
@@ -277,7 +282,7 @@ pub fn run_pdf_child_for_verified_file(
 }
 
 pub fn run_pdf_child_for_verified_file_with_exe(
-    mut file: File,
+    file: File,
     expected_size: i64,
     exe: std::path::PathBuf,
 ) -> Result<String, PdfChildError> {

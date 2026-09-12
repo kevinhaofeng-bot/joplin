@@ -120,7 +120,7 @@ fn sleeping_child_script() -> (tempfile::TempDir, std::path::PathBuf, std::path:
 
 #[cfg(unix)]
 fn wait_for_file(path: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -157,7 +157,6 @@ fn cancellable_verified_file_runner_kills_and_reaps_a_running_child() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/resources/extractor-fixture.pdf"
     );
-    let started = Instant::now();
     let runner = std::thread::spawn(move || {
         extractor::run_pdf_child_for_verified_file_with_exe_and_cancellation(
             std::fs::File::open(fixture).unwrap(),
@@ -167,13 +166,14 @@ fn cancellable_verified_file_runner_kills_and_reaps_a_running_child() {
         )
     });
     wait_for_file(&pid_file);
+    let cancelled_at = Instant::now();
     cancelled.store(true, Ordering::Release);
     assert_eq!(
         runner.join().unwrap(),
         Err(extractor::PdfChildError::Cancelled)
     );
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        cancelled_at.elapsed() < Duration::from_secs(2),
         "cancellation must not wait for the child timeout"
     );
     assert_child_is_reaped(&pid_file);
@@ -258,10 +258,15 @@ fn cancelling_a_running_coordinator_reaps_the_child_and_keeps_the_job_pending() 
         )
     });
     wait_for_file(&pid_file);
+    let cancelled_at = Instant::now();
     cancelled.store(true, Ordering::Release);
     assert_eq!(
         runner.join().unwrap().unwrap(),
         extractor::DerivedTextCoordinatorOutcome::Cancelled
+    );
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(2),
+        "coordinator cancellation must not wait for the child timeout"
     );
     assert_child_is_reaped(&pid_file);
     assert_eq!(
