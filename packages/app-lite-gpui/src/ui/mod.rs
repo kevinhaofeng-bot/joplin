@@ -165,7 +165,9 @@ impl PendingRepositoryEvents {
             // Search/sync queue notifications have no library projection
             // transition in this MVP and were intentionally ignored by the
             // previous bridge as well.
-            LibraryEvent::SearchProjectionQueued(_) | LibraryEvent::SyncQueued(_) => {}
+            LibraryEvent::SearchProjectionQueued(_)
+            | LibraryEvent::DerivedTextIndexed(_)
+            | LibraryEvent::SyncQueued(_) => {}
         }
     }
 
@@ -1321,16 +1323,6 @@ impl LibraryShell {
                             );
                             if this
                                 .update(cx, |shell, shell_cx| {
-                                    // A successful publish is a search-only
-                                    // projection event. Reuse the fenced route
-                                    // refresh, which never edits history or a
-                                    // retained dirty session.
-                                    if matches!(
-                                        outcome,
-                                        crate::extractor::DerivedTextCoordinatorOutcome::Indexed(_)
-                                    ) {
-                                        shell.schedule_active_search_refresh(shell_cx);
-                                    }
                                     shell_cx.notify();
                                 })
                                 .is_err()
@@ -1356,13 +1348,25 @@ impl LibraryShell {
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
                     .await;
-                if receiver.try_iter().take(128).any(|event| {
-                    matches!(
-                        event,
-                        app_lite_core::LibraryEvent::SearchProjectionQueued(_)
-                    )
-                }) {
-                    scheduled = true;
+                let mut refresh_search_route = false;
+                for event in receiver.try_iter().take(128) {
+                    match event {
+                        app_lite_core::LibraryEvent::SearchProjectionQueued(_) => scheduled = true,
+                        app_lite_core::LibraryEvent::DerivedTextIndexed(_) => {
+                            refresh_search_route = true
+                        }
+                        _ => {}
+                    }
+                }
+                if refresh_search_route
+                    && this
+                        .update(cx, |shell, shell_cx| {
+                            shell.schedule_active_search_refresh(shell_cx);
+                            shell_cx.notify();
+                        })
+                        .is_err()
+                {
+                    break;
                 }
             }
         })

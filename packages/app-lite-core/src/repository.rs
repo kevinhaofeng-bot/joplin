@@ -291,6 +291,7 @@ pub enum LibraryEvent {
     NoteRestored(NoteId),
     OrganizationChanged,
     SearchProjectionQueued(NoteId),
+    DerivedTextIndexed(ResourceId),
     SyncQueued(EntityRef),
 }
 
@@ -2850,6 +2851,10 @@ impl LibraryRepository {
         )?;
         transaction.execute("UPDATE derived_text_jobs SET state='indexed',failure=NULL,updated_time=?2 WHERE resource_id=?1", params![job.resource_id.as_str(), now])?;
         transaction.commit()?;
+        drop(connection);
+        self.publish(vec![LibraryEvent::DerivedTextIndexed(
+            job.resource_id.clone(),
+        )]);
         Ok(true)
     }
 
