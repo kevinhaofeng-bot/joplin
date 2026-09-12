@@ -1,7 +1,7 @@
 use crate::resource::{
     DatabaseFile, ProfileDir, ResourceBlob, ResourceError, ResourceInput, ResourceStore,
 };
-use crate::schema::migrate_schema;
+use crate::schema::{DERIVED_TEXT_EXTRACTOR_VERSION, migrate_schema};
 use crate::{
     BlobHash, CanonicalDocument, CreateNote, DerivedTextFailure, DerivedTextJob, DerivedTextStatus,
     EditJournalEntry, EntityRef, JournalOwnership, LibraryNavigationIndex, ListQuery,
@@ -26,10 +26,6 @@ use thiserror::Error;
 
 const LIBRARY_SHELL_PANES_SETTING: &str = "library-shell.panes";
 const LIBRARY_SHELL_SELECTED_NOTE_SETTING: &str = "library-shell.selected-note-id";
-/// This is an identity label for the intentionally absent extractor. D3b must
-/// publish a new value when its algorithm changes, thereby making old text
-/// non-current rather than silently reusing it.
-pub const DERIVED_TEXT_EXTRACTOR_VERSION: &str = "d3a-placeholder-v1";
 const MAX_DERIVED_TEXT_BYTES: usize = 1024 * 1024;
 
 fn is_reserved_library_shell_setting(key: &str) -> bool {
@@ -2849,14 +2845,14 @@ impl LibraryRepository {
     ) -> Result<bool, LibraryError> {
         let now = self.now();
         let connection = self.connection.lock().expect("library mutex poisoned");
-        let changed = connection.execute("UPDATE derived_text_jobs SET state='failed',failure=?4,attempts=attempts+1,updated_time=?5 WHERE resource_id=?1 AND sha256=?2 AND extractor_version=?3 AND extractor_version='d3a-placeholder-v1' AND state='pending' AND EXISTS(SELECT 1 FROM resources r WHERE r.id=derived_text_jobs.resource_id AND r.sha256=derived_text_jobs.sha256 AND r.deleted_time=0) AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=derived_text_jobs.resource_id AND nr.is_associated=1 AND n.deleted_time=0)", params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version, failure.as_str(), now])?;
+        let changed = connection.execute("UPDATE derived_text_jobs SET state='failed',failure=?4,attempts=attempts+1,updated_time=?5 WHERE resource_id=?1 AND sha256=?2 AND extractor_version=?3 AND extractor_version=?6 AND state='pending' AND EXISTS(SELECT 1 FROM resources r WHERE r.id=derived_text_jobs.resource_id AND r.sha256=derived_text_jobs.sha256 AND r.deleted_time=0) AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=derived_text_jobs.resource_id AND nr.is_associated=1 AND n.deleted_time=0)", params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version, failure.as_str(), now, DERIVED_TEXT_EXTRACTOR_VERSION])?;
         Ok(changed == 1)
     }
 
     pub fn retry_derived_text(&self, job: &DerivedTextJob) -> Result<bool, LibraryError> {
         let now = self.now();
         let connection = self.connection.lock().expect("library mutex poisoned");
-        let changed = connection.execute("UPDATE derived_text_jobs SET state='pending',failure=NULL,updated_time=?4 WHERE resource_id=?1 AND sha256=?2 AND extractor_version=?3 AND extractor_version='d3a-placeholder-v1' AND state='failed' AND EXISTS(SELECT 1 FROM resources r WHERE r.id=derived_text_jobs.resource_id AND r.sha256=derived_text_jobs.sha256 AND r.deleted_time=0) AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=derived_text_jobs.resource_id AND nr.is_associated=1 AND n.deleted_time=0)", params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version, now])?;
+        let changed = connection.execute("UPDATE derived_text_jobs SET state='pending',failure=NULL,updated_time=?4 WHERE resource_id=?1 AND sha256=?2 AND extractor_version=?3 AND extractor_version=?5 AND state='failed' AND EXISTS(SELECT 1 FROM resources r WHERE r.id=derived_text_jobs.resource_id AND r.sha256=derived_text_jobs.sha256 AND r.deleted_time=0) AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=derived_text_jobs.resource_id AND nr.is_associated=1 AND n.deleted_time=0)", params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version, now, DERIVED_TEXT_EXTRACTOR_VERSION])?;
         Ok(changed == 1)
     }
 
@@ -3108,19 +3104,28 @@ impl LibraryRepository {
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
+                values.push(rusqlite::types::Value::Text(
+                    DERIVED_TEXT_EXTRACTOR_VERSION.into(),
+                ));
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
-                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE st.title LIKE ? ESCAPE '\\' OR st.body LIKE ? ESCAPE '\\') OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND rf.filename LIKE ? ESCAPE '\\') OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_trigram dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version='d3a-placeholder-v1' AND dt.text LIKE ? ESCAPE '\\'))".to_owned()
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE st.title LIKE ? ESCAPE '\\' OR st.body LIKE ? ESCAPE '\\') OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND rf.filename LIKE ? ESCAPE '\\') OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_trigram dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version=? AND dt.text LIKE ? ESCAPE '\\'))".to_owned()
             } else if contains_cjk(text) {
                 values.push(rusqlite::types::Value::Text(fts_literal(text)));
                 values.push(rusqlite::types::Value::Text(fts_literal(text)));
+                values.push(rusqlite::types::Value::Text(
+                    DERIVED_TEXT_EXTRACTOR_VERSION.into(),
+                ));
                 values.push(rusqlite::types::Value::Text(fts_literal(text)));
-                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE search_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_trigram dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version='d3a-placeholder-v1' AND derived_text_trigram MATCH ?))".to_owned()
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE search_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_trigram dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version=? AND derived_text_trigram MATCH ?))".to_owned()
             } else {
                 let fts = fts_literal(text);
                 values.push(rusqlite::types::Value::Text(fts.clone()));
                 values.push(rusqlite::types::Value::Text(fts));
+                values.push(rusqlite::types::Value::Text(
+                    DERIVED_TEXT_EXTRACTOR_VERSION.into(),
+                ));
                 values.push(rusqlite::types::Value::Text(fts_literal(text)));
-                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_unicode rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_unicode dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version='d3a-placeholder-v1' AND derived_text_unicode MATCH ?))".to_owned()
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_unicode rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_unicode dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version=? AND derived_text_unicode MATCH ?))".to_owned()
             };
             predicates.push(if negated {
                 format!("NOT ({condition})")
@@ -3157,9 +3162,9 @@ impl LibraryRepository {
             };
             let mut derived_matches = Vec::new();
             for term in &ordinary_derived_text_provenance {
-                let (subquery, value) = derived_text_provenance_subquery(term);
+                let (subquery, mut values) = derived_text_provenance_subquery(term);
                 derived_matches.push(subquery);
-                provenance_values.push(value);
+                provenance_values.append(&mut values);
             }
             let derived_matches = if derived_matches.len() == 1 {
                 derived_matches
@@ -3860,7 +3865,7 @@ fn filename_provenance_subquery(term: &str) -> (String, rusqlite::types::Value) 
     )
 }
 
-fn derived_text_provenance_subquery(term: &str) -> (String, rusqlite::types::Value) {
+fn derived_text_provenance_subquery(term: &str) -> (String, Vec<rusqlite::types::Value>) {
     let (table, predicate, value) = if contains_short_cjk(term) {
         (
             "derived_text_trigram",
@@ -3882,9 +3887,12 @@ fn derived_text_provenance_subquery(term: &str) -> (String, rusqlite::types::Val
     };
     (
         format!(
-            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN {table} dt ON dt.rowid=dr.fts_rowid WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version='d3a-placeholder-v1' AND {predicate} ORDER BY nr.position,nr.resource_id LIMIT 1)"
+            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN {table} dt ON dt.rowid=dr.fts_rowid WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version=? AND {predicate} ORDER BY nr.position,nr.resource_id LIMIT 1)"
         ),
-        value,
+        vec![
+            rusqlite::types::Value::Text(DERIVED_TEXT_EXTRACTOR_VERSION.into()),
+            value,
+        ],
     )
 }
 
@@ -4181,6 +4189,59 @@ mod tests {
         );
         repository.purge_note(&note.id).unwrap();
         assert_eq!(repository.derived_text_status(&resource).unwrap(), None);
+    }
+
+    #[test]
+    fn v10_reopen_requeues_live_attachment_once_when_extractor_version_changes() {
+        let profile = tempdir().unwrap();
+        let database = profile.path().join("library.sqlite");
+        let repository = LibraryRepository::open(&database).unwrap();
+        let resource = repository
+            .import_resource(b"opaque", "upgrade.pdf", "application/pdf", "pdf")
+            .unwrap();
+        repository
+            .create_note(CreateNote {
+                title: "owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: resource.clone(),
+                        filename: "upgrade.pdf".into(),
+                        media_type: "application/pdf".into(),
+                    },
+                ]),
+            })
+            .unwrap();
+        let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+        repository
+            .publish_derived_text(&job, "version rollover text")
+            .unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection.execute("UPDATE derived_text_jobs SET extractor_version='old-extractor',state='indexed' WHERE resource_id=?1", [resource.as_str()]).unwrap();
+            connection.execute("UPDATE settings SET value='old-extractor' WHERE key='derived-text.extractor-version'", []).unwrap();
+        }
+        drop(repository);
+        let reopened = LibraryRepository::open(&database).unwrap();
+        let requeued = reopened.take_derived_text_jobs(1).unwrap();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].resource_id, resource);
+        assert_eq!(
+            requeued[0].extractor_version,
+            DERIVED_TEXT_EXTRACTOR_VERSION
+        );
+        assert_eq!(
+            reopened.derived_text_status(&resource).unwrap(),
+            Some(DerivedTextStatus::Pending { attempts: 0 })
+        );
+        drop(reopened);
+        // The sentinel now matches; a subsequent open is the bounded hot path
+        // and does not reset the pending job's attempt/status.
+        let reopened = LibraryRepository::open(&database).unwrap();
+        assert_eq!(
+            reopened.derived_text_status(&resource).unwrap(),
+            Some(DerivedTextStatus::Pending { attempts: 0 })
+        );
     }
 
     #[cfg(unix)]

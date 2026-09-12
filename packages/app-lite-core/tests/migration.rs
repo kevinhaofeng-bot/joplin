@@ -1,4 +1,6 @@
 use app_lite_core::document::Block;
+#[cfg(feature = "test-support")]
+use app_lite_core::schema::SCHEMA_VERSION;
 use app_lite_core::{
     AssociateResource, CanonicalDocument, CreateNote, EditJournalEntry, LibraryError,
     LibraryRepository, SaveNote,
@@ -1259,7 +1261,7 @@ fn migration_gate_blocks_a_second_v3_writer_before_html_publication() {
         check
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        SCHEMA_VERSION
     );
     assert_eq!(
         check
@@ -1473,7 +1475,7 @@ fn migration_commit_returns_bound_repository_when_selected_profile_is_replaced()
         published
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        SCHEMA_VERSION
     );
 }
 

@@ -5,6 +5,11 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 pub const SCHEMA_VERSION: i64 = 10;
+/// The durable identity of the extractor implementation currently compiled
+/// into the client. A future extractor changes this one value; v10 reopen
+/// reconciles the live associated queue once through the settings sentinel.
+pub const DERIVED_TEXT_EXTRACTOR_VERSION: &str = "d3a-placeholder-v1";
+const DERIVED_TEXT_EXTRACTOR_VERSION_SETTING: &str = "derived-text.extractor-version";
 
 pub(crate) fn migrate_schema(
     connection: &mut Connection,
@@ -37,10 +42,25 @@ pub(crate) fn migrate_schema(
     // schema/data mutation, while this migration-wide lock is still held.
     let mut resource_store = preflight()?;
     if version == SCHEMA_VERSION {
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                [DERIVED_TEXT_EXTRACTOR_VERSION_SETTING],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let requeued = stored.as_deref() != Some(DERIVED_TEXT_EXTRACTOR_VERSION);
+        if requeued {
+            requeue_live_derived_text(&transaction)?;
+            transaction.execute(
+                "INSERT INTO settings(key,value,updated_time) VALUES(?1,?2,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_time=excluded.updated_time",
+                params![DERIVED_TEXT_EXTRACTOR_VERSION_SETTING, DERIVED_TEXT_EXTRACTOR_VERSION],
+            )?;
+        }
         verify_profile(&transaction)?;
         transaction.commit()?;
         resource_store.mark_published();
-        return Ok((false, resource_store));
+        return Ok((requeued, resource_store));
     }
     transaction.execute_batch("CREATE TABLE IF NOT EXISTS stacks (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS notebooks (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, stack_id TEXT REFERENCES stacks(id) ON DELETE SET NULL, is_default INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0);
@@ -154,7 +174,11 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
         // D3a is only an identity/index/job seam.  This migration must not
         // hydrate authoritative note bodies or resource bytes.
         transaction.execute_batch("DROP TRIGGER IF EXISTS derived_text_resource_delete; DROP TABLE IF EXISTS derived_text_unicode; DROP TABLE IF EXISTS derived_text_trigram; DROP TABLE IF EXISTS derived_text_rows; DROP TABLE IF EXISTS derived_text_jobs; CREATE TABLE derived_text_rows (fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT, resource_id TEXT NOT NULL UNIQUE REFERENCES resources(id) ON DELETE CASCADE, sha256 TEXT NOT NULL, extractor_version TEXT NOT NULL); CREATE TABLE derived_text_jobs (resource_id TEXT PRIMARY KEY NOT NULL REFERENCES resources(id) ON DELETE CASCADE, sha256 TEXT NOT NULL, extractor_version TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','indexed','failed')), failure TEXT, attempts INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL); CREATE VIRTUAL TABLE derived_text_unicode USING fts5(resource_id UNINDEXED, text, tokenize='unicode61'); CREATE VIRTUAL TABLE derived_text_trigram USING fts5(resource_id UNINDEXED, text, tokenize='trigram'); CREATE TRIGGER derived_text_resource_delete BEFORE DELETE ON resources BEGIN DELETE FROM derived_text_unicode WHERE rowid IN (SELECT fts_rowid FROM derived_text_rows WHERE resource_id=OLD.id); DELETE FROM derived_text_trigram WHERE rowid IN (SELECT fts_rowid FROM derived_text_rows WHERE resource_id=OLD.id); END;")?;
-        transaction.execute("INSERT INTO derived_text_jobs(resource_id,sha256,extractor_version,state,failure,attempts,updated_time) SELECT r.id,r.sha256,'d3a-placeholder-v1','pending',NULL,0,r.updated_time FROM resources r WHERE r.deleted_time=0 AND (r.mime='application/pdf' OR r.mime LIKE 'image/%') AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=r.id AND nr.is_associated=1 AND n.deleted_time=0) ON CONFLICT(resource_id) DO NOTHING", [])?;
+        requeue_live_derived_text(&transaction)?;
+        transaction.execute(
+            "INSERT INTO settings(key,value,updated_time) VALUES(?1,?2,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_time=excluded.updated_time",
+            params![DERIVED_TEXT_EXTRACTOR_VERSION_SETTING, DERIVED_TEXT_EXTRACTOR_VERSION],
+        )?;
     }
     transaction.execute_batch("PRAGMA user_version = 10")?;
     before_commit();
@@ -166,6 +190,19 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     resource_store.mark_published();
     after_migration_commit();
     Ok((true, resource_store))
+}
+
+fn requeue_live_derived_text(transaction: &Transaction<'_>) -> Result<(), LibraryError> {
+    transaction.execute(
+        "INSERT INTO derived_text_jobs(resource_id,sha256,extractor_version,state,failure,attempts,updated_time)
+         SELECT r.id,r.sha256,?1,'pending',NULL,0,r.updated_time FROM resources r
+         WHERE r.deleted_time=0 AND (r.mime='application/pdf' OR r.mime LIKE 'image/%')
+           AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=r.id AND nr.is_associated=1 AND n.deleted_time=0)
+         ON CONFLICT(resource_id) DO UPDATE SET sha256=excluded.sha256,extractor_version=excluded.extractor_version,state='pending',failure=NULL,attempts=0,updated_time=excluded.updated_time
+         WHERE derived_text_jobs.sha256<>excluded.sha256 OR derived_text_jobs.extractor_version<>excluded.extractor_version",
+        [DERIVED_TEXT_EXTRACTOR_VERSION],
+    )?;
+    Ok(())
 }
 
 fn canonicalize_notes(transaction: &Transaction<'_>) -> Result<(), LibraryError> {
