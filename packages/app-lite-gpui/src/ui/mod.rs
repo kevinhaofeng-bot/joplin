@@ -81,6 +81,16 @@ enum ShellSaveError {
     Lifecycle { message: String },
 }
 
+/// Search indexing is a disposable, asynchronous projection.  It is never a
+/// local-save error: the authoritative note transaction has already committed
+/// when this state changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IndexingStatus {
+    Idle,
+    Pending,
+    Failed(String),
+}
+
 /// A bounded coalescing buffer between the repository's unbounded sender and
 /// the retained GPUI event task. The model refresh only distinguishes these
 /// event *kinds*; keeping one representative ID per kind is therefore enough
@@ -474,6 +484,13 @@ pub struct LibraryShell {
     // Held by the entity so GPUI cancels the receiver loop when this window is
     // destroyed. The task captures only a WeakEntity and never blocks on recv.
     _event_task: Task<()>,
+    /// One retained, cancellable worker drains the durable search queue. It
+    /// owns no note body or second repository state; the SQLite queue remains
+    /// the restart-safe authority.
+    _indexing_task: Task<()>,
+    indexing_status: IndexingStatus,
+    #[cfg(test)]
+    indexing_task_cancellation_receiver: Option<Receiver<()>>,
     #[cfg(test)]
     event_task_cancellation_receiver: Option<Receiver<()>>,
     #[cfg(test)]
@@ -827,11 +844,23 @@ impl LibraryShell {
             }
         });
         let event_receiver = model.read(cx).subscribe_library_events();
+        let indexing_receiver = model.read(cx).subscribe_library_events();
         #[cfg(test)]
         let (event_task_lifetime, event_task_cancellation_receiver) = EventTaskLifetime::observed();
+        #[cfg(test)]
+        let (indexing_task_lifetime, indexing_task_cancellation_receiver) =
+            EventTaskLifetime::observed();
         #[cfg(not(test))]
         let event_task_lifetime = EventTaskLifetime::unobserved();
+        #[cfg(not(test))]
+        let indexing_task_lifetime = EventTaskLifetime::unobserved();
         let event_task = Self::spawn_event_bridge(event_receiver, event_task_lifetime, cx);
+        let indexing_task = Self::spawn_index_scheduler(
+            model.read(cx).repository(),
+            indexing_receiver,
+            indexing_task_lifetime,
+            cx,
+        );
         let mut shell = Self {
             model,
             note_session: None,
@@ -871,6 +900,10 @@ impl LibraryShell {
             toolbar_more_open: false,
             _model_observation: observation,
             _event_task: event_task,
+            _indexing_task: indexing_task,
+            indexing_status: IndexingStatus::Pending,
+            #[cfg(test)]
+            indexing_task_cancellation_receiver: Some(indexing_task_cancellation_receiver),
             #[cfg(test)]
             event_task_cancellation_receiver: Some(event_task_cancellation_receiver),
             #[cfg(test)]
@@ -947,6 +980,90 @@ impl LibraryShell {
                         // The shell owns the task, but stop promptly as well
                         // if an already-queued timer wakes after its entity
                         // died.
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    fn spawn_index_scheduler(
+        repository: Arc<LibraryRepository>,
+        receiver: Receiver<app_lite_core::LibraryEvent>,
+        indexing_task_lifetime: EventTaskLifetime,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let _indexing_task_lifetime = indexing_task_lifetime;
+            // An open profile may already have durable work from a prior run.
+            // Afterwards SearchProjectionQueued wakes one coalesced batch;
+            // no GPUI state retains canonical text or creates per-note tasks.
+            let mut scheduled = true;
+            loop {
+                if scheduled {
+                    scheduled = false;
+                    match repository.process_search_jobs() {
+                        Ok(completed) => {
+                            // A full batch means there may be more work, but
+                            // yield before another bounded batch so typing and
+                            // navigation retain their normal GPUI turns.
+                            scheduled = completed == 100;
+                            let status = if scheduled {
+                                IndexingStatus::Pending
+                            } else {
+                                IndexingStatus::Idle
+                            };
+                            if this
+                                .update(cx, |shell, shell_cx| {
+                                    shell.indexing_status = status;
+                                    shell_cx.notify();
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            // Do not acknowledge or convert this into a save
+                            // failure. The core worker leaves the exact queue
+                            // identity durable for a later event or reopen.
+                            if this
+                                .update(cx, |shell, shell_cx| {
+                                    shell.indexing_status =
+                                        IndexingStatus::Failed(format!("本地索引待重试：{error}"));
+                                    shell_cx.notify();
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let mut queued = false;
+                for event in receiver.try_iter().take(128) {
+                    if matches!(
+                        event,
+                        app_lite_core::LibraryEvent::SearchProjectionQueued(_)
+                    ) {
+                        queued = true;
+                    }
+                }
+                if queued {
+                    scheduled = true;
+                    if this
+                        .update(cx, |shell, shell_cx| {
+                            if !matches!(shell.indexing_status, IndexingStatus::Failed(_)) {
+                                shell.indexing_status = IndexingStatus::Pending;
+                            }
+                            shell_cx.notify();
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1189,6 +1306,18 @@ impl LibraryShell {
         self.save_error
             .as_ref()
             .map(|error| error.message().to_owned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexing_status_for_test(&self) -> IndexingStatus {
+        self.indexing_status.clone()
+    }
+
+    #[cfg(test)]
+    fn take_indexing_task_cancellation_receiver_for_test(&mut self) -> Receiver<()> {
+        self.indexing_task_cancellation_receiver
+            .take()
+            .expect("indexing task cancellation receiver is taken only once per test")
     }
 
     #[cfg(test)]
@@ -4590,6 +4719,24 @@ impl Render for LibraryShell {
                 .text_color(rgba(0xa34838ff))
                 .child(error.message().to_owned())
         }))
+        .children(match &self.indexing_status {
+            // Pending is intentionally quiet: it is normal immediately after
+            // a save. Failure is separately visible and never reuses the
+            // save-error surface or its semantics.
+            IndexingStatus::Failed(message) => Some(
+                div()
+                    .id("library-indexing-status")
+                    .debug_selector(|| "library-indexing-status".to_owned())
+                    .absolute()
+                    .bottom(px(58.0))
+                    .right(px(14.0))
+                    .max_w(px(520.0))
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x8d6a27ff))
+                    .child(message.clone()),
+            ),
+            IndexingStatus::Idle | IndexingStatus::Pending => None,
+        })
         .children(self.resource_notice.as_ref().map(|notice| {
             div()
                 .id("library-resource-notice")
@@ -4838,6 +4985,8 @@ fn import_note_body(note: &Note) -> Result<crate::native_editor::model::Document
 mod create_note_route_tests;
 #[cfg(test)]
 mod editor_scroll_tests;
+#[cfg(test)]
+mod index_scheduler_tests;
 #[cfg(test)]
 mod navigation_retention_tests;
 #[cfg(test)]

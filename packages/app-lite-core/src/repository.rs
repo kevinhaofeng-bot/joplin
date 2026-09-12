@@ -357,6 +357,10 @@ pub struct LibraryRepository {
     shell_state_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(any(test, feature = "test-support"))]
     next_note_load_failure: Mutex<Option<LibraryError>>,
+    /// Test seam for the independent derived-index worker. It never affects
+    /// the authoritative save transaction and is consumed once per worker
+    /// invocation so retry/reopen behavior remains observable.
+    next_search_job_failure: Mutex<Option<LibraryError>>,
     #[cfg(test)]
     next_staged_resource_snapshot_failure: Mutex<Option<LibraryError>>,
     #[allow(dead_code)]
@@ -584,6 +588,7 @@ impl LibraryRepository {
             shell_state_read_hook: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             next_note_load_failure: Mutex::new(None),
+            next_search_job_failure: Mutex::new(None),
             #[cfg(test)]
             next_staged_resource_snapshot_failure: Mutex::new(None),
             database_path: path,
@@ -775,6 +780,22 @@ impl LibraryRepository {
             .next_note_load_failure
             .lock()
             .expect("note-load failure mutex poisoned") = Some(error);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_next_search_jobs_for_test(&self, error: LibraryError) {
+        *self
+            .next_search_job_failure
+            .lock()
+            .expect("search-job failure mutex poisoned") = Some(error);
+    }
+
+    pub(crate) fn take_search_job_failure(&self) -> Option<LibraryError> {
+        self.next_search_job_failure
+            .lock()
+            .expect("search-job failure mutex poisoned")
+            .take()
     }
 
     #[cfg(test)]

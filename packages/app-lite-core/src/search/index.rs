@@ -4,6 +4,9 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 /// Drains at most one bounded worker batch.  A failed document leaves its job
 /// untouched, so reopening the repository can retry without losing authority.
 pub fn process_search_jobs(repository: &LibraryRepository) -> Result<usize, LibraryError> {
+    if let Some(error) = repository.take_search_job_failure() {
+        return Err(error);
+    }
     let jobs = repository.take_search_jobs(100)?;
     let mut completed = 0;
     for job in jobs {
