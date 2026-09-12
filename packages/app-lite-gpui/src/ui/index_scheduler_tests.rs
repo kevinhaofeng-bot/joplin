@@ -127,6 +127,99 @@ async fn mounted_scheduler_advances_a_derived_job_saved_after_open(cx: &mut Test
 }
 
 #[gpui::test]
+async fn mounted_derived_text_publish_refreshes_an_active_search_route(cx: &mut TestAppContext) {
+    // This injects D3a output directly to exercise the mounted event-to-search
+    // refresh seam. It is deliberately not a claim about the PDFKit child.
+    let (_profile, repository) = repository();
+    let resource = repository
+        .import_resource(b"opaque source", "fixture.png", "image/png", "png")
+        .expect("import opaque source");
+    let note = repository
+        .create_note(CreateNote {
+            title: "derived search owner".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "fixture.png".into(),
+                media_type: "image/png".into(),
+            }]),
+        })
+        .expect("create ordinary note");
+    repository
+        .process_search_jobs()
+        .expect("finish ordinary title/body search work before opening shell");
+    let job = repository
+        .take_derived_text_jobs(1)
+        .expect("take associated derived identity")
+        .pop()
+        .expect("derived job pending");
+    let model = cx.new(|_| {
+        let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+        let generation = model.begin_search("derived-only-needle");
+        model
+            .commit_search_results(generation, "derived-only-needle".into(), vec![], None)
+            .expect("commit initially empty SearchRoute");
+        model
+    });
+    // Hold the process-wide child gate until the synthetic D3a publish has
+    // emitted. Otherwise the startup worker can consume this intentionally
+    // pending image job before the mounted event path observes it.
+    let derived_worker_guard = super::DERIVED_TEXT_WORKER_LOCK
+        .lock()
+        .expect("derived worker gate");
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        LibraryShell::new_with_save_clock(
+            model,
+            None,
+            Arc::new(ManualSaveClock::default()),
+            window,
+            cx,
+        )
+    });
+    let (history_before, snapshot_before) = view.read_with(cx, |shell, app| {
+        let navigation = shell.model.read(app).navigation();
+        (navigation.history_len_for_test(), navigation.snapshot())
+    });
+    assert!(
+        repository
+            .publish_derived_text(&job, "derived-only-needle")
+            .expect("publish synthetic derived text")
+    );
+    drop(derived_worker_guard);
+    assert_eq!(
+        repository
+            .search(SearchQuery::parse("derived-only-needle"))
+            .expect("derived text reaches FTS")
+            .len(),
+        1
+    );
+
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(300));
+    redraw(cx);
+
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(
+            model.projections().len(),
+            1,
+            "active route receives derived hit"
+        );
+        assert_eq!(model.projections()[0].id, note.id);
+        assert_eq!(
+            model.navigation().history_len_for_test(),
+            history_before,
+            "derived refresh must not create history"
+        );
+        assert_eq!(
+            model.navigation().snapshot(),
+            snapshot_before,
+            "derived refresh keeps the active typed route unchanged"
+        );
+    });
+}
+
+#[gpui::test]
 async fn mounted_scheduler_coalesces_latest_save_then_removes_trash_and_purge_hits(
     cx: &mut TestAppContext,
 ) {

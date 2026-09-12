@@ -1245,6 +1245,17 @@ impl AppModel {
         ))
     }
 
+    /// Mark only the currently visible typed SearchRoute stale after durable
+    /// attachment text becomes searchable. This deliberately does not mutate
+    /// navigation, history, selection, or the retained editor session.
+    pub fn invalidate_active_search_for_derived_text(&mut self) -> bool {
+        if self.navigation.search_query().is_none() {
+            return false;
+        }
+        self.mark_search_refresh_pending();
+        true
+    }
+
     /// Atomically replace the cards of the already-active SearchRoute. It
     /// never creates history and cannot turn the search view into All Notes.
     pub fn commit_search_refresh(

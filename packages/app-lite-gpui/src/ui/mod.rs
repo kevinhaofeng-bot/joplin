@@ -1361,7 +1361,12 @@ impl LibraryShell {
                 if refresh_search_route
                     && this
                         .update(cx, |shell, shell_cx| {
-                            shell.schedule_active_search_refresh(shell_cx);
+                            let invalidated = shell.model.update(shell_cx, |model, _| {
+                                model.invalidate_active_search_for_derived_text()
+                            });
+                            if invalidated {
+                                shell.schedule_active_search_refresh(shell_cx);
+                            }
                             shell_cx.notify();
                         })
                         .is_err()
