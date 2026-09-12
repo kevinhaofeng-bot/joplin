@@ -602,6 +602,156 @@ async fn mounted_cmd_k_search_ignores_marked_enter_and_opens_the_thirteenth_resu
     });
 }
 
+#[gpui::test]
+async fn search_palette_keyboard_reveals_a_wrapping_tail_row_in_the_real_scroll_viewport(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    for index in 0..SearchQuery::MAX_PAGE_SIZE {
+        repository
+            .create_note(CreateNote {
+                title: format!(
+                    "needle {index:03} 这是一条会在窄调色板中换行的很长标题，用于验证真实几何滚动"
+                ),
+                notebook_id: None,
+                document: rich_document("needle 这是一段也会换行的摘要内容，以避免固定行高估算。"),
+            })
+            .expect("create wrapping search fixture");
+    }
+    for _ in 0..32 {
+        if !repository
+            .has_pending_search_jobs()
+            .expect("inspect fixture search queue")
+        {
+            break;
+        }
+        repository
+            .process_search_jobs()
+            .expect("index one bounded fixture batch");
+    }
+    assert!(
+        !repository
+            .has_pending_search_jobs()
+            .expect("fixture indexing drained"),
+        "the mounted 500-row geometry test needs every real fixture hit indexed"
+    );
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    redraw(cx);
+    let tail_id = view.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.search_palette_results.len(),
+            SearchQuery::MAX_PAGE_SIZE,
+            "the bounded repository packet must mount all 500 real hits"
+        );
+        let unique = shell
+            .search_palette_results
+            .iter()
+            .map(|hit| hit.note.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), SearchQuery::MAX_PAGE_SIZE);
+        shell.search_palette_results[SearchQuery::MAX_PAGE_SIZE - 1]
+            .note
+            .id
+            .clone()
+    });
+    for _ in 0..(SearchQuery::MAX_PAGE_SIZE - 1) {
+        cx.simulate_keystrokes("down");
+    }
+    redraw(cx);
+    // `scroll_to_item` is applied during GPUI prepaint, then the resulting
+    // child geometry is available on the following draw.
+    redraw(cx);
+
+    let (viewport, tail, offset) = view.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.search_palette_scroll.children_count(),
+            SearchQuery::MAX_PAGE_SIZE,
+            "the tracked scroll container must expose every bounded result as a direct child"
+        );
+        (
+            shell.search_palette_scroll.bounds(),
+            shell
+                .search_palette_scroll
+                .bounds_for_item(SearchQuery::MAX_PAGE_SIZE - 1)
+                .expect("mounted tail row remains mouse reachable"),
+            shell.search_palette_scroll.offset(),
+        )
+    });
+    assert!(
+        tail.bottom() + offset.y > viewport.top() && tail.top() + offset.y < viewport.bottom(),
+        "the keyboard-selected wrapping tail row must intersect the painted scroll viewport"
+    );
+    view.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.search_palette_selected,
+            SearchQuery::MAX_PAGE_SIZE - 1
+        );
+    });
+    cx.simulate_click(
+        point(tail.center().x, tail.center().y + offset.y),
+        Modifiers::default(),
+    );
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(
+            !shell.search_palette_open,
+            "the painted tail row is mouse clickable"
+        );
+        assert_eq!(
+            shell.model.read(app).navigation().selected_note_id(),
+            Some(&tail_id),
+            "tail click must select the real tail NoteId"
+        );
+    });
+}
+
+#[gpui::test]
+async fn search_palette_escape_restores_an_open_organization_input_and_its_panel(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.organization_panel_open = true;
+            shell
+                .organization_input
+                .read(shell_cx)
+                .focus_handle()
+                .focus(window);
+        });
+    });
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.toggle_search_palette_visibility(window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+    view.read_with(cx, |shell, _| {
+        assert!(
+            shell.organization_panel_open,
+            "closing the palette must restore the panel containing the prior focus"
+        );
+    });
+    assert!(cx.update(|window, app| {
+        view.read(app)
+            .organization_input
+            .read(app)
+            .focus_handle()
+            .is_focused(window)
+    }));
+}
+
 #[test]
 fn pending_repository_events_coalesce_multi_batch_receiver_bursts_to_a_fixed_packet() {
     // Mutation-sensitive: a lifecycle barrier can hold an event packet for

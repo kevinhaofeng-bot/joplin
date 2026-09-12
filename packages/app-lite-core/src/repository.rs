@@ -2807,7 +2807,9 @@ impl LibraryRepository {
     pub fn has_pending_search_jobs(&self) -> Result<bool, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
         connection
-            .query_row("SELECT EXISTS(SELECT 1 FROM search_queue)", [], |row| row.get(0))
+            .query_row("SELECT EXISTS(SELECT 1 FROM search_queue)", [], |row| {
+                row.get(0)
+            })
             .map_err(Into::into)
     }
 

@@ -516,10 +516,13 @@ pub struct LibraryShell {
     /// precise native owner that had focus so Escape/backdrop can return to
     /// title, body, or an auxiliary field without inventing an editor move.
     search_palette_return_focus: Option<FocusHandle>,
+    search_palette_return_organization_panel_open: bool,
     _search_task: Option<Task<()>>,
     _history_search_task: Option<Task<()>>,
     _search_route_refresh_task: Option<Task<()>>,
     history_search_notice: Option<String>,
+    search_refresh_retry_available: bool,
+    search_refresh_retry_history: Option<bool>,
     organization_panel_open: bool,
     pending_destructive_action: Option<PendingDestructiveAction>,
     /// Retained alongside the shell so the typed navigation tree can request
@@ -980,10 +983,13 @@ impl LibraryShell {
             search_palette_selected: 0,
             search_palette_scroll: ScrollHandle::new(),
             search_palette_return_focus: None,
+            search_palette_return_organization_panel_open: false,
             _search_task: None,
             _history_search_task: None,
             _search_route_refresh_task: None,
             history_search_notice: None,
+            search_refresh_retry_available: false,
+            search_refresh_retry_history: None,
             organization_panel_open: false,
             pending_destructive_action: None,
             sidebar_scroll: UniformListScrollHandle::new(),
@@ -1883,14 +1889,19 @@ impl LibraryShell {
             .is_some_and(|session| !matches!(session.read(cx).save_state(), SaveState::Clean))
     }
 
-    fn active_session_save_fence(&self, cx: &App) -> Option<(NoteId, i64)> {
+    fn active_session_save_fence(&self, cx: &App) -> Option<(NoteId, i64, i64)> {
         self.note_session.as_ref().map(|session| {
             let note_id = self.surface_note_id.clone().unwrap_or_else(|| {
                 self.model
                     .read_with(cx, |model, _| model.active_session_note_id().cloned())
                     .expect("retained session has an active note")
             });
-            (note_id, session.read(cx).save_generation())
+            let session = session.read(cx);
+            (
+                note_id,
+                session.save_generation(),
+                session.expected_revision(),
+            )
         })
     }
 
@@ -3390,26 +3401,16 @@ impl LibraryShell {
         }
     }
 
-    fn focus_before_search_palette(&self, window: &Window, cx: &App) -> FocusHandle {
-        if !self.organization_panel_open
-            && self
-                .organization_input
-                .read(cx)
-                .focus_handle()
-                .is_focused(window)
-        {
+    fn fallback_focus_before_search_palette(&self, cx: &App) -> FocusHandle {
+        if self.organization_panel_open {
             return self.organization_input.read(cx).focus_handle().clone();
         }
         if let Some(session) = self.note_session.as_ref() {
             let (title, editor) = session.read_with(cx, |session, _| {
                 (session.title().clone(), session.editor().clone())
             });
-            if title.read(cx).focus_handle().is_focused(window) {
-                return title.read(cx).focus_handle().clone();
-            }
-            if editor.read(cx).focus_handle().is_focused(window) {
-                return editor.read(cx).focus_handle().clone();
-            }
+            let _ = title;
+            return editor.read(cx).focus_handle().clone();
         }
         self.focus_handle.clone()
     }
@@ -3417,7 +3418,10 @@ impl LibraryShell {
     fn toggle_search_palette_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_palette_open = !self.search_palette_open;
         if self.search_palette_open {
-            self.search_palette_return_focus = Some(self.focus_before_search_palette(window, cx));
+            self.search_palette_return_focus = window
+                .focused(cx)
+                .or_else(|| Some(self.fallback_focus_before_search_palette(cx)));
+            self.search_palette_return_organization_panel_open = self.organization_panel_open;
             self.organization_panel_open = false;
             self.toolbar_more_open = false;
             self.search_input.read(cx).focus_handle().focus(window);
@@ -3427,6 +3431,8 @@ impl LibraryShell {
             self.search_palette_status = SearchPaletteStatus::Idle;
             self.search_palette_results.clear();
             self.search_palette_selected = 0;
+            self.organization_panel_open = self.search_palette_return_organization_panel_open;
+            self.search_palette_return_organization_panel_open = false;
             if let Some(focus) = self.search_palette_return_focus.take() {
                 focus.focus(window);
                 // A backdrop pointer event can claim focus after its handler
@@ -3600,7 +3606,11 @@ impl LibraryShell {
                 };
                 shell.history_search_notice = match outcome {
                     Ok(true) | Ok(false) => None,
-                    Err(error) => Some(format!("无法恢复搜索结果：{error}")),
+                    Err(error) => {
+                        shell.search_refresh_retry_available = true;
+                        shell.search_refresh_retry_history = Some(forward);
+                        Some(format!("无法恢复搜索结果：{error}"))
+                    }
                 };
                 shell_cx.notify();
             });
@@ -3702,6 +3712,18 @@ impl LibraryShell {
                     });
                     if matches!(committed, Ok(true)) {
                         shell.history_search_notice = None;
+                        shell.search_refresh_retry_available = false;
+                        shell.search_refresh_retry_history = None;
+                    } else if let Err(error) = committed {
+                        shell.history_search_notice = Some(format!("本地搜索更新失败：{error}"));
+                        shell.search_refresh_retry_available = true;
+                        shell.search_refresh_retry_history = None;
+                    } else if shell.model.read_with(shell_cx, |model, _| {
+                        model.pending_search_refresh().is_some()
+                    }) {
+                        // A stale completion belongs to an older route/generation.
+                        // Reissue only the latest retained SearchRoute request.
+                        shell.schedule_active_search_refresh(shell_cx);
                     }
                 } else if let Err(error) = result {
                     // A search refresh is not a save failure, but silently
@@ -3709,6 +3731,8 @@ impl LibraryShell {
                     // route intact and surface the error; a later repository
                     // event/index Idle edge is the bounded retry trigger.
                     shell.history_search_notice = Some(format!("本地搜索更新失败：{error}"));
+                    shell.search_refresh_retry_available = true;
+                    shell.search_refresh_retry_history = None;
                 }
                 shell_cx.notify();
             });
@@ -4700,27 +4724,10 @@ impl LibraryShell {
     }
 
     fn reveal_search_palette_selection(&self) {
-        // Each retained search row has two text lines plus padding. Keep the
-        // active keyboard row inside the 420px viewport without a second
-        // virtual result authority. `ScrollHandle` clamps against measured
-        // content once the list has mounted.
-        const ROW_HEIGHT: f32 = 58.0;
-        const VIEWPORT_HEIGHT: f32 = 420.0;
-        let top = self.search_palette_selected as f32 * ROW_HEIGHT;
-        let bottom = top + ROW_HEIGHT;
-        let current_top = -f32::from(self.search_palette_scroll.offset().y);
-        let current_bottom = current_top + VIEWPORT_HEIGHT;
-        let target_top = if top < current_top {
-            top
-        } else if bottom > current_bottom {
-            bottom - VIEWPORT_HEIGHT
-        } else {
-            return;
-        };
-        let max_y = self.search_palette_scroll.max_offset().height.max(px(0.0));
-        let mut offset = self.search_palette_scroll.offset();
-        offset.y = -px(target_top.max(0.0)).max(-max_y);
-        self.search_palette_scroll.set_offset(offset);
+        // Search rows are direct tracked children, so GPUI can use their
+        // painted bounds instead of inventing a fixed line height.
+        self.search_palette_scroll
+            .scroll_to_item(self.search_palette_selected);
     }
 
     fn render_search_palette(
@@ -4819,18 +4826,20 @@ impl LibraryShell {
             ),
             SearchPaletteStatus::Error(message) => format!("搜索失败：{message}"),
         };
-        let mut results = div()
-            .id("library-search-results")
+        let mut results_scroll = div()
+            .id("library-search-results-scroll")
             .flex()
             .flex_col()
-            .gap(px(4.0));
+            .h(px(420.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.search_palette_scroll);
         // The packet is explicitly capped at 500. Mount the complete bounded
         // list so native wheel scrolling can reach every result as well as
         // keyboard navigation; no separate result authority is introduced.
         for (index, hit) in self.search_palette_results.iter().enumerate() {
             let title = hit.note.title_prefix.clone();
             let snippet = hit.snippet.clone();
-            results = results.child(
+            results_scroll = results_scroll.child(
                 div()
                     .id(SharedString::from(format!("library-search-result-{index}")))
                     .cursor_pointer()
@@ -4906,16 +4915,7 @@ impl LibraryShell {
                                 .text_color(rgba(0x718075ff))
                                 .child(status),
                         )
-                        .child(
-                            div()
-                                .id("library-search-results-scroll")
-                                .flex()
-                                .flex_col()
-                                .h(px(420.0))
-                                .overflow_y_scroll()
-                                .track_scroll(&self.search_palette_scroll)
-                                .child(results),
-                        ),
+                        .child(results_scroll),
                 )
                 .into_any_element(),
         )
@@ -5699,6 +5699,8 @@ impl Render for LibraryShell {
                 .child(notice.clone())
         }))
         .children(self.history_search_notice.as_ref().map(|notice| {
+            let retry_available = self.search_refresh_retry_available;
+            let retry_history = self.search_refresh_retry_history;
             div()
                 .id("library-history-search-status")
                 .absolute()
@@ -5707,7 +5709,35 @@ impl Render for LibraryShell {
                 .max_w(px(520.0))
                 .text_size(px(11.0))
                 .text_color(rgba(0x536f59ff))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
                 .child(notice.clone())
+                .children(retry_available.then(|| {
+                    div()
+                        .id("library-search-refresh-retry")
+                        .debug_selector(|| "library-search-refresh-retry".to_owned())
+                        .cursor_pointer()
+                        .px(px(6.0))
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0x00a82d20))
+                        .text_color(rgba(EVERNOTE_GREEN))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _event, _window, cx| {
+                                shell.search_refresh_retry_available = false;
+                                shell.history_search_notice = Some("正在重试本地搜索更新…".into());
+                                if let Some(forward) = retry_history {
+                                    let _ = shell.schedule_history_search(forward, cx);
+                                } else {
+                                    shell.schedule_active_search_refresh(cx);
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child("重试")
+                }))
         }))
         .children(self.startup_notice.as_ref().map(|notice| {
             div()
