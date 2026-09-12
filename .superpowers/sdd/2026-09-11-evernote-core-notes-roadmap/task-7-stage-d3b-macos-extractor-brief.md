@@ -1,15 +1,21 @@
 # Task 7 D3b: bounded macOS PDF/image text extractor
 
-Status: design boundary for the stage after D3a, 2026-09-13. No extractor is
-implemented or accepted by this brief.
+Status: original D3b design boundary, 2026-09-13. The selectable-PDF child and
+automatic scheduler were subsequently accepted at
+`joplin-lite-native-v0.17.0-automatic-pdf-search-checkpoint`; image OCR and
+scanned-PDF OCR remain unimplemented at that checkpoint. The accepted-code
+reports, not every candidate below, describe the actual shipped path.
 
 Source-first clarification from the unpacked Evernote 11.32.5 main bundle:
 `main-readable/src/modules/34309__module-34309.js::searchText` calls
 `di.quasar.queries.attachment.resourceSearchTextAndRecognition`, while
 `50177__module-50177.js::NOTE_RECOGNITIONS_AND_SEARCH` requests a resource's
-`recognition` and `searchText` from a GraphQL note response. The local
+`recognition` and `searchText` from a GraphQL note response. The
+`45897__note-content-fetch.js::downloadNoteAttachmentsRecognitionAndSearchText`
+path fetches those values and calls the local DAO's
+`updateRecognitionContents` and `setSearchText`. The local
 `47391__module-47391.js::setSearchText` and migration `59009` persist/index
-that returned text. These paths support our derived-index data relationship;
+the fetched search text. These paths support our derived-index data relationship;
 they **do not show an Evernote desktop PDFKit/OCR extraction algorithm**.
 Local macOS PDFKit/Vision extraction is an independent offline-first product
 decision for this single-user app, not a claim of reproducing their server
@@ -40,8 +46,11 @@ through a child-only dynamic framework load) if the normal binary otherwise
 links it. Merely putting PDFKit calls behind an argument branch is not enough
 to prove idle-memory isolation.
 
-For PDF, spool the bounded verified stream into a 0600 short-lived file, open
-it with PDFKit, and read pages one at a time under autorelease pools. Enforce
+The original PDF candidate was to spool a 0600 temporary file; the accepted
+selectable-PDF child instead reads at most 20 MiB of descriptor-backed stdin
+into its own process and constructs a PDFKit `PDFDocument` from `NSData`, so
+the parent does not materialize the PDF. It reads pages one at a time under
+autorelease pools. Enforce
 page, input-byte, output-byte and execution-time budgets; report truncation,
 password-protection and parse failure explicitly. A scanned page with no
 selectable text is not automatically searchable until a separate PDF-page OCR
