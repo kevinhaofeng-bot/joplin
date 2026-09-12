@@ -96,3 +96,7 @@ Round1 commits: `37dd66571cabfa24742752bc91f7586ba826d06e`,
 The latest complete suite, Release rebuild, and disposable-profile smoke remain
 controller-owned final-head gates; this section intentionally does not claim
 they were rerun here.
+
+## Controller final-head gate
+
+At `a2559a14c`, the controller independently ran core `cargo test --features test-support` (PASS), GPUI `cargo test --quiet --bin velotype -- --skip cross_block_cut_writes_markdown_deletes_range_and_undo_restores` (1,296 passed / 0 failed / 1 filtered), both crate `cargo fmt --check`, `git diff --check`, and GPUI `cargo build --release --quiet` (all exit 0). The final Release binary's SHA-256 and disposable-profile visual/keyboard launch, Cmd-K, Escape, Cmd-N, Cmd-Q, and SQLite integrity evidence are recorded in `task-7-stage-b2c-release-smoke-2026-09-13.md`. This closes the B2c bounded code/empty-profile smoke gate only, not the populated-results/IME/performance or Task 7/M2 gates.
