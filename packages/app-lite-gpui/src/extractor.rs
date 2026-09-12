@@ -80,16 +80,34 @@ pub fn run_derived_text_pdf_job_with_exe(
     exe: std::path::PathBuf,
 ) -> Result<DerivedTextCoordinatorOutcome, LibraryError> {
     let resource_id = job.resource_id.clone();
+    // Metadata is cheap and authoritative enough to reject a MIME we do not
+    // support or a file outside this worker's parent-I/O budget. Do this
+    // before `open_verified_resource_file`, whose SHA verification streams
+    // the complete blob. The descriptor result is checked again below.
+    let expected = match repository.resource_metadata(&resource_id)? {
+        Some(resource) => resource,
+        None => return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id)),
+    };
+    if expected.sha256 != job.sha256 {
+        return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id));
+    }
+    if expected.mime != "application/pdf" {
+        return record_derived_failure(repository, job, DerivedTextFailure::Unsupported);
+    }
+    if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected.size) {
+        return record_derived_failure(repository, job, DerivedTextFailure::TooLarge);
+    }
     let (resource, file) = match repository.open_verified_resource_file(&resource_id) {
         Ok(Some(value)) => value,
         Ok(None) => return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id)),
         Err(_) => return record_derived_failure(repository, job, DerivedTextFailure::Unavailable),
     };
-    if resource.sha256 != job.sha256 {
+    if resource.sha256 != expected.sha256
+        || resource.mime != expected.mime
+        || resource.size != expected.size
+        || resource.sha256 != job.sha256
+    {
         return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id));
-    }
-    if resource.mime != "application/pdf" {
-        return record_derived_failure(repository, job, DerivedTextFailure::Unsupported);
     }
     match run_pdf_child_for_verified_file_with_exe(file, resource.size, exe) {
         Ok(text) => {

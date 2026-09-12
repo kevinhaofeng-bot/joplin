@@ -191,6 +191,7 @@ fn pdf_coordinator_records_parse_and_oversize_without_a_search_hit() {
         "application/pdf",
         "pdf",
     );
+    let verified_opens = repository.observe_verified_resource_opens();
     assert_eq!(
         extractor::run_one_derived_text_pdf_job_with_exe(
             &repository,
@@ -209,6 +210,10 @@ fn pdf_coordinator_records_parse_and_oversize_without_a_search_hit() {
             attempts: 1,
         })
     );
+    assert!(matches!(
+        verified_opens.recv_timeout(std::time::Duration::from_millis(20)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
 }
 
 #[test]
@@ -257,6 +262,7 @@ fn coordinator_marks_non_pdf_jobs_unsupported_without_launching_the_pdf_child() 
         "image/png",
         "png",
     );
+    let verified_opens = repository.observe_verified_resource_opens();
     assert_eq!(
         extractor::run_one_derived_text_pdf_job_with_exe(
             &repository,
@@ -275,4 +281,8 @@ fn coordinator_marks_non_pdf_jobs_unsupported_without_launching_the_pdf_child() 
             attempts: 1,
         })
     );
+    assert!(matches!(
+        verified_opens.recv_timeout(std::time::Duration::from_millis(20)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
 }
