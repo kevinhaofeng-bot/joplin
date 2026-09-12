@@ -301,26 +301,36 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
             }
         })
         .collect();
-    let find_highlights = layout
-        .visible()
-        .iter()
-        .flat_map(|block| {
-            layout
-                .find_highlight_text_range(block.node_id)
-                .into_iter()
-                .flat_map(|visible_utf8_range| {
-                    editor
-                        .find_matches_for_node_in_range(block.node_id, visible_utf8_range)
-                        .flat_map(|(found, primary)| {
-                            layout
-                                .range_segment_bounds(found.node_id, found.utf8_range.clone())
-                                .into_iter()
-                                .filter(|bounds| layout.intersects_find_highlight_viewport(*bounds))
-                                .map(move |bounds| FindHighlightGeometry { bounds, primary })
-                        })
-                })
-        })
-        .collect();
+    let find_highlights = if editor.find_summary().total == 0 {
+        Vec::new()
+    } else {
+        layout
+            .visible()
+            .iter()
+            .filter(|block| editor.find_has_matches_for_node(block.node_id))
+            .flat_map(|block| {
+                layout
+                    .find_highlight_text_range(block.node_id)
+                    .into_iter()
+                    .flat_map(|visible_utf8_range| {
+                        editor
+                            .find_matches_for_node_in_range(block.node_id, visible_utf8_range)
+                            .flat_map(|(found, primary)| {
+                                layout
+                                    .find_range_segment_bounds(
+                                        found.node_id,
+                                        found.utf8_range.clone(),
+                                    )
+                                    .into_iter()
+                                    .filter(|bounds| {
+                                        layout.intersects_find_highlight_viewport(*bounds)
+                                    })
+                                    .map(move |bounds| FindHighlightGeometry { bounds, primary })
+                            })
+                    })
+            })
+            .collect()
+    };
     RenderSnapshot {
         blocks,
         find_highlights,

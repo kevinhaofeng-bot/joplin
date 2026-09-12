@@ -538,6 +538,10 @@ impl EditorCore {
         self.find.matches_for_node_in_range(node_id, utf8_range)
     }
 
+    pub(crate) fn find_has_matches_for_node(&self, node_id: NodeId) -> bool {
+        self.find.has_matches_for_node(node_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn find_scanned_blocks_for_test(&self) -> usize {
         self.find.scanned_blocks_for_test()

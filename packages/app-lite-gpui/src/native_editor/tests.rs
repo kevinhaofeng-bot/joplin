@@ -7266,11 +7266,16 @@ async fn find_dense_single_paragraph_only_materializes_viewport_highlights(
             .layout
             .shape_visible_with_window(&document, 0.0, 96.0, 48.0, window);
     });
+    let soft_rows_before = editor.layout().find_range_geometry_soft_row_work_for_test();
     let top = render::find_highlights_for_test(&editor);
     assert!(
         !top.is_empty() && top.len() < 96,
         "a dense single paragraph needs only viewport-sized highlight geometry, got {}",
         top.len()
+    );
+    assert!(
+        editor.layout().find_range_geometry_soft_row_work_for_test() - soft_rows_before < 256,
+        "visible find matches must not each rescan every soft row in a giant hard line"
     );
 
     let tail_viewport_top = 8_000.0;
@@ -7288,6 +7293,83 @@ async fn find_dense_single_paragraph_only_materializes_viewport_highlights(
         tail.iter()
             .all(|highlight| highlight.bounds.bottom() >= px(tail_viewport_top - 48.0)),
         "tail viewport must paint its own matches, rather than truncating the first matches"
+    );
+}
+
+#[gpui::test]
+async fn find_render_skips_hard_line_viewport_scan_without_a_query(cx: &mut gpui::TestAppContext) {
+    const HARD_LINES: usize = 4_096;
+    let mut cx = cx.add_empty_window();
+    let text = (0..HARD_LINES)
+        .map(|index| format!("plain hard line {index}\n"))
+        .collect::<String>();
+    let mut editor = EditorCore::for_test(&text, &mut cx);
+    editor.layout = LayoutRegistry::with_budget(96 * 1024 * 1024);
+    let document = editor.document().clone();
+    cx.update(|window, _| {
+        editor
+            .layout
+            .shape_visible_with_window(&document, 80_000.0, 96.0, 240.0, window);
+    });
+    let before = editor.layout().find_viewport_line_work_for_test();
+
+    assert!(render::find_highlights_for_test(&editor).is_empty());
+    assert_eq!(
+        editor.layout().find_viewport_line_work_for_test() - before,
+        0,
+        "a no-query frame must not scan a retained giant block for find rows"
+    );
+}
+
+#[gpui::test]
+async fn find_tail_hard_lines_use_bounded_viewport_and_geometry_work(
+    cx: &mut gpui::TestAppContext,
+) {
+    const HARD_LINES: usize = 4_096;
+    let mut cx = cx.add_empty_window();
+    let text = (0..HARD_LINES)
+        .map(|index| {
+            if index + 1 == HARD_LINES {
+                "needle at tail\n".to_owned()
+            } else {
+                format!("plain hard line {index}\n")
+            }
+        })
+        .collect::<String>();
+    let mut editor = EditorCore::for_test(&text, &mut cx);
+    editor.layout = LayoutRegistry::with_budget(96 * 1024 * 1024);
+    editor.set_find_query("needle", false).unwrap();
+    assert_eq!(editor.find_summary().total, 1);
+    let document = editor.document().clone();
+    // Shape once at the head to turn the document-height estimate into the
+    // actual multi-hard-line height, then exercise the real tail viewport.
+    cx.update(|window, _| {
+        editor
+            .layout
+            .shape_visible_with_window(&document, 0.0, 96.0, 240.0, window);
+    });
+    let tail_viewport_top = (editor.layout().total_height() - 96.0).max(0.0);
+    cx.update(|window, _| {
+        editor
+            .layout
+            .shape_visible_with_window(&document, tail_viewport_top, 96.0, 240.0, window);
+    });
+    let viewport_before = editor.layout().find_viewport_line_work_for_test();
+    let geometry_before = editor.layout().find_range_geometry_line_work_for_test();
+
+    let highlights = render::find_highlights_for_test(&editor);
+    assert_eq!(highlights.len(), 1, "the tail match remains visible");
+    assert!(
+        highlights[0].bounds.bottom() >= px(tail_viewport_top - 48.0),
+        "tail geometry must be rooted at the tail viewport"
+    );
+    assert!(
+        editor.layout().find_viewport_line_work_for_test() - viewport_before <= 192,
+        "find viewport localization must not rescan all hard-line prefixes"
+    );
+    assert!(
+        editor.layout().find_range_geometry_line_work_for_test() - geometry_before <= 192,
+        "find geometry must not locate tail matches through a hard-line prefix scan"
     );
 }
 

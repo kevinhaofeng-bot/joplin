@@ -4,6 +4,8 @@
 //! only viewport geometry, so an evicted shaped block cannot remain alive in a
 //! second renderer-owned vector.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
@@ -37,6 +39,10 @@ const CARET_WIDTH: f32 = 1.0;
 const LIST_MARKER_WIDTH: f32 = 22.0;
 const LIST_DEPTH_INDENT: f32 = 20.0;
 const NUMBERING_CHECKPOINT_STRIDE: usize = 64;
+/// Find highlighting needs byte-to-y localization, but only while a query
+/// has matches. Keep a tiny sparse index with the retained shaped block
+/// instead of allocating one location record for every hard line.
+const FIND_LINE_CHECKPOINT_STRIDE: usize = 64;
 
 #[derive(Clone)]
 struct BlockVisualStyle {
@@ -383,7 +389,24 @@ pub struct CachedBlockLayout {
     /// decoder/residency cache.
     pub(crate) is_atomic: bool,
     pub(crate) line_height: Pixels,
+    find_line_checkpoints: Vec<FindLineCheckpoint>,
     shape_key: ShapeKey,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FindLineCheckpoint {
+    line_index: usize,
+    utf8_offset: usize,
+    /// Relative to `layout.bounds.top()` so canvas translation does not have
+    /// to rewrite every retained checkpoint.
+    top_offset: Pixels,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FindLinePosition {
+    line_index: usize,
+    utf8_offset: usize,
+    top_offset: Pixels,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -581,6 +604,12 @@ pub struct LayoutRegistry {
     height_index_work: usize,
     shape_count: usize,
     layout_scan_count: usize,
+    #[cfg(test)]
+    find_viewport_line_work: Cell<usize>,
+    #[cfg(test)]
+    find_range_geometry_line_work: Cell<usize>,
+    #[cfg(test)]
+    find_range_geometry_soft_row_work: Cell<usize>,
 }
 
 impl Default for LayoutRegistry {
@@ -624,6 +653,12 @@ impl LayoutRegistry {
             height_index_work: 0,
             shape_count: 0,
             layout_scan_count: 0,
+            #[cfg(test)]
+            find_viewport_line_work: Cell::new(0),
+            #[cfg(test)]
+            find_range_geometry_line_work: Cell::new(0),
+            #[cfg(test)]
+            find_range_geometry_soft_row_work: Cell::new(0),
         }
     }
 
@@ -670,64 +705,92 @@ impl LayoutRegistry {
     }
 
     /// Byte interval of this shaped text block that intersects the current
-    /// paint viewport (with a quarter-viewport overscan). The scan walks
-    /// shaped rows, not matches; callers can binary-search their sorted match
-    /// ranges and avoid building note-wide decoration geometry.
+    /// paint viewport (with a quarter-viewport overscan). Callers can
+    /// binary-search their sorted match ranges and avoid building note-wide
+    /// decoration geometry.
     pub fn find_highlight_text_range(&self, node_id: NodeId) -> Option<Range<usize>> {
         let viewport = self.find_highlight_viewport.as_ref()?;
         let cached = self.cache.get(&node_id)?;
         if cached.is_atomic || cached.layout.text_lines.is_empty() {
             return None;
         }
-        let mut line_top = cached.layout.bounds.top();
-        let mut utf8_offset = 0usize;
-        let mut visible_start = None;
-        let mut visible_end = 0usize;
-        for (index, line) in cached.layout.text_lines.iter().enumerate() {
-            let line_bottom = line_top + line.size(cached.line_height).height;
-            if f32::from(line_bottom) >= viewport.start && f32::from(line_top) <= viewport.end {
-                // GPUI's `WrappedLineLayout::size` and paint paths both use
-                // this raw boundary count to define visual y rows. Reaching
-                // two boundary offsets directly therefore follows the same
-                // row coordinate system without walking every soft row of a
-                // giant hard line merely to locate this viewport. The local
-                // `for_each_wrapped_row` is deliberately more defensive for
-                // selection geometry, but it is not the paint-row authority.
-                let row_count = line.wrap_boundaries().len().saturating_add(1).max(1);
-                let first_row = row_index_for_y(
-                    row_count,
-                    px((viewport.start - f32::from(line_top)).max(0.0)),
-                    cached.line_height,
-                );
-                let last_row = row_index_for_y(
-                    row_count,
-                    px((viewport.end - f32::from(line_top)).max(0.0)),
-                    cached.line_height,
-                );
-                let row_start = if first_row == 0 {
-                    0
-                } else {
-                    wrap_boundary_offset(line, first_row - 1).unwrap_or(0)
-                };
-                let row_end = if last_row + 1 >= row_count {
-                    line.len()
-                } else {
-                    wrap_boundary_offset(line, last_row).unwrap_or(line.len())
-                };
-                if row_end > row_start {
-                    visible_start.get_or_insert(utf8_offset.saturating_add(row_start));
-                    visible_end = utf8_offset.saturating_add(row_end);
-                }
-            }
-            line_top = line_bottom;
-            if visible_start.is_some() && f32::from(line_bottom) > viewport.end {
+        if f32::from(cached.layout.bounds.bottom()) < viewport.start
+            || f32::from(cached.layout.bounds.top()) > viewport.end
+        {
+            return None;
+        }
+        let first = self.find_line_at_y(cached, px(viewport.start))?;
+        let last = self.find_line_at_y(cached, px(viewport.end))?;
+        let first_line = cached.layout.text_lines.get(first.line_index)?;
+        let last_line = cached.layout.text_lines.get(last.line_index)?;
+
+        // GPUI's `WrappedLineLayout::size` and paint paths both use raw
+        // boundary count to define visual y rows. Reaching two boundary
+        // offsets directly follows the same coordinate system without
+        // walking every soft row of a giant hard line. The local
+        // `for_each_wrapped_row` is deliberately more defensive for
+        // selection geometry, but it is not the paint-row authority.
+        let first_row = row_index_for_y(
+            first_line.wrap_boundaries().len().saturating_add(1).max(1),
+            (px(viewport.start) - (cached.layout.bounds.top() + first.top_offset)).max(px(0.0)),
+            cached.line_height,
+        );
+        let last_row = row_index_for_y(
+            last_line.wrap_boundaries().len().saturating_add(1).max(1),
+            (px(viewport.end) - (cached.layout.bounds.top() + last.top_offset)).max(px(0.0)),
+            cached.line_height,
+        );
+        let start = first.utf8_offset.saturating_add(if first_row == 0 {
+            0
+        } else {
+            wrap_boundary_offset(first_line, first_row - 1).unwrap_or(0)
+        });
+        let end = last.utf8_offset.saturating_add(
+            if last_row + 1 >= last_line.wrap_boundaries().len().saturating_add(1).max(1) {
+                last_line.len()
+            } else {
+                wrap_boundary_offset(last_line, last_row).unwrap_or(last_line.len())
+            },
+        );
+        (end > start).then_some(start..end)
+    }
+
+    fn find_line_at_y(
+        &self,
+        cached: &CachedBlockLayout,
+        target_y: Pixels,
+    ) -> Option<FindLinePosition> {
+        let lines = &cached.layout.text_lines;
+        let relative_y = (target_y - cached.layout.bounds.top()).max(px(0.0));
+        let checkpoint = cached.find_line_checkpoints.get(
+            cached
+                .find_line_checkpoints
+                .partition_point(|entry| entry.top_offset <= relative_y)
+                .saturating_sub(1),
+        )?;
+        let mut top_offset = checkpoint.top_offset;
+        let mut utf8_offset = checkpoint.utf8_offset;
+        let mut found = None;
+        for line_index in checkpoint.line_index..lines.len() {
+            #[cfg(test)]
+            self.find_viewport_line_work
+                .set(self.find_viewport_line_work.get().saturating_add(1));
+            let line = lines.get(line_index)?;
+            let bottom = top_offset + line.size(cached.line_height).height;
+            if relative_y <= bottom || line_index + 1 == lines.len() {
+                found = Some(FindLinePosition {
+                    line_index,
+                    utf8_offset,
+                    top_offset,
+                });
                 break;
             }
+            top_offset = bottom;
             utf8_offset = utf8_offset
                 .saturating_add(line.len())
-                .saturating_add(usize::from(index + 1 < cached.layout.text_lines.len()));
+                .saturating_add(usize::from(line_index + 1 < lines.len()));
         }
-        visible_start.map(|start| start..visible_end)
+        found
     }
 
     pub fn intersects_find_highlight_viewport(&self, bounds: Bounds<Pixels>) -> bool {
@@ -798,6 +861,21 @@ impl LayoutRegistry {
     #[cfg(test)]
     pub(crate) fn ordered_number_scan_count(&self) -> usize {
         self.ordered_number_scan_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_viewport_line_work_for_test(&self) -> usize {
+        self.find_viewport_line_work.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_range_geometry_line_work_for_test(&self) -> usize {
+        self.find_range_geometry_line_work.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_range_geometry_soft_row_work_for_test(&self) -> usize {
+        self.find_range_geometry_soft_row_work.get()
     }
 
     #[cfg(test)]
@@ -1558,8 +1636,157 @@ impl LayoutRegistry {
             &cached.layout.text_lines,
             &range,
         ));
+        #[cfg(test)]
+        {
+            let (start_line, _, _) =
+                line_position_for_offset(&cached.layout.text_lines, range.start);
+            let (end_line, _, _) = line_position_for_offset(&cached.layout.text_lines, range.end);
+            // Both offset locators and the prefix-height fold start at hard
+            // line zero in this general selection path. Keep the accounting
+            // next to the real work so find rendering can prove it no longer
+            // uses this prefix-linear helper.
+            let work = start_line
+                .saturating_add(1)
+                .saturating_add(end_line.saturating_add(1))
+                .saturating_add(start_line)
+                .saturating_add(end_line.saturating_sub(start_line).saturating_add(1));
+            self.find_range_geometry_line_work.set(
+                self.find_range_geometry_line_work
+                    .get()
+                    .saturating_add(work),
+            );
+        }
         append_range_segment_bounds(&cached.layout, cached.line_height, range, &mut segments);
         segments
+    }
+
+    /// Find-only range geometry. Unlike selection geometry this is never
+    /// asked to span the entire document: literal match ranges are bounded,
+    /// and their hard-line locations come from retained sparse checkpoints.
+    /// Keeping this separate protects selection/caret behavior while making a
+    /// tail find match independent of all preceding hard lines.
+    pub fn find_range_segment_bounds(
+        &self,
+        node_id: NodeId,
+        range: Range<usize>,
+    ) -> Vec<Bounds<Pixels>> {
+        let Some(cached) = self.cache.get(&node_id) else {
+            return Vec::new();
+        };
+        if cached.is_atomic || range.start >= range.end {
+            return Vec::new();
+        }
+        if cached.layout.text_lines.is_empty() {
+            let text_left = cached.layout.bounds.left() + cached.layout.text_inset;
+            let left = text_left + px(range.start as f32 * FALLBACK_GLYPH_WIDTH);
+            let right = text_left + px(range.end as f32 * FALLBACK_GLYPH_WIDTH);
+            return vec![Bounds::from_corners(
+                point(left, cached.layout.bounds.top()),
+                point(
+                    right.max(left + px(CARET_WIDTH)),
+                    cached.layout.bounds.bottom(),
+                ),
+            )];
+        }
+        let Some(start) = self.find_line_at_offset(cached, range.start) else {
+            return Vec::new();
+        };
+        let Some(end) = self.find_line_at_offset(cached, range.end) else {
+            return Vec::new();
+        };
+        let mut segments = Vec::with_capacity(
+            end.line_index
+                .saturating_sub(start.line_index)
+                .saturating_add(1),
+        );
+        let mut line_top = cached.layout.bounds.top() + start.top_offset;
+        let viewport = self.find_highlight_viewport.as_ref();
+        for line_index in start.line_index..=end.line_index {
+            #[cfg(test)]
+            self.find_range_geometry_line_work
+                .set(self.find_range_geometry_line_work.get().saturating_add(1));
+            let Some(line) = cached.layout.text_lines.get(line_index) else {
+                continue;
+            };
+            let line_start = if line_index == start.line_index {
+                range
+                    .start
+                    .saturating_sub(start.utf8_offset)
+                    .min(line.len())
+            } else {
+                0
+            };
+            let line_end = if line_index == end.line_index {
+                range.end.saturating_sub(end.utf8_offset).min(line.len())
+            } else {
+                line.len()
+            };
+            #[cfg(test)]
+            let visited_rows = append_find_range_segment_bounds_for_line(
+                line,
+                line_top,
+                &cached.layout,
+                cached.line_height,
+                line_start,
+                line_end,
+                viewport,
+                &mut segments,
+            );
+            #[cfg(not(test))]
+            append_find_range_segment_bounds_for_line(
+                line,
+                line_top,
+                &cached.layout,
+                cached.line_height,
+                line_start,
+                line_end,
+                viewport,
+                &mut segments,
+            );
+            #[cfg(test)]
+            self.find_range_geometry_soft_row_work.set(
+                self.find_range_geometry_soft_row_work
+                    .get()
+                    .saturating_add(visited_rows),
+            );
+            line_top += line.size(cached.line_height).height;
+        }
+        segments
+    }
+
+    fn find_line_at_offset(
+        &self,
+        cached: &CachedBlockLayout,
+        target: usize,
+    ) -> Option<FindLinePosition> {
+        let lines = &cached.layout.text_lines;
+        let checkpoint = cached.find_line_checkpoints.get(
+            cached
+                .find_line_checkpoints
+                .partition_point(|entry| entry.utf8_offset <= target)
+                .saturating_sub(1),
+        )?;
+        let mut top_offset = checkpoint.top_offset;
+        let mut utf8_offset = checkpoint.utf8_offset;
+        let mut found = None;
+        for line_index in checkpoint.line_index..lines.len() {
+            #[cfg(test)]
+            self.find_range_geometry_line_work
+                .set(self.find_range_geometry_line_work.get().saturating_add(1));
+            let line = lines.get(line_index)?;
+            let line_end = utf8_offset.saturating_add(line.len());
+            if target <= line_end || line_index + 1 == lines.len() {
+                found = Some(FindLinePosition {
+                    line_index,
+                    utf8_offset,
+                    top_offset,
+                });
+                break;
+            }
+            top_offset += line.size(cached.line_height).height;
+            utf8_offset = line_end.saturating_add(1);
+        }
+        found
     }
 
     pub fn caret_bounds(&self, node_id: NodeId, offset: usize) -> Option<Bounds<Pixels>> {
@@ -2217,7 +2444,12 @@ impl LayoutRegistry {
         let node_id = layout.node_id;
         let revision = shape_key.block_revision;
         let width = f32::from_bits(shape_key.width_bits);
-        let line_height = px(f64::from_bits(shape_key.line_height_bits) as f32);
+        let requested_line_height = px(f64::from_bits(shape_key.line_height_bits) as f32);
+        let line_height = if requested_line_height == px(0.0) {
+            default_line_height
+        } else {
+            requested_line_height
+        };
         if let Some(previous) = self.cache.remove(&node_id) {
             self.used_bytes = self.used_bytes.saturating_sub(previous.bytes);
         }
@@ -2226,6 +2458,7 @@ impl LayoutRegistry {
             &layout,
             requested_selection_geometry_bytes.max(size_of::<Bounds<Pixels>>() * 2),
         );
+        let find_line_checkpoints = find_line_checkpoints(&layout, line_height);
         let retained_bytes = estimate_retained_cache_bytes(
             &layout,
             selection_geometry_bytes,
@@ -2261,11 +2494,8 @@ impl LayoutRegistry {
                 shaped_background_run_count,
                 is_image,
                 is_atomic,
-                line_height: if line_height == px(0.0) {
-                    default_line_height
-                } else {
-                    line_height
-                },
+                line_height,
+                find_line_checkpoints,
                 shape_key,
             },
         );
@@ -2489,9 +2719,37 @@ fn estimate_retained_cache_bytes(
     size_of::<CachedBlockLayout>()
         .saturating_add(size_of::<BlockLayout>())
         .saturating_add(layout.text_lines.capacity() * size_of::<WrappedLine>())
+        .saturating_add(
+            layout
+                .text_lines
+                .len()
+                .div_ceil(FIND_LINE_CHECKPOINT_STRIDE)
+                .saturating_mul(size_of::<FindLineCheckpoint>()),
+        )
         .saturating_add(shaped_bytes)
         .saturating_add(line_count_spill)
         .saturating_add(selection_geometry_bytes)
+}
+
+fn find_line_checkpoints(layout: &BlockLayout, line_height: Pixels) -> Vec<FindLineCheckpoint> {
+    let lines = &layout.text_lines;
+    let mut checkpoints = Vec::with_capacity(lines.len().div_ceil(FIND_LINE_CHECKPOINT_STRIDE));
+    let mut top_offset = px(0.0);
+    let mut utf8_offset = 0usize;
+    for (line_index, line) in lines.iter().enumerate() {
+        if line_index % FIND_LINE_CHECKPOINT_STRIDE == 0 {
+            checkpoints.push(FindLineCheckpoint {
+                line_index,
+                utf8_offset,
+                top_offset,
+            });
+        }
+        top_offset += line.size(line_height).height;
+        utf8_offset = utf8_offset
+            .saturating_add(line.len())
+            .saturating_add(usize::from(line_index + 1 < lines.len()));
+    }
+    checkpoints
 }
 
 fn estimate_snapshot_clone_bytes(
@@ -2841,6 +3099,102 @@ fn range_segment_bounds_for_line(
         ));
         row_index = row_index.saturating_add(1);
     });
+}
+
+/// Find highlights are already limited to the current byte viewport, so this
+/// path can intersect that byte interval with the visual viewport before
+/// producing any rectangles. Selection intentionally keeps the simpler
+/// all-row helper above: it has different cross-block semantics and must not
+/// inherit find's paint clipping.
+fn append_find_range_segment_bounds_for_line(
+    line: &WrappedLine,
+    line_top: Pixels,
+    layout: &BlockLayout,
+    line_height: Pixels,
+    start_offset: usize,
+    end_offset: usize,
+    viewport: Option<&Range<f32>>,
+    segments: &mut Vec<Bounds<Pixels>>,
+) -> usize {
+    if start_offset >= end_offset {
+        return 0;
+    }
+    let row_count = line.wrap_boundaries().len().saturating_add(1).max(1);
+    let first_match_row = line.wrap_boundaries().partition_point(|boundary| {
+        wrap_boundary_utf8_offset(line, boundary).unwrap_or(line.len()) <= start_offset
+    });
+    let last_match_row = line.wrap_boundaries().partition_point(|boundary| {
+        wrap_boundary_utf8_offset(line, boundary).unwrap_or(line.len()) < end_offset
+    });
+    let (first_viewport_row, last_viewport_row) = viewport.map_or((0, row_count - 1), |viewport| {
+        let line_bottom = line_top + line.size(line_height).height;
+        if f32::from(line_bottom) < viewport.start || f32::from(line_top) > viewport.end {
+            (row_count, 0)
+        } else {
+            (
+                row_index_for_y(
+                    row_count,
+                    (px(viewport.start) - line_top).max(px(0.0)),
+                    line_height,
+                ),
+                row_index_for_y(
+                    row_count,
+                    (px(viewport.end) - line_top).max(px(0.0)),
+                    line_height,
+                ),
+            )
+        }
+    });
+    let first_row = first_match_row.max(first_viewport_row);
+    let last_row = last_match_row.min(last_viewport_row).min(row_count - 1);
+    if first_row > last_row {
+        return 0;
+    }
+    let mut visited = 0usize;
+    for row_index in first_row..=last_row {
+        visited = visited.saturating_add(1);
+        let row_start = if row_index == 0 {
+            0
+        } else {
+            wrap_boundary_offset(line, row_index - 1)
+                .unwrap_or(0)
+                .min(line.len())
+        };
+        let row_end = if row_index + 1 >= row_count {
+            line.len()
+        } else {
+            wrap_boundary_offset(line, row_index)
+                .unwrap_or(line.len())
+                .min(line.len())
+        };
+        if row_end <= row_start {
+            continue;
+        }
+        let segment_start = start_offset.max(row_start).min(row_end);
+        let segment_end = end_offset.min(row_end).max(row_start);
+        if segment_start >= segment_end {
+            continue;
+        }
+        let row_start_x = line.unwrapped_layout.x_for_index(row_start);
+        let start_x = line.unwrapped_layout.x_for_index(segment_start) - row_start_x;
+        let end_x = line.unwrapped_layout.x_for_index(segment_end) - row_start_x;
+        let row_top = line_top + line_height * row_index as f32;
+        let row_origin = wrapped_row_origin_x(layout, line, row_start, row_end);
+        segments.push(Bounds::from_corners(
+            point(row_origin + start_x, row_top),
+            point(
+                row_origin + end_x.max(start_x + px(CARET_WIDTH)),
+                row_top + line_height,
+            ),
+        ));
+    }
+    visited
+}
+
+fn wrap_boundary_utf8_offset(line: &WrappedLine, boundary: &WrapBoundary) -> Option<usize> {
+    let run = line.runs().get(boundary.run_ix)?;
+    let glyph = run.glyphs.get(boundary.glyph_ix)?;
+    Some(glyph.index)
 }
 
 fn snap_grapheme_offset(text: &str, offset: usize, affinity: Affinity) -> usize {

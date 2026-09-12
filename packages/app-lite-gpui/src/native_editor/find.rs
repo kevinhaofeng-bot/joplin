@@ -272,6 +272,12 @@ impl FindState {
         })
     }
 
+    pub fn has_matches_for_node(&self, node_id: NodeId) -> bool {
+        self.blocks
+            .get(&node_id)
+            .is_some_and(|cached| !cached.matches.is_empty())
+    }
+
     /// Return only the sorted literal matches which overlap a shaped byte
     /// interval. Renderers use this for dense paragraphs so scrolling does
     /// not create geometry for every note-wide match each frame.
