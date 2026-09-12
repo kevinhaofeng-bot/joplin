@@ -4,11 +4,92 @@
 //! hash-verified descriptor from core and stream it to this process; this
 //! module never resolves a profile path or touches SQLite.
 
+use std::fs::File;
 use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_PAGES: usize = 500;
+const CHILD_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PdfChildError {
+    TooLarge,
+    Spawn,
+    Timeout,
+    OutputTooLarge,
+    StderrTooLarge,
+    Failed,
+    Utf8,
+    Io,
+}
+
+/// Background-only bridge for an already hash-verified core descriptor. It
+/// never receives a profile path or materializes the PDF in parent memory.
+pub fn run_pdf_child_for_verified_file(
+    mut file: File,
+    expected_size: i64,
+) -> Result<String, PdfChildError> {
+    if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected_size) {
+        return Err(PdfChildError::TooLarge);
+    }
+    use std::io::Seek;
+    file.rewind().map_err(|_| PdfChildError::Io)?;
+    let exe = std::env::current_exe().map_err(|_| PdfChildError::Spawn)?;
+    let mut child = Command::new(exe)
+        .args(["--extract-resource-text", "--mime", "application/pdf"])
+        .stdin(Stdio::from(file))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| PdfChildError::Spawn)?;
+    let mut stdout = child.stdout.take().ok_or(PdfChildError::Spawn)?;
+    let mut stderr = child.stderr.take().ok_or(PdfChildError::Spawn)?;
+    let out = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        stdout
+            .take((MAX_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut v)
+            .map(|_| v)
+    });
+    let err = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        stderr.take(4097).read_to_end(&mut v).map(|_| v)
+    });
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|_| PdfChildError::Io)? {
+            let out = out
+                .join()
+                .map_err(|_| PdfChildError::Io)?
+                .map_err(|_| PdfChildError::Io)?;
+            let err = err
+                .join()
+                .map_err(|_| PdfChildError::Io)?
+                .map_err(|_| PdfChildError::Io)?;
+            if out.len() > MAX_OUTPUT_BYTES {
+                return Err(PdfChildError::OutputTooLarge);
+            }
+            if err.len() > 4096 {
+                return Err(PdfChildError::StderrTooLarge);
+            }
+            if !status.success() {
+                return Err(PdfChildError::Failed);
+            }
+            return String::from_utf8(out).map_err(|_| PdfChildError::Utf8);
+        }
+        if start.elapsed() >= CHILD_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out.join();
+            let _ = err.join();
+            return Err(PdfChildError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 pub fn run_child(args: &[String]) -> i32 {
     let mut mime = None;
