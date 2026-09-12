@@ -461,6 +461,52 @@ async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) 
             && panel.bottom() <= pane.bottom(),
         "900px window keeps the wrapped Find controls inside the editor pane: panel={panel:?}, pane={pane:?}"
     );
+    let find_input = view.read_with(cx, |shell, _| shell.find_input.clone());
+    let long_query = "长".repeat(80);
+    cx.simulate_input(&long_query);
+    redraw(cx);
+    let visible_input = cx
+        .debug_bounds("library-find-in-note-panel")
+        .expect("find input viewport is mounted");
+    let candidate_bounds = cx.update(|window, app| {
+        find_input.update(app, |input, input_cx| {
+            <TitleInput as EntityInputHandler>::bounds_for_range(
+                input,
+                79..80,
+                visible_input,
+                window,
+                input_cx,
+            )
+        })
+    });
+    let candidate_bounds = candidate_bounds.expect("IME candidate range has visible bounds");
+    assert!(
+        candidate_bounds.left() >= visible_input.left()
+            && candidate_bounds.right() <= visible_input.right(),
+        "long-query IME candidate remains inside the translated input viewport"
+    );
+    let offscreen_candidate_bounds = cx.update(|window, app| {
+        find_input.update(app, |input, input_cx| {
+            <TitleInput as EntityInputHandler>::bounds_for_range(
+                input,
+                0..1,
+                visible_input,
+                window,
+                input_cx,
+            )
+        })
+    });
+    let offscreen_candidate_bounds =
+        offscreen_candidate_bounds.expect("offscreen IME range bounds");
+    assert!(
+        offscreen_candidate_bounds.left() >= visible_input.left()
+            && offscreen_candidate_bounds.right() <= visible_input.right(),
+        "offscreen-left IME range is clamped without inverted bounds"
+    );
+    find_input.update(cx, |input, input_cx| {
+        input.select_all();
+        input_cx.notify();
+    });
     cx.simulate_input("会议");
     redraw(cx);
     let (editor, undo_depth) = view.read_with(cx, |shell, app| {
@@ -492,7 +538,6 @@ async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) 
         Some(0)
     );
 
-    let find_input = view.read_with(cx, |shell, _| shell.find_input.clone());
     cx.update(|window, app| {
         find_input.update(app, |input, input_cx| {
             input.select_all();
@@ -511,6 +556,28 @@ async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) 
         editor.read_with(cx, |editor, _| editor.find_summary().total),
         2,
         "IME marked text must not replace the live query or scroll"
+    );
+    // Closing and reopening must not turn an in-flight native composition
+    // into a committed find query merely because the panel remounts.
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-f");
+    redraw(cx);
+    assert!(find_input.read_with(cx, |input, _| input.marked_range().is_some()));
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().total),
+        2,
+        "Escape → Cmd-F retains provisional composition"
+    );
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-f");
+    redraw(cx);
+    assert!(find_input.read_with(cx, |input, _| input.marked_range().is_some()));
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().total),
+        2,
+        "Cmd-K → Cmd-F retains provisional composition"
     );
     cx.update(|window, app| {
         view.update(app, |shell, shell_cx| {

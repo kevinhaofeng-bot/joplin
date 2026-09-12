@@ -1,7 +1,7 @@
 use crate::native_editor::commands::EditorCommand;
 use gpui::{
     Bounds, Context, EntityInputHandler, FocusHandle, Pixels, Point, ShapedLine, UTF16Selection,
-    Window,
+    Window, point,
 };
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -471,12 +471,24 @@ impl EntityInputHandler for TitleInput {
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(element_bounds)
+        let range = self.checked_utf16_range(&range_utf16)?;
+        let layout_bounds = self.last_bounds?;
+        let line = self.last_layout.as_ref()?;
+        let left = (layout_bounds.left() + line.x_for_index(range.start))
+            .max(element_bounds.left())
+            .min(element_bounds.right());
+        let right = (layout_bounds.left() + line.x_for_index(range.end))
+            .max(left)
+            .min(element_bounds.right());
+        Some(Bounds::from_corners(
+            point(left, element_bounds.top()),
+            point(right, element_bounds.bottom()),
+        ))
     }
 
     fn character_index_for_point(

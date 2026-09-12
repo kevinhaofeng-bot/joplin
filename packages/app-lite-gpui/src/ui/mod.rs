@@ -3576,6 +3576,7 @@ impl LibraryShell {
             });
             self.find_input.read(cx).focus_handle().focus(window);
         } else {
+            let marked_composition = self.find_input.read(cx).marked_range().is_some();
             // Cmd-F deliberately takes over from the global palette. Do not
             // use its normal close path: its deferred focus restoration would
             // steal focus back from this visible in-note input.
@@ -3604,10 +3605,12 @@ impl LibraryShell {
             if let Some(surface) = self.editor_surface.as_ref() {
                 let _ = surface.update(cx, |surface, _| surface.set_find_panel_open(true));
             }
-            self.find_input.update(cx, |input, input_cx| {
-                input.select_all();
-                input_cx.notify();
-            });
+            if !marked_composition {
+                self.find_input.update(cx, |input, input_cx| {
+                    input.select_all();
+                    input_cx.notify();
+                });
+            }
             self.find_input.read(cx).focus_handle().focus(window);
         }
         cx.notify();
@@ -5379,7 +5382,7 @@ impl LibraryShell {
         // column. The row wraps below its natural compact width rather than
         // placing controls on top of the document or each other.
         let panel_width = (available_width - 32.0).clamp(1.0, 340.0);
-        let input_width = (panel_width - 196.0).clamp(48.0, 128.0);
+        let canvas_input_width = (panel_width - 242.0).clamp(48.0, 128.0);
         let canvas_input = input.clone();
         let paint_input = input.clone();
         let input_canvas = canvas(
@@ -5454,7 +5457,7 @@ impl LibraryShell {
                 }
             },
         )
-        .w(px(input_width))
+        .w(px(canvas_input_width))
         .h(px(30.0));
         let summary = self.note_session.as_ref().map(|session| {
             let editor = session.read(cx).editor().clone();
@@ -5470,6 +5473,11 @@ impl LibraryShell {
         } else {
             "无结果".to_owned()
         };
+        // Counts are information, not decoration: 10000 / 10000 must remain
+        // readable. The row can wrap at narrow widths, so reserve just enough
+        // space for its complete current label rather than clipping it.
+        let summary_width = (summary_text.chars().count() as f32 * 7.0 + 8.0).clamp(42.0, 112.0);
+        let input_width = (panel_width - 130.0 - summary_width).clamp(48.0, 128.0);
         let case_background = if self.find_case_sensitive {
             rgba(0x00a82d20)
         } else {
@@ -5506,8 +5514,7 @@ impl LibraryShell {
                 .child(
                     div()
                         .id("library-find-in-note-summary")
-                        .w(px(66.0))
-                        .overflow_hidden()
+                        .w(px(summary_width))
                         .text_size(px(11.0))
                         .text_color(rgba(0x718075ff))
                         .child(summary_text),
