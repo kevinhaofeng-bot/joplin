@@ -8,7 +8,7 @@ pub const SCHEMA_VERSION: i64 = 10;
 /// The durable identity of the extractor implementation currently compiled
 /// into the client. A future extractor changes this one value; v10 reopen
 /// reconciles the live associated queue once through the settings sentinel.
-pub const DERIVED_TEXT_EXTRACTOR_VERSION: &str = "pdfkit-selectable-text-v1";
+pub const DERIVED_TEXT_EXTRACTOR_VERSION: &str = "pdfkit-vision-resource-text-v2";
 const DERIVED_TEXT_EXTRACTOR_VERSION_SETTING: &str = "derived-text.extractor-version";
 
 pub(crate) fn migrate_schema(

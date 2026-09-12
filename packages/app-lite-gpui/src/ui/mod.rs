@@ -97,7 +97,7 @@ pub(crate) enum IndexingStatus {
 }
 
 // The child itself is process-wide; separate library windows must not launch
-// competing PDFKit helpers. A busy window leaves its durable job pending and
+// competing PDFKit/Vision helpers. A busy window leaves its durable job pending and
 // retries on a later bounded scheduler turn.
 static DERIVED_TEXT_WORKER_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1296,7 +1296,7 @@ impl LibraryShell {
     }
 
     /// Independent from the stable note/title FTS scheduler: one durable D3a
-    /// job may run a bounded PDFKit child, so it must never delay ordinary
+    /// job may run a bounded PDFKit/Vision child, so it must never delay ordinary
     /// search projection work or a foreground save/quit lifecycle callback.
     fn spawn_derived_text_scheduler(
         repository: Arc<LibraryRepository>,

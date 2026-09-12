@@ -4266,6 +4266,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v10_reopen_requeues_a_pre_vision_failed_image_from_the_v1_sentinel() {
+        let profile = tempdir().unwrap();
+        let database = profile.path().join("library.sqlite");
+        let repository = LibraryRepository::open(&database).unwrap();
+        let resource = repository
+            .import_resource(b"opaque", "upgrade.png", "image/png", "png")
+            .unwrap();
+        repository
+            .create_note(CreateNote {
+                title: "owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: resource.clone(),
+                        filename: "upgrade.png".into(),
+                        media_type: "image/png".into(),
+                    },
+                ]),
+            })
+            .unwrap();
+        let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+        assert!(repository
+            .fail_derived_text(&job, DerivedTextFailure::Unsupported)
+            .unwrap());
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE derived_text_jobs SET extractor_version='pdfkit-selectable-text-v1' WHERE resource_id=?1",
+                    [resource.as_str()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE settings SET value='pdfkit-selectable-text-v1' WHERE key='derived-text.extractor-version'",
+                    [],
+                )
+                .unwrap();
+        }
+        drop(repository);
+
+        let reopened = LibraryRepository::open(&database).unwrap();
+        assert_eq!(
+            reopened.derived_text_status(&resource).unwrap(),
+            Some(DerivedTextStatus::Pending { attempts: 0 })
+        );
+        let requeued = reopened.take_derived_text_jobs(1).unwrap();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].resource_id, resource);
+        assert_eq!(requeued[0].extractor_version, DERIVED_TEXT_EXTRACTOR_VERSION);
+    }
+
     #[cfg(unix)]
     fn queue_orphan_blob_then_stage_same_bytes(
         repository: &LibraryRepository,

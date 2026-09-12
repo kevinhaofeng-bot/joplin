@@ -83,8 +83,13 @@ async fn mounted_scheduler_advances_a_derived_job_saved_after_open(cx: &mut Test
         })
         .expect("create ordinary note");
     let resource = repository
-        .import_resource(b"future vision source", "fixture.png", "image/png", "png")
-        .expect("import selectable PDF fixture");
+        .import_resource(
+            b"unsupported image source",
+            "fixture.gif",
+            "image/gif",
+            "gif",
+        )
+        .expect("import unsupported-image fixture");
     let (_shell, cx) = mount_shell(Arc::clone(&repository), cx);
     redraw(cx);
     assert!(
@@ -103,8 +108,8 @@ async fn mounted_scheduler_advances_a_derived_job_saved_after_open(cx: &mut Test
             title: note.title,
             document: CanonicalDocument::from_blocks(vec![Block::Attachment {
                 resource_id: resource.clone(),
-                filename: "fixture.png".into(),
-                media_type: "image/png".into(),
+                filename: "fixture.gif".into(),
+                media_type: "image/gif".into(),
             }]),
             resource_ids: vec![resource.clone()],
             selected_thumbnail_id: None,

@@ -175,3 +175,108 @@ fn ordinary_app_indexes_a_selectable_pdf_into_english_and_chinese_search() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// Manual macOS acceptance smoke for the normal GUI scheduler's Vision child.
+/// As above, it operates exclusively on a disposable profile and does not
+/// constitute a visual UI or large-image performance acceptance test.
+#[test]
+#[ignore = "manual macOS WindowServer smoke"]
+fn ordinary_app_indexes_real_png_ocr_into_english_and_chinese_search() {
+    let profile = tempfile::tempdir().expect("temporary smoke profile");
+    let database = profile.path().join("library.sqlite");
+    let (english_resource, english_note, chinese_resource, chinese_note) = {
+        let repository = LibraryRepository::open(&database).expect("create isolated library");
+        let english_resource = repository
+            .import_resource(
+                include_bytes!("resources/ocr-english.png"),
+                "one.png",
+                "image/png",
+                "png",
+            )
+            .expect("import checked-in English OCR fixture");
+        let chinese_resource = repository
+            .import_resource(
+                include_bytes!("resources/ocr-chinese.png"),
+                "two.png",
+                "image/png",
+                "png",
+            )
+            .expect("import checked-in Chinese OCR fixture");
+        let english_note = repository
+            .create_note(CreateNote {
+                title: "image derived text owner one".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                    resource_id: english_resource.clone(),
+                    filename: "one.png".into(),
+                    media_type: "image/png".into(),
+                }]),
+            })
+            .expect("associate English OCR image without target words in metadata");
+        let chinese_note = repository
+            .create_note(CreateNote {
+                title: "image derived text owner two".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                    resource_id: chinese_resource.clone(),
+                    filename: "two.png".into(),
+                    media_type: "image/png".into(),
+                }]),
+            })
+            .expect("associate Chinese OCR image without target words in metadata");
+        (
+            english_resource,
+            english_note,
+            chinese_resource,
+            chinese_note,
+        )
+    };
+
+    let mut app = RunningApp::start(profile.path());
+    let observer = LibraryRepository::open(&database).expect("open independent smoke observer");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut child_peak_rss_kib = None;
+    loop {
+        if let Some(context) = app.exit_context() {
+            panic!("{context}");
+        }
+        child_peak_rss_kib = child_peak_rss_kib.max(direct_child_peak_rss_kib(app.pid()));
+        let english_status = observer
+            .derived_text_status(&english_resource)
+            .expect("read English OCR status");
+        let chinese_status = observer
+            .derived_text_status(&chinese_resource)
+            .expect("read Chinese OCR status");
+        if matches!(english_status, Some(DerivedTextStatus::Indexed { .. }))
+            && matches!(chinese_status, Some(DerivedTextStatus::Indexed { .. }))
+        {
+            for (term, resource, note) in [
+                ("English", &english_resource, &english_note),
+                ("中文视觉文字识别", &chinese_resource, &chinese_note),
+            ] {
+                let hits = observer
+                    .search(SearchQuery::parse(term))
+                    .expect("search OCR-derived text");
+                assert_eq!(hits.len(), 1, "{term}");
+                assert_eq!(hits[0].note.id, note.id, "{term}");
+                assert_eq!(hits[0].matched_resource, Some(resource.clone()), "{term}");
+            }
+            // Informational only: parent RSS is sampled after indexing and child
+            // RSS is the greatest 10 ms observation, not a strict peak or gate.
+            eprintln!(
+                "D3b Vision live smoke RSS sample: parent after indexing={} KiB; greatest observed child RSS={child_peak_rss_kib:?} KiB",
+                rss_kib(app.pid()).unwrap_or_default()
+            );
+            return;
+        }
+        if Instant::now() >= deadline {
+            let output = app.finish();
+            panic!(
+                "ordinary app did not index OCR fixtures within 25s; English={english_status:?}; Chinese={chinese_status:?}; exit {:?}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

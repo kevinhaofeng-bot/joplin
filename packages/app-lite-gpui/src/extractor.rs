@@ -157,7 +157,7 @@ pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
     if expected.sha256 != job.sha256 {
         return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id));
     }
-    if expected.mime != "application/pdf" {
+    if !is_extractable_mime(&expected.mime) {
         return record_derived_failure_or_cancel(
             repository,
             job,
@@ -204,9 +204,10 @@ pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
     {
         return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id));
     }
-    match run_pdf_child_for_verified_file_with_exe_and_cancellation(
+    match run_resource_child_for_verified_file_with_exe_and_cancellation(
         file,
         resource.size,
+        &resource.mime,
         exe,
         cancelled,
     ) {
@@ -228,6 +229,10 @@ pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
             cancelled,
         ),
     }
+}
+
+fn is_extractable_mime(mime: &str) -> bool {
+    matches!(mime, "application/pdf" | "image/png" | "image/jpeg")
 }
 
 fn record_derived_failure(
@@ -295,8 +300,27 @@ pub fn run_pdf_child_for_verified_file_with_exe(
 /// Same descriptor-safe child bridge, with a shell-lifetime cancellation
 /// token. It only runs on a background executor.
 pub fn run_pdf_child_for_verified_file_with_exe_and_cancellation(
+    file: File,
+    expected_size: i64,
+    exe: std::path::PathBuf,
+    cancelled: &AtomicBool,
+) -> Result<String, PdfChildError> {
+    run_resource_child_for_verified_file_with_exe_and_cancellation(
+        file,
+        expected_size,
+        "application/pdf",
+        exe,
+        cancelled,
+    )
+}
+
+/// Descriptor-safe bridge for any child-supported resource MIME. The
+/// coordinator passes the MIME returned by the hash-verified core descriptor;
+/// this function does not resolve a path or trust caller-supplied metadata.
+pub fn run_resource_child_for_verified_file_with_exe_and_cancellation(
     mut file: File,
     expected_size: i64,
+    mime: &str,
     exe: std::path::PathBuf,
     cancelled: &AtomicBool,
 ) -> Result<String, PdfChildError> {
@@ -315,7 +339,7 @@ pub fn run_pdf_child_for_verified_file_with_exe_and_cancellation(
         return Err(PdfChildError::Cancelled);
     }
     let mut child = Command::new(exe)
-        .args(["--extract-resource-text", "--mime", "application/pdf"])
+        .args(["--extract-resource-text", "--mime", mime])
         .stdin(Stdio::from(file))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -416,9 +440,37 @@ fn classify_child_failure(stderr: &[u8]) -> PdfChildError {
         Some("pdf-parse-failed") => PdfChildError::Parse,
         Some("pdf-locked") => PdfChildError::Locked,
         Some("pdf-no-selectable-text") => PdfChildError::NoSelectableText,
+        Some("image-decode-failed") | Some("image-type-mismatch") => PdfChildError::Parse,
+        Some("image-limit") => PdfChildError::TooLarge,
+        Some("vision-unavailable") => PdfChildError::Io,
+        Some("image-no-text") => PdfChildError::NoSelectableText,
+        Some("vision-failed") => PdfChildError::Failed,
         Some("unsupported-mime") => PdfChildError::Unsupported,
         Some("input-too-large") | Some("output-limit") => PdfChildError::OutputTooLarge,
         _ => PdfChildError::Failed,
+    }
+}
+
+#[cfg(test)]
+mod failure_classification_tests {
+    use super::{PdfChildError, classify_child_failure};
+
+    #[test]
+    fn image_child_markers_preserve_durable_failure_categories() {
+        for (marker, expected) in [
+            ("image-decode-failed", PdfChildError::Parse),
+            ("image-type-mismatch", PdfChildError::Parse),
+            ("image-limit", PdfChildError::TooLarge),
+            ("vision-unavailable", PdfChildError::Io),
+            ("image-no-text", PdfChildError::NoSelectableText),
+            ("vision-failed", PdfChildError::Failed),
+        ] {
+            assert_eq!(
+                classify_child_failure(format!("joplin-lite-extractor:{marker}\n").as_bytes()),
+                expected,
+                "{marker}"
+            );
+        }
     }
 }
 
@@ -451,6 +503,12 @@ pub fn run_child(args: &[String]) -> i32 {
             _ => return fail("invalid-arguments"),
         }
         i += 1;
+    }
+    if !matches!(
+        mime,
+        Some("application/pdf") | Some("image/png") | Some("image/jpeg")
+    ) {
+        return fail("unsupported-mime");
     }
     let mut input = Vec::new();
     if std::io::stdin()

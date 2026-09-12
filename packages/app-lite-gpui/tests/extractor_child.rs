@@ -51,6 +51,30 @@ fn resource_text_child_rejects_unsupported_mime_and_corrupt_input() {
 }
 
 #[test]
+fn child_rejects_unknown_mime_without_waiting_for_stdin_eof() {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_velotype"))
+        .args(["--extract-resource-text", "--mime", "image/gif"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start child with an open stdin pipe");
+    let _stdin = process.stdin.take().expect("hold stdin open");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        if let Some(status) = process.try_wait().expect("poll child") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unsupported MIME child waited for stdin EOF"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+}
+
+#[test]
 fn image_child_extracts_real_english_and_chinese_fixtures() {
     for fixture in [
         (
@@ -449,15 +473,15 @@ fn pdf_coordinator_never_publishes_a_stale_job_identity() {
 }
 
 #[test]
-fn coordinator_marks_non_pdf_jobs_unsupported_without_launching_the_pdf_child() {
+fn coordinator_marks_unsupported_image_mime_without_opening_a_descriptor() {
     let profile = tempfile::tempdir().unwrap();
     let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
     let (image, _) = associated_resource(
         &repository,
         b"not decoded in D3b-2B",
-        "future-vision.png",
-        "image/png",
-        "png",
+        "unsupported.gif",
+        "image/gif",
+        "gif",
     );
     let verified_opens = repository.observe_verified_resource_opens();
     assert_eq!(
@@ -482,6 +506,45 @@ fn coordinator_marks_non_pdf_jobs_unsupported_without_launching_the_pdf_child() 
         verified_opens.recv_timeout(std::time::Duration::from_millis(20)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     ));
+}
+
+#[test]
+fn coordinator_indexes_real_english_and_chinese_images_with_resource_provenance() {
+    let profile = tempfile::tempdir().unwrap();
+    let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let (english, english_note) = associated_resource(
+        &repository,
+        include_bytes!("resources/ocr-english.png"),
+        "one.png",
+        "image/png",
+        "png",
+    );
+    let (chinese, chinese_note) = associated_resource(
+        &repository,
+        include_bytes!("resources/ocr-chinese.png"),
+        "two.png",
+        "image/png",
+        "png",
+    );
+    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_velotype"));
+
+    assert_eq!(
+        extractor::run_one_derived_text_pdf_job_with_exe(&repository, exe.clone()).unwrap(),
+        extractor::DerivedTextCoordinatorOutcome::Indexed(english.clone())
+    );
+    assert_eq!(
+        extractor::run_one_derived_text_pdf_job_with_exe(&repository, exe).unwrap(),
+        extractor::DerivedTextCoordinatorOutcome::Indexed(chinese.clone())
+    );
+    for (term, resource, note) in [
+        ("Vision OCR English", english, english_note),
+        ("中文视觉文字识别", chinese, chinese_note),
+    ] {
+        let hits = repository.search(SearchQuery::parse(term)).unwrap();
+        assert_eq!(hits.len(), 1, "{term}");
+        assert_eq!(hits[0].note.id, note.id, "{term}");
+        assert_eq!(hits[0].matched_resource, Some(resource), "{term}");
+    }
 }
 
 #[test]
