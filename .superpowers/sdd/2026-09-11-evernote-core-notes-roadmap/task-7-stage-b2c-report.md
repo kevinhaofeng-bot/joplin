@@ -70,6 +70,12 @@ that B2 is accepted.
   query, commit-persistence fault, Retry click and successful same-direction
   restore use the production history coordinator; no notice or worker error is
   assigned by the test.
+- The Cmd-K backdrop now occludes and stops its pointer event before it can
+  reach the retained Link popover's full-window backdrop. The mounted Link
+  regression proves both Escape and exposed-corner backdrop dismissal retain
+  the Link popover and its focus handle, session entity, selection and undo.
+  `toolbar_more` remains a mouse-only `div` without a `track_focus` handle;
+  it is therefore deliberately not captured as a focus-restoration origin.
 
 Base corrective commit: `9c9116713664156b9d78d78ea334dbe40172fac1`.
 Follow-up implementation commit: `b72f58723cd51d0e3789141d71beac65854cda52`.

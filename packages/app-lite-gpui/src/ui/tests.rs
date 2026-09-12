@@ -482,6 +482,113 @@ async fn search_palette_escape_and_backdrop_restore_the_original_focus_and_sessi
 }
 
 #[gpui::test]
+async fn search_palette_preserves_link_popover_focus_on_escape_and_backdrop(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "链接搜索焦点".into(),
+            notebook_id: None,
+            document: rich_document("需要链接的文字"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let (session_id, editor, selection, undo_depth) = view.update(cx, |shell, shell_cx| {
+        let session = shell.note_session.as_ref().unwrap().clone();
+        let editor = session.read(shell_cx).editor().clone();
+        let selection = editor.update(shell_cx, |editor, editor_cx| {
+            let block = editor.document().blocks().first().unwrap();
+            let selection = Selection::new(
+                DocPoint::with_affinity(block.id, 0, Affinity::Before),
+                DocPoint::with_affinity(
+                    block.id,
+                    block.content.as_text().unwrap().len(),
+                    Affinity::After,
+                ),
+            );
+            editor.set_selection_for_test(selection);
+            editor_cx.notify();
+            selection
+        });
+        (
+            session.entity_id(),
+            editor.clone(),
+            selection,
+            editor.read(shell_cx).undo_depth(),
+        )
+    });
+    let link = cx.debug_bounds("Link").unwrap();
+    cx.simulate_click(link.center(), Modifiers::default());
+    redraw(cx);
+    let chrome_before = view.read_with(cx, |shell, _| {
+        shell.command_chrome.as_ref().unwrap().entity_id()
+    });
+    for dismiss_with_backdrop in [false, true] {
+        let focus = view.read_with(cx, |shell, app| {
+            let popover = shell
+                .command_chrome
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .link_popover_for_test()
+                .unwrap();
+            popover.read(app).focus.clone()
+        });
+        cx.update(|window, app| {
+            assert!(focus.is_focused(window));
+            view.update(app, |shell, shell_cx| {
+                shell.toggle_search_palette_visibility(window, shell_cx)
+            });
+        });
+        redraw(cx);
+        view.read_with(cx, |shell, app| {
+            let chrome = shell.command_chrome.as_ref().unwrap();
+            assert!(chrome.read(app).has_link_popover(), "opening Cmd-K lost Link: session={:?}/{:?}, chrome={:?}/{:?}, surface={:?}, active_revision={:?}, session_revision={:?}", session_id, shell.note_session.as_ref().unwrap().entity_id(), chrome_before, chrome.entity_id(), shell.surface_note_id, shell.model.read(app).active_note().map(|note| note.revision), shell.note_session.as_ref().map(|session| session.read(app).expected_revision()));
+        });
+        if dismiss_with_backdrop {
+            let backdrop = cx.debug_bounds("library-search-backdrop").unwrap();
+            cx.simulate_click(
+                point(backdrop.left() + px(4.0), backdrop.top() + px(4.0)),
+                Modifiers::default(),
+            );
+        } else {
+            cx.simulate_keystrokes("escape");
+        }
+        redraw(cx);
+        view.read_with(cx, |shell, app| {
+            assert!(
+                shell
+                    .command_chrome
+                    .as_ref()
+                    .unwrap()
+                    .read(app)
+                    .has_link_popover(),
+                "Link disappeared after {} dismissal",
+                if dismiss_with_backdrop {
+                    "backdrop"
+                } else {
+                    "Escape"
+                }
+            );
+            assert_eq!(shell.note_session.as_ref().unwrap().entity_id(), session_id);
+            assert_eq!(editor.read(app).selection(), selection);
+            assert_eq!(editor.read(app).undo_depth(), undo_depth);
+        });
+        assert!(cx.update(|window, _| focus.is_focused(window)));
+    }
+}
+
+#[gpui::test]
 async fn mounted_cmd_k_search_ignores_marked_enter_and_opens_the_thirteenth_result(
     cx: &mut TestAppContext,
 ) {

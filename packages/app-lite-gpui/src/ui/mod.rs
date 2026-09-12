@@ -3455,11 +3455,11 @@ impl LibraryShell {
             self.organization_panel_open = self.search_palette_return_organization_panel_open;
             self.search_palette_return_organization_panel_open = false;
             if let Some(focus) = self.search_palette_return_focus.take() {
-                focus.focus(window);
                 // A backdrop pointer event can claim focus after its handler
-                // returns. Restore once more at the end of this window turn
-                // so mouse dismissal has the same exact focus contract as
-                // Escape without remounting the retained note session.
+                // returns. Defer the sole restoration until the end of this
+                // window turn: restoring a Link field synchronously would
+                // let the same Escape event reach its underlying handler and
+                // cancel the popover we are returning to.
                 window.defer(cx, move |window, _app| focus.focus(window));
             } else {
                 self.focus_active_editor_or_shell(window, cx);
@@ -5000,9 +5000,11 @@ impl LibraryShell {
                 .absolute()
                 .inset_0()
                 .bg(rgba(0x10181033))
+                .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|shell, _event, window, cx| {
+                        cx.stop_propagation();
                         shell.toggle_search_palette_visibility(window, cx)
                     }),
                 )
