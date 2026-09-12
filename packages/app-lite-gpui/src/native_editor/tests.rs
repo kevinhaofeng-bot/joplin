@@ -2,6 +2,7 @@ use super::commands::{
     CommandArgument, CommandCatalogue, CommandError, EditorCommand, ToggleState,
 };
 use super::core::EditorCore;
+use super::find::{FindError, MAX_FIND_QUERY_BYTES};
 use super::history::History;
 use super::images::{
     ClipboardPayload, ImageMetadata, ImageNodeState, ImagePayload, ImageStore, PasteIntent,
@@ -9,6 +10,7 @@ use super::images::{
 };
 use super::layout::{LAYOUT_CACHE_BUDGET_BYTES, LayoutRegistry, ordered_number_summary};
 use super::render;
+use super::surface::{EditorSurface, EditorSurfaceMode};
 use crate::spike_app::{SpikeRouteContract, layout_for_viewport, route_contract};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -7067,6 +7069,292 @@ async fn read_only_editor_rejects_document_history_ime_and_image_mutations(
     assert!(
         after.1 != before.1,
         "selection remains usable in read-only mode"
+    );
+}
+
+#[gpui::test]
+fn find_literal_matches_text_blocks_without_mutating_editor_state(cx: &mut gpui::TestAppContext) {
+    // This fails if find becomes a document transaction, searches an image
+    // atom's metadata, or loses the document's UTF-8 byte offsets for CJK.
+    let mut editor = EditorCore::fixture_text_image_text(
+        "上海上海 café",
+        "0123456789abcdef0123456789abcdef",
+        "SHANGHAI 上海",
+        cx,
+    );
+    let image_resource = app_lite_core::ResourceId::new("0123456789abcdef0123456789abcdef")
+        .expect("fixture resource id");
+    let before_document = editor.document().semantic_snapshot();
+    let before_html = super::codec::export_canonical_with_resources(
+        editor.document(),
+        Some(&[image_resource.clone()]),
+    )
+    .expect("fixture remains exportable")
+    .to_canonical_html()
+    .as_str()
+    .to_owned();
+    let before_revision = editor.document().revision();
+    let before_selection = editor.selection();
+    let before_undo_depth = editor.undo_depth();
+    let before_redo_depth = editor.redo_depth();
+
+    editor.set_find_query("上海", false).unwrap();
+    assert_eq!(editor.find_summary().total, 3);
+    assert_eq!(
+        editor
+            .find_matches()
+            .map(|found| (found.node_id, found.utf8_range.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (editor.document().blocks()[0].id, 0..6),
+            (editor.document().blocks()[0].id, 6..12),
+            (editor.document().blocks()[2].id, 9..15),
+        ]
+    );
+
+    editor.set_find_query("shanghai", false).unwrap();
+    assert_eq!(editor.find_summary().total, 1);
+    editor.set_find_query("shanghai", true).unwrap();
+    assert_eq!(editor.find_summary().total, 0);
+    editor
+        .set_find_query("0123456789abcdef0123456789abcdef", false)
+        .unwrap();
+    assert_eq!(editor.find_summary().total, 0);
+    editor.set_find_query("", false).unwrap();
+    assert_eq!(editor.find_summary().total, 0);
+
+    assert_eq!(editor.document().semantic_snapshot(), before_document);
+    assert_eq!(editor.document().revision(), before_revision);
+    assert_eq!(editor.selection(), before_selection);
+    assert_eq!(editor.undo_depth(), before_undo_depth);
+    assert_eq!(editor.redo_depth(), before_redo_depth);
+    assert_eq!(
+        super::codec::export_canonical_with_resources(editor.document(), Some(&[image_resource]))
+            .expect("find leaves canonical export valid")
+            .to_canonical_html()
+            .as_str(),
+        before_html
+    );
+}
+
+#[gpui::test]
+fn find_rejects_oversized_pasted_query_without_losing_previous_state(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut editor = EditorCore::for_test("keep this visible", cx);
+    editor.set_find_query("visible", false).unwrap();
+    let durable_before = editor.document().semantic_snapshot();
+    let summary_before = editor.find_summary();
+    let pasted_query = "x".repeat(MAX_FIND_QUERY_BYTES + 1);
+
+    assert_eq!(
+        editor.set_find_query(&pasted_query, false),
+        Err(FindError::QueryTooLong {
+            max_bytes: MAX_FIND_QUERY_BYTES
+        }),
+        "an untrusted pasted query is rejected before regex compilation"
+    );
+    assert_eq!(editor.find_summary(), summary_before);
+    assert_eq!(editor.document().semantic_snapshot(), durable_before);
+}
+
+#[gpui::test]
+fn find_reconciles_changed_blocks_across_input_undo_and_redo(cx: &mut gpui::TestAppContext) {
+    // Replacing reconcile with an eager full-document scan makes the scan
+    // assertion fail; dropping any mutation boundary makes one result stale.
+    let mut editor = EditorCore::for_test_paragraphs(["match first", "middle", "match last"], cx);
+    let middle = editor.document().blocks()[1].id;
+    let final_match = editor.document().blocks()[2].id;
+    editor.set_find_query("match", false).unwrap();
+    assert_eq!(editor.find_summary().total, 2);
+    assert_eq!(
+        editor.find_next().map(|found| found.node_id),
+        Some(final_match)
+    );
+    let scans_before_edit = editor.find_scanned_blocks_for_test();
+    let matcher_compiles_before_edit = editor.find_matcher_compiles_for_test();
+
+    editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+        middle,
+        0,
+        Affinity::Before,
+    )));
+    editor.insert_text("match ").expect("ordinary text input");
+    assert_eq!(editor.find_summary().total, 3);
+    assert_eq!(editor.find_summary().primary_index, Some(2));
+    assert_eq!(
+        editor.find_scanned_blocks_for_test(),
+        scans_before_edit + 1,
+        "only the edited text block is rescanned"
+    );
+    assert_eq!(
+        editor.find_matcher_compiles_for_test(),
+        matcher_compiles_before_edit,
+        "ordinary input reuses the query's compiled literal matcher"
+    );
+
+    editor.undo().expect("undo ordinary text input");
+    assert_eq!(editor.find_summary().total, 2);
+    assert_eq!(editor.find_summary().primary_index, Some(1));
+    editor.redo().expect("redo ordinary text input");
+    assert_eq!(editor.find_summary().total, 3);
+    assert_eq!(editor.find_summary().primary_index, Some(2));
+    assert_eq!(
+        editor.find_next().map(|found| found.node_id),
+        Some(editor.document().blocks()[0].id),
+        "next wraps from the final result to the first"
+    );
+    assert_eq!(
+        editor.find_previous().map(|found| found.node_id),
+        Some(final_match),
+        "previous wraps in the opposite direction"
+    );
+}
+
+#[gpui::test]
+async fn find_paints_only_visible_match_geometry_for_long_notes(cx: &mut gpui::TestAppContext) {
+    // This fails if the renderer materializes one decoration per result rather
+    // than asking the real visible layout for just the current viewport.
+    let mut cx = cx.add_empty_window();
+    let mut editor = EditorCore::for_test_paragraphs(
+        (0..600).map(|index| format!("needle block {index}")),
+        &mut cx,
+    );
+    editor.set_find_query("needle", false).unwrap();
+    assert_eq!(editor.find_summary().total, 600);
+    let document = editor.document().clone();
+    cx.update(|window, _| {
+        editor
+            .layout
+            .shape_visible_with_window(&document, 0.0, 90.0, 420.0, window);
+    });
+
+    let highlights = render::find_highlights_for_test(&editor);
+    assert!(
+        !highlights.is_empty(),
+        "visible matches need painted geometry"
+    );
+    assert!(
+        highlights.len() < editor.find_summary().total,
+        "a 600-match note must not materialize all highlight rectangles"
+    );
+    assert_eq!(
+        highlights
+            .iter()
+            .filter(|highlight| highlight.primary)
+            .count(),
+        1,
+        "the initial visible match is the distinct primary highlight"
+    );
+}
+
+#[gpui::test]
+async fn offscreen_find_seek_refines_wrapped_prefix_before_using_exact_range(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A height index is only an initial seek: this fixture puts both a heavily
+    // wrapped paragraph and an image before the distant match. The second
+    // phase must shape the target viewport and use its text range, rather
+    // than claiming the first estimated block box is exact.
+    let mut cx = cx.add_empty_window();
+    let editor = EditorCore::fixture_text_image_text(
+        &"包行前缀 ".repeat(1_200),
+        "0123456789abcdef0123456789abcdef",
+        "needle target",
+        &mut cx,
+    );
+    let document = editor.document().clone();
+    let target = document.blocks()[2].id;
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(&document, 0.0, 120.0, 42.0);
+    let estimated_target = layout
+        .bounds_for_node(&document, target)
+        .expect("height index locates remote target");
+
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(&document, 0.0, 120.0, 42.0, window);
+    });
+    let refined_target = layout
+        .bounds_for_node(&document, target)
+        .expect("measured prefix keeps target seekable");
+    assert_ne!(
+        estimated_target.top(),
+        refined_target.top(),
+        "wrapped text before a remote result changes the initial height-index seek"
+    );
+
+    cx.update(|window, _| {
+        layout.shape_visible_with_window(
+            &document,
+            f32::from(refined_target.top()),
+            120.0,
+            42.0,
+            window,
+        );
+    });
+    let exact = layout
+        .range_bounds(target, 0.."needle".len())
+        .expect("second phase obtains exact target glyph geometry");
+    assert!(
+        layout.visible().iter().any(|block| block.node_id == target),
+        "the refined height seek shapes the remote target rather than merely changing an offset"
+    );
+    assert!(exact.size.width > px(0.0));
+}
+
+#[gpui::test]
+fn mounted_find_reveal_refines_remote_wrapped_result_into_the_viewport(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut document = Document::from_paragraph(&"包行前缀 ".repeat(1_200));
+    document
+        .apply(Transaction::InsertImage {
+            selection: document.end_selection(),
+            resource_id: "0123456789abcdef0123456789abcdef".into(),
+            natural_size: (1_600, 900),
+        })
+        .unwrap();
+    let target = document.blocks().last().expect("trailing paragraph").id;
+    document
+        .apply(Transaction::InsertText {
+            selection: document.end_selection(),
+            text: "needle target".into(),
+        })
+        .unwrap();
+    let (surface, cx) = cx.add_window_view(move |_window, cx| {
+        let editor = cx.new(|cx| EditorCore::new(document, cx));
+        EditorSurface::new(editor, EditorSurfaceMode::Editable, None, cx)
+    });
+
+    surface.update(cx, |surface, surface_cx| {
+        surface
+            .editor()
+            .update(surface_cx, |editor, _| {
+                editor.set_find_query("needle", false)
+            })
+            .unwrap();
+        assert!(surface.reveal_find_primary(surface_cx));
+    });
+    // First paint consumes the indexed seek. A second paint is the exact
+    // range correction after the target viewport has been shaped.
+    cx.update(|window, app| window.draw(app).clear());
+    cx.run_until_parked();
+    cx.update(|window, app| window.draw(app).clear());
+    cx.run_until_parked();
+
+    let (target_bounds, viewport) = surface.read_with(cx, |surface, app| {
+        let editor = surface.editor().read(app);
+        (
+            editor
+                .layout()
+                .range_bounds(target, 0.."needle".len())
+                .expect("production reveal shapes the target match"),
+            surface.scroll_metrics_for_test().viewport,
+        )
+    });
+    assert!(
+        target_bounds.bottom() >= viewport.top() && target_bounds.top() <= viewport.bottom(),
+        "production reveal must place the exact remote match in the mounted viewport; target={target_bounds:?}, viewport={viewport:?}"
     );
 }
 

@@ -5,6 +5,7 @@
 //! its measurement callbacks around the same canvas helper.
 
 use super::core::{AtomicBlockHit, EditorCore};
+use super::find::FindMatch;
 use super::images::BudgetedImageCache;
 use super::model::{BlockKind, DocPoint};
 use super::render;
@@ -162,6 +163,10 @@ pub struct EditorSurface {
     // surface as an embedded canvas and keeps that established scroll owner.
     embedded_frame: Option<(f32, f32)>,
     accepts_pointer_input: bool,
+    // A distant result first seeks through the height index. The next canvas
+    // pass shapes that viewport, then uses the exact text range to correct
+    // wrapped paragraphs before the result is considered revealed.
+    pending_find_reveal: Option<FindMatch>,
     _editor_subscription: Subscription,
     #[cfg(test)]
     light_surface_paint_for_test: EditorSurfaceLightContract,
@@ -209,6 +214,7 @@ impl EditorSurface {
             hooks: EditorSurfaceHooks::default(),
             embedded_frame,
             accepts_pointer_input,
+            pending_find_reveal: None,
             _editor_subscription: subscription,
             #[cfg(test)]
             light_surface_paint_for_test: EditorSurfaceLightContract {
@@ -225,6 +231,41 @@ impl EditorSurface {
 
     pub fn mode(&self) -> EditorSurfaceMode {
         self.mode
+    }
+
+    /// Reveal the current find result without changing the editor selection.
+    /// Visible text uses exact match geometry. An offscreen result first uses
+    /// the retained height index, then the next canvas pass corrects to the
+    /// freshly shaped text range (important for wrapped text and images above
+    /// the result).
+    pub fn reveal_find_primary(&mut self, cx: &mut Context<Self>) -> bool {
+        let found = self.editor.read(cx).find_primary().cloned();
+        let target = found.as_ref().and_then(|found| {
+            let editor = self.editor.read(cx);
+            editor
+                .layout()
+                .range_bounds(found.node_id, found.utf8_range.clone())
+        });
+        if let Some(target) = target {
+            reveal_scroll_bounds(&self.scroll_handle, target);
+            self.pending_find_reveal = None;
+            true
+        } else if let Some(found) = found {
+            let target = self
+                .editor
+                .read(cx)
+                .layout()
+                .bounds_for_node(self.editor.read(cx).document(), found.node_id);
+            if let Some(target) = target {
+                reveal_scroll_bounds(&self.scroll_handle, target);
+                self.pending_find_reveal = Some(found);
+                cx.notify();
+                return true;
+            }
+            false
+        } else {
+            false
+        }
     }
 
     #[cfg(test)]
@@ -453,6 +494,10 @@ impl Render for EditorSurface {
         };
         let before_shape = self.hooks.clone();
         let after_paint = self.hooks.clone();
+        let pending_find_reveal = self.pending_find_reveal.take();
+        let find_reveal_editor = editor.clone();
+        let find_reveal_scroll_handle = self.scroll_handle.clone();
+        let find_reveal_surface = cx.entity().downgrade();
         let mut surface = div()
             .id("native-editor-surface")
             .debug_selector(|| "native-editor-surface".to_owned())
@@ -546,6 +591,36 @@ impl Render for EditorSurface {
             self.image_cache.clone(),
             content_height,
             move |window, cx| (before_shape.before_shape)(window, cx),
+            move |_window, cx| {
+                let Some(found) = pending_find_reveal.clone() else {
+                    return;
+                };
+                let target = find_reveal_editor
+                    .read(cx)
+                    .layout()
+                    .range_bounds(found.node_id, found.utf8_range.clone());
+                let corrected = target.is_some();
+                if let Some(target) = target {
+                    reveal_scroll_bounds(&find_reveal_scroll_handle, target);
+                } else {
+                    let editor = find_reveal_editor.read(cx);
+                    if let Some(estimate) = editor
+                        .layout()
+                        .bounds_for_node(editor.document(), found.node_id)
+                    {
+                        // The preceding pass may have measured wrapped text
+                        // or an image and shifted the retained height index.
+                        // Seek again until the primary's own text is shaped.
+                        reveal_scroll_bounds(&find_reveal_scroll_handle, estimate);
+                    }
+                }
+                let _ = find_reveal_surface.update(cx, |surface, surface_cx| {
+                    surface.pending_find_reveal = (!corrected).then_some(found);
+                    if !corrected {
+                        surface_cx.notify();
+                    }
+                });
+            },
             move |window, cx| (after_paint.after_paint)(window, cx),
         ));
         if embedded {
@@ -575,6 +650,7 @@ pub fn editor_canvas(
     image_cache: Option<Entity<BudgetedImageCache>>,
     height: f32,
     before_shape: impl Fn(&mut Window, &mut App) + 'static,
+    after_shape: impl Fn(&mut Window, &mut App) + 'static,
     after_paint: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let canvas_editor = editor.clone();
@@ -592,6 +668,7 @@ pub fn editor_canvas(
                     editor_cx.notify();
                 }
             });
+            after_shape(window, cx);
             canvas_editor.clone()
         },
         move |bounds, entity, window, cx| {

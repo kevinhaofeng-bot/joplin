@@ -7254,6 +7254,7 @@ dependencies = [
  "ratex-parser",
  "ratex-svg",
  "raw-window-handle",
+ "regex",
  "reqwest",
  "resvg",
  "rusqlite",

@@ -4,6 +4,7 @@ pub mod codec;
 pub mod commands;
 pub mod core;
 pub mod diagnostics;
+pub mod find;
 pub mod fixtures;
 pub mod history;
 pub mod images;

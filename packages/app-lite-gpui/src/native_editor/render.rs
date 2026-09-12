@@ -55,9 +55,18 @@ struct AttachmentRenderInfo {
 #[derive(Clone)]
 struct RenderSnapshot {
     blocks: Vec<RenderBlock>,
+    find_highlights: Vec<FindHighlightGeometry>,
     selection_rects: Vec<Bounds<Pixels>>,
     selection: Selection,
     caret_bounds: Option<Bounds<Pixels>>,
+}
+
+/// Geometry is collected from the already-shaped visible block layouts. It is
+/// never a second document traversal or a retained element per match.
+#[derive(Clone, Debug)]
+pub(crate) struct FindHighlightGeometry {
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) primary: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -292,8 +301,23 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
             }
         })
         .collect();
+    let find_highlights = layout
+        .visible()
+        .iter()
+        .flat_map(|block| {
+            editor
+                .find_matches_for_node(block.node_id)
+                .flat_map(|(found, primary)| {
+                    layout
+                        .range_segment_bounds(found.node_id, found.utf8_range.clone())
+                        .into_iter()
+                        .map(move |bounds| FindHighlightGeometry { bounds, primary })
+                })
+        })
+        .collect();
     RenderSnapshot {
         blocks,
+        find_highlights,
         selection_rects: layout.selection_rects(editor.selection()),
         selection: editor.selection(),
         caret_bounds: editor
@@ -302,6 +326,11 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
             .then(|| layout.caret_bounds_for_point(editor.selection().head))
             .flatten(),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn find_highlights_for_test(editor: &EditorCore) -> Vec<FindHighlightGeometry> {
+    snapshot(editor).find_highlights
 }
 
 fn bounds_intersect(left: Bounds<Pixels>, right: Bounds<Pixels>) -> bool {
@@ -439,7 +468,18 @@ fn paint_snapshot(
         window.paint_quad(quad);
     }
 
-    // 2. Selection rectangles. Image atoms use the same geometry but with a
+    // 2. Find rectangles stay behind selection and glyphs. The primary is a
+    // more saturated accent without changing the editor's actual selection.
+    for highlight in &snapshot.find_highlights {
+        let color = if highlight.primary {
+            rgba(0xf59e0b80)
+        } else {
+            rgba(0xfde68a99)
+        };
+        window.paint_quad(fill(highlight.bounds, color));
+    }
+
+    // 3. Selection rectangles. Image atoms use the same geometry but with a
     // rounded outline-like highlight rather than a text rectangle.
     for rect in &snapshot.selection_rects {
         let is_image = snapshot
@@ -459,7 +499,7 @@ fn paint_snapshot(
         }
     }
 
-    // 3. Glyphs/images.
+    // 4. Glyphs/images.
     for (index, block) in snapshot.blocks.iter().enumerate() {
         if block.is_image {
             let image = residency
@@ -723,18 +763,20 @@ pub fn paint_entity(
 }
 
 /// A small pure description useful to tests and to a future measured-layout
-/// element. It preserves the same four-layer ordering as `paint`.
+/// element. It preserves the same paint ordering as `paint`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderLayer {
     BlockSurface,
+    FindHighlight,
     Selection,
     GlyphsOrImage,
     Caret,
 }
 
-pub fn render_order() -> [RenderLayer; 4] {
+pub fn render_order() -> [RenderLayer; 5] {
     [
         RenderLayer::BlockSurface,
+        RenderLayer::FindHighlight,
         RenderLayer::Selection,
         RenderLayer::GlyphsOrImage,
         RenderLayer::Caret,

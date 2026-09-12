@@ -663,6 +663,22 @@ impl LayoutRegistry {
         self.first_visible..self.last_visible
     }
 
+    /// Return the document-height-indexed block box even when the text block
+    /// is outside the shaped viewport. Its height and prefix use every
+    /// measurement currently known to the retained index, so callers must
+    /// shape and then refine an offscreen text range before treating it as
+    /// exact geometry.
+    pub fn bounds_for_node(&self, document: &Document, node_id: NodeId) -> Option<Bounds<Pixels>> {
+        let index = document.node_index(node_id).ok()?;
+        let top = self.height_prefix(index);
+        let bottom = self.height_prefix(index.saturating_add(1));
+        let block = document.block(node_id)?;
+        let mut bounds = block_bounds(self.estimate_width.max(1.0), block);
+        bounds.origin.y = px(top);
+        bounds.size.height = px((bottom - top).max(1.0));
+        Some(bounds)
+    }
+
     /// Current measured/estimated document extent from the same height index
     /// used by viewport seeking.  The spike scroll surface uses this value
     /// instead of a block-count guess, so wrapped paragraphs remain reachable.

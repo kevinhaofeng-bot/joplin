@@ -18,6 +18,7 @@ use uuid::Uuid;
 #[cfg(test)]
 use gpui::TestAppContext;
 
+use super::find::{FindError, FindMatch, FindState, FindSummary};
 use super::history::History;
 use super::images::{ImageMetadata, ImagePayload, ImageStore, image_format_from_path};
 use super::input;
@@ -237,6 +238,9 @@ pub struct EditorCore {
     composition_base_range: Option<Range<usize>>,
     last_input_error: Option<DocumentError>,
     history: History,
+    /// Ephemeral find state follows committed document mutations but is never
+    /// encoded into canonical HTML or represented in undo/redo history.
+    find: FindState,
     image_store: ImageStore,
     /// Pure in-memory source state for retained durable images. Rendering
     /// consults this instead of probing `Path::is_file` every frame; the
@@ -441,6 +445,7 @@ impl EditorCore {
             composition_base_range: None,
             last_input_error: None,
             history: History::new(1_000, 16 * 1024 * 1024),
+            find: FindState::default(),
             image_store: ImageStore::default(),
             materialized_image_ids: HashSet::new(),
             pending_image_hydration: HashSet::new(),
@@ -495,6 +500,51 @@ impl EditorCore {
 
     pub fn selection(&self) -> Selection {
         self.selection
+    }
+
+    pub fn set_find_query(&mut self, query: &str, case_sensitive: bool) -> Result<(), FindError> {
+        self.find.set_query(&self.document, query, case_sensitive)
+    }
+
+    pub fn find_next(&mut self) -> Option<&FindMatch> {
+        self.find.next()
+    }
+
+    pub fn find_previous(&mut self) -> Option<&FindMatch> {
+        self.find.previous()
+    }
+
+    pub fn find_summary(&self) -> FindSummary {
+        self.find.summary()
+    }
+
+    pub fn find_matches(&self) -> impl Iterator<Item = &FindMatch> {
+        self.find.matches()
+    }
+
+    pub fn find_primary(&self) -> Option<&FindMatch> {
+        self.find.primary()
+    }
+
+    pub fn clear_find(&mut self) {
+        self.find.clear();
+    }
+
+    pub(crate) fn find_matches_for_node(
+        &self,
+        node_id: NodeId,
+    ) -> impl Iterator<Item = (&FindMatch, bool)> {
+        self.find.matches_for_node(node_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_scanned_blocks_for_test(&self) -> usize {
+        self.find.scanned_blocks_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_matcher_compiles_for_test(&self) -> usize {
+        self.find.matcher_compiles_for_test()
     }
 
     /// Register a point that an asynchronous external resource completion
@@ -1480,6 +1530,7 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
+        self.find.reconcile(&self.document);
         self.layout.invalidate_nodes_with_delta(
             &self.document,
             &outcome.changed_nodes,
@@ -1531,6 +1582,7 @@ impl EditorCore {
         self.preferred_x = None;
         self.clear_composition();
         self.last_input_error = None;
+        self.find.reconcile(&self.document);
         self.layout.invalidate_nodes_with_delta(
             &self.document,
             &outcome.changed_nodes,
@@ -1557,6 +1609,7 @@ impl EditorCore {
                 .apply_with_selection(&mut self.document, self.selection, transaction)?;
         self.apply_resource_anchor_replacement(resource_anchor_mapping);
         self.preferred_x = None;
+        self.find.reconcile(&self.document);
         self.layout.invalidate_nodes_with_delta(
             &self.document,
             &outcome.changed_nodes,
@@ -1583,6 +1636,7 @@ impl EditorCore {
             self.history
                 .apply_batch_with_selection(&mut self.document, before_selection, batch)?;
         self.apply_resource_anchor_replacement(resource_anchor_mapping);
+        self.find.reconcile(&self.document);
         Ok(outcome)
     }
 
@@ -1598,6 +1652,7 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
+        self.find.reconcile(&self.document);
         self.layout.invalidate_nodes_with_delta(
             &self.document,
             &outcome.changed_nodes,
@@ -1620,6 +1675,7 @@ impl EditorCore {
         self.selection = outcome.selection;
         self.preferred_x = None;
         self.clear_composition();
+        self.find.reconcile(&self.document);
         self.layout.invalidate_nodes_with_delta(
             &self.document,
             &outcome.changed_nodes,
@@ -1691,6 +1747,7 @@ impl EditorCore {
             self.apply_resource_anchor_replacement(resource_anchor_mapping);
             self.selection = outcome.selection;
             self.preferred_x = None;
+            self.find.reconcile(&self.document);
             self.layout.invalidate_nodes_with_delta(
                 &self.document,
                 &outcome.changed_nodes,
@@ -1817,6 +1874,7 @@ impl EditorCore {
             self.apply_resource_anchor_replacement(resource_anchor_mapping);
             self.selection = outcome.selection;
             self.preferred_x = None;
+            self.find.reconcile(&self.document);
             self.layout.invalidate_nodes_with_delta(
                 &self.document,
                 &outcome.changed_nodes,
@@ -1851,6 +1909,7 @@ impl EditorCore {
         self.apply_resource_anchor_replacement(resource_anchor_mapping);
         self.selection = outcome.selection;
         self.preferred_x = None;
+        self.find.reconcile(&self.document);
         self.layout.invalidate_nodes_with_delta(
             &self.document,
             &outcome.changed_nodes,
@@ -2440,6 +2499,7 @@ impl EditorCore {
         self.selection = selection;
         self.preferred_x = None;
         self.clear_composition();
+        self.find.reconcile(&self.document);
         // Replaying a compact history suffix has several intermediate
         // structural deltas. The exceptional path trades a single cache
         // rebuild for correctness instead of feeding stale intermediate
