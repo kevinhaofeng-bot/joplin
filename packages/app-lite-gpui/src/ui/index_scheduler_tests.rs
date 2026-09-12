@@ -328,3 +328,83 @@ async fn mounted_background_index_worker_does_not_block_note_switch_or_shell_tea
     );
     drop(release);
 }
+
+#[gpui::test]
+async fn mounted_note_switch_and_shell_close_survive_an_active_index_transaction(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "事务中的索引 A".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("first queued note");
+    let second = repository
+        .create_note(CreateNote {
+            title: "前台选择 B".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("second queued note");
+    // Let the mounted scheduler consume a controlled retryable failure first,
+    // so this test owns the following real transaction instead of racing its
+    // startup batch.
+    repository.fail_next_search_jobs_for_test(LibraryError::InvalidSnapshot);
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    let (entered_sender, entered) = std::sync::mpsc::channel();
+    let (release_sender, release) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Mutex::new(release));
+    repository.set_search_index_transaction_hook_for_test(Arc::new(move || {
+        entered_sender
+            .send(())
+            .expect("signal active index transaction");
+        release
+            .lock()
+            .expect("release mutex")
+            .recv()
+            .expect("release active index transaction");
+    }));
+    let worker_repository = Arc::clone(&repository);
+    let worker = std::thread::spawn(move || worker_repository.process_search_jobs());
+    entered
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("index transaction is active");
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(second.id.clone()), window, shell_cx);
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(second.id.clone()),
+        "mounted selection uses the foreground connection while WAL indexing is active"
+    );
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.save_error_for_test()),
+        None,
+        "a retryable indexing failure remains distinct from local-save status"
+    );
+
+    cx.update(|window, _| window.remove_window());
+    drop(view);
+    assert!(
+        repository
+            .take_search_jobs(100)
+            .expect("queue identity remains readable after shell close")
+            .iter()
+            .any(|job| job.note_id == first.id),
+        "closing the shell cannot acknowledge an in-flight queue identity"
+    );
+    release_sender.send(()).expect("release worker");
+    assert_eq!(
+        worker
+            .join()
+            .expect("worker thread")
+            .expect("worker result"),
+        2
+    );
+}

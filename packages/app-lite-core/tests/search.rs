@@ -5,8 +5,8 @@ use app_lite_core::{
     AssociateResource, CanonicalDocument, CreateNote, LibraryRepository, ListQuery,
     RepositoryClock, RepositoryIdSource, SaveNote, SearchFilter, SearchQuery, SearchTerm,
 };
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use tempfile::TempDir;
 
 struct Clock(AtomicI64);
@@ -143,6 +143,58 @@ fn old_ack_cannot_delete_newer_snapshot_and_rename_replaces_index() {
             .note
             .id,
         changed.id
+    );
+}
+
+#[test]
+fn active_index_transaction_does_not_block_main_connection_note_load() {
+    let (_profile, repo) = repository();
+    let first = create(&repo, "index writer", "the index transaction is active");
+    let second = create(&repo, "foreground reader", "must remain responsive");
+    let (entered_sender, entered) = mpsc::channel();
+    let (release_sender, release) = mpsc::channel();
+    let release = Arc::new(Mutex::new(release));
+    repo.set_search_index_transaction_hook_for_test(Arc::new(move || {
+        entered_sender.send(()).expect("signal active transaction");
+        release
+            .lock()
+            .expect("release mutex")
+            .recv()
+            .expect("release active transaction");
+    }));
+
+    let worker_repository = Arc::clone(&repo);
+    let worker = std::thread::spawn(move || worker_repository.process_search_jobs());
+    entered
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("index transaction is active");
+
+    assert_eq!(
+        repo.load_note(&second.id)
+            .expect("main connection remains readable during WAL index write")
+            .expect("second note exists")
+            .id,
+        second.id
+    );
+    release_sender.send(()).expect("release worker");
+    assert_eq!(
+        worker
+            .join()
+            .expect("worker thread")
+            .expect("worker result"),
+        2
+    );
+    assert!(
+        repo.take_search_jobs(100)
+            .expect("queue readable")
+            .is_empty()
+    );
+    assert_eq!(
+        repo.search(SearchQuery::parse("index writer"))
+            .expect("derived projection committed")[0]
+            .note
+            .id,
+        first.id
     );
 }
 

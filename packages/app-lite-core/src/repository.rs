@@ -341,6 +341,11 @@ struct PurgeResourceCandidate {
 
 pub struct LibraryRepository {
     connection: Mutex<Connection>,
+    /// A lazily opened, independently verified SQLite handle used only by the
+    /// derived search worker.  Foreground reads and saves retain the primary
+    /// handle, so a bounded FTS write never also holds its Rust mutex.
+    index_connection: Mutex<Option<Connection>>,
+    profile_dir: ProfileDir,
     #[allow(dead_code)]
     database_file: DatabaseFile,
     resource_store: ResourceStore,
@@ -361,10 +366,11 @@ pub struct LibraryRepository {
     /// the authoritative save transaction and is consumed once per worker
     /// invocation so retry/reopen behavior remains observable.
     next_search_job_failure: Mutex<Option<LibraryError>>,
+    #[cfg(any(test, feature = "test-support"))]
+    search_index_transaction_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     next_staged_resource_snapshot_failure: Mutex<Option<LibraryError>>,
-    #[allow(dead_code)]
-    database_path: PathBuf,
+    database_name: std::ffi::OsString,
     clock: Arc<dyn RepositoryClock>,
     id_source: Arc<dyn RepositoryIdSource>,
 }
@@ -573,6 +579,8 @@ impl LibraryRepository {
         // and in-memory state movement; do not lie that it failed afterward.
         let repository = Self {
             connection: Mutex::new(connection),
+            index_connection: Mutex::new(None),
+            profile_dir: profile,
             database_file,
             resource_store,
             events: Mutex::new(Vec::new()),
@@ -589,9 +597,11 @@ impl LibraryRepository {
             #[cfg(any(test, feature = "test-support"))]
             next_note_load_failure: Mutex::new(None),
             next_search_job_failure: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            search_index_transaction_hook: Mutex::new(None),
             #[cfg(test)]
             next_staged_resource_snapshot_failure: Mutex::new(None),
-            database_path: path,
+            database_name: name.to_owned(),
             clock,
             id_source,
         };
@@ -796,6 +806,27 @@ impl LibraryRepository {
             .lock()
             .expect("search-job failure mutex poisoned")
             .take()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_search_index_transaction_hook_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .search_index_transaction_hook
+            .lock()
+            .expect("search-index transaction hook mutex poisoned") = Some(hook);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn notify_search_index_transaction_started_for_test(&self) {
+        let hook = self
+            .search_index_transaction_hook
+            .lock()
+            .expect("search-index transaction hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     #[cfg(test)]
@@ -2755,19 +2786,7 @@ impl LibraryRepository {
     /// its full queue identity so a newer upsert cannot be accidentally lost.
     pub fn take_search_jobs(&self, limit: usize) -> Result<Vec<crate::SearchJob>, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
-        let mut statement = connection.prepare(
-            "SELECT note_id, updated_time, reason FROM search_queue ORDER BY updated_time, note_id LIMIT ?1",
-        )?;
-        statement
-            .query_map([limit as i64], |row| {
-                Ok(crate::SearchJob {
-                    note_id: NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
-                    updated_time: row.get(1)?,
-                    reason: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        take_search_jobs(&connection, limit)
     }
 
     pub fn ack_search_jobs(&self, jobs: &[crate::SearchJob]) -> Result<(), LibraryError> {
@@ -2789,8 +2808,61 @@ impl LibraryRepository {
         crate::search::process_search_jobs(self)
     }
 
-    pub(crate) fn search_connection(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.connection.lock().expect("library mutex poisoned")
+    pub(crate) fn with_search_index_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, LibraryError>,
+    ) -> Result<T, LibraryError> {
+        let mut slot = self
+            .index_connection
+            .lock()
+            .expect("search-index mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(self.open_verified_search_index_connection()?);
+        }
+        operation(slot.as_mut().expect("index connection was initialized"))
+    }
+
+    fn open_verified_search_index_connection(&self) -> Result<Connection, LibraryError> {
+        if !self
+            .profile_dir
+            .verify_path_identity()
+            .map_err(|_| LibraryError::InvalidDatabasePath)?
+        {
+            return Err(LibraryError::InvalidDatabasePath);
+        }
+        let path = self
+            .profile_dir
+            .database_path(&self.database_name)
+            .map_err(|_| LibraryError::InvalidDatabasePath)?;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        if connection_has_moved(&connection)?
+            || !self
+                .profile_dir
+                .verify_path_identity()
+                .map_err(|_| LibraryError::InvalidDatabasePath)?
+            || !self
+                .database_file
+                .matches_sqlite_connection(&connection, &self.profile_dir)
+                .map_err(|_| LibraryError::InvalidDatabasePath)?
+        {
+            return Err(LibraryError::InvalidDatabasePath);
+        }
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let foreign_keys: i64 =
+            connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        if !journal_mode(&connection)?.eq_ignore_ascii_case("wal") || foreign_keys != 1 {
+            return Err(LibraryError::Pragma);
+        }
+        // The indexer yields to foreground writers rather than holding a
+        // process-wide repository mutex.  Each note still uses one immediate
+        // transaction, so this timeout is bounded by that single projection.
+        connection.busy_timeout(std::time::Duration::from_millis(250))?;
+        Ok(connection)
     }
 
     /// Searches only derived FTS tables plus card projection metadata.  The
@@ -3020,6 +3092,25 @@ fn journal_mode(connection: &Connection) -> Result<String, LibraryError> {
     connection
         .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
         .map(|mode| mode.to_ascii_lowercase())
+        .map_err(Into::into)
+}
+
+pub(crate) fn take_search_jobs(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<crate::SearchJob>, LibraryError> {
+    let mut statement = connection.prepare(
+        "SELECT note_id, updated_time, reason FROM search_queue ORDER BY updated_time, note_id LIMIT ?1",
+    )?;
+    statement
+        .query_map([limit as i64], |row| {
+            Ok(crate::SearchJob {
+                note_id: NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                updated_time: row.get(1)?,
+                reason: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
