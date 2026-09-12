@@ -8,8 +8,9 @@ pub use navigation::*;
 
 use app_lite_core::{
     CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
-    LibraryNavigationIndex, LibraryRepository, LibraryShellState, ListQuery, Note, NoteId,
-    NoteProjection, ResourceId, SortDirection, SortField,
+    LibraryNavigationIndex, LibraryRepository, LibraryRoute, LibraryShellState, ListQuery, Note,
+    NoteId, NoteOrganizationState, NoteProjection, NotebookId, ResourceId, SortDirection,
+    SortField,
 };
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -77,6 +78,30 @@ enum StatusOrigin {
     ProjectionEvent,
 }
 
+/// Durable mutation already succeeded, but its route/index/projection/session
+/// candidate did not. The recovery target is typed rather than inferred from
+/// a status string: Create Note must recover its newly-created NoteId under
+/// All Notes, whereas ordinary organization/trash mutations recover from the
+/// existing route and deterministic selection fallback.
+#[derive(Clone, Debug)]
+enum PendingReconciliation {
+    CurrentRoute,
+    CreateNote {
+        note: Note,
+        destination_route: LibraryRoute,
+    },
+}
+
+/// A note creation command is compiled from the current typed route before a
+/// repository write. This is the local equivalent of Evernote's explicit
+/// `CREATE_NEW_NOTE.container`: a Stack filters notes but never becomes a
+/// fake direct note container.
+#[derive(Clone, Debug)]
+struct CreateNoteDestination {
+    notebook_id: Option<NotebookId>,
+    route: LibraryRoute,
+}
+
 pub struct AppModel {
     repository: Arc<LibraryRepository>,
     navigation: NavigationState,
@@ -92,8 +117,17 @@ pub struct AppModel {
     // recovery action completes; a later projection event must not falsely
     // imply the user action was rolled back.
     partial_commit_message: Option<String>,
+    /// A repository mutation has committed but its full route/index/list/
+    /// session candidate has not yet been installed. This is deliberately
+    /// broader than organization rows: Trash, Restore and Purge can also
+    /// change the selected note's legal lifecycle or revision. Until a full
+    /// candidate commits, the shell freezes its retained editor rather than
+    /// letting a stale save fence accept input.
+    reconciliation_pending: Option<PendingReconciliation>,
     #[cfg(test)]
     next_refresh_failure: Option<LibraryError>,
+    #[cfg(test)]
+    next_shell_state_persist_failure: Option<LibraryError>,
     #[cfg(test)]
     projection_event_refreshes: usize,
 }
@@ -105,6 +139,18 @@ pub struct AppModel {
 struct PreparedNavigationCommit {
     navigation: NavigationState,
     projections: Vec<NoteProjection>,
+    active_session: Option<ActiveSession>,
+}
+
+/// A repository organization mutation has already committed, but none of its
+/// new sidebar/projection/session state becomes visible until all candidate
+/// reads and any required target hydration have succeeded. The index belongs
+/// in this same prepared packet so the three library columns cannot describe
+/// different durable generations.
+struct PreparedOrganizationCommit {
+    navigation: NavigationState,
+    projections: Vec<NoteProjection>,
+    navigation_index: LibraryNavigationIndex,
     active_session: Option<ActiveSession>,
 }
 
@@ -128,8 +174,11 @@ impl AppModel {
             status: AppStatus::Ready,
             status_origin: StatusOrigin::Neutral,
             partial_commit_message: None,
+            reconciliation_pending: None,
             #[cfg(test)]
             next_refresh_failure: None,
+            #[cfg(test)]
+            next_shell_state_persist_failure: None,
             #[cfg(test)]
             projection_event_refreshes: 0,
         };
@@ -151,14 +200,98 @@ impl AppModel {
 
     pub fn dispatch(&mut self, action: AppAction) -> Result<(), LibraryError> {
         let action_can_recover_partial = matches!(
-            action,
+            &action,
             AppAction::CreateNote
+                | AppAction::CreateStack { .. }
+                | AppAction::CreateNotebook { .. }
+                | AppAction::CreateTag { .. }
+                | AppAction::RenameStack { .. }
+                | AppAction::RenameNotebook { .. }
+                | AppAction::RenameTag { .. }
+                | AppAction::DeleteStack(_)
+                | AppAction::DeleteNotebook(_)
+                | AppAction::DeleteTag(_)
+                | AppAction::MoveSelectedNote(_)
+                | AppAction::SetSelectedNoteTags(_)
+                | AppAction::AddTagToSelectedNote(_)
+                | AppAction::RemoveTagFromSelectedNote(_)
                 | AppAction::SelectNote(_)
                 | AppAction::TrashNote(_)
                 | AppAction::TrashSelected
+                | AppAction::RestoreNote(_)
+                | AppAction::RestoreSelected
+                | AppAction::PurgeNote(_)
+                | AppAction::PurgeSelected
         );
         let result = match action {
             AppAction::CreateNote => self.create_note(),
+            AppAction::CreateStack { title } => self
+                .apply_organization_mutation("笔记本组已创建", move |repository| {
+                    repository.create_stack(&title).map(|_| ())
+                }),
+            AppAction::CreateNotebook { title, stack_id } => {
+                self.apply_organization_mutation("笔记本已创建", move |repository| {
+                    repository
+                        .create_notebook(&title, stack_id.as_ref())
+                        .map(|_| ())
+                })
+            }
+            AppAction::CreateTag { title } => self
+                .apply_organization_mutation("标签已创建", move |repository| {
+                    repository.create_tag(&title).map(|_| ())
+                }),
+            AppAction::RenameStack { id, title } => self
+                .apply_organization_mutation("笔记本组已重命名", move |repository| {
+                    repository.rename_stack(&id, &title).map(|_| ())
+                }),
+            AppAction::RenameNotebook { id, title } => self
+                .apply_organization_mutation("笔记本已重命名", move |repository| {
+                    repository.rename_notebook(&id, &title).map(|_| ())
+                }),
+            AppAction::RenameTag { id, title } => self
+                .apply_organization_mutation("标签已重命名", move |repository| {
+                    repository.rename_tag(&id, &title).map(|_| ())
+                }),
+            AppAction::DeleteStack(id) => self
+                .apply_organization_mutation("笔记本组已解散", move |repository| {
+                    repository.delete_stack(&id)
+                }),
+            AppAction::DeleteNotebook(id) => self
+                .apply_organization_mutation("笔记本已删除", move |repository| {
+                    repository.delete_notebook(&id)
+                }),
+            AppAction::DeleteTag(id) => self
+                .apply_organization_mutation("标签已删除", move |repository| {
+                    repository.delete_tag(&id)
+                }),
+            AppAction::MoveSelectedNote(notebook_id) => {
+                self.selected_note_for_organization().and_then(|note_id| {
+                    self.apply_organization_mutation("笔记已移动", move |repository| {
+                        repository.move_selected_note(&note_id, &notebook_id)
+                    })
+                })
+            }
+            AppAction::SetSelectedNoteTags(tag_ids) => {
+                self.selected_note_for_organization().and_then(|note_id| {
+                    self.apply_organization_mutation("笔记标签已更新", move |repository| {
+                        repository.set_note_tags(&note_id, &tag_ids)
+                    })
+                })
+            }
+            AppAction::AddTagToSelectedNote(tag_id) => {
+                self.selected_note_for_organization().and_then(|note_id| {
+                    self.apply_organization_mutation("笔记标签已更新", move |repository| {
+                        repository.add_note_tag(&note_id, &tag_id)
+                    })
+                })
+            }
+            AppAction::RemoveTagFromSelectedNote(tag_id) => {
+                self.selected_note_for_organization().and_then(|note_id| {
+                    self.apply_organization_mutation("笔记标签已更新", move |repository| {
+                        repository.remove_note_tag(&note_id, &tag_id)
+                    })
+                })
+            }
             AppAction::SelectNote(id) => self.select_note(id),
             AppAction::NavigateTo {
                 route,
@@ -173,6 +306,24 @@ impl AppModel {
                 .cloned()
                 .ok_or(LibraryError::NotFound)
                 .and_then(|id| self.trash_note(id)),
+            AppAction::RestoreNote(id) => self
+                .apply_organization_mutation("笔记已恢复", move |repository| {
+                    repository.restore_note(&id)
+                }),
+            AppAction::RestoreSelected => self.selected_note_for_organization().and_then(|id| {
+                self.apply_organization_mutation("笔记已恢复", move |repository| {
+                    repository.restore_note(&id)
+                })
+            }),
+            AppAction::PurgeNote(id) => self
+                .apply_organization_mutation("笔记已永久删除", move |repository| {
+                    repository.purge_note(&id)
+                }),
+            AppAction::PurgeSelected => self.selected_note_for_organization().and_then(|id| {
+                self.apply_organization_mutation("笔记已永久删除", move |repository| {
+                    repository.purge_note(&id)
+                })
+            }),
             AppAction::ToggleSidebar => {
                 self.panes.sidebar_visible = !self.panes.sidebar_visible;
                 self.persist_shell_state()
@@ -203,7 +354,7 @@ impl AppModel {
                 // Only an explicit user action that re-runs the
                 // refresh/selection path may resolve a prior committed
                 // mutation warning. Cosmetic list actions do not retry it.
-                if action_can_recover_partial {
+                if action_can_recover_partial && self.reconciliation_pending.is_none() {
                     self.partial_commit_message = None;
                 }
                 self.set_action_success_status();
@@ -216,22 +367,80 @@ impl AppModel {
     }
 
     fn create_note(&mut self) -> Result<(), LibraryError> {
+        let destination = self.resolve_create_note_destination()?;
         // The repository transaction is the source of truth: no temporary UI note exists.
         let note = self.repository.create_note(RepositoryCreateNote {
             title: String::new(),
-            notebook_id: None,
+            notebook_id: destination.notebook_id.clone(),
             document: CanonicalDocument::default(),
         })?;
-        self.navigation.clear_search();
-        if let Err(error) = self.refresh_list() {
-            self.record_partial_commit("笔记已创建", &error);
-            return Err(error);
+        match self
+            .prepare_create_note_reconciliation_commit(note.clone(), destination.route.clone())
+        {
+            Ok(prepared) => {
+                self.commit_organization(prepared);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_create_note_reconciliation_partial_commit(
+                    note,
+                    destination.route,
+                    &error,
+                );
+                Err(error)
+            }
         }
-        if let Err(error) = self.select_loaded_note(note) {
-            self.record_partial_commit("笔记已创建，但无法恢复选中状态", &error);
-            return Err(error);
+    }
+
+    /// Resolve a concrete Notebook owner before the Create Note transaction.
+    /// A notebook route is already a durable note container. A stack route is
+    /// not: prefer the currently selected child Note's notebook, otherwise
+    /// accept the only child notebook. Multiple or zero children are an
+    /// explicit user choice error, never an accidental default-notebook write.
+    fn resolve_create_note_destination(&self) -> Result<CreateNoteDestination, LibraryError> {
+        match self.navigation.route() {
+            LibraryRoute::Notebook(id) => Ok(CreateNoteDestination {
+                notebook_id: Some(id.clone()),
+                route: LibraryRoute::Notebook(id.clone()),
+            }),
+            LibraryRoute::Stack(stack_id) => {
+                let index = self.repository.list_navigation_index()?;
+                let children = index
+                    .notebooks
+                    .iter()
+                    .filter(|notebook| notebook.stack_id.as_ref() == Some(stack_id))
+                    .collect::<Vec<_>>();
+                let selected_child = self
+                    .navigation
+                    .selected_note_id()
+                    .and_then(|selected_id| {
+                        self.active_session.as_ref().filter(|active| {
+                            active.note.id == *selected_id
+                                && children
+                                    .iter()
+                                    .any(|child| child.id == active.note.notebook_id)
+                        })
+                    })
+                    .map(|active| active.note.notebook_id.clone());
+                let notebook_id = selected_child
+                    .or_else(|| (children.len() == 1).then(|| children[0].id.clone()));
+                let notebook_id = notebook_id.ok_or(LibraryError::StackNoteContainerRequired)?;
+                Ok(CreateNoteDestination {
+                    notebook_id: Some(notebook_id),
+                    route: LibraryRoute::Stack(stack_id.clone()),
+                })
+            }
+            // Tags are filters, not durable containers; a new untagged note
+            // cannot legally remain selected there. Trash is deliberately
+            // handled identically to preserve the existing safe editable
+            // All Notes fallback.
+            LibraryRoute::AllNotes | LibraryRoute::Tags(_) | LibraryRoute::Trash => {
+                Ok(CreateNoteDestination {
+                    notebook_id: None,
+                    route: LibraryRoute::AllNotes,
+                })
+            }
         }
-        Ok(())
     }
 
     fn select_note(&mut self, id: NoteId) -> Result<(), LibraryError> {
@@ -262,55 +471,305 @@ impl AppModel {
     }
 
     fn trash_note(&mut self, id: NoteId) -> Result<(), LibraryError> {
-        let old_index = self
-            .projections
-            .iter()
-            .position(|projection| projection.id == id);
-        let was_selected = self.navigation.selected_note_id() == Some(&id);
-        // Preserve the user's visible ordering while the repository refreshes
-        // its updated-time sort; selection is still an ID, never an index.
-        let nearest_before_refresh = old_index.and_then(|index| {
-            self.projections
-                .get(index + 1)
-                .or_else(|| {
-                    index
-                        .checked_sub(1)
-                        .and_then(|previous| self.projections.get(previous))
-                })
-                .map(|projection| projection.id.clone())
-        });
         self.repository.trash_note(&id)?;
-        if let Err(error) = self.refresh_list() {
-            self.record_partial_commit("笔记已移至废纸篓", &error);
-            return Err(error);
-        }
-        if was_selected {
-            let replacement = nearest_before_refresh.filter(|candidate| {
-                self.projections
-                    .iter()
-                    .any(|projection| projection.id == *candidate)
-            });
-            if let Some(replacement) = replacement {
-                if let Err(error) = self.select_note(replacement) {
-                    self.record_partial_commit(
-                        "笔记已移至废纸篓，但无法恢复相邻笔记选中状态",
-                        &error,
-                    );
-                    return Err(error);
-                }
-            } else {
-                self.navigation.select(None);
-                self.active_session = None;
-                if let Err(error) = self.persist_shell_state() {
-                    self.record_partial_commit(
-                        "笔记已移至废纸篓，但无法清除已保存的选中状态",
-                        &error,
-                    );
-                    return Err(error);
-                }
+        // The SQLite mutation has already committed, but its successor
+        // selection, target Note hydration and persisted shell selection are
+        // each fallible. Build them in the same candidate packet used for
+        // organization mutations; never publish a list without its coherent
+        // selected/active pair.
+        match self.prepare_organization_commit() {
+            Ok(prepared) => {
+                self.commit_organization(prepared);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_reconciliation_partial_commit("笔记已移至废纸篓", &error);
+                Err(error)
             }
         }
-        Ok(())
+    }
+
+    fn selected_note_for_organization(&self) -> Result<NoteId, LibraryError> {
+        self.navigation
+            .selected_note_id()
+            .cloned()
+            .ok_or(LibraryError::NotFound)
+    }
+
+    /// Executes one durable organization mutation, then constructs all three
+    /// visible library columns as a candidate before changing the live model.
+    /// If the repository mutation itself fails, nothing is touched; if it has
+    /// committed but a later candidate read fails, the old route/projections/
+    /// selection/session remain coherent and the status truthfully records the
+    /// committed data fact.
+    fn apply_organization_mutation(
+        &mut self,
+        committed_action: &str,
+        mutation: impl FnOnce(&LibraryRepository) -> Result<(), LibraryError>,
+    ) -> Result<(), LibraryError> {
+        mutation(Arc::as_ref(&self.repository))?;
+        match self.prepare_organization_commit() {
+            Ok(prepared) => {
+                self.commit_organization(prepared);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_reconciliation_partial_commit(committed_action, &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Candidate used both immediately after a successful Create Note
+    /// transaction and by the queued `NoteCreated` recovery event if that
+    /// first candidate failed. The transaction-built `Note` is safe to reuse
+    /// only while the durable lifecycle/revision metadata still matches it.
+    /// A concurrent writer can advance or trash the new note before the
+    /// queued event arrives, so recovery rehydrates the latest full note
+    /// rather than publishing a newer card beside a stale active session.
+    fn prepare_create_note_reconciliation_commit(
+        &mut self,
+        cached_note: Note,
+        destination_route: LibraryRoute,
+    ) -> Result<PreparedOrganizationCommit, LibraryError> {
+        let Some(metadata) = self.repository.note_organization_state(&cached_note.id)? else {
+            // The create did commit, but another writer may have purged it
+            // before our first UI candidate. There is no remaining full Note
+            // to mount, so clear the typed target through a coherent All
+            // Notes/no-selection packet rather than freezing indefinitely.
+            return self.prepare_removed_created_note_reconciliation_commit();
+        };
+        let note = if metadata.revision == cached_note.revision
+            && metadata.deleted_time == cached_note.deleted_time
+        {
+            // The create transaction returned this complete snapshot. Avoid a
+            // second body load in the ordinary no-race path.
+            cached_note
+        } else {
+            let latest = self
+                .repository
+                .load_note(&cached_note.id)?
+                .ok_or(LibraryError::NotFound)?;
+            // Do not commit a packet assembled across two durable revisions.
+            // The later event retry will build a fresh candidate if another
+            // writer won between this metadata probe and full-note load.
+            if latest.revision != metadata.revision || latest.deleted_time != metadata.deleted_time
+            {
+                return Err(LibraryError::StaleRevision {
+                    expected: metadata.revision,
+                    actual: latest.revision,
+                });
+            }
+            latest
+        };
+        if note.deleted_time.is_some() {
+            // A deleted note cannot be mounted as the editable active session
+            // under All Notes. The source of truth is still represented by
+            // the event and durable data, but the deterministic route
+            // fallback has no stale selection to mutate.
+            return self.prepare_removed_created_note_reconciliation_commit();
+        }
+        let navigation_index = self.repository.list_navigation_index()?;
+        let destination_route = if route_is_available(&destination_route, &navigation_index) {
+            destination_route
+        } else {
+            LibraryRoute::AllNotes
+        };
+        let (navigation, projections) =
+            self.prepare_create_note_navigation(note.id.clone(), destination_route)?;
+        self.persist_shell_state_for(&navigation)?;
+        Ok(PreparedOrganizationCommit {
+            navigation,
+            projections,
+            navigation_index,
+            // The create transaction already returned a complete Note. Do
+            // not insert a fallible post-commit body hydration here.
+            active_session: Some(ActiveSession { note }),
+        })
+    }
+
+    /// Build a route/projection candidate for a newly durable Note. When a
+    /// concurrent organization mutation makes its requested context invalid
+    /// (or makes the note leave that filter), All Notes is the only universal
+    /// legal fallback. Construct from the old navigation each time so a
+    /// failed first route never leaves a phantom history entry.
+    fn prepare_create_note_navigation(
+        &mut self,
+        note_id: NoteId,
+        destination_route: LibraryRoute,
+    ) -> Result<(NavigationState, Vec<NoteProjection>), LibraryError> {
+        let mut navigation = self.navigation.clone();
+        navigation.clear_search();
+        navigation.navigate_to(NavigationSnapshot {
+            route: destination_route.clone(),
+            selected_note_id: Some(note_id.clone()),
+        });
+        let projections = self.load_projections_for(&navigation)?;
+        if projections
+            .iter()
+            .any(|projection| projection.id == note_id)
+        {
+            return Ok((navigation, projections));
+        }
+        if destination_route == LibraryRoute::AllNotes {
+            return Err(LibraryError::NotFound);
+        }
+
+        let mut fallback = self.navigation.clone();
+        fallback.clear_search();
+        fallback.navigate_to(NavigationSnapshot {
+            route: LibraryRoute::AllNotes,
+            selected_note_id: Some(note_id.clone()),
+        });
+        let projections = self.load_projections_for(&fallback)?;
+        if !projections
+            .iter()
+            .any(|projection| projection.id == note_id)
+        {
+            return Err(LibraryError::NotFound);
+        }
+        Ok((fallback, projections))
+    }
+
+    fn prepare_removed_created_note_reconciliation_commit(
+        &mut self,
+    ) -> Result<PreparedOrganizationCommit, LibraryError> {
+        let mut navigation = self.navigation.clone();
+        navigation.clear_search();
+        navigation.navigate_to(NavigationSnapshot {
+            route: LibraryRoute::AllNotes,
+            selected_note_id: None,
+        });
+        let projections = self.load_projections_for(&navigation)?;
+        let navigation_index = self.repository.list_navigation_index()?;
+        self.persist_shell_state_for(&navigation)?;
+        Ok(PreparedOrganizationCommit {
+            navigation,
+            projections,
+            navigation_index,
+            active_session: None,
+        })
+    }
+
+    fn prepare_pending_reconciliation_commit(
+        &mut self,
+    ) -> Result<PreparedOrganizationCommit, LibraryError> {
+        match self.reconciliation_pending.clone() {
+            Some(PendingReconciliation::CreateNote {
+                note,
+                destination_route,
+            }) => self.prepare_create_note_reconciliation_commit(note, destination_route),
+            Some(PendingReconciliation::CurrentRoute) | None => self.prepare_organization_commit(),
+        }
+    }
+
+    fn prepare_organization_commit(&mut self) -> Result<PreparedOrganizationCommit, LibraryError> {
+        let navigation_index = self.repository.list_navigation_index()?;
+        let mut navigation = self.navigation.clone();
+        navigation
+            .sanitize_unavailable_routes(|route| route_is_available(route, &navigation_index));
+        let prior_selected = navigation.selected_note_id().cloned();
+        if !route_is_available(navigation.route(), &navigation_index) {
+            navigation.replace_current_route(LibraryRoute::AllNotes);
+            // A deleted tag/notebook route does not itself delete the note.
+            // Preserve its stable ID long enough for the post-fallback card
+            // query to retain the existing session when it still belongs in
+            // All Notes; otherwise the deterministic successor rule below
+            // clears/replaces it.
+            navigation.select(prior_selected);
+        }
+        let projections = self.load_projections_for(&navigation)?;
+        let selected_note_id = self.organization_selection_after_refresh(&projections, &navigation);
+        navigation.select(selected_note_id);
+        let active_session = match navigation.selected_note_id().cloned() {
+            Some(id)
+                if self
+                    .active_session
+                    .as_ref()
+                    .is_some_and(|active| active.note.id == id) =>
+            {
+                let metadata = self
+                    .repository
+                    .note_organization_state(&id)?
+                    .ok_or(LibraryError::NotFound)?;
+                let mut note = self
+                    .active_session
+                    .as_ref()
+                    .expect("matching active session was checked")
+                    .note
+                    .clone();
+                note.notebook_id = metadata.notebook_id;
+                note.tag_ids = metadata.tag_ids;
+                note.updated_time = metadata.updated_time;
+                note.deleted_time = metadata.deleted_time;
+                note.revision = metadata.revision;
+                Some(ActiveSession { note })
+            }
+            Some(id) => Some(ActiveSession {
+                note: self
+                    .repository
+                    .load_note(&id)?
+                    .ok_or(LibraryError::NotFound)?,
+            }),
+            None => None,
+        };
+        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+            self.persist_shell_state_for(&navigation)?;
+        }
+        Ok(PreparedOrganizationCommit {
+            navigation,
+            projections,
+            navigation_index,
+            active_session,
+        })
+    }
+
+    fn organization_selection_after_refresh(
+        &self,
+        projections: &[NoteProjection],
+        navigation: &NavigationState,
+    ) -> Option<NoteId> {
+        let selected = navigation.selected_note_id()?.clone();
+        if projections
+            .iter()
+            .any(|projection| projection.id == selected)
+        {
+            return Some(selected);
+        }
+        let contains = |candidate: &NoteId| {
+            projections
+                .iter()
+                .any(|projection| projection.id == *candidate)
+        };
+        self.projections
+            .iter()
+            .position(|projection| projection.id == selected)
+            .and_then(|index| {
+                self.projections[index + 1..]
+                    .iter()
+                    .map(|projection| &projection.id)
+                    .find(|candidate| contains(candidate))
+                    .cloned()
+                    .or_else(|| {
+                        self.projections[..index]
+                            .iter()
+                            .rev()
+                            .map(|projection| &projection.id)
+                            .find(|candidate| contains(candidate))
+                            .cloned()
+                    })
+            })
+            .or_else(|| projections.first().map(|projection| projection.id.clone()))
+    }
+
+    fn commit_organization(&mut self, prepared: PreparedOrganizationCommit) {
+        self.navigation = prepared.navigation;
+        self.projections = prepared.projections;
+        self.navigation_index = prepared.navigation_index;
+        self.active_session = prepared.active_session;
+        if self.reconciliation_pending.take().is_some() {
+            self.partial_commit_message = None;
+        }
     }
 
     pub fn refresh_list(&mut self) -> Result<(), LibraryError> {
@@ -355,23 +814,34 @@ impl AppModel {
         {
             self.projection_event_refreshes += 1;
         }
-        // Organization rows are not card projections. Prepare their typed
-        // snapshot before changing the visible list so a failed sidebar
-        // refresh cannot publish a half-updated three-column shell.
-        let prepared_navigation_index = if events
-            .iter()
-            .any(|event| matches!(event, LibraryEvent::OrganizationChanged))
+        // Once any committed action is unreconciled, every relevant queued
+        // event must retry the one full candidate, including NoteRestored and
+        // NoteTrashed (which do not necessarily emit OrganizationChanged).
+        // Otherwise an old active session could be paired with a newly legal
+        // Trash/All Notes route and a same-card click could falsely clear its
+        // committed-action warning.
+        if self.reconciliation_pending.is_some()
+            || events
+                .iter()
+                .any(|event| matches!(event, LibraryEvent::OrganizationChanged))
         {
-            Some(self.repository.list_navigation_index()?)
-        } else {
-            None
-        };
-        let result = self.refresh_list();
-        if result.is_ok()
-            && let Some(navigation_index) = prepared_navigation_index
-        {
-            self.navigation_index = navigation_index;
+            match self.prepare_pending_reconciliation_commit() {
+                Ok(prepared) => {
+                    self.commit_organization(prepared);
+                    self.status = AppStatus::Ready;
+                    self.status_origin = StatusOrigin::Neutral;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    if self.status_origin != StatusOrigin::Action {
+                        self.status = AppStatus::Error(error.to_string());
+                        self.status_origin = StatusOrigin::ProjectionEvent;
+                    }
+                    return Err(error);
+                }
+            }
         }
+        let result = self.refresh_list();
         match &result {
             Ok(()) if self.status_origin != StatusOrigin::Action => {
                 self.status = AppStatus::Ready;
@@ -386,6 +856,60 @@ impl AppModel {
         result.map(|()| true)
     }
 
+    /// Decide whether a queued repository event can actually replace the
+    /// retained editor packet. This deliberately uses only navigation/index
+    /// and note-organization metadata: a local action's echoed
+    /// OrganizationChanged is often already reflected in `active_session`,
+    /// and forcing a lifecycle flush for that no-op echo would reset the
+    /// editor's 100ms journal/500ms settled-save timeline.
+    pub(crate) fn event_batch_requires_active_session_replacement(
+        &self,
+        events: &[LibraryEvent],
+    ) -> Result<bool, LibraryError> {
+        let Some(active) = self.active_session.as_ref() else {
+            return Ok(false);
+        };
+        let active_id = &active.note.id;
+        // `PendingRepositoryEvents` intentionally bounds the bridge by
+        // retaining one representative id per kind. A same-kind event for B
+        // can therefore replace an earlier event for dirty active A in the
+        // same 50ms batch. Never decide lifecycle safety from that lossy
+        // representative: every event which can refresh a projection probes
+        // A's own durable metadata before the shell considers unmounting it.
+        let projection_affecting = events.iter().any(|event| {
+            matches!(
+                event,
+                LibraryEvent::NoteCreated(_)
+                    | LibraryEvent::NoteProjectionChanged(_)
+                    | LibraryEvent::NoteTrashed(_)
+                    | LibraryEvent::NoteRestored(_)
+                    | LibraryEvent::OrganizationChanged
+            )
+        });
+        if !projection_affecting {
+            return Ok(false);
+        }
+
+        let Some(metadata) = self.repository.note_organization_state(active_id)? else {
+            return Ok(true);
+        };
+        if metadata.revision != active.note.revision
+            || metadata.deleted_time != active.note.deleted_time
+        {
+            return Ok(true);
+        }
+        // Stack/notebook/tag destruction can invalidate a route without
+        // changing this note's own revision (for example stack disband).
+        // This remains a lightweight index query; it never hydrates a body
+        // or blob, and it must run for a lossy coalesced projection batch as
+        // well as an explicit OrganizationChanged representative.
+        let index = self.repository.list_navigation_index()?;
+        if !route_is_available(self.navigation.route(), &index) {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn subscribe_library_events(&self) -> Receiver<LibraryEvent> {
         self.repository.subscribe()
     }
@@ -394,11 +918,51 @@ impl AppModel {
         Arc::clone(&self.repository)
     }
 
-    pub fn persist_shell_state(&self) -> Result<(), LibraryError> {
-        self.persist_shell_state_for(&self.navigation)
+    /// Resolves the current selection only for the sidebar's lifecycle
+    /// preflight. `prepare_navigation_commit` still performs the authoritative
+    /// destination-projection check before publishing a route.
+    pub(crate) fn sidebar_selected_note_for_route(
+        &self,
+        route: &LibraryRoute,
+    ) -> Result<Option<NoteId>, LibraryError> {
+        let Some(selected_note_id) = self.navigation.selected_note_id().cloned() else {
+            return Ok(None);
+        };
+        let Some(metadata) = self.repository.note_organization_state(&selected_note_id)? else {
+            return Ok(None);
+        };
+        // All Notes/Trash membership is fully described by the selected
+        // note's metadata. Avoid a duplicate sidebar-tree query for those
+        // two common routes; Notebook/Stack/Tag additionally need the
+        // current typed entity index to reject tombstoned route IDs.
+        let matches = match route {
+            LibraryRoute::AllNotes => metadata.deleted_time.is_none(),
+            LibraryRoute::Trash => metadata.deleted_time.is_some(),
+            LibraryRoute::Notebook(_) | LibraryRoute::Stack(_) | LibraryRoute::Tags(_) => {
+                let index = self.repository.list_navigation_index()?;
+                note_organization_state_matches_route(&metadata, route, &index)
+            }
+        };
+        Ok(matches.then_some(selected_note_id))
     }
 
-    fn persist_shell_state_for(&self, navigation: &NavigationState) -> Result<(), LibraryError> {
+    pub(crate) fn report_navigation_preflight_error(&mut self, error: &LibraryError) {
+        self.set_action_error_status(error);
+    }
+
+    pub fn persist_shell_state(&mut self) -> Result<(), LibraryError> {
+        let navigation = self.navigation.clone();
+        self.persist_shell_state_for(&navigation)
+    }
+
+    fn persist_shell_state_for(
+        &mut self,
+        navigation: &NavigationState,
+    ) -> Result<(), LibraryError> {
+        #[cfg(test)]
+        if let Some(error) = self.next_shell_state_persist_failure.take() {
+            return Err(error);
+        }
         self.repository
             .write_library_shell_state(&LibraryShellState {
                 sidebar_width: self.panes.sidebar_width,
@@ -463,6 +1027,37 @@ impl AppModel {
         }
         self.sort_projections();
     }
+
+    /// Apply the complete result of a normal title/body snapshot before a
+    /// later organization candidate is allowed to reuse `active_session`.
+    /// The session observer that delivers this result is retained only for
+    /// the currently mounted note, and the ID check protects a queued stale
+    /// completion after a selection change.  Unlike a resource transaction,
+    /// this save has no independent thumbnail outcome, so it intentionally
+    /// preserves the projection's canonical thumbnail field.
+    pub(crate) fn apply_active_note_snapshot(&mut self, note: Note) {
+        if self.navigation.selected_note_id() != Some(&note.id) {
+            return;
+        }
+        let Some(active) = self.active_session.as_mut() else {
+            return;
+        };
+        if active.note.id != note.id {
+            return;
+        }
+        active.note = note.clone();
+        if let Some(projection) = self
+            .projections
+            .iter_mut()
+            .find(|projection| projection.id == note.id)
+        {
+            projection.title_prefix = note.title.chars().take(120).collect();
+            projection.snippet = note.snippet.chars().take(160).collect();
+            projection.updated_time = note.updated_time;
+            projection.attachment_count = note.resource_ids.len() as i64;
+        }
+        self.sort_projections();
+    }
     pub fn panes(&self) -> PaneState {
         self.panes
     }
@@ -484,6 +1079,10 @@ impl AppModel {
     #[cfg(test)]
     pub fn fail_next_refresh_for_test(&mut self, error: LibraryError) {
         self.next_refresh_failure = Some(error);
+    }
+    #[cfg(test)]
+    pub fn fail_next_shell_state_persist_for_test(&mut self, error: LibraryError) {
+        self.next_shell_state_persist_failure = Some(error);
     }
     #[cfg(test)]
     pub fn projection_event_refreshes_for_test(&self) -> usize {
@@ -645,6 +1244,36 @@ impl AppModel {
         ));
     }
 
+    fn record_reconciliation_partial_commit(
+        &mut self,
+        committed_action: &str,
+        error: &LibraryError,
+    ) {
+        self.reconciliation_pending = Some(PendingReconciliation::CurrentRoute);
+        self.record_partial_commit(committed_action, error);
+    }
+
+    fn record_create_note_reconciliation_partial_commit(
+        &mut self,
+        note: Note,
+        destination_route: LibraryRoute,
+        error: &LibraryError,
+    ) {
+        self.reconciliation_pending = Some(PendingReconciliation::CreateNote {
+            note,
+            destination_route,
+        });
+        self.record_partial_commit("笔记已创建", error);
+    }
+
+    /// The retained shell uses this typed model fact to freeze a stale
+    /// session in the exact tick after a committed-but-unreconciled action.
+    /// It is intentionally not inferred from presentation text: a localized
+    /// warning must never become a mutation authority.
+    pub(crate) fn reconciliation_pending(&self) -> bool {
+        self.reconciliation_pending.is_some()
+    }
+
     fn set_action_success_status(&mut self) {
         if let Some(message) = &self.partial_commit_message {
             self.status = AppStatus::Error(message.clone());
@@ -662,6 +1291,47 @@ impl AppModel {
                 .unwrap_or_else(|| error.to_string()),
         );
         self.status_origin = StatusOrigin::Action;
+    }
+}
+
+fn route_is_available(route: &LibraryRoute, index: &LibraryNavigationIndex) -> bool {
+    match route {
+        LibraryRoute::AllNotes | LibraryRoute::Trash => true,
+        LibraryRoute::Notebook(id) => index.notebooks.iter().any(|notebook| notebook.id == *id),
+        LibraryRoute::Stack(id) => index.stacks.iter().any(|stack| stack.id == *id),
+        LibraryRoute::Tags(tag_ids) => tag_ids
+            .iter()
+            .all(|id| index.tags.iter().any(|tag| tag.id == *id)),
+    }
+}
+
+fn note_organization_state_matches_route(
+    note: &NoteOrganizationState,
+    route: &LibraryRoute,
+    index: &LibraryNavigationIndex,
+) -> bool {
+    match route {
+        LibraryRoute::AllNotes => note.deleted_time.is_none(),
+        LibraryRoute::Notebook(id) => {
+            note.deleted_time.is_none()
+                && note.notebook_id == *id
+                && route_is_available(route, index)
+        }
+        LibraryRoute::Stack(id) => {
+            note.deleted_time.is_none()
+                && index.stacks.iter().any(|stack| stack.id == *id)
+                && index.notebooks.iter().any(|notebook| {
+                    notebook.id == note.notebook_id && notebook.stack_id.as_ref() == Some(id)
+                })
+        }
+        LibraryRoute::Tags(tag_ids) => {
+            note.deleted_time.is_none()
+                && tag_ids.iter().all(|id| {
+                    note.tag_ids.iter().any(|tag_id| tag_id == id)
+                        && index.tags.iter().any(|tag| tag.id == *id)
+                })
+        }
+        LibraryRoute::Trash => note.deleted_time.is_some(),
     }
 }
 

@@ -304,6 +304,33 @@ impl ResourceStore {
         Ok(file)
     }
 
+    /// Re-check a previously staged content-addressed blob while a caller
+    /// holds its SQLite publication transaction. A staging operation and a
+    /// later metadata commit are intentionally separate, so the durable GC
+    /// queue may have reclaimed an otherwise invisible blob in between. Do
+    /// not let a metadata row make that absence user-visible: verify both the
+    /// descriptor-bound digest and exact staged length immediately before the
+    /// caller publishes it.
+    pub(crate) fn verify_staged_blob(&self, blob: &ResourceBlob) -> Result<(), ResourceError> {
+        let file = self.open_verified(&blob.sha256)?;
+        if file.metadata()?.len() != blob.size as u64 {
+            return Err(ResourceError::CorruptBlob);
+        }
+        Ok(())
+    }
+
+    /// Reclaim one content-addressed blob only after the repository has made
+    /// a durable no-reference decision. `unlinkat` is descriptor-relative and
+    /// never follows a replacement symlink; a missing file is already the
+    /// desired recovered state after a crash between unlink and queue ack.
+    pub(crate) fn remove_blob(&self, sha256: &BlobHash) -> Result<(), ResourceError> {
+        match unlink_at(self.blobs_dir.0, sha256.as_str()) {
+            Ok(()) => fsync_fd(self.blobs_dir.0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn read_blob(&self, sha256: &str) -> Result<Vec<u8>, ResourceError> {
         if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ResourceError::InvalidData);

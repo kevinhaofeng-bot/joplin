@@ -67,6 +67,22 @@ impl NavigationHistory {
         })
     }
 
+    /// A container/tag can be deleted while several typed snapshots still
+    /// point at it. Keep user selection where All Notes can still resolve it,
+    /// but never leave a Back/Forward entry that can resurrect a tombstoned
+    /// navigation entity.
+    fn replace_unavailable_routes(&mut self, available: impl Fn(&LibraryRoute) -> bool) {
+        for snapshot in &mut self.entries {
+            if !available(&snapshot.route) {
+                snapshot.route = LibraryRoute::AllNotes;
+            }
+        }
+    }
+
+    fn current(&self) -> NavigationSnapshot {
+        self.entries[self.cursor].clone()
+    }
+
     pub fn can_navigate_back(&self) -> bool {
         self.cursor > 0
     }
@@ -153,6 +169,29 @@ impl NavigationState {
         self.route = snapshot.route;
         self.selected_note_id = snapshot.selected_note_id;
         self.history.push(self.snapshot());
+    }
+
+    /// A destructive organization mutation can make the current typed route
+    /// unavailable (for example a deleted notebook or tag). That is not a
+    /// user navigation, so replace the current history snapshot instead of
+    /// appending a phantom route which Back would immediately revisit.
+    pub(crate) fn replace_current_route(&mut self, route: LibraryRoute) {
+        self.route = route;
+        self.selected_note_id = None;
+        self.history.replace_current(self.snapshot());
+    }
+
+    /// Organization deletion is not user navigation, but it can invalidate
+    /// more than the current route. Rewrite the complete native history in
+    /// one candidate before `AppModel` commits its new index/projection
+    /// packet, so Back/Forward cannot land on a ghost Notebook/Tag/Stack.
+    pub(crate) fn sanitize_unavailable_routes(
+        &mut self,
+        available: impl Fn(&LibraryRoute) -> bool,
+    ) {
+        self.history.replace_unavailable_routes(&available);
+        self.route_sorts.retain(|route, _| available(route));
+        self.apply_history_snapshot(&self.history.current());
     }
 
     pub(crate) fn navigate_back(&mut self) -> Option<NavigationSnapshot> {

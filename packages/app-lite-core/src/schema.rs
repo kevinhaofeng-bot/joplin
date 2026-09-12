@@ -4,7 +4,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub(crate) fn migrate_schema(
     connection: &mut Connection,
@@ -45,6 +45,7 @@ pub(crate) fn migrate_schema(
     transaction.execute_batch("CREATE TABLE IF NOT EXISTS stacks (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS notebooks (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, stack_id TEXT REFERENCES stacks(id) ON DELETE SET NULL, is_default INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS resource_blobs (sha256 TEXT PRIMARY KEY NOT NULL, size INTEGER NOT NULL, mime TEXT NOT NULL, relative_path TEXT NOT NULL, created_time INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS resource_gc_queue (sha256 TEXT PRIMARY KEY NOT NULL, created_time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS resources (id TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL REFERENCES resource_blobs(sha256), title TEXT NOT NULL, mime TEXT NOT NULL, file_extension TEXT NOT NULL, size INTEGER NOT NULL, created_time INTEGER NOT NULL, updated_time INTEGER NOT NULL, deleted_time INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL DEFAULT '', body_html TEXT NOT NULL DEFAULT '', body_text TEXT NOT NULL DEFAULT '', snippet TEXT NOT NULL DEFAULT '', notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE RESTRICT, selected_thumbnail_id TEXT REFERENCES resources(id) ON DELETE SET NULL, merge_state BLOB, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS tags (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, created_time INTEGER NOT NULL DEFAULT 0, updated_time INTEGER NOT NULL DEFAULT 0, deleted_time INTEGER NOT NULL DEFAULT 0);
@@ -124,9 +125,21 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
     // before publishing v5, otherwise the first crash checkpoint after an
     // apparently successful upgrade fails at runtime.
     ensure_edit_journal_v5(&transaction, version)?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS resource_gc_queue (sha256 TEXT PRIMARY KEY NOT NULL, created_time INTEGER NOT NULL);",
+    )?;
     transaction.execute("INSERT OR IGNORE INTO note_revisions (note_id, revision, title, body_html, body_text, created_time) SELECT id, 1, title, body_html, body_text, updated_time FROM notes", [])?;
-    transaction.execute("INSERT OR IGNORE INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-bootstrap' FROM notes", [])?;
-    transaction.execute_batch("PRAGMA user_version = 5")?;
+    if version < 6 {
+        transaction.execute("INSERT OR IGNORE INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-bootstrap' FROM notes", [])?;
+    }
+    if version < 8 {
+        // These projections are deliberately independent from authoritative
+        // notes.  v6 profiles may have an already-acked old queue, so every
+        // surviving note is replayed once when the indexes first appear.
+        transaction.execute_batch("CREATE TABLE IF NOT EXISTS search_index_rows (fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT, note_id TEXT NOT NULL UNIQUE); CREATE VIRTUAL TABLE IF NOT EXISTS search_unicode USING fts5(note_id UNINDEXED, title, body, tokenize='unicode61'); CREATE VIRTUAL TABLE IF NOT EXISTS search_trigram USING fts5(note_id UNINDEXED, title, body, tokenize='trigram');")?;
+        transaction.execute("INSERT INTO search_queue (note_id, updated_time, reason) SELECT id, updated_time, 'migration-v7-bootstrap' FROM notes WHERE true ON CONFLICT(note_id) DO NOTHING", [])?;
+    }
+    transaction.execute_batch("PRAGMA user_version = 8")?;
     before_commit();
     // The test hook models the last pathname/descriptor race.  It must run
     // before the final identity check so a swapped profile aborts the still

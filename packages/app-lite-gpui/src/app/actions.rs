@@ -1,4 +1,4 @@
-use app_lite_core::{LibraryRoute, NoteId, SortSpec};
+use app_lite_core::{LibraryRoute, NoteId, NotebookId, SortSpec, StackId, TagId};
 
 gpui::actions!(
     notes_library,
@@ -72,6 +72,35 @@ impl NoteSort {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppAction {
     CreateNote,
+    CreateStack {
+        title: String,
+    },
+    CreateNotebook {
+        title: String,
+        stack_id: Option<StackId>,
+    },
+    CreateTag {
+        title: String,
+    },
+    RenameStack {
+        id: StackId,
+        title: String,
+    },
+    RenameNotebook {
+        id: NotebookId,
+        title: String,
+    },
+    RenameTag {
+        id: TagId,
+        title: String,
+    },
+    DeleteStack(StackId),
+    DeleteNotebook(NotebookId),
+    DeleteTag(TagId),
+    MoveSelectedNote(NotebookId),
+    SetSelectedNoteTags(Vec<TagId>),
+    AddTagToSelectedNote(TagId),
+    RemoveTagFromSelectedNote(TagId),
     SelectNote(NoteId),
     NavigateTo {
         route: LibraryRoute,
@@ -81,6 +110,10 @@ pub enum AppAction {
     NavigateForward,
     TrashNote(NoteId),
     TrashSelected,
+    RestoreNote(NoteId),
+    RestoreSelected,
+    PurgeNote(NoteId),
+    PurgeSelected,
     ToggleSidebar,
     ToggleNoteList,
     SetListViewMode(ListViewMode),

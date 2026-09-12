@@ -102,6 +102,19 @@ pub struct Note {
     pub revision: i64,
 }
 
+/// The narrow post-organization shape for an already-mounted note. It keeps
+/// route membership and tag controls current without loading canonical HTML,
+/// search text, merge state, or resource bytes just to repaint a sidebar/menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteOrganizationState {
+    pub id: NoteId,
+    pub notebook_id: NotebookId,
+    pub tag_ids: Vec<TagId>,
+    pub updated_time: i64,
+    pub deleted_time: Option<i64>,
+    pub revision: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateNote {
     pub title: String,

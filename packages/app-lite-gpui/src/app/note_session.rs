@@ -583,7 +583,12 @@ enum SaveCompletion {
         ownership: JournalOwnership,
     },
     Snapshot {
-        saved: SavedRevision,
+        /// The normal text/title save path must carry the same complete Note
+        /// assembled inside its SQLite transaction.  Organization mutations
+        /// can otherwise remount a stale `AppModel::active_session` body
+        /// after a successful autosave and overwrite that durable text with a
+        /// later edit.
+        note: Note,
         snapshot: SessionSnapshot,
         expected_revision: i64,
     },
@@ -1036,6 +1041,16 @@ fn hydrate_persisted_attachments(
 /// selection and paint notifications that must never create false saves.
 pub(crate) struct NoteSession {
     note_id: NoteId,
+    /// A deleted note has no legal journal/snapshot CAS target. Keep its
+    /// retained detail session for copy, scrolling and attachment open, but
+    /// place both title and body behind the same read-only authority.
+    read_only: bool,
+    /// A local organization/trash mutation committed in SQLite but has not
+    /// yet produced a coherent replacement candidate for the retained shell.
+    /// While that candidate is pending, the old revision is only a stale
+    /// presentation snapshot and must not accept title/body/format/resource
+    /// mutations that a following event could otherwise discard.
+    reconciliation_locked: bool,
     expected_revision: i64,
     writer_token: String,
     /// The current journal lease owned by this session. It changes every time
@@ -1089,6 +1104,12 @@ pub(crate) struct NoteSession {
     _opened_attachment_sources: Vec<AttachmentMaterializationLease>,
     pending_staged_resource: Option<PendingStagedResourceInsert>,
     pending_failed_resource_commit: Option<StagedResourceInsert>,
+    /// A normal title/body snapshot has committed.  The retained shell
+    /// consumes this authoritative result before any organization candidate
+    /// is allowed to reuse the active-session note as metadata scaffolding.
+    /// Coalescing to the latest completion is safe: it is a complete durable
+    /// note, and an observer never needs an intermediate body revision.
+    saved_note_outcome: Option<Note>,
     resource_import_outcome: Option<Result<InsertedResource, SaveError>>,
     attachment_open_outcome: Option<Result<AttachmentOpenSuccess, SaveError>>,
     attachment_opener: AttachmentOpener,
@@ -1231,13 +1252,27 @@ impl NoteSession {
             journal_ownership,
             recovery_ownership: _,
         } = prepared.0;
+        let read_only = note.deleted_time.is_some();
         let committed_snapshot = NativeSessionSnapshot {
             title: snapshot.title.clone(),
             document: document.clone(),
             allowed_resource_ids: snapshot.resource_ids.clone(),
         };
-        let title = cx.new(|cx| TitleInput::new(snapshot.title.clone(), cx));
-        let editor = cx.new(|cx| EditorCore::new(document, cx));
+        let title_text = snapshot.title.clone();
+        let title = cx.new(move |cx| {
+            if read_only {
+                TitleInput::new_read_only(title_text, cx)
+            } else {
+                TitleInput::new(title_text, cx)
+            }
+        });
+        let editor = cx.new(move |cx| {
+            if read_only {
+                EditorCore::new_read_only(document, cx)
+            } else {
+                EditorCore::new(document, cx)
+            }
+        });
         let mut load_notices = image_load_notices;
         load_notices.extend(attachment_load_notices);
         let mut resource_load_warning = (!load_notices.is_empty()).then(|| load_notices.join("；"));
@@ -1300,6 +1335,8 @@ impl NoteSession {
         }
         Self {
             note_id: note.id,
+            read_only,
+            reconciliation_locked: false,
             expected_revision: note.revision,
             writer_token,
             journal_ownership,
@@ -1329,6 +1366,7 @@ impl NoteSession {
             _opened_attachment_sources: Vec::new(),
             pending_staged_resource: None,
             pending_failed_resource_commit: None,
+            saved_note_outcome: None,
             resource_import_outcome: None,
             attachment_open_outcome: None,
             attachment_opener: Arc::new(system_attachment_opener),
@@ -1371,6 +1409,59 @@ impl NoteSession {
         &self.title
     }
 
+    /// Any current input path must use this capability, rather than infer it
+    /// from the durable deleted flag. A reconciliation lock is deliberately
+    /// as strong as Trash for document/title/format/resource mutation.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only || self.reconciliation_locked
+    }
+
+    /// Only the durable deleted-note preview has Trash lifecycle semantics.
+    /// In particular, a temporary reconciliation lock must never let
+    /// Restore/Purge bypass the ordinary active-session flush boundary.
+    pub(crate) fn is_durable_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub(crate) fn is_reconciliation_locked(&self) -> bool {
+        self.reconciliation_locked
+    }
+
+    /// Freeze or unfreeze a retained, otherwise editable session while the
+    /// AppModel reconciles a committed metadata mutation. The durable Trash
+    /// flag remains authoritative, so a successful candidate can only unlock
+    /// sessions which were editable before this temporary fence.
+    pub(crate) fn set_reconciliation_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
+        if self.reconciliation_locked == locked {
+            return;
+        }
+        self.reconciliation_locked = locked;
+        if locked {
+            // A staged descriptor has no visible SQLite metadata yet, but
+            // its tracked Selection was captured from the revision which is
+            // now being reconciled.  Do not keep it around to run after an
+            // unlock: that would turn an old picker/drop completion into a
+            // mutation of whichever packet eventually wins recovery.
+            if let Some(pending) = self.pending_staged_resource.take() {
+                self.discard_resource_insert_intent(pending.intent, cx);
+                self.pending_resource_lifecycle_flush = false;
+                self.resource_import_outcome = Some(Err(SaveError::new(
+                    "资料库已提交，正在恢复界面；已取消本次资源插入，请恢复后重新选择",
+                )));
+            }
+        }
+        let title_read_only = self.read_only || locked;
+        let _ = self.title.update(cx, |title, title_cx| {
+            title.set_read_only_for_session(title_read_only);
+            title_cx.notify();
+        });
+        let _ = self.editor.update(cx, |editor, editor_cx| {
+            editor.set_recovery_locked(locked);
+            editor_cx.notify();
+        });
+        cx.notify();
+    }
+
     pub(crate) fn editor(&self) -> &Entity<EditorCore> {
         &self.editor
     }
@@ -1397,6 +1488,15 @@ impl NoteSession {
 
     pub(crate) fn save_generation(&self) -> i64 {
         self.save.generation()
+    }
+
+    pub(crate) fn expected_revision(&self) -> i64 {
+        self.expected_revision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_save_failure_for_test(&mut self, message: impl Into<String>) {
+        self.save.fail(message);
     }
 
     /// A lifecycle action has asked for an exact durable confirmation.  A
@@ -1495,6 +1595,13 @@ impl NoteSession {
         // Own cleanup from the first instruction: a validation error or a
         // canceled retained task must remove only bridge-owned temp files.
         let temporary_paths = TemporaryResourcePaths(owned_temporary_paths);
+        if self.is_read_only() {
+            return Err(SaveError::new(if self.read_only {
+                "废纸篓中的笔记为只读；请先恢复后再插入资源"
+            } else {
+                "资料库已提交，正在恢复界面；暂不可插入资源"
+            }));
+        }
         if !intent.belongs_to(&self.note_id) {
             return Err(SaveError::new(
                 "资源插入意图不属于当前笔记；请重新选择插入位置",
@@ -1575,6 +1682,17 @@ impl NoteSession {
                 return;
             }
         };
+        if self.is_read_only() {
+            self.discard_resource_insert_intent(intent, cx);
+            self.pending_resource_lifecycle_flush = false;
+            self.resource_import_outcome = Some(Err(SaveError::new(if self.read_only {
+                "废纸篓中的笔记为只读；已取消本次资源插入"
+            } else {
+                "资料库已提交，正在恢复界面；已取消本次资源插入，请恢复后重新选择"
+            })));
+            cx.notify();
+            return;
+        }
         // A Task-4 journal/snapshot may have started while the descriptor was
         // being copied. Preserve the tracked Selection and wait for that exact
         // writer instead of resolving a later live caret or racing its lease.
@@ -1592,6 +1710,19 @@ impl NoteSession {
     }
 
     fn drive_pending_staged_resource(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            if let Some(pending) = self.pending_staged_resource.take() {
+                self.discard_resource_insert_intent(pending.intent, cx);
+                self.pending_resource_lifecycle_flush = false;
+                self.resource_import_outcome = Some(Err(SaveError::new(if self.read_only {
+                    "废纸篓中的笔记为只读；已取消本次资源插入"
+                } else {
+                    "资料库已提交，正在恢复界面；已取消本次资源插入，请恢复后重新选择"
+                })));
+                cx.notify();
+            }
+            return;
+        }
         if self.resource_insert_is_fenced() {
             return;
         }
@@ -1614,6 +1745,13 @@ impl NoteSession {
         intent: InsertIntent,
         cx: &mut Context<Self>,
     ) -> Result<(), SaveError> {
+        if self.is_read_only() {
+            return Err(SaveError::new(if self.read_only {
+                "废纸篓中的笔记为只读；请先恢复后再插入资源"
+            } else {
+                "资料库已提交，正在恢复界面；暂不可插入资源"
+            }));
+        }
         if !intent.belongs_to(&self.note_id) {
             return Err(SaveError::new(
                 "资源插入意图不属于当前笔记；请重新选择插入位置",
@@ -2013,6 +2151,13 @@ impl NoteSession {
     /// discarded and the caller can continue with an ordinary snapshot of the
     /// remaining document.
     fn retry_failed_resource_commit(&mut self, cx: &mut Context<Self>) -> Result<bool, SaveError> {
+        if self.is_read_only() {
+            return Err(SaveError::new(if self.read_only {
+                "废纸篓中的笔记为只读；请先恢复后再重试资源"
+            } else {
+                "资料库已提交，正在恢复界面；暂不可重试资源"
+            }));
+        }
         if self._resource_commit_task.is_some() {
             return Err(SaveError::new("资源重试已在后台进行"));
         }
@@ -2093,6 +2238,15 @@ impl NoteSession {
         &mut self,
     ) -> Option<Result<InsertedResource, SaveError>> {
         self.resource_import_outcome.take()
+    }
+
+    /// Return the latest complete note produced by the ordinary title/body
+    /// snapshot transaction.  This is deliberately separate from resource
+    /// import outcomes: a normal save has no resource-side presentation work,
+    /// but the model still needs its exact durable body before an
+    /// organization action may build a replacement active session.
+    pub(crate) fn take_saved_note_outcome(&mut self) -> Option<Note> {
+        self.saved_note_outcome.take()
     }
 
     /// Start the explicit attachment-open path. It is independent from save
@@ -2207,6 +2361,13 @@ impl NoteSession {
         intent: InsertIntent,
         cx: &mut Context<Self>,
     ) -> Result<InsertedResource, SaveError> {
+        if self.is_read_only() {
+            return Err(SaveError::new(if self.read_only {
+                "废纸篓中的笔记为只读；请先恢复后再插入资源"
+            } else {
+                "资料库已提交，正在恢复界面；暂不可插入资源"
+            }));
+        }
         if !intent.belongs_to(&self.note_id) {
             return Err(SaveError::new(
                 "资源插入意图不属于当前笔记；请重新选择插入位置",
@@ -2652,6 +2813,19 @@ impl NoteSession {
         editor: &Entity<EditorCore>,
         cx: &mut Context<Self>,
     ) {
+        // Image materialization remains a presentation concern for a Trash
+        // preview, but legacy geometry repair mutates the canonical document
+        // and schedules a save. A deleted note may never take that semantic
+        // path merely because it became visible. A temporary reconciliation
+        // lock merely postpones the repair until its full candidate unlocks;
+        // dropping that queue would permanently preserve legacy geometry.
+        if self.read_only {
+            self.pending_legacy_image_repairs.clear();
+            return;
+        }
+        if self.reconciliation_locked {
+            return;
+        }
         if editor.read(cx).marked_text().is_some() || self.title.read(cx).marked_range().is_some() {
             return;
         }
@@ -2831,7 +3005,7 @@ impl NoteSession {
             }
             SaveWork::Snapshot { .. } => {
                 let snapshot = Self::encode_snapshot(job.snapshot, "保存快照")?;
-                let saved = job.repository.flush_snapshot(
+                let note = job.repository.flush_snapshot_note(
                     SaveNote {
                         id: job.note_id,
                         expected_revision: job.expected_revision,
@@ -2843,7 +3017,7 @@ impl NoteSession {
                     job.journal_ownership,
                 )?;
                 Ok(SaveCompletion::Snapshot {
-                    saved,
+                    note,
                     snapshot,
                     expected_revision: job.expected_revision,
                 })
@@ -2876,10 +3050,14 @@ impl NoteSession {
                 Ok(None)
             }
             Ok(SaveCompletion::Snapshot {
-                saved,
+                note,
                 snapshot,
                 expected_revision,
             }) => {
+                let saved = SavedRevision {
+                    revision: note.revision,
+                    saved_time: note.updated_time,
+                };
                 let completes_pending_flush = self.pending_flush.is_some_and(|barrier| {
                     publishes_current_generation
                         && barrier.generation == generation
@@ -2888,6 +3066,7 @@ impl NoteSession {
                 });
                 self.expected_revision = saved.revision;
                 self.last_saved = saved.clone();
+                self.saved_note_outcome = Some(note);
                 self.journal_base = snapshot;
                 self.journal_ownership = None;
                 self.save.snapshotted(generation);

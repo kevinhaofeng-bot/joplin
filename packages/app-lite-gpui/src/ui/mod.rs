@@ -1,7 +1,11 @@
+mod card_thumbnail;
 pub mod note_card;
 pub mod note_list;
 pub mod sidebar;
 
+use self::card_thumbnail::{
+    CARD_THUMBNAIL_CACHE_BUDGET, CARD_THUMBNAIL_PROXY_EDGE, CardThumbnailManager,
+};
 #[cfg(test)]
 use crate::app::note_session::AttachmentOpener;
 use crate::app::note_session::{InsertIntent, NoteSession, ResourceImportRequest};
@@ -33,17 +37,23 @@ use crate::native_editor::toolbar::{
 };
 #[cfg(test)]
 use app_lite_core::CanonicalDocument;
-use app_lite_core::{LibraryRepository, Note, NoteId, NoteProjection};
+use app_lite_core::{
+    LibraryEvent, LibraryRepository, LibraryRoute, Note, NoteId, NoteProjection, NotebookId,
+    ResourceId, StackId, TagId,
+};
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent,
     ElementInputHandler, Entity, ExternalPaths, FocusHandle, FontWeight, InteractiveElement,
     IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathPromptOptions, Render, ScrollStrategy, SharedString, Styled,
-    Subscription, Task, TextRun, UniformListScrollHandle, Window, WindowBounds, WindowHandle,
-    WindowOptions, canvas, div, point, px, rgba, size, uniform_list,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, TextRun, UniformListDecoration,
+    UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowOptions, canvas, div, point,
+    px, rgba, size, uniform_list,
 };
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -52,10 +62,139 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
+// These are presentation-only library actions. They intentionally do not
+// mirror an `AppAction`: the model remains the sole owner of durable note,
+// route, sort and pane mutations, while the shell owns only menu visibility
+// and the platform-picker handoff.
+gpui::actions!(
+    library_toolbar_adaptation,
+    [
+        ToggleLibraryToolbarMore,
+        ToggleLibraryOrganizationPanel,
+        OpenLibraryResourcePicker,
+    ]
+);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ShellSaveError {
     Automatic { generation: i64, message: String },
     Lifecycle { message: String },
+}
+
+/// A bounded coalescing buffer between the repository's unbounded sender and
+/// the retained GPUI event task. The model refresh only distinguishes these
+/// event *kinds*; keeping one representative ID per kind is therefore enough
+/// to preserve its semantics while an IME/save/reconciliation barrier delays
+/// installation of a full candidate.
+#[derive(Default)]
+struct PendingRepositoryEvents {
+    note_created: Option<NoteId>,
+    projection_changed: Option<NoteId>,
+    note_trashed: Option<NoteId>,
+    note_restored: Option<NoteId>,
+    organization_changed: bool,
+}
+
+impl PendingRepositoryEvents {
+    fn merge(&mut self, event: LibraryEvent) {
+        match event {
+            LibraryEvent::NoteCreated(id) => self.note_created = Some(id),
+            LibraryEvent::NoteProjectionChanged(id) => self.projection_changed = Some(id),
+            LibraryEvent::NoteTrashed(id) => self.note_trashed = Some(id),
+            LibraryEvent::NoteRestored(id) => self.note_restored = Some(id),
+            LibraryEvent::OrganizationChanged => self.organization_changed = true,
+            // Search/sync queue notifications have no library projection
+            // transition in this MVP and were intentionally ignored by the
+            // previous bridge as well.
+            LibraryEvent::SearchProjectionQueued(_) | LibraryEvent::SyncQueued(_) => {}
+        }
+    }
+
+    fn drain(&mut self, receiver: &Receiver<LibraryEvent>) {
+        for event in receiver.try_iter().take(128) {
+            self.merge(event);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.note_created.is_none()
+            && self.projection_changed.is_none()
+            && self.note_trashed.is_none()
+            && self.note_restored.is_none()
+            && !self.organization_changed
+    }
+
+    fn events(&self) -> Vec<LibraryEvent> {
+        let mut events = Vec::with_capacity(5);
+        if let Some(id) = &self.note_created {
+            events.push(LibraryEvent::NoteCreated(id.clone()));
+        }
+        if let Some(id) = &self.projection_changed {
+            events.push(LibraryEvent::NoteProjectionChanged(id.clone()));
+        }
+        if let Some(id) = &self.note_trashed {
+            events.push(LibraryEvent::NoteTrashed(id.clone()));
+        }
+        if let Some(id) = &self.note_restored {
+            events.push(LibraryEvent::NoteRestored(id.clone()));
+        }
+        if self.organization_changed {
+            events.push(LibraryEvent::OrganizationChanged);
+        }
+        events
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// An irreversible library command is deliberately only an in-shell intent
+/// until the person confirms it. Its stable ID is retained here rather than a
+/// row position so a changed route/card cannot redirect an old confirmation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingDestructiveAction {
+    DeleteStack(StackId),
+    DeleteNotebook(NotebookId),
+    DeleteTag(TagId),
+    PurgeNote(NoteId),
+}
+
+impl PendingDestructiveAction {
+    fn action(&self) -> AppAction {
+        match self {
+            Self::DeleteStack(id) => AppAction::DeleteStack(id.clone()),
+            Self::DeleteNotebook(id) => AppAction::DeleteNotebook(id.clone()),
+            Self::DeleteTag(id) => AppAction::DeleteTag(id.clone()),
+            Self::PurgeNote(id) => AppAction::PurgeNote(id.clone()),
+        }
+    }
+
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::DeleteStack(_) => "确认解散当前笔记本组？组内笔记本和笔记会保留。",
+            Self::DeleteNotebook(_) => "确认删除当前笔记本？其中笔记会移至默认笔记本。",
+            Self::DeleteTag(_) => "确认删除当前标签？笔记正文不会删除。",
+            Self::PurgeNote(_) => "确认永久删除当前笔记？此操作不可撤销。",
+        }
+    }
+}
+
+/// A native panel completion is bound to the exact picker invocation that
+/// captured its selection.  A window can recover, switch notes, or open a
+/// second panel before the first AppKit callback arrives; accepting a bare
+/// path would let the old callback consume the newer panel's saved intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResourcePickerToken(u64);
+
+struct PendingResourcePicker {
+    token: ResourcePickerToken,
+    intent: InsertIntent,
+}
+
+struct ResourcePickerPrompt {
+    window: WindowHandle<LibraryShell>,
+    token: ResourcePickerToken,
 }
 
 /// A real platform completion whose saved document point must survive a
@@ -90,6 +229,16 @@ const EVERNOTE_LIGHT_PRIMARY_TEXT: u32 = 0x141414ff;
 const EVERNOTE_LIGHT_MUTED_TEXT: u32 = 0x696564ff;
 /// `--color-surface-stroke-primary-enabled` resolves to `--colors-grey-95`.
 const EVERNOTE_LIGHT_PRIMARY_STROKE: u32 = 0xf3f2f1ff;
+
+/// Measured against the Chinese labels in the default three-pane window:
+/// 540--580pt is compact, while an approximately 830pt editor keeps the
+/// familiar full row. This is a local GPUI product decision, not an inferred
+/// Evernote breakpoint.
+const LIBRARY_TOOLBAR_COMPACT_WIDTH: f32 = 640.0;
+
+fn library_toolbar_is_compact(available_editor_width: f32) -> bool {
+    available_editor_width < LIBRARY_TOOLBAR_COMPACT_WIDTH
+}
 
 #[derive(Clone, Copy, Debug)]
 enum LibraryPrimarySurface {
@@ -128,12 +277,106 @@ struct LibraryEditorRender {
     overlays: Vec<gpui::AnyElement>,
 }
 
+/// The application toolbar follows normal editor-column flex layout, while
+/// its compact More menu uses a window-layer backdrop so outside clicks cannot
+/// reach the editor surface's capture-phase selection handler.
+struct LibraryToolbarRender {
+    toolbar: gpui::AnyElement,
+    overlays: Vec<gpui::AnyElement>,
+}
+
 impl LibraryEditorRender {
     fn plain(pane: gpui::AnyElement) -> Self {
         Self {
             pane,
             overlays: Vec::new(),
         }
+    }
+}
+
+/// `UniformList::render_items` is also called for measurement probes (usually
+/// item zero). Decorations run only after UniformList has computed its real
+/// prepaint `visible_range`, so this invisible observer is the first safe
+/// place to reconcile card thumbnail residency. It intentionally produces no
+/// visual or hit-test surface of its own.
+struct CardThumbnailViewportDecoration {
+    shell: gpui::WeakEntity<LibraryShell>,
+    projections: Arc<Vec<NoteProjection>>,
+    state: Rc<RefCell<CardThumbnailViewportState>>,
+}
+
+/// Shared by the short-lived UniformList decoration instances for one shell.
+/// It avoids opening an entity update on every prepaint when the actual
+/// visible thumbnail identities did not change, while an explicit worker
+/// completion invalidates it so a newly adopted proxy is installed once.
+#[derive(Default)]
+struct CardThumbnailViewportState {
+    last_resource_ids: Option<HashSet<ResourceId>>,
+}
+
+impl CardThumbnailViewportState {
+    fn take_if_changed(
+        &mut self,
+        resource_ids: HashSet<ResourceId>,
+    ) -> Option<HashSet<ResourceId>> {
+        if self.last_resource_ids.as_ref() == Some(&resource_ids) {
+            None
+        } else {
+            self.last_resource_ids = Some(resource_ids.clone());
+            Some(resource_ids)
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.last_resource_ids = None;
+    }
+
+    /// `UniformList::render_items` is also used for the index-zero measuring
+    /// probe. That probe may construct a Card whose bounded proxy is retained
+    /// in the source LRU but is not in the actual prepaint viewport. Do not
+    /// hand an `img` that source: GPUI would ask the image cache to decode it,
+    /// the cache would reject it as non-visible on completion, and the next
+    /// measurement frame would start the same decode again.
+    fn contains(&self, resource_id: Option<&ResourceId>) -> bool {
+        resource_id.is_some_and(|resource_id| {
+            self.last_resource_ids
+                .as_ref()
+                .is_some_and(|resource_ids| resource_ids.contains(resource_id))
+        })
+    }
+}
+
+impl UniformListDecoration for CardThumbnailViewportDecoration {
+    fn compute(
+        &self,
+        visible_range: std::ops::Range<usize>,
+        _bounds: Bounds<gpui::Pixels>,
+        _scroll_offset: gpui::Point<gpui::Pixels>,
+        _item_height: gpui::Pixels,
+        _item_count: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        #[cfg(test)]
+        let visible_range_for_test = visible_range.clone();
+        let resource_ids = visible_range
+            .filter_map(|index| {
+                self.projections
+                    .get(index)
+                    .and_then(|projection| projection.selected_thumbnail_id.clone())
+            })
+            .collect::<HashSet<_>>();
+        let resource_ids = self.state.borrow_mut().take_if_changed(resource_ids);
+        if let Some(resource_ids) = resource_ids {
+            let _ = self.shell.update(cx, |shell, shell_cx| {
+                #[cfg(test)]
+                {
+                    shell.rendered_note_range = Some(visible_range_for_test);
+                }
+                shell.reconcile_card_thumbnail_residency(resource_ids, window, shell_cx);
+            });
+        }
+        div().size_full().into_any_element()
     }
 }
 
@@ -166,11 +409,38 @@ pub struct LibraryShell {
     /// resource invalidates the current canvas rather than waiting for a note
     /// switch to construct another cache.
     image_cache: Entity<BudgetedImageCache>,
+    /// Cards own a separate, much smaller cache and task-owned source leases.
+    /// It intentionally never participates in the active editor's image
+    /// residency: scrolling the list must not evict or hydrate document
+    /// images, and opening a document must not populate card textures.
+    card_thumbnail_cache: Entity<BudgetedImageCache>,
+    /// The exact card proxy sources last installed in `card_thumbnail_cache`.
+    /// UniformList measures and paints a stable viewport more than once per
+    /// frame; updating the cache for an unchanged source set would notify the
+    /// window and turn those measurement passes into a decode/redraw loop.
+    card_thumbnail_cache_resources: HashSet<gpui::Resource>,
+    card_thumbnails: CardThumbnailManager,
+    card_thumbnail_viewport_state: Rc<RefCell<CardThumbnailViewportState>>,
+    _card_thumbnail_task: Option<Task<()>>,
     surface_note_id: Option<NoteId>,
+    /// Organization commands may commit a new revision for the *same* NoteId
+    /// (for example move or tag membership). The retained session owns an
+    /// optimistic save fence for its original revision, so the model observer
+    /// must rebuild it only after one of those successful external commits.
+    /// Normal editor saves deliberately do not set this flag: their live
+    /// session has already advanced its own fence and must retain history.
+    remount_current_surface_after_organization_commit: bool,
     /// Saved before a native panel opens. Completion always uses this point,
     /// never an arbitrary caret that may have moved while the picker owned
     /// focus.
-    pending_resource_insert: Option<InsertIntent>,
+    pending_resource_insert: Option<PendingResourcePicker>,
+    /// A native picker can complete after a committed organization action has
+    /// frozen the retained session.  Its old tracked selection was discarded
+    /// at the lock transition; retain only this one-shot reason so the late
+    /// platform callback gets a truthful recovery error rather than silently
+    /// looking like an ordinary picker expiry.
+    last_resource_picker_cancelled_by_reconciliation: Option<ResourcePickerToken>,
+    next_resource_picker_token: u64,
     queued_resource_inserts: VecDeque<QueuedResourceInsert>,
     resource_queue_completion_scheduled: bool,
     pending_drop_intent: Option<InsertIntent>,
@@ -185,10 +455,21 @@ pub struct LibraryShell {
     startup_notice: Option<String>,
     save_clock: Arc<dyn crate::app::save_coordinator::SaveClock>,
     focus_handle: FocusHandle,
+    /// A small real text-input owner for C1 organization actions. It shares
+    /// the title input's UTF-16 bridge but is intentionally independent from
+    /// the active note title/session so cancelling an organization menu can
+    /// never dirty a document.
+    organization_input: Entity<TitleInput>,
+    organization_panel_open: bool,
+    pending_destructive_action: Option<PendingDestructiveAction>,
     /// Retained alongside the shell so the typed navigation tree can request
     /// an offscreen route without eagerly constructing every notebook/tag row.
     sidebar_scroll: UniformListScrollHandle,
     note_list_scroll: UniformListScrollHandle,
+    /// Compact editor columns preserve high-frequency actions directly and
+    /// house the secondary route/list mutations in this one transient menu.
+    /// It owns no `AppAction` state and is closed on any model transition.
+    toolbar_more_open: bool,
     _model_observation: Subscription,
     // Held by the entity so GPUI cancels the receiver loop when this window is
     // destroyed. The task captures only a WeakEntity and never blocks on recv.
@@ -204,6 +485,13 @@ pub struct LibraryShell {
     /// library windows concurrently.
     #[cfg(test)]
     sidebar_render_probe: SidebarRenderProbe,
+    /// Per-shell rather than global because mounted tests create independent
+    /// windows concurrently. It proves a stable Cards viewport does not
+    /// continuously re-install the same cache residency.
+    #[cfg(test)]
+    card_thumbnail_cache_reconciliations: usize,
+    #[cfg(test)]
+    card_thumbnail_viewport_reconciliations: usize,
     #[cfg(test)]
     library_surface_paint_hooks_for_test: Arc<LibrarySurfacePaintHooks>,
 }
@@ -309,6 +597,9 @@ impl SidebarRenderProbe {
 #[derive(Clone, Debug)]
 pub(crate) struct ImageFlowProbe {
     pub(crate) note_id: NoteId,
+    /// Proves a lifecycle event retained the same stage/commit owner instead
+    /// of merely repainting the same NoteId through a replacement session.
+    pub(crate) session_entity_id: gpui::EntityId,
     pub(crate) has_image_block: bool,
     pub(crate) measured_height: f32,
     pub(crate) cache_has_resource: bool,
@@ -373,6 +664,16 @@ fn bind_library_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-alt-v", CycleListViewMode, Some("LibraryShell")),
         KeyBinding::new("cmd-alt-o", CycleSort, Some("LibraryShell")),
         KeyBinding::new("cmd-s", SyncCurrent, Some("LibraryShell")),
+        // Compact-toolbar presentation commands deliberately remain scoped to
+        // the library window. They do not introduce model mutations outside
+        // the existing typed AppAction reducer.
+        KeyBinding::new("cmd-alt-m", ToggleLibraryToolbarMore, Some("LibraryShell")),
+        KeyBinding::new(
+            "cmd-alt-g",
+            ToggleLibraryOrganizationPanel,
+            Some("LibraryShell"),
+        ),
+        KeyBinding::new("cmd-alt-i", OpenLibraryResourcePicker, Some("LibraryShell")),
     ]);
 }
 
@@ -484,8 +785,16 @@ impl LibraryShell {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
+        let organization_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
         let image_cache = BudgetedImageCache::new_entity_in_context(cx, DECODED_IMAGE_CACHE_BUDGET);
+        let card_thumbnail_cache =
+            BudgetedImageCache::new_entity_in_context(cx, CARD_THUMBNAIL_CACHE_BUDGET);
+        let card_thumbnails = CardThumbnailManager::new(model.read(cx).repository());
         let observation = cx.observe(&model, |shell, _, cx| {
+            // A model transition can replace the current route, selection, or
+            // durable target. Never let a stale two-step intent survive it.
+            shell.pending_destructive_action = None;
+            shell.toolbar_more_open = false;
             shell.sync_editor_surface(cx);
             shell.scroll_selected_into_view(cx);
             cx.notify();
@@ -496,12 +805,26 @@ impl LibraryShell {
         // edit. The weak entity also means this callback cannot retain a
         // closed library window by itself.
         let close_shell = cx.weak_entity();
-        window.on_window_should_close(cx, move |_window, app| {
-            close_shell
-                .update(app, |shell, shell_cx| {
-                    shell.flush_active_session(FlushReason::WindowClose, shell_cx)
-                })
-                .unwrap_or(true)
+        window.on_window_should_close(cx, move |window, app| {
+            match close_shell.update(app, |shell, shell_cx| {
+                shell.flush_active_session(FlushReason::WindowClose, shell_cx)
+            }) {
+                Ok(allow_close) => allow_close,
+                // A weak-session update error is not proof that the old
+                // session was clean. Block close and leave a platform-visible
+                // explanation instead of using the old fail-open default.
+                Err(_) => {
+                    let buttons = ["好"];
+                    let _ = window.prompt(
+                        gpui::PromptLevel::Critical,
+                        "无法安全关闭 Joplin Lite",
+                        Some("无法确认当前资料库会话是否已保存；请保持窗口打开后重试。"),
+                        &buttons,
+                        app,
+                    );
+                    false
+                }
+            }
         });
         let event_receiver = model.read(cx).subscribe_library_events();
         #[cfg(test)]
@@ -518,8 +841,18 @@ impl LibraryShell {
             _command_chrome_event_subscription: None,
             _editor_surface_event_subscription: None,
             image_cache,
+            card_thumbnail_cache,
+            card_thumbnail_cache_resources: HashSet::new(),
+            card_thumbnails,
+            card_thumbnail_viewport_state: Rc::new(RefCell::new(
+                CardThumbnailViewportState::default(),
+            )),
+            _card_thumbnail_task: None,
             surface_note_id: None,
+            remount_current_surface_after_organization_commit: false,
             pending_resource_insert: None,
+            last_resource_picker_cancelled_by_reconciliation: None,
+            next_resource_picker_token: 1,
             queued_resource_inserts: VecDeque::new(),
             resource_queue_completion_scheduled: false,
             pending_drop_intent: None,
@@ -530,8 +863,12 @@ impl LibraryShell {
             startup_notice,
             save_clock,
             focus_handle,
+            organization_input,
+            organization_panel_open: false,
+            pending_destructive_action: None,
             sidebar_scroll: UniformListScrollHandle::new(),
             note_list_scroll: UniformListScrollHandle::new(),
+            toolbar_more_open: false,
             _model_observation: observation,
             _event_task: event_task,
             #[cfg(test)]
@@ -542,6 +879,10 @@ impl LibraryShell {
             last_scroll_request: None,
             #[cfg(test)]
             sidebar_render_probe: SidebarRenderProbe::default(),
+            #[cfg(test)]
+            card_thumbnail_cache_reconciliations: 0,
+            #[cfg(test)]
+            card_thumbnail_viewport_reconciliations: 0,
             #[cfg(test)]
             library_surface_paint_hooks_for_test: Arc::new(LibrarySurfacePaintHooks::default()),
         };
@@ -575,31 +916,83 @@ impl LibraryShell {
             // Keep the guard inside the cancellable future, not on the shell.
             // When `_event_task` drops, this guard drops in the same turn.
             let _event_task_lifetime = event_task_lifetime;
+            // An event that cannot yet cross the active-session lifecycle
+            // boundary remains owned here. Consuming it directly from the
+            // receiver and then remounting would discard dirty, marked-IME,
+            // or staged-resource state without another chance to reconcile.
+            let mut pending_events = PendingRepositoryEvents::default();
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
                     .await;
-                // `try_iter` is non-blocking; the explicit cap prevents a
-                // noisy importer/sync burst from monopolizing a UI turn.
-                let events = receiver.try_iter().take(128).collect::<Vec<_>>();
-                if events.is_empty() {
+                // Keep draining while a prior event batch waits behind a
+                // lifecycle barrier. `PendingRepositoryEvents` coalesces to
+                // five semantic kinds, so a long IME/resource wait cannot
+                // turn the repository sender into an unbounded UI buffer.
+                pending_events.drain(&receiver);
+                if pending_events.is_empty() {
                     continue;
                 }
-                if this
-                    .update(cx, |shell, shell_cx| {
-                        let _ = shell.model.update(shell_cx, |model, model_cx| {
-                            let _ = model.refresh_projection_events(events);
-                            model_cx.notify();
-                        });
-                    })
-                    .is_err()
-                {
-                    // The shell owns the task, but stop promptly as well if
-                    // an already-queued timer wakes after its entity died.
-                    break;
+                let events = pending_events.events();
+                match this.update(cx, |shell, shell_cx| {
+                    shell.reconcile_repository_events(&events, shell_cx)
+                }) {
+                    Ok(true) => pending_events.clear(),
+                    Ok(false) => {
+                        // Keep the exact batch for the next bounded timer
+                        // turn. New sender-side events stay queued until the
+                        // current lifecycle barrier has honestly completed.
+                    }
+                    Err(_) => {
+                        // The shell owns the task, but stop promptly as well
+                        // if an already-queued timer wakes after its entity
+                        // died.
+                        break;
+                    }
                 }
             }
         })
+    }
+
+    /// Apply one repository batch only after the retained active session is
+    /// at a lifecycle-safe point. A metadata event can alter the current
+    /// note's revision, deleted state, or route membership; replacing its
+    /// entity before a dirty/IME/resource operation flushes is data loss, not
+    /// a harmless projection refresh.
+    fn reconcile_repository_events(
+        &mut self,
+        events: &[app_lite_core::LibraryEvent],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let reconciliation_pending = self
+            .model
+            .read_with(cx, |model, _| model.reconciliation_pending());
+        let can_replace_active_session = self.model.read_with(cx, |model, _| {
+            // If a metadata-only probe itself fails, remain conservative and
+            // keep the lifecycle barrier. The later full refresh will expose
+            // the same repository error without discarding the session.
+            model
+                .event_batch_requires_active_session_replacement(events)
+                .unwrap_or(true)
+        });
+        // A committed-but-unreconciled session is already frozen. A durable
+        // Trash preview is also non-writable, so neither can have title/body
+        // changes that need a lifecycle flush before its candidate replaces
+        // the old entity.
+        if can_replace_active_session
+            && !reconciliation_pending
+            && !self.active_session_is_read_only(cx)
+            && !self.flush_active_session(FlushReason::NoteSwitch, cx)
+        {
+            return false;
+        }
+        self.model
+            .update(cx, |model, model_cx| {
+                let result = model.refresh_projection_events(events.iter().cloned());
+                model_cx.notify();
+                result
+            })
+            .is_ok()
     }
 
     fn poll_active_session(&mut self, cx: &mut Context<Self>) {
@@ -636,6 +1029,23 @@ impl LibraryShell {
         session.update(cx, |session, _| {
             session.stall_next_resource_stage_for_test()
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stall_next_card_thumbnail_materialization_for_test(
+        &mut self,
+    ) -> futures::channel::oneshot::Sender<()> {
+        self.card_thumbnails.stall_next_materialization_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_thumbnail_cache_reconciliations_for_test(&self) -> usize {
+        self.card_thumbnail_cache_reconciliations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_thumbnail_viewport_reconciliations_for_test(&self) -> usize {
+        self.card_thumbnail_viewport_reconciliations
     }
 
     #[cfg(test)]
@@ -842,6 +1252,7 @@ impl LibraryShell {
             .surface_note_id
             .clone()
             .expect("active session has a note id");
+        let session_entity_id = session.entity_id();
         let card_thumbnail_id = self.model.read_with(cx, |model, _| {
             model
                 .projections()
@@ -851,6 +1262,7 @@ impl LibraryShell {
         });
         ImageFlowProbe {
             note_id,
+            session_entity_id,
             has_image_block: image_resource_id.is_some(),
             measured_height,
             cache_has_resource: self.image_cache.read(cx).len() > 0,
@@ -878,22 +1290,194 @@ impl LibraryShell {
     pub(crate) fn apply_action(
         &mut self,
         action: AppAction,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(reason) = self.flush_reason_for_action(&action)
+        let _ = self.apply_action_with_result(action, window, cx);
+    }
+
+    /// Runs the one shell reducer and reports only whether its durable model
+    /// action completed. This is deliberately private: callers which need a
+    /// post-success UI effect (the shared organization title field) must not
+    /// build a second mutation path around `AppModel::dispatch`.
+    fn apply_action_with_result(
+        &mut self,
+        action: AppAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // A committed repository mutation is waiting for one coherent
+        // candidate. Do not let a same-card click, a second destructive menu
+        // action, or a shortcut mutate the stale retained revision and clear
+        // its truthful warning. The queued repository event owns recovery.
+        if self
+            .model
+            .read_with(cx, |model, _| model.reconciliation_pending())
+        {
+            self.set_active_session_reconciliation_lock(true, cx);
+            cx.notify();
+            return false;
+        }
+        // Restore and purge are the two lifecycle transitions which make a
+        // Trash detail legal again or remove it forever. A deliberately
+        // read-only Trash session has no pending durable mutation, and a
+        // stale Failed state must not strand the user's only recovery path.
+        let bypass_read_only_trash_flush = self.active_session_is_durable_read_only(cx)
+            && matches!(
+                action,
+                AppAction::RestoreNote(_)
+                    | AppAction::RestoreSelected
+                    | AppAction::PurgeNote(_)
+                    | AppAction::PurgeSelected
+            );
+        if !bypass_read_only_trash_flush
+            && let Some(reason) = self.flush_reason_for_action(&action)
             && !self.flush_active_session(reason, cx)
         {
-            return;
+            return false;
         }
-        let _ = self.model.update(cx, |model, model_cx| {
-            let _ = model.dispatch(action);
+        let remount_current_surface = self.action_can_change_active_session_revision(&action);
+        if remount_current_surface {
+            // Set this before the model notification so even an eager GPUI
+            // observer cannot reconcile the old fence first. A failed reducer
+            // result below clears it before any future model transition.
+            self.remount_current_surface_after_organization_commit = true;
+        }
+        let result = self.model.update(cx, |model, model_cx| {
+            let result = model.dispatch(action);
             model_cx.notify();
+            result
         });
+        if result.is_err() {
+            self.remount_current_surface_after_organization_commit = false;
+            if self
+                .model
+                .read_with(cx, |model, _| model.reconciliation_pending())
+            {
+                // `model_cx.notify` is intentionally asynchronous relative
+                // to this reducer. Close the mutation window in this same UI
+                // turn instead of waiting for the retained observer.
+                self.set_active_session_reconciliation_lock(true, cx);
+            }
+        }
         // The retained model observer owns surface synchronization, deferred
         // scrolling, and shell invalidation. Keeping this reducer to model
         // mutation plus notification makes every user and event route share
         // the exact same visible-state bridge.
+        result.is_ok()
+    }
+
+    /// The organization panel owns one shared `TitleInput`. Clear it only
+    /// after the authoritative reducer reports success: validation, flush, or
+    /// committed-but-unreconciled failures retain the user's title for a
+    /// visible correction/retry instead of silently losing it.
+    fn submit_organization_create(
+        &mut self,
+        action: AppAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(matches!(
+            action,
+            AppAction::CreateNotebook { .. }
+                | AppAction::CreateStack { .. }
+                | AppAction::CreateTag { .. }
+        ));
+        if self.apply_action_with_result(action, window, cx) {
+            self.organization_input.update(cx, |input, input_cx| {
+                input.select_all();
+                input.delete_forward();
+                input_cx.notify();
+            });
+        }
+    }
+
+    fn active_session_is_read_only(&self, cx: &App) -> bool {
+        self.note_session
+            .as_ref()
+            .is_some_and(|session| session.read_with(cx, |session, _| session.is_read_only()))
+    }
+
+    fn active_session_is_durable_read_only(&self, cx: &App) -> bool {
+        self.note_session.as_ref().is_some_and(|session| {
+            session.read_with(cx, |session, _| session.is_durable_read_only())
+        })
+    }
+
+    fn resource_mutation_block_message(&self, operation: &str, cx: &App) -> String {
+        if self.active_session_is_durable_read_only(cx) {
+            format!("废纸篓中的笔记为只读；请先恢复后再{operation}")
+        } else {
+            format!("资料库已提交，正在恢复界面；暂不可{operation}")
+        }
+    }
+
+    fn editor_surface_mode_for_session(session: &NoteSession) -> EditorSurfaceMode {
+        if session.is_durable_read_only() {
+            EditorSurfaceMode::ReadOnly
+        } else if session.is_reconciliation_locked() {
+            EditorSurfaceMode::RecoveryLocked
+        } else {
+            EditorSurfaceMode::Editable
+        }
+    }
+
+    /// Keep title input, core and canvas in one temporary access state while
+    /// the AppModel waits for a full committed-action candidate. This mirrors
+    /// the session's hard core gate; it is not a second mutation authority.
+    fn set_active_session_reconciliation_lock(&mut self, locked: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.note_session.clone() else {
+            return;
+        };
+        let was_locked = session.read_with(cx, |session, _| session.is_reconciliation_locked());
+        if locked && !was_locked {
+            self.invalidate_resource_intents_for_reconciliation_lock(&session, cx);
+        }
+        let _ = session.update(cx, |session, session_cx| {
+            session.set_reconciliation_locked(locked, session_cx);
+        });
+        let mode = session.read_with(cx, |session, _| {
+            Self::editor_surface_mode_for_session(session)
+        });
+        if let Some(surface) = self.editor_surface.clone() {
+            let _ = surface.update(cx, |surface, surface_cx| {
+                surface.set_mode(mode);
+                surface_cx.notify();
+            });
+        }
+    }
+
+    /// Captured external-resource intents are revision-scoped.  A
+    /// committed-but-unreconciled organization action freezes the old packet,
+    /// so leave neither a native picker callback nor a queued save-fence
+    /// completion able to resolve its old anchor after recovery unlocks.
+    fn invalidate_resource_intents_for_reconciliation_lock(
+        &mut self,
+        session: &Entity<NoteSession>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut invalidated = false;
+        if let Some(pending) = self.pending_resource_insert.take() {
+            Self::discard_resource_insert_intent(session, pending.intent, cx);
+            self.last_resource_picker_cancelled_by_reconciliation = Some(pending.token);
+            invalidated = true;
+        }
+        if let Some(intent) = self.pending_drop_intent.take() {
+            Self::discard_resource_insert_intent(session, intent, cx);
+            invalidated = true;
+        }
+        while let Some(queued) = self.queued_resource_inserts.pop_front() {
+            cleanup_owned_temporary_paths(&queued.owned_temporary_paths);
+            Self::discard_resource_insert_intent(session, queued.intent, cx);
+            invalidated = true;
+        }
+        self.resource_queue_completion_scheduled = false;
+        if invalidated {
+            self.resource_notice = Some(
+                "资料库已提交，正在恢复界面；已取消尚未完成的资源插入，请恢复后重新选择".to_owned(),
+            );
+            cx.notify();
+        }
     }
 
     fn flush_reason_for_action(&self, action: &AppAction) -> Option<FlushReason> {
@@ -903,19 +1487,52 @@ impl LibraryShell {
             AppAction::SelectNote(id) if active_id.as_ref() != Some(id) => {
                 active_id.map(|_| FlushReason::NoteSwitch)
             }
-            AppAction::NavigateTo {
-                selected_note_id, ..
-            } if active_id.as_ref() != selected_note_id.as_ref() => {
-                active_id.map(|_| FlushReason::NoteSwitch)
-            }
+            // Route membership is verified by the later, projection-backed
+            // AppModel candidate. A metadata preflight is useful for passing
+            // a likely-valid NoteId, but cannot atomically cover the interval
+            // before that candidate reads SQLite. Always cross the existing
+            // retained-session boundary first: otherwise a concurrent
+            // move/tag/trash can turn an equal NoteId into an unmount and
+            // silently drop the old dirty document.
+            AppAction::NavigateTo { .. } => active_id.map(|_| FlushReason::NoteSwitch),
             AppAction::NavigateBack | AppAction::NavigateForward => {
                 active_id.map(|_| FlushReason::NoteSwitch)
             }
             AppAction::TrashSelected => active_id.map(|_| FlushReason::Delete),
             AppAction::TrashNote(id) if active_id.as_ref() == Some(id) => Some(FlushReason::Delete),
+            AppAction::MoveSelectedNote(_)
+            | AppAction::SetSelectedNoteTags(_)
+            | AppAction::AddTagToSelectedNote(_)
+            | AppAction::RemoveTagFromSelectedNote(_)
+            | AppAction::DeleteStack(_)
+            | AppAction::DeleteNotebook(_)
+            | AppAction::DeleteTag(_) => active_id.map(|_| FlushReason::ManualSync),
+            AppAction::RestoreNote(id) | AppAction::PurgeNote(id)
+                if active_id.as_ref() == Some(id) =>
+            {
+                Some(FlushReason::ManualSync)
+            }
+            AppAction::RestoreSelected | AppAction::PurgeSelected => {
+                active_id.map(|_| FlushReason::ManualSync)
+            }
             AppAction::ManualSync => active_id.map(|_| FlushReason::ManualSync),
             _ => None,
         }
+    }
+
+    fn action_can_change_active_session_revision(&self, action: &AppAction) -> bool {
+        if self.surface_note_id.is_none() {
+            return false;
+        }
+        matches!(
+            action,
+            AppAction::MoveSelectedNote(_)
+                | AppAction::SetSelectedNoteTags(_)
+                | AppAction::AddTagToSelectedNote(_)
+                | AppAction::RemoveTagFromSelectedNote(_)
+                | AppAction::DeleteNotebook(_)
+                | AppAction::DeleteTag(_)
+        )
     }
 
     fn flush_active_session(&mut self, reason: FlushReason, cx: &mut Context<Self>) -> bool {
@@ -924,6 +1541,12 @@ impl LibraryShell {
         };
         match session.update(cx, |session, session_cx| session.flush(reason, session_cx)) {
             Ok(_) => {
+                // A save worker can finish immediately before the retained
+                // session observer gets its next turn. Consume its complete
+                // transaction-built Note at this explicit boundary as well,
+                // so an organization action in the very same UI turn never
+                // prepares a replacement session from an older active body.
+                self.consume_saved_note_outcome(&session, cx);
                 self.save_error = None;
                 self.save_pending = false;
                 cx.notify();
@@ -954,6 +1577,14 @@ impl LibraryShell {
         cx: &mut Context<Self>,
     ) -> bool {
         self.flush_active_session(reason, cx)
+    }
+
+    /// A failed lifecycle flush can either still have retained work in flight
+    /// or be a visible terminal error. The application-level Quit coordinator
+    /// retries only the first case; retrying the second would turn a failed
+    /// save into a non-responsive quit command.
+    pub(crate) fn lifecycle_flush_pending(&self) -> bool {
+        self.save_pending
     }
 
     fn create_note(&mut self, _: &CreateNote, window: &mut Window, cx: &mut Context<Self>) {
@@ -998,12 +1629,68 @@ impl LibraryShell {
         self.apply_action(AppAction::ManualSync, window, cx);
     }
 
+    fn toggle_library_toolbar_more(
+        &mut self,
+        _: &ToggleLibraryToolbarMore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_toolbar_more(window, cx);
+    }
+
+    fn toggle_library_organization_panel(
+        &mut self,
+        _: &ToggleLibraryOrganizationPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_organization_panel_visibility(window, cx);
+    }
+
+    fn open_library_resource_picker(
+        &mut self,
+        _: &OpenLibraryResourcePicker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Capture the document point synchronously, then launch AppKit only
+        // after this action update returns. This shares the existing Task-5
+        // picker token/completion path without re-entering the current window
+        // borrow from a keyboard handler.
+        match self.prompt_for_resource_picker(window, cx) {
+            Ok(prompt) => {
+                #[cfg(not(test))]
+                window.defer(cx, move |_window, app| {
+                    prompt_for_resource_path(prompt, app)
+                });
+                #[cfg(test)]
+                let _ = prompt;
+            }
+            Err(error) => {
+                self.resource_notice = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
     fn sync_editor_surface(&mut self, cx: &mut Context<Self>) {
         let note = self
             .model
             .read_with(cx, |model, _| model.active_note().cloned());
+        let reconciliation_pending = self
+            .model
+            .read_with(cx, |model, _| model.reconciliation_pending());
         let next_id = note.as_ref().map(|note| note.id.clone());
-        if self.surface_note_id == next_id {
+        let next_revision = note.as_ref().map(|note| note.revision);
+        let mounted_session_revision = self
+            .note_session
+            .as_ref()
+            .map(|session| session.read_with(cx, |session, _| session.expected_revision()));
+        if self.surface_note_id == next_id
+            && mounted_session_revision == next_revision
+            && !self.remount_current_surface_after_organization_commit
+        {
+            self.set_active_session_reconciliation_lock(reconciliation_pending, cx);
             return;
         }
 
@@ -1017,6 +1704,7 @@ impl LibraryShell {
         self._editor_surface_event_subscription = None;
         self.editor_surface = None;
         self.surface_note_id = next_id.clone();
+        self.remount_current_surface_after_organization_commit = false;
         self.unsupported_document = None;
         self.pending_resource_insert = None;
         self.pending_drop_intent = None;
@@ -1045,29 +1733,49 @@ impl LibraryShell {
                 }) {
                     self.resource_notice = Some(warning);
                 }
-                let editor = session.read(cx).editor().clone();
-                let chrome_editor = editor.clone();
-                let command_chrome = cx.new(move |chrome_cx| {
-                    EditorCommandChrome::new(
-                        chrome_editor,
-                        EditorCommandChromeHost::Library,
-                        dispatch_library_resource_picker,
-                        chrome_cx,
-                    )
-                });
-                self._command_chrome_event_subscription = Some(cx.subscribe(
-                    &command_chrome,
-                    |shell, _chrome, event, shell_cx| match event {
-                        EditorCommandChromeEvent::RequestInsertImage { .. } => {
-                            if let Err(error) = shell.begin_resource_picker(shell_cx) {
-                                shell.resource_notice = Some(format!("资源未插入：{error}"));
-                                shell_cx.notify();
+                if reconciliation_pending {
+                    let _ = session.update(cx, |session, session_cx| {
+                        session.set_reconciliation_locked(true, session_cx);
+                    });
+                }
+                let (editor, surface_mode, durable_read_only) =
+                    session.read_with(cx, |session, _| {
+                        (
+                            session.editor().clone(),
+                            Self::editor_surface_mode_for_session(session),
+                            session.is_durable_read_only(),
+                        )
+                    });
+                // A temporary reconciliation lock keeps the same shared
+                // Chrome mounted in its disabled state, so the eventual
+                // candidate unlock does not need a second toolbar authority.
+                // Durable Trash previews intentionally have no formatter.
+                let command_chrome = (!durable_read_only).then(|| {
+                    let chrome_editor = editor.clone();
+                    let command_chrome = cx.new(move |chrome_cx| {
+                        EditorCommandChrome::new(
+                            chrome_editor,
+                            EditorCommandChromeHost::Library,
+                            dispatch_library_resource_picker,
+                            chrome_cx,
+                        )
+                    });
+                    self._command_chrome_event_subscription = Some(cx.subscribe(
+                        &command_chrome,
+                        |shell, _chrome, event, shell_cx| match event {
+                            EditorCommandChromeEvent::RequestInsertImage { .. } => {
+                                if let Err(error) = shell.begin_resource_picker(shell_cx) {
+                                    shell.resource_notice = Some(format!("资源未插入：{error}"));
+                                    shell_cx.notify();
+                                }
                             }
-                        }
-                    },
-                ));
+                        },
+                    ));
+                    command_chrome
+                });
                 self._note_session_observation =
                     Some(cx.observe(&session, |shell, session, cx| {
+                        shell.consume_saved_note_outcome(&session, cx);
                         shell.consume_resource_import_outcome(&session, cx);
                         shell.consume_attachment_open_outcome(&session, cx);
                         // Persisted-image hydration is intentionally driven
@@ -1116,6 +1824,12 @@ impl LibraryShell {
                         // retained-session notification. The queued intent is
                         // the original saved DocPoint, never the live caret.
                         shell.schedule_queued_resource_completion(cx);
+                        // A native menu/Cmd-Q request may have started this
+                        // session's exact background snapshot. Defer the
+                        // cross-window completion check until this entity
+                        // update has returned; it will either finish the same
+                        // request or leave the visible lifecycle error intact.
+                        cx.defer(crate::library_menu::retry_pending_quit);
                         cx.notify();
                     }));
                 #[cfg(test)]
@@ -1125,19 +1839,10 @@ impl LibraryShell {
                 let image_cache = self.image_cache.clone();
                 let surface = cx.new(move |cx| {
                     #[cfg(test)]
-                    let mut surface = EditorSurface::new(
-                        editor,
-                        EditorSurfaceMode::Editable,
-                        Some(image_cache.clone()),
-                        cx,
-                    );
+                    let mut surface =
+                        EditorSurface::new(editor, surface_mode, Some(image_cache.clone()), cx);
                     #[cfg(not(test))]
-                    let surface = EditorSurface::new(
-                        editor,
-                        EditorSurfaceMode::Editable,
-                        Some(image_cache),
-                        cx,
-                    );
+                    let surface = EditorSurface::new(editor, surface_mode, Some(image_cache), cx);
                     #[cfg(test)]
                     surface.set_paint_hooks(EditorSurfaceHooks::new(
                         move |_window, _app| {
@@ -1158,7 +1863,7 @@ impl LibraryShell {
                     },
                 ));
                 self.editor_surface = Some(surface);
-                self.command_chrome = Some(command_chrome);
+                self.command_chrome = command_chrome;
                 self.note_session = Some(session);
             }
             Err(error) => self.unsupported_document = Some(error.to_string()),
@@ -1169,29 +1874,60 @@ impl LibraryShell {
     /// picker, pasteboard and drop routes.  Keeping this tiny state mutation
     /// synchronous makes cancellation harmless and lets the OS panel live
     /// outside the GPUI view borrow.
-    pub(crate) fn begin_resource_picker(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+    pub(crate) fn begin_resource_picker(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<ResourcePickerToken, String> {
+        if self.active_session_is_read_only(cx) {
+            return Err(self.resource_mutation_block_message("插入资源", cx));
+        }
         let Some(session) = self.note_session.clone() else {
             return Err("请先选择一篇笔记再插入资源".to_owned());
         };
-        self.pending_resource_insert =
-            Some(Self::capture_resource_insert_intent(&session, None, cx)?);
+        let token = ResourcePickerToken(self.next_resource_picker_token);
+        self.next_resource_picker_token = self.next_resource_picker_token.wrapping_add(1);
+        self.pending_resource_insert = Some(PendingResourcePicker {
+            token,
+            intent: Self::capture_resource_insert_intent(&session, None, cx)?,
+        });
         self.resource_notice = None;
         cx.notify();
-        Ok(())
+        Ok(token)
     }
 
     /// Complete a path chosen by the platform picker. This is deliberately
     /// public within the crate so mounted tests exercise exactly the route
     /// called after the asynchronous native panel settles.
-    pub(crate) fn complete_resource_picker_path(
+    fn complete_resource_picker_path_for_token(
         &mut self,
+        token: ResourcePickerToken,
         path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let Some(intent) = self.pending_resource_insert.take() else {
-            return Err("资源选择已过期；请重新打开选择器".to_owned());
+        let Some(pending) = self.pending_resource_insert.as_ref() else {
+            return Err(
+                if self.last_resource_picker_cancelled_by_reconciliation == Some(token) {
+                    "资料库已提交，正在恢复界面；已取消本次资源插入，请恢复后重新选择".to_owned()
+                } else {
+                    "资源选择已过期；请重新打开选择器".to_owned()
+                },
+            );
         };
+        if pending.token != token {
+            return Err(
+                if self.last_resource_picker_cancelled_by_reconciliation == Some(token) {
+                    "资料库已提交，正在恢复界面；已取消本次资源插入，请恢复后重新选择".to_owned()
+                } else {
+                    "资源选择已过期；请重新打开选择器".to_owned()
+                },
+            );
+        }
+        let intent = self
+            .pending_resource_insert
+            .take()
+            .expect("token matched a pending picker")
+            .intent;
         self.complete_resource_request(
             ResourceImportRequest::Path(path),
             intent,
@@ -1199,6 +1935,32 @@ impl LibraryShell {
             window,
             cx,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_resource_picker_path(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let token = self
+            .pending_resource_insert
+            .as_ref()
+            .map(|pending| pending.token)
+            .ok_or_else(|| "资源选择已过期；请重新打开选择器".to_owned())?;
+        self.complete_resource_picker_path_for_token(token, path, window, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_resource_picker_path_for_token_for_test(
+        &mut self,
+        token: ResourcePickerToken,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.complete_resource_picker_path_for_token(token, path, window, cx)
     }
 
     /// Complete the one production resource transaction shared by picker,
@@ -1213,6 +1975,13 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if self.active_session_is_read_only(cx) {
+            cleanup_owned_temporary_paths(&owned_temporary_paths);
+            if let Some(session) = self.note_session.as_ref() {
+                Self::discard_resource_insert_intent(session, intent, cx);
+            }
+            return Err(self.resource_mutation_block_message("插入资源", cx));
+        }
         let Some(session) = self.note_session.clone() else {
             cleanup_owned_temporary_paths(&owned_temporary_paths);
             return Err("笔记已关闭，未插入资源".to_owned());
@@ -1278,6 +2047,26 @@ impl LibraryShell {
         }
     }
 
+    /// A settled normal save is a complete `Note` returned by the same SQLite
+    /// transaction.  Install it into the model before any organization
+    /// action can prepare a candidate from `active_session`; otherwise a
+    /// metadata-only organization refresh can remount a stale body and lose
+    /// text that was already durable.
+    fn consume_saved_note_outcome(
+        &mut self,
+        session: &Entity<NoteSession>,
+        cx: &mut Context<Self>,
+    ) {
+        let saved = session.update(cx, |session, _| session.take_saved_note_outcome());
+        let Some(note) = saved else {
+            return;
+        };
+        let _ = self.model.update(cx, |model, model_cx| {
+            model.apply_active_note_snapshot(note);
+            model_cx.notify();
+        });
+    }
+
     /// The surface already made the attachment a full atomic selection. This
     /// shell boundary owns the only platform-facing side effect and delegates
     /// descriptor resolution/materialization to the retained session worker.
@@ -1339,6 +2128,13 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if self.active_session_is_read_only(cx) {
+            cleanup_owned_temporary_paths(&owned_temporary_paths);
+            if let Some(session) = self.note_session.as_ref() {
+                Self::discard_resource_insert_intent(session, intent, cx);
+            }
+            return Err(self.resource_mutation_block_message("插入资源", cx));
+        }
         let Some(session) = self.note_session.clone() else {
             cleanup_owned_temporary_paths(&owned_temporary_paths);
             return Err("笔记已关闭，未插入资源".to_owned());
@@ -1430,6 +2226,12 @@ impl LibraryShell {
             self.discard_queued_resource_inserts();
             return;
         };
+        if session.read_with(cx, |session, _| session.is_read_only()) {
+            self.invalidate_resource_intents_for_reconciliation_lock(&session, cx);
+            self.resource_notice = Some(self.resource_mutation_block_message("插入资源", cx));
+            cx.notify();
+            return;
+        }
         if session.read_with(cx, |session, _| session.resource_insert_is_fenced()) {
             return;
         }
@@ -1460,19 +2262,43 @@ impl LibraryShell {
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<WindowHandle<LibraryShell>, String> {
-        self.begin_resource_picker(cx)?;
-        window
+    ) -> Result<ResourcePickerPrompt, String> {
+        let token = self.begin_resource_picker(cx)?;
+        let window = window
             .window_handle()
             .downcast::<LibraryShell>()
-            .ok_or_else(|| "无法关联资源选择器到当前资料库窗口".to_owned())
+            .ok_or_else(|| "无法关联资源选择器到当前资料库窗口".to_owned())?;
+        Ok(ResourcePickerPrompt { window, token })
     }
 
-    fn cancel_resource_picker(&mut self, cx: &mut Context<Self>) {
-        if let Some(intent) = self.pending_resource_insert.take()
+    /// The shared Chrome already captured the selection before it emitted its
+    /// typed request.  This only packages that exact pending token for the
+    /// native panel; it never captures a second, unrelated anchor.
+    fn pending_resource_picker_prompt(
+        &self,
+        window: &mut Window,
+    ) -> Result<ResourcePickerPrompt, String> {
+        let token = self
+            .pending_resource_insert
+            .as_ref()
+            .map(|pending| pending.token)
+            .ok_or_else(|| "资源选择已过期；请重新打开选择器".to_owned())?;
+        let window = window
+            .window_handle()
+            .downcast::<LibraryShell>()
+            .ok_or_else(|| "无法关联资源选择器到当前资料库窗口".to_owned())?;
+        Ok(ResourcePickerPrompt { window, token })
+    }
+
+    fn cancel_resource_picker(&mut self, token: ResourcePickerToken, cx: &mut Context<Self>) {
+        if self
+            .pending_resource_insert
+            .as_ref()
+            .is_some_and(|pending| pending.token == token)
+            && let Some(pending) = self.pending_resource_insert.take()
             && let Some(session) = self.note_session.as_ref()
         {
-            Self::discard_resource_insert_intent(session, intent, cx);
+            Self::discard_resource_insert_intent(session, pending.intent, cx);
         }
         cx.notify();
     }
@@ -1482,6 +2308,11 @@ impl LibraryShell {
     /// durable resource transaction as picker and Finder drop, while ordinary
     /// text keeps the existing EntityInputHandler path.
     fn paste_resource_or_text(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_session_is_read_only(cx) {
+            self.resource_notice = Some(self.resource_mutation_block_message("编辑", cx));
+            cx.notify();
+            return;
+        }
         let payload = resolve_clipboard_payload(
             read_native_pasteboard(),
             cx.read_from_clipboard().map(ClipboardPayload::from_gpui),
@@ -1517,6 +2348,12 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if self.active_session_is_read_only(cx) {
+            if let Some(session) = self.note_session.as_ref() {
+                Self::discard_resource_insert_intent(session, saved_intent, cx);
+            }
+            return Err(self.resource_mutation_block_message("编辑", cx));
+        }
         match intent {
             PasteIntent::Image { payload } => self.complete_resource_request(
                 ResourceImportRequest::Image(payload),
@@ -1593,6 +2430,9 @@ impl LibraryShell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_session_is_read_only(cx) {
+            return;
+        }
         let Some(session) = self.note_session.clone() else {
             return;
         };
@@ -1620,6 +2460,11 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_session_is_read_only(cx) {
+            self.resource_notice = Some(self.resource_mutation_block_message("拖入资源", cx));
+            cx.notify();
+            return;
+        }
         let intent = match self.pending_drop_intent.take() {
             Some(intent) => Ok(intent),
             None => self
@@ -1655,6 +2500,12 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if self.active_session_is_read_only(cx) {
+            if let Some(session) = self.note_session.as_ref() {
+                Self::discard_resource_insert_intent(session, intent, cx);
+            }
+            return Err(self.resource_mutation_block_message("拖入资源", cx));
+        }
         self.complete_paste_intent(classify_drop(&paths), intent, window, cx)
     }
 
@@ -1677,6 +2528,102 @@ impl LibraryShell {
         }
     }
 
+    /// Reconcile Cards-only thumbnail residency from the uniform-list's
+    /// bounded construction range. This does no filesystem work: resource
+    /// verification/copying is started below on the retained background task,
+    /// while the GPUI thread only swaps IDs and requests small cache proxies.
+    fn reconcile_card_thumbnail_residency(
+        &mut self,
+        resource_ids: impl IntoIterator<Item = app_lite_core::ResourceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(test)]
+        {
+            self.card_thumbnail_viewport_reconciliations = self
+                .card_thumbnail_viewport_reconciliations
+                .saturating_add(1);
+        }
+        self.card_thumbnails.reconcile_desired(resource_ids);
+        self.sync_card_thumbnail_cache_residency(window, cx);
+        self.start_next_card_thumbnail_materialization(cx);
+    }
+
+    /// Tear down card-specific resources only when the Cards presentation or
+    /// its list itself disappears. A Cards viewport with no image keys is
+    /// deliberately reconciled through `reconcile_card_thumbnail_residency`:
+    /// it should release decoded cache entries while retaining the small,
+    /// bounded source LRU for a nearby image card.
+    fn leave_card_thumbnail_residency(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.card_thumbnail_viewport_state.borrow_mut().invalidate();
+        self.card_thumbnails.leave_cards();
+        self.sync_card_thumbnail_cache_residency(window, cx);
+    }
+
+    /// Install a new visible source set only when the final UniformList range
+    /// or a worker completion actually changed it. `Entity::update` itself is
+    /// observable by GPUI, so an unconditional cache update here causes
+    /// render -> deferred range -> cache update -> render even when no source
+    /// or request changed.
+    fn sync_card_thumbnail_cache_residency(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let resources = self.card_thumbnails.visible_resources();
+        let next_resources = resources.iter().cloned().collect::<HashSet<_>>();
+        if next_resources == self.card_thumbnail_cache_resources {
+            return;
+        }
+        self.card_thumbnail_cache.update(cx, |cache, cache_cx| {
+            cache.set_visible_resources(resources.iter());
+            for resource in &resources {
+                // Every Card source is already a bounded 192px proxy. Tell
+                // the cache its natural edge so it never promotes a 192px
+                // PNG to the quantized 256px tier on later paints.
+                cache.request_edge_with_natural_max(
+                    resource,
+                    CARD_THUMBNAIL_PROXY_EDGE,
+                    Some(CARD_THUMBNAIL_PROXY_EDGE),
+                );
+            }
+            cache.evict_offscreen(window, cache_cx);
+        });
+        self.card_thumbnail_cache_resources = next_resources;
+        #[cfg(test)]
+        {
+            self.card_thumbnail_cache_reconciliations =
+                self.card_thumbnail_cache_reconciliations.saturating_add(1);
+        }
+    }
+
+    fn start_next_card_thumbnail_materialization(&mut self, cx: &mut Context<Self>) {
+        if self._card_thumbnail_task.is_some() {
+            return;
+        }
+        let Some(job) = self.card_thumbnails.next_job() else {
+            return;
+        };
+        let worker = cx
+            .background_executor()
+            .spawn(async move { CardThumbnailManager::materialize(job).await });
+        self._card_thumbnail_task = Some(cx.spawn(async move |this, cx| {
+            let completion = worker.await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                shell._card_thumbnail_task = None;
+                shell.card_thumbnails.finish(completion);
+                // The desired viewport may be unchanged while this worker
+                // added its first source. Ask the next actual-prepaint
+                // decoration to install that source exactly once.
+                shell
+                    .card_thumbnail_viewport_state
+                    .borrow_mut()
+                    .invalidate();
+                shell.start_next_card_thumbnail_materialization(shell_cx);
+                // A successful source is adopted only in this live-shell
+                // callback. The next frame registers it with the card cache;
+                // a dropped shell never recreates a stale editor cache root.
+                shell_cx.notify();
+            });
+        }));
+    }
+
     fn render_note_list(
         &mut self,
         items: Vec<NoteProjection>,
@@ -1684,9 +2631,11 @@ impl LibraryShell {
         list_width: u16,
         visible: bool,
         mode: ListViewMode,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         if !visible {
+            self.leave_card_thumbnail_residency(window, cx);
             return div()
                 .id("note-list-hidden")
                 .debug_selector(|| "library-note-list".to_owned())
@@ -1697,12 +2646,22 @@ impl LibraryShell {
         }
         let shell = cx.weak_entity();
         let processor_shell = shell.clone();
+        let viewport_state_for_processor = Rc::clone(&self.card_thumbnail_viewport_state);
         let selected_for_processor = selected.clone();
+        let items = Arc::new(items);
+        let items_for_processor = Arc::clone(&items);
         let item_count = items.len();
+        if !matches!(mode, ListViewMode::Cards) || item_count == 0 {
+            self.leave_card_thumbnail_residency(window, cx);
+        }
         let list = uniform_list(
             "library-note-list-items",
             item_count,
             cx.processor(move |_this, range: std::ops::Range<usize>, _window, _cx| {
+                // The actual card residency side effect lives exclusively in
+                // the prepaint decoration below. Retain this legacy probe for
+                // scale tests that inspect UniformList construction ranges;
+                // it is test-only and never schedules I/O or cache work.
                 #[cfg(test)]
                 {
                     _this.rendered_note_range = Some(range.clone());
@@ -1710,9 +2669,30 @@ impl LibraryShell {
                 note_list::record_constructed_items(range.len());
                 range
                     .filter_map(|index| {
-                        let projection = items.get(index)?.clone();
+                        let projection = items_for_processor.get(index)?.clone();
                         let id = projection.id.clone();
                         let selected = selected_for_processor.as_ref() == Some(&id);
+                        let thumbnail_is_actually_visible = !matches!(mode, ListViewMode::Cards)
+                            || viewport_state_for_processor
+                                .borrow()
+                                .contains(projection.selected_thumbnail_id.as_ref());
+                        let thumbnail_source = thumbnail_is_actually_visible
+                            .then(|| {
+                                _this
+                                    .card_thumbnails
+                                    .source_for(projection.selected_thumbnail_id.as_ref())
+                            })
+                            .flatten();
+                        let materialization_failed = _this
+                            .card_thumbnails
+                            .failed(projection.selected_thumbnail_id.as_ref());
+                        let card_thumbnail_cache = _this.card_thumbnail_cache.clone();
+                        let cache_failed = thumbnail_source.as_ref().is_some_and(|source| {
+                            card_thumbnail_cache
+                                .read(_cx)
+                                .failed_resource(&gpui::Resource::from(source.clone()))
+                        });
+                        let thumbnail_failed = materialization_failed || cache_failed;
                         let click_shell = processor_shell.clone();
                         Some(
                             div()
@@ -1736,7 +2716,14 @@ impl LibraryShell {
                                         );
                                     });
                                 })
-                                .child(note_card::render(&projection, selected, mode)),
+                                .child(note_card::render(
+                                    &projection,
+                                    selected,
+                                    mode,
+                                    thumbnail_source,
+                                    thumbnail_failed,
+                                    &card_thumbnail_cache,
+                                )),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1744,6 +2731,15 @@ impl LibraryShell {
         )
         .size_full()
         .track_scroll(self.note_list_scroll.clone());
+        let list = if matches!(mode, ListViewMode::Cards) && item_count > 0 {
+            list.with_decoration(CardThumbnailViewportDecoration {
+                shell,
+                projections: items,
+                state: Rc::clone(&self.card_thumbnail_viewport_state),
+            })
+        } else {
+            list
+        };
         div()
             .id("note-list")
             .debug_selector(|| "library-note-list".to_owned())
@@ -1761,7 +2757,9 @@ impl LibraryShell {
 
     fn render_note_title(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let session = self.note_session.as_ref()?.clone();
-        let title = session.read_with(cx, |session, _| session.title().clone());
+        let (title, read_only) = session.read_with(cx, |session, _| {
+            (session.title().clone(), session.is_read_only())
+        });
         let title_text_color = self.evernote_primary_text_fill();
         let paint_title = title.clone();
         let canvas_title = title.clone();
@@ -1822,7 +2820,7 @@ impl LibraryShell {
                         rgba(EVERNOTE_GREEN),
                     ));
                 }
-                if focus.is_focused(window) {
+                if !read_only && focus.is_focused(window) {
                     window.handle_input(
                         &focus,
                         ElementInputHandler::new(bounds, paint_title.clone()),
@@ -1925,11 +2923,21 @@ impl LibraryShell {
         let (title, editor) = session.read_with(cx, |session, _| {
             (session.title().clone(), session.editor().clone())
         });
+        let read_only = session.read_with(cx, |session, _| session.is_read_only());
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let secondary = modifiers.secondary();
         if TitleInput::moves_focus_to_body_for(key) {
             focus_editor(&editor, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if read_only
+            && (matches!(key, "backspace" | "delete") || (secondary && matches!(key, "x" | "v")))
+        {
+            // Do not let a title-level destructive shortcut bubble into an
+            // unrelated parent handler. Selection movement and Cmd-C below
+            // remain intentionally available for a retained Trash preview.
             cx.stop_propagation();
             return;
         }
@@ -2010,6 +3018,832 @@ impl LibraryShell {
         }
     }
 
+    fn toggle_organization_panel(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_organization_panel_visibility(window, cx);
+    }
+
+    fn toggle_organization_panel_visibility(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.organization_panel_open = !self.organization_panel_open;
+        if self.organization_panel_open {
+            self.toolbar_more_open = false;
+            self.organization_input
+                .read(cx)
+                .focus_handle()
+                .focus(window);
+        } else {
+            self.pending_destructive_action = None;
+            self.focus_active_editor_or_shell(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn focus_active_editor_or_shell(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.note_session.as_ref() {
+            let editor = session.read_with(cx, |session, _| session.editor().clone());
+            focus_editor(&editor, window, cx);
+        } else {
+            self.focus_handle.focus(window);
+        }
+    }
+
+    fn toggle_toolbar_more(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toolbar_more_open = !self.toolbar_more_open;
+        if self.toolbar_more_open {
+            self.organization_panel_open = false;
+            self.pending_destructive_action = None;
+            if let Some(chrome) = self.command_chrome.clone() {
+                let _ = chrome.update(cx, |chrome, chrome_cx| {
+                    chrome.dismiss_overlay(window, chrome_cx)
+                });
+            }
+        }
+        self.focus_active_editor_or_shell(window, cx);
+        cx.notify();
+    }
+
+    fn dismiss_toolbar_more(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.toolbar_more_open {
+            return false;
+        }
+        self.toolbar_more_open = false;
+        self.focus_active_editor_or_shell(window, cx);
+        cx.notify();
+        true
+    }
+
+    fn apply_toolbar_more_action(
+        &mut self,
+        action: AppAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toolbar_more_open = false;
+        self.apply_action(action, window, cx);
+    }
+
+    fn request_destructive_confirmation(
+        &mut self,
+        pending: PendingDestructiveAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_destructive_action = Some(pending);
+        cx.notify();
+    }
+
+    fn cancel_destructive_confirmation(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_destructive_action = None;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn destructive_confirmation_is_current(
+        &self,
+        pending: &PendingDestructiveAction,
+        cx: &App,
+    ) -> bool {
+        self.model.read_with(cx, |model, _| match pending {
+            PendingDestructiveAction::DeleteStack(id) => model
+                .navigation_index()
+                .stacks
+                .iter()
+                .any(|candidate| candidate.id == *id),
+            PendingDestructiveAction::DeleteNotebook(id) => model
+                .navigation_index()
+                .notebooks
+                .iter()
+                .any(|candidate| candidate.id == *id),
+            PendingDestructiveAction::DeleteTag(id) => model
+                .navigation_index()
+                .tags
+                .iter()
+                .any(|candidate| candidate.id == *id),
+            PendingDestructiveAction::PurgeNote(id) => {
+                model.navigation().route() == &LibraryRoute::Trash
+                    && model.navigation().selected_note_id() == Some(id)
+                    && model
+                        .projections()
+                        .iter()
+                        .any(|projection| projection.id == *id)
+            }
+        })
+    }
+
+    fn confirm_destructive_action(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_destructive_action.take() else {
+            return;
+        };
+        if !self.destructive_confirmation_is_current(&pending, cx) {
+            self.resource_notice = Some("待确认的目标已变化；请重新打开操作。".to_owned());
+            self.focus_handle.focus(window);
+            cx.notify();
+            return;
+        }
+        self.focus_handle.focus(window);
+        self.apply_action(pending.action(), window, cx);
+    }
+
+    fn render_destructive_confirmation(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let pending = self.pending_destructive_action.as_ref()?;
+        Some(
+            div()
+                .id("library-organization-destructive-confirmation")
+                .debug_selector(|| "library-organization-destructive-confirmation".to_owned())
+                .p(px(7.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(rgba(0xe7c7c1ff))
+                .bg(rgba(0xfff8f6ff))
+                .text_color(rgba(0x7b3025ff))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(pending.label())
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .id("library-organization-confirm-destructive")
+                                .debug_selector(|| {
+                                    "library-organization-confirm-destructive".to_owned()
+                                })
+                                .px(px(7.0))
+                                .py(px(4.0))
+                                .rounded(px(4.0))
+                                .bg(rgba(0xa34838ff))
+                                .text_size(px(11.0))
+                                .text_color(rgba(0xffffffff))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::confirm_destructive_action),
+                                )
+                                .child("确认"),
+                        )
+                        .child(
+                            div()
+                                .id("library-organization-cancel-destructive")
+                                .debug_selector(|| {
+                                    "library-organization-cancel-destructive".to_owned()
+                                })
+                                .px(px(7.0))
+                                .py(px(4.0))
+                                .rounded(px(4.0))
+                                .bg(rgba(0xf1f4f1ff))
+                                .text_size(px(11.0))
+                                .text_color(rgba(0x36413aff))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::cancel_destructive_confirmation),
+                                )
+                                .child("取消"),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_organization_input(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let input = self.organization_input.clone();
+        let paint_input = input.clone();
+        let canvas_input = input.clone();
+        let canvas = canvas(
+            move |bounds, _window, cx| {
+                let _ = canvas_input.update(cx, |input, _| input.record_bounds(bounds));
+                canvas_input.clone()
+            },
+            move |bounds, entity, window, cx| {
+                let (text, selection, focus) = entity.read_with(cx, |input, _| {
+                    (
+                        SharedString::from(input.text().to_owned()),
+                        input.selection().clone(),
+                        input.focus_handle().clone(),
+                    )
+                });
+                let line = window.text_system().shape_line(
+                    text,
+                    px(14.0),
+                    &[TextRun {
+                        len: entity.read(cx).text().len(),
+                        font: window.text_style().font(),
+                        color: rgba(0x172033ff).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+                entity.update(cx, |input, _| input.record_layout(bounds, line.clone()));
+                if focus.is_focused(window) && !selection.is_empty() {
+                    window.paint_quad(gpui::fill(
+                        Bounds::from_corners(
+                            point(
+                                bounds.left() + line.x_for_index(selection.start),
+                                bounds.top(),
+                            ),
+                            point(
+                                bounds.left() + line.x_for_index(selection.end),
+                                bounds.bottom(),
+                            ),
+                        ),
+                        rgba(0x00a82d33),
+                    ));
+                }
+                line.paint(bounds.origin, bounds.size.height, window, cx)
+                    .ok();
+                if focus.is_focused(window) && selection.is_empty() {
+                    let x = line.x_for_index(selection.start);
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(
+                            point(bounds.left() + x, bounds.top()),
+                            size(px(1.0), bounds.size.height),
+                        ),
+                        rgba(EVERNOTE_GREEN),
+                    ));
+                }
+                if focus.is_focused(window) {
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(bounds, paint_input.clone()),
+                        cx,
+                    );
+                }
+            },
+        )
+        .w_full()
+        .h(px(26.0));
+        div()
+            .id("library-organization-input")
+            .debug_selector(|| "library-organization-input".to_owned())
+            .w(px(230.0))
+            .h(px(28.0))
+            .px(px(7.0))
+            .rounded(px(5.0))
+            .bg(rgba(0xffffffff))
+            .border_1()
+            .border_color(rgba(0xcbd5e1ff))
+            .key_context("LibraryOrganizationInput")
+            .track_focus(input.read(cx).focus_handle())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::on_organization_input_mouse_down),
+            )
+            .on_mouse_move(cx.listener(Self::on_organization_input_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(Self::on_organization_input_mouse_up),
+            )
+            .on_key_down(cx.listener(Self::on_organization_input_key_down))
+            .child(canvas)
+            .into_any_element()
+    }
+
+    fn on_organization_input_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            cx.propagate();
+            return;
+        }
+        self.organization_input.update(cx, |input, input_cx| {
+            input.begin_pointer_selection(event.position, event.modifiers.shift);
+            input.focus_handle().focus(window);
+            input_cx.notify();
+        });
+        cx.stop_propagation();
+    }
+
+    fn on_organization_input_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            cx.propagate();
+            return;
+        }
+        self.organization_input.update(cx, |input, input_cx| {
+            if input.extend_pointer_selection(event.position).is_some() {
+                input_cx.notify();
+            }
+        });
+        cx.stop_propagation();
+    }
+
+    fn on_organization_input_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.organization_input
+            .update(cx, |input, _| input.end_pointer_selection());
+        cx.stop_propagation();
+    }
+
+    fn on_organization_input_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.organization_input.clone();
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        let secondary = modifiers.secondary();
+        if key == "escape" {
+            self.organization_panel_open = false;
+            self.pending_destructive_action = None;
+            self.focus_handle.focus(window);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if key == "enter" {
+            let title = input.read(cx).text().to_owned();
+            let stack_id = self
+                .model
+                .read_with(cx, |model, _| match model.navigation().route() {
+                    LibraryRoute::Stack(id) => Some(id.clone()),
+                    _ => None,
+                });
+            self.submit_organization_create(
+                AppAction::CreateNotebook { title, stack_id },
+                window,
+                cx,
+            );
+            cx.stop_propagation();
+            return;
+        }
+        let handled = match key {
+            "backspace" => {
+                input.update(cx, |input, input_cx| {
+                    input.delete_backward();
+                    input_cx.notify();
+                });
+                true
+            }
+            "delete" => {
+                input.update(cx, |input, input_cx| {
+                    input.delete_forward();
+                    input_cx.notify();
+                });
+                true
+            }
+            "left" => {
+                input.update(cx, |input, input_cx| {
+                    input.move_horizontal(false, modifiers.shift);
+                    input_cx.notify();
+                });
+                true
+            }
+            "right" => {
+                input.update(cx, |input, input_cx| {
+                    input.move_horizontal(true, modifiers.shift);
+                    input_cx.notify();
+                });
+                true
+            }
+            "home" => {
+                input.update(cx, |input, input_cx| {
+                    input.move_to_edge(false, modifiers.shift);
+                    input_cx.notify();
+                });
+                true
+            }
+            "end" => {
+                input.update(cx, |input, input_cx| {
+                    input.move_to_edge(true, modifiers.shift);
+                    input_cx.notify();
+                });
+                true
+            }
+            "a" if secondary => {
+                input.update(cx, |input, input_cx| {
+                    input.select_all();
+                    input_cx.notify();
+                });
+                true
+            }
+            "c" if secondary => {
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    input.read(cx).selected_text().to_owned(),
+                ));
+                true
+            }
+            "x" if secondary => {
+                let selected = input.read(cx).selected_text().to_owned();
+                if !selected.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                    input.update(cx, |input, input_cx| {
+                        input.delete_forward();
+                        input_cx.notify();
+                    });
+                }
+                true
+            }
+            "v" if secondary => {
+                input.update(cx, |input, input_cx| input.paste_from_clipboard(input_cx));
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Small C1 organization menu. All controls dispatch typed `AppAction`
+    /// values through the same shell reducer as cards/menus/keys; this view
+    /// owns neither SQLite nor a parallel selected-note state.
+    fn render_organization_panel(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.organization_panel_open {
+            return None;
+        }
+        let (route, index, selected_tag_ids, has_selected_note) =
+            self.model.read_with(cx, |model, _| {
+                (
+                    model.navigation().route().clone(),
+                    model.navigation_index().clone(),
+                    model
+                        .active_note()
+                        .map(|note| note.tag_ids.clone())
+                        .unwrap_or_default(),
+                    model.navigation().selected_note_id().is_some(),
+                )
+            });
+        let stack_for_new_notebook = match &route {
+            LibraryRoute::Stack(id) => Some(id.clone()),
+            _ => None,
+        };
+        let is_trash_route = route == LibraryRoute::Trash;
+        let input = self.render_organization_input(cx);
+        let create_notebook_stack = stack_for_new_notebook.clone();
+        let create_notebook = div()
+            .id("library-organization-create-notebook")
+            .debug_selector(|| "library-organization-create-notebook".to_owned())
+            .px(px(7.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(rgba(0x00a82dff))
+            .text_size(px(11.0))
+            .text_color(rgba(0xffffffff))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |shell, _event, window, cx| {
+                    let title = shell.organization_input.read(cx).text().to_owned();
+                    shell.submit_organization_create(
+                        AppAction::CreateNotebook {
+                            title,
+                            stack_id: create_notebook_stack.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .child("新建笔记本");
+        let create_stack = div()
+            .id("library-organization-create-stack")
+            .debug_selector(|| "library-organization-create-stack".to_owned())
+            .px(px(7.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(rgba(0xf1f4f1ff))
+            .text_size(px(11.0))
+            .text_color(rgba(0x36413aff))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event, window, cx| {
+                    let title = shell.organization_input.read(cx).text().to_owned();
+                    shell.submit_organization_create(AppAction::CreateStack { title }, window, cx);
+                }),
+            )
+            .child("新建组");
+        let create_tag = div()
+            .id("library-organization-create-tag")
+            .debug_selector(|| "library-organization-create-tag".to_owned())
+            .px(px(7.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(rgba(0xf1f4f1ff))
+            .text_size(px(11.0))
+            .text_color(rgba(0x36413aff))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event, window, cx| {
+                    let title = shell.organization_input.read(cx).text().to_owned();
+                    shell.submit_organization_create(AppAction::CreateTag { title }, window, cx);
+                }),
+            )
+            .child("新建标签");
+
+        let rename_current: Option<gpui::AnyElement> = match route.clone() {
+            LibraryRoute::Stack(id) => Some(
+                div()
+                    .id("library-organization-rename-current")
+                    .debug_selector(|| "library-organization-rename-current".to_owned())
+                    .px(px(7.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(0xf1f4f1ff))
+                    .text_size(px(11.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event, window, cx| {
+                            let title = shell.organization_input.read(cx).text().to_owned();
+                            shell.apply_action(
+                                AppAction::RenameStack {
+                                    id: id.clone(),
+                                    title,
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .child("重命名当前")
+                    .into_any_element(),
+            ),
+            LibraryRoute::Notebook(id) => Some(
+                div()
+                    .id("library-organization-rename-current")
+                    .debug_selector(|| "library-organization-rename-current".to_owned())
+                    .px(px(7.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(0xf1f4f1ff))
+                    .text_size(px(11.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event, window, cx| {
+                            let title = shell.organization_input.read(cx).text().to_owned();
+                            shell.apply_action(
+                                AppAction::RenameNotebook {
+                                    id: id.clone(),
+                                    title,
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .child("重命名当前")
+                    .into_any_element(),
+            ),
+            LibraryRoute::Tags(tag_ids) if tag_ids.len() == 1 => {
+                let id = tag_ids.iter().next().expect("one tag").clone();
+                Some(
+                    div()
+                        .id("library-organization-rename-current")
+                        .debug_selector(|| "library-organization-rename-current".to_owned())
+                        .px(px(7.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0xf1f4f1ff))
+                        .text_size(px(11.0))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _event, window, cx| {
+                                let title = shell.organization_input.read(cx).text().to_owned();
+                                shell.apply_action(
+                                    AppAction::RenameTag {
+                                        id: id.clone(),
+                                        title,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child("重命名当前")
+                        .into_any_element(),
+                )
+            }
+            _ => None,
+        };
+        let delete_current: Option<gpui::AnyElement> = match route.clone() {
+            LibraryRoute::Stack(id) => Some(
+                library_destructive_action_button(
+                    "library-organization-delete-current-stack",
+                    "解散当前笔记本组".to_owned(),
+                    PendingDestructiveAction::DeleteStack(id),
+                    cx,
+                )
+                .into_any_element(),
+            ),
+            LibraryRoute::Notebook(id) => Some(
+                library_destructive_action_button(
+                    "library-organization-delete-current-notebook",
+                    "删除当前笔记本".to_owned(),
+                    PendingDestructiveAction::DeleteNotebook(id),
+                    cx,
+                )
+                .into_any_element(),
+            ),
+            LibraryRoute::Tags(tag_ids) if tag_ids.len() == 1 => Some(
+                library_destructive_action_button(
+                    "library-organization-delete-current-tag",
+                    "删除当前标签".to_owned(),
+                    PendingDestructiveAction::DeleteTag(
+                        tag_ids.into_iter().next().expect("one tag"),
+                    ),
+                    cx,
+                )
+                .into_any_element(),
+            ),
+            _ => None,
+        };
+
+        let mut move_targets = div()
+            .id("library-organization-move-targets")
+            .debug_selector(|| "library-organization-move-targets".to_owned())
+            .flex()
+            .flex_wrap()
+            .gap(px(4.0));
+        for notebook in &index.notebooks {
+            let id = notebook.id.clone();
+            let selector = format!("library-organization-move-note-{}", id.as_str());
+            move_targets = move_targets.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .px(px(6.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(0xf1f4f1ff))
+                    .text_size(px(10.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event, window, cx| {
+                            shell.apply_action(AppAction::MoveSelectedNote(id.clone()), window, cx)
+                        }),
+                    )
+                    .child(format!("移至 {}", notebook.title)),
+            );
+        }
+
+        let mut tag_targets = div()
+            .id("library-organization-tag-targets")
+            .debug_selector(|| "library-organization-tag-targets".to_owned())
+            .flex()
+            .flex_wrap()
+            .gap(px(4.0));
+        for tag in &index.tags {
+            let id = tag.id.clone();
+            let selected = selected_tag_ids.contains(&id);
+            let selector = format!("library-organization-tag-{}", id.as_str());
+            let action = if selected {
+                AppAction::RemoveTagFromSelectedNote(id.clone())
+            } else {
+                AppAction::AddTagToSelectedNote(id.clone())
+            };
+            tag_targets = tag_targets.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .px(px(6.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .bg(if selected {
+                        rgba(0x00a82d20)
+                    } else {
+                        rgba(0xf1f4f1ff)
+                    })
+                    .text_size(px(10.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event, window, cx| {
+                            shell.apply_action(action.clone(), window, cx)
+                        }),
+                    )
+                    .child(if selected {
+                        format!("移除 #{}", tag.title)
+                    } else {
+                        format!("添加 #{}", tag.title)
+                    }),
+            );
+        }
+
+        let trash_controls: Option<gpui::AnyElement> =
+            (is_trash_route && has_selected_note).then(|| {
+                div()
+                    .id("library-organization-trash-controls")
+                    .debug_selector(|| "library-organization-trash-controls".to_owned())
+                    .flex()
+                    .gap(px(6.0))
+                    .child(library_action_button(
+                        "library-organization-restore-selected",
+                        "恢复当前笔记".to_owned(),
+                        AppAction::RestoreSelected,
+                        cx,
+                    ))
+                    .child(library_destructive_action_button(
+                        "library-organization-purge-selected",
+                        "永久删除".to_owned(),
+                        self.model.read_with(cx, |model, _| {
+                            PendingDestructiveAction::PurgeNote(
+                                model
+                                    .navigation()
+                                    .selected_note_id()
+                                    .expect("Trash controls require a selected typed note")
+                                    .clone(),
+                            )
+                        }),
+                        cx,
+                    ))
+                    .into_any_element()
+            });
+        let destructive_confirmation = self.render_destructive_confirmation(cx);
+
+        let mut panel = div()
+            .id("library-organization-panel")
+            .debug_selector(|| "library-organization-panel".to_owned())
+            .mx(px(12.0))
+            .mb(px(8.0))
+            .p(px(8.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgba(0xd9e1d9ff))
+            .bg(rgba(0xfafcfaff))
+            .text_color(rgba(0x36413aff))
+            .text_size(px(11.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .max_h(px(228.0))
+            .overflow_y_scroll()
+            .child(div().text_color(rgba(0x718075ff)).child("组织"))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(input)
+                    .child(create_notebook)
+                    .child(create_stack)
+                    .child(create_tag),
+            )
+            .children(rename_current)
+            .children(delete_current)
+            .children(destructive_confirmation);
+        if has_selected_note && !is_trash_route {
+            panel = panel
+                .child(div().text_color(rgba(0x718075ff)).child("移动当前笔记"))
+                .child(move_targets)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(div().text_color(rgba(0x718075ff)).child("标签"))
+                        .child(library_action_button(
+                            "library-organization-clear-tags",
+                            "清空标签".to_owned(),
+                            AppAction::SetSelectedNoteTags(Vec::new()),
+                            cx,
+                        )),
+                )
+                .child(tag_targets);
+        }
+        Some(panel.children(trash_controls).into_any_element())
+    }
+
     /// Escape belongs to the shared command Chrome, not to a LibraryShell
     /// duplicate of its Link/More state. The focused editor surface bubbles
     /// this unhandled key to the retained shell; the Chrome then closes either
@@ -2021,6 +3855,18 @@ impl LibraryShell {
         cx: &mut Context<Self>,
     ) {
         if event.keystroke.key != "escape" {
+            return;
+        }
+        if self.dismiss_toolbar_more(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.organization_panel_open {
+            self.organization_panel_open = false;
+            self.pending_destructive_action = None;
+            self.focus_active_editor_or_shell(window, cx);
+            cx.notify();
+            cx.stop_propagation();
             return;
         }
         let Some(chrome) = self.command_chrome.clone() else {
@@ -2127,6 +3973,12 @@ impl LibraryShell {
                     .debug_selector(|| "library-native-editor-pane".to_owned())
                     .flex_1()
                     .min_w(px(1.0))
+                    // The document surface is its own scroll owner. In a
+                    // vertical flex column its automatic min-content height
+                    // otherwise expands this pane to a tall image/PDF's full
+                    // document height, leaving ScrollHandle::max_offset at
+                    // zero and making the following attachment unreachable.
+                    .min_h(px(0.0))
                     .h_full()
                     .relative()
                     .flex()
@@ -2138,7 +3990,13 @@ impl LibraryShell {
                     .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
                     .children(title)
                     .child(toolbar)
-                    .child(div().flex_1().min_w(px(1.0)).child(surface.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(1.0))
+                            .min_h(px(0.0))
+                            .child(surface.clone()),
+                    )
                     .into_any_element(),
                 overlays,
             };
@@ -2157,11 +4015,328 @@ impl LibraryShell {
     }
 }
 
+impl LibraryShell {
+    fn render_library_toolbar(
+        &mut self,
+        available_editor_width: f32,
+        editor_left: f32,
+        content_mask: Bounds<Pixels>,
+        route: &LibraryRoute,
+        mode: ListViewMode,
+        sort: NoteSort,
+        cx: &mut Context<Self>,
+    ) -> LibraryToolbarRender {
+        let compact = library_toolbar_is_compact(available_editor_width);
+        // A resize to an ample editor column must not revive a stale compact
+        // overlay when the next narrow layout is entered.
+        if !compact {
+            self.toolbar_more_open = false;
+        }
+        let mode_label = match mode {
+            ListViewMode::Cards => "卡片",
+            ListViewMode::Snippets => "摘要",
+            ListViewMode::Compact => "紧凑",
+        };
+        let sort_label = match sort {
+            NoteSort::UpdatedDescending => "按更新时间",
+            NoteSort::DeletedDescending => "按删除时间",
+            NoteSort::TitleAscending => "按标题 A-Z",
+            NoteSort::TitleDescending => "按标题 Z-A",
+        };
+        let mut actions = Vec::new();
+        if compact {
+            actions.push(
+                library_primary_action_button(
+                    "library-create-note",
+                    "新建".to_owned(),
+                    AppAction::CreateNote,
+                    cx,
+                )
+                .into_any_element(),
+            );
+            if !matches!(route, LibraryRoute::Trash) {
+                actions.push(library_resource_picker_button(cx).into_any_element());
+            }
+            actions.extend([
+                library_action_button(
+                    "library-toggle-sidebar",
+                    "侧栏".to_owned(),
+                    AppAction::ToggleSidebar,
+                    cx,
+                )
+                .into_any_element(),
+                library_action_button(
+                    "library-toggle-list",
+                    "笔记列表".to_owned(),
+                    AppAction::ToggleNoteList,
+                    cx,
+                )
+                .into_any_element(),
+                library_action_button(
+                    "library-sync-current",
+                    "保存".to_owned(),
+                    AppAction::ManualSync,
+                    cx,
+                )
+                .into_any_element(),
+                self.render_organization_toolbar_toggle(cx)
+                    .into_any_element(),
+                self.render_toolbar_more_trigger(cx),
+            ]);
+        } else {
+            if !matches!(route, LibraryRoute::Trash) {
+                actions.push(library_resource_picker_button(cx).into_any_element());
+            }
+            actions.extend([
+                library_primary_action_button(
+                    "library-create-note",
+                    "新建".to_owned(),
+                    AppAction::CreateNote,
+                    cx,
+                )
+                .into_any_element(),
+                library_action_button(
+                    "library-trash-selected",
+                    "移至废纸篓".to_owned(),
+                    AppAction::TrashSelected,
+                    cx,
+                )
+                .into_any_element(),
+                library_action_button(
+                    "library-toggle-sidebar",
+                    "侧栏".to_owned(),
+                    AppAction::ToggleSidebar,
+                    cx,
+                )
+                .into_any_element(),
+                library_action_button(
+                    "library-toggle-list",
+                    "笔记列表".to_owned(),
+                    AppAction::ToggleNoteList,
+                    cx,
+                )
+                .into_any_element(),
+                library_action_button(
+                    "library-cycle-view",
+                    format!("视图：{mode_label}"),
+                    AppAction::SetListViewMode(mode.next()),
+                    cx,
+                )
+                .into_any_element(),
+                library_action_button(
+                    "library-cycle-sort",
+                    sort_label.to_owned(),
+                    AppAction::SetSort(sort.next()),
+                    cx,
+                )
+                .into_any_element(),
+                library_action_button(
+                    "library-sync-current",
+                    "保存".to_owned(),
+                    AppAction::ManualSync,
+                    cx,
+                )
+                .into_any_element(),
+                self.render_organization_toolbar_toggle(cx)
+                    .into_any_element(),
+            ]);
+        }
+        let toolbar = div()
+            .id("library-actions")
+            .debug_selector(|| "library-actions".to_owned())
+            .w_full()
+            .min_w(px(0.0))
+            .h(px(42.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .overflow_hidden()
+            .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::Toolbar))
+            .text_color(self.evernote_primary_text_fill())
+            .border_b_1()
+            .border_color(self.evernote_primary_stroke())
+            .children(actions)
+            .into_any_element();
+        let overlays = self.render_toolbar_more_overlays(
+            compact,
+            available_editor_width,
+            editor_left,
+            content_mask,
+            route,
+            mode,
+            sort,
+            cx,
+        );
+        LibraryToolbarRender { toolbar, overlays }
+    }
+
+    fn render_organization_toolbar_toggle(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("library-toggle-organization")
+            .debug_selector(|| "library-toggle-organization".to_owned())
+            .flex_shrink_0()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(5.0))
+            .bg(if self.organization_panel_open {
+                rgba(0x00a82d20)
+            } else {
+                rgba(0xf1f4f1ff)
+            })
+            .text_size(px(12.0))
+            .text_color(rgba(0x36413aff))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::toggle_organization_panel),
+            )
+            .child("组织")
+    }
+
+    fn render_toolbar_more_trigger(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("library-toolbar-more")
+            .debug_selector(|| "library-toolbar-more".to_owned())
+            .flex_shrink_0()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(5.0))
+            .bg(if self.toolbar_more_open {
+                rgba(0x00a82d20)
+            } else {
+                rgba(0xf1f4f1ff)
+            })
+            .text_size(px(12.0))
+            .text_color(rgba(0x36413aff))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event, window, cx| shell.toggle_toolbar_more(window, cx)),
+            )
+            .child(if self.toolbar_more_open {
+                "更多 ▴"
+            } else {
+                "更多 ▾"
+            })
+            .into_any_element()
+    }
+
+    fn render_toolbar_more_overlays(
+        &self,
+        compact: bool,
+        available_editor_width: f32,
+        editor_left: f32,
+        content_mask: Bounds<Pixels>,
+        route: &LibraryRoute,
+        mode: ListViewMode,
+        sort: NoteSort,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        if !compact || !self.toolbar_more_open {
+            return Vec::new();
+        }
+        let mask_left = f32::from(content_mask.left());
+        let mask_right = f32::from(content_mask.right());
+        let mask_top = f32::from(content_mask.top());
+        let mask_bottom = f32::from(content_mask.bottom());
+        let menu_width = 220.0_f32.min(available_editor_width.max(1.0));
+        let left = (editor_left + available_editor_width - menu_width - 12.0)
+            .max(mask_left)
+            .min((mask_right - menu_width).max(mask_left));
+        let max_height = (mask_bottom - (mask_top + 42.0)).max(1.0).min(280.0);
+        let mut actions = Vec::new();
+        if !matches!(route, LibraryRoute::Trash) {
+            actions.push(
+                library_toolbar_more_action_button(
+                    "library-toolbar-more-trash",
+                    "移至废纸篓".to_owned(),
+                    AppAction::TrashSelected,
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+        let mode_label = match mode {
+            ListViewMode::Cards => "卡片",
+            ListViewMode::Snippets => "摘要",
+            ListViewMode::Compact => "紧凑",
+        };
+        let sort_label = match sort {
+            NoteSort::UpdatedDescending => "按更新时间",
+            NoteSort::DeletedDescending => "按删除时间",
+            NoteSort::TitleAscending => "按标题 A-Z",
+            NoteSort::TitleDescending => "按标题 Z-A",
+        };
+        actions.extend([
+            library_toolbar_more_action_button(
+                "library-toolbar-more-view",
+                format!("视图：{mode_label}"),
+                AppAction::SetListViewMode(mode.next()),
+                cx,
+            )
+            .into_any_element(),
+            library_toolbar_more_action_button(
+                "library-toolbar-more-sort",
+                sort_label.to_owned(),
+                AppAction::SetSort(sort.next()),
+                cx,
+            )
+            .into_any_element(),
+        ]);
+        let shell = cx.entity();
+        let backdrop = div()
+            .id("library-toolbar-more-backdrop")
+            .debug_selector(|| "library-toolbar-more-backdrop".to_owned())
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                cx.stop_propagation();
+                let _ = shell.update(cx, |shell, shell_cx| {
+                    shell.dismiss_toolbar_more(window, shell_cx)
+                });
+            })
+            .into_any_element();
+        let menu = div()
+            .id("library-toolbar-more-menu")
+            .debug_selector(|| "library-toolbar-more-menu".to_owned())
+            .absolute()
+            .top(px(mask_top + 42.0))
+            .left(px(left))
+            .w(px(menu_width))
+            .max_h(px(max_height))
+            .overflow_y_scroll()
+            .occlude()
+            .p(px(8.0))
+            .rounded(px(6.0))
+            .bg(rgba(0xffffffff))
+            .border_1()
+            .border_color(rgba(0xc7d0ddff))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .children(actions)
+            .into_any_element();
+        vec![backdrop, menu]
+    }
+}
+
 /// Ask the native platform for one file, then return to the exact library
 /// window which captured the insertion point. No picker task holds the shell
 /// strongly, so closing a window while the panel is open simply discards its
 /// eventual completion.
-fn prompt_for_resource_path(window_handle: WindowHandle<LibraryShell>, cx: &mut App) {
+fn prompt_for_resource_path(prompt_request: ResourcePickerPrompt, cx: &mut App) {
+    let ResourcePickerPrompt {
+        window: window_handle,
+        token,
+    } = prompt_request;
     let prompt = cx.prompt_for_paths(PathPromptOptions {
         files: true,
         directories: false,
@@ -2176,13 +4351,14 @@ fn prompt_for_resource_path(window_handle: WindowHandle<LibraryShell>, cx: &mut 
         let _ = cx.update(move |app| {
             let _ = window_handle.update(app, |shell, window, shell_cx| {
                 if let Some(path) = completion {
-                    if let Err(error) = shell.complete_resource_picker_path(path, window, shell_cx)
+                    if let Err(error) =
+                        shell.complete_resource_picker_path_for_token(token, path, window, shell_cx)
                     {
                         shell.resource_notice = Some(format!("资源未插入：{error}"));
                         shell_cx.notify();
                     }
                 } else {
-                    shell.cancel_resource_picker(shell_cx);
+                    shell.cancel_resource_picker(token, shell_cx);
                 }
             });
         });
@@ -2201,7 +4377,12 @@ fn prompt_for_resource_path(window_handle: WindowHandle<LibraryShell>, cx: &mut 
 fn dispatch_library_resource_picker(window: AnyWindowHandle, cx: &mut App) {
     #[cfg(not(test))]
     if let Some(window) = window.downcast::<LibraryShell>() {
-        prompt_for_resource_path(window, cx);
+        let prompt = window.update(cx, |shell, window, _| {
+            shell.pending_resource_picker_prompt(window)
+        });
+        if let Ok(Ok(prompt)) = prompt {
+            prompt_for_resource_path(prompt, cx);
+        }
     }
 
     #[cfg(test)]
@@ -2260,23 +4441,30 @@ impl Render for LibraryShell {
             AppStatus::Ready => None,
             AppStatus::Error(error) => Some(format!("资料库错误：{error}")),
         };
+        let editor_left_in_window = if panes.sidebar_visible {
+            f32::from(panes.sidebar_width)
+        } else {
+            0.0
+        } + if panes.list_visible {
+            f32::from(panes.list_width)
+        } else {
+            0.0
+        };
+        // `Window::bounds` can include platform chrome and does not follow a
+        // test/runtime content-mask resize until the next platform pass. The
+        // toolbar must adapt to the actual flex column that will be painted,
+        // not that outer window measurement.
+        let content_mask = window.content_mask().bounds;
+        let available_editor_width =
+            (f32::from(content_mask.size.width) - editor_left_in_window).max(1.0);
+        let editor_left = f32::from(content_mask.left()) + editor_left_in_window;
         let LibraryEditorRender {
             pane: editor_pane,
             overlays: editor_overlays,
         } = self.render_editor_panel(
             items.is_empty(),
             active_note,
-            f32::from(window.bounds().size.width)
-                - if panes.sidebar_visible {
-                    f32::from(panes.sidebar_width)
-                } else {
-                    0.0
-                }
-                - if panes.list_visible {
-                    f32::from(panes.list_width)
-                } else {
-                    0.0
-                },
+            available_editor_width,
             window,
             cx,
         );
@@ -2286,6 +4474,7 @@ impl Render for LibraryShell {
             panes.list_width,
             panes.list_visible,
             mode,
+            window,
             cx,
         );
         let sidebar_shell = cx.weak_entity();
@@ -2298,10 +4487,22 @@ impl Render for LibraryShell {
             cx,
             move |route, window, app| {
                 let _ = sidebar_shell.update(app, |shell, shell_cx| {
+                    let selected_note_id = match shell.model.read_with(shell_cx, |model, _| {
+                        model.sidebar_selected_note_for_route(&route)
+                    }) {
+                        Ok(selected_note_id) => selected_note_id,
+                        Err(error) => {
+                            shell.model.update(shell_cx, |model, model_cx| {
+                                model.report_navigation_preflight_error(&error);
+                                model_cx.notify();
+                            });
+                            return;
+                        }
+                    };
                     shell.apply_action(
                         AppAction::NavigateTo {
                             route,
-                            selected_note_id: None,
+                            selected_note_id,
                         },
                         window,
                         shell_cx,
@@ -2309,75 +4510,19 @@ impl Render for LibraryShell {
                 });
             },
         );
-        let mode_label = match mode {
-            ListViewMode::Cards => "卡片",
-            ListViewMode::Snippets => "摘要",
-            ListViewMode::Compact => "紧凑",
-        };
-        let sort_label = match sort {
-            NoteSort::UpdatedDescending => "按更新时间",
-            NoteSort::DeletedDescending => "按删除时间",
-            NoteSort::TitleAscending => "按标题 A-Z",
-            NoteSort::TitleDescending => "按标题 Z-A",
-        };
-        let toolbar = div()
-            .id("library-actions")
-            .debug_selector(|| "library-actions".to_owned())
-            .h(px(42.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(12.0))
-            .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::Toolbar))
-            .text_color(self.evernote_primary_text_fill())
-            .border_b_1()
-            .border_color(self.evernote_primary_stroke())
-            .children([
-                library_resource_picker_button(cx),
-                library_action_button(
-                    "library-create-note",
-                    "新建".to_owned(),
-                    AppAction::CreateNote,
-                    cx,
-                ),
-                library_action_button(
-                    "library-trash-selected",
-                    "移至废纸篓".to_owned(),
-                    AppAction::TrashSelected,
-                    cx,
-                ),
-                library_action_button(
-                    "library-toggle-sidebar",
-                    "侧栏".to_owned(),
-                    AppAction::ToggleSidebar,
-                    cx,
-                ),
-                library_action_button(
-                    "library-toggle-list",
-                    "笔记列表".to_owned(),
-                    AppAction::ToggleNoteList,
-                    cx,
-                ),
-                library_action_button(
-                    "library-cycle-view",
-                    format!("视图：{mode_label}"),
-                    AppAction::SetListViewMode(mode.next()),
-                    cx,
-                ),
-                library_action_button(
-                    "library-cycle-sort",
-                    sort_label.to_owned(),
-                    AppAction::SetSort(sort.next()),
-                    cx,
-                ),
-                library_action_button(
-                    "library-sync-current",
-                    "保存".to_owned(),
-                    AppAction::ManualSync,
-                    cx,
-                ),
-            ]);
+        let LibraryToolbarRender {
+            toolbar,
+            overlays: toolbar_overlays,
+        } = self.render_library_toolbar(
+            available_editor_width,
+            editor_left,
+            content_mask,
+            &route,
+            mode,
+            sort,
+            cx,
+        );
+        let organization_panel = self.render_organization_panel(cx);
         let mut root = div()
             .id("library-shell")
             .debug_selector(|| "library-shell".to_owned())
@@ -2394,6 +4539,9 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::cycle_list_view_mode))
             .on_action(cx.listener(Self::cycle_sort))
             .on_action(cx.listener(Self::sync_current))
+            .on_action(cx.listener(Self::toggle_library_toolbar_more))
+            .on_action(cx.listener(Self::toggle_library_organization_panel))
+            .on_action(cx.listener(Self::open_library_resource_picker))
             .on_action(cx.listener(Self::paste_resource_or_text))
             .on_key_down(cx.listener(Self::on_shell_key_down))
             .child(sidebar)
@@ -2410,8 +4558,12 @@ impl Render for LibraryShell {
                     .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::MainEditor))
                     .text_color(self.evernote_primary_text_fill())
                     .child(toolbar)
+                    .children(organization_panel)
                     .child(editor_pane),
             );
+        for overlay in toolbar_overlays {
+            root = root.child(overlay);
+        }
         for overlay in editor_overlays {
             root = root.child(overlay);
         }
@@ -2471,6 +4623,7 @@ impl Render for LibraryShell {
 /// minimal ordinary GPUI window rather than panicking inside a deferred window
 /// factory or printing a message which can disappear when launched by Finder.
 pub(crate) struct StartupErrorView {
+    title: String,
     message: String,
 }
 
@@ -2485,7 +4638,7 @@ impl Render for StartupErrorView {
             .flex_col()
             .gap(px(12.0))
             .bg(rgba(0xffffffff))
-            .child(div().text_size(px(23.0)).child("无法启动 Joplin Lite"))
+            .child(div().text_size(px(23.0)).child(self.title.clone()))
             .child(
                 div()
                     .text_color(rgba(0xa34838ff))
@@ -2503,13 +4656,31 @@ pub(crate) fn open_startup_error_window(
     cx: &mut App,
     message: String,
 ) -> Result<WindowHandle<StartupErrorView>, String> {
+    open_application_error_window(cx, "无法启动 Joplin Lite".to_owned(), message)
+}
+
+/// Fallback when a live window cannot even accept an in-place prompt. It is
+/// deliberately separate from startup semantics so a blocked quit tells the
+/// person what happened rather than pretending application launch failed.
+pub(crate) fn open_quit_safety_error_window(
+    cx: &mut App,
+    message: String,
+) -> Result<WindowHandle<StartupErrorView>, String> {
+    open_application_error_window(cx, "无法安全退出 Joplin Lite".to_owned(), message)
+}
+
+fn open_application_error_window(
+    cx: &mut App,
+    title: String,
+    message: String,
+) -> Result<WindowHandle<StartupErrorView>, String> {
     let bounds = gpui::Bounds::centered(None, size(px(520.0), px(240.0)), cx);
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..WindowOptions::default()
         },
-        move |_window, cx| cx.new(|_| StartupErrorView { message }),
+        move |_window, cx| cx.new(|_| StartupErrorView { title, message }),
     )
     .map_err(|error| error.to_string())
 }
@@ -2523,6 +4694,7 @@ fn library_action_button(
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
+        .flex_shrink_0()
         .px(px(8.0))
         .py(px(5.0))
         .rounded(px(5.0))
@@ -2539,11 +4711,97 @@ fn library_action_button(
         .child(label)
 }
 
+/// The compact and wide toolbars share this actual `CreateNote` route. The
+/// green treatment makes the habitual writer action visually primary without
+/// manufacturing a second create reducer.
+fn library_primary_action_button(
+    id: &'static str,
+    label: String,
+    action: AppAction,
+    cx: &mut Context<LibraryShell>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex_shrink_0()
+        .px(px(8.0))
+        .py(px(5.0))
+        .rounded(px(5.0))
+        .bg(rgba(EVERNOTE_GREEN))
+        .text_size(px(12.0))
+        .text_color(rgba(0xffffffff))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |shell, _event, window, cx| {
+                shell.apply_action(action.clone(), window, cx)
+            }),
+        )
+        .child(label)
+}
+
+/// The overflow owns only whether it is open. Choosing a row immediately
+/// closes that transient layer then sends the same typed model action as the
+/// wide direct button.
+fn library_toolbar_more_action_button(
+    id: &'static str,
+    label: String,
+    action: AppAction,
+    cx: &mut Context<LibraryShell>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .w_full()
+        .px(px(8.0))
+        .py(px(6.0))
+        .rounded(px(4.0))
+        .bg(rgba(0xf7f9f7ff))
+        .text_size(px(12.0))
+        .text_color(rgba(0x36413aff))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |shell, _event, window, cx| {
+                cx.stop_propagation();
+                shell.apply_toolbar_more_action(action.clone(), window, cx)
+            }),
+        )
+        .child(label)
+}
+
+fn library_destructive_action_button(
+    id: &'static str,
+    label: String,
+    pending: PendingDestructiveAction,
+    cx: &mut Context<LibraryShell>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex_shrink_0()
+        .px(px(8.0))
+        .py(px(5.0))
+        .rounded(px(5.0))
+        .bg(rgba(0xfff1efff))
+        .text_size(px(12.0))
+        .text_color(rgba(0x8d3b30ff))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |shell, _event, window, cx| {
+                shell.request_destructive_confirmation(pending.clone(), window, cx)
+            }),
+        )
+        .child(label)
+}
+
 fn library_resource_picker_button(cx: &mut Context<LibraryShell>) -> gpui::Stateful<gpui::Div> {
     let shell = cx.weak_entity();
     div()
         .id("library-insert-resource")
         .debug_selector(|| "library-insert-resource".to_owned())
+        .flex_shrink_0()
         .px(px(8.0))
         .py(px(5.0))
         .rounded(px(5.0))
@@ -2556,7 +4814,7 @@ fn library_resource_picker_button(cx: &mut Context<LibraryShell>) -> gpui::State
                 shell.prompt_for_resource_picker(window, shell_cx)
             });
             match result {
-                Ok(Ok(window_handle)) => prompt_for_resource_path(window_handle, app),
+                Ok(Ok(prompt_request)) => prompt_for_resource_path(prompt_request, app),
                 Ok(Err(error)) => {
                     let _ = shell.update(app, |shell, shell_cx| {
                         shell.resource_notice = Some(error);
@@ -2577,4 +4835,18 @@ fn import_note_body(note: &Note) -> Result<crate::native_editor::model::Document
 }
 
 #[cfg(test)]
+mod create_note_route_tests;
+#[cfg(test)]
+mod editor_scroll_tests;
+#[cfg(test)]
+mod navigation_retention_tests;
+#[cfg(test)]
+mod note_card_tests;
+#[cfg(test)]
+mod organization_input_tests;
+#[cfg(test)]
+mod quit_lifecycle_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod toolbar_adaptation_tests;

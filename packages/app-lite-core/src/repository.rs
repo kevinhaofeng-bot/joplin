@@ -4,8 +4,9 @@ use crate::resource::{
 use crate::schema::migrate_schema;
 use crate::{
     BlobHash, CanonicalDocument, CreateNote, EditJournalEntry, EntityRef, JournalOwnership,
-    LibraryNavigationIndex, ListQuery, ListQueryError, Note, NoteId, NoteProjection, Notebook,
-    NotebookId, ResourceId, SaveNote, SavedRevision, Stack, StackId, Tag, TagId,
+    LibraryNavigationIndex, ListQuery, ListQueryError, Note, NoteId, NoteOrganizationState,
+    NoteProjection, Notebook, NotebookId, ResourceId, SaveNote, SavedRevision, SearchFilter,
+    SearchHit, SearchQuery, SearchQueryError, SearchTerm, Stack, StackId, Tag, TagId,
     compile_note_list_query,
 };
 use rusqlite::hooks::{AuthAction, Authorization};
@@ -258,8 +259,16 @@ pub enum LibraryError {
     InvalidLibraryShellState,
     #[error("generic settings access cannot address reserved library shell state")]
     ReservedLibraryShellSetting,
+    #[error("organization title must contain visible text and fit within 255 characters")]
+    InvalidOrganizationTitle,
+    #[error("select a child notebook before creating a note in this notebook group")]
+    StackNoteContainerRequired,
+    #[error("the default notebook cannot be deleted")]
+    DefaultNotebookCannotBeDeleted,
     #[error("invalid note-list query")]
     ListQuery(#[from] ListQueryError),
+    #[error("invalid search query")]
+    SearchQuery(#[from] SearchQueryError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +332,13 @@ pub struct StagedResourceSnapshotCommit {
     pub selected_thumbnail_id: Option<ResourceId>,
 }
 
+#[derive(Debug, Clone)]
+struct PurgeResourceCandidate {
+    id: ResourceId,
+    sha256: BlobHash,
+    revision: i64,
+}
+
 pub struct LibraryRepository {
     connection: Mutex<Connection>,
     #[allow(dead_code)]
@@ -331,7 +347,11 @@ pub struct LibraryRepository {
     events: Mutex<Vec<Sender<LibraryEvent>>>,
     list_observers: Mutex<Vec<Sender<Vec<String>>>>,
     #[cfg(any(test, feature = "test-support"))]
+    search_observers: Mutex<Vec<Sender<Vec<String>>>>,
+    #[cfg(any(test, feature = "test-support"))]
     navigation_index_observers: Mutex<Vec<Sender<Vec<String>>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    organization_state_observers: Mutex<Vec<Sender<Vec<String>>>>,
     note_load_observers: Mutex<Vec<Sender<NoteId>>>,
     #[cfg(test)]
     shell_state_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -547,14 +567,18 @@ impl LibraryRepository {
         // Every operation above this line can still return a normal open
         // failure.  Once schema commit succeeds, publication is only owned-fd
         // and in-memory state movement; do not lie that it failed afterward.
-        Ok(Self {
+        let repository = Self {
             connection: Mutex::new(connection),
             database_file,
             resource_store,
             events: Mutex::new(Vec::new()),
             list_observers: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
+            search_observers: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-support"))]
             navigation_index_observers: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            organization_state_observers: Mutex::new(Vec::new()),
             note_load_observers: Mutex::new(Vec::new()),
             #[cfg(test)]
             shell_state_read_hook: Mutex::new(None),
@@ -565,7 +589,12 @@ impl LibraryRepository {
             database_path: path,
             clock,
             id_source,
-        })
+        };
+        // A physical unlink is necessarily outside SQLite, so a crash or a
+        // transient filesystem refusal leaves this durable queue for a later
+        // open. It must never make an already-published database unusable.
+        let _ = repository.drain_resource_gc();
+        Ok(repository)
     }
 
     fn now(&self) -> i64 {
@@ -586,6 +615,12 @@ impl LibraryRepository {
             let exists: i64 = if table == "notes" {
                 transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1 UNION ALL SELECT 1 FROM note_revisions WHERE note_id=?1 UNION ALL SELECT 1 FROM tombstones WHERE entity_type='note' AND entity_id=?1)",
+                    [&id],
+                    |row| row.get(0),
+                )?
+            } else if table == "resources" {
+                transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM resources WHERE id=?1 UNION ALL SELECT 1 FROM tombstones WHERE entity_type='resource' AND entity_id=?1)",
                     [&id],
                     |row| row.get(0),
                 )?
@@ -663,6 +698,17 @@ impl LibraryRepository {
         receiver
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_next_search_query(&self) -> Receiver<Vec<String>> {
+        let (sender, receiver) = channel();
+        self.search_observers
+            .lock()
+            .expect("search observer mutex poisoned")
+            .push(sender);
+        receiver
+    }
+
     /// Reports actual SQLite `Read` actions for the next navigation-index
     /// query. It is deliberately feature-gated so production navigation has
     /// no observer lock or authorizer bookkeeping, while test-support builds
@@ -675,6 +721,21 @@ impl LibraryRepository {
         self.navigation_index_observers
             .lock()
             .expect("navigation-index observer mutex poisoned")
+            .push(sender);
+        receiver
+    }
+
+    /// Reports physical SQLite reads made while reconciling an already
+    /// mounted selected note after a typed organization mutation. This stays
+    /// feature-gated with the other authorizer probes: production pays no
+    /// observer lock or authorizer installation cost.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_next_note_organization_state_query(&self) -> Receiver<Vec<String>> {
+        let (sender, receiver) = channel();
+        self.organization_state_observers
+            .lock()
+            .expect("organization-state observer mutex poisoned")
             .push(sender);
         receiver
     }
@@ -1117,6 +1178,13 @@ impl LibraryRepository {
                 .ok_or(LibraryError::InvalidSnapshot)?,
         );
         if let Some(staged) = staged_resource {
+            // `stage_resource` deliberately has no SQLite publication. Hold
+            // this IMMEDIATE writer transaction while re-opening its
+            // descriptor-safe bytes: if queued physical GC already won, this
+            // returns before resource metadata, note relations, outbox work,
+            // or events can become visible. If this writer won, GC must see
+            // the metadata committed below before it can unlink the hash.
+            self.resource_store.verify_staged_blob(&staged.blob)?;
             self.insert_staged_resource_metadata(&transaction, staged, now)?;
             #[cfg(test)]
             if let Some(error) = self
@@ -1279,6 +1347,86 @@ impl LibraryRepository {
         result
     }
 
+    /// Reads only the metadata an already-mounted note session needs after a
+    /// move/tag/delete mutation. This is deliberately not `load_note`: the
+    /// organization UI must never hydrate canonical bodies or resources just
+    /// to repaint route membership.
+    pub fn note_organization_state(
+        &self,
+        note_id: &NoteId,
+    ) -> Result<Option<NoteOrganizationState>, LibraryError> {
+        #[cfg(any(test, feature = "test-support"))]
+        let observers = std::mem::take(
+            &mut *self
+                .organization_state_observers
+                .lock()
+                .expect("organization-state observer mutex poisoned"),
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        let columns = Arc::new(Mutex::new(BTreeSet::new()));
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        #[cfg(any(test, feature = "test-support"))]
+        if !observers.is_empty() {
+            let captured = Arc::clone(&columns);
+            connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if let AuthAction::Read {
+                    table_name,
+                    column_name,
+                } = context.action
+                {
+                    captured
+                        .lock()
+                        .expect("organization-state column observer mutex poisoned")
+                        .insert(format!("{table_name}.{column_name}"));
+                }
+                Authorization::Allow
+            }));
+        }
+        let result = (|| -> Result<Option<NoteOrganizationState>, LibraryError> {
+            let row: Option<(String, i64, i64, i64)> = connection
+                .query_row(
+                    "SELECT notebook_id, updated_time, deleted_time, revision FROM notes WHERE id = ?1",
+                    [note_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((notebook_id, updated_time, deleted_time, revision)) = row else {
+                return Ok(None);
+            };
+            let mut statement = connection.prepare(
+                "SELECT tag_id FROM note_tags WHERE note_id = ?1 ORDER BY position, tag_id",
+            )?;
+            let tag_ids = statement
+                .query_map([note_id.as_str()], |row| {
+                    TagId::parse(row.get::<_, String>(0)?).map_err(invalid_column)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(NoteOrganizationState {
+                id: note_id.clone(),
+                notebook_id: NotebookId::parse(notebook_id).map_err(|_| LibraryError::InvalidId)?,
+                tag_ids,
+                updated_time,
+                deleted_time: (deleted_time != 0).then_some(deleted_time),
+                revision,
+            }))
+        })();
+        #[cfg(any(test, feature = "test-support"))]
+        connection.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
+        #[cfg(any(test, feature = "test-support"))]
+        if !observers.is_empty() {
+            let fields = columns
+                .lock()
+                .expect("organization-state column observer mutex poisoned")
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            for observer in observers {
+                let _ = observer.send(fields.clone());
+            }
+        }
+        result
+    }
+
     pub fn trash_note(&self, id: &NoteId) -> Result<(), LibraryError> {
         self.set_deleted(id, true)
     }
@@ -1289,7 +1437,7 @@ impl LibraryRepository {
     pub fn purge_note(&self, id: &NoteId) -> Result<(), LibraryError> {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (revision, deleted_time): (i64, i64) = transaction
             .query_row(
                 "SELECT revision, deleted_time FROM notes WHERE id = ?1 AND deleted_time <> 0",
@@ -1298,7 +1446,10 @@ impl LibraryRepository {
             )
             .optional()?
             .ok_or(LibraryError::NotFound)?;
-        let final_revision = revision + 1;
+        let final_revision = revision
+            .checked_add(1)
+            .ok_or(LibraryError::InvalidSnapshot)?;
+        let resource_candidates = purge_resource_candidates(&transaction, id)?;
         transaction.execute("INSERT INTO tombstones (entity_type, entity_id, final_revision, deleted_time, purged_time) VALUES ('note', ?1, ?2, ?3, ?4)", params![id.as_str(), final_revision, deleted_time, now])?;
         transaction.execute("DELETE FROM notes WHERE id = ?1", [id.as_str()])?;
         queue_search(&transaction, id, now, "purge")?;
@@ -1310,13 +1461,128 @@ impl LibraryRepository {
             "purge",
             now,
         )?;
+        let reclaimed_resources =
+            self.reclaim_unreferenced_purge_resources(&transaction, resource_candidates, now)?;
         transaction.commit()?;
-        self.publish(vec![
+        drop(connection);
+        let mut events = vec![
             LibraryEvent::NoteProjectionChanged(id.clone()),
             LibraryEvent::SearchProjectionQueued(id.clone()),
             LibraryEvent::SyncQueued(EntityRef::Note(id.clone())),
-        ]);
+        ];
+        events.extend(
+            reclaimed_resources
+                .into_iter()
+                .map(|id| LibraryEvent::SyncQueued(EntityRef::Resource(id))),
+        );
+        self.publish(events);
+        // The queue is durable before publication. A failed unlink leaves it
+        // for the next repository open/retry rather than rolling back a note
+        // tombstone or allowing a live resource relation to disappear.
+        let _ = self.drain_resource_gc();
         Ok(())
+    }
+
+    fn reclaim_unreferenced_purge_resources(
+        &self,
+        transaction: &Transaction<'_>,
+        candidates: Vec<PurgeResourceCandidate>,
+        now: i64,
+    ) -> Result<Vec<ResourceId>, LibraryError> {
+        let mut reclaimed = Vec::new();
+        for candidate in candidates {
+            let deleted = transaction.execute(
+                "DELETE FROM resources
+                 WHERE id = ?1
+                   AND NOT EXISTS(SELECT 1 FROM note_resources WHERE resource_id = ?1)",
+                [candidate.id.as_str()],
+            )?;
+            if deleted == 0 {
+                continue;
+            }
+            let final_revision = candidate
+                .revision
+                .checked_add(1)
+                .ok_or(LibraryError::InvalidSnapshot)?;
+            transaction.execute(
+                "DELETE FROM sync_outbox WHERE entity_type = 'resource' AND entity_id = ?1",
+                [candidate.id.as_str()],
+            )?;
+            transaction.execute(
+                "INSERT INTO tombstones (entity_type, entity_id, final_revision, deleted_time, purged_time)
+                 VALUES ('resource', ?1, ?2, ?3, ?3)",
+                params![candidate.id.as_str(), final_revision, now],
+            )?;
+            enqueue_sync(
+                transaction,
+                self.id_source.as_ref(),
+                &EntityRef::Resource(candidate.id.clone()),
+                final_revision,
+                "purge",
+                now,
+            )?;
+            let blob_is_unreferenced: i64 = transaction.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM resources WHERE sha256 = ?1)",
+                [candidate.sha256.as_str()],
+                |row| row.get(0),
+            )?;
+            if blob_is_unreferenced != 0 {
+                transaction.execute(
+                    "DELETE FROM resource_blobs
+                     WHERE sha256 = ?1
+                       AND NOT EXISTS(SELECT 1 FROM resources WHERE sha256 = ?1)",
+                    [candidate.sha256.as_str()],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO resource_gc_queue (sha256, created_time) VALUES (?1, ?2)",
+                    params![candidate.sha256.as_str(), now],
+                )?;
+            }
+            reclaimed.push(candidate.id);
+        }
+        Ok(reclaimed)
+    }
+
+    fn drain_resource_gc(&self) -> Result<(), LibraryError> {
+        loop {
+            let mut connection = self.connection.lock().expect("library mutex poisoned");
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let queued: Option<String> = transaction
+                .query_row(
+                    "SELECT sha256 FROM resource_gc_queue ORDER BY created_time, sha256 LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(queued) = queued else {
+                transaction.commit()?;
+                return Ok(());
+            };
+            let sha256 = BlobHash::new(&queued).map_err(|_| LibraryError::InvalidSnapshot)?;
+            let metadata_reappeared: i64 = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resource_blobs WHERE sha256 = ?1)",
+                [sha256.as_str()],
+                |row| row.get(0),
+            )?;
+            if metadata_reappeared != 0 {
+                transaction.execute(
+                    "DELETE FROM resource_gc_queue WHERE sha256 = ?1",
+                    [sha256.as_str()],
+                )?;
+                transaction.commit()?;
+                continue;
+            }
+            // Keep this IMMEDIATE transaction until the descriptor-relative
+            // unlink and queue acknowledgement have both occurred. A second
+            // repository cannot publish a resource row for this hash midway.
+            self.resource_store.remove_blob(&sha256)?;
+            transaction.execute(
+                "DELETE FROM resource_gc_queue WHERE sha256 = ?1",
+                [sha256.as_str()],
+            )?;
+            transaction.commit()?;
+        }
     }
 
     pub fn create_notebook(
@@ -1324,6 +1590,7 @@ impl LibraryRepository {
         title: &str,
         stack_id: Option<&StackId>,
     ) -> Result<Notebook, LibraryError> {
+        let title = organization_title(title)?;
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
@@ -1349,7 +1616,7 @@ impl LibraryRepository {
         ]);
         Ok(Notebook {
             id,
-            title: title.into(),
+            title,
             stack_id: stack_id.cloned(),
             revision: 1,
             is_default: false,
@@ -1357,6 +1624,7 @@ impl LibraryRepository {
     }
 
     pub fn create_stack(&self, title: &str) -> Result<Stack, LibraryError> {
+        let title = organization_title(title)?;
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
@@ -1379,12 +1647,13 @@ impl LibraryRepository {
         ]);
         Ok(Stack {
             id,
-            title: title.into(),
+            title,
             revision: 1,
         })
     }
 
     pub fn create_tag(&self, title: &str) -> Result<Tag, LibraryError> {
+        let title = organization_title(title)?;
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
@@ -1407,8 +1676,128 @@ impl LibraryRepository {
         ]);
         Ok(Tag {
             id,
-            title: title.into(),
+            title,
             revision: 1,
+        })
+    }
+
+    /// Renames a stack in place. Sidebar routes, history entries and nested
+    /// notebooks retain their durable StackId; a title update is never a
+    /// delete-and-recreate operation.
+    pub fn rename_stack(&self, id: &StackId, title: &str) -> Result<Stack, LibraryError> {
+        let title = organization_title(title)?;
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        let revision = next_organization_revision(&transaction, "stacks", id.as_str())?;
+        let updated_time = next_organization_time(&transaction, "stacks", id.as_str(), now)?;
+        let changed = transaction.execute(
+            "UPDATE stacks SET title = ?2, revision = ?3, updated_time = ?4
+             WHERE id = ?1 AND deleted_time = 0",
+            params![id.as_str(), title, revision, updated_time],
+        )?;
+        if changed != 1 {
+            return Err(LibraryError::NotFound);
+        }
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Stack(id.clone()),
+            revision,
+            "rename",
+            updated_time,
+        )?;
+        transaction.commit()?;
+        self.publish(vec![
+            LibraryEvent::OrganizationChanged,
+            LibraryEvent::SyncQueued(EntityRef::Stack(id.clone())),
+        ]);
+        Ok(Stack {
+            id: id.clone(),
+            title,
+            revision,
+        })
+    }
+
+    /// Renames a notebook without changing its StackId or note membership.
+    pub fn rename_notebook(&self, id: &NotebookId, title: &str) -> Result<Notebook, LibraryError> {
+        let title = organization_title(title)?;
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        let (stack_id, is_default): (Option<String>, i64) = transaction
+            .query_row(
+                "SELECT stack_id, is_default FROM notebooks WHERE id = ?1 AND deleted_time = 0",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(LibraryError::NotFound)?;
+        let revision = next_organization_revision(&transaction, "notebooks", id.as_str())?;
+        let updated_time = next_organization_time(&transaction, "notebooks", id.as_str(), now)?;
+        transaction.execute(
+            "UPDATE notebooks SET title = ?2, revision = ?3, updated_time = ?4 WHERE id = ?1",
+            params![id.as_str(), title, revision, updated_time],
+        )?;
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Notebook(id.clone()),
+            revision,
+            "rename",
+            updated_time,
+        )?;
+        transaction.commit()?;
+        self.publish(vec![
+            LibraryEvent::OrganizationChanged,
+            LibraryEvent::SyncQueued(EntityRef::Notebook(id.clone())),
+        ]);
+        Ok(Notebook {
+            id: id.clone(),
+            title,
+            stack_id: stack_id
+                .map(StackId::parse)
+                .transpose()
+                .map_err(|_| LibraryError::InvalidId)?,
+            revision,
+            is_default: is_default != 0,
+        })
+    }
+
+    /// Renames a tag in place, retaining its stable TagId and all active note
+    /// relationships.
+    pub fn rename_tag(&self, id: &TagId, title: &str) -> Result<Tag, LibraryError> {
+        let title = organization_title(title)?;
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        let revision = next_organization_revision(&transaction, "tags", id.as_str())?;
+        let updated_time = next_organization_time(&transaction, "tags", id.as_str(), now)?;
+        let changed = transaction.execute(
+            "UPDATE tags SET title = ?2, revision = ?3, updated_time = ?4
+             WHERE id = ?1 AND deleted_time = 0",
+            params![id.as_str(), title, revision, updated_time],
+        )?;
+        if changed != 1 {
+            return Err(LibraryError::NotFound);
+        }
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Tag(id.clone()),
+            revision,
+            "rename",
+            updated_time,
+        )?;
+        transaction.commit()?;
+        self.publish(vec![
+            LibraryEvent::OrganizationChanged,
+            LibraryEvent::SyncQueued(EntityRef::Tag(id.clone())),
+        ]);
+        Ok(Tag {
+            id: id.clone(),
+            title,
+            revision,
         })
     }
 
@@ -1455,53 +1844,305 @@ impl LibraryRepository {
         Ok(())
     }
 
+    /// The single-note form used by the C1 shell. It deliberately delegates
+    /// to the same transaction/event path as future multi-select work rather
+    /// than creating a second move authority.
+    pub fn move_selected_note(
+        &self,
+        note_id: &NoteId,
+        notebook_id: &NotebookId,
+    ) -> Result<(), LibraryError> {
+        self.move_notes(std::slice::from_ref(note_id), notebook_id)
+    }
+
     pub fn set_note_tags(&self, note_id: &NoteId, tag_ids: &[TagId]) -> Result<(), LibraryError> {
+        let tag_ids = normalized_tag_ids(tag_ids)?;
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        replace_note_tags_in_transaction(
+            &transaction,
+            self.id_source.as_ref(),
+            note_id,
+            &tag_ids,
+            now,
+            "tags",
+        )?;
+        transaction.commit()?;
+        self.publish(note_tag_events(note_id));
+        Ok(())
+    }
+
+    /// Adds one tag without hydrating the note body. Existing membership is
+    /// idempotent, matching the donor's typed AddTag action semantics.
+    pub fn add_note_tag(&self, note_id: &NoteId, tag_id: &TagId) -> Result<(), LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        require_tag(&transaction, tag_id)?;
+        let mut tag_ids = active_note_tag_ids(&transaction, note_id)?;
+        if tag_ids.contains(tag_id) {
+            transaction.commit()?;
+            return Ok(());
+        }
+        tag_ids.push(tag_id.clone());
+        replace_note_tags_in_transaction(
+            &transaction,
+            self.id_source.as_ref(),
+            note_id,
+            &tag_ids,
+            now,
+            "tags",
+        )?;
+        transaction.commit()?;
+        self.publish(note_tag_events(note_id));
+        Ok(())
+    }
+
+    /// Removes exactly one active relation. It does not silently edit a
+    /// deleted note or a non-existent tag, so the UI can display a truthful
+    /// failure without publishing a partial navigation refresh.
+    pub fn remove_note_tag(&self, note_id: &NoteId, tag_id: &TagId) -> Result<(), LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        require_tag(&transaction, tag_id)?;
+        let mut tag_ids = active_note_tag_ids(&transaction, note_id)?;
+        let Some(position) = tag_ids.iter().position(|candidate| candidate == tag_id) else {
+            return Err(LibraryError::NotFound);
+        };
+        tag_ids.remove(position);
+        replace_note_tags_in_transaction(
+            &transaction,
+            self.id_source.as_ref(),
+            note_id,
+            &tag_ids,
+            now,
+            "tags",
+        )?;
+        transaction.commit()?;
+        self.publish(note_tag_events(note_id));
+        Ok(())
+    }
+
+    /// Retires a non-default notebook in one transaction and moves every
+    /// surviving durable note relationship to the default notebook. Notes are
+    /// never left pointing at a route that the navigation index no longer
+    /// exposes, including notes currently in Trash that may later be restored.
+    pub fn delete_notebook(&self, id: &NotebookId) -> Result<(), LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        let (is_default, revision): (i64, i64) = transaction
+            .query_row(
+                "SELECT is_default, revision FROM notebooks WHERE id = ?1 AND deleted_time = 0",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(LibraryError::NotFound)?;
+        if is_default != 0 {
+            return Err(LibraryError::DefaultNotebookCannotBeDeleted);
+        }
+        let fallback = default_notebook_id(&transaction)?;
+        let note_ids = note_ids_for_notebook(&transaction, id)?;
+        let mut events = vec![LibraryEvent::OrganizationChanged];
+        for note_id in note_ids {
+            let note_revision = next_note_revision_any(&transaction, &note_id)?;
+            let updated = next_note_time(&transaction, &note_id, now)?;
+            transaction.execute(
+                "UPDATE notes SET notebook_id = ?2, updated_time = ?3, revision = ?4 WHERE id = ?1",
+                params![note_id.as_str(), fallback.as_str(), updated, note_revision],
+            )?;
+            queue_search(&transaction, &note_id, updated, "organization")?;
+            enqueue_sync(
+                &transaction,
+                self.id_source.as_ref(),
+                &EntityRef::Note(note_id.clone()),
+                note_revision,
+                "move",
+                updated,
+            )?;
+            events.push(LibraryEvent::NoteProjectionChanged(note_id.clone()));
+            events.push(LibraryEvent::SearchProjectionQueued(note_id.clone()));
+            events.push(LibraryEvent::SyncQueued(EntityRef::Note(note_id)));
+        }
+        let updated_time = next_organization_time(&transaction, "notebooks", id.as_str(), now)?;
+        let deleted_revision = revision
+            .checked_add(1)
+            .ok_or(LibraryError::InvalidSnapshot)?;
+        transaction.execute(
+            "UPDATE notebooks SET deleted_time = ?2, updated_time = ?2, revision = ?3 WHERE id = ?1",
+            params![id.as_str(), updated_time, deleted_revision],
+        )?;
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Notebook(id.clone()),
+            deleted_revision,
+            "delete",
+            updated_time,
+        )?;
+        transaction.commit()?;
+        events.push(LibraryEvent::SyncQueued(EntityRef::Notebook(id.clone())));
+        self.publish(events);
+        Ok(())
+    }
+
+    /// Disbands a Stack without deleting its child notebooks or their notes.
+    ///
+    /// Evernote models this as a typed `DESTROY_STACK` operation rather than
+    /// an expunge of each contained notebook. We retain that distinction in
+    /// the local durable model: every child notebook becomes floating in the
+    /// same transaction, including an already-soft-deleted notebook so a
+    /// later restore cannot point back at an unavailable Stack. Notes retain
+    /// their notebook IDs and need no body/resource hydration or revision
+    /// rewrite.
+    pub fn delete_stack(&self, id: &StackId) -> Result<(), LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        let (stack_revision, stack_updated_time): (i64, i64) = transaction
+            .query_row(
+                "SELECT revision, updated_time FROM stacks WHERE id = ?1 AND deleted_time = 0",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(LibraryError::NotFound)?;
+        let children = {
+            let mut statement = transaction.prepare(
+                "SELECT id, revision, updated_time
+                 FROM notebooks
+                 WHERE stack_id = ?1
+                 ORDER BY id",
+            )?;
+            statement
+                .query_map([id.as_str()], |row| {
+                    Ok((
+                        NotebookId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut events = vec![LibraryEvent::OrganizationChanged];
+        for (notebook_id, revision, updated_time) in children {
+            let revision = revision
+                .checked_add(1)
+                .ok_or(LibraryError::InvalidSnapshot)?;
+            let updated_time = now.max(
+                updated_time
+                    .checked_add(1)
+                    .ok_or(LibraryError::InvalidSnapshot)?,
+            );
+            let changed = transaction.execute(
+                "UPDATE notebooks
+                 SET stack_id = NULL, revision = ?2, updated_time = ?3
+                 WHERE id = ?1 AND stack_id = ?4",
+                params![notebook_id.as_str(), revision, updated_time, id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(LibraryError::InvalidSnapshot);
+            }
+            enqueue_sync(
+                &transaction,
+                self.id_source.as_ref(),
+                &EntityRef::Notebook(notebook_id.clone()),
+                revision,
+                "stack_remove",
+                updated_time,
+            )?;
+            events.push(LibraryEvent::SyncQueued(EntityRef::Notebook(notebook_id)));
+        }
+        let deleted_revision = stack_revision
+            .checked_add(1)
+            .ok_or(LibraryError::InvalidSnapshot)?;
+        let deleted_time = now.max(
+            stack_updated_time
+                .checked_add(1)
+                .ok_or(LibraryError::InvalidSnapshot)?,
+        );
+        let changed = transaction.execute(
+            "UPDATE stacks
+             SET deleted_time = ?2, updated_time = ?2, revision = ?3
+             WHERE id = ?1 AND deleted_time = 0",
+            params![id.as_str(), deleted_time, deleted_revision],
+        )?;
+        if changed != 1 {
+            return Err(LibraryError::NotFound);
+        }
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Stack(id.clone()),
+            deleted_revision,
+            "delete",
+            deleted_time,
+        )?;
+        transaction.commit()?;
+        events.push(LibraryEvent::SyncQueued(EntityRef::Stack(id.clone())));
+        self.publish(events);
+        Ok(())
+    }
+
+    /// Retires a tag and removes all typed note-tag rows in one transaction.
+    /// The note's body, resources, and selected thumbnail remain untouched.
+    pub fn delete_tag(&self, id: &TagId) -> Result<(), LibraryError> {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
         let revision: i64 = transaction
             .query_row(
-                "SELECT revision FROM notes WHERE id = ?1 AND deleted_time = 0",
-                [note_id.as_str()],
-                |row| row.get::<_, i64>(0),
+                "SELECT revision FROM tags WHERE id = ?1 AND deleted_time = 0",
+                [id.as_str()],
+                |row| row.get(0),
             )
             .optional()?
-            .ok_or(LibraryError::NotFound)?
-            + 1;
-        for tag_id in tag_ids {
-            require_tag(&transaction, tag_id)?;
-        }
-        transaction.execute(
-            "DELETE FROM note_tags WHERE note_id = ?1",
-            [note_id.as_str()],
-        )?;
-        for (position, tag_id) in tag_ids.iter().enumerate() {
+            .ok_or(LibraryError::NotFound)?;
+        let note_ids = note_ids_for_tag(&transaction, id)?;
+        let mut events = vec![LibraryEvent::OrganizationChanged];
+        for note_id in note_ids {
+            let note_revision = next_note_revision_any(&transaction, &note_id)?;
+            let updated = next_note_time(&transaction, &note_id, now)?;
             transaction.execute(
-                "INSERT INTO note_tags (note_id, tag_id, position) VALUES (?1, ?2, ?3)",
-                params![note_id.as_str(), tag_id.as_str(), position as i64],
+                "UPDATE notes SET updated_time = ?2, revision = ?3 WHERE id = ?1",
+                params![note_id.as_str(), updated, note_revision],
             )?;
+            queue_search(&transaction, &note_id, updated, "organization")?;
+            enqueue_sync(
+                &transaction,
+                self.id_source.as_ref(),
+                &EntityRef::Note(note_id.clone()),
+                note_revision,
+                "tags",
+                updated,
+            )?;
+            events.push(LibraryEvent::NoteProjectionChanged(note_id.clone()));
+            events.push(LibraryEvent::SearchProjectionQueued(note_id.clone()));
+            events.push(LibraryEvent::SyncQueued(EntityRef::Note(note_id)));
         }
-        let updated = next_note_time(&transaction, note_id, now)?;
+        transaction.execute("DELETE FROM note_tags WHERE tag_id = ?1", [id.as_str()])?;
+        let updated_time = next_organization_time(&transaction, "tags", id.as_str(), now)?;
+        let deleted_revision = revision
+            .checked_add(1)
+            .ok_or(LibraryError::InvalidSnapshot)?;
         transaction.execute(
-            "UPDATE notes SET updated_time = ?2, revision = ?3 WHERE id = ?1",
-            params![note_id.as_str(), updated, revision],
+            "UPDATE tags SET deleted_time = ?2, updated_time = ?2, revision = ?3 WHERE id = ?1",
+            params![id.as_str(), updated_time, deleted_revision],
         )?;
-        queue_search(&transaction, note_id, updated, "organization")?;
         enqueue_sync(
             &transaction,
             self.id_source.as_ref(),
-            &EntityRef::Note(note_id.clone()),
-            revision,
-            "tags",
-            now,
+            &EntityRef::Tag(id.clone()),
+            deleted_revision,
+            "delete",
+            updated_time,
         )?;
         transaction.commit()?;
-        self.publish(vec![
-            LibraryEvent::OrganizationChanged,
-            LibraryEvent::NoteProjectionChanged(note_id.clone()),
-            LibraryEvent::SearchProjectionQueued(note_id.clone()),
-            LibraryEvent::SyncQueued(EntityRef::Note(note_id.clone())),
-        ]);
+        events.push(LibraryEvent::SyncQueued(EntityRef::Tag(id.clone())));
+        self.publish(events);
         Ok(())
     }
 
@@ -1946,7 +2587,12 @@ impl LibraryRepository {
     fn commit_staged_resource_metadata(&self, staged: &StagedResource) -> Result<(), LibraryError> {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
-        let transaction = connection.transaction()?;
+        // Stand-alone imports share the exact staged-byte publication fence
+        // with note snapshots. A deferred transaction would leave a gap for
+        // durable GC between validation and INSERT; IMMEDIATE serializes that
+        // physical decision with `drain_resource_gc`.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.resource_store.verify_staged_blob(&staged.blob)?;
         self.insert_staged_resource_metadata(&transaction, staged, now)?;
         transaction.commit()?;
         drop(connection);
@@ -2114,6 +2760,145 @@ impl LibraryRepository {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Runs one bounded local indexing batch.  It is intentionally explicit:
+    /// a note save is authoritative before this disposable projection exists.
+    pub fn process_search_jobs(&self) -> Result<usize, LibraryError> {
+        crate::search::process_search_jobs(self)
+    }
+
+    pub(crate) fn search_connection(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.connection.lock().expect("library mutex poisoned")
+    }
+
+    /// Searches only derived FTS tables plus card projection metadata.  The
+    /// canonical HTML/body and blob bytes remain unavailable to this path.
+    pub fn search(&self, query: SearchQuery) -> Result<Vec<SearchHit>, LibraryError> {
+        let mut predicates = Vec::<String>::new();
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        let trash = query
+            .filters
+            .iter()
+            .find_map(|filter| match filter {
+                SearchFilter::Trash(value) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or(false);
+        predicates.push(
+            if trash {
+                "n.deleted_time <> 0"
+            } else {
+                "n.deleted_time = 0"
+            }
+            .into(),
+        );
+        for filter in &query.filters {
+            match filter {
+                SearchFilter::Trash(_) => {}
+                SearchFilter::Notebook(value) => { predicates.push("n.notebook_id IN (SELECT id FROM notebooks WHERE id=? OR title COLLATE NOCASE=?)".into()); values.push(rusqlite::types::Value::Text(value.clone())); values.push(rusqlite::types::Value::Text(value.clone())); }
+                SearchFilter::Stack(value) => { predicates.push("n.notebook_id IN (SELECT nb.id FROM notebooks nb JOIN stacks s ON s.id=nb.stack_id WHERE s.id=? OR s.title COLLATE NOCASE=?)".into()); values.push(rusqlite::types::Value::Text(value.clone())); values.push(rusqlite::types::Value::Text(value.clone())); }
+                SearchFilter::Tag(value) => { predicates.push("n.id IN (SELECT nt.note_id FROM note_tags nt JOIN tags t ON t.id=nt.tag_id WHERE t.id=? OR t.title COLLATE NOCASE=?)".into()); values.push(rusqlite::types::Value::Text(value.clone())); values.push(rusqlite::types::Value::Text(value.clone())); }
+                SearchFilter::Created(range) => add_range(&mut predicates, &mut values, "n.created_time", range),
+                SearchFilter::Updated(range) => add_range(&mut predicates, &mut values, "n.updated_time", range),
+                SearchFilter::HasAttachment(value) => predicates.push(if *value { "EXISTS (SELECT 1 FROM note_resources nr WHERE nr.note_id=n.id AND nr.is_associated=1)" } else { "NOT EXISTS (SELECT 1 FROM note_resources nr WHERE nr.note_id=n.id AND nr.is_associated=1)" }.into()),
+                SearchFilter::Filename(value) => { predicates.push("EXISTS (SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND r.title LIKE ? ESCAPE '\\')".into()); values.push(rusqlite::types::Value::Text(like_contains(value))); }
+                SearchFilter::Mime(value) => { predicates.push("EXISTS (SELECT 1 FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND r.mime LIKE ? ESCAPE '\\')".into()); values.push(rusqlite::types::Value::Text(like_contains(value))); }
+                SearchFilter::Not(inner) => match inner.as_ref() {
+                    SearchFilter::Tag(value) => { predicates.push("n.id NOT IN (SELECT nt.note_id FROM note_tags nt JOIN tags t ON t.id=nt.tag_id WHERE t.id=? OR t.title COLLATE NOCASE=?)".into()); values.push(rusqlite::types::Value::Text(value.clone())); values.push(rusqlite::types::Value::Text(value.clone())); }
+                    SearchFilter::Notebook(value) => { predicates.push("n.notebook_id NOT IN (SELECT id FROM notebooks WHERE id=? OR title COLLATE NOCASE=?)".into()); values.push(rusqlite::types::Value::Text(value.clone())); values.push(rusqlite::types::Value::Text(value.clone())); }
+                    _ => return Err(LibraryError::InvalidSnapshot),
+                },
+            }
+        }
+        for term in &query.terms {
+            let (text, negated) = match term {
+                SearchTerm::Text(text) | SearchTerm::Phrase(text) => (text, false),
+                SearchTerm::NegatedText(text) | SearchTerm::NegatedPhrase(text) => (text, true),
+            };
+            let condition = if contains_short_cjk(text) {
+                values.push(rusqlite::types::Value::Text(like_contains(text)));
+                values.push(rusqlite::types::Value::Text(like_contains(text)));
+                "n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE st.title LIKE ? ESCAPE '\\' OR st.body LIKE ? ESCAPE '\\')".to_owned()
+            } else if contains_cjk(text) {
+                values.push(rusqlite::types::Value::Text(fts_literal(text)));
+                "n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE search_trigram MATCH ?)".to_owned()
+            } else {
+                let fts = fts_literal(text);
+                values.push(rusqlite::types::Value::Text(fts));
+                "n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?)".to_owned()
+            };
+            predicates.push(if negated {
+                format!("NOT ({condition})")
+            } else {
+                condition
+            });
+        }
+        let limit =
+            i64::try_from(query.limit()).map_err(|_| SearchQueryError::SqlIntegerOverflow)?;
+        let offset =
+            i64::try_from(query.offset()).map_err(|_| SearchQueryError::SqlIntegerOverflow)?;
+        values.push(rusqlite::types::Value::Integer(limit));
+        values.push(rusqlite::types::Value::Integer(offset));
+        let sql = format!(
+            "SELECT n.id, substr(n.title,1,120), substr(n.snippet,1,160), n.updated_time, n.deleted_time, n.notebook_id, COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id=snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')), (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime IN ('image/png','image/jpeg') ORDER BY nr.position,nr.resource_id LIMIT 1)), (SELECT count(*) FROM note_resources nr WHERE nr.note_id=n.id AND nr.is_associated=1) FROM notes n WHERE {} ORDER BY n.updated_time DESC, n.id ASC LIMIT ? OFFSET ?",
+            predicates.join(" AND ")
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        let observers = std::mem::take(
+            &mut *self
+                .search_observers
+                .lock()
+                .expect("search observer mutex poisoned"),
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        let columns = Arc::new(Mutex::new(BTreeSet::new()));
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        #[cfg(any(test, feature = "test-support"))]
+        if !observers.is_empty() {
+            let captured = Arc::clone(&columns);
+            connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if let AuthAction::Read {
+                    table_name,
+                    column_name,
+                } = context.action
+                {
+                    captured
+                        .lock()
+                        .expect("search column observer mutex poisoned")
+                        .insert(format!("{table_name}.{column_name}"));
+                }
+                Authorization::Allow
+            }));
+        }
+        let result = (|| -> Result<Vec<SearchHit>, LibraryError> {
+            let mut statement = connection.prepare(&sql)?;
+            Ok(statement
+                .query_map(params_from_iter(values), |row| {
+                    Ok(SearchHit {
+                        note: row_to_projection(row)?,
+                        snippet: row.get(2)?,
+                        matched_resource: None,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?)
+        })();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            connection.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
+            if !observers.is_empty() {
+                let fields = columns
+                    .lock()
+                    .expect("search column observer mutex poisoned")
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for observer in observers {
+                    let _ = observer.send(fields.clone());
+                }
+            }
+        }
+        result
     }
 
     fn set_deleted(&self, id: &NoteId, deleted: bool) -> Result<(), LibraryError> {
@@ -2306,6 +3091,182 @@ fn restore_journal_mode_on_connection(
 fn snippet(text: &str) -> String {
     text.chars().take(160).collect()
 }
+
+fn organization_title(value: &str) -> Result<String, LibraryError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 255 {
+        return Err(LibraryError::InvalidOrganizationTitle);
+    }
+    Ok(value.to_owned())
+}
+
+/// Organization table names at these private call sites are static literals;
+/// keeping the column/table shape here avoids public stringly-typed mutation
+/// APIs while retaining a single revision/timestamp rule for all entities.
+fn next_organization_revision(
+    transaction: &Transaction<'_>,
+    table: &str,
+    id: &str,
+) -> Result<i64, LibraryError> {
+    let revision: Option<i64> = transaction
+        .query_row(
+            &format!("SELECT revision FROM {table} WHERE id = ?1 AND deleted_time = 0"),
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    revision
+        .ok_or(LibraryError::NotFound)?
+        .checked_add(1)
+        .ok_or(LibraryError::InvalidSnapshot)
+}
+
+fn next_organization_time(
+    transaction: &Transaction<'_>,
+    table: &str,
+    id: &str,
+    now: i64,
+) -> Result<i64, LibraryError> {
+    let previous: Option<i64> = transaction
+        .query_row(
+            &format!("SELECT updated_time FROM {table} WHERE id = ?1 AND deleted_time = 0"),
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let previous = previous.ok_or(LibraryError::NotFound)?;
+    Ok(now.max(
+        previous
+            .checked_add(1)
+            .ok_or(LibraryError::InvalidSnapshot)?,
+    ))
+}
+
+fn next_note_revision_any(transaction: &Transaction<'_>, id: &NoteId) -> Result<i64, LibraryError> {
+    let revision: Option<i64> = transaction
+        .query_row(
+            "SELECT revision FROM notes WHERE id = ?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    revision
+        .ok_or(LibraryError::NotFound)?
+        .checked_add(1)
+        .ok_or(LibraryError::InvalidSnapshot)
+}
+
+fn normalized_tag_ids(tag_ids: &[TagId]) -> Result<Vec<TagId>, LibraryError> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(tag_ids.len());
+    for tag_id in tag_ids {
+        if !seen.insert(tag_id.clone()) {
+            return Err(LibraryError::InvalidSnapshot);
+        }
+        normalized.push(tag_id.clone());
+    }
+    Ok(normalized)
+}
+
+fn active_note_tag_ids(
+    transaction: &Transaction<'_>,
+    note_id: &NoteId,
+) -> Result<Vec<TagId>, LibraryError> {
+    let exists: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM notes WHERE id = ?1 AND deleted_time = 0)",
+        [note_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if exists != 1 {
+        return Err(LibraryError::NotFound);
+    }
+    let mut statement = transaction
+        .prepare("SELECT tag_id FROM note_tags WHERE note_id = ?1 ORDER BY position, tag_id")?;
+    statement
+        .query_map([note_id.as_str()], |row| {
+            TagId::parse(row.get::<_, String>(0)?).map_err(invalid_column)
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn replace_note_tags_in_transaction(
+    transaction: &Transaction<'_>,
+    id_source: &dyn RepositoryIdSource,
+    note_id: &NoteId,
+    tag_ids: &[TagId],
+    now: i64,
+    operation: &str,
+) -> Result<(), LibraryError> {
+    let _ = active_note_tag_ids(transaction, note_id)?;
+    for tag_id in tag_ids {
+        require_tag(transaction, tag_id)?;
+    }
+    transaction.execute(
+        "DELETE FROM note_tags WHERE note_id = ?1",
+        [note_id.as_str()],
+    )?;
+    for (position, tag_id) in tag_ids.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO note_tags (note_id, tag_id, position) VALUES (?1, ?2, ?3)",
+            params![note_id.as_str(), tag_id.as_str(), position as i64],
+        )?;
+    }
+    let revision = next_note_revision_any(transaction, note_id)?;
+    let updated = next_note_time(transaction, note_id, now)?;
+    transaction.execute(
+        "UPDATE notes SET updated_time = ?2, revision = ?3 WHERE id = ?1",
+        params![note_id.as_str(), updated, revision],
+    )?;
+    queue_search(transaction, note_id, updated, "organization")?;
+    enqueue_sync(
+        transaction,
+        id_source,
+        &EntityRef::Note(note_id.clone()),
+        revision,
+        operation,
+        updated,
+    )?;
+    Ok(())
+}
+
+fn note_tag_events(note_id: &NoteId) -> Vec<LibraryEvent> {
+    vec![
+        LibraryEvent::OrganizationChanged,
+        LibraryEvent::NoteProjectionChanged(note_id.clone()),
+        LibraryEvent::SearchProjectionQueued(note_id.clone()),
+        LibraryEvent::SyncQueued(EntityRef::Note(note_id.clone())),
+    ]
+}
+
+fn note_ids_for_notebook(
+    transaction: &Transaction<'_>,
+    notebook_id: &NotebookId,
+) -> Result<Vec<NoteId>, LibraryError> {
+    let mut statement =
+        transaction.prepare("SELECT id FROM notes WHERE notebook_id = ?1 ORDER BY id")?;
+    statement
+        .query_map([notebook_id.as_str()], |row| {
+            NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn note_ids_for_tag(
+    transaction: &Transaction<'_>,
+    tag_id: &TagId,
+) -> Result<Vec<NoteId>, LibraryError> {
+    let mut statement =
+        transaction.prepare("SELECT note_id FROM note_tags WHERE tag_id = ?1 ORDER BY note_id")?;
+    statement
+        .query_map([tag_id.as_str()], |row| {
+            NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn next_note_time(
     transaction: &Transaction<'_>,
     id: &NoteId,
@@ -2355,6 +3316,32 @@ fn require_entity(
     } else {
         Err(LibraryError::NotFound)
     }
+}
+
+fn purge_resource_candidates(
+    transaction: &Transaction<'_>,
+    note_id: &NoteId,
+) -> Result<Vec<PurgeResourceCandidate>, LibraryError> {
+    // `DISTINCT` turns a same-note A-B-A occurrence into one resource-entity
+    // decision. The later NOT EXISTS check sees every surviving relation,
+    // including Trash rows that can still be restored.
+    let mut statement = transaction.prepare(
+        "SELECT DISTINCT r.id, r.sha256, r.revision
+         FROM note_resources nr
+         JOIN resources r ON r.id = nr.resource_id
+         WHERE nr.note_id = ?1 AND nr.is_associated = 1
+         ORDER BY r.id",
+    )?;
+    statement
+        .query_map([note_id.as_str()], |row| {
+            Ok(PurgeResourceCandidate {
+                id: ResourceId::new(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                sha256: BlobHash::new(row.get::<_, String>(1)?).map_err(invalid_column)?,
+                revision: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn replace_note_resources(
@@ -2426,6 +3413,47 @@ fn queue_search(
     transaction.execute("INSERT INTO search_queue (note_id, updated_time, reason) VALUES (?1, ?2, ?3) ON CONFLICT(note_id) DO UPDATE SET updated_time = excluded.updated_time, reason = excluded.reason", params![note_id.as_str(), now, reason])?;
     Ok(())
 }
+
+fn add_range(
+    predicates: &mut Vec<String>,
+    values: &mut Vec<rusqlite::types::Value>,
+    column: &str,
+    range: &crate::DateRange,
+) {
+    if let Some(start) = range.start {
+        predicates.push(format!("{column} >= ?"));
+        values.push(rusqlite::types::Value::Integer(start));
+    }
+    if let Some(end) = range.end {
+        predicates.push(format!("{column} <= ?"));
+        values.push(rusqlite::types::Value::Integer(end));
+    }
+}
+
+fn fts_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn like_contains(value: &str) -> String {
+    format!(
+        "%{}%",
+        value
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
+}
+
+fn contains_short_cjk(value: &str) -> bool {
+    contains_cjk(value) && value.chars().count() < 3
+}
+fn contains_cjk(value: &str) -> bool {
+    let cjk = value
+        .chars()
+        .filter(|ch| matches!(*ch as u32, 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff))
+        .count();
+    cjk > 0
+}
 fn enqueue_sync(
     transaction: &Transaction<'_>,
     id_source: &dyn RepositoryIdSource,
@@ -2458,7 +3486,76 @@ fn enqueue_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn queue_orphan_blob_then_stage_same_bytes(
+        repository: &LibraryRepository,
+        profile: &std::path::Path,
+        bytes: &[u8],
+        title: &str,
+        mime: &str,
+        extension: &str,
+    ) -> StagedResource {
+        // This is the concrete v6/Task-5 reverse ordering: a successful
+        // permanent purge can leave a durable GC queue entry when its
+        // descriptor-relative unlink is temporarily refused. An invisible
+        // stage of the same content must not turn that queued cleanup into a
+        // future dangling resource row.
+        let original = repository
+            .import_resource(bytes, title, mime, extension)
+            .expect("persist original resource");
+        let note = repository
+            .create_note(CreateNote {
+                title: "GC owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: original.clone(),
+                        filename: title.into(),
+                        media_type: mime.into(),
+                    },
+                ]),
+            })
+            .expect("create resource owner");
+        let hash = repository
+            .resource_metadata(&original)
+            .expect("load original metadata")
+            .expect("original metadata exists")
+            .sha256;
+        let blobs = profile.join("resources").join("blobs");
+        assert!(blobs.join(hash.as_str()).exists());
+        repository.trash_note(&note.id).expect("trash owner");
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o500))
+            .expect("temporarily refuse physical GC unlink");
+        repository
+            .purge_note(&note.id)
+            .expect("purge commits its durable queue before physical cleanup");
+        assert!(repository.resource_metadata(&original).unwrap().is_none());
+        // `put_reader` always creates a descriptor-relative temporary first,
+        // even when an equal final blob is already present. Restore writes
+        // only after the purge's automatic drain has failed, then keep the
+        // durable queue for the separately opened recovery repository below.
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o700))
+            .expect("restore staging write permission");
+        let staged = repository
+            .stage_resource(bytes, title, mime, extension)
+            .expect("the still-present uncommitted blob can be staged");
+        assert_eq!(staged.sha256(), &hash);
+        staged
+    }
+
+    #[cfg(unix)]
+    fn assert_staged_blob_was_removed(result: Result<(), LibraryError>) {
+        assert!(
+            matches!(result, Err(LibraryError::Resource(ResourceError::Io(error))) if error.kind() == std::io::ErrorKind::NotFound),
+            "GC winning before staged publication must fail closed before any SQLite row is inserted"
+        );
+    }
 
     #[test]
     fn shell_state_read_keeps_one_snapshot_when_a_second_connection_commits_between_fields() {
@@ -2645,6 +3742,193 @@ mod tests {
             ]
         );
         assert_eq!(repository.outbox_count().unwrap(), before_outbox + 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_winning_before_direct_staged_metadata_commit_never_publishes_a_missing_blob() {
+        // Mutation-sensitive v6 regression: removing the staged-byte
+        // verification below makes this commit succeed after a second
+        // repository drains the old purge queue, leaving `resources` pointed
+        // at a path that no longer exists.
+        let profile = tempdir().expect("temporary profile");
+        let database = profile.path().join("library.sqlite");
+        let repository = LibraryRepository::open(&database).expect("open repository");
+        let bytes = b"%PDF-1.7\nqueued-stage\n%%EOF\n";
+        let staged = queue_orphan_blob_then_stage_same_bytes(
+            &repository,
+            profile.path(),
+            bytes,
+            "queued-stage.pdf",
+            "application/pdf",
+            "pdf",
+        );
+        let staged_id = staged.resource_id().clone();
+        let staged_hash = staged.sha256().clone();
+        let events = repository.subscribe();
+        let before_outbox = repository.outbox_count().expect("outbox count");
+
+        // A separately opened repository performs the persisted GC recovery
+        // before this invisible stage is committed.
+        let gc_runner = LibraryRepository::open(database.clone()).expect("open drains queued GC");
+        assert!(
+            !profile
+                .path()
+                .join("resources")
+                .join("blobs")
+                .join(staged_hash.as_str())
+                .exists(),
+            "the deterministic reverse ordering must remove the old physical blob"
+        );
+        drop(gc_runner);
+
+        assert_staged_blob_was_removed(repository.commit_staged_resource_metadata(&staged));
+        assert!(repository.resource_metadata(&staged_id).unwrap().is_none());
+        assert_eq!(repository.outbox_count().unwrap(), before_outbox);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_millis(30)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        let connection = repository.connection.lock().expect("repository connection");
+        let blob_rows: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM resource_blobs WHERE sha256 = ?1",
+                [staged_hash.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count no dangling blob metadata");
+        assert_eq!(blob_rows, 0);
+        drop(connection);
+
+        // A fresh stage may safely retry after the failed, zero-publication
+        // attempt. If it succeeds, the normal durable reader must prove that
+        // its byte/hash fact exists rather than trusting metadata alone.
+        let retry = repository
+            .stage_resource(bytes, "queued-stage.pdf", "application/pdf", "pdf")
+            .expect("fresh stage recreates the deleted content-addressed blob");
+        let retry_id = retry.resource_id().clone();
+        repository
+            .commit_staged_resource_metadata(&retry)
+            .expect("retry direct metadata commit");
+        assert_eq!(
+            repository
+                .read_resource_bytes(&retry_id)
+                .expect("read retry resource")
+                .expect("metadata and verified bytes both exist"),
+            bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_winning_before_staged_snapshot_commit_never_publishes_a_missing_relation() {
+        // The note-snapshot route is the production Task-5 insertion path.
+        // It needs the same verification before resource metadata,
+        // note_resources, search work, outbox, or events can become visible.
+        let profile = tempdir().expect("temporary profile");
+        let database = profile.path().join("library.sqlite");
+        let repository = LibraryRepository::open(&database).expect("open repository");
+        let bytes = b"%PDF-1.7\nqueued-snapshot\n%%EOF\n";
+        let staged = queue_orphan_blob_then_stage_same_bytes(
+            &repository,
+            profile.path(),
+            bytes,
+            "queued-snapshot.pdf",
+            "application/pdf",
+            "pdf",
+        );
+        let target = repository
+            .create_note(CreateNote {
+                title: "snapshot target".into(),
+                notebook_id: None,
+                document: CanonicalDocument::default(),
+            })
+            .expect("create target note");
+        let staged_id = staged.resource_id().clone();
+        let staged_hash = staged.sha256().clone();
+        let snapshot = SaveNote {
+            id: target.id.clone(),
+            expected_revision: target.revision,
+            title: target.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![crate::document::Block::Attachment {
+                resource_id: staged_id.clone(),
+                filename: "queued-snapshot.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+            resource_ids: vec![staged_id.clone()],
+            selected_thumbnail_id: None,
+        };
+        let events = repository.subscribe();
+        let before_outbox = repository.outbox_count().expect("outbox count");
+        let gc_runner = LibraryRepository::open(database.clone()).expect("open drains queued GC");
+        drop(gc_runner);
+
+        let result = repository
+            .commit_staged_resource_snapshot(snapshot.clone(), None, &staged)
+            .map(|_| ());
+        assert_staged_blob_was_removed(result);
+        assert!(repository.resource_metadata(&staged_id).unwrap().is_none());
+        assert_eq!(repository.outbox_count().unwrap(), before_outbox);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_millis(30)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        let retained = repository
+            .load_note(&target.id)
+            .expect("load target after failed transaction")
+            .expect("target remains");
+        assert_eq!(retained.revision, target.revision);
+        assert!(retained.resource_ids.is_empty());
+        let connection = repository.connection.lock().expect("repository connection");
+        let relations: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM note_resources WHERE note_id = ?1",
+                [target.id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count no dangling relation");
+        let blob_rows: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM resource_blobs WHERE sha256 = ?1",
+                [staged_hash.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count no dangling blob metadata");
+        assert_eq!((relations, blob_rows), (0, 0));
+        drop(connection);
+
+        let retry = repository
+            .stage_resource(bytes, "queued-snapshot.pdf", "application/pdf", "pdf")
+            .expect("fresh retry stage");
+        let retry_id = retry.resource_id().clone();
+        let committed = repository
+            .commit_staged_resource_snapshot(
+                SaveNote {
+                    id: target.id.clone(),
+                    expected_revision: target.revision,
+                    title: target.title,
+                    document: CanonicalDocument::from_blocks(vec![
+                        crate::document::Block::Attachment {
+                            resource_id: retry_id.clone(),
+                            filename: "queued-snapshot.pdf".into(),
+                            media_type: "application/pdf".into(),
+                        },
+                    ]),
+                    resource_ids: vec![retry_id.clone()],
+                    selected_thumbnail_id: None,
+                },
+                None,
+                &retry,
+            )
+            .expect("retry snapshot commit");
+        assert_eq!(committed.note.resource_ids, vec![retry_id.clone()]);
+        assert_eq!(
+            repository
+                .read_resource_bytes(&retry_id)
+                .expect("read retry resource")
+                .expect("metadata and verified bytes both exist"),
+            bytes
+        );
     }
 
     #[test]

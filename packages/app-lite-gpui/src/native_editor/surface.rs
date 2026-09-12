@@ -6,12 +6,12 @@
 
 use super::core::{AtomicBlockHit, EditorCore};
 use super::images::BudgetedImageCache;
-use super::model::DocPoint;
+use super::model::{BlockKind, DocPoint};
 use super::render;
 use crate::components::{
     BlockDown, BlockUp, Copy, Delete, DeleteBack, End, FocusNext, FocusPrev, Home, MoveLeft,
-    MoveRight, Newline, Redo, SelectAll, SelectEnd, SelectHome, SelectLeft, SelectRight, Undo,
-    WordSelectLeft, WordSelectRight,
+    MoveRight, Newline, PageDown, PageUp, Redo, SelectAll, SelectEnd, SelectHome, SelectLeft,
+    SelectRight, Undo, WordSelectLeft, WordSelectRight,
 };
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
@@ -35,6 +35,18 @@ pub(crate) struct EditorSurfaceLightContract {
     background: u32,
     border: u32,
     foreground: u32,
+}
+
+/// Test-only geometry from the retained scroll owner.  Keeping this at the
+/// surface boundary lets mounted LibraryShell tests distinguish an unbounded
+/// flex child from a document/layout problem without exposing a second
+/// production scrolling API.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EditorSurfaceScrollMetrics {
+    pub(crate) viewport: gpui::Bounds<Pixels>,
+    pub(crate) max_offset: gpui::Size<Pixels>,
+    pub(crate) offset: gpui::Point<Pixels>,
 }
 
 #[cfg(test)]
@@ -83,12 +95,18 @@ macro_rules! bind_result_action {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorSurfaceMode {
     Editable,
+    /// A durable Trash preview. Its explanatory copy may truthfully tell the
+    /// person that restoring the note is the path back to editing.
     ReadOnly,
+    /// A normal note whose durable organization mutation committed, but whose
+    /// full route/session candidate has not been installed yet. It is just as
+    /// non-mutating as Trash, but must not pretend the note was deleted.
+    RecoveryLocked,
 }
 
 impl EditorSurfaceMode {
     pub const fn is_read_only(self) -> bool {
-        matches!(self, Self::ReadOnly)
+        !matches!(self, Self::Editable)
     }
 }
 
@@ -209,6 +227,23 @@ impl EditorSurface {
         self.mode
     }
 
+    #[cfg(test)]
+    pub(crate) fn scroll_metrics_for_test(&self) -> EditorSurfaceScrollMetrics {
+        EditorSurfaceScrollMetrics {
+            viewport: self.scroll_handle.bounds(),
+            max_offset: self.scroll_handle.max_offset(),
+            offset: self.scroll_handle.offset(),
+        }
+    }
+
+    /// The retained shell may temporarily freeze an otherwise editable
+    /// surface while reconciling a committed metadata mutation. This changes
+    /// only event routing; the shared EditorCore remains the authority and
+    /// independently rejects mutations through its recovery lock.
+    pub fn set_mode(&mut self, mode: EditorSurfaceMode) {
+        self.mode = mode;
+    }
+
     /// Update the spike's measured body frame without taking over its outer
     /// scroll container. This is intentionally a presentation detail; both
     /// modes keep the same EditorCore and `paint_entity` path.
@@ -271,7 +306,8 @@ impl EditorSurface {
         // between two section-level atoms (or below a terminal atom).  The
         // donor editor materializes/focuses a paragraph for that background
         // seam; only an actual atom-content hit becomes a NodeSelection.
-        let activate_dead_zone = !event.modifiers.shift
+        let activate_dead_zone = !self.mode.is_read_only()
+            && !event.modifiers.shift
             && self
                 .editor
                 .read(cx)
@@ -382,19 +418,39 @@ impl Render for EditorSurface {
             .embedded_frame
             .map(|(width, height)| (width, height, true))
             .unwrap_or((1.0, measured_height, false));
-        let readonly_notice = self.mode.is_read_only().then(|| {
-            div()
-                .absolute()
-                .top(px(10.0))
-                .right(px(14.0))
-                .px(px(8.0))
-                .py(px(4.0))
-                .rounded(px(5.0))
-                .bg(rgba(0xfff3cdff))
-                .text_size(px(11.0))
-                .text_color(rgba(0x6f5200ff))
-                .child("只读预览：保存将在下一阶段启用")
-        });
+        let readonly_notice = match self.mode {
+            EditorSurfaceMode::Editable => None,
+            EditorSurfaceMode::ReadOnly => Some(
+                div()
+                    .id("native-editor-surface-trash-readonly-notice")
+                    .debug_selector(|| "native-editor-surface-trash-readonly-notice".to_owned())
+                    .absolute()
+                    .top(px(10.0))
+                    .right(px(14.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(5.0))
+                    .bg(rgba(0xfff3cdff))
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x6f5200ff))
+                    .child("废纸篓中的笔记为只读；恢复后可编辑"),
+            ),
+            EditorSurfaceMode::RecoveryLocked => Some(
+                div()
+                    .id("native-editor-surface-recovery-locked-notice")
+                    .debug_selector(|| "native-editor-surface-recovery-locked-notice".to_owned())
+                    .absolute()
+                    .top(px(10.0))
+                    .right(px(14.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(5.0))
+                    .bg(rgba(0xfff3cdff))
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x6f5200ff))
+                    .child("资料库已提交，正在恢复界面；暂不可编辑"),
+            ),
+        };
         let before_shape = self.hooks.clone();
         let after_paint = self.hooks.clone();
         let mut surface = div()
@@ -449,9 +505,35 @@ impl Render for EditorSurface {
         bind_selection_action!(surface, editor, SelectEnd, select_end);
         bind_selection_action!(surface, editor, BlockUp, move_up);
         bind_selection_action!(surface, editor, BlockDown, move_down);
-        bind_selection_action!(surface, editor, FocusPrev, move_up);
-        bind_selection_action!(surface, editor, FocusNext, move_down);
+        let focus_prev_editor = editor.clone();
+        let focus_prev_handle = self.scroll_handle.clone();
+        surface = surface.on_action(move |_action: &FocusPrev, window, cx| {
+            move_editor_vertically_and_reveal(&focus_prev_editor, &focus_prev_handle, -1, cx);
+            focus_editor(&focus_prev_editor, window, cx);
+            window.refresh();
+        });
+        let focus_next_editor = editor.clone();
+        let focus_next_handle = self.scroll_handle.clone();
+        surface = surface.on_action(move |_action: &FocusNext, window, cx| {
+            move_editor_vertically_and_reveal(&focus_next_editor, &focus_next_handle, 1, cx);
+            focus_editor(&focus_next_editor, window, cx);
+            window.refresh();
+        });
         bind_selection_action!(surface, editor, SelectAll, select_all);
+        // Page navigation belongs to this retained scroll owner, not to a
+        // block-level selection action.  The other editor implementation has
+        // the same viewport-sized step; keep this canvas focused while the
+        // document itself remains untouched.
+        let page_up_handle = self.scroll_handle.clone();
+        surface = surface.on_action(move |_action: &PageUp, window, _cx| {
+            scroll_handle_by_page(&page_up_handle, 1.0);
+            window.refresh();
+        });
+        let page_down_handle = self.scroll_handle.clone();
+        surface = surface.on_action(move |_action: &PageDown, window, _cx| {
+            scroll_handle_by_page(&page_down_handle, -1.0);
+            window.refresh();
+        });
         let copy_editor = editor.clone();
         surface = surface.on_action(move |_action: &Copy, _window, cx| {
             let text = copy_editor.read(cx).copy_plain_text();
@@ -536,4 +618,78 @@ pub fn surface_viewport(
 pub fn focus_editor(editor: &Entity<EditorCore>, window: &mut Window, cx: &mut App) {
     let focus_handle = editor.read(cx).focus_handle().clone();
     focus_handle.focus(window);
+}
+
+/// Move the retained nested editor viewport by exactly one current page.
+/// GPUI offsets become increasingly negative toward the document end.
+fn scroll_handle_by_page(scroll_handle: &ScrollHandle, direction: f32) {
+    let page = scroll_handle.bounds().size.height.max(px(1.0));
+    scroll_handle_by_pixels(scroll_handle, page * direction);
+}
+
+fn scroll_handle_by_pixels(scroll_handle: &ScrollHandle, delta_y: Pixels) {
+    let max_y = scroll_handle.max_offset().height.max(px(0.0));
+    let mut offset = scroll_handle.offset();
+    offset.y = (offset.y + delta_y).min(px(0.0)).max(-max_y);
+    scroll_handle.set_offset(offset);
+}
+
+/// Keep arrow-key traversal useful when an atomic image/attachment is the
+/// only thing between the selection and the next text node. The ordinary
+/// `EditorCore` movement remains authoritative; only a no-op at that
+/// structural boundary advances the viewport by two visual lines so holding
+/// Down can still reach the next atomic resource without inventing text.
+fn move_editor_vertically_and_reveal(
+    editor: &Entity<EditorCore>,
+    scroll_handle: &ScrollHandle,
+    direction: isize,
+    cx: &mut App,
+) {
+    let (moved, caret, stopped_at_resource_atom) = editor.update(cx, |editor, editor_cx| {
+        let before = editor.selection();
+        if direction < 0 {
+            editor.move_up();
+        } else {
+            editor.move_down();
+        }
+        let moved = editor.selection() != before;
+        let caret = editor
+            .layout()
+            .caret_bounds_for_point(editor.selection().head);
+        let stopped_at_resource_atom = !moved
+            && editor.selection().is_caret()
+            && editor
+                .document()
+                .block(editor.selection().head.node_id)
+                .is_some_and(|block| {
+                    matches!(block.kind, BlockKind::Image | BlockKind::Attachment)
+                });
+        editor_cx.notify();
+        (moved, caret, stopped_at_resource_atom)
+    });
+    // Once movement stops at an atom boundary, that old caret must not pull
+    // the viewport back to itself on every Down press. Only a genuine
+    // selection move asks to reveal a caret; boundary repeats use the line
+    // scroll fallback below.
+    if moved && let Some(caret) = caret {
+        reveal_scroll_bounds(scroll_handle, caret);
+    }
+    if stopped_at_resource_atom {
+        let line_step = px(48.0) * if direction < 0 { 1.0 } else { -1.0 };
+        scroll_handle_by_pixels(scroll_handle, line_step);
+    }
+}
+
+fn reveal_scroll_bounds(scroll_handle: &ScrollHandle, target: gpui::Bounds<Pixels>) {
+    let viewport = scroll_handle.bounds();
+    let delta_y = if target.top() < viewport.top() {
+        viewport.top() - target.top()
+    } else if target.bottom() > viewport.bottom() {
+        viewport.bottom() - target.bottom()
+    } else {
+        px(0.0)
+    };
+    if delta_y != px(0.0) {
+        scroll_handle_by_pixels(scroll_handle, delta_y);
+    }
 }

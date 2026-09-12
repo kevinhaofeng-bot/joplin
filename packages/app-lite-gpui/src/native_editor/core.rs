@@ -292,6 +292,10 @@ impl PreparedEditorCommit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorAccess {
     Editable,
+    /// A committed library mutation is waiting for a complete model/session
+    /// reconciliation. The old editor stays selectable/copyable but cannot
+    /// accept input against an obsolete durable revision.
+    RecoveryLocked,
     ReadOnly,
 }
 
@@ -463,7 +467,18 @@ impl EditorCore {
     }
 
     pub fn is_read_only(&self) -> bool {
-        self.access == EditorAccess::ReadOnly
+        self.access != EditorAccess::Editable
+    }
+
+    /// Temporarily freeze only an otherwise editable retained session while
+    /// its owning LibraryShell waits for a full committed-action candidate.
+    /// A durable Trash preview remains ReadOnly regardless of this flag.
+    pub(crate) fn set_recovery_locked(&mut self, locked: bool) {
+        self.access = match (self.access, locked) {
+            (EditorAccess::Editable, true) => EditorAccess::RecoveryLocked,
+            (EditorAccess::RecoveryLocked, false) => EditorAccess::Editable,
+            (access, _) => access,
+        };
     }
 
     fn ensure_editable(&self) -> Result<(), DocumentError> {
@@ -1377,6 +1392,11 @@ impl EditorCore {
         node_ids: &[NodeId],
         natural_size: (u32, u32),
     ) -> Result<bool, DocumentError> {
+        // Hydration is presentation work, but a legacy geometry repair is a
+        // semantic canonical-document mutation that will be snapshotted. It
+        // must obey the same Trash/reconciliation capability as every other
+        // document mutation.
+        self.ensure_editable()?;
         if natural_size.0 == 0 || natural_size.1 == 0 {
             return Err(DocumentError::InvalidOperation(
                 "legacy image natural size must be positive".into(),

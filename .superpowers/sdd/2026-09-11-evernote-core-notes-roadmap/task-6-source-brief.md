@@ -46,7 +46,7 @@ rendering remains our Rust implementation and is checked against the running app
 | `main-readable/src/modules/54193__module-54193.js`: application state exposes separate `canNavigateBack`/`canNavigateForward` flags and `NAVIGATE_TO` carries typed view plus note/notebook/stack identifiers. `62264__application-controller.js` delegates Back/Forward to the active Electron `webContents` history. | A pure GPUI app has no browser history to borrow, so `NavigationHistory` records typed route snapshots and selected `NoteId`. This is a source-backed UX contract with a native Rust mechanism, not an imitation of Electron internals. | Navigate All Notes → notebook → tag → note; Back/Forward restores route, filters, and selected IDs. A new navigation after Back truncates the forward branch. Repository/list refreshes do not create history entries. |
 | `renderer-readable/chunks/9093.js`, module `633704`, preserves `src/components/Nav/styles.css`: 60 px collapsed width, 30 px rows, 300 ms overall transition, 150 ms row transition, selected/hover states, and chevrons that replace the main icon on hover. Entry module `373454` renders typed All Notes, notebook/stack, tags, shortcuts, recent notes, and trash rows from stable IDs. | GPUI sidebar geometry and interaction states are explicit tokens. Expanded/collapsed motion changes width and opacity without remounting application/editor entities. | Mounted tests assert stable IDs and entity identity across collapse/expand. Release measurement checks the intended transition duration, hover chevron swap, and no editor/image rehydration during motion. |
 | `renderer-readable/chunks/9435.js`, modules `706930`, `911674`, and `610348`: DetailList uses a 400 ms container transition and separate 100 ms width transition; width is clamped to 280-880 px and constrained by navigation plus editor minimum width; cards are 168 px with two default columns and list virtualization overscans 40 rows. | `PaneLayout`, note-list viewport, and list virtualization use these source-backed constraints while keeping Rust residency bounded. | Resize/collapse/restore and restart preserve width. A 1,662-note fixture keeps mounted rows and thumbnail requests bounded; editor minimum width is never violated. |
-| `renderer-readable/chunks/9435.js`, modules `300044`, `157405`, and `144957`: top-list resize animates for 100 ms; card view supports sticky groups; cards use 13 px title/snippet, 600 title weight, thumbnail size variants, two-line title clamp, date/footer indicators, selected outline, and 150 ms hover transition. Entry module `373454` cycles Cards → Snippets → List → Top List and persists global/notebook/stack/trash options independently. | `ListViewMode` consumes one `NoteListItem` projection. Task 6 implements Cards/Snippets/Compact first, with route-scoped presentation options; Top List remains a later layout mode rather than a different data path. | Switching modes preserves ordering and selected `NoteId`, does not hydrate body/blob data, and does not duplicate thumbnail requests. Visual fixtures verify hierarchy, thumbnail fallback, selection, and date/indicator placement. |
+| `renderer-readable/chunks/9435.js::300044` source-map is `src/components/NoteList/TopListResizable/styles.css` (100 ms Top List resize); `9435.js::157405` is `src/components/NoteList/Views/NoteCardView/styles.css` (row wrapper/sticky-group treatment); `9435.js::144957` is `src/components/NoteListItemViews/NoteCard/styles.css` (13 px/600 card title, snippet/date/footer, selected outline, thumbnail variants, 150 ms hover). Only `144957` is direct Card-thumbnail presentation evidence. Entry module `373454` cycles Cards → Snippets → List → Top List and persists global/notebook/stack/trash options independently. | `ListViewMode` consumes one `NoteListItem` projection. Task 6 implements Cards/Snippets/Compact first, with route-scoped presentation options; Top List remains a later layout mode rather than a different data path. Card rendering is scoped to `note_card` rather than borrowing Top List or sticky-group behavior. | Switching modes preserves ordering and selected `NoteId`, does not hydrate body/blob data, and does not duplicate thumbnail requests. Visual fixtures verify hierarchy, thumbnail fallback, selection, and date/indicator placement. |
 
 ## Architecture rulings before implementation
 
@@ -76,3 +76,26 @@ rendering remains our Rust implementation and is checked against the running app
 5. Add pane persistence and motion as an isolated final change.
 6. Run the 1,662-note / 31-notebook / 64-tag / 4,238-resource scale fixture,
    then perform a fresh Release visual/interaction pass.
+
+## C3 motion re-read before implementation (2026-09-12)
+
+The renderer CSS source-map `sourcesContent` was re-read directly, not inferred
+from the installed UI: `renderer-readable/chunks/9093.js::633704`, original
+`src/components/Nav/styles.css`, defines a 300ms token and `.transitionAnimation`
+using `all 0.3s ease-in-out`; its `.filler` also has a separate 200ms width
+transition. `renderer-readable/chunks/9435.js::706930`, original
+`src/components/DetailList/styles.css`, defines `.detailListContainer` with
+`all 0.4s ease-in-out` and the inner `.DetailList` width with `0.1s linear`.
+These are distinct layers, not evidence for one universal Evernote duration.
+The 200ms ease-out in our product plan is an **independent local decision**
+balancing visible motion and a lighter-feeling native app.
+
+Current GPUI source `ui/sidebar.rs::render` returns a 0px shell when hidden;
+`ui/mod.rs::render_note_list` returns a 0px shell and releases card-thumbnail
+residency when hidden. `AppModel::dispatch` persists the final visibility
+immediately. Any C3 animation must keep `NoteSession`/editor entity identity,
+not replay `AppAction` per frame, and avoid making every intermediate pane
+width schedule a new card thumbnail viewport or background read. A bounded
+scale baseline is required before choosing the actual GPUI compositor/update
+mechanism; if intermediate layouts violate the existing image or memory budget,
+the motion is deferred, not shipped as a regressively expensive effect.

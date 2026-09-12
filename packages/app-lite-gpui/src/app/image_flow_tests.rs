@@ -17,6 +17,7 @@ use image::{ImageBuffer, Rgba};
 use rusqlite::Connection;
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 
 fn redraw(cx: &mut VisualTestContext) {
     cx.update(|window, app| window.draw(app).clear());
@@ -704,6 +705,279 @@ async fn mounted_lifecycle_switch_waits_for_a_gated_resource_stage_then_commits_
             .note_id),
         original_note_id,
         "the next lifecycle request proceeds only after the stage/commit barrier has cleared"
+    );
+}
+
+#[gpui::test]
+async fn mounted_external_organization_event_keeps_a_staged_resource_session_alive(
+    cx: &mut TestAppContext,
+) {
+    // An external metadata writer can advance the active note while the
+    // retained ResourceStageJob still owns a saved insert selection. The
+    // bridge must keep that task/session intact and visibly block the event;
+    // installing the new revision would discard the stage without another
+    // chance to commit or report it.
+    let (profile, repository) = repository();
+    let model = cx.new({
+        let repository = Arc::clone(&repository);
+        move |_| AppModel::open(repository).expect("open real app model")
+    });
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        LibraryShell::new_with_save_clock(model.clone(), None, clock, window, cx)
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::CreateNote, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let before = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    let release = view.update(cx, |shell, shell_cx| {
+        shell.stall_next_resource_import_for_test(shell_cx)
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .begin_resource_picker(shell_cx)
+                .expect("capture a saved resource insert selection");
+            shell
+                .complete_resource_picker_path(picker_png(&profile), window, shell_cx)
+                .expect("schedule the real retained ResourceStageJob");
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+
+    let tag = repository.create_tag("stage race tag").expect("create tag");
+    repository
+        .add_note_tag(&before.note_id, &tag.id)
+        .expect("external metadata revision commits");
+    cx.executor().advance_clock(Duration::from_millis(60));
+    cx.run_until_parked();
+    redraw(cx);
+
+    let after = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert_eq!(after.note_id, before.note_id);
+    assert_eq!(
+        after.session_entity_id, before.session_entity_id,
+        "the external event must not remount away the stage-owning session"
+    );
+    assert!(
+        view.read_with(cx, |shell, _| shell.save_error_for_test())
+            .is_some_and(|message| message.contains("资源")),
+        "the lifecycle barrier must remain visible until the stage owner resolves"
+    );
+    assert!(
+        repository
+            .load_note(&before.note_id)
+            .expect("load original note")
+            .expect("active note remains")
+            .resource_ids
+            .is_empty(),
+        "the blocked stage must not publish a partial resource relation"
+    );
+
+    // Do not leave a retained worker suspended after the mounted assertion.
+    release.send(()).expect("release stage task");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn mounted_reconciliation_lock_rejects_a_picker_completion_captured_before_an_organization_partial_commit(
+    cx: &mut TestAppContext,
+) {
+    // The platform picker can outlive the UI action that opened it.  If an
+    // organization mutation commits while its full candidate fails, the old
+    // note session is deliberately retained but temporarily locked.  A late
+    // picker completion must not turn the pre-lock tracked selection into a
+    // stage/SQLite mutation of that stale revision.
+    let (profile, repository) = repository();
+    let model = cx.new({
+        let repository = Arc::clone(&repository);
+        move |_| AppModel::open(repository).expect("open real app model")
+    });
+    let model_for_shell = model.clone();
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        LibraryShell::new_with_save_clock(model_for_shell.clone(), None, clock, window, cx)
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::CreateNote, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let before = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    let tag = repository
+        .create_tag("资源选择期间的组织变更")
+        .expect("create tag used by the committed action");
+
+    let old_picker_token = view.update(cx, |shell, shell_cx| {
+        shell
+            .begin_resource_picker(shell_cx)
+            .expect("capture a real picker insert intent before the mutation")
+    });
+    model.update(cx, |model, _| {
+        model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::AddTagToSelectedNote(tag.id.clone()),
+                window,
+                shell_cx,
+            );
+        });
+    });
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("native-editor-surface-recovery-locked-notice")
+            .is_some(),
+        "the committed-but-unreconciled action must lock the same session before picker completion"
+    );
+
+    let completion = cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_resource_picker_path_for_token_for_test(
+                old_picker_token,
+                picker_png(&profile),
+                window,
+                shell_cx,
+            )
+        })
+    });
+    let completion_error = completion.expect_err(
+        "a picker completion captured before the recovery lock must be rejected at the production completion seam",
+    );
+    assert!(completion_error.contains("正在恢复"));
+    assert!(!completion_error.contains("废纸篓"));
+
+    cx.run_until_parked();
+    redraw(cx);
+    let after = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert_eq!(after.note_id, before.note_id);
+    assert_eq!(after.session_entity_id, before.session_entity_id);
+    assert!(
+        !after.has_image_block,
+        "rejected completion must not mutate the retained old editor"
+    );
+    let durable = repository
+        .load_note(&before.note_id)
+        .expect("load tagged note")
+        .expect("note remains after partial reconciliation");
+    assert!(
+        durable.resource_ids.is_empty(),
+        "a rejected late picker completion must not publish a note relation"
+    );
+    let connection = Connection::open(profile.path().join("library.sqlite")).expect("open sqlite");
+    let resource_rows: i64 = connection
+        .query_row("SELECT count(*) FROM resources", [], |row| row.get(0))
+        .expect("count committed resource metadata");
+    let relation_rows: i64 = connection
+        .query_row("SELECT count(*) FROM note_resources", [], |row| row.get(0))
+        .expect("count committed resource relations");
+    let blob_rows: i64 = connection
+        .query_row("SELECT count(*) FROM resource_blobs", [], |row| row.get(0))
+        .expect("count committed blob rows");
+    assert_eq!(
+        (resource_rows, relation_rows, blob_rows),
+        (0, 0, 0),
+        "the locked completion must not even begin a visible resource publication"
+    );
+}
+
+#[gpui::test]
+async fn mounted_stale_native_picker_completion_cannot_consume_a_new_picker_after_reconciliation(
+    cx: &mut TestAppContext,
+) {
+    // AppKit can return an old panel after recovery has mounted a fresh
+    // session and the person has already opened another picker.  The old
+    // callback must carry its original token: matching only the current
+    // `pending_resource_insert` would insert the old path at the new saved
+    // selection and make the second panel silently disappear.
+    let (profile, repository) = repository();
+    let model = cx.new({
+        let repository = Arc::clone(&repository);
+        move |_| AppModel::open(repository).expect("open real app model")
+    });
+    let model_for_shell = model.clone();
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        LibraryShell::new_with_save_clock(model_for_shell.clone(), None, clock, window, cx)
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::CreateNote, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let tag = repository
+        .create_tag("旧选择器回调")
+        .expect("create tag used to enter reconciliation");
+    let old_token = view.update(cx, |shell, shell_cx| {
+        shell
+            .begin_resource_picker(shell_cx)
+            .expect("open first native picker")
+    });
+    model.update(cx, |model, _| {
+        model.fail_next_refresh_for_test(app_lite_core::LibraryError::NotFound);
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::AddTagToSelectedNote(tag.id.clone()),
+                window,
+                shell_cx,
+            );
+        });
+    });
+    redraw(cx);
+    cx.executor().advance_clock(Duration::from_millis(60));
+    cx.run_until_parked();
+    redraw(cx);
+
+    let new_token = view.update(cx, |shell, shell_cx| {
+        shell
+            .begin_resource_picker(shell_cx)
+            .expect("recovered session opens a second picker")
+    });
+    let stale_completion = cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_resource_picker_path_for_token_for_test(
+                old_token,
+                picker_png(&profile),
+                window,
+                shell_cx,
+            )
+        })
+    });
+    assert!(
+        stale_completion
+            .expect_err("old native callback must not consume the new picker intent")
+            .contains("正在恢复"),
+        "the late callback should explain why its own selection was cancelled"
+    );
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .complete_resource_picker_path_for_token_for_test(
+                    new_token,
+                    picker_png(&profile),
+                    window,
+                    shell_cx,
+                )
+                .expect("the newer panel still owns its saved selection");
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        view.read_with(cx, |shell, app| shell
+            .image_flow_probe_for_test(app)
+            .has_image_block),
+        "rejecting the old callback must leave the current picker usable"
     );
 }
 

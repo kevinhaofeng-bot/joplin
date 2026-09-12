@@ -6,6 +6,7 @@ pub mod repository;
 pub mod resource;
 pub mod revision;
 pub mod schema;
+pub mod search;
 
 pub use document::{CanonicalDocument, CanonicalHtml, DocumentError, SearchText};
 pub use domain::*;
@@ -19,3 +20,4 @@ pub use resource::{
     ResourceInput, ResourceStore,
 };
 pub use revision::*;
+pub use search::*;

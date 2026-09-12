@@ -1076,6 +1076,146 @@ fn write_private_image_reader<R: Read>(
     Ok(())
 }
 
+/// Stream a verified durable image into a task-private staging leaf without
+/// calling `sync_all`.  Unlike an editor source, this file exists only long
+/// enough for ImageIO to make a bounded card proxy; it is never adopted by a
+/// document or relied upon after a process crash.  The leaf is still created
+/// 0600 with `O_NOFOLLOW`, and failures remove both the staging and destination
+/// paths just like the durable materialization path above.
+fn write_private_ephemeral_image_reader<R: Read>(
+    resource_root: &Path,
+    destination: &Path,
+    reader: &mut R,
+) -> std::io::Result<()> {
+    ensure_private_image_materialization_root(resource_root)?;
+    let filename = destination.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ephemeral image materialization destination has no filename",
+        )
+    })?;
+    let temporary = resource_root.join(format!(
+        ".{}.{}.tmp",
+        filename.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let materialized = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut target = options.open(&temporary)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            target.write_all(&buffer[..count])?;
+        }
+        drop(target);
+        std::fs::rename(&temporary, destination)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if let Err(error) = materialized {
+        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThumbnailProxyPixelLayout {
+    /// CoreGraphics `PremultipliedFirst | Order32Little`: BGRA premultiplied.
+    PremultipliedBgra,
+    /// resvg/tiny-skia pixmap bytes: RGBA premultiplied.
+    PremultipliedRgba,
+    /// The pure-Rust raster decoder swaps RGBA to GPUI's straight BGRA.
+    StraightBgra,
+}
+
+fn thumbnail_proxy_pixel_layout(format: ImageFormat) -> ThumbnailProxyPixelLayout {
+    if format == ImageFormat::Svg {
+        // tiny-skia::Pixmap::take() is premultiplied RGBA on every target.
+        ThumbnailProxyPixelLayout::PremultipliedRgba
+    } else if cfg!(target_os = "macos") {
+        ThumbnailProxyPixelLayout::PremultipliedBgra
+    } else {
+        ThumbnailProxyPixelLayout::StraightBgra
+    }
+}
+
+fn unpremultiply_thumbnail_component(component: u8, alpha: u8) -> u8 {
+    debug_assert!(alpha > 0);
+    let restored = (u16::from(component) * 255 + u16::from(alpha) / 2) / u16::from(alpha);
+    restored.min(255) as u8
+}
+
+fn encode_thumbnail_proxy(
+    image: &RenderImage,
+    max_encoded_bytes: usize,
+    pixel_layout: ThumbnailProxyPixelLayout,
+) -> std::io::Result<Vec<u8>> {
+    let size = image.size(0);
+    let width = u32::from(size.width);
+    let height = u32::from(size.height);
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| std::io::Error::other("thumbnail proxy dimensions overflow"))?;
+    let mut rgba = image
+        .as_bytes(0)
+        .filter(|bytes| bytes.len() == expected)
+        .ok_or_else(|| std::io::Error::other("thumbnail proxy pixels are invalid"))?
+        .to_vec();
+    // The editor's RenderImage retains its decoder-native layout. PNG needs
+    // straight RGBA, so the narrow card-export boundary normalizes each
+    // supported layout without changing stable editor pixels.
+    for pixel in rgba.chunks_exact_mut(4) {
+        let alpha = pixel[3];
+        let (red, green, blue, premultiplied) = match pixel_layout {
+            ThumbnailProxyPixelLayout::PremultipliedBgra => (pixel[2], pixel[1], pixel[0], true),
+            ThumbnailProxyPixelLayout::PremultipliedRgba => (pixel[0], pixel[1], pixel[2], true),
+            ThumbnailProxyPixelLayout::StraightBgra => (pixel[2], pixel[1], pixel[0], false),
+        };
+        let (red, green, blue) = if premultiplied {
+            if alpha == 0 {
+                // RGB under zero alpha has no visual meaning. Clearing it is
+                // deterministic and prevents stale premultiplied color from
+                // leaking into the proxy payload.
+                (0, 0, 0)
+            } else {
+                (
+                    unpremultiply_thumbnail_component(red, alpha),
+                    unpremultiply_thumbnail_component(green, alpha),
+                    unpremultiply_thumbnail_component(blue, alpha),
+                )
+            }
+        } else {
+            (red, green, blue)
+        };
+        pixel.copy_from_slice(&[red, green, blue, alpha]);
+    }
+    let buffer = ImageBuffer::from_raw(width, height, rgba)
+        .ok_or_else(|| std::io::Error::other("thumbnail proxy pixels are malformed"))?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(buffer)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .map_err(std::io::Error::other)?;
+    let bytes = encoded.into_inner();
+    if bytes.len() > max_encoded_bytes {
+        return Err(std::io::Error::other(
+            "thumbnail proxy exceeds encoded-byte budget",
+        ));
+    }
+    Ok(bytes)
+}
+
 impl ImageStore {
     pub fn for_test() -> Self {
         Self::default()
@@ -1163,6 +1303,51 @@ impl ImageStore {
         }
         write_private_image_reader(resource_root, &source, &mut reader)?;
         Ok(source)
+    }
+
+    /// Build a small, task-private PNG proxy for an already verified resource
+    /// reader.  Card thumbnails cannot retain full originals: a transient
+    /// 0600 source exists only while ImageIO downscales it, then is removed;
+    /// the final 0600 PNG is the sole cache lease.  The final write is atomic
+    /// and synced because it is what the caller may retain across viewports;
+    /// the full-sized staging copy is deliberately not synced because it is
+    /// never durable state and is discarded before this function returns.
+    pub(crate) fn materialize_bounded_thumbnail_proxy_from_verified_reader<R: Read>(
+        resource_root: &Path,
+        metadata: &ImageMetadata,
+        mut reader: R,
+        format: ImageFormat,
+        max_edge: u32,
+        max_encoded_bytes: usize,
+    ) -> std::io::Result<PathBuf> {
+        ensure_private_image_materialization_root(resource_root)?;
+        let staging = resource_root.join(format!(
+            ".{}.{}.source.{}",
+            metadata.resource_id,
+            uuid::Uuid::new_v4().simple(),
+            image_extension(format)
+        ));
+        write_private_ephemeral_image_reader(resource_root, &staging, &mut reader)?;
+        let decoded = BudgetedImageCache::decode_resource_bounded_with_max_edge(
+            &Resource::from(staging.clone()),
+            (max_edge as usize)
+                .checked_mul(max_edge as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| std::io::Error::other("thumbnail proxy budget overflow"))?,
+            max_edge,
+        )
+        .map_err(std::io::Error::other);
+        let _ = std::fs::remove_file(&staging);
+        let decoded = decoded?;
+        let encoded = encode_thumbnail_proxy(
+            &decoded,
+            max_encoded_bytes,
+            thumbnail_proxy_pixel_layout(format),
+        )?;
+        let proxy = resource_root.join(format!("{}.card.png", metadata.resource_id));
+        let mut encoded = std::io::Cursor::new(encoded);
+        write_private_image_reader(resource_root, &proxy, &mut encoded)?;
+        Ok(proxy)
     }
 
     /// Publish a source that `materialize_durable_reader_at` already copied
@@ -1665,6 +1850,24 @@ impl BudgetedImageCache {
         self.entries.len()
     }
 
+    /// Read-only presentation state for a managed resource.  List cards use
+    /// this after their proxy has entered the cache so a completed ImageIO
+    /// failure is not rendered as an indistinguishable loading tile.  It does
+    /// not probe the filesystem or schedule a retry; visible-set changes own
+    /// the bounded retry policy.
+    pub(crate) fn failed_resource(&self, resource: &Resource) -> bool {
+        self.entries
+            .get(&hash(resource))
+            .is_some_and(|entry| matches!(&entry.item, ImageCacheItem::Loaded(Err(_))))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loaded_success_for_test(&self, resource: &Resource) -> bool {
+        self.entries
+            .get(&hash(resource))
+            .is_some_and(|entry| matches!(&entry.item, ImageCacheItem::Loaded(Ok(_))))
+    }
+
     #[cfg(test)]
     fn reserved_bytes_for_test(&self) -> usize {
         self.reserved_bytes
@@ -2153,10 +2356,11 @@ impl BudgetedImageCache {
                 "decoded image remains over the hard budget after resize"
             )));
         }
-        // GPUI's bitmap path expects BGRA (the same conversion used by
-        // platform.rs::Image::to_image_data). resvg's tiny-skia pixmap is
-        // already in the platform-native premultiplied order, so do not
-        // apply the bitmap swap to SVG output.
+        // GPUI's ordinary bitmap path expects BGRA (the same conversion used
+        // by platform.rs::Image::to_image_data). resvg's tiny-skia pixmap is
+        // premultiplied RGBA, and the existing RenderImage path retains that
+        // native pixmap layout; do not apply the raster B/R swap here. The
+        // separate card-PNG exporter explicitly handles this layout.
         if !is_svg {
             for frame in &mut frames {
                 for pixel in frame.buffer_mut().chunks_exact_mut(4) {
@@ -4393,6 +4597,141 @@ mod tests {
         assert_eq!(store.metadata(id).unwrap().natural_width, 4031);
         assert_eq!(store.metadata(id).unwrap().natural_height, 3023);
         assert_eq!(std::fs::read(&path).expect("managed source"), original);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_card_thumbnail_proxy_round_trip_preserves_unpremultiplied_transparent_png_color() {
+        // This exercises the production ImageIO path used by Cards, rather
+        // than a synthetic RenderImage. CoreGraphics renders into
+        // PremultipliedFirst|Order32Little BGRA; serializing those bytes as
+        // ordinary PNG RGBA darkens every half-transparent pixel.
+        let source = ImageBuffer::from_fn(4, 1, |x, _| {
+            if x == 0 {
+                // Transparent RGB is undefined after premultiplication. The
+                // exported proxy must make it deterministic rather than leak
+                // a stale color under alpha zero.
+                Rgba([251, 37, 19, 0])
+            } else if x == 1 {
+                // At alpha=1, only a full-red source survives 8-bit
+                // premultiplication. It must be restored to red rather than
+                // remain the almost-black premultiplied component 1.
+                Rgba([255, 0, 0, 1])
+            } else if x == 2 {
+                Rgba([200, 100, 50, 128])
+            } else {
+                // Alpha 255 is the opaque control: unpremultiplication must
+                // be a no-op for existing JPEG-like card fixtures.
+                Rgba([20, 110, 220, 255])
+            }
+        });
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode transparent PNG fixture");
+        let root = tempfile::tempdir().expect("temporary card proxy root");
+        let proxy = ImageStore::materialize_bounded_thumbnail_proxy_from_verified_reader(
+            root.path(),
+            &ImageMetadata::new("transparent-card-proxy", 4, 1),
+            std::io::Cursor::new(encoded.into_inner()),
+            ImageFormat::Png,
+            192,
+            512 * 1024,
+        )
+        .expect("ImageIO should materialize a transparent card proxy");
+        let round_trip = image::load_from_memory(&std::fs::read(proxy).expect("proxy bytes"))
+            .expect("proxy PNG should decode")
+            .to_rgba8();
+        assert_eq!(
+            round_trip.get_pixel(0, 0).0,
+            [0, 0, 0, 0],
+            "zero-alpha output must not retain an arbitrary premultiplied color"
+        );
+        assert_eq!(
+            round_trip.get_pixel(1, 0).0,
+            [255, 0, 0, 1],
+            "alpha=1 must restore the surviving premultiplied red component"
+        );
+        let half = round_trip.get_pixel(2, 0).0;
+        assert!(
+            half[0].abs_diff(200) <= 2
+                && half[1].abs_diff(100) <= 2
+                && half[2].abs_diff(50) <= 2
+                && half[3].abs_diff(128) <= 1,
+            "half-transparent pixel was darkened by premultiplied BGRA export: {half:?}"
+        );
+        assert_eq!(
+            round_trip.get_pixel(3, 0).0,
+            [20, 110, 220, 255],
+            "alpha=255 must remain an unchanged opaque proxy pixel"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_card_thumbnail_proxy_keeps_opaque_jpeg_color_straight() {
+        // Keep the common opaque Cards input on the same ImageIO → PNG proxy
+        // path. The alpha=255 branch of unpremultiplication must be a no-op,
+        // aside from the JPEG codec's small, bounded color rounding.
+        let source = ImageBuffer::from_pixel(8, 8, Rgba([35, 113, 219, 255]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+            .expect("encode opaque JPEG fixture");
+        let root = tempfile::tempdir().expect("temporary card proxy root");
+        let proxy = ImageStore::materialize_bounded_thumbnail_proxy_from_verified_reader(
+            root.path(),
+            &ImageMetadata::new("opaque-card-proxy", 8, 8),
+            std::io::Cursor::new(encoded.into_inner()),
+            ImageFormat::Jpeg,
+            192,
+            512 * 1024,
+        )
+        .expect("ImageIO should materialize an opaque JPEG card proxy");
+        let pixel = image::load_from_memory(&std::fs::read(proxy).expect("proxy bytes"))
+            .expect("proxy PNG should decode")
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0;
+        assert!(
+            pixel[0].abs_diff(35) <= 3
+                && pixel[1].abs_diff(113) <= 3
+                && pixel[2].abs_diff(219) <= 3
+                && pixel[3] == 255,
+            "opaque JPEG card proxy must not be modified by alpha restoration: {pixel:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_card_thumbnail_proxy_round_trip_preserves_transparent_svg_color() {
+        // `decode_resource_bounded_with_max_edge` routes .svg through resvg
+        // rather than CGImageSource. Its tiny-skia pixmap is still
+        // premultiplied, so the card PNG exporter must not treat it as a
+        // straight-alpha bitmap merely because it bypassed ImageIO.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#c86432" fill-opacity="0.5"/></svg>"##;
+        let root = tempfile::tempdir().expect("temporary card proxy root");
+        let proxy = ImageStore::materialize_bounded_thumbnail_proxy_from_verified_reader(
+            root.path(),
+            &ImageMetadata::new("transparent-svg-card-proxy", 4, 4),
+            std::io::Cursor::new(svg),
+            ImageFormat::Svg,
+            192,
+            512 * 1024,
+        )
+        .expect("resvg should materialize a transparent card proxy");
+        let pixel = image::load_from_memory(&std::fs::read(proxy).expect("proxy bytes"))
+            .expect("proxy PNG should decode")
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0;
+        assert!(
+            pixel[0].abs_diff(200) <= 2
+                && pixel[1].abs_diff(100) <= 2
+                && pixel[2].abs_diff(50) <= 2
+                && pixel[3].abs_diff(128) <= 1,
+            "transparent SVG card proxy lost its straight color: {pixel:?}"
+        );
     }
 
     #[cfg(target_os = "macos")]

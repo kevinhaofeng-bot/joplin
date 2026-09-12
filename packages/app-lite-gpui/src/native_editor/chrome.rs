@@ -43,6 +43,11 @@ pub struct ToolbarPlacement {
 /// offsets internally; platform input remains UTF-16 at this narrow bridge.
 pub struct TitleInput {
     text: String,
+    /// Title text belongs to the same durable note snapshot as the body. A
+    /// trashed note may still expose selection and copy, but it must never
+    /// accept an IME/key/clipboard mutation that its repository writer would
+    /// reject.
+    read_only: bool,
     selection: Range<usize>,
     selection_anchor: usize,
     selection_reversed: bool,
@@ -55,9 +60,18 @@ pub struct TitleInput {
 
 impl TitleInput {
     pub fn new(text: String, cx: &mut Context<Self>) -> Self {
+        Self::with_access(text, false, cx)
+    }
+
+    pub fn new_read_only(text: String, cx: &mut Context<Self>) -> Self {
+        Self::with_access(text, true, cx)
+    }
+
+    fn with_access(text: String, read_only: bool, cx: &mut Context<Self>) -> Self {
         let end = text.len();
         Self {
             text,
+            read_only,
             selection: end..end,
             selection_anchor: end,
             selection_reversed: false,
@@ -67,6 +81,18 @@ impl TitleInput {
             last_layout: None,
             pointer_anchor: None,
         }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Restores editability only for a title that was not constructed as a
+    /// durable read-only Trash preview. Callers pass that durable fact back
+    /// explicitly so a reconciliation completion cannot accidentally make a
+    /// trashed note editable.
+    pub(crate) fn set_read_only_for_session(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     pub fn text(&self) -> &str {
@@ -146,6 +172,9 @@ impl TitleInput {
     }
 
     pub fn delete_backward(&mut self) {
+        if self.read_only {
+            return;
+        }
         let range = self.selection.clone();
         let range = if range.is_empty() {
             previous_grapheme_boundary(&self.text, range.start)..range.start
@@ -156,6 +185,9 @@ impl TitleInput {
     }
 
     pub fn delete_forward(&mut self) {
+        if self.read_only {
+            return;
+        }
         let range = self.selection.clone();
         let range = if range.is_empty() {
             range.end..next_grapheme_boundary(&self.text, range.end)
@@ -166,6 +198,9 @@ impl TitleInput {
     }
 
     pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.replace_utf16(None, &text);
             cx.notify();
@@ -248,6 +283,9 @@ impl TitleInput {
     }
 
     fn replace_utf16(&mut self, range: Option<Range<usize>>, replacement: &str) -> bool {
+        if self.read_only {
+            return false;
+        }
         let range = match range {
             Some(range) => match self.checked_utf16_range(&range) {
                 Some(range) => range,
@@ -274,6 +312,9 @@ impl TitleInput {
         replacement: &str,
         selected_range: Option<Range<usize>>,
     ) -> bool {
+        if self.read_only {
+            return false;
+        }
         let range = match range {
             Some(range) => match self.checked_utf16_range(&range) {
                 Some(range) => range,
@@ -396,6 +437,9 @@ impl EntityInputHandler for TitleInput {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         self.unmark();
         cx.notify();
     }
