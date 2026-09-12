@@ -1881,6 +1881,17 @@ impl LibraryShell {
             .is_some_and(|session| !matches!(session.read(cx).save_state(), SaveState::Clean))
     }
 
+    fn active_session_save_fence(&self, cx: &App) -> Option<(NoteId, i64)> {
+        self.note_session.as_ref().map(|session| {
+            let note_id = self.surface_note_id.clone().unwrap_or_else(|| {
+                self.model
+                    .read_with(cx, |model, _| model.active_session_note_id().cloned())
+                    .expect("retained session has an active note")
+            });
+            (note_id, session.read(cx).save_generation())
+        })
+    }
+
     /// Used by the native app lifecycle, whose close/quit callbacks operate
     /// outside ordinary element action dispatch. It shares the exact session
     /// boundary as note switches and the visible manual-save command.
@@ -3508,6 +3519,7 @@ impl LibraryShell {
             return false;
         };
         self._history_search_task = None;
+        let expected_session_fence = self.active_session_save_fence(cx);
         self.history_search_notice = Some("正在恢复本地搜索结果…".into());
         let query_for_worker = query.clone();
         let task = cx.spawn(async move |this, cx| {
@@ -3518,12 +3530,24 @@ impl LibraryShell {
                     parsed
                         .set_page(0, SearchQuery::MAX_PAGE_SIZE)
                         .expect("bounded history search page");
-                    repository.search(parsed)
+                    if repository.has_pending_search_jobs()? {
+                        Ok(None)
+                    } else {
+                        repository.search(parsed).map(Some)
+                    }
                 })
                 .await;
             let _ = this.update(cx, |shell, shell_cx| {
+                if shell.active_session_save_fence(shell_cx) != expected_session_fence {
+                    // An automatic save can finish while SQLite is searching,
+                    // returning the session to Clean before this callback.
+                    // The generation fence catches that otherwise invisible
+                    // change and prevents committing a pre-save packet.
+                    shell.retry_history_search(forward, shell_cx);
+                    return;
+                }
                 let outcome = match result {
-                    Ok(hits) => {
+                    Ok(Some(hits)) => {
                         let active_would_change = shell.model.read_with(shell_cx, |model, _| {
                             let target_stays_selected = expected_target
                                 .selected_note_id
@@ -3559,6 +3583,11 @@ impl LibraryShell {
                                 hits,
                             )
                         })
+                    }
+                    Ok(None) => {
+                        shell.history_search_notice = Some("正在等待本地索引更新…".into());
+                        shell.retry_history_search(forward, shell_cx);
+                        return;
                     }
                     Err(error) => Err(error),
                 };
@@ -3607,6 +3636,7 @@ impl LibraryShell {
             return;
         };
         self._search_route_refresh_task = None;
+        let expected_session_fence = self.active_session_save_fence(cx);
         let query_for_worker = query.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
@@ -3624,6 +3654,13 @@ impl LibraryShell {
                 })
                 .await;
             let _ = this.update(cx, |shell, shell_cx| {
+                if shell.active_session_save_fence(shell_cx) != expected_session_fence {
+                    // See history completion above: Clean is not proof that
+                    // the editor did not save while this packet was in flight.
+                    // Leave the core refresh pending for the new durable FTS
+                    // queue/Idle edge rather than publishing stale cards.
+                    return;
+                }
                 if let Ok(Some(hits)) = result {
                     let active_would_disappear = shell.model.read_with(shell_cx, |model, _| {
                         model
