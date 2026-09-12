@@ -739,6 +739,7 @@ async fn mounted_find_panel_shows_a_complete_ten_thousand_match_count(cx: &mut T
     redraw(cx);
     cx.simulate_keystrokes("cmd-f");
     cx.simulate_input("命中");
+    cx.simulate_keystrokes("cmd-shift-g");
     redraw(cx);
     view.read_with(cx, |shell, app| {
         let editor = shell
@@ -749,6 +750,7 @@ async fn mounted_find_panel_shows_a_complete_ten_thousand_match_count(cx: &mut T
             .editor()
             .clone();
         assert_eq!(editor.read(app).find_summary().total, 10_000);
+        assert_eq!(editor.read(app).find_summary().primary_index, Some(9_999));
     });
     let summary = cx
         .debug_bounds("library-find-in-note-summary")
