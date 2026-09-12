@@ -667,6 +667,44 @@ fn projection_events_never_replace_an_active_search_packet_with_all_notes() {
 }
 
 #[test]
+fn renaming_a_tag_during_search_keeps_the_bounded_packet_until_background_refresh() {
+    let (_profile, repository) = repository();
+    let matching = create(&repository, "tagged search result");
+    let unrelated = create(&repository, "unrelated card");
+    let tag = repository.create_tag("before").expect("create tag");
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    let hit = SearchHit {
+        note: model
+            .projections()
+            .iter()
+            .find(|row| row.id == matching)
+            .expect("matching projection")
+            .clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+    let generation = model.begin_search("tagged");
+    assert!(
+        model
+            .commit_search_results(generation, "tagged".into(), vec![hit], None)
+            .expect("commit search")
+    );
+
+    model
+        .dispatch(AppAction::RenameTag {
+            id: tag.id,
+            title: "after".into(),
+        })
+        .expect("rename tag");
+
+    assert_eq!(model.navigation().search_query(), Some("tagged"));
+    assert_eq!(model.projections().len(), 1);
+    assert_eq!(model.projections()[0].id, matching);
+    assert_ne!(model.projections()[0].id, unrelated);
+    assert!(model.pending_search_refresh().is_some());
+}
+
+#[test]
 fn pending_search_refresh_replaces_only_the_active_search_packet() {
     let (_profile, repository) = repository();
     let original = create(&repository, "refresh match one");

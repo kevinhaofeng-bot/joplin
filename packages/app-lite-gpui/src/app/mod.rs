@@ -688,6 +688,34 @@ impl AppModel {
 
     fn prepare_organization_commit(&mut self) -> Result<PreparedOrganizationCommit, LibraryError> {
         let navigation_index = self.repository.list_navigation_index()?;
+        if self.navigation.search_query().is_some() {
+            // A SearchRoute owns the packet already in `projections`.  An
+            // organization mutation may change sidebar metadata immediately,
+            // but its compatibility AllNotes container is not permission to
+            // publish an AllNotes card list into a still-visible SearchRoute.
+            // Build the small candidate atomically, then let the shell query
+            // the same typed route in the background.
+            let mut navigation = self.navigation.clone();
+            let active_session = match self.active_session.as_ref() {
+                Some(active) => match self.repository.load_note(&active.note.id)? {
+                    Some(note) => Some(ActiveSession { note }),
+                    None => {
+                        navigation.select(None);
+                        None
+                    }
+                },
+                None => None,
+            };
+            if navigation.selected_note_id() != self.navigation.selected_note_id() {
+                self.persist_shell_state_for(&navigation)?;
+            }
+            return Ok(PreparedOrganizationCommit {
+                navigation,
+                projections: self.projections.clone(),
+                navigation_index,
+                active_session,
+            });
+        }
         let mut navigation = self.navigation.clone();
         navigation
             .sanitize_unavailable_routes(|route| route_is_available(route, &navigation_index));
@@ -786,10 +814,15 @@ impl AppModel {
     }
 
     fn commit_organization(&mut self, prepared: PreparedOrganizationCommit) {
+        let search_route_remains_active = prepared.navigation.search_query().is_some();
         self.navigation = prepared.navigation;
         self.projections = prepared.projections;
         self.navigation_index = prepared.navigation_index;
         self.active_session = prepared.active_session;
+        // The candidate above deliberately preserved the old bounded packet.
+        // Its FTS replacement is owned by the retained shell worker, never by
+        // `load_projections_for(AllNotes)` on this foreground mutation path.
+        self.search_refresh_pending |= search_route_remains_active;
         if self.reconciliation_pending.take().is_some() {
             self.partial_commit_message = None;
         }

@@ -511,6 +511,10 @@ pub struct LibraryShell {
     search_palette_status: SearchPaletteStatus,
     search_palette_generation: Option<u64>,
     search_palette_selected: usize,
+    /// The palette is an overlay, not a navigation event.  Preserve the
+    /// precise native owner that had focus so Escape/backdrop can return to
+    /// title, body, or an auxiliary field without inventing an editor move.
+    search_palette_return_focus: Option<FocusHandle>,
     _search_task: Option<Task<()>>,
     _history_search_task: Option<Task<()>>,
     _search_route_refresh_task: Option<Task<()>>,
@@ -973,6 +977,7 @@ impl LibraryShell {
             search_palette_status: SearchPaletteStatus::Idle,
             search_palette_generation: None,
             search_palette_selected: 0,
+            search_palette_return_focus: None,
             _search_task: None,
             _history_search_task: None,
             _search_route_refresh_task: None,
@@ -1225,6 +1230,19 @@ impl LibraryShell {
         events: &[app_lite_core::LibraryEvent],
         cx: &mut Context<Self>,
     ) -> bool {
+        // Metadata-only organization changes (for example a tag rename) do
+        // not enqueue an FTS job.  They still invalidate the SearchRoute
+        // packet's displayed metadata, so they need their own background
+        // refresh instead of waiting forever for a nonexistent Idle edge.
+        let refresh_search_without_index_job = events
+            .iter()
+            .any(|event| matches!(event, app_lite_core::LibraryEvent::OrganizationChanged))
+            && !events.iter().any(|event| {
+                matches!(
+                    event,
+                    app_lite_core::LibraryEvent::SearchProjectionQueued(_)
+                )
+            });
         let reconciliation_pending = self
             .model
             .read_with(cx, |model, _| model.reconciliation_pending());
@@ -1258,6 +1276,9 @@ impl LibraryShell {
         // SearchProjectionQueued reaches the Stage B1 scheduler separately.
         // Do not query here: the save event precedes its FTS transaction, and
         // an early completion could consume the pending fence before Idle.
+        if refreshed && refresh_search_without_index_job {
+            self.schedule_active_search_refresh(cx);
+        }
         refreshed
     }
 
@@ -3360,9 +3381,33 @@ impl LibraryShell {
         }
     }
 
+    fn focus_before_search_palette(&self, window: &Window, cx: &App) -> FocusHandle {
+        if self
+            .organization_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+        {
+            return self.organization_input.read(cx).focus_handle().clone();
+        }
+        if let Some(session) = self.note_session.as_ref() {
+            let (title, editor) = session.read_with(cx, |session, _| {
+                (session.title().clone(), session.editor().clone())
+            });
+            if title.read(cx).focus_handle().is_focused(window) {
+                return title.read(cx).focus_handle().clone();
+            }
+            if editor.read(cx).focus_handle().is_focused(window) {
+                return editor.read(cx).focus_handle().clone();
+            }
+        }
+        self.focus_handle.clone()
+    }
+
     fn toggle_search_palette_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_palette_open = !self.search_palette_open;
         if self.search_palette_open {
+            self.search_palette_return_focus = Some(self.focus_before_search_palette(window, cx));
             self.organization_panel_open = false;
             self.toolbar_more_open = false;
             self.search_input.read(cx).focus_handle().focus(window);
@@ -3372,7 +3417,11 @@ impl LibraryShell {
             self.search_palette_status = SearchPaletteStatus::Idle;
             self.search_palette_results.clear();
             self.search_palette_selected = 0;
-            self.focus_active_editor_or_shell(window, cx);
+            if let Some(focus) = self.search_palette_return_focus.take() {
+                focus.focus(window);
+            } else {
+                self.focus_active_editor_or_shell(window, cx);
+            }
         }
         cx.notify();
     }
@@ -3479,8 +3528,13 @@ impl LibraryShell {
                 let outcome = match result {
                     Ok(hits) => {
                         let active_would_change = shell.model.read_with(shell_cx, |model, _| {
+                            let target_stays_selected = expected_target
+                                .selected_note_id
+                                .as_ref()
+                                .is_some_and(|id| hits.iter().any(|hit| hit.note.id == *id));
                             model.active_session_note_id()
                                 != expected_target.selected_note_id.as_ref()
+                                || !target_stays_selected
                         });
                         if active_would_change
                             && !shell.flush_active_session(FlushReason::NoteSwitch, shell_cx)
@@ -3515,7 +3569,11 @@ impl LibraryShell {
     fn retry_history_search(&mut self, forward: bool, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(50))
+                // Keep an IME composition or a transient local SQLite error
+                // from turning into a 20Hz background-query loop. The route
+                // and retained session remain visible while the next bounded
+                // attempt is deferred.
+                .timer(Duration::from_millis(500))
                 .await;
             let _ = this.update(cx, |shell, shell_cx| {
                 let _ = shell.schedule_history_search(forward, shell_cx);
@@ -3569,6 +3627,13 @@ impl LibraryShell {
                     let _ = shell.model.update(shell_cx, |model, _| {
                         model.commit_search_refresh(&query, &expected_snapshot, hits)
                     });
+                } else if let Err(error) = result {
+                    // A search refresh is not a save failure, but silently
+                    // leaving an old packet visible is misleading. Keep the
+                    // route intact, report the local retry, and try again.
+                    shell.history_search_notice =
+                        Some(format!("本地搜索更新失败，正在重试：{error}"));
+                    shell.retry_active_search_refresh(shell_cx);
                 }
                 shell_cx.notify();
             });
@@ -3580,7 +3645,7 @@ impl LibraryShell {
     fn retry_active_search_refresh(&mut self, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(50))
+                .timer(Duration::from_millis(500))
                 .await;
             let _ = this.update(cx, |shell, shell_cx| {
                 shell.schedule_active_search_refresh(shell_cx);
@@ -4658,16 +4723,10 @@ impl LibraryShell {
             .flex()
             .flex_col()
             .gap(px(4.0));
-        // Keep keyboard selection visible without mounting hundreds of cards.
-        // This is a retained window over the bounded packet, not a second
-        // result authority; Up/Down can still visit every local hit.
-        let result_window_start = self.search_palette_selected.saturating_sub(5);
-        let result_window_end = (result_window_start + 12).min(self.search_palette_results.len());
-        for (index, hit) in self.search_palette_results[result_window_start..result_window_end]
-            .iter()
-            .enumerate()
-            .map(|(offset, hit)| (result_window_start + offset, hit))
-        {
+        // The packet is explicitly capped at 500. Mount the complete bounded
+        // list so native wheel scrolling can reach every result as well as
+        // keyboard navigation; no separate result authority is introduced.
+        for (index, hit) in self.search_palette_results.iter().enumerate() {
             let title = hit.note.title_prefix.clone();
             let snippet = hit.snippet.clone();
             results = results.child(
