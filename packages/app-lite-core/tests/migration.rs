@@ -33,7 +33,7 @@ impl RepositoryIdSource for FixedIds {
 }
 
 #[test]
-fn open_creates_clean_v9_database_idempotently() {
+fn open_creates_clean_v10_database_idempotently() {
     // Catches a fresh profile missing v7 schema/PRAGMAs or a second open changing it.
     let profile = tempdir().unwrap();
     let path = profile.path().join("library.sqlite");
@@ -44,7 +44,7 @@ fn open_creates_clean_v9_database_idempotently() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     assert_eq!(
         connection
@@ -79,6 +79,8 @@ fn open_creates_clean_v9_database_idempotently() {
         "search_trigram",
         "resource_filename_unicode",
         "resource_filename_trigram",
+        "derived_text_unicode",
+        "derived_text_trigram",
     ] {
         assert_eq!(
             connection
@@ -178,6 +180,59 @@ fn v8_to_v9_does_not_rewrite_existing_note_bodies() {
             )
             .unwrap(),
         "preserve original text"
+    );
+}
+
+#[test]
+fn v9_to_v10_queues_live_eligible_attachments_without_rewriting_note_text() {
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).unwrap();
+    let resource = repository
+        .import_resource(
+            b"must not be read by migration",
+            "scan.pdf",
+            "application/pdf",
+            "pdf",
+        )
+        .unwrap();
+    let note = repository
+        .create_note(CreateNote {
+            title: "migration queue".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "scan.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+        })
+        .unwrap();
+    drop(repository);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE notes SET body_text='migration body sentinel' WHERE id=?1",
+            [note.id.as_str()],
+        )
+        .unwrap();
+    connection.execute_batch("DROP TRIGGER derived_text_resource_delete; DROP TABLE derived_text_unicode; DROP TABLE derived_text_trigram; DROP TABLE derived_text_rows; DROP TABLE derived_text_jobs; PRAGMA user_version=9;").unwrap();
+    drop(connection);
+
+    let reopened = LibraryRepository::open(&path).unwrap();
+    let jobs = reopened.take_derived_text_jobs(10).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].resource_id, resource);
+    drop(reopened);
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT body_text FROM notes WHERE id=?1",
+                [note.id.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "migration body sentinel"
     );
 }
 

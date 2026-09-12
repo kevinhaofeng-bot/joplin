@@ -3,11 +3,11 @@ use crate::resource::{
 };
 use crate::schema::migrate_schema;
 use crate::{
-    BlobHash, CanonicalDocument, CreateNote, EditJournalEntry, EntityRef, JournalOwnership,
-    LibraryNavigationIndex, ListQuery, ListQueryError, Note, NoteId, NoteOrganizationState,
-    NoteProjection, Notebook, NotebookId, ResourceId, SaveNote, SavedRevision, SearchFilter,
-    SearchHit, SearchQuery, SearchQueryError, SearchTerm, Stack, StackId, Tag, TagId,
-    compile_note_list_query,
+    BlobHash, CanonicalDocument, CreateNote, DerivedTextFailure, DerivedTextJob, DerivedTextStatus,
+    EditJournalEntry, EntityRef, JournalOwnership, LibraryNavigationIndex, ListQuery,
+    ListQueryError, Note, NoteId, NoteOrganizationState, NoteProjection, Notebook, NotebookId,
+    ResourceId, SaveNote, SavedRevision, SearchFilter, SearchHit, SearchQuery, SearchQueryError,
+    SearchTerm, Stack, StackId, Tag, TagId, compile_note_list_query,
 };
 use rusqlite::hooks::{AuthAction, Authorization};
 use rusqlite::{
@@ -26,6 +26,11 @@ use thiserror::Error;
 
 const LIBRARY_SHELL_PANES_SETTING: &str = "library-shell.panes";
 const LIBRARY_SHELL_SELECTED_NOTE_SETTING: &str = "library-shell.selected-note-id";
+/// This is an identity label for the intentionally absent extractor. D3b must
+/// publish a new value when its algorithm changes, thereby making old text
+/// non-current rather than silently reusing it.
+pub const DERIVED_TEXT_EXTRACTOR_VERSION: &str = "d3a-placeholder-v1";
+const MAX_DERIVED_TEXT_BYTES: usize = 1024 * 1024;
 
 fn is_reserved_library_shell_setting(key: &str) -> bool {
     matches!(
@@ -278,6 +283,8 @@ pub enum LibraryError {
     ListQuery(#[from] ListQueryError),
     #[error("invalid search query")]
     SearchQuery(#[from] SearchQueryError),
+    #[error("derived attachment text exceeds its bounded storage limit")]
+    DerivedTextTooLarge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1072,6 +1079,7 @@ impl LibraryRepository {
         })?;
         let id = NoteId::parse(raw_id).expect("validated generated ID is valid");
         replace_note_resources(&transaction, &id, &resource_ids)?;
+        queue_derived_text_for_note(&transaction, &id, now)?;
         let thumbnail = selected_thumbnail_id(&transaction, &id, None)?;
         transaction.execute(
             "UPDATE notes SET selected_thumbnail_id = ?2 WHERE id = ?1",
@@ -1265,6 +1273,7 @@ impl LibraryRepository {
             }
         }
         replace_note_resources(&transaction, &input.id, &input.resource_ids)?;
+        queue_derived_text_for_note(&transaction, &input.id, now)?;
         let thumbnail = selected_thumbnail_id(
             &transaction,
             &input.id,
@@ -2758,6 +2767,142 @@ impl LibraryRepository {
         }).optional().map_err(Into::into)
     }
 
+    /// Takes a bounded set of live attachment identities for the future local
+    /// extractor. It returns no blob handle or bytes; D3b must opt into
+    /// `open_verified_resource_file` after taking one job.
+    pub fn take_derived_text_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DerivedTextJob>, LibraryError> {
+        let limit = i64::try_from(limit.min(100)).map_err(|_| LibraryError::InvalidSnapshot)?;
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT j.resource_id,j.sha256,j.extractor_version
+             FROM derived_text_jobs j JOIN resources r ON r.id=j.resource_id
+             WHERE j.state='pending' AND j.extractor_version=?1 AND j.sha256=r.sha256 AND r.deleted_time=0
+               AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=j.resource_id AND nr.is_associated=1 AND n.deleted_time=0)
+             ORDER BY j.updated_time,j.resource_id LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![DERIVED_TEXT_EXTRACTOR_VERSION, limit], |row| {
+                Ok(DerivedTextJob {
+                    resource_id: ResourceId::new(row.get::<_, String>(0)?)
+                        .map_err(invalid_column)?,
+                    sha256: crate::BlobHash::new(row.get::<_, String>(1)?)
+                        .map_err(invalid_column)?,
+                    extractor_version: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Atomically accepts synthetic/platform extraction output only when the
+    /// queued identity is still the current, live associated resource.
+    /// `false` means stale, detached, deleted, or already superseded; none of
+    /// those cases may revive a searchable projection.
+    pub fn publish_derived_text(
+        &self,
+        job: &DerivedTextJob,
+        text: &str,
+    ) -> Result<bool, LibraryError> {
+        if text.len() > MAX_DERIVED_TEXT_BYTES {
+            return Err(LibraryError::DerivedTextTooLarge);
+        }
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM derived_text_jobs j JOIN resources r ON r.id=j.resource_id WHERE j.resource_id=?1 AND j.sha256=?2 AND r.sha256=?2 AND j.extractor_version=?3 AND j.extractor_version=?4 AND j.state='pending' AND r.deleted_time=0 AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=j.resource_id AND nr.is_associated=1 AND n.deleted_time=0))",
+            params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version, DERIVED_TEXT_EXTRACTOR_VERSION], |row| row.get(0))?;
+        if current == 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute("INSERT INTO derived_text_rows(resource_id,sha256,extractor_version) VALUES(?1,?2,?3) ON CONFLICT(resource_id) DO UPDATE SET sha256=excluded.sha256,extractor_version=excluded.extractor_version", params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version])?;
+        let rowid: i64 = transaction.query_row(
+            "SELECT fts_rowid FROM derived_text_rows WHERE resource_id=?1",
+            [job.resource_id.as_str()],
+            |row| row.get(0),
+        )?;
+        transaction.execute("DELETE FROM derived_text_unicode WHERE rowid=?1", [rowid])?;
+        transaction.execute("DELETE FROM derived_text_trigram WHERE rowid=?1", [rowid])?;
+        transaction.execute(
+            "INSERT INTO derived_text_unicode(rowid,resource_id,text) VALUES(?1,?2,?3)",
+            params![rowid, job.resource_id.as_str(), text],
+        )?;
+        transaction.execute(
+            "INSERT INTO derived_text_trigram(rowid,resource_id,text) VALUES(?1,?2,?3)",
+            params![rowid, job.resource_id.as_str(), text],
+        )?;
+        transaction.execute("UPDATE derived_text_jobs SET state='indexed',failure=NULL,updated_time=?2 WHERE resource_id=?1", params![job.resource_id.as_str(), now])?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Persist a classified extractor outcome without affecting the saved
+    /// note. The caller may subsequently expose this state or retry it.
+    pub fn fail_derived_text(
+        &self,
+        job: &DerivedTextJob,
+        failure: DerivedTextFailure,
+    ) -> Result<bool, LibraryError> {
+        let now = self.now();
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let changed = connection.execute("UPDATE derived_text_jobs SET state='failed',failure=?4,attempts=attempts+1,updated_time=?5 WHERE resource_id=?1 AND sha256=?2 AND extractor_version=?3 AND extractor_version='d3a-placeholder-v1' AND state='pending' AND EXISTS(SELECT 1 FROM resources r WHERE r.id=derived_text_jobs.resource_id AND r.sha256=derived_text_jobs.sha256 AND r.deleted_time=0) AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=derived_text_jobs.resource_id AND nr.is_associated=1 AND n.deleted_time=0)", params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version, failure.as_str(), now])?;
+        Ok(changed == 1)
+    }
+
+    pub fn retry_derived_text(&self, job: &DerivedTextJob) -> Result<bool, LibraryError> {
+        let now = self.now();
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let changed = connection.execute("UPDATE derived_text_jobs SET state='pending',failure=NULL,updated_time=?4 WHERE resource_id=?1 AND sha256=?2 AND extractor_version=?3 AND extractor_version='d3a-placeholder-v1' AND state='failed' AND EXISTS(SELECT 1 FROM resources r WHERE r.id=derived_text_jobs.resource_id AND r.sha256=derived_text_jobs.sha256 AND r.deleted_time=0) AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=derived_text_jobs.resource_id AND nr.is_associated=1 AND n.deleted_time=0)", params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version, now])?;
+        Ok(changed == 1)
+    }
+
+    pub fn derived_text_status(
+        &self,
+        id: &ResourceId,
+    ) -> Result<Option<DerivedTextStatus>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        connection
+            .query_row(
+                "SELECT state,failure,attempts FROM derived_text_jobs WHERE resource_id=?1",
+                [id.as_str()],
+                |row| {
+                    let state: String = row.get(0)?;
+                    let failure: Option<String> = row.get(1)?;
+                    let attempts = row.get(2)?;
+                    Ok(match state.as_str() {
+                        "pending" => DerivedTextStatus::Pending { attempts },
+                        "indexed" => DerivedTextStatus::Indexed { attempts },
+                        "failed" => DerivedTextStatus::Failed {
+                            failure: failure
+                                .as_deref()
+                                .and_then(DerivedTextFailure::parse)
+                                .ok_or_else(|| {
+                                    rusqlite::Error::InvalidColumnType(
+                                        1,
+                                        "derived failure".into(),
+                                        rusqlite::types::Type::Text,
+                                    )
+                                })?,
+                            attempts,
+                        },
+                        _ => {
+                            return Err(rusqlite::Error::InvalidColumnType(
+                                0,
+                                "derived state".into(),
+                                rusqlite::types::Type::Text,
+                            ));
+                        }
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn rollback_unassociated_resource(&self, id: &ResourceId) -> Result<(), LibraryError> {
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
@@ -2907,6 +3052,7 @@ impl LibraryRepository {
         let mut filename_provenance = None;
         let mut mime_provenance = None;
         let mut ordinary_filename_provenance = Vec::new();
+        let mut ordinary_derived_text_provenance = Vec::new();
         let trash = query
             .filters
             .iter()
@@ -2956,21 +3102,25 @@ impl LibraryRepository {
             };
             if !negated {
                 ordinary_filename_provenance.push(text.clone());
+                ordinary_derived_text_provenance.push(text.clone());
             }
             let condition = if contains_short_cjk(text) {
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
-                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE st.title LIKE ? ESCAPE '\\' OR st.body LIKE ? ESCAPE '\\') OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND rf.filename LIKE ? ESCAPE '\\'))".to_owned()
+                values.push(rusqlite::types::Value::Text(like_contains(text)));
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE st.title LIKE ? ESCAPE '\\' OR st.body LIKE ? ESCAPE '\\') OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND rf.filename LIKE ? ESCAPE '\\') OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_trigram dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version='d3a-placeholder-v1' AND dt.text LIKE ? ESCAPE '\\'))".to_owned()
             } else if contains_cjk(text) {
                 values.push(rusqlite::types::Value::Text(fts_literal(text)));
                 values.push(rusqlite::types::Value::Text(fts_literal(text)));
-                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE search_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_trigram MATCH ?))".to_owned()
+                values.push(rusqlite::types::Value::Text(fts_literal(text)));
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE search_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_trigram dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version='d3a-placeholder-v1' AND derived_text_trigram MATCH ?))".to_owned()
             } else {
                 let fts = fts_literal(text);
                 values.push(rusqlite::types::Value::Text(fts.clone()));
                 values.push(rusqlite::types::Value::Text(fts));
-                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_unicode rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_unicode MATCH ?))".to_owned()
+                values.push(rusqlite::types::Value::Text(fts_literal(text)));
+                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_unicode rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_unicode dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version='d3a-placeholder-v1' AND derived_text_unicode MATCH ?))".to_owned()
             };
             predicates.push(if negated {
                 format!("NOT ({condition})")
@@ -3000,11 +3150,25 @@ impl LibraryRepository {
             // applies the same unicode/trigram semantics as the candidate
             // predicate, then relation order makes the chosen attachment
             // deterministic.
-            if matches.len() == 1 {
+            let filename_matches = if matches.len() == 1 {
                 matches.pop().expect("one filename provenance predicate")
             } else {
                 format!("COALESCE({})", matches.join(","))
+            };
+            let mut derived_matches = Vec::new();
+            for term in &ordinary_derived_text_provenance {
+                let (subquery, value) = derived_text_provenance_subquery(term);
+                derived_matches.push(subquery);
+                provenance_values.push(value);
             }
+            let derived_matches = if derived_matches.len() == 1 {
+                derived_matches
+                    .pop()
+                    .expect("one derived provenance predicate")
+            } else {
+                format!("COALESCE({})", derived_matches.join(","))
+            };
+            format!("COALESCE({filename_matches},{derived_matches})")
         } else {
             "NULL".into()
         };
@@ -3613,6 +3777,27 @@ fn queue_search(
     Ok(())
 }
 
+/// The relation table is rebuilt on ordinary snapshots, so this is explicitly
+/// identity-idempotent: preserving an already indexed ResourceId/SHA/version
+/// must never turn a routine note save into another extraction request.
+fn queue_derived_text_for_note(
+    transaction: &Transaction<'_>,
+    note_id: &NoteId,
+    now: i64,
+) -> Result<(), LibraryError> {
+    transaction.execute(
+        "INSERT INTO derived_text_jobs(resource_id,sha256,extractor_version,state,failure,attempts,updated_time)
+         SELECT DISTINCT r.id,r.sha256,?2,'pending',NULL,0,?3
+         FROM note_resources nr JOIN resources r ON r.id=nr.resource_id
+         WHERE nr.note_id=?1 AND nr.is_associated=1 AND r.deleted_time=0
+           AND (r.mime='application/pdf' OR r.mime LIKE 'image/%')
+         ON CONFLICT(resource_id) DO UPDATE SET sha256=excluded.sha256,extractor_version=excluded.extractor_version,state='pending',failure=NULL,attempts=0,updated_time=excluded.updated_time
+         WHERE derived_text_jobs.sha256<>excluded.sha256 OR derived_text_jobs.extractor_version<>excluded.extractor_version",
+        params![note_id.as_str(), DERIVED_TEXT_EXTRACTOR_VERSION, now],
+    )?;
+    Ok(())
+}
+
 fn add_range(
     predicates: &mut Vec<String>,
     values: &mut Vec<rusqlite::types::Value>,
@@ -3675,6 +3860,34 @@ fn filename_provenance_subquery(term: &str) -> (String, rusqlite::types::Value) 
     )
 }
 
+fn derived_text_provenance_subquery(term: &str) -> (String, rusqlite::types::Value) {
+    let (table, predicate, value) = if contains_short_cjk(term) {
+        (
+            "derived_text_trigram",
+            "dt.text LIKE ? ESCAPE '\\'",
+            rusqlite::types::Value::Text(like_contains(term)),
+        )
+    } else if contains_cjk(term) {
+        (
+            "derived_text_trigram",
+            "derived_text_trigram MATCH ?",
+            rusqlite::types::Value::Text(fts_literal(term)),
+        )
+    } else {
+        (
+            "derived_text_unicode",
+            "derived_text_unicode MATCH ?",
+            rusqlite::types::Value::Text(fts_literal(term)),
+        )
+    };
+    (
+        format!(
+            "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN {table} dt ON dt.rowid=dr.fts_rowid WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version='d3a-placeholder-v1' AND {predicate} ORDER BY nr.position,nr.resource_id LIMIT 1)"
+        ),
+        value,
+    )
+}
+
 fn contains_short_cjk(value: &str) -> bool {
     contains_cjk(value) && value.chars().count() < 3
 }
@@ -3722,6 +3935,253 @@ mod tests {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn derived_text_is_searchable_only_while_its_exact_live_attachment_is_associated() {
+        // This is deliberately injected extractor output, not a claim that an
+        // OCR/PDF bridge exists. It establishes the D3a hand-off contract.
+        let profile = tempdir().expect("temporary profile");
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open repository");
+        let resource = repository
+            .import_resource(
+                b"opaque pdf bytes",
+                "evidence.pdf",
+                "application/pdf",
+                "pdf",
+            )
+            .expect("import opaque attachment");
+        let note = repository
+            .create_note(CreateNote {
+                title: "unrelated title".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: resource.clone(),
+                        filename: "evidence.pdf".into(),
+                        media_type: "application/pdf".into(),
+                    },
+                ]),
+            })
+            .expect("associate attachment");
+        let job = repository
+            .take_derived_text_jobs(1)
+            .expect("take pending extraction")
+            .pop()
+            .expect("associated PDF is pending");
+        assert_eq!(job.resource_id, resource);
+        assert!(
+            repository
+                .publish_derived_text(&job, "甲乙丙 alpha beta contract")
+                .expect("publish exact synthetic text")
+        );
+
+        for term in ["甲", "甲乙", "甲乙丙", "\"alpha beta\""] {
+            let hits = repository
+                .search(SearchQuery::parse(term))
+                .expect("search derived text");
+            assert_eq!(hits.len(), 1, "{term}");
+            assert_eq!(hits[0].note.id, note.id);
+            assert_eq!(hits[0].matched_resource, Some(resource.clone()));
+        }
+
+        // `replace_note_resources` deletes then reinserts rows. An ordinary
+        // save retaining this attachment must not requeue/erase the exact
+        // completed projection merely because of that implementation detail.
+        let retained = repository
+            .save_note(SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: "renamed without changing attachment".into(),
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: resource.clone(),
+                        filename: "evidence.pdf".into(),
+                        media_type: "application/pdf".into(),
+                    },
+                ]),
+                resource_ids: vec![resource.clone()],
+                selected_thumbnail_id: None,
+            })
+            .expect("ordinary save retains exact completed attachment text");
+        assert_eq!(
+            repository
+                .derived_text_status(&resource)
+                .expect("read durable status"),
+            Some(DerivedTextStatus::Indexed { attempts: 0 })
+        );
+        assert_eq!(
+            repository
+                .search(SearchQuery::parse("甲乙丙"))
+                .expect("search after ordinary save")[0]
+                .matched_resource,
+            Some(resource.clone())
+        );
+
+        let detached = repository
+            .save_note(SaveNote {
+                id: note.id.clone(),
+                expected_revision: retained.revision,
+                title: retained.title,
+                document: CanonicalDocument::default(),
+                resource_ids: vec![],
+                selected_thumbnail_id: None,
+            })
+            .expect("detach without touching resource bytes");
+        assert!(
+            repository
+                .search(SearchQuery::parse("甲乙丙"))
+                .expect("search after detach")
+                .is_empty()
+        );
+        assert_eq!(detached.resource_ids, Vec::<ResourceId>::new());
+    }
+
+    #[test]
+    fn derived_text_failure_is_visible_retryable_and_never_requires_a_blob_read() {
+        let profile = tempdir().expect("temporary profile");
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open repository");
+        let resource = repository
+            .import_resource(b"opaque image bytes", "scan.png", "image/png", "png")
+            .expect("import image");
+        repository
+            .create_note(CreateNote {
+                title: "scan owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: resource.clone(),
+                        filename: "scan.png".into(),
+                        media_type: "image/png".into(),
+                    },
+                ]),
+            })
+            .expect("associate image");
+        let reads = repository.observe_resource_reads();
+        let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+        assert!(
+            repository
+                .fail_derived_text(&job, DerivedTextFailure::Unavailable)
+                .unwrap()
+        );
+        assert_eq!(
+            repository.derived_text_status(&resource).unwrap(),
+            Some(DerivedTextStatus::Failed {
+                failure: DerivedTextFailure::Unavailable,
+                attempts: 1
+            })
+        );
+        assert!(repository.retry_derived_text(&job).unwrap());
+        assert_eq!(
+            repository.derived_text_status(&resource).unwrap(),
+            Some(DerivedTextStatus::Pending { attempts: 1 })
+        );
+        assert!(matches!(
+            reads.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn stale_hash_or_extractor_version_cannot_publish_or_leak_a_derived_hit() {
+        let profile = tempdir().unwrap();
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+        let resource = repository
+            .import_resource(b"opaque PDF", "sealed.pdf", "application/pdf", "pdf")
+            .unwrap();
+        repository
+            .create_note(CreateNote {
+                title: "owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: resource.clone(),
+                        filename: "sealed.pdf".into(),
+                        media_type: "application/pdf".into(),
+                    },
+                ]),
+            })
+            .unwrap();
+        let stale_job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+        {
+            let connection = repository.connection.lock().unwrap();
+            let replacement = "b".repeat(64);
+            connection.execute("INSERT INTO resource_blobs(sha256,size,mime,relative_path,created_time,revision) VALUES(?1,1,'application/pdf','unused',0,1)", [&replacement]).unwrap();
+            connection
+                .execute(
+                    "UPDATE resources SET sha256=?2 WHERE id=?1",
+                    params![resource.as_str(), replacement],
+                )
+                .unwrap();
+        }
+        assert!(
+            !repository
+                .publish_derived_text(&stale_job, "must not publish")
+                .unwrap()
+        );
+        assert!(repository.take_derived_text_jobs(1).unwrap().is_empty());
+
+        // Simulate a future extractor-version rollover with stale FTS rows:
+        // the current search contract still excludes the old projection.
+        {
+            let connection = repository.connection.lock().unwrap();
+            connection.execute("UPDATE derived_text_jobs SET sha256=(SELECT sha256 FROM resources WHERE id=?1), extractor_version='obsolete-v0',state='indexed' WHERE resource_id=?1", [resource.as_str()]).unwrap();
+            connection.execute("INSERT INTO derived_text_rows(resource_id,sha256,extractor_version) VALUES(?1,(SELECT sha256 FROM resources WHERE id=?1),'obsolete-v0')", [resource.as_str()]).unwrap();
+            let rowid: i64 = connection
+                .query_row(
+                    "SELECT fts_rowid FROM derived_text_rows WHERE resource_id=?1",
+                    [resource.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection.execute("INSERT INTO derived_text_unicode(rowid,resource_id,text) VALUES(?1,?2,'obsolete secret')", params![rowid, resource.as_str()]).unwrap();
+            connection.execute("INSERT INTO derived_text_trigram(rowid,resource_id,text) VALUES(?1,?2,'obsolete secret')", params![rowid, resource.as_str()]).unwrap();
+        }
+        assert!(
+            repository
+                .search(SearchQuery::parse("obsolete"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trashed_and_purged_attachment_owner_cannot_leave_derived_text_live() {
+        let profile = tempdir().unwrap();
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+        let resource = repository
+            .import_resource(b"opaque", "final.pdf", "application/pdf", "pdf")
+            .unwrap();
+        let note = repository
+            .create_note(CreateNote {
+                title: "owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: resource.clone(),
+                        filename: "final.pdf".into(),
+                        media_type: "application/pdf".into(),
+                    },
+                ]),
+            })
+            .unwrap();
+        let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+        assert!(
+            repository
+                .publish_derived_text(&job, "purge-me text")
+                .unwrap()
+        );
+        repository.trash_note(&note.id).unwrap();
+        assert!(
+            repository
+                .search(SearchQuery::parse("purge-me"))
+                .unwrap()
+                .is_empty()
+        );
+        repository.purge_note(&note.id).unwrap();
+        assert_eq!(repository.derived_text_status(&resource).unwrap(), None);
+    }
 
     #[cfg(unix)]
     fn queue_orphan_blob_then_stage_same_bytes(

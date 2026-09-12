@@ -183,3 +183,53 @@ pub struct SearchJob {
     pub updated_time: i64,
     pub reason: String,
 }
+
+/// A bounded hand-off to the future platform extractor.  D3a never opens the
+/// blob: the worker receives its identity and must later use the repository's
+/// verified descriptor boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedTextJob {
+    pub resource_id: ResourceId,
+    pub sha256: BlobHash,
+    pub extractor_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DerivedTextFailure {
+    Unsupported,
+    Unavailable,
+    Failed,
+}
+
+impl DerivedTextFailure {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unsupported" => Some(Self::Unsupported),
+            "unavailable" => Some(Self::Unavailable),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DerivedTextStatus {
+    Pending {
+        attempts: i64,
+    },
+    Indexed {
+        attempts: i64,
+    },
+    Failed {
+        failure: DerivedTextFailure,
+        attempts: i64,
+    },
+}
