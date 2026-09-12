@@ -66,9 +66,15 @@ fn pdf_text(bytes: &[u8]) -> Result<String, &'static str> {
     use cocoa::base::{id, nil};
     use cocoa::foundation::{NSAutoreleasePool, NSString};
     use objc::{class, msg_send, sel, sel_impl};
-    #[link(name = "PDFKit", kind = "framework")]
-    unsafe extern "C" {}
     unsafe {
+        // Keep PDFKit out of the GUI image; only this child loads it.
+        let pdfkit = libc::dlopen(
+            c"/System/Library/Frameworks/PDFKit.framework/PDFKit".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
+        if pdfkit.is_null() {
+            return Err("pdfkit-unavailable");
+        }
         let _pool = NSAutoreleasePool::new(nil);
         let data: id = msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() length: bytes.len()];
         let document: id = msg_send![class!(PDFDocument), alloc];
@@ -114,6 +120,7 @@ fn pdf_text(bytes: &[u8]) -> Result<String, &'static str> {
             }
         }
         let _: () = msg_send![document, release];
+        libc::dlclose(pdfkit);
         if out.trim().is_empty() {
             return Err("pdf-no-selectable-text");
         }
