@@ -147,6 +147,7 @@ impl Default for EditorSurfaceHooks {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EditorSurfaceEvent {
     OpenAttachment { resource_id: String },
+    DismissFindInNote,
 }
 
 /// One mounted document canvas. Its editor is the only input-handler owner;
@@ -158,6 +159,7 @@ pub struct EditorSurface {
     pointer_anchor: Option<DocPoint>,
     image_cache: Option<Entity<BudgetedImageCache>>,
     hooks: EditorSurfaceHooks,
+    find_panel_open: bool,
     // The library owns a nested document scroll area. The spike already owns
     // a larger scroll column (title, toolbar, body), so it mounts the same
     // surface as an embedded canvas and keeps that established scroll owner.
@@ -212,6 +214,7 @@ impl EditorSurface {
             pointer_anchor: None,
             image_cache,
             hooks: EditorSurfaceHooks::default(),
+            find_panel_open: false,
             embedded_frame,
             accepts_pointer_input,
             pending_find_reveal: None,
@@ -231,6 +234,12 @@ impl EditorSurface {
 
     pub fn mode(&self) -> EditorSurfaceMode {
         self.mode
+    }
+
+    /// The shell retains find visibility, while the focused canvas owns the
+    /// Escape event that must not fall through to its command chrome.
+    pub fn set_find_panel_open(&mut self, open: bool) {
+        self.find_panel_open = open;
     }
 
     /// Reveal the current find result without changing the editor selection.
@@ -424,6 +433,11 @@ impl EditorSurface {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_panel_open && matches!(event.keystroke.key.as_str(), "escape" | "esc") {
+            cx.emit(EditorSurfaceEvent::DismissFindInNote);
+            cx.stop_propagation();
+            return;
+        }
         if !event.keystroke.modifiers.shift {
             return;
         }

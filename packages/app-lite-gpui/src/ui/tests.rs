@@ -390,6 +390,195 @@ fn mount_shell_with_save_clock<'a>(
 }
 
 #[gpui::test]
+async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "查找会话".into(),
+            notebook_id: None,
+            document: rich_document("会议记录：会议继续。"),
+        })
+        .expect("create find fixture");
+    let other_note = repository
+        .create_note(CreateNote {
+            title: "另一篇笔记".into(),
+            notebook_id: None,
+            document: rich_document("没有同一查找词"),
+        })
+        .expect("create second find fixture");
+    let original_html = note.body_html.clone();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+
+    cx.simulate_keystrokes("cmd-f");
+    redraw(cx);
+
+    assert!(
+        cx.debug_bounds("library-find-in-note-panel").is_some(),
+        "Cmd-F must mount the in-note panel inside the retained editor column"
+    );
+    // Sidebar + note list retain their explicit minimum widths, so 900px
+    // leaves the editor at its narrow real-world column rather than hiding it.
+    cx.simulate_resize(gpui::size(px(900.0), px(720.0)));
+    redraw(cx);
+    let controls = [
+        "library-find-in-note-case",
+        "library-find-in-note-previous",
+        "library-find-in-note-next",
+        "library-find-in-note-close",
+    ]
+    .map(|selector| {
+        cx.debug_bounds(selector)
+            .expect("narrow panel control is mounted")
+    });
+    for (index, bounds) in controls.iter().enumerate() {
+        for other in controls.iter().skip(index + 1) {
+            assert!(
+                bounds.right() <= other.left()
+                    || other.right() <= bounds.left()
+                    || bounds.bottom() <= other.top()
+                    || other.bottom() <= bounds.top(),
+                "narrow-panel controls need distinct click targets"
+            );
+        }
+    }
+    cx.simulate_input("会议");
+    redraw(cx);
+    let (editor, undo_depth) = view.read_with(cx, |shell, app| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone();
+        assert_eq!(
+            editor.read(app).find_summary().total,
+            2,
+            "CJK input is found literally"
+        );
+        assert_eq!(editor.read(app).find_summary().primary_index, Some(0));
+        (editor.clone(), editor.read(app).undo_depth())
+    });
+    cx.simulate_keystrokes("cmd-g");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().primary_index),
+        Some(1)
+    );
+    cx.simulate_keystrokes("cmd-shift-g");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().primary_index),
+        Some(0)
+    );
+
+    let find_input = view.read_with(cx, |shell, _| shell.find_input.clone());
+    cx.update(|window, app| {
+        find_input.update(app, |input, input_cx| {
+            input.select_all();
+            <TitleInput as EntityInputHandler>::replace_and_mark_text_in_range(
+                input,
+                None,
+                "无",
+                Some(0..1),
+                window,
+                input_cx,
+            );
+        });
+    });
+    assert!(find_input.read_with(cx, |input, _| input.marked_range().is_some()));
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().total),
+        2,
+        "IME marked text must not replace the live query or scroll"
+    );
+    cx.update(|window, app| {
+        find_input.update(app, |input, input_cx| {
+            <TitleInput as EntityInputHandler>::unmark_text(input, window, input_cx);
+        });
+    });
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().total),
+        0
+    );
+    cx.update(|window, app| {
+        find_input.update(app, |input, input_cx| {
+            input.select_all();
+            <TitleInput as EntityInputHandler>::replace_text_in_range(
+                input, None, "会议", window, input_cx,
+            );
+        });
+    });
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().total),
+        2
+    );
+
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+    view.read_with(cx, |shell, _| assert!(!shell.find_panel_open));
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().total),
+        2
+    );
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.undo_depth()),
+        undo_depth
+    );
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().body_html,
+        original_html,
+        "find stays outside saved HTML"
+    );
+
+    cx.simulate_keystrokes("cmd-f");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(
+            shell.find_input.read(app).text(),
+            "会议",
+            "same note reuses its query"
+        );
+    });
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("library-search-palette").is_some(),
+        "Cmd-K stays global search"
+    );
+    view.read_with(cx, |shell, _| assert!(shell.find_panel_open));
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::SelectNote(other_note.id.clone()),
+                window,
+                shell_cx,
+            );
+        });
+    });
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.find_summary().total),
+        0
+    );
+    view.read_with(cx, |shell, app| {
+        assert!(!shell.find_panel_open);
+        assert!(shell.find_input.read(app).text().is_empty());
+    });
+}
+
+#[gpui::test]
 async fn cmd_k_palette_mounts_above_the_retained_editor_without_changing_session(
     cx: &mut TestAppContext,
 ) {

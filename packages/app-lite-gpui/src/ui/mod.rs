@@ -76,6 +76,9 @@ gpui::actions!(
         ToggleLibraryOrganizationPanel,
         OpenLibraryResourcePicker,
         ToggleSearchPalette,
+        ToggleFindInNote,
+        FindNextInNote,
+        FindPreviousInNote,
     ]
 );
 
@@ -515,6 +518,12 @@ pub struct LibraryShell {
     organization_input: Entity<TitleInput>,
     search_input: Entity<TitleInput>,
     _search_input_observation: Option<Subscription>,
+    find_input: Entity<TitleInput>,
+    _find_input_observation: Option<Subscription>,
+    find_panel_open: bool,
+    find_case_sensitive: bool,
+    find_return_focus: Option<FocusHandle>,
+    find_error: Option<String>,
     search_palette_open: bool,
     search_palette_results: Vec<SearchHit>,
     search_palette_status: SearchPaletteStatus,
@@ -765,6 +774,9 @@ fn bind_library_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-alt-o", CycleSort, Some("LibraryShell")),
         KeyBinding::new("cmd-s", SyncCurrent, Some("LibraryShell")),
         KeyBinding::new("cmd-k", ToggleSearchPalette, Some("LibraryShell")),
+        KeyBinding::new("cmd-f", ToggleFindInNote, Some("LibraryShell")),
+        KeyBinding::new("cmd-g", FindNextInNote, Some("LibraryShell")),
+        KeyBinding::new("cmd-shift-g", FindPreviousInNote, Some("LibraryShell")),
         // Compact-toolbar presentation commands deliberately remain scoped to
         // the library window. They do not introduce model mutations outside
         // the existing typed AppAction reducer.
@@ -888,6 +900,7 @@ impl LibraryShell {
         focus_handle.focus(window);
         let organization_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
         let search_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
+        let find_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
         let image_cache = BudgetedImageCache::new_entity_in_context(cx, DECODED_IMAGE_CACHE_BUDGET);
         let card_thumbnail_cache =
             BudgetedImageCache::new_entity_in_context(cx, CARD_THUMBNAIL_CACHE_BUDGET);
@@ -953,6 +966,11 @@ impl LibraryShell {
                 shell.schedule_search_from_input(cx);
             }
         });
+        let find_input_observation = cx.observe(&find_input, |shell, input, cx| {
+            if shell.find_panel_open && input.read(cx).marked_range().is_none() {
+                shell.refresh_find_in_note(cx);
+            }
+        });
         let mut shell = Self {
             model,
             note_session: None,
@@ -987,6 +1005,12 @@ impl LibraryShell {
             organization_input,
             search_input,
             _search_input_observation: Some(search_input_observation),
+            find_input,
+            _find_input_observation: Some(find_input_observation),
+            find_panel_open: false,
+            find_case_sensitive: false,
+            find_return_focus: None,
+            find_error: None,
             search_palette_open: false,
             search_palette_results: Vec::new(),
             search_palette_status: SearchPaletteStatus::Idle,
@@ -2005,6 +2029,28 @@ impl LibraryShell {
         self.toggle_search_palette_visibility(window, cx);
     }
 
+    fn toggle_find_in_note(
+        &mut self,
+        _: &ToggleFindInNote,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_find_in_note_visibility(window, cx);
+    }
+
+    fn find_next_in_note(&mut self, _: &FindNextInNote, _: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_find_in_note(true, cx);
+    }
+
+    fn find_previous_in_note(
+        &mut self,
+        _: &FindPreviousInNote,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_find_in_note(false, cx);
+    }
+
     fn toggle_library_organization_panel(
         &mut self,
         _: &ToggleLibraryOrganizationPanel,
@@ -2059,6 +2105,25 @@ impl LibraryShell {
         {
             self.set_active_session_reconciliation_lock(reconciliation_pending, cx);
             return;
+        }
+
+        let note_changed = self.surface_note_id != next_id;
+        if note_changed {
+            if let Some(session) = self.note_session.as_ref() {
+                let editor = session.read_with(cx, |session, _| session.editor().clone());
+                let _ = editor.update(cx, |editor, editor_cx| {
+                    editor.clear_find();
+                    editor_cx.notify();
+                });
+            }
+            self.find_panel_open = false;
+            self.find_return_focus = None;
+            self.find_error = None;
+            self.find_input.update(cx, |input, input_cx| {
+                input.select_all();
+                input.delete_backward();
+                input_cx.notify();
+            });
         }
 
         // A switch (including a codec failure) first removes the old mounted
@@ -2227,11 +2292,22 @@ impl LibraryShell {
                         EditorSurfaceEvent::OpenAttachment { resource_id } => {
                             shell.open_attachment_resource(resource_id.clone(), shell_cx);
                         }
+                        EditorSurfaceEvent::DismissFindInNote => {
+                            shell.close_find_in_note_from_editor(shell_cx);
+                        }
                     },
                 ));
                 self.editor_surface = Some(surface);
+                if self.find_panel_open {
+                    if let Some(surface) = self.editor_surface.as_ref() {
+                        let _ = surface.update(cx, |surface, _| surface.set_find_panel_open(true));
+                    }
+                }
                 self.command_chrome = command_chrome;
                 self.note_session = Some(session);
+                if !note_changed && !self.find_input.read(cx).text().is_empty() {
+                    self.refresh_find_in_note(cx);
+                }
             }
             Err(error) => self.unsupported_document = Some(error.to_string()),
         }
@@ -3466,6 +3542,105 @@ impl LibraryShell {
             }
         }
         cx.notify();
+    }
+
+    fn toggle_find_in_note_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.note_session.is_none() || self.editor_surface.is_none() {
+            return;
+        }
+        if self.find_panel_open {
+            self.find_input.update(cx, |input, input_cx| {
+                input.select_all();
+                input_cx.notify();
+            });
+            self.find_input.read(cx).focus_handle().focus(window);
+        } else {
+            self.find_panel_open = true;
+            self.find_return_focus = window
+                .focused(cx)
+                .or_else(|| Some(self.fallback_focus_before_search_palette(cx)));
+            self.find_error = None;
+            self.refresh_find_in_note(cx);
+            if let Some(surface) = self.editor_surface.as_ref() {
+                let _ = surface.update(cx, |surface, _| surface.set_find_panel_open(true));
+            }
+            self.find_input.read(cx).focus_handle().focus(window);
+        }
+        cx.notify();
+    }
+
+    fn close_find_in_note_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find_panel_open {
+            return;
+        }
+        self.find_panel_open = false;
+        if let Some(surface) = self.editor_surface.as_ref() {
+            let _ = surface.update(cx, |surface, _| surface.set_find_panel_open(false));
+        }
+        if let Some(focus) = self.find_return_focus.take() {
+            window.defer(cx, move |window, _app| focus.focus(window));
+        }
+        cx.notify();
+    }
+
+    fn close_find_in_note_from_editor(&mut self, cx: &mut Context<Self>) {
+        if !self.find_panel_open {
+            return;
+        }
+        self.find_panel_open = false;
+        self.find_return_focus = None;
+        if let Some(surface) = self.editor_surface.as_ref() {
+            let _ = surface.update(cx, |surface, _| surface.set_find_panel_open(false));
+        }
+        cx.notify();
+    }
+
+    fn refresh_find_in_note(&mut self, cx: &mut Context<Self>) {
+        let query = self.find_input.read(cx).text().to_owned();
+        let Some(session) = self.note_session.as_ref() else {
+            return;
+        };
+        let editor = session.read_with(cx, |session, _| session.editor().clone());
+        let result = editor.update(cx, |editor, editor_cx| {
+            let result = editor.set_find_query(&query, self.find_case_sensitive);
+            editor_cx.notify();
+            result
+        });
+        self.find_error = result.err().map(|error| error.to_string());
+        if self.find_error.is_none() {
+            self.reveal_find_in_note(cx);
+        }
+        cx.notify();
+    }
+
+    fn navigate_find_in_note(&mut self, next: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.note_session.as_ref() else {
+            return;
+        };
+        let editor = session.read_with(cx, |session, _| session.editor().clone());
+        let _ = editor.update(cx, |editor, editor_cx| {
+            if next {
+                editor.find_next();
+            } else {
+                editor.find_previous();
+            }
+            editor_cx.notify();
+        });
+        self.reveal_find_in_note(cx);
+        cx.notify();
+    }
+
+    fn reveal_find_in_note(&mut self, cx: &mut Context<Self>) {
+        if let Some(surface) = self.editor_surface.as_ref() {
+            let _ = surface.update(cx, |surface, surface_cx| {
+                surface.reveal_find_primary(surface_cx);
+            });
+        }
+    }
+
+    fn toggle_find_case_sensitive(&mut self, cx: &mut Context<Self>) {
+        self.find_case_sensitive = !self.find_case_sensitive;
+        self.refresh_find_in_note(cx);
     }
 
     fn schedule_search_from_input(&mut self, cx: &mut Context<Self>) {
@@ -4719,12 +4894,17 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.search_palette_open && event.keystroke.key == "escape" {
+        if self.find_panel_open && matches!(event.keystroke.key.as_str(), "escape" | "esc") {
+            self.close_find_in_note_visibility(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.search_palette_open && matches!(event.keystroke.key.as_str(), "escape" | "esc") {
             self.toggle_search_palette_visibility(window, cx);
             cx.stop_propagation();
             return;
         }
-        if event.keystroke.key != "escape" {
+        if !matches!(event.keystroke.key.as_str(), "escape" | "esc") {
             return;
         }
         if self.dismiss_toolbar_more(window, cx) {
@@ -4760,7 +4940,7 @@ impl LibraryShell {
         let modifiers = event.keystroke.modifiers;
         let secondary = modifiers.secondary();
         let handled = match event.keystroke.key.as_str() {
-            "escape" => {
+            "escape" | "esc" => {
                 self.toggle_search_palette_visibility(window, cx);
                 true
             }
@@ -5048,6 +5228,293 @@ impl LibraryShell {
         )
     }
 
+    fn on_find_in_note_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.find_input.clone();
+        let modifiers = event.keystroke.modifiers;
+        let secondary = modifiers.secondary();
+        let handled = match event.keystroke.key.as_str() {
+            "escape" => {
+                self.close_find_in_note_visibility(window, cx);
+                true
+            }
+            "enter" if input.read(cx).marked_range().is_none() => {
+                self.navigate_find_in_note(true, cx);
+                true
+            }
+            "g" if secondary => {
+                self.navigate_find_in_note(!modifiers.shift, cx);
+                true
+            }
+            "backspace" => {
+                input.update(cx, |input, input_cx| {
+                    input.delete_backward();
+                    input_cx.notify();
+                });
+                true
+            }
+            "delete" => {
+                input.update(cx, |input, input_cx| {
+                    input.delete_forward();
+                    input_cx.notify();
+                });
+                true
+            }
+            "left" => {
+                input.update(cx, |input, input_cx| {
+                    input.move_horizontal(false, modifiers.shift);
+                    input_cx.notify();
+                });
+                true
+            }
+            "right" => {
+                input.update(cx, |input, input_cx| {
+                    input.move_horizontal(true, modifiers.shift);
+                    input_cx.notify();
+                });
+                true
+            }
+            "home" => {
+                input.update(cx, |input, input_cx| {
+                    input.move_to_edge(false, modifiers.shift);
+                    input_cx.notify();
+                });
+                true
+            }
+            "end" => {
+                input.update(cx, |input, input_cx| {
+                    input.move_to_edge(true, modifiers.shift);
+                    input_cx.notify();
+                });
+                true
+            }
+            "a" if secondary => {
+                input.update(cx, |input, input_cx| {
+                    input.select_all();
+                    input_cx.notify();
+                });
+                true
+            }
+            "v" if secondary => {
+                input.update(cx, |input, input_cx| input.paste_from_clipboard(input_cx));
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            cx.stop_propagation();
+        }
+    }
+
+    fn render_find_in_note_panel(
+        &self,
+        available_width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.find_panel_open || self.note_session.is_none() {
+            return None;
+        }
+        let input = self.find_input.clone();
+        // Keep every control independently hit-testable in a narrow editor
+        // column. The row wraps below its natural compact width rather than
+        // placing controls on top of the document or each other.
+        let input_width = (available_width - 172.0).clamp(48.0, 128.0);
+        let canvas_input = input.clone();
+        let paint_input = input.clone();
+        let input_canvas = canvas(
+            move |bounds, _window, cx| {
+                let _ = canvas_input.update(cx, |input, _| input.record_bounds(bounds));
+                canvas_input.clone()
+            },
+            move |bounds, entity, window, cx| {
+                let (text, selection, focus) = entity.read_with(cx, |input, _| {
+                    (
+                        SharedString::from(input.text().to_owned()),
+                        input.selection().clone(),
+                        input.focus_handle().clone(),
+                    )
+                });
+                let line = window.text_system().shape_line(
+                    text,
+                    px(14.0),
+                    &[TextRun {
+                        len: entity.read(cx).text().len(),
+                        font: window.text_style().font(),
+                        color: rgba(0x202420ff).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+                entity.update(cx, |input, _| input.record_layout(bounds, line.clone()));
+                if focus.is_focused(window) && !selection.is_empty() {
+                    window.paint_quad(gpui::fill(
+                        Bounds::from_corners(
+                            point(
+                                bounds.left() + line.x_for_index(selection.start),
+                                bounds.top(),
+                            ),
+                            point(
+                                bounds.left() + line.x_for_index(selection.end),
+                                bounds.bottom(),
+                            ),
+                        ),
+                        rgba(0x00a82d33),
+                    ));
+                }
+                line.paint(bounds.origin, bounds.size.height, window, cx)
+                    .ok();
+                if focus.is_focused(window) && selection.is_empty() {
+                    let x = line.x_for_index(selection.start);
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(
+                            point(bounds.left() + x, bounds.top()),
+                            size(px(1.0), bounds.size.height),
+                        ),
+                        rgba(EVERNOTE_GREEN),
+                    ));
+                }
+                if focus.is_focused(window) {
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(bounds, paint_input.clone()),
+                        cx,
+                    );
+                }
+            },
+        )
+        .w(px(input_width))
+        .h(px(30.0));
+        let summary = self.note_session.as_ref().map(|session| {
+            let editor = session.read(cx).editor().clone();
+            editor.read(cx).find_summary()
+        });
+        let summary_text = if let Some(error) = &self.find_error {
+            error.clone()
+        } else if let Some(summary) = summary {
+            match summary.primary_index {
+                Some(index) => format!("{} / {}", index + 1, summary.total),
+                None => "无结果".to_owned(),
+            }
+        } else {
+            "无结果".to_owned()
+        };
+        let case_background = if self.find_case_sensitive {
+            rgba(0x00a82d20)
+        } else {
+            rgba(0xf1f4f1ff)
+        };
+        Some(
+            div()
+                .id("library-find-in-note-panel")
+                .debug_selector(|| "library-find-in-note-panel".to_owned())
+                .absolute()
+                .top(px(10.0))
+                .right(px(16.0))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(5.0))
+                .p(px(6.0))
+                .rounded(px(7.0))
+                .bg(rgba(0xffffffff))
+                .border_1()
+                .border_color(rgba(0xd9e1d9ff))
+                .shadow_sm()
+                .key_context("LibraryFindInNote")
+                .on_key_down(cx.listener(Self::on_find_in_note_key_down))
+                .track_focus(input.read(cx).focus_handle())
+                .child(
+                    div()
+                        .id("library-find-in-note-input")
+                        .w(px(input_width))
+                        .child(input_canvas),
+                )
+                .child(
+                    div()
+                        .id("library-find-in-note-summary")
+                        .w(px(42.0))
+                        .text_size(px(11.0))
+                        .text_color(rgba(0x718075ff))
+                        .child(summary_text),
+                )
+                .child(
+                    div()
+                        .id("library-find-in-note-case")
+                        .debug_selector(|| "library-find-in-note-case".to_owned())
+                        .cursor_pointer()
+                        .px(px(5.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(case_background)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event, _window, cx| {
+                                shell.toggle_find_case_sensitive(cx)
+                            }),
+                        )
+                        .child("Aa"),
+                )
+                .child(
+                    div()
+                        .id("library-find-in-note-previous")
+                        .debug_selector(|| "library-find-in-note-previous".to_owned())
+                        .cursor_pointer()
+                        .px(px(5.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0xf1f4f1ff))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event, _window, cx| {
+                                shell.navigate_find_in_note(false, cx)
+                            }),
+                        )
+                        .child("‹"),
+                )
+                .child(
+                    div()
+                        .id("library-find-in-note-next")
+                        .debug_selector(|| "library-find-in-note-next".to_owned())
+                        .cursor_pointer()
+                        .px(px(5.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0xf1f4f1ff))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event, _window, cx| {
+                                shell.navigate_find_in_note(true, cx)
+                            }),
+                        )
+                        .child("›"),
+                )
+                .child(
+                    div()
+                        .id("library-find-in-note-close")
+                        .debug_selector(|| "library-find-in-note-close".to_owned())
+                        .cursor_pointer()
+                        .px(px(5.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0xf1f4f1ff))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event, window, cx| {
+                                shell.close_find_in_note_visibility(window, cx)
+                            }),
+                        )
+                        .child("×"),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_editor_panel(
         &mut self,
         items_empty: bool,
@@ -5119,6 +5586,7 @@ impl LibraryShell {
         }
         if let Some(surface) = &self.editor_surface {
             let title = self.render_note_title(cx);
+            let find_panel = self.render_find_in_note_panel(available_width, cx);
             let EditorCommandChromeRender { toolbar, overlays } = self
                 .command_chrome
                 .as_ref()
@@ -5165,6 +5633,7 @@ impl LibraryShell {
                             .min_h(px(0.0))
                             .child(surface.clone()),
                     )
+                    .children(find_panel)
                     .into_any_element(),
                 overlays,
             };
@@ -5731,6 +6200,9 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::cycle_sort))
             .on_action(cx.listener(Self::sync_current))
             .on_action(cx.listener(Self::toggle_search_palette))
+            .on_action(cx.listener(Self::toggle_find_in_note))
+            .on_action(cx.listener(Self::find_next_in_note))
+            .on_action(cx.listener(Self::find_previous_in_note))
             .on_action(cx.listener(Self::toggle_library_toolbar_more))
             .on_action(cx.listener(Self::toggle_library_organization_panel))
             .on_action(cx.listener(Self::open_library_resource_picker))
