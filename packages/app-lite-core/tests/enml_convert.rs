@@ -183,3 +183,30 @@ fn a_div_containing_only_an_image_becomes_a_structural_image_block() {
     );
     assert!(matches!(converted.document.blocks(), [Block::Image { .. }]));
 }
+
+#[test]
+fn semantic_nbsp_is_not_discarded_as_xml_formatting_whitespace() {
+    // Mutation caught: Unicode trim treating NBSP as ignorable and dropping
+    // visible text before choosing an image-only block or root paragraph.
+    let root = convert_enml("<en-note>&#160;</en-note>", &BTreeMap::new()).unwrap();
+    assert_eq!(root.html.as_str(), "<p>&nbsp;</p>");
+    assert_eq!(root.search_text.as_str(), "\u{a0}");
+    let enml = format!(
+        "<en-note><div>&#160;<en-media hash=\"{IMAGE_MD5}\" type=\"image/png\"/></div></en-note>"
+    );
+    let converted = convert_enml(&enml, &resources()).unwrap();
+    assert_eq!(
+        converted.html.as_str(),
+        format!("<p>&nbsp;<img src=\":/{IMAGE_ID}\" alt=\"图.png\"></p>")
+    );
+    assert_eq!(converted.search_text.as_str(), "\u{a0}图.png");
+}
+
+#[test]
+fn media_blocker_path_uses_its_actual_child_index() {
+    // Mutation caught: image-only optimization hard-coding /0 after skipped
+    // XML formatting whitespace callbacks.
+    let enml = "<en-note><div> \n<en-media hash=\"cccccccccccccccccccccccccccccccc\" type=\"image/png\"/></div></en-note>";
+    let error = convert_enml(enml, &BTreeMap::new()).unwrap_err();
+    assert_eq!(error.path, "/en-note/0/1");
+}

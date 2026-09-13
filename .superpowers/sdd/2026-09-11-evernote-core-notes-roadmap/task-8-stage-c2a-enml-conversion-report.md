@@ -78,3 +78,25 @@ After these last two corrections: `cargo fmt`, focused `cargo test --test
 enml_convert` (7 passed), `cargo fmt --check` (clean), `git diff --check`
 (clean), and final `cargo test --quiet` (all core groups passed with the same
 counts above).
+
+## Independent review round 2 correction
+
+The new Important finding was loss of semantic Unicode whitespace from
+`str::trim().is_empty()`. RED: `<en-note>&#160;</en-note>` produced an empty
+document, and NBSP before an image could trigger the image-only block path.
+GREEN: all ENML places that skip XML formatting whitespace now use only ASCII
+space, tab, CR and LF, matching the canonical document's own rule. NBSP remains
+in search text and serializes as `&nbsp;` in canonical HTML; NBSP+image stays
+one paragraph rather than becoming a pure image block. The same predicate is
+used in root flow lookahead, list inter-item checks and outside-root handling;
+semantic whitespace outside the root blocks instead of disappearing.
+
+The adjacent Minor provenance fix has its own RED: an image after a
+whitespace-only child reported `/en-note/0/0`. GREEN: the image-only
+optimization records the actual child index and reports `/en-note/0/1`.
+Focused ENML conversion tests after these changes: **9 passed**.
+Final round-2 commands: `cargo fmt`, `cargo fmt --check` (clean),
+`git diff --check` (clean), and `cargo test --quiet` (all core groups passed:
+67 unit, 4 document, 16 ENEX, 9 ENML conversion, 27 JEX, 15 migration,
+8 organization, 7 repository flow, 7 resource-store tests; empty/doc groups
+passed).

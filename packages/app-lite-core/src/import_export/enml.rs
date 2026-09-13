@@ -73,7 +73,7 @@ pub fn convert_enml(
     for (index, child) in root.children.iter().enumerate() {
         let path = format!("/en-note/{index}");
         let root_inline = match child {
-            Child::Text(text) => inline_run || !text.trim().is_empty(),
+            Child::Text(text) => inline_run || !is_xml_formatting_whitespace(text),
             Child::Element(element) => {
                 matches!(
                     element.name.as_str(),
@@ -125,7 +125,7 @@ pub fn convert_enml(
 
 fn root_flow_child(child: &Child) -> bool {
     match child {
-        Child::Text(text) => !text.trim().is_empty(),
+        Child::Text(text) => !is_xml_formatting_whitespace(text),
         Child::Element(element) => matches!(
             element.name.as_str(),
             "b" | "strong"
@@ -147,7 +147,7 @@ fn next_root_flow_child(children: &[Child], index: usize) -> bool {
     children
         .iter()
         .skip(index + 1)
-        .find(|child| !matches!(child, Child::Text(text) if text.trim().is_empty()))
+        .find(|child| !matches!(child, Child::Text(text) if is_xml_formatting_whitespace(text)))
         .is_some_and(root_flow_child)
 }
 
@@ -303,7 +303,7 @@ fn append_text(value: &str, stack: &mut [Element]) -> Result<(), EnmlFidelityBlo
     if let Some(parent) = stack.last_mut() {
         parent.children.push(Child::Text(value.to_owned()));
         Ok(())
-    } else if value.trim().is_empty() {
+    } else if is_xml_formatting_whitespace(value) {
         Ok(())
     } else {
         Err(blocked("/", "text outside en-note root"))
@@ -322,7 +322,7 @@ impl RenderContext<'_> {
         out: &mut String,
     ) -> Result<(), EnmlFidelityBlocker> {
         match child {
-            Child::Text(text) if text.trim().is_empty() => Ok(()),
+            Child::Text(text) if is_xml_formatting_whitespace(text) => Ok(()),
             Child::Text(text) => {
                 out.push_str("<p>");
                 escape(text, out);
@@ -332,10 +332,10 @@ impl RenderContext<'_> {
             Child::Element(element) => match element.name.as_str() {
                 "div" | "p" | "h1" | "h2" | "h3" => {
                     self.attrs(element, &[], path)?;
-                    if element.name == "div" && element.children.iter().filter(|child| !matches!(child, Child::Text(text) if text.trim().is_empty())).count() == 1 {
-                        if let Some(Child::Element(media)) = element.children.iter().find(|child| !matches!(child, Child::Text(text) if text.trim().is_empty())) {
+                    if element.name == "div" && element.children.iter().filter(|child| !matches!(child, Child::Text(text) if is_xml_formatting_whitespace(text))).count() == 1 {
+                        if let Some((media_index, Child::Element(media))) = element.children.iter().enumerate().find(|(_, child)| !matches!(child, Child::Text(text) if is_xml_formatting_whitespace(text))) {
                             if media.name == "en-media" {
-                                return self.media(media, &format!("{path}/0"), out, false);
+                                return self.media(media, &format!("{path}/{media_index}"), out, false);
                             }
                         }
                     }
@@ -465,7 +465,7 @@ impl RenderContext<'_> {
         let mut checked = Vec::new();
         for (i, child) in element.children.iter().enumerate() {
             let Child::Element(li) = child else {
-                if matches!(child, Child::Text(t) if t.trim().is_empty()) {
+                if matches!(child, Child::Text(t) if is_xml_formatting_whitespace(t)) {
                     continue;
                 }
                 return Err(blocked(path, "list contains non-item content"));
@@ -666,4 +666,9 @@ fn escape(input: &str, out: &mut String) {
             _ => out.push(c),
         }
     }
+}
+
+fn is_xml_formatting_whitespace(text: &str) -> bool {
+    text.chars()
+        .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n'))
 }
