@@ -17,6 +17,7 @@ getrandom = { version = "0.2", features = ["std"] }
 html5ever = "0.38"
 libc = "0.2"
 md-5 = "0.10"
+pulldown-cmark = "=0.13.4"
 quick-xml = "0.37"
 rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }

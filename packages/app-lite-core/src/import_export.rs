@@ -21,6 +21,8 @@ mod enml;
 pub use enml::*;
 mod jex_spool;
 pub use jex_spool::*;
+mod jex_body;
+pub use jex_body::*;
 
 /// Maximum number of tar entries accepted by a preflight scan.
 pub const MAX_JEX_ARCHIVE_ENTRIES: usize = 50_000;
