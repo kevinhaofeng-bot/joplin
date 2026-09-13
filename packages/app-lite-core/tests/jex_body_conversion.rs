@@ -5,7 +5,7 @@ use app_lite_core::{
 };
 
 const NOTE: &str = "11111111111111111111111111111111";
-const IMAGE: &str = "22222222222222222222222222222222";
+const IMAGE: &str = "222222222222222222222222222222aa";
 const PDF: &str = "33333333333333333333333333333333";
 const TARGET_IMAGE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TARGET_PDF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -46,19 +46,19 @@ fn converts_chinese_crlf_markdown_with_exact_html_search_and_resource_order() {
     // Mutation caught: a lossy HTML projection, Markdown literal fallback,
     // image/text reordering, or metadata filename replacing the body alt.
     let source = format!(
-        "# 中文标题\r\n\r\n前**粗** *斜* ~~删~~ `码` [外链](https://example.com/x) 后\r\n换行\r\n\r\n图前![图](:/{IMAGE})图后\r\n\r\n- 清单一\r\n- 清单二\r\n\r\n- [x] 已办\r\n- [ ] 待办\r\n\r\n1. 第一\r\n2. 第二\r\n"
+        "# 中文标题\r\n\r\n前**粗** *斜* ~~删~~ `码` [外链](https://example.com/x) 后\r\n换行\r\n\r\n图前![图](:/{IMAGE})图后\r\n\r\n- 清单一\r\n- 清单二\r\n\r\n列表分界\r\n\r\n- [x] 已办\r\n- [ ] 待办\r\n\r\n1. 第一\r\n2. 第二\r\n"
     );
     let converted =
         convert_jex_note_body(NOTE, &format!("{NOTE}.md"), 1, &source, &resources()).unwrap();
     assert_eq!(
         converted.canonical_html,
         format!(
-            "<h1>中文标题</h1><p>前<strong>粗</strong> <em>斜</em> <s>删</s> <code>码</code> <a href=\"https://example.com/x\">外链</a> 后<br>换行</p><p>图前<img src=\":/{TARGET_IMAGE}\" alt=\"图\">图后</p><ul><li>清单一</li><li>清单二</li></ul><ul data-type=\"checklist\"><li data-checked=\"true\">已办</li><li data-checked=\"false\">待办</li></ul><ol><li>第一</li><li>第二</li></ol>"
+            "<h1>中文标题</h1><p>前<strong>粗</strong> <em>斜</em> <s>删</s> <code>码</code> <a href=\"https://example.com/x\">外链</a> 后<br>换行</p><p>图前<img src=\":/{TARGET_IMAGE}\" alt=\"图\">图后</p><ul><li>清单一</li><li>清单二</li></ul><p>列表分界</p><ul data-type=\"checklist\"><li data-checked=\"true\">已办</li><li data-checked=\"false\">待办</li></ul><ol><li>第一</li><li>第二</li></ol>"
         )
     );
     assert_eq!(
         converted.search_text,
-        "中文标题\n前粗 斜 删 码 外链 后\n换行\n图前图图后\n清单一\n清单二\n已办\n待办\n第一\n第二"
+        "中文标题\n前粗 斜 删 码 外链 后\n换行\n图前图图后\n清单一\n清单二\n列表分界\n已办\n待办\n第一\n第二"
     );
     assert_eq!(
         converted.ordered_resource_occurrences,
@@ -117,6 +117,41 @@ fn converts_other_verified_non_image_card_and_case_insensitive_source_id() {
 }
 
 #[test]
+fn accepts_uppercase_source_resource_map_key_and_uri_without_losing_occurrence() {
+    // Mutation caught: normalizing only the URI, not C2c-1's original map key.
+    let mut map = resources();
+    let resource = map.remove(IMAGE).unwrap();
+    map.insert(IMAGE.to_ascii_uppercase(), resource);
+    let source = format!("前![图](:/{})后", IMAGE.to_ascii_uppercase());
+    let converted = convert_jex_note_body(NOTE, "upper-map.md", 1, &source, &map).unwrap();
+    assert_eq!(converted.search_text, "前图后");
+    assert_eq!(
+        converted.ordered_resource_occurrences,
+        vec![ResourceId::new(TARGET_IMAGE).unwrap()]
+    );
+}
+
+#[test]
+fn rejects_case_fold_collision_in_verified_source_resource_map() {
+    // Mutation caught: silently selecting one of two conflicting source keys.
+    let mut map = resources();
+    map.insert(
+        IMAGE.to_ascii_uppercase(),
+        JexVerifiedResource {
+            destination_id: ResourceId::new(TARGET_PDF).unwrap(),
+            mime: "image/png".into(),
+            filename: "冲突.png".into(),
+        },
+    );
+    let source = format!("![图](:/{IMAGE})");
+    let error = convert_jex_note_body(NOTE, "collision.md", 1, &source, &map).unwrap_err();
+    assert_eq!(error.kind, JexBodyBlockerKind::UnverifiedResource);
+    assert_eq!(error.source_note_id, NOTE);
+    assert_eq!(error.source_path, "collision.md");
+    assert!(error.reason.contains("conflict"));
+}
+
+#[test]
 fn retains_repeated_image_occurrences_and_chinese_whitespace() {
     // Mutation caught: deduplicating body occurrences or swapping metadata
     // filename for user-authored alt text.
@@ -158,6 +193,10 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
         ),
         (
             "- 普通\n- [x] 混排".into(),
+            JexBodyBlockerKind::UnsupportedStructure,
+        ),
+        (
+            "- 普通\n\n- [x] 混排".into(),
             JexBodyBlockerKind::UnsupportedStructure,
         ),
         (

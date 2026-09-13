@@ -1,7 +1,7 @@
 //! Fail-closed, side-effect-free conversion of one verified JEX Markdown body.
 //! HTML JEX notes deliberately remain blocked until their separate converter exists.
 
-use std::{collections::BTreeMap, ops::Range};
+use std::collections::BTreeMap;
 
 use pulldown_cmark::{Event, HeadingLevel as MdHeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -65,9 +65,7 @@ type Result<T> = std::result::Result<T, JexBodyFidelityBlocker>;
 struct Converter<'a> {
     note_id: &'a str,
     path: &'a str,
-    body: &'a str,
     events: Vec<Event<'a>>,
-    ranges: Vec<Range<usize>>,
     cursor: usize,
     resources: &'a BTreeMap<String, JexVerifiedResource>,
     occurrences: Vec<ResourceId>,
@@ -352,7 +350,7 @@ impl<'a> Converter<'a> {
         })
     }
 
-    fn list(&mut self, ordered_start: Option<u64>) -> Result<Vec<Block>> {
+    fn list(&mut self, ordered_start: Option<u64>) -> Result<Block> {
         if ordered_start.is_some_and(|start| start != 1) {
             return self.blocked(
                 JexBodyBlockerKind::UnsupportedStructure,
@@ -362,7 +360,6 @@ impl<'a> Converter<'a> {
         let mut items = Vec::new();
         while matches!(self.peek(), Some(Event::Start(Tag::Item))) {
             self.next();
-            let item_start = self.ranges[self.cursor - 1].start;
             let has_paragraph = matches!(self.peek(), Some(Event::Start(Tag::Paragraph)));
             if has_paragraph {
                 self.next();
@@ -375,17 +372,6 @@ impl<'a> Converter<'a> {
                 }
                 _ => None,
             };
-            if items
-                .last()
-                .is_some_and(|previous: &ListItem| previous.checked.is_some() != checked.is_some())
-                && !self.body[..item_start].ends_with("\n\n")
-                && !self.body[..item_start].ends_with("\r\n\r\n")
-            {
-                return self.blocked(
-                    JexBodyBlockerKind::UnsupportedStructure,
-                    "Mixed plain and task list items require a blank-line boundary",
-                );
-            }
             let inlines = if has_paragraph {
                 self.inlines(TagEnd::Paragraph, Marks::default(), false)?
             } else {
@@ -411,39 +397,20 @@ impl<'a> Converter<'a> {
             });
         }
         self.expect_end(TagEnd::List(ordered_start.is_some()))?;
-        let kind = if ordered_start.is_some() {
-            if items.iter().any(|item| item.checked.is_some()) {
+        let all_checked = items.iter().all(|item| item.checked.is_some());
+        let none_checked = items.iter().all(|item| item.checked.is_none());
+        let kind = match ordered_start {
+            Some(_) if none_checked => ListKind::Ordered,
+            None if all_checked => ListKind::Checklist,
+            None if none_checked => ListKind::Unordered,
+            _ => {
                 return self.blocked(
                     JexBodyBlockerKind::UnsupportedStructure,
-                    "Ordered checklist is unsupported",
+                    "Mixed task/plain or ordered checklist items cannot be represented as one canonical list",
                 );
             }
-            ListKind::Ordered
-        } else {
-            ListKind::Unordered
         };
-        if kind == ListKind::Ordered {
-            return Ok(vec![Block::List { kind, items }]);
-        }
-        // CommonMark treats adjacent plain/task bullet lists as one list even
-        // across a blank line. Preserve the visible task semantics by cutting
-        // at each contiguous marker-kind boundary.
-        let mut blocks = Vec::new();
-        for item in items {
-            let item_kind = if item.checked.is_some() {
-                ListKind::Checklist
-            } else {
-                ListKind::Unordered
-            };
-            match blocks.last_mut() {
-                Some(Block::List { kind, items }) if *kind == item_kind => items.push(item),
-                _ => blocks.push(Block::List {
-                    kind: item_kind,
-                    items: vec![item],
-                }),
-            }
-        }
-        Ok(blocks)
+        Ok(Block::List { kind, items })
     }
 
     fn blocks(&mut self) -> Result<Vec<Block>> {
@@ -489,7 +456,7 @@ impl<'a> Converter<'a> {
                         inlines,
                     });
                 }
-                Event::Start(Tag::List(start)) => blocks.extend(self.list(start)?),
+                Event::Start(Tag::List(start)) => blocks.push(self.list(start)?),
                 Event::Html(_) | Event::InlineHtml(_) | Event::Start(Tag::HtmlBlock) => {
                     return self.blocked(
                         JexBodyBlockerKind::RawHtml,
@@ -539,6 +506,20 @@ pub fn convert_jex_note_body(
             "Markdown body exceeds the safe byte budget",
         ));
     }
+    // C2c-1 retains the source's original ID spelling; the body URI may use
+    // different ASCII case. Reject collisions instead of choosing one target.
+    let mut normalized_resources = BTreeMap::new();
+    for (source_id, resource) in resources {
+        if normalized_resources
+            .insert(source_id.to_ascii_lowercase(), resource.clone())
+            .is_some()
+        {
+            return Err(blocked(
+                JexBodyBlockerKind::UnverifiedResource,
+                "Case-fold conflict in verified source resource map",
+            ));
+        }
+    }
     if body
         .lines()
         .any(|line| line.trim_start().starts_with(":::"))
@@ -559,9 +540,8 @@ pub fn convert_jex_note_body(
         | Options::ENABLE_DEFINITION_LIST
         | Options::ENABLE_WIKILINKS;
     let mut events = Vec::new();
-    let mut ranges = Vec::new();
     let mut depth = 0usize;
-    for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
+    for event in Parser::new_ext(body, options) {
         if events.len() >= MAX_EVENTS {
             return Err(blocked(
                 JexBodyBlockerKind::ParserBudget,
@@ -582,16 +562,13 @@ pub fn convert_jex_note_body(
             _ => {}
         }
         events.push(event);
-        ranges.push(range);
     }
     let mut converter = Converter {
         note_id: source_note_id,
         path: source_path,
-        body,
         events,
-        ranges,
         cursor: 0,
-        resources,
+        resources: &normalized_resources,
         occurrences: Vec::new(),
         url_bytes: 0,
     };
