@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 use tar::{Archive, EntryType};
 use thiserror::Error;
 
+mod enex;
+pub use enex::*;
+
 /// Maximum number of tar entries accepted by a preflight scan.
 pub const MAX_JEX_ARCHIVE_ENTRIES: usize = 50_000;
 /// Maximum bytes held while parsing one serialized metadata item.
@@ -129,9 +132,9 @@ pub struct JexScanReport {
 
 impl JexScanReport {
     /// A clean scan is structurally safe and contains no skipped or incomplete
-    /// source archive entities. It does not parse note bodies, so it does not
-    /// prove every `:/<id>` inline body link has resource metadata. It also
-    /// says nothing about a later import operation.
+    /// source archive entities. It validates the bounded canonical internal
+    /// references it recognizes, but it does not prove full note-body fidelity
+    /// or anything about a later import operation.
     pub fn is_clean(&self) -> bool {
         self.duplicate_archive_paths.is_empty()
             && self.duplicate_item_ids.is_empty()

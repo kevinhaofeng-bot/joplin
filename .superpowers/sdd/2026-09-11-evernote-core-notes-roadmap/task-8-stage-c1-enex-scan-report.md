@@ -1,0 +1,71 @@
+# Task 8 / Stage C1 ENEX scan report
+
+## Scope and result
+
+Implemented `app_lite_core::scan_enex_file`: a read-only ENEX evidence scan.
+It has no repository, profile, SQLite, blob-store, or GPUI dependency, so it
+cannot mutate a live library. This is not staging, import, export, or sync.
+
+The report preserves note ordinal/title/raw timestamps/repeated tags, ENML byte
+size and SHA-256, nested `en-media` MD5/type references, resource occurrence
+metadata, decoded-byte MD5/SHA-256/size, duplicate MD5s, unresolved media,
+unreferenced real resources, MIME mismatches, and `table` as an unsupported
+fidelity construct. Resource occurrences are deliberately not deduplicated.
+
+## Source to Rust mapping
+
+| Source evidence | C1 behavior |
+| --- | --- |
+| Evernote reconstructed `36364__note-import-mutation-import-enex-file-import-file-from-url.js` uses SAX input, sanitizes content, then invokes its mutation | C1 keeps only SAX-style evidence collection; it intentionally contains no sanitizer, mutation, or profile write. |
+| Renderer module `916042` allowlists `en-media` `hash`/`type` and `en-todo` `checked` | The ENML scanner recognizes `en-media` at any nesting depth and retains hash/type. `en-todo` remains retained in the content digest; no canonicalization/import is claimed. |
+| Evernote `getAttributeResourceFromElement` lowercases `en-media` hash and falls back to its `type` | References are normalized to lowercase MD5 while retaining the declared MIME for mismatch evidence. |
+| Joplin `import-enex.ts::processNoteResource` writes base64 to a temporary file, decodes it, then uses decoded-byte MD5 for `en-media` identity | C1 decodes only bounded resources, calculates decoded-byte MD5 separately from SHA-256, and correlates media by MD5. |
+| Joplin `import-enex-html-gen.ts::enexXmlToHtml_` finds nested `en-media` and retains unmatched attachments | C1 separately reports unresolved media and unreferenced real resource occurrences; neither is silently discarded. |
+
+## TDD evidence
+
+1. RED: `cargo test --test enex_scan` failed with unresolved `EnexScanError`,
+   `EnexScanReport`, and `scan_enex_file` symbols before implementation.
+2. GREEN: added the scanner and golden fixture; `cargo test --test enex_scan`
+   passed all four tests.
+3. RED: added the internal-entity safety assertion; it failed because the
+   scanner accepted an internal `<!ENTITY>` declaration.
+4. GREEN: rejecting internal entity declarations made that test pass. The
+   ordinary external ENEX DOCTYPE remains accepted inertly and is never fetched.
+
+The golden tests cover Chinese title, raw dates, repeated tags, rich/nested
+ENML (`en-todo` and `en-media` inside `<i>/<div>`), table detection, inline
+image plus unreferenced PDF, duplicate bytes/MD5, orphan media, MIME mismatch,
+invalid and non-base64 data, malformed nesting, internal entity declaration,
+and a generated 21 MiB data field.
+
+## Commands and results
+
+```text
+cargo test --test enex_scan
+4 passed; 0 failed
+
+cargo test --quiet
+all app-lite-core unit, integration, and doc tests passed (including 67 unit,
+4 document roundtrip, 4 ENEX, 27 JEX, 15 migration, 8 organization, 7
+repository-flow, and 7 resource-store tests)
+
+git diff --check
+no whitespace errors
+```
+
+## Limits and explicit follow-up gate
+
+`quick-xml` materializes one text event. C1 therefore first scans raw input
+with a fixed 64 KiB buffer. A `<data>` text payload over 4 MiB returns
+`EnexScanError::NeedsContext` before XML parsing, including the generated
+21 MiB test fixture. C1 **does not claim bounded streaming decode for large
+resources**. Later staging needs a proven streaming XML/base64 path (or an
+isolated temporary-file decoder) before accepting large attachments.
+
+ENML content is retained only up to 4 MiB and ordinary metadata fields up to
+16 KiB; note/resource occurrence counts are capped at 50,000. The raw data
+preflight is conservative: a literal `<data ...>` inside ENML CDATA can be
+classified as a data field and produce `NeedsContext`; that is safe but may
+need a context-aware streaming tokenizer in the later staging work. Tables are
+reported rather than flattened because `CanonicalDocument` has no table model.

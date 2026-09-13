@@ -1,0 +1,131 @@
+use std::io::Write;
+
+use app_lite_core::{EnexScanError, scan_enex_file};
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
+
+fn scan_fixture(xml: &str) -> Result<app_lite_core::EnexScanReport, EnexScanError> {
+    let mut fixture = NamedTempFile::new().unwrap();
+    fixture.write_all(xml.as_bytes()).unwrap();
+    scan_enex_file(fixture.path())
+}
+
+#[test]
+fn scans_chinese_rich_enml_and_keeps_every_resource_occurrence_for_later_staging() {
+    // Mutation caught: dropping repeated tags/resources, treating MD5 as SHA-256,
+    // or failing to record nested en-media references makes this golden report differ.
+    let image = b"image bytes";
+    let pdf = b"%PDF-not-a-real-document";
+    let image_md5 = "bebb32c1d5592c44df47d1826cacc09b";
+    let xml = format!(
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE en-export SYSTEM "http://xml.evernote.com/pub/enex/evernote-export3.dtd">
+<en-export><note><title>中文清单</title><created>20260913T010203Z</created><updated>20260913T040506Z</updated><tag>收件箱</tag><tag>收件箱</tag><content><![CDATA[<!DOCTYPE en-note SYSTEM "http://xml.evernote.com/pub/enml2.dtd"><en-note><div><i><en-todo checked="true"/><en-media hash="{image_md5}" type="image/png"/></i></div><table><tr><td>不应静默压平</td></tr></table></en-note>]]></content><resource><data encoding="base64">aW1hZ2UgYnl0ZXM=</data><mime>image/png</mime><resource-attributes><file-name>图.png</file-name></resource-attributes></resource><resource><data encoding="base64">JVBERi1ub3QtYS1yZWFsLWRvY3VtZW50</data><mime>application/pdf</mime><resource-attributes><file-name>未引用.pdf</file-name></resource-attributes></resource></note></en-export>"##
+    );
+
+    let report = scan_fixture(&xml).unwrap();
+
+    assert_eq!(report.counts.notes, 1);
+    assert_eq!(report.counts.resource_occurrences, 2);
+    let note = &report.notes[0];
+    assert_eq!(note.ordinal, 1);
+    assert_eq!(note.title, "中文清单");
+    assert_eq!(note.created_raw, "20260913T010203Z");
+    assert_eq!(note.updated_raw, "20260913T040506Z");
+    assert_eq!(note.tags, ["收件箱", "收件箱"]);
+    assert_eq!(note.media_references.len(), 1);
+    assert_eq!(note.media_references[0].hash_md5, image_md5);
+    assert_eq!(note.media_references[0].mime, "image/png");
+    assert!(
+        note.unsupported_fidelity_constructs
+            .contains(&"table".to_owned())
+    );
+    assert_eq!(report.resources[0].md5, image_md5);
+    assert_eq!(
+        report.resources[0].sha256,
+        format!("{:x}", Sha256::digest(image))
+    );
+    assert_eq!(report.resources[0].filename, "图.png");
+    assert_eq!(
+        report.resources[1].sha256,
+        format!("{:x}", Sha256::digest(pdf))
+    );
+    assert_eq!(report.unreferenced_resource_ordinals, vec![2]);
+    assert!(report.unresolved_media_references.is_empty());
+}
+
+#[test]
+fn reports_duplicate_and_missing_en_media_hashes_without_dropping_the_real_attachment() {
+    // Mutation caught: deduplicating occurrence records or conflating an orphan
+    // en-media reference with an unreferenced real attachment.
+    let xml = r#"<en-export><note><title>refs</title><content><![CDATA[<en-note><en-media hash="900150983cd24fb0d6963f7d28e17f72" type="image/png"/><en-media hash="00000000000000000000000000000000" type="image/png"/></en-note>]]></content><resource><data encoding="base64">YWJj</data><mime>application/octet-stream</mime><resource-attributes><file-name>actually.png</file-name></resource-attributes></resource><resource><data encoding="base64">YWJj</data><mime>image/png</mime></resource></note></en-export>"#;
+
+    let report = scan_fixture(xml).unwrap();
+
+    assert_eq!(report.resources.len(), 2);
+    assert_eq!(
+        report.duplicate_resource_md5s,
+        vec!["900150983cd24fb0d6963f7d28e17f72"]
+    );
+    assert_eq!(report.unresolved_media_references.len(), 1);
+    assert_eq!(
+        report.unresolved_media_references[0].hash_md5,
+        "00000000000000000000000000000000"
+    );
+    assert_eq!(report.mime_mismatches.len(), 1);
+    assert_eq!(
+        report.mime_mismatches[0].declared_mime,
+        "application/octet-stream"
+    );
+    assert_eq!(report.mime_mismatches[0].referenced_mime, "image/png");
+    assert!(report.unreferenced_resource_ordinals.is_empty());
+}
+
+#[test]
+fn rejects_invalid_base64_and_malformed_xml_instead_of_returning_partial_evidence() {
+    // Mutation caught: accepting corrupt/non-base64 bytes or silently recovering broken nesting.
+    let corrupt = r#"<en-export><note><title>x</title><resource><data encoding="base64">!!!!</data></resource></note></en-export>"#;
+    assert!(matches!(
+        scan_fixture(corrupt),
+        Err(EnexScanError::InvalidBase64 { .. })
+    ));
+
+    let malformed = r#"<en-export><note><title>x</note></en-export>"#;
+    assert!(matches!(
+        scan_fixture(malformed),
+        Err(EnexScanError::MalformedXml(_))
+    ));
+
+    let non_base64 = r#"<en-export><note><title>x</title><resource><data encoding="hex">616263</data></resource></note></en-export>"#;
+    assert!(matches!(
+        scan_fixture(non_base64),
+        Err(EnexScanError::UnsupportedDataEncoding { .. })
+    ));
+
+    let entity = r#"<!DOCTYPE en-export [<!ENTITY boom "x">]><en-export><note><title>&boom;</title></note></en-export>"#;
+    assert!(matches!(
+        scan_fixture(entity),
+        Err(EnexScanError::UnsafeXml(_))
+    ));
+}
+
+#[test]
+fn stops_before_parsing_large_data_text_and_returns_needs_context() {
+    // Mutation caught: removing the fixed-buffer preflight, which lets an XML
+    // text-event parser materialize the whole resource's base64 payload.
+    let mut fixture = NamedTempFile::new().unwrap();
+    fixture
+        .write_all(b"<en-export><note><title>large</title><resource><data encoding=\"base64\">")
+        .unwrap();
+    for _ in 0..(21 * 1024 * 1024 / 4) {
+        fixture.write_all(b"QUFB").unwrap();
+    }
+    fixture
+        .write_all(b"</data></resource></note></en-export>")
+        .unwrap();
+
+    assert!(matches!(
+        scan_enex_file(fixture.path()),
+        Err(EnexScanError::NeedsContext { .. })
+    ));
+}
