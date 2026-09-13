@@ -2,6 +2,7 @@ use std::io::Write;
 
 use app_lite_core::{EnexScanError, scan_enex_file};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use md5::Md5;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
@@ -111,24 +112,32 @@ fn rejects_invalid_base64_and_malformed_xml_instead_of_returning_partial_evidenc
 }
 
 #[test]
-fn stops_before_parsing_large_data_text_and_returns_needs_context() {
-    // Mutation caught: removing the fixed-buffer preflight, which lets an XML
-    // text-event parser materialize the whole resource's base64 payload.
+fn streams_a_resource_over_20_mib_and_reports_decoded_digests() {
+    // Mutation caught: collecting the whole base64 field or hashing encoded
+    // rather than decoded bytes cannot satisfy this large-resource contract.
     let mut fixture = NamedTempFile::new().unwrap();
     fixture
         .write_all(b"<en-export><note><title>large</title><resource><data encoding=\"base64\">")
         .unwrap();
-    for _ in 0..(21 * 1024 * 1024 / 4) {
-        fixture.write_all(b"QUFB").unwrap();
+    let chunk = b"QUFB".repeat(16 * 1024);
+    for _ in 0..448 {
+        fixture.write_all(&chunk).unwrap();
     }
     fixture
         .write_all(b"</data></resource></note></en-export>")
         .unwrap();
 
-    assert!(matches!(
-        scan_enex_file(fixture.path()),
-        Err(EnexScanError::NeedsContext { .. })
-    ));
+    let report = scan_enex_file(fixture.path()).unwrap();
+    let resource = &report.resources[0];
+    assert_eq!(resource.byte_count, 22_020_096);
+    assert_eq!(
+        resource.md5,
+        format!("{:x}", Md5::digest(vec![b'A'; 22_020_096]))
+    );
+    assert_eq!(
+        resource.sha256,
+        format!("{:x}", Sha256::digest(vec![b'A'; 22_020_096]))
+    );
 }
 
 #[test]
@@ -193,5 +202,62 @@ fn rejects_malformed_enml_and_stops_on_an_oversized_non_data_cdata_field() {
     assert!(matches!(
         scan_fixture(&oversized_title),
         Err(EnexScanError::FieldTooLarge { .. })
+    ));
+}
+
+#[test]
+fn rejects_oversized_xml_metadata_and_duplicate_fields() {
+    // Mutation caught: a callback allocating an unchecked attribute, comment,
+    // PI or DTD body before validation, or resetting note field state at resource end.
+    let long = "x".repeat(17 * 1024);
+    for xml in [
+        format!("<en-export x=\"{long}\"/>"),
+        format!("<!--{long}--><en-export/>"),
+        format!("<?probe {long}?><en-export/>"),
+        format!("<!DOCTYPE en-export SYSTEM \"{long}\"><en-export/>"),
+    ] {
+        assert!(
+            matches!(scan_fixture(&xml), Err(EnexScanError::FieldTooLarge { .. })),
+            "{xml:.80}"
+        );
+    }
+    let duplicate = "<en-export><note><title>a</title><resource><data>YQ==</data></resource><title>b</title></note></en-export>";
+    assert!(matches!(
+        scan_fixture(duplicate),
+        Err(EnexScanError::Structure(_))
+    ));
+}
+
+#[test]
+fn rejects_bad_padding_and_accepts_whitespace_at_chunk_boundary() {
+    // Mutation caught: decoding callbacks independently or accepting data after padding.
+    let base = "QUFB".repeat(16 * 1024);
+    let xml = format!(
+        "<en-export><note><resource><data>{base}\nYg==</data></resource></note></en-export>"
+    );
+    let report = scan_fixture(&xml).unwrap();
+    assert_eq!(report.resources[0].byte_count, 49_153);
+    let corrupt = "<en-export><note><resource><data>Yg==YQ==</data></resource></note></en-export>";
+    assert!(matches!(
+        scan_fixture(corrupt),
+        Err(EnexScanError::InvalidBase64 { .. })
+    ));
+}
+
+#[test]
+fn rejects_unbounded_repeated_attributes_and_tags() {
+    // Mutation caught: individually bounded values still permit aggregate
+    // metadata growth without a per-element/per-note count limit.
+    let attrs = (0..300).map(|i| format!(" x{i}=\"y\"")).collect::<String>();
+    let xml = format!("<en-export{attrs}/>");
+    assert!(matches!(
+        scan_fixture(&xml),
+        Err(EnexScanError::TooManyEntities)
+    ));
+    let tags = "<tag>x</tag>".repeat(1100);
+    let xml = format!("<en-export><note>{tags}</note></en-export>");
+    assert!(matches!(
+        scan_fixture(&xml),
+        Err(EnexScanError::TooManyEntities)
     ));
 }

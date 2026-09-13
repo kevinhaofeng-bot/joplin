@@ -1,17 +1,5 @@
-//! Read-only, bounded evidence collection for Evernote ENEX files.
-//!
-//! This is deliberately a scanner, rather than an importer: it has no profile,
-//! repository, or blob-store dependency. `quick-xml` emits a whole text event,
-//! so a fixed-buffer preflight refuses `<data>` fields beyond the safe event
-//! size before XML parsing starts. Such files return `NeedsContext`; this stage
-//! does not claim to stream-decode them.
-
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::{self, BufReader},
-    path::Path,
-};
+//! Read-only ENEX evidence scanner. The outer XML has exactly one bounded,
+//! chunk-callback parser; only a retained (at most 4 MiB) ENML body uses quick-xml.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use md5::Md5;
@@ -20,17 +8,24 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io,
+    path::Path,
+};
 use thiserror::Error;
 use xml_syntax_reader::{QName, Span, Visitor, parse_read_with_capacity};
 
-/// Number of notes or resource occurrences retained by one scan.
 pub const MAX_ENEX_ENTITIES: usize = 50_000;
-/// Retained ENML bytes for a single note.
 pub const MAX_ENEX_CONTENT_BYTES: usize = 4 * 1024 * 1024;
-/// Largest base64 text event this scanner will allow `quick-xml` to materialize.
-pub const MAX_ENEX_DATA_BASE64_BYTES: usize = 4 * 1024 * 1024;
+/// Kept for API compatibility; this is the input callback capacity, not a data limit.
+pub const MAX_ENEX_DATA_BASE64_BYTES: usize = 64 * 1024;
 const MAX_FIELD_BYTES: usize = 16 * 1024;
-const PREFLIGHT_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
+const MAX_TAGS_PER_NOTE: usize = 1024;
+const INPUT_BYTES: usize = 64 * 1024;
+const MAX_RESOURCE_BYTES: usize = crate::resource::MAX_RESOURCE_BYTES;
 
 #[derive(Debug, Error)]
 pub enum EnexScanError {
@@ -51,6 +46,11 @@ pub enum EnexScanError {
     ContentTooLarge { limit: usize },
     #[error("ENEX metadata field exceeds {limit} bytes")]
     FieldTooLarge { limit: usize },
+    #[error("ENEX resource {resource_ordinal} exceeds {limit} decoded bytes")]
+    ResourceTooLarge {
+        resource_ordinal: usize,
+        limit: usize,
+    },
     #[error("ENEX exceeds the {MAX_ENEX_ENTITIES} entity limit")]
     TooManyEntities,
     #[error("invalid base64 data in resource {resource_ordinal}: {reason}")]
@@ -71,13 +71,11 @@ pub struct EnexScanCounts {
     pub notes: usize,
     pub resource_occurrences: usize,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnexMediaReference {
     pub hash_md5: String,
     pub mime: String,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnexScannedNote {
     pub ordinal: usize,
@@ -90,27 +88,22 @@ pub struct EnexScannedNote {
     pub media_references: Vec<EnexMediaReference>,
     pub unsupported_fidelity_constructs: Vec<String>,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnexScannedResource {
     pub ordinal: usize,
     pub note_ordinal: usize,
     pub mime: String,
     pub filename: String,
-    /// ENEX identity used by `<en-media hash>`.
     pub md5: String,
-    /// Separate content-integrity digest used by a future local store.
     pub sha256: String,
     pub byte_count: usize,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnexUnresolvedMediaReference {
     pub note_ordinal: usize,
     pub hash_md5: String,
     pub mime: String,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnexMimeMismatch {
     pub note_ordinal: usize,
@@ -118,12 +111,10 @@ pub struct EnexMimeMismatch {
     pub declared_mime: String,
     pub referenced_mime: String,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnexScanReport {
     pub counts: EnexScanCounts,
     pub notes: Vec<EnexScannedNote>,
-    /// Occurrence order is preserved, including identical bytes/MD5s.
     pub resources: Vec<EnexScannedResource>,
     pub duplicate_resource_md5s: Vec<String>,
     pub unresolved_media_references: Vec<EnexUnresolvedMediaReference>,
@@ -139,355 +130,505 @@ struct NoteBuilder {
     updated_raw: String,
     tags: Vec<String>,
     content: String,
+    seen: BTreeSet<String>,
 }
 
-#[derive(Default)]
 struct ResourceBuilder {
     ordinal: usize,
     note_ordinal: usize,
     mime: String,
     filename: String,
-    data: String,
+    seen: BTreeSet<String>,
     saw_data: bool,
+    md5: Md5,
+    sha256: Sha256,
+    byte_count: usize,
+    carry: [u8; 4],
+    carry_len: usize,
+    padded: bool,
 }
-
-/// Scan an ENEX file without opening, writing, or otherwise touching a profile.
-///
-/// The scanner accepts ordinary ENEX/ENML external-DOCTYPE declarations but
-/// does not resolve external entities or access the network.
-pub fn scan_enex_file(path: impl AsRef<Path>) -> Result<EnexScanReport, EnexScanError> {
-    preflight_large_data(path.as_ref())?;
-    let file = File::open(path)?;
-    let mut reader = Reader::from_reader(BufReader::new(file));
-    reader.config_mut().trim_text(false);
-    let mut buffer = Vec::new();
-    let mut stack = Vec::<String>::new();
-    let mut current_note: Option<NoteBuilder> = None;
-    let mut current_resource: Option<ResourceBuilder> = None;
-    let mut field: Option<String> = None;
-    let mut field_text = String::new();
-    let mut report = EnexScanReport::default();
-    let mut saw_root = false;
-
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => {
-                let name = event_name(event.name().as_ref())?;
-                if name == "data" {
-                    ensure_base64_data(&event)?;
-                }
-                if stack.is_empty() {
-                    if name != "en-export" || saw_root {
-                        return Err(EnexScanError::Structure(
-                            "root must be one en-export element".to_owned(),
-                        ));
-                    }
-                    saw_root = true;
-                }
-                begin_element(
-                    &name,
-                    &mut stack,
-                    &mut current_note,
-                    &mut current_resource,
-                    &mut report,
-                    &mut field,
-                    &mut field_text,
-                )?;
-            }
-            Ok(Event::Empty(event)) => {
-                let name = event_name(event.name().as_ref())?;
-                if name == "data" {
-                    ensure_base64_data(&event)?;
-                }
-                begin_element(
-                    &name,
-                    &mut stack,
-                    &mut current_note,
-                    &mut current_resource,
-                    &mut report,
-                    &mut field,
-                    &mut field_text,
-                )?;
-                end_element(
-                    &name,
-                    &mut stack,
-                    &mut current_note,
-                    &mut current_resource,
-                    &mut report,
-                    &mut field,
-                    &mut field_text,
-                )?;
-            }
-            Ok(Event::Text(text)) => append_text(
-                std::str::from_utf8(text.as_ref())
-                    .map_err(|error| EnexScanError::MalformedXml(error.to_string()))?,
-                &field,
-                &mut field_text,
-                &mut current_note,
-                &mut current_resource,
-            )?,
-            Ok(Event::CData(text)) => append_text(
-                std::str::from_utf8(text.as_ref())
-                    .map_err(|error| EnexScanError::MalformedXml(error.to_string()))?,
-                &field,
-                &mut field_text,
-                &mut current_note,
-                &mut current_resource,
-            )?,
-            Ok(Event::End(event)) => {
-                let name = event_name(event.name().as_ref())?;
-                end_element(
-                    &name,
-                    &mut stack,
-                    &mut current_note,
-                    &mut current_resource,
-                    &mut report,
-                    &mut field,
-                    &mut field_text,
-                )?;
-            }
-            // An external ENEX/ENML DTD is accepted as inert: `quick-xml`
-            // never resolves it. Internal entity declarations are rejected
-            // rather than permitting entity-expansion semantics.
-            Ok(Event::DocType(doctype)) => {
-                if doctype
-                    .as_ref()
-                    .windows(b"<!ENTITY".len())
-                    .any(|part| part.eq_ignore_ascii_case(b"<!ENTITY"))
-                {
-                    return Err(EnexScanError::UnsafeXml(
-                        "internal entity declaration".to_owned(),
-                    ));
-                }
-            }
-            Ok(Event::Decl(_)) | Ok(Event::Comment(_)) | Ok(Event::PI(_)) => {}
-            Ok(Event::Eof) => break,
-            Err(error) => return Err(EnexScanError::MalformedXml(error.to_string())),
+impl ResourceBuilder {
+    fn new(ordinal: usize, note_ordinal: usize) -> Self {
+        Self {
+            ordinal,
+            note_ordinal,
+            mime: String::new(),
+            filename: String::new(),
+            seen: BTreeSet::new(),
+            saw_data: false,
+            md5: Md5::new(),
+            sha256: Sha256::new(),
+            byte_count: 0,
+            carry: [0; 4],
+            carry_len: 0,
+            padded: false,
         }
-        buffer.clear();
     }
-    if !saw_root || !stack.is_empty() || current_note.is_some() || current_resource.is_some() {
-        return Err(EnexScanError::MalformedXml("unexpected EOF".to_owned()));
+    fn decode(&mut self, bytes: &[u8]) -> Result<(), EnexScanError> {
+        // The 64 KiB input callback is consumed directly. Only one quartet and
+        // three decoded bytes are ever held outside the digest states.
+        for &byte in bytes {
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            if self.padded {
+                return Err(self.bad_base64("characters after padding"));
+            }
+            if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'/' | b'=') {
+                return Err(self.bad_base64("non-base64 character"));
+            }
+            self.carry[self.carry_len] = byte;
+            self.carry_len += 1;
+            if self.carry_len == 4 {
+                let mut out = [0; 3];
+                let len = STANDARD
+                    .decode_slice(self.carry, &mut out)
+                    .map_err(|error| self.bad_base64(&error.to_string()))?;
+                if self.byte_count.saturating_add(len) > MAX_RESOURCE_BYTES {
+                    return Err(EnexScanError::ResourceTooLarge {
+                        resource_ordinal: self.ordinal,
+                        limit: MAX_RESOURCE_BYTES,
+                    });
+                }
+                self.md5.update(&out[..len]);
+                self.sha256.update(&out[..len]);
+                self.byte_count += len;
+                self.padded = self.carry.contains(&b'=');
+                self.carry_len = 0;
+            }
+        }
+        Ok(())
     }
-    correlate_resources(&mut report);
-    Ok(report)
+    fn bad_base64(&self, reason: &str) -> EnexScanError {
+        EnexScanError::InvalidBase64 {
+            resource_ordinal: self.ordinal,
+            reason: reason.to_owned(),
+        }
+    }
+    fn finish(self) -> Result<EnexScannedResource, EnexScanError> {
+        if !self.saw_data {
+            return Err(EnexScanError::MissingResourceData {
+                resource_ordinal: self.ordinal,
+            });
+        }
+        if self.carry_len != 0 {
+            return Err(self.bad_base64("incomplete base64 quartet"));
+        }
+        Ok(EnexScannedResource {
+            ordinal: self.ordinal,
+            note_ordinal: self.note_ordinal,
+            mime: self.mime,
+            filename: self.filename,
+            md5: format!("{:x}", self.md5.finalize()),
+            sha256: format!("{:x}", self.sha256.finalize()),
+            byte_count: self.byte_count,
+        })
+    }
 }
 
-fn begin_element(
-    name: &str,
-    stack: &mut Vec<String>,
-    note: &mut Option<NoteBuilder>,
-    resource: &mut Option<ResourceBuilder>,
-    report: &mut EnexScanReport,
-    field: &mut Option<String>,
-    field_text: &mut String,
-) -> Result<(), EnexScanError> {
-    if name == "note" {
-        if note.is_some()
-            || resource.is_some()
-            || stack.last().map(String::as_str) != Some("en-export")
-        {
-            return Err(EnexScanError::Structure(
-                "note must be a direct en-export child".to_owned(),
+#[derive(Default)]
+struct EnexVisitor {
+    stack: Vec<String>,
+    root_seen: bool,
+    doctype_seen: bool,
+    note: Option<NoteBuilder>,
+    resource: Option<ResourceBuilder>,
+    field: Option<String>,
+    field_text: String,
+    attr_name: Option<String>,
+    attr_text: String,
+    attr_seen: BTreeSet<String>,
+    ignored_text_bytes: usize,
+    doctype: Vec<u8>,
+    comment_bytes: usize,
+    pi_bytes: usize,
+    report: EnexScanReport,
+}
+
+impl EnexVisitor {
+    fn name(name: QName<'_>) -> Result<String, EnexScanError> {
+        let raw = std::str::from_utf8(name.as_bytes())
+            .map_err(|e| EnexScanError::MalformedXml(e.to_string()))?;
+        if raw.is_empty() || raw.contains(':') || raw != raw.to_ascii_lowercase() {
+            return Err(EnexScanError::Structure(format!(
+                "unsupported XML name {raw}"
+            )));
+        }
+        Ok(raw.to_owned())
+    }
+    fn begin(&mut self, name: String) -> Result<(), EnexScanError> {
+        if self.stack.len() >= 64 {
+            return Err(EnexScanError::Structure("XML nesting exceeds 64".into()));
+        }
+        let parent = self.stack.last().map(String::as_str);
+        let valid = match (parent, name.as_str()) {
+            (None, "en-export") if !self.root_seen => {
+                self.root_seen = true;
+                true
+            }
+            (Some("en-export"), "note") => {
+                if self.report.counts.notes >= MAX_ENEX_ENTITIES {
+                    return Err(EnexScanError::TooManyEntities);
+                }
+                self.note = Some(NoteBuilder {
+                    ordinal: self.report.counts.notes + 1,
+                    ..Default::default()
+                });
+                true
+            }
+            (Some("note"), "resource") => {
+                if self.report.counts.resource_occurrences >= MAX_ENEX_ENTITIES {
+                    return Err(EnexScanError::TooManyEntities);
+                }
+                self.resource = Some(ResourceBuilder::new(
+                    self.report.counts.resource_occurrences + 1,
+                    self.note.as_ref().unwrap().ordinal,
+                ));
+                true
+            }
+            (
+                Some("note"),
+                "title" | "created" | "updated" | "tag" | "content" | "note-attributes",
+            ) => {
+                if name == "tag" && self.note.as_ref().unwrap().tags.len() >= MAX_TAGS_PER_NOTE {
+                    return Err(EnexScanError::TooManyEntities);
+                }
+                true
+            }
+            (Some("resource"), "data" | "mime" | "resource-attributes") => true,
+            (Some("resource-attributes"), "file-name") => true,
+            // Known ENEX metadata is bounded even if we do not report it yet.
+            (Some("note-attributes"), _) | (Some("resource-attributes"), _) => true,
+            _ => false,
+        };
+        if !valid {
+            return Err(EnexScanError::Structure(format!(
+                "{name} not allowed below {parent:?}"
+            )));
+        }
+        if matches!(
+            name.as_str(),
+            "title" | "created" | "updated" | "content" | "data" | "mime" | "file-name"
+        ) {
+            let seen = if let Some(resource) = self.resource.as_mut() {
+                &mut resource.seen
+            } else {
+                &mut self.note.as_mut().unwrap().seen
+            };
+            if !seen.insert(name.clone()) {
+                return Err(EnexScanError::Structure(format!("duplicate {name}")));
+            }
+        }
+        if matches!(
+            name.as_str(),
+            "title" | "created" | "updated" | "tag" | "content" | "data" | "mime" | "file-name"
+        ) {
+            self.field = Some(name.clone());
+            self.field_text.clear();
+        }
+        self.attr_seen.clear();
+        self.ignored_text_bytes = 0;
+        self.stack.push(name);
+        Ok(())
+    }
+    fn close(&mut self, name: &str) -> Result<(), EnexScanError> {
+        if self.stack.pop().as_deref() != Some(name) {
+            return Err(EnexScanError::MalformedXml(
+                "mismatched element nesting".into(),
             ));
         }
-        if report.counts.notes >= MAX_ENEX_ENTITIES {
-            return Err(EnexScanError::TooManyEntities);
+        if self.field.as_deref() == Some(name) {
+            let text = std::mem::take(&mut self.field_text);
+            if let Some(resource) = self.resource.as_mut() {
+                match name {
+                    "data" => {
+                        resource.saw_data = true;
+                    }
+                    "mime" => resource.mime = text.trim().to_owned(),
+                    "file-name" => resource.filename = text.trim().to_owned(),
+                    _ => {}
+                }
+            } else if let Some(note) = self.note.as_mut() {
+                match name {
+                    "title" => note.title = text.trim().to_owned(),
+                    "created" => note.created_raw = text.trim().to_owned(),
+                    "updated" => note.updated_raw = text.trim().to_owned(),
+                    "tag" => note.tags.push(text.trim().to_owned()),
+                    _ => {}
+                }
+            }
+            self.field = None;
         }
-        *note = Some(NoteBuilder {
-            ordinal: report.counts.notes + 1,
-            ..Default::default()
-        });
-    }
-    if name == "resource" {
-        let Some(note) = note.as_ref() else {
-            return Err(EnexScanError::Structure("resource outside note".to_owned()));
-        };
-        if resource.is_some() || report.counts.resource_occurrences >= MAX_ENEX_ENTITIES {
-            return Err(EnexScanError::TooManyEntities);
+        if name == "resource" {
+            let resource = self.resource.take().unwrap().finish()?;
+            self.report.resources.push(resource);
+            self.report.counts.resource_occurrences += 1;
         }
-        *resource = Some(ResourceBuilder {
-            ordinal: report.counts.resource_occurrences + 1,
-            note_ordinal: note.ordinal,
-            ..Default::default()
-        });
+        if name == "note" {
+            let note = self.note.take().unwrap();
+            let (media_references, unsupported_fidelity_constructs) = inspect_enml(&note.content)?;
+            self.report.notes.push(EnexScannedNote {
+                ordinal: note.ordinal,
+                title: note.title,
+                created_raw: note.created_raw,
+                updated_raw: note.updated_raw,
+                tags: note.tags,
+                content_size: note.content.len(),
+                content_sha256: format!("{:x}", Sha256::digest(note.content.as_bytes())),
+                media_references,
+                unsupported_fidelity_constructs,
+            });
+            self.report.counts.notes += 1;
+        }
+        Ok(())
     }
-    if matches!(
-        name,
-        "title" | "created" | "updated" | "tag" | "content" | "data" | "mime" | "file-name"
-    ) {
-        *field = Some(name.to_owned());
-        field_text.clear();
+    fn text(&mut self, value: &[u8]) -> Result<(), EnexScanError> {
+        let value =
+            std::str::from_utf8(value).map_err(|e| EnexScanError::MalformedXml(e.to_string()))?;
+        match self.field.as_deref() {
+            Some("data") => self.resource.as_mut().unwrap().decode(value.as_bytes()),
+            Some("content") => {
+                let content = &mut self.note.as_mut().unwrap().content;
+                if content.len().saturating_add(value.len()) > MAX_ENEX_CONTENT_BYTES {
+                    return Err(EnexScanError::ContentTooLarge {
+                        limit: MAX_ENEX_CONTENT_BYTES,
+                    });
+                }
+                content.push_str(value);
+                Ok(())
+            }
+            Some(_) => {
+                if self.field_text.len().saturating_add(value.len()) > MAX_FIELD_BYTES {
+                    return Err(EnexScanError::FieldTooLarge {
+                        limit: MAX_FIELD_BYTES,
+                    });
+                }
+                self.field_text.push_str(value);
+                Ok(())
+            }
+            None if value.trim().is_empty() => Ok(()),
+            None if self
+                .stack
+                .last()
+                .is_some_and(|s| s == "note-attributes" || s == "resource-attributes") =>
+            {
+                self.ignored_text_bytes = self.ignored_text_bytes.saturating_add(value.len());
+                if self.ignored_text_bytes > MAX_FIELD_BYTES {
+                    Err(EnexScanError::FieldTooLarge {
+                        limit: MAX_FIELD_BYTES,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            None => Err(EnexScanError::Structure(
+                "non-whitespace outside field".into(),
+            )),
+        }
     }
-    stack.push(name.to_owned());
-    Ok(())
-}
-
-fn append_text(
-    value: &str,
-    field: &Option<String>,
-    field_text: &mut String,
-    note: &mut Option<NoteBuilder>,
-    resource: &mut Option<ResourceBuilder>,
-) -> Result<(), EnexScanError> {
-    let Some(field) = field.as_deref() else {
-        return Ok(());
-    };
-    if field == "content" {
-        let note = note
-            .as_mut()
-            .ok_or_else(|| EnexScanError::Structure("content outside note".to_owned()))?;
-        if note.content.len().saturating_add(value.len()) > MAX_ENEX_CONTENT_BYTES {
-            return Err(EnexScanError::ContentTooLarge {
-                limit: MAX_ENEX_CONTENT_BYTES,
+    fn attr_text(&mut self, value: &[u8]) -> Result<(), EnexScanError> {
+        let value =
+            std::str::from_utf8(value).map_err(|e| EnexScanError::MalformedXml(e.to_string()))?;
+        if self.attr_text.len().saturating_add(value.len()) > MAX_FIELD_BYTES {
+            return Err(EnexScanError::FieldTooLarge {
+                limit: MAX_FIELD_BYTES,
             });
         }
-        note.content.push_str(value);
-    } else {
-        let limit = if field == "data" {
-            MAX_ENEX_DATA_BASE64_BYTES
+        self.attr_text.push_str(value);
+        Ok(())
+    }
+    fn finish_attr(&mut self) -> Result<(), EnexScanError> {
+        let name = self
+            .attr_name
+            .take()
+            .ok_or_else(|| EnexScanError::Structure("attribute without name".into()))?;
+        if self.stack.last().is_some_and(|s| s == "data")
+            && name == "encoding"
+            && !self.attr_text.eq_ignore_ascii_case("base64")
+        {
+            return Err(EnexScanError::UnsupportedDataEncoding {
+                encoding: self.attr_text.clone(),
+            });
+        }
+        self.attr_text.clear();
+        Ok(())
+    }
+}
+
+impl Visitor for EnexVisitor {
+    type Error = EnexScanError;
+    fn start_tag_open(&mut self, name: QName<'_>) -> Result<(), Self::Error> {
+        self.begin(Self::name(name)?)
+    }
+    fn start_tag_close(&mut self, _: Span) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn empty_element_end(&mut self, _: Span) -> Result<(), Self::Error> {
+        let name = self
+            .stack
+            .last()
+            .cloned()
+            .ok_or_else(|| EnexScanError::Structure("empty element without start".into()))?;
+        self.close(&name)
+    }
+    fn end_tag(&mut self, name: QName<'_>) -> Result<(), Self::Error> {
+        self.close(&Self::name(name)?)
+    }
+    fn attribute_name(&mut self, name: QName<'_>) -> Result<(), Self::Error> {
+        let name = Self::name(name)?;
+        if !self.attr_seen.insert(name.clone()) {
+            return Err(EnexScanError::Structure("duplicate attribute".into()));
+        }
+        if self.attr_seen.len() > MAX_ATTRIBUTES_PER_ELEMENT {
+            return Err(EnexScanError::TooManyEntities);
+        }
+        self.attr_name = Some(name);
+        self.attr_text.clear();
+        Ok(())
+    }
+    fn attribute_value(&mut self, value: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.attr_text(value)
+    }
+    fn attribute_end(&mut self, _: Span) -> Result<(), Self::Error> {
+        self.finish_attr()
+    }
+    fn attribute_entity_ref(&mut self, name: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.attr_text(entity(name)?.as_bytes())
+    }
+    fn attribute_char_ref(&mut self, value: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.attr_text(char_ref(value)?.as_bytes())
+    }
+    fn characters(&mut self, value: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.text(value)
+    }
+    fn cdata_content(&mut self, value: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.text(value)
+    }
+    fn entity_ref(&mut self, name: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.text(entity(name)?.as_bytes())
+    }
+    fn char_ref(&mut self, value: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.text(char_ref(value)?.as_bytes())
+    }
+    fn xml_declaration(
+        &mut self,
+        _: &[u8],
+        encoding: Option<&[u8]>,
+        _: Option<bool>,
+        _: Span,
+    ) -> Result<(), Self::Error> {
+        if encoding.is_some_and(|s| !s.eq_ignore_ascii_case(b"utf-8")) {
+            Err(EnexScanError::UnsafeXml("non-UTF-8 XML declaration".into()))
         } else {
-            MAX_FIELD_BYTES
-        };
-        if field_text.len().saturating_add(value.len()) > limit {
-            return Err(EnexScanError::FieldTooLarge { limit });
-        }
-        field_text.push_str(value);
-        if field == "data" {
-            let resource = resource
-                .as_mut()
-                .ok_or_else(|| EnexScanError::Structure("data outside resource".to_owned()))?;
-            resource.saw_data = true;
+            Ok(())
         }
     }
-    Ok(())
-}
-
-fn end_element(
-    name: &str,
-    stack: &mut Vec<String>,
-    note: &mut Option<NoteBuilder>,
-    resource: &mut Option<ResourceBuilder>,
-    report: &mut EnexScanReport,
-    field: &mut Option<String>,
-    field_text: &mut String,
-) -> Result<(), EnexScanError> {
-    if stack.pop().as_deref() != Some(name) {
-        return Err(EnexScanError::MalformedXml(
-            "mismatched element nesting".to_owned(),
-        ));
+    fn comment_start(&mut self, _: Span) -> Result<(), Self::Error> {
+        self.comment_bytes = 0;
+        Ok(())
     }
-    if field.as_deref() == Some(name) {
-        finish_field(name, field_text, note, resource)?;
-        *field = None;
-        field_text.clear();
+    fn comment_content(&mut self, bytes: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.comment_bytes = self.comment_bytes.saturating_add(bytes.len());
+        if self.comment_bytes > MAX_FIELD_BYTES {
+            Err(EnexScanError::FieldTooLarge {
+                limit: MAX_FIELD_BYTES,
+            })
+        } else {
+            Ok(())
+        }
     }
-    if name == "resource" {
-        let resource = resource.take().expect("resource start was checked");
-        if !resource.saw_data {
-            return Err(EnexScanError::MissingResourceData {
-                resource_ordinal: resource.ordinal,
+    fn pi_start(&mut self, target: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.pi_bytes = target.len();
+        Ok(())
+    }
+    fn pi_content(&mut self, bytes: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.pi_bytes = self.pi_bytes.saturating_add(bytes.len());
+        if self.pi_bytes > MAX_FIELD_BYTES {
+            Err(EnexScanError::FieldTooLarge {
+                limit: MAX_FIELD_BYTES,
+            })
+        } else {
+            Ok(())
+        }
+    }
+    fn doctype_start(&mut self, name: &[u8], _: Span) -> Result<(), Self::Error> {
+        if name != b"en-export" || self.root_seen || self.doctype_seen {
+            return Err(EnexScanError::UnsafeXml("unexpected DOCTYPE".into()));
+        }
+        self.doctype_seen = true;
+        self.doctype.extend_from_slice(name);
+        Ok(())
+    }
+    fn doctype_content(&mut self, bytes: &[u8], _: Span) -> Result<(), Self::Error> {
+        if self.doctype.len().saturating_add(bytes.len()) > MAX_FIELD_BYTES {
+            return Err(EnexScanError::FieldTooLarge {
+                limit: MAX_FIELD_BYTES,
             });
         }
-        let compact: String = resource
-            .data
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect();
-        let bytes = STANDARD
-            .decode(compact)
-            .map_err(|error| EnexScanError::InvalidBase64 {
-                resource_ordinal: resource.ordinal,
-                reason: error.to_string(),
-            })?;
-        report.resources.push(EnexScannedResource {
-            ordinal: resource.ordinal,
-            note_ordinal: resource.note_ordinal,
-            mime: resource.mime,
-            filename: resource.filename,
-            md5: format!("{:x}", Md5::digest(&bytes)),
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
-            byte_count: bytes.len(),
-        });
-        report.counts.resource_occurrences += 1;
+        self.doctype.extend_from_slice(bytes);
+        Ok(())
     }
-    if name == "note" {
-        let note = note.take().expect("note start was checked");
-        let (media_references, unsupported_fidelity_constructs) = inspect_enml(&note.content)?;
-        report.notes.push(EnexScannedNote {
-            ordinal: note.ordinal,
-            title: note.title,
-            created_raw: note.created_raw,
-            updated_raw: note.updated_raw,
-            tags: note.tags,
-            content_size: note.content.len(),
-            content_sha256: format!("{:x}", Sha256::digest(note.content.as_bytes())),
-            media_references,
-            unsupported_fidelity_constructs,
-        });
-        report.counts.notes += 1;
-    }
-    Ok(())
-}
-
-fn finish_field(
-    name: &str,
-    text: &mut String,
-    note: &mut Option<NoteBuilder>,
-    resource: &mut Option<ResourceBuilder>,
-) -> Result<(), EnexScanError> {
-    if name == "content" {
-        return Ok(());
-    }
-    if name == "data" {
-        let resource = resource
-            .as_mut()
-            .ok_or_else(|| EnexScanError::Structure("data outside resource".to_owned()))?;
-        resource.data = std::mem::take(text);
-        return Ok(());
-    }
-    if let Some(resource) = resource.as_mut() {
-        match name {
-            "mime" => resource.mime = std::mem::take(text).trim().to_owned(),
-            "file-name" => resource.filename = std::mem::take(text).trim().to_owned(),
-            _ => {}
+    fn doctype_end(&mut self, _: Span) -> Result<(), Self::Error> {
+        if self.doctype.contains(&b'[')
+            || self
+                .doctype
+                .windows(8)
+                .any(|s| s.eq_ignore_ascii_case(b"<!ENTITY"))
+        {
+            return Err(EnexScanError::UnsafeXml("internal DTD subset".into()));
         }
-        return Ok(());
+        self.doctype.clear();
+        Ok(())
     }
-    let note = note
-        .as_mut()
-        .ok_or_else(|| EnexScanError::Structure(format!("{name} outside note")))?;
+}
+
+fn entity(name: &[u8]) -> Result<&'static str, EnexScanError> {
     match name {
-        "title" => note.title = std::mem::take(text).trim().to_owned(),
-        "created" => note.created_raw = std::mem::take(text).trim().to_owned(),
-        "updated" => note.updated_raw = std::mem::take(text).trim().to_owned(),
-        "tag" => note.tags.push(std::mem::take(text).trim().to_owned()),
-        _ => {}
+        b"amp" => Ok("&"),
+        b"lt" => Ok("<"),
+        b"gt" => Ok(">"),
+        b"apos" => Ok("'"),
+        b"quot" => Ok("\""),
+        _ => Err(EnexScanError::UnsafeXml("general entity reference".into())),
     }
-    Ok(())
+}
+fn char_ref(value: &[u8]) -> Result<String, EnexScanError> {
+    let raw = std::str::from_utf8(value).map_err(|e| EnexScanError::MalformedXml(e.to_string()))?;
+    let number = if let Some(hex) = raw.strip_prefix('x').or_else(|| raw.strip_prefix('X')) {
+        u32::from_str_radix(hex, 16)
+    } else {
+        raw.parse::<u32>()
+    };
+    let value = number
+        .ok()
+        .and_then(char::from_u32)
+        .ok_or_else(|| EnexScanError::MalformedXml("invalid character reference".into()))?;
+    if value == '\0' {
+        return Err(EnexScanError::MalformedXml("NUL reference".into()));
+    }
+    Ok(value.to_string())
 }
 
-fn event_name(name: &[u8]) -> Result<String, EnexScanError> {
-    std::str::from_utf8(name)
-        .map(|name| name.to_ascii_lowercase())
-        .map_err(|error| EnexScanError::MalformedXml(error.to_string()))
-}
-
-fn ensure_base64_data(event: &BytesStart<'_>) -> Result<(), EnexScanError> {
-    for attribute in event.attributes().with_checks(true) {
-        let attribute =
-            attribute.map_err(|error| EnexScanError::MalformedXml(error.to_string()))?;
-        if attribute.key.as_ref().eq_ignore_ascii_case(b"encoding") {
-            let encoding = std::str::from_utf8(attribute.value.as_ref())
-                .map_err(|error| EnexScanError::MalformedXml(error.to_string()))?;
-            if !encoding.eq_ignore_ascii_case("base64") {
-                return Err(EnexScanError::UnsupportedDataEncoding {
-                    encoding: encoding.to_owned(),
-                });
+pub fn scan_enex_file(path: impl AsRef<Path>) -> Result<EnexScanReport, EnexScanError> {
+    let mut visitor = EnexVisitor::default();
+    parse_read_with_capacity(File::open(path)?, &mut visitor, INPUT_BYTES).map_err(|error| {
+        match error {
+            xml_syntax_reader::ReadError::Visitor(error) => error,
+            xml_syntax_reader::ReadError::Io(error) => EnexScanError::Io(error),
+            xml_syntax_reader::ReadError::Xml(error) => {
+                EnexScanError::MalformedXml(format!("{error:?}"))
             }
         }
+    })?;
+    if !visitor.root_seen
+        || !visitor.stack.is_empty()
+        || visitor.note.is_some()
+        || visitor.resource.is_some()
+    {
+        return Err(EnexScanError::MalformedXml("unexpected EOF".into()));
     }
-    Ok(())
+    correlate_resources(&mut visitor.report);
+    Ok(visitor.report)
 }
 
 fn correlate_resources(report: &mut EnexScanReport) {
@@ -564,20 +705,20 @@ fn inspect_enml(enml: &str) -> Result<(Vec<EnexMediaReference>, Vec<String>), En
             }
             Ok(Event::End(event)) => {
                 let name = event_name(event.name().as_ref())?;
-                if stack.pop().as_deref() != Some(name.as_str()) {
+                if stack.pop().as_deref() != Some(&name) {
                     return Err(EnexScanError::MalformedXml(
-                        "mismatched ENML nesting".to_owned(),
+                        "mismatched ENML nesting".into(),
                     ));
                 }
             }
             Ok(Event::DocType(doctype)) => {
                 if doctype
                     .as_ref()
-                    .windows(b"<!ENTITY".len())
+                    .windows(8)
                     .any(|part| part.eq_ignore_ascii_case(b"<!ENTITY"))
                 {
                     return Err(EnexScanError::UnsafeXml(
-                        "internal ENML entity declaration".to_owned(),
+                        "internal ENML entity declaration".into(),
                     ));
                 }
             }
@@ -588,13 +729,16 @@ fn inspect_enml(enml: &str) -> Result<(Vec<EnexMediaReference>, Vec<String>), En
         buffer.clear();
     }
     if !stack.is_empty() {
-        return Err(EnexScanError::MalformedXml(
-            "unexpected ENML EOF".to_owned(),
-        ));
+        return Err(EnexScanError::MalformedXml("unexpected ENML EOF".into()));
     }
     Ok((references, unsupported.into_iter().collect()))
 }
 
+fn event_name(name: &[u8]) -> Result<String, EnexScanError> {
+    std::str::from_utf8(name)
+        .map(|name| name.to_ascii_lowercase())
+        .map_err(|error| EnexScanError::MalformedXml(error.to_string()))
+}
 fn inspect_enml_start(
     event: &BytesStart<'_>,
     references: &mut Vec<EnexMediaReference>,
@@ -602,7 +746,7 @@ fn inspect_enml_start(
 ) -> Result<String, EnexScanError> {
     let name = event_name(event.name().as_ref())?;
     if name == "table" {
-        unsupported.insert("table".to_owned());
+        unsupported.insert("table".into());
     }
     if name == "en-media" {
         let mut hash = None;
@@ -621,156 +765,10 @@ fn inspect_enml_start(
         }
         references.push(EnexMediaReference {
             hash_md5: hash
-                .ok_or_else(|| EnexScanError::Structure("en-media without hash".to_owned()))?
+                .ok_or_else(|| EnexScanError::Structure("en-media without hash".into()))?
                 .to_ascii_lowercase(),
             mime: mime.unwrap_or_default(),
         });
     }
     Ok(name)
-}
-
-fn preflight_large_data(path: &Path) -> Result<(), EnexScanError> {
-    let mut visitor = BoundedXmlPreflight::default();
-    parse_read_with_capacity(File::open(path)?, &mut visitor, PREFLIGHT_BUFFER_BYTES).map_err(
-        |error| match error {
-            xml_syntax_reader::ReadError::Visitor(error) => error,
-            xml_syntax_reader::ReadError::Io(error) => EnexScanError::Io(error),
-            xml_syntax_reader::ReadError::Xml(error) => {
-                EnexScanError::MalformedXml(format!("{error:?}"))
-            }
-        },
-    )
-}
-
-#[derive(Default)]
-struct BoundedXmlPreflight {
-    stack: Vec<(String, usize)>,
-    resource_ordinal: usize,
-    doctype: Vec<u8>,
-}
-
-impl BoundedXmlPreflight {
-    fn name(name: QName<'_>) -> Result<String, EnexScanError> {
-        std::str::from_utf8(name.as_bytes())
-            .map(|name| name.to_ascii_lowercase())
-            .map_err(|error| EnexScanError::MalformedXml(error.to_string()))
-    }
-
-    fn add_text(&mut self, bytes: &[u8]) -> Result<(), EnexScanError> {
-        let Some((name, count)) = self.stack.last_mut() else {
-            return Ok(());
-        };
-        *count = count.saturating_add(bytes.len());
-        let limit = match name.as_str() {
-            "data" => MAX_ENEX_DATA_BASE64_BYTES,
-            "content" => MAX_ENEX_CONTENT_BYTES,
-            _ => MAX_FIELD_BYTES,
-        };
-        if *count > limit {
-            return if name == "data" {
-                Err(EnexScanError::NeedsContext {
-                    resource_ordinal: self.resource_ordinal,
-                    limit,
-                })
-            } else if name == "content" {
-                Err(EnexScanError::ContentTooLarge { limit })
-            } else {
-                Err(EnexScanError::FieldTooLarge { limit })
-            };
-        }
-        Ok(())
-    }
-
-    fn close(&mut self, name: QName<'_>) -> Result<(), EnexScanError> {
-        let name = Self::name(name)?;
-        match self.stack.pop() {
-            Some((opened, _)) if opened == name => Ok(()),
-            _ => Err(EnexScanError::MalformedXml(
-                "mismatched element nesting".to_owned(),
-            )),
-        }
-    }
-}
-
-impl Visitor for BoundedXmlPreflight {
-    type Error = EnexScanError;
-
-    fn start_tag_open(&mut self, name: QName<'_>) -> Result<(), Self::Error> {
-        let name = Self::name(name)?;
-        if name == "data" {
-            self.resource_ordinal += 1;
-        }
-        if self.stack.len() >= 4096 {
-            return Err(EnexScanError::Structure(
-                "XML nesting exceeds 4096".to_owned(),
-            ));
-        }
-        self.stack.push((name, 0));
-        Ok(())
-    }
-
-    fn empty_element_end(&mut self, _: Span) -> Result<(), Self::Error> {
-        self.stack
-            .pop()
-            .ok_or_else(|| EnexScanError::MalformedXml("empty element without start".to_owned()))?;
-        Ok(())
-    }
-
-    fn end_tag(&mut self, name: QName<'_>) -> Result<(), Self::Error> {
-        self.close(name)
-    }
-    fn characters(&mut self, text: &[u8], _: Span) -> Result<(), Self::Error> {
-        self.add_text(text)
-    }
-    fn cdata_content(&mut self, text: &[u8], _: Span) -> Result<(), Self::Error> {
-        self.add_text(text)
-    }
-
-    fn entity_ref(&mut self, name: &[u8], _: Span) -> Result<(), Self::Error> {
-        if !matches!(name, b"amp" | b"lt" | b"gt" | b"apos" | b"quot") {
-            return Err(EnexScanError::UnsafeXml(
-                "general entity reference".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn xml_declaration(
-        &mut self,
-        _: &[u8],
-        encoding: Option<&[u8]>,
-        _: Option<bool>,
-        _: Span,
-    ) -> Result<(), Self::Error> {
-        if encoding.is_some_and(|value| !value.eq_ignore_ascii_case(b"utf-8")) {
-            return Err(EnexScanError::UnsafeXml(
-                "non-UTF-8 XML declaration".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn doctype_content(&mut self, content: &[u8], _: Span) -> Result<(), Self::Error> {
-        if self.doctype.len().saturating_add(content.len()) > MAX_FIELD_BYTES {
-            return Err(EnexScanError::FieldTooLarge {
-                limit: MAX_FIELD_BYTES,
-            });
-        }
-        self.doctype.extend_from_slice(content);
-        Ok(())
-    }
-
-    fn doctype_end(&mut self, _: Span) -> Result<(), Self::Error> {
-        if self
-            .doctype
-            .windows(b"<!ENTITY".len())
-            .any(|part| part.eq_ignore_ascii_case(b"<!ENTITY"))
-        {
-            return Err(EnexScanError::UnsafeXml(
-                "internal entity declaration".to_owned(),
-            ));
-        }
-        self.doctype.clear();
-        Ok(())
-    }
 }
