@@ -17,6 +17,8 @@ use thiserror::Error;
 
 mod enex;
 pub use enex::*;
+mod enml;
+pub use enml::*;
 
 /// Maximum number of tar entries accepted by a preflight scan.
 pub const MAX_JEX_ARCHIVE_ENTRIES: usize = 50_000;

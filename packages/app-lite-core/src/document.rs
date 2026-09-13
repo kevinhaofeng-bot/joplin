@@ -1964,7 +1964,7 @@ fn image_dimension_attribute(attrs: &[Attribute], name: &str) -> Option<u32> {
         .filter(|&value| valid_persisted_image_dimension(value))
 }
 
-fn valid_link(value: &str) -> bool {
+pub(crate) fn valid_link(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_LINK_LENGTH || value.chars().any(char::is_control) {
         return false;
     }
