@@ -1,7 +1,8 @@
-//! Human-readable, fail-closed library export bundles.
+//! Human-readable, fail-closed note-selection export bundles.
 //!
-//! This is the first deliberately narrow Task-8 restore slice: active notes
-//! in the default notebook with no tags. The JSON manifest is authoritative
+//! This is the first deliberately narrow Task-8 restore slice: an explicit
+//! selection of active notes in the default notebook with no tags. It is not
+//! a full-library backup API. The JSON manifest is authoritative
 //! for recovery; the matching HTML files are there for a person to inspect.
 //! Every resource is copied as its original bytes and verified by SHA-256
 //! before an export is published or a restore profile is opened.
@@ -19,12 +20,19 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use tempfile::Builder;
 use thiserror::Error;
 
 const BUNDLE_VERSION: u32 = 1;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_BUNDLE_NOTES: usize = 10_000;
+const MAX_BUNDLE_RESOURCES: usize = 50_000;
+const MAX_NOTE_HTML_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_NOTE_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NOTE_REVISIONS: usize = 10_000;
+const MAX_NOTE_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadableExportReport {
@@ -91,7 +99,19 @@ struct ManifestNote {
     created_time: i64,
     updated_time: i64,
     revision: i64,
+    selected_thumbnail_id: Option<String>,
     resource_ids: Vec<String>,
+    revisions: Vec<ManifestRevision>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestRevision {
+    revision: i64,
+    title: String,
+    body_html: String,
+    body_html_sha256: String,
+    body_text: String,
+    created_time: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,9 +126,15 @@ struct ManifestResource {
     relative_path: String,
 }
 
+struct ValidatedBundle {
+    manifest: BundleManifest,
+    current_html: BTreeMap<String, String>,
+    resource_files: BTreeMap<String, File>,
+}
+
 /// Exports selected active, untagged notes from the default notebook into a
 /// newly-created bundle directory. The bundle path must not exist already.
-pub fn export_readable_library(
+pub fn export_readable_selection(
     repository: &LibraryRepository,
     note_ids: &[NoteId],
     destination: impl AsRef<Path>,
@@ -126,6 +152,7 @@ pub fn export_readable_library(
     fs::create_dir_all(parent)?;
     let default = repository.default_notebook()?;
     let mut seen_notes = BTreeSet::new();
+    let mut observed_notes = Vec::with_capacity(note_ids.len());
     let mut notes = Vec::with_capacity(note_ids.len());
     let mut resources = BTreeMap::<String, ManifestResource>::new();
     let temporary = Builder::new()
@@ -149,7 +176,27 @@ pub fn export_readable_library(
                 note.id.as_str().into(),
             ));
         }
-        let html_path = format!("notes/{}.html", note.id.as_str());
+        let state = repository
+            .readable_export_note_state(note_id, MAX_NOTE_REVISIONS, MAX_NOTE_HISTORY_BYTES)?
+            .ok_or_else(|| {
+                ReadableExportError::InvalidManifest(format!("note state missing: {note_id:?}"))
+            })?;
+        if state.revisions.is_empty() || state.revisions.len() > MAX_NOTE_REVISIONS {
+            return Err(ReadableExportError::InvalidManifest(
+                "invalid revision count".into(),
+            ));
+        }
+        let last = state.revisions.last().expect("checked non-empty");
+        if last.revision != note.revision
+            || last.title != note.title
+            || last.body_html != note.body_html
+            || last.body_text != note.body_text
+        {
+            return Err(ReadableExportError::InvalidManifest(
+                "note revision is not current".into(),
+            ));
+        }
+        let html_path = expected_html_path(note.id.as_str());
         write_synced(
             &temporary.path().join(&html_path),
             note.body_html.as_bytes(),
@@ -214,7 +261,54 @@ pub fn export_readable_library(
                 .iter()
                 .map(|id| id.as_str().into())
                 .collect(),
+            selected_thumbnail_id: state.selected_thumbnail_id.map(|id| id.as_str().into()),
+            revisions: state
+                .revisions
+                .into_iter()
+                .map(|revision| ManifestRevision {
+                    revision: revision.revision,
+                    title: revision.title,
+                    body_html_sha256: sha256_hex(revision.body_html.as_bytes()),
+                    body_html: revision.body_html,
+                    body_text: revision.body_text,
+                    created_time: revision.created_time,
+                })
+                .collect(),
         });
+        observed_notes.push((note_id.clone(), note.revision, note.updated_time));
+    }
+    // An explicit selection is not a database-wide MVCC snapshot. It is still
+    // fail-closed against a visible selection changing while files are copied.
+    for (id, revision, updated_time) in &observed_notes {
+        let reloaded = repository.load_note(id)?.ok_or_else(|| {
+            ReadableExportError::InvalidManifest("selected note disappeared while exporting".into())
+        })?;
+        if reloaded.revision != *revision || reloaded.updated_time != *updated_time {
+            return Err(ReadableExportError::InvalidManifest(
+                "selected note changed while exporting; flush and retry".into(),
+            ));
+        }
+        repository
+            .readable_export_note_state(id, MAX_NOTE_REVISIONS, MAX_NOTE_HISTORY_BYTES)?
+            .ok_or_else(|| {
+                ReadableExportError::InvalidManifest("selected note state disappeared".into())
+            })?;
+    }
+    for resource in resources.values() {
+        let id = ResourceId::new(&resource.id).map_err(|_| {
+            ReadableExportError::InvalidManifest("resource ID changed while exporting".into())
+        })?;
+        let reloaded = repository.resource_metadata(&id)?.ok_or_else(|| {
+            ReadableExportError::ResourceVerification("resource disappeared while exporting".into())
+        })?;
+        if reloaded.sha256.as_str() != resource.sha256
+            || reloaded.size != resource.size
+            || reloaded.revision != resource.revision
+        {
+            return Err(ReadableExportError::ResourceVerification(
+                "resource changed while exporting".into(),
+            ));
+        }
     }
     let manifest = BundleManifest {
         format: "app-lite-readable-export".into(),
@@ -241,7 +335,7 @@ pub fn export_readable_library(
     Ok(report)
 }
 
-/// Verifies an entire bundle before opening a newly-created empty profile.
+/// Verifies an entire bundle before opening an owned sibling staging profile.
 /// It restores only the current default-notebook/no-tag active-note slice.
 pub fn restore_readable_export(
     bundle: impl AsRef<Path>,
@@ -250,18 +344,27 @@ pub fn restore_readable_export(
     let bundle = bundle.as_ref();
     let empty_profile = empty_profile.as_ref();
     ensure_existing_empty_directory(empty_profile)?;
-    let manifest: BundleManifest =
-        serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
-    validate_manifest(bundle, &manifest)?;
-
-    let database = empty_profile.join("library.sqlite");
+    let validated = validate_manifest(bundle)?;
+    let parent = empty_profile
+        .parent()
+        .ok_or_else(|| ReadableExportError::RestoreDestinationNotEmpty)?;
+    let staging = Builder::new()
+        .prefix("readable-restore-")
+        .tempdir_in(parent)?;
+    let database = staging.path().join("library.sqlite");
     let repository = LibraryRepository::open(&database)?;
     let default = repository.default_notebook()?;
-    let mut generated_resource_ids = Vec::with_capacity(manifest.resources.len());
-    for resource in &manifest.resources {
-        let source = File::open(bundle.join(&resource.relative_path))?;
+    let mut generated_resource_ids = Vec::with_capacity(validated.manifest.resources.len());
+    for resource in &validated.manifest.resources {
+        let mut source = validated
+            .resource_files
+            .get(&resource.id)
+            .ok_or_else(|| {
+                ReadableExportError::InvalidManifest("verified resource disappeared".into())
+            })?
+            .try_clone()?;
         let generated = repository.import_resource_reader(
-            source,
+            &mut source,
             usize::try_from(resource.size).map_err(|_| {
                 ReadableExportError::InvalidManifest("resource size is invalid".into())
             })?,
@@ -294,12 +397,17 @@ pub fn restore_readable_export(
     tx.execute(
         "UPDATE notebooks SET id=?1, title=?2 WHERE id=?3 AND is_default=1",
         params![
-            manifest.default_notebook.id,
-            manifest.default_notebook.title,
+            validated.manifest.default_notebook.id,
+            validated.manifest.default_notebook.title,
             default.id.as_str()
         ],
     )?;
-    for (resource, generated_id) in manifest.resources.iter().zip(&generated_resource_ids) {
+    for (resource, generated_id) in validated
+        .manifest
+        .resources
+        .iter()
+        .zip(&generated_resource_ids)
+    {
         tx.execute(
             "UPDATE resources SET id=?1, revision=?2 WHERE id=?3",
             params![resource.id, resource.revision, generated_id.as_str()],
@@ -315,11 +423,14 @@ pub fn restore_readable_export(
             )?;
         }
     }
-    for note in &manifest.notes {
+    for note in &validated.manifest.notes {
+        let current_html = validated.current_html.get(&note.id).ok_or_else(|| {
+            ReadableExportError::InvalidManifest("verified note HTML disappeared".into())
+        })?;
         tx.execute(
-            "INSERT INTO notes (id,title,body_html,body_text,snippet,notebook_id,created_time,updated_time,revision)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![note.id, note.title, read_html(bundle, note)?, note.body_text, snippet(&note.body_text), manifest.default_notebook.id, note.created_time, note.updated_time, note.revision],
+            "INSERT INTO notes (id,title,body_html,body_text,snippet,notebook_id,selected_thumbnail_id,created_time,updated_time,revision)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![note.id, note.title, current_html, note.body_text, snippet(&note.body_text), validated.manifest.default_notebook.id, note.selected_thumbnail_id, note.created_time, note.updated_time, note.revision],
         )?;
         for (position, resource_id) in note.resource_ids.iter().enumerate() {
             tx.execute(
@@ -327,18 +438,13 @@ pub fn restore_readable_export(
                 params![note.id, position as i64, resource_id],
             )?;
         }
-        tx.execute(
-            "INSERT INTO note_revisions(note_id,revision,title,body_html,body_text,created_time)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                note.id,
-                note.revision,
-                note.title,
-                read_html(bundle, note)?,
-                note.body_text,
-                note.updated_time
-            ],
-        )?;
+        for revision in &note.revisions {
+            tx.execute(
+                "INSERT INTO note_revisions(note_id,revision,title,body_html,body_text,created_time)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![note.id, revision.revision, revision.title, revision.body_html, revision.body_text, revision.created_time],
+            )?;
+        }
         tx.execute(
             "INSERT INTO search_queue(note_id,updated_time,reason) VALUES(?1,?2,'restore')",
             params![note.id, note.updated_time],
@@ -356,19 +462,44 @@ pub fn restore_readable_export(
             ));
         }
     }
-    Ok(ReadableRestoreReport {
-        note_count: manifest.notes.len(),
-        resource_count: manifest.resources.len(),
-    })
+    verify_restored(&repository, &validated)?;
+    drop(repository);
+    let verification = Connection::open(&database)?;
+    let integrity: String =
+        verification.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    let foreign_key_violations: i64 =
+        verification.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if integrity != "ok" || foreign_key_violations != 0 {
+        return Err(ReadableExportError::InvalidManifest(
+            "restored SQLite integrity verification failed".into(),
+        ));
+    }
+    drop(verification);
+    fs::rename(staging.path(), empty_profile)?;
+    let report = ReadableRestoreReport {
+        note_count: validated.manifest.notes.len(),
+        resource_count: validated.manifest.resources.len(),
+    };
+    std::mem::forget(staging);
+    Ok(report)
 }
 
-fn validate_manifest(bundle: &Path, manifest: &BundleManifest) -> Result<(), ReadableExportError> {
+fn validate_manifest(bundle: &Path) -> Result<ValidatedBundle, ReadableExportError> {
+    ensure_bundle_root(bundle)?;
+    let manifest_bytes =
+        read_regular_file_bounded(&bundle.join("manifest.json"), MAX_MANIFEST_BYTES)?;
+    let manifest: BundleManifest = serde_json::from_slice(&manifest_bytes)?;
     if manifest.format != "app-lite-readable-export" || manifest.version != BUNDLE_VERSION {
         return Err(ReadableExportError::InvalidManifest(
             "unsupported bundle format/version".into(),
         ));
     }
-    if manifest.notes.is_empty() {
+    if manifest.notes.is_empty()
+        || manifest.notes.len() > MAX_BUNDLE_NOTES
+        || manifest.resources.len() > MAX_BUNDLE_RESOURCES
+    {
         return Err(ReadableExportError::InvalidManifest(
             "bundle contains no notes".into(),
         ));
@@ -377,6 +508,7 @@ fn validate_manifest(bundle: &Path, manifest: &BundleManifest) -> Result<(), Rea
         .map_err(|_| ReadableExportError::InvalidManifest("invalid default notebook ID".into()))?;
     let mut note_ids = BTreeSet::new();
     let mut resources = BTreeMap::new();
+    let mut resource_files = BTreeMap::new();
     for resource in &manifest.resources {
         let id = ResourceId::new(&resource.id)
             .map_err(|_| ReadableExportError::InvalidManifest("invalid resource ID".into()))?;
@@ -387,20 +519,23 @@ fn validate_manifest(bundle: &Path, manifest: &BundleManifest) -> Result<(), Rea
                 "duplicate or invalid resource".into(),
             ));
         }
-        let relative = safe_relative_path(&resource.relative_path)?;
-        if !relative.starts_with("resources/") {
+        let expected_path = expected_resource_path(resource);
+        if resource.relative_path != expected_path {
             return Err(ReadableExportError::InvalidManifest(
-                "resource path escapes resources".into(),
+                "resource path does not match resource identity".into(),
             ));
         }
-        let (actual_hash, actual_size) = hash_file(&bundle.join(relative))?;
+        let (file, actual_hash, actual_size) =
+            open_and_hash_regular_file(&bundle.join(&expected_path))?;
         if actual_hash != hash.as_str() || actual_size != resource.size as u64 {
             return Err(ReadableExportError::ResourceVerification(format!(
                 "{}",
                 resource.id
             )));
         }
+        resource_files.insert(resource.id.clone(), file);
     }
+    let mut current_html = BTreeMap::new();
     for note in &manifest.notes {
         let id = NoteId::parse(&note.id)
             .map_err(|_| ReadableExportError::InvalidManifest("invalid note ID".into()))?;
@@ -409,7 +544,18 @@ fn validate_manifest(bundle: &Path, manifest: &BundleManifest) -> Result<(), Rea
                 "duplicate or invalid note".into(),
             ));
         }
-        let html = read_html(bundle, note)?;
+        if note.html_path != expected_html_path(&note.id)
+            || note.body_text.len() > MAX_NOTE_TEXT_BYTES
+        {
+            return Err(ReadableExportError::InvalidManifest(
+                "note metadata exceeds selection bounds".into(),
+            ));
+        }
+        let html = String::from_utf8(read_regular_file_bounded(
+            &bundle.join(&note.html_path),
+            MAX_NOTE_HTML_BYTES,
+        )?)
+        .map_err(|_| ReadableExportError::InvalidManifest("note HTML is not UTF-8".into()))?;
         if sha256_hex(html.as_bytes()) != note.body_html_sha256 {
             return Err(ReadableExportError::InvalidManifest(
                 "HTML digest differs".into(),
@@ -417,7 +563,8 @@ fn validate_manifest(bundle: &Path, manifest: &BundleManifest) -> Result<(), Rea
         }
         let document = CanonicalDocument::parse_html(&html)
             .map_err(|_| ReadableExportError::InvalidManifest("HTML is not canonical".into()))?;
-        if document.search_text().as_str() != note.body_text
+        if document.to_canonical_html().as_str() != html
+            || document.search_text().as_str() != note.body_text
             || document
                 .resource_ids()
                 .iter()
@@ -437,8 +584,58 @@ fn validate_manifest(bundle: &Path, manifest: &BundleManifest) -> Result<(), Rea
                 "note body/resources differ".into(),
             ));
         }
+        if let Some(selected) = &note.selected_thumbnail_id {
+            if !note.resource_ids.contains(selected) || !resources.contains_key(selected) {
+                return Err(ReadableExportError::InvalidManifest(
+                    "selected thumbnail differs".into(),
+                ));
+            }
+        }
+        if note.revisions.is_empty() || note.revisions.len() > MAX_NOTE_REVISIONS {
+            return Err(ReadableExportError::InvalidManifest(
+                "revision count exceeds bound".into(),
+            ));
+        }
+        let mut expected_revision = 1_i64;
+        for revision in &note.revisions {
+            if revision.revision != expected_revision
+                || revision.body_text.len() > MAX_NOTE_TEXT_BYTES
+                || sha256_hex(revision.body_html.as_bytes()) != revision.body_html_sha256
+            {
+                return Err(ReadableExportError::InvalidManifest(
+                    "revision metadata differs".into(),
+                ));
+            }
+            let document = CanonicalDocument::parse_html(&revision.body_html).map_err(|_| {
+                ReadableExportError::InvalidManifest("revision HTML is invalid".into())
+            })?;
+            if document.to_canonical_html().as_str() != revision.body_html
+                || document.search_text().as_str() != revision.body_text
+            {
+                return Err(ReadableExportError::InvalidManifest(
+                    "revision HTML is not canonical".into(),
+                ));
+            }
+            expected_revision += 1;
+        }
+        let current = note.revisions.last().expect("checked non-empty");
+        if current.revision != note.revision
+            || current.title != note.title
+            || current.body_html != html
+            || current.body_text != note.body_text
+            || current.created_time != note.updated_time
+        {
+            return Err(ReadableExportError::InvalidManifest(
+                "current note differs from history".into(),
+            ));
+        }
+        current_html.insert(note.id.clone(), html);
     }
-    Ok(())
+    Ok(ValidatedBundle {
+        manifest,
+        current_html,
+        resource_files,
+    })
 }
 
 fn ensure_existing_empty_directory(path: &Path) -> Result<(), ReadableExportError> {
@@ -448,29 +645,135 @@ fn ensure_existing_empty_directory(path: &Path) -> Result<(), ReadableExportErro
     Ok(())
 }
 
-fn read_html(bundle: &Path, note: &ManifestNote) -> Result<String, ReadableExportError> {
-    let path = safe_relative_path(&note.html_path)?;
-    if !path.starts_with("notes/") {
+fn verify_restored(
+    repository: &LibraryRepository,
+    validated: &ValidatedBundle,
+) -> Result<(), ReadableExportError> {
+    for note in &validated.manifest.notes {
+        let actual = repository
+            .load_note(
+                &NoteId::parse(&note.id)
+                    .map_err(|_| ReadableExportError::InvalidManifest("invalid note ID".into()))?,
+            )?
+            .ok_or_else(|| ReadableExportError::InvalidManifest("restored note missing".into()))?;
+        let html = validated
+            .current_html
+            .get(&note.id)
+            .expect("validated note HTML exists");
+        if actual.title != note.title
+            || actual.body_html != *html
+            || actual.body_text != note.body_text
+            || actual
+                .resource_ids
+                .iter()
+                .map(ResourceId::as_str)
+                .collect::<Vec<_>>()
+                != note
+                    .resource_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            || actual.revision != note.revision
+        {
+            return Err(ReadableExportError::InvalidManifest(
+                "restored note differs".into(),
+            ));
+        }
+        let state = repository
+            .readable_export_note_state(&actual.id, MAX_NOTE_REVISIONS, MAX_NOTE_HISTORY_BYTES)?
+            .ok_or_else(|| {
+                ReadableExportError::InvalidManifest("restored note state missing".into())
+            })?;
+        if state.selected_thumbnail_id.as_ref().map(ResourceId::as_str)
+            != note.selected_thumbnail_id.as_deref()
+            || state.revisions.len() != note.revisions.len()
+            || state
+                .revisions
+                .iter()
+                .zip(&note.revisions)
+                .any(|(actual, expected)| {
+                    actual.revision != expected.revision
+                        || actual.title != expected.title
+                        || actual.body_html != expected.body_html
+                        || actual.body_text != expected.body_text
+                        || actual.created_time != expected.created_time
+                })
+        {
+            return Err(ReadableExportError::InvalidManifest(
+                "restored history differs".into(),
+            ));
+        }
+    }
+    for resource in &validated.manifest.resources {
+        let id = ResourceId::new(&resource.id)
+            .map_err(|_| ReadableExportError::InvalidManifest("invalid resource ID".into()))?;
+        let actual = repository.resource_metadata(&id)?.ok_or_else(|| {
+            ReadableExportError::InvalidManifest("restored resource missing".into())
+        })?;
+        if actual.sha256.as_str() != resource.sha256
+            || actual.size != resource.size
+            || actual.revision != resource.revision
+            || sha256_hex(&repository.read_resource_bytes(&id)?.ok_or_else(|| {
+                ReadableExportError::InvalidManifest("restored resource bytes missing".into())
+            })?) != resource.sha256
+        {
+            return Err(ReadableExportError::ResourceVerification(
+                "restored resource differs".into(),
+            ));
+        }
+    }
+    if repository.outbox_count()? != 0 {
         return Err(ReadableExportError::InvalidManifest(
-            "note HTML path escapes notes".into(),
+            "restored profile queued sync work".into(),
         ));
     }
-    String::from_utf8(fs::read(bundle.join(path))?)
-        .map_err(|_| ReadableExportError::InvalidManifest("note HTML is not UTF-8".into()))
+    Ok(())
 }
 
-fn safe_relative_path(path: &str) -> Result<PathBuf, ReadableExportError> {
-    let path = Path::new(path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
+fn ensure_bundle_root(bundle: &Path) -> Result<(), ReadableExportError> {
+    for entry in [bundle, &bundle.join("notes"), &bundle.join("resources")] {
+        let metadata = fs::symlink_metadata(entry)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(ReadableExportError::InvalidManifest(
+                "bundle directory is unsafe".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expected_html_path(note_id: &str) -> String {
+    format!("notes/{note_id}.html")
+}
+
+fn expected_resource_path(resource: &ManifestResource) -> String {
+    format!(
+        "resources/{}--{}--{}",
+        resource.sha256,
+        resource.id,
+        safe_display_name(&resource.title, &resource.file_extension)
+    )
+}
+
+fn read_regular_file_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, ReadableExportError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > maximum
     {
         return Err(ReadableExportError::InvalidManifest(
-            "unsafe bundle path".into(),
+            "bundle file is unsafe or exceeds bound".into(),
         ));
     }
-    Ok(path.to_owned())
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > maximum {
+        return Err(ReadableExportError::InvalidManifest(
+            "bundle file changed or exceeds bound".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn safe_display_name(title: &str, extension: &str) -> String {
@@ -522,12 +825,11 @@ fn copy_and_hash(input: &mut dyn Read, destination: &Path) -> io::Result<(String
     Ok((format!("{:x}", digest.finalize()), size))
 }
 
-fn hash_file(path: &Path) -> io::Result<(String, u64)> {
+fn open_and_hash_regular_file(path: &Path) -> Result<(File, String, u64), ReadableExportError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bundle resource is not a regular file",
+        return Err(ReadableExportError::InvalidManifest(
+            "bundle resource is not a regular file".into(),
         ));
     }
     let mut file = File::open(path)?;
@@ -542,7 +844,9 @@ fn hash_file(path: &Path) -> io::Result<(String, u64)> {
         digest.update(&buffer[..count]);
         size += count as u64;
     }
-    Ok((format!("{:x}", digest.finalize()), size))
+    use std::io::Seek;
+    file.rewind()?;
+    Ok((file, format!("{:x}", digest.finalize()), size))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

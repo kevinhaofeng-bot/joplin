@@ -50,6 +50,26 @@ pub struct LibraryShellState {
     pub selected_note_id: Option<NoteId>,
 }
 
+/// A bounded immutable note revision view used by the readable-export path.
+/// It deliberately exposes no mutable connection or body cache handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadableExportRevision {
+    pub revision: i64,
+    pub title: String,
+    pub body_html: String,
+    pub body_text: String,
+    pub created_time: i64,
+}
+
+/// Per-note presentation and history facts required for a lossless readable
+/// export. This is a narrow read-only repository API rather than a side-door
+/// SQLite connection in an exporter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadableExportNoteState {
+    pub selected_thumbnail_id: Option<ResourceId>,
+    pub revisions: Vec<ReadableExportRevision>,
+}
+
 impl LibraryShellState {
     pub const DEFAULT_SIDEBAR_WIDTH: u16 = 220;
     pub const DEFAULT_LIST_WIDTH: u16 = 360;
@@ -1161,6 +1181,70 @@ impl LibraryRepository {
 
     pub fn load_note_by_hex(&self, id: &str) -> Result<Option<Note>, LibraryError> {
         self.load_note(&NoteId::parse(id).map_err(|_| LibraryError::InvalidId)?)
+    }
+
+    /// Returns the complete retained revision sequence and selected cover for
+    /// one already-loaded note. The exporter uses this while holding the
+    /// repository's normal read boundary so future schema changes cannot make
+    /// it accidentally depend on a second, unconstrained SQLite connection.
+    pub fn readable_export_note_state(
+        &self,
+        id: &NoteId,
+        maximum_revisions: usize,
+        maximum_utf8_bytes: usize,
+    ) -> Result<Option<ReadableExportNoteState>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let selected_thumbnail_id = connection
+            .query_row(
+                "SELECT selected_thumbnail_id FROM notes WHERE id=?1",
+                [id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(selected_thumbnail_id) = selected_thumbnail_id else {
+            return Ok(None);
+        };
+        let selected_thumbnail_id = selected_thumbnail_id
+            .map(|value| ResourceId::new(value).map_err(invalid_column))
+            .transpose()?;
+        let pending_journal: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM edit_journal WHERE note_id=?1)",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        if pending_journal != 0 || maximum_revisions == 0 {
+            return Err(LibraryError::InvalidSnapshot);
+        }
+        let mut statement = connection.prepare(
+            "SELECT revision,title,body_html,body_text,created_time
+             FROM note_revisions WHERE note_id=?1 ORDER BY revision ASC LIMIT ?2",
+        )?;
+        let mut rows =
+            statement.query(rusqlite::params![id.as_str(), maximum_revisions as i64 + 1])?;
+        let mut revisions = Vec::new();
+        let mut total_utf8_bytes = 0_usize;
+        while let Some(row) = rows.next()? {
+            let revision = ReadableExportRevision {
+                revision: row.get(0)?,
+                title: row.get(1)?,
+                body_html: row.get(2)?,
+                body_text: row.get(3)?,
+                created_time: row.get(4)?,
+            };
+            total_utf8_bytes = total_utf8_bytes
+                .checked_add(revision.title.len())
+                .and_then(|value| value.checked_add(revision.body_html.len()))
+                .and_then(|value| value.checked_add(revision.body_text.len()))
+                .ok_or(LibraryError::InvalidSnapshot)?;
+            if revisions.len() >= maximum_revisions || total_utf8_bytes > maximum_utf8_bytes {
+                return Err(LibraryError::InvalidSnapshot);
+            }
+            revisions.push(revision);
+        }
+        Ok(Some(ReadableExportNoteState {
+            selected_thumbnail_id,
+            revisions,
+        }))
     }
 
     pub fn save_note(&self, input: SaveNote) -> Result<Note, LibraryError> {

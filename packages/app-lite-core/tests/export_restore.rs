@@ -1,8 +1,9 @@
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{
-    CanonicalDocument, CreateNote, LibraryRepository, SaveNote, export_readable_library,
+    CanonicalDocument, CreateNote, LibraryRepository, SaveNote, export_readable_selection,
     restore_readable_export,
 };
+use sha2::Digest;
 use std::fs;
 use tempfile::tempdir;
 
@@ -92,11 +93,24 @@ fn readable_export_restores_multiple_notes_ids_html_and_reused_attachment_bytes(
         })
         .unwrap();
     let source_attachment = source.resource_metadata(&attachment).unwrap().unwrap();
+    let source_histories = [first.id.clone(), second.id.clone()]
+        .into_iter()
+        .map(|id| {
+            (
+                id.clone(),
+                source
+                    .readable_export_note_state(&id, 10_000, 16 * 1024 * 1024)
+                    .unwrap()
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
 
     let bundle_parent = tempdir().unwrap();
     let bundle = bundle_parent.path().join("readable-export");
     let export =
-        export_readable_library(&source, &[first.id.clone(), second.id.clone()], &bundle).unwrap();
+        export_readable_selection(&source, &[first.id.clone(), second.id.clone()], &bundle)
+            .unwrap();
     assert_eq!(export.note_count, 2);
     assert_eq!(export.resource_count, 1);
     assert!(bundle.join("manifest.json").is_file());
@@ -138,6 +152,50 @@ fn readable_export_restores_multiple_notes_ids_html_and_reused_attachment_bytes(
             .unwrap(),
         b"exact attachment bytes"
     );
+    for (id, expected_history) in source_histories {
+        let restored_history = reopened
+            .readable_export_note_state(&id, 10_000, 16 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_history, expected_history);
+    }
+}
+
+#[test]
+fn readable_selection_restores_selected_thumbnail() {
+    let source_profile = tempdir().unwrap();
+    let source = LibraryRepository::open(source_profile.path().join("library.sqlite")).unwrap();
+    let image = source
+        .import_resource(b"opaque image", "cover.png", "image/png", "png")
+        .unwrap();
+    let note = source
+        .create_note(CreateNote {
+            title: "有封面".into(),
+            notebook_id: None,
+            document: document_with_repeated_attachment("封面", image.clone()),
+        })
+        .unwrap();
+    let source_state = source
+        .readable_export_note_state(&note.id, 10_000, 16 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_state.selected_thumbnail_id, Some(image.clone()));
+    let parent = tempdir().unwrap();
+    let bundle = parent.path().join("bundle");
+    export_readable_selection(&source, &[note.id.clone()], &bundle).unwrap();
+    let restore_parent = tempdir().unwrap();
+    let target = restore_parent.path().join("empty");
+    fs::create_dir(&target).unwrap();
+    restore_readable_export(&bundle, &target).unwrap();
+    let reopened = LibraryRepository::open(target.join("library.sqlite")).unwrap();
+    assert_eq!(
+        reopened
+            .readable_export_note_state(&note.id, 10_000, 16 * 1024 * 1024)
+            .unwrap()
+            .unwrap()
+            .selected_thumbnail_id,
+        Some(image)
+    );
 }
 
 #[test]
@@ -170,10 +228,80 @@ fn readable_export_refuses_nondefault_organization_instead_of_omitting_it() {
         .unwrap();
     let bundle_parent = tempdir().unwrap();
     let destination = bundle_parent.path().join("must-not-exist");
-    let error = export_readable_library(&repository, &[note.id], &destination).unwrap_err();
+    let error = export_readable_selection(&repository, &[note.id], &destination).unwrap_err();
     assert!(error.to_string().contains("default notebook"));
     assert!(
         !destination.exists(),
         "a typed refusal must not publish a partial bundle"
     );
+}
+
+#[test]
+fn invalid_resource_metadata_leaves_requested_restore_target_empty() {
+    let source_profile = tempdir().unwrap();
+    let source = LibraryRepository::open(source_profile.path().join("library.sqlite")).unwrap();
+    let resource = source
+        .import_resource(b"attachment", "report.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = source
+        .create_note(CreateNote {
+            title: "需要附件".into(),
+            notebook_id: None,
+            document: document_with_repeated_attachment("正文", resource),
+        })
+        .unwrap();
+    let bundle_parent = tempdir().unwrap();
+    let bundle = bundle_parent.path().join("bundle");
+    export_readable_selection(&source, &[note.id], &bundle).unwrap();
+    let manifest_path = bundle.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["resources"][0]["mime"] = serde_json::Value::String("not a mime".into());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let parent = tempdir().unwrap();
+    let target = parent.path().join("empty-target");
+    fs::create_dir(&target).unwrap();
+    assert!(restore_readable_export(&bundle, &target).is_err());
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
+}
+
+#[test]
+fn restore_rejects_html_that_is_not_already_canonical() {
+    let source_profile = tempdir().unwrap();
+    let source = LibraryRepository::open(source_profile.path().join("library.sqlite")).unwrap();
+    let note = source
+        .create_note(CreateNote {
+            title: "安全正文".into(),
+            notebook_id: None,
+            document: text_document("正文"),
+        })
+        .unwrap();
+    let bundle_parent = tempdir().unwrap();
+    let bundle = bundle_parent.path().join("bundle");
+    export_readable_selection(&source, &[note.id.clone()], &bundle).unwrap();
+    let html_path = bundle
+        .join("notes")
+        .join(format!("{}.html", note.id.as_str()));
+    let tampered = "<p>正文<script>not retained</script></p>";
+    fs::write(&html_path, tampered).unwrap();
+    let manifest_path = bundle.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["notes"][0]["body_html_sha256"] =
+        serde_json::Value::String(format!("{:x}", sha2::Sha256::digest(tampered.as_bytes())));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let parent = tempdir().unwrap();
+    let target = parent.path().join("empty-target");
+    fs::create_dir(&target).unwrap();
+    assert!(restore_readable_export(&bundle, &target).is_err());
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
 }
