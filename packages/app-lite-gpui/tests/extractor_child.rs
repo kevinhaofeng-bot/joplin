@@ -538,14 +538,26 @@ fn coordinator_indexes_real_english_and_chinese_images_with_resource_provenance(
     assert_eq!(indexed.len(), 2);
     assert!(indexed.contains(&english));
     assert!(indexed.contains(&chinese));
-    for (term, resource, note) in [
-        ("Vision OCR English", english, english_note),
-        ("中文视觉文字识别", chinese, chinese_note),
+    for (term, resource, note, provenance) in [
+        (
+            "Vision OCR English",
+            english,
+            english_note,
+            "匹配附件：one.png",
+        ),
+        (
+            "中文视觉文字识别",
+            chinese,
+            chinese_note,
+            "匹配附件：two.png",
+        ),
     ] {
         let hits = repository.search(SearchQuery::parse(term)).unwrap();
         assert_eq!(hits.len(), 1, "{term}");
         assert_eq!(hits[0].note.id, note.id, "{term}");
         assert_eq!(hits[0].matched_resource, Some(resource), "{term}");
+        assert_eq!(hits[0].snippet, provenance, "{term}");
+        assert_eq!(hits[0].note.snippet, provenance, "{term}");
     }
 }
 

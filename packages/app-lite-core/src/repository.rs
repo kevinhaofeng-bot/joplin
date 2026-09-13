@@ -3211,7 +3211,7 @@ impl LibraryRepository {
         values.push(rusqlite::types::Value::Integer(limit));
         values.push(rusqlite::types::Value::Integer(offset));
         let sql = format!(
-            "SELECT n.id, substr(n.title,1,120), substr(n.snippet,1,160), n.updated_time, n.deleted_time, n.notebook_id, COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id=snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')), (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime IN ('image/png','image/jpeg') ORDER BY nr.position,nr.resource_id LIMIT 1)), (SELECT count(*) FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0), {matched_resource} FROM notes n WHERE {} ORDER BY n.updated_time DESC, n.id ASC LIMIT ? OFFSET ?",
+            "WITH matched AS (SELECT n.id, substr(n.title,1,120) AS title_prefix, substr(n.snippet,1,160) AS snippet, n.updated_time, n.deleted_time, n.notebook_id, COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id=snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')), (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime IN ('image/png','image/jpeg') ORDER BY nr.position,nr.resource_id LIMIT 1)) AS selected_thumbnail_id, (SELECT count(*) FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0) AS attachment_count, {matched_resource} AS matched_resource FROM notes n WHERE {} ORDER BY n.updated_time DESC, n.id ASC LIMIT ? OFFSET ?) SELECT m.id,m.title_prefix,m.snippet,m.updated_time,m.deleted_time,m.notebook_id,m.selected_thumbnail_id,m.attachment_count,m.matched_resource,r.title FROM matched m LEFT JOIN resources r ON r.id=m.matched_resource ORDER BY m.updated_time DESC,m.id ASC",
             predicates.join(" AND "),
         );
         #[cfg(any(test, feature = "test-support"))]
@@ -3245,14 +3245,21 @@ impl LibraryRepository {
             let mut statement = connection.prepare(&sql)?;
             Ok(statement
                 .query_map(params_from_iter(values), |row| {
+                    let matched_resource = row
+                        .get::<_, Option<String>>(8)?
+                        .map(ResourceId::new)
+                        .transpose()
+                        .map_err(invalid_column)?;
+                    let snippet = match (&matched_resource, row.get::<_, Option<String>>(9)?) {
+                        (Some(_), Some(filename)) => attachment_match_snippet(&filename),
+                        _ => row.get(2)?,
+                    };
+                    let mut note = row_to_projection(row)?;
+                    note.snippet = snippet.clone();
                     Ok(SearchHit {
-                        note: row_to_projection(row)?,
-                        snippet: row.get(2)?,
-                        matched_resource: row
-                            .get::<_, Option<String>>(8)?
-                            .map(ResourceId::new)
-                            .transpose()
-                            .map_err(invalid_column)?,
+                        note,
+                        snippet,
+                        matched_resource,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
@@ -3483,6 +3490,40 @@ fn restore_journal_mode_on_connection(
 
 fn snippet(text: &str) -> String {
     text.chars().take(160).collect()
+}
+
+const MATCHED_ATTACHMENT_FILENAME_LIMIT: usize = 72;
+
+/// The attachment is already selected by the bounded search packet. Keep its
+/// user-visible name compact without splitting a UTF-8 character or losing a
+/// recognizable file extension.
+fn attachment_match_snippet(filename: &str) -> String {
+    let filename = filename
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let filename = truncate_attachment_filename(&filename);
+    format!("匹配附件：{filename}")
+}
+
+fn truncate_attachment_filename(filename: &str) -> String {
+    let chars = filename.chars().collect::<Vec<_>>();
+    if chars.len() <= MATCHED_ATTACHMENT_FILENAME_LIMIT {
+        return filename.to_owned();
+    }
+    let extension_start = chars
+        .iter()
+        .rposition(|ch| *ch == '.')
+        .filter(|index| *index > 0 && chars.len() - *index <= 16);
+    let extension = extension_start.map(|index| &chars[index..]).unwrap_or(&[]);
+    let prefix_len = MATCHED_ATTACHMENT_FILENAME_LIMIT
+        .saturating_sub(1)
+        .saturating_sub(extension.len());
+    chars[..prefix_len]
+        .iter()
+        .chain(std::iter::once(&'…'))
+        .chain(extension.iter())
+        .collect()
 }
 
 fn organization_title(value: &str) -> Result<String, LibraryError> {
@@ -3970,6 +4011,49 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn attachment_search_provenance_is_utf8_bounded_and_preserves_the_extension() {
+        let filename = format!("{}.png", "a".repeat(80));
+        assert_eq!(
+            attachment_match_snippet(&filename),
+            format!("匹配附件：{}….png", "a".repeat(67))
+        );
+        assert_eq!(
+            attachment_match_snippet("收据\n扫描.png"),
+            "匹配附件：收据 扫描.png"
+        );
+    }
+
+    #[test]
+    fn ordinary_note_search_keeps_its_existing_snippet_without_attachment_provenance() {
+        let profile = tempdir().expect("temporary profile");
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite"))
+            .expect("open repository");
+        let note = repository
+            .create_note(CreateNote {
+                title: "ordinary title".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![crate::document::Block::Paragraph {
+                    style: crate::document::BlockStyle::default(),
+                    inlines: vec![crate::document::Inline::Text {
+                        text: "ordinary body search term".into(),
+                        marks: Default::default(),
+                    }],
+                }]),
+            })
+            .expect("create ordinary note");
+        repository.process_search_jobs().expect("index ordinary note");
+
+        let hits = repository
+            .search(SearchQuery::parse("ordinary"))
+            .expect("search ordinary note");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].note.id, note.id);
+        assert_eq!(hits[0].matched_resource, None);
+        assert_eq!(hits[0].snippet, "ordinary body search term");
+        assert_eq!(hits[0].note.snippet, "ordinary body search term");
+    }
+
+    #[test]
     fn derived_text_is_searchable_only_while_its_exact_live_attachment_is_associated() {
         // This is deliberately injected extractor output, not a claim that an
         // OCR/PDF bridge exists. It establishes the D3a hand-off contract.
@@ -4016,6 +4100,8 @@ mod tests {
             assert_eq!(hits.len(), 1, "{term}");
             assert_eq!(hits[0].note.id, note.id);
             assert_eq!(hits[0].matched_resource, Some(resource.clone()));
+            assert_eq!(hits[0].snippet, "匹配附件：evidence.pdf");
+            assert_eq!(hits[0].note.snippet, "匹配附件：evidence.pdf");
         }
 
         // `replace_note_resources` deletes then reinserts rows. An ordinary

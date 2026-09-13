@@ -1081,6 +1081,69 @@ async fn mounted_cmd_k_search_ignores_marked_enter_and_opens_the_thirteenth_resu
 }
 
 #[gpui::test]
+async fn mounted_attachment_text_search_shows_its_attachment_in_palette_and_search_route(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let resource = repository
+        .import_resource(
+            &structural_png(16, 12),
+            "invoice-scan.png",
+            "image/png",
+            "png",
+        )
+        .expect("import verified image attachment");
+    let note = repository
+        .create_note(CreateNote {
+            title: "没有正文命中".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "invoice-scan.png".into(),
+                media_type: "image/png".into(),
+            }]),
+        })
+        .expect("associate image attachment");
+    let job = repository
+        .take_derived_text_jobs(1)
+        .expect("take derived-text job")
+        .pop()
+        .expect("associated image is queued");
+    assert!(
+        repository
+            .publish_derived_text(&job, "image-only searchable token")
+            .expect("publish bounded synthetic OCR text")
+    );
+
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_input("searchable");
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.search_palette_results.len(), 1);
+        let hit = &shell.search_palette_results[0];
+        assert_eq!(hit.note.id, note.id);
+        assert_eq!(hit.matched_resource, Some(resource.clone()));
+        assert_eq!(hit.snippet, "匹配附件：invoice-scan.png");
+        assert_eq!(hit.note.snippet, "匹配附件：invoice-scan.png");
+    });
+
+    cx.simulate_keystrokes("enter");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(model.navigation().search_query(), Some("searchable"));
+        assert_eq!(model.projections().len(), 1);
+        assert_eq!(model.projections()[0].id, note.id);
+        assert_eq!(model.projections()[0].snippet, "匹配附件：invoice-scan.png");
+    });
+}
+
+#[gpui::test]
 async fn search_palette_keyboard_reveals_a_wrapping_tail_row_in_the_real_scroll_viewport(
     cx: &mut TestAppContext,
 ) {
