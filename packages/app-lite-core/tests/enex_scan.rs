@@ -1,6 +1,7 @@
 use std::io::Write;
 
 use app_lite_core::{EnexScanError, scan_enex_file};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
@@ -127,5 +128,70 @@ fn stops_before_parsing_large_data_text_and_returns_needs_context() {
     assert!(matches!(
         scan_enex_file(fixture.path()),
         Err(EnexScanError::NeedsContext { .. })
+    ));
+}
+
+#[test]
+fn accepts_a_128_kib_resource_without_using_the_metadata_limit() {
+    // Mutation caught: routing a valid data event through the 16 KiB metadata cap.
+    let payload = vec![b'x'; 128 * 1024];
+    let xml = format!(
+        "<en-export><note><title>large-but-bounded</title><resource><data>{}</data><mime>application/octet-stream</mime></resource></note></en-export>",
+        STANDARD.encode(&payload)
+    );
+
+    let report = scan_fixture(&xml).unwrap();
+
+    assert_eq!(report.resources[0].byte_count, payload.len());
+}
+
+#[test]
+fn never_matches_a_note_media_reference_to_another_notes_same_md5_attachment() {
+    // Mutation caught: global MD5 correlation that hides a missing attachment
+    // in note A because note B happens to carry identical bytes.
+    let hash = "900150983cd24fb0d6963f7d28e17f72";
+    let xml = format!(
+        r#"<en-export><note><title>A</title><content><![CDATA[<en-note><en-media hash="{hash}" type="image/png"/></en-note>]]></content></note><note><title>B</title><resource><data>YWJj</data><mime>image/png</mime></resource></note></en-export>"#
+    );
+
+    let report = scan_fixture(&xml).unwrap();
+
+    assert_eq!(report.unresolved_media_references.len(), 1);
+    assert_eq!(report.unresolved_media_references[0].note_ordinal, 1);
+    assert_eq!(report.unreferenced_resource_ordinals, vec![1]);
+}
+
+#[test]
+fn accepts_literal_data_markup_inside_enml_cdata_and_long_legal_tag_attributes() {
+    // Mutation caught: raw preflight mistaking ENML CDATA for outer resource
+    // data or enforcing an arbitrary 256-byte XML-tag maximum.
+    let long_attribute = "a".repeat(300);
+    let xml = format!(
+        r#"<en-export><note><title>x</title><content><![CDATA[<en-note><div data-long="{long_attribute}">literal <data>not a resource</data></div></en-note>]]></content></note></en-export>"#
+    );
+
+    let report = scan_fixture(&xml).unwrap();
+
+    assert_eq!(report.counts.notes, 1);
+    assert!(report.resources.is_empty());
+}
+
+#[test]
+fn rejects_malformed_enml_and_stops_on_an_oversized_non_data_cdata_field() {
+    // Mutation caught: accepting malformed ENML nesting or handing an
+    // unbounded non-data CDATA event to quick-xml.
+    let malformed_enml = r#"<en-export><note><title>x</title><content><![CDATA[<en-note><div></en-note>]]></content></note></en-export>"#;
+    assert!(matches!(
+        scan_fixture(malformed_enml),
+        Err(EnexScanError::MalformedXml(_))
+    ));
+
+    let oversized_title = format!(
+        "<en-export><note><title><![CDATA[{}]]></title></note></en-export>",
+        "x".repeat(17 * 1024)
+    );
+    assert!(matches!(
+        scan_fixture(&oversized_title),
+        Err(EnexScanError::FieldTooLarge { .. })
     ));
 }

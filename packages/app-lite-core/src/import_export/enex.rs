@@ -9,7 +9,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{self, BufReader, Read},
+    io::{self, BufReader},
     path::Path,
 };
 
@@ -21,6 +21,7 @@ use quick_xml::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use xml_syntax_reader::{QName, Span, Visitor, parse_read_with_capacity};
 
 /// Number of notes or resource occurrences retained by one scan.
 pub const MAX_ENEX_ENTITIES: usize = 50_000;
@@ -343,10 +344,13 @@ fn append_text(
         }
         note.content.push_str(value);
     } else {
-        if field_text.len().saturating_add(value.len()) > MAX_FIELD_BYTES {
-            return Err(EnexScanError::FieldTooLarge {
-                limit: MAX_FIELD_BYTES,
-            });
+        let limit = if field == "data" {
+            MAX_ENEX_DATA_BASE64_BYTES
+        } else {
+            MAX_FIELD_BYTES
+        };
+        if field_text.len().saturating_add(value.len()) > limit {
+            return Err(EnexScanError::FieldTooLarge { limit });
         }
         field_text.push_str(value);
         if field == "data" {
@@ -488,9 +492,14 @@ fn ensure_base64_data(event: &BytesStart<'_>) -> Result<(), EnexScanError> {
 
 fn correlate_resources(report: &mut EnexScanReport) {
     let mut by_md5 = BTreeMap::<String, Vec<&EnexScannedResource>>::new();
+    let mut by_note_and_md5 = BTreeMap::<(usize, String), Vec<&EnexScannedResource>>::new();
     for resource in &report.resources {
         by_md5
             .entry(resource.md5.clone())
+            .or_default()
+            .push(resource);
+        by_note_and_md5
+            .entry((resource.note_ordinal, resource.md5.clone()))
             .or_default()
             .push(resource);
     }
@@ -501,7 +510,7 @@ fn correlate_resources(report: &mut EnexScanReport) {
     let mut referenced = BTreeSet::new();
     for note in &report.notes {
         for media in &note.media_references {
-            match by_md5.get(&media.hash_md5) {
+            match by_note_and_md5.get(&(note.ordinal, media.hash_md5.clone())) {
                 None => report
                     .unresolved_media_references
                     .push(EnexUnresolvedMediaReference {
@@ -538,162 +547,230 @@ fn correlate_resources(report: &mut EnexScanReport) {
 }
 
 fn inspect_enml(enml: &str) -> Result<(Vec<EnexMediaReference>, Vec<String>), EnexScanError> {
+    let mut reader = Reader::from_reader(enml.as_bytes());
+    let mut buffer = Vec::new();
+    let mut stack = Vec::<String>::new();
     let mut references = Vec::new();
     let mut unsupported = BTreeSet::new();
-    let bytes = enml.as_bytes();
-    let mut position = 0;
-    while let Some(relative_start) = bytes[position..].iter().position(|byte| *byte == b'<') {
-        let start = position + relative_start;
-        let Some(end) = tag_end(bytes, start) else {
-            return Err(EnexScanError::MalformedXml(
-                "unterminated ENML tag".to_owned(),
-            ));
-        };
-        let tag = std::str::from_utf8(&bytes[start + 1..end])
-            .map_err(|error| EnexScanError::MalformedXml(error.to_string()))?;
-        let trimmed = tag.trim();
-        if !trimmed.starts_with('/') && !trimmed.starts_with('!') && !trimmed.starts_with('?') {
-            let name_end = trimmed
-                .find(|character: char| character.is_ascii_whitespace() || character == '/')
-                .unwrap_or(trimmed.len());
-            let name = trimmed[..name_end].to_ascii_lowercase();
-            if name == "table" {
-                unsupported.insert("table".to_owned());
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => stack.push(inspect_enml_start(
+                &event,
+                &mut references,
+                &mut unsupported,
+            )?),
+            Ok(Event::Empty(event)) => {
+                inspect_enml_start(&event, &mut references, &mut unsupported)?;
             }
-            if name == "en-media" {
-                let attributes = parse_attributes(&trimmed[name_end..]);
-                let hash_md5 = attributes
-                    .get("hash")
-                    .cloned()
-                    .ok_or_else(|| EnexScanError::Structure("en-media without hash".to_owned()))?;
-                references.push(EnexMediaReference {
-                    hash_md5: hash_md5.to_ascii_lowercase(),
-                    mime: attributes.get("type").cloned().unwrap_or_default(),
-                });
+            Ok(Event::End(event)) => {
+                let name = event_name(event.name().as_ref())?;
+                if stack.pop().as_deref() != Some(name.as_str()) {
+                    return Err(EnexScanError::MalformedXml(
+                        "mismatched ENML nesting".to_owned(),
+                    ));
+                }
             }
+            Ok(Event::DocType(doctype)) => {
+                if doctype
+                    .as_ref()
+                    .windows(b"<!ENTITY".len())
+                    .any(|part| part.eq_ignore_ascii_case(b"<!ENTITY"))
+                {
+                    return Err(EnexScanError::UnsafeXml(
+                        "internal ENML entity declaration".to_owned(),
+                    ));
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(EnexScanError::MalformedXml(error.to_string())),
         }
-        position = end + 1;
+        buffer.clear();
+    }
+    if !stack.is_empty() {
+        return Err(EnexScanError::MalformedXml(
+            "unexpected ENML EOF".to_owned(),
+        ));
     }
     Ok((references, unsupported.into_iter().collect()))
 }
 
-fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut quote = None;
-    for (offset, byte) in bytes[start + 1..].iter().enumerate() {
-        match (*byte, quote) {
-            (b'\'' | b'\"', None) => quote = Some(*byte),
-            (byte, Some(current)) if byte == current => quote = None,
-            (b'>', None) => return Some(start + offset + 1),
-            _ => {}
+fn inspect_enml_start(
+    event: &BytesStart<'_>,
+    references: &mut Vec<EnexMediaReference>,
+    unsupported: &mut BTreeSet<String>,
+) -> Result<String, EnexScanError> {
+    let name = event_name(event.name().as_ref())?;
+    if name == "table" {
+        unsupported.insert("table".to_owned());
+    }
+    if name == "en-media" {
+        let mut hash = None;
+        let mut mime = None;
+        for attribute in event.attributes().with_checks(true) {
+            let attribute =
+                attribute.map_err(|error| EnexScanError::MalformedXml(error.to_string()))?;
+            let value = std::str::from_utf8(attribute.value.as_ref())
+                .map_err(|error| EnexScanError::MalformedXml(error.to_string()))?
+                .to_owned();
+            if attribute.key.as_ref().eq_ignore_ascii_case(b"hash") {
+                hash = Some(value);
+            } else if attribute.key.as_ref().eq_ignore_ascii_case(b"type") {
+                mime = Some(value);
+            }
         }
+        references.push(EnexMediaReference {
+            hash_md5: hash
+                .ok_or_else(|| EnexScanError::Structure("en-media without hash".to_owned()))?
+                .to_ascii_lowercase(),
+            mime: mime.unwrap_or_default(),
+        });
     }
-    None
-}
-
-fn parse_attributes(input: &str) -> BTreeMap<String, String> {
-    let mut attributes = BTreeMap::new();
-    let mut rest = input.trim();
-    while !rest.is_empty() && rest != "/" {
-        let Some(equal) = rest.find('=') else {
-            break;
-        };
-        let key = rest[..equal].trim();
-        rest = rest[equal + 1..].trim_start();
-        let Some(quote) = rest
-            .chars()
-            .next()
-            .filter(|quote| *quote == '\'' || *quote == '\"')
-        else {
-            break;
-        };
-        rest = &rest[quote.len_utf8()..];
-        let Some(end) = rest.find(quote) else {
-            break;
-        };
-        attributes.insert(key.to_ascii_lowercase(), rest[..end].to_owned());
-        rest = rest[end + quote.len_utf8()..].trim_start();
-    }
-    attributes
+    Ok(name)
 }
 
 fn preflight_large_data(path: &Path) -> Result<(), EnexScanError> {
-    let mut reader = BufReader::with_capacity(PREFLIGHT_BUFFER_BYTES, File::open(path)?);
-    let mut buffer = [0_u8; PREFLIGHT_BUFFER_BYTES];
-    let mut state = PreflightState::Outside;
-    let mut resource_ordinal = 0;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        for byte in &buffer[..read] {
-            match &mut state {
-                PreflightState::Outside => {
-                    if *byte == b'<' {
-                        state = PreflightState::Tag(vec![*byte]);
-                    }
-                }
-                PreflightState::Tag(tag) => {
-                    tag.push(*byte);
-                    if tag.len() > 256 {
-                        return Err(EnexScanError::MalformedXml("oversized XML tag".to_owned()));
-                    }
-                    if *byte == b'>' {
-                        let opening = tag.starts_with(b"<data")
-                            && tag
-                                .get(5)
-                                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>');
-                        if opening {
-                            resource_ordinal += 1;
-                            state = PreflightState::Data {
-                                bytes: 0,
-                                close: 0,
-                                ordinal: resource_ordinal,
-                            };
-                        } else {
-                            state = PreflightState::Outside;
-                        }
-                    }
-                }
-                PreflightState::Data {
-                    bytes,
-                    close,
-                    ordinal,
-                } => {
-                    const END: &[u8] = b"</data>";
-                    *bytes += 1;
-                    if *bytes > MAX_ENEX_DATA_BASE64_BYTES {
-                        return Err(EnexScanError::NeedsContext {
-                            resource_ordinal: *ordinal,
-                            limit: MAX_ENEX_DATA_BASE64_BYTES,
-                        });
-                    }
-                    if *byte == END[*close] {
-                        *close += 1;
-                        if *close == END.len() {
-                            state = PreflightState::Outside;
-                        }
-                    } else {
-                        *close = usize::from(*byte == END[0]);
-                    }
-                }
+    let mut visitor = BoundedXmlPreflight::default();
+    parse_read_with_capacity(File::open(path)?, &mut visitor, PREFLIGHT_BUFFER_BYTES).map_err(
+        |error| match error {
+            xml_syntax_reader::ReadError::Visitor(error) => error,
+            xml_syntax_reader::ReadError::Io(error) => EnexScanError::Io(error),
+            xml_syntax_reader::ReadError::Xml(error) => {
+                EnexScanError::MalformedXml(format!("{error:?}"))
             }
-        }
-    }
-    if !matches!(state, PreflightState::Outside) {
-        return Err(EnexScanError::MalformedXml(
-            "unterminated XML tag or data".to_owned(),
-        ));
-    }
-    Ok(())
+        },
+    )
 }
 
-enum PreflightState {
-    Outside,
-    Tag(Vec<u8>),
-    Data {
-        bytes: usize,
-        close: usize,
-        ordinal: usize,
-    },
+#[derive(Default)]
+struct BoundedXmlPreflight {
+    stack: Vec<(String, usize)>,
+    resource_ordinal: usize,
+    doctype: Vec<u8>,
+}
+
+impl BoundedXmlPreflight {
+    fn name(name: QName<'_>) -> Result<String, EnexScanError> {
+        std::str::from_utf8(name.as_bytes())
+            .map(|name| name.to_ascii_lowercase())
+            .map_err(|error| EnexScanError::MalformedXml(error.to_string()))
+    }
+
+    fn add_text(&mut self, bytes: &[u8]) -> Result<(), EnexScanError> {
+        let Some((name, count)) = self.stack.last_mut() else {
+            return Ok(());
+        };
+        *count = count.saturating_add(bytes.len());
+        let limit = match name.as_str() {
+            "data" => MAX_ENEX_DATA_BASE64_BYTES,
+            "content" => MAX_ENEX_CONTENT_BYTES,
+            _ => MAX_FIELD_BYTES,
+        };
+        if *count > limit {
+            return if name == "data" {
+                Err(EnexScanError::NeedsContext {
+                    resource_ordinal: self.resource_ordinal,
+                    limit,
+                })
+            } else if name == "content" {
+                Err(EnexScanError::ContentTooLarge { limit })
+            } else {
+                Err(EnexScanError::FieldTooLarge { limit })
+            };
+        }
+        Ok(())
+    }
+
+    fn close(&mut self, name: QName<'_>) -> Result<(), EnexScanError> {
+        let name = Self::name(name)?;
+        match self.stack.pop() {
+            Some((opened, _)) if opened == name => Ok(()),
+            _ => Err(EnexScanError::MalformedXml(
+                "mismatched element nesting".to_owned(),
+            )),
+        }
+    }
+}
+
+impl Visitor for BoundedXmlPreflight {
+    type Error = EnexScanError;
+
+    fn start_tag_open(&mut self, name: QName<'_>) -> Result<(), Self::Error> {
+        let name = Self::name(name)?;
+        if name == "data" {
+            self.resource_ordinal += 1;
+        }
+        if self.stack.len() >= 4096 {
+            return Err(EnexScanError::Structure(
+                "XML nesting exceeds 4096".to_owned(),
+            ));
+        }
+        self.stack.push((name, 0));
+        Ok(())
+    }
+
+    fn empty_element_end(&mut self, _: Span) -> Result<(), Self::Error> {
+        self.stack
+            .pop()
+            .ok_or_else(|| EnexScanError::MalformedXml("empty element without start".to_owned()))?;
+        Ok(())
+    }
+
+    fn end_tag(&mut self, name: QName<'_>) -> Result<(), Self::Error> {
+        self.close(name)
+    }
+    fn characters(&mut self, text: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.add_text(text)
+    }
+    fn cdata_content(&mut self, text: &[u8], _: Span) -> Result<(), Self::Error> {
+        self.add_text(text)
+    }
+
+    fn entity_ref(&mut self, name: &[u8], _: Span) -> Result<(), Self::Error> {
+        if !matches!(name, b"amp" | b"lt" | b"gt" | b"apos" | b"quot") {
+            return Err(EnexScanError::UnsafeXml(
+                "general entity reference".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn xml_declaration(
+        &mut self,
+        _: &[u8],
+        encoding: Option<&[u8]>,
+        _: Option<bool>,
+        _: Span,
+    ) -> Result<(), Self::Error> {
+        if encoding.is_some_and(|value| !value.eq_ignore_ascii_case(b"utf-8")) {
+            return Err(EnexScanError::UnsafeXml(
+                "non-UTF-8 XML declaration".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn doctype_content(&mut self, content: &[u8], _: Span) -> Result<(), Self::Error> {
+        if self.doctype.len().saturating_add(content.len()) > MAX_FIELD_BYTES {
+            return Err(EnexScanError::FieldTooLarge {
+                limit: MAX_FIELD_BYTES,
+            });
+        }
+        self.doctype.extend_from_slice(content);
+        Ok(())
+    }
+
+    fn doctype_end(&mut self, _: Span) -> Result<(), Self::Error> {
+        if self
+            .doctype
+            .windows(b"<!ENTITY".len())
+            .any(|part| part.eq_ignore_ascii_case(b"<!ENTITY"))
+        {
+            return Err(EnexScanError::UnsafeXml(
+                "internal entity declaration".to_owned(),
+            ));
+        }
+        self.doctype.clear();
+        Ok(())
+    }
 }

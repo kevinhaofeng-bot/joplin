@@ -24,6 +24,7 @@ serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
 thiserror = "2"
+xml-syntax-reader = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -56,16 +56,35 @@ no whitespace errors
 
 ## Limits and explicit follow-up gate
 
-`quick-xml` materializes one text event. C1 therefore first scans raw input
-with a fixed 64 KiB buffer. A `<data>` text payload over 4 MiB returns
-`EnexScanError::NeedsContext` before XML parsing, including the generated
-21 MiB test fixture. C1 **does not claim bounded streaming decode for large
-resources**. Later staging needs a proven streaming XML/base64 path (or an
-isolated temporary-file decoder) before accepting large attachments.
+### Review correction: bounded outer syntax preflight
+
+The initial raw-byte preflight was replaced after independent review: it could
+misread CDATA/comment/quoted contexts, arbitrarily rejected a legal tag over
+256 bytes, and `quick-xml` could still materialize a long non-data text event.
+C1 now uses `xml-syntax-reader` with a fixed 64 KiB input buffer before the
+existing semantic scan. Its visitor receives text, CDATA, DOCTYPE, and
+attribute-value chunks at buffer boundaries; C1 keeps its own element stack,
+rejects mismatched nesting/entities/internal DTD entities/non-UTF-8 XML, and
+enforces field limits before `quick-xml` is invoked. The semantic parser sees
+only input whose data field is at most 4 MiB, content at most 4 MiB, and other
+text at most 16 KiB.
+
+A `<data>` text payload over 4 MiB returns `EnexScanError::NeedsContext`
+before `quick-xml` parsing, including the generated 21 MiB test fixture. C1
+**does not claim >20 MiB streaming decode/import success**. Later staging
+needs a proven incremental base64 decoder (for example, an isolated temporary
+file plus incremental MD5/SHA-256) before it can accept large attachments.
+
+The new mutation-sensitive tests also prove that a 128 KiB ordinary resource
+is accepted (not constrained by the 16 KiB metadata limit), a media reference
+in note A cannot be satisfied by same-MD5 bytes in note B, literal `<data>`
+inside ENML CDATA is ordinary ENML, a 300-byte legal attribute is accepted,
+malformed ENML is rejected by a strict event stack, and an oversized non-data
+CDATA field is rejected by the outer bounded visitor.
 
 ENML content is retained only up to 4 MiB and ordinary metadata fields up to
-16 KiB; note/resource occurrence counts are capped at 50,000. The raw data
-preflight is conservative: a literal `<data ...>` inside ENML CDATA can be
-classified as a data field and produce `NeedsContext`; that is safe but may
-need a context-aware streaming tokenizer in the later staging work. Tables are
-reported rather than flattened because `CanonicalDocument` has no table model.
+16 KiB; note/resource occurrence counts are capped at 50,000. The syntax
+reader itself has a documented 1,000-byte atomic XML-name cap; tags with normal
+long attribute values are streamed and accepted, but a name beyond that cap is
+rejected rather than buffered without bound. Tables are reported rather than
+flattened because `CanonicalDocument` has no table model.
