@@ -23,7 +23,7 @@ pub enum DocumentError {
 const MAX_DOM_DEPTH: usize = 4096;
 const MAX_DOM_NODES: usize = 1_000_000;
 const MAX_LINK_LENGTH: usize = 8 * 1024;
-const MAX_RETAINED_LINK_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_RETAINED_LINK_BYTES: usize = 64 * 1024;
 // A decoded image's dimensions are bounded separately by the resource intake
 // path. This persistence bound keeps malformed HTML from manufacturing an
 // absurd first-frame layout while still accepting ordinary high-resolution

@@ -31,3 +31,50 @@ Final commands after the last DOCTYPE correction: `cargo fmt`,
 passed: 67 unit, 4 document, 16 ENEX, 4 ENML conversion, 27 JEX,
 15 migration, 8 organization, 7 repository flow, 7 resource-store tests;
 empty/doc groups passed). This is still pending independent review.
+
+## Independent review round 1 correction
+
+Review of the initial C2a commit requested three Important and one Minor
+correction. RED tests first demonstrated:
+
+1. Root-level `Text` followed by CDATA became `<p>前</p><p>后</p>` instead of
+   one text flow; root inline marks/media and `<br/>` also needed one flow.
+2. A synthetic group of 400 links exceeded the canonical document's 64 KiB
+   retained-link budget yet converted successfully after link marks were
+   silently removed. An `<a>` surrounding an image likewise lost link
+   semantics because canonical `Inline::Image` has no link mark.
+3. `<div><en-media image/></div>` became a paragraph with inline image rather
+   than the editor's structural `Block::Image`.
+
+GREEN: root inline siblings now share a paragraph until a block boundary,
+preserving text/CDATA/inline-media order and soft breaks. The converter reuses
+the canonical link-budget constant and conservatively charges potential text
+runs before projection; it blocks linked media rather than discarding the
+link. Standalone images render with the canonical block-image marker, and the
+test checks both exact HTML and `Block::Image`. A div with only one nonblank
+media child also maps to that block form. Focused `enml_convert` result after
+the correction: **7 passed**.
+
+The link precheck can reject a dense but potentially representable document;
+this is intentional fail-closed behavior until a precise projection-proof
+mapping is available. It does not broaden C2a's pure-conversion scope.
+
+Final review-round-1 commands: `cargo fmt`, `cargo test --test enml_convert`
+(7 passed), `cargo fmt --check` (clean), `git diff --check` (clean), and
+`cargo test --quiet` (all core groups passed: 67 unit, 4 document, 16 ENEX,
+7 ENML conversion, 27 JEX, 15 migration, 8 organization, 7 repository flow,
+7 resource-store tests; empty/doc groups passed).
+
+Additional self-review before the fix commit: nested XML anchors
+`<a href=A>甲<a href=B>乙</a>丙</a>` were accepted even though HTML5 repairs
+their nesting. A RED test reproduced the successful lossy conversion; GREEN
+rejects any descendant anchor under an anchor. Root media followed by
+whitespace and CDATA text was likewise split into an image block plus text;
+RED→GREEN lookahead now skips whitespace-only root callbacks when deciding
+whether adjacent media belongs to the same inline flow. The standalone image
+block test remains green.
+
+After these last two corrections: `cargo fmt`, focused `cargo test --test
+enml_convert` (7 passed), `cargo fmt --check` (clean), `git diff --check`
+(clean), and final `cargo test --quiet` (all core groups passed with the same
+counts above).

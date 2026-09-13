@@ -2,7 +2,7 @@
 //! This module never reads a profile or writes a resource.
 
 use crate::{
-    document::{CanonicalDocument, CanonicalHtml, SearchText, valid_link},
+    document::{CanonicalDocument, CanonicalHtml, MAX_RETAINED_LINK_BYTES, SearchText, valid_link},
     resource::ResourceId,
 };
 use quick_xml::{
@@ -65,12 +65,50 @@ pub fn convert_enml(
 ) -> Result<EnmlConversion, EnmlFidelityBlocker> {
     let root = parse_enml(enml)?;
     let mut html = String::new();
-    let context = RenderContext {
+    let mut context = RenderContext {
         resources: same_note_resources,
+        conservative_link_bytes: 0,
     };
+    let mut inline_run = false;
     for (index, child) in root.children.iter().enumerate() {
         let path = format!("/en-note/{index}");
-        context.block(child, &path, &mut html)?;
+        let root_inline = match child {
+            Child::Text(text) => inline_run || !text.trim().is_empty(),
+            Child::Element(element) => {
+                matches!(
+                    element.name.as_str(),
+                    "b" | "strong"
+                        | "i"
+                        | "em"
+                        | "u"
+                        | "s"
+                        | "strike"
+                        | "del"
+                        | "mark"
+                        | "span"
+                        | "a"
+                ) || (element.name == "en-media"
+                    && (inline_run || next_root_flow_child(&root.children, index)))
+                    || (element.name == "br"
+                        && (inline_run || next_root_flow_child(&root.children, index)))
+            }
+        };
+        if root_inline {
+            if !inline_run {
+                html.push_str("<p>");
+                inline_run = true;
+            }
+            context.inline(child, &path, &mut html)?;
+        } else {
+            if inline_run {
+                html.push_str("</p>");
+                inline_run = false;
+            }
+            context.block(child, &path, &mut html)?;
+        }
+    }
+    if inline_run {
+        html.push_str("</p>");
     }
     let document = CanonicalDocument::parse_html(&html)
         .map_err(|e| blocked("/en-note", format!("canonical parser: {e}")))?;
@@ -83,6 +121,34 @@ pub fn convert_enml(
         search_text,
         resource_ids,
     })
+}
+
+fn root_flow_child(child: &Child) -> bool {
+    match child {
+        Child::Text(text) => !text.trim().is_empty(),
+        Child::Element(element) => matches!(
+            element.name.as_str(),
+            "b" | "strong"
+                | "i"
+                | "em"
+                | "u"
+                | "s"
+                | "strike"
+                | "del"
+                | "mark"
+                | "span"
+                | "a"
+                | "br"
+        ),
+    }
+}
+
+fn next_root_flow_child(children: &[Child], index: usize) -> bool {
+    children
+        .iter()
+        .skip(index + 1)
+        .find(|child| !matches!(child, Child::Text(text) if text.trim().is_empty()))
+        .is_some_and(root_flow_child)
 }
 
 fn parse_enml(input: &str) -> Result<Element, EnmlFidelityBlocker> {
@@ -246,10 +312,11 @@ fn append_text(value: &str, stack: &mut [Element]) -> Result<(), EnmlFidelityBlo
 
 struct RenderContext<'a> {
     resources: &'a BTreeMap<String, Vec<VerifiedEnmlResource>>,
+    conservative_link_bytes: usize,
 }
 impl RenderContext<'_> {
     fn block(
-        &self,
+        &mut self,
         child: &Child,
         path: &str,
         out: &mut String,
@@ -265,8 +332,8 @@ impl RenderContext<'_> {
             Child::Element(element) => match element.name.as_str() {
                 "div" | "p" | "h1" | "h2" | "h3" => {
                     self.attrs(element, &[], path)?;
-                    if element.name == "div" && element.children.len() == 1 {
-                        if let Child::Element(media) = &element.children[0] {
+                    if element.name == "div" && element.children.iter().filter(|child| !matches!(child, Child::Text(text) if text.trim().is_empty())).count() == 1 {
+                        if let Some(Child::Element(media)) = element.children.iter().find(|child| !matches!(child, Child::Text(text) if text.trim().is_empty())) {
                             if media.name == "en-media" {
                                 return self.media(media, &format!("{path}/0"), out, false);
                             }
@@ -303,7 +370,7 @@ impl RenderContext<'_> {
         }
     }
     fn inline(
-        &self,
+        &mut self,
         child: &Child,
         path: &str,
         out: &mut String,
@@ -333,12 +400,35 @@ impl RenderContext<'_> {
                 };
                 if tag == "a" {
                     self.attrs(element, &["href"], path)?;
+                    if element.children.iter().any(contains_media) {
+                        return Err(blocked(
+                            path,
+                            "linked image is not representable in canonical inline model",
+                        ));
+                    }
+                    if element.children.iter().any(contains_anchor) {
+                        return Err(blocked(path, "nested links cannot be projected faithfully"));
+                    }
                     let href = element
                         .attrs
                         .get("href")
                         .ok_or_else(|| blocked(path, "link missing href"))?;
                     if !valid_link(href) || href.chars().any(char::is_whitespace) {
                         return Err(blocked(path, format!("unsafe link {href}")));
+                    }
+                    let runs = element
+                        .children
+                        .iter()
+                        .map(conservative_link_runs)
+                        .sum::<usize>();
+                    if runs == 0 {
+                        return Err(blocked(path, "empty link cannot be represented"));
+                    }
+                    let charge = href.len().saturating_mul(runs);
+                    self.conservative_link_bytes =
+                        self.conservative_link_bytes.saturating_add(charge);
+                    if self.conservative_link_bytes > MAX_RETAINED_LINK_BYTES {
+                        return Err(blocked(path, "canonical link retention budget exceeded"));
                     }
                     out.push_str("<a href=\"");
                     escape(href, out);
@@ -366,7 +456,7 @@ impl RenderContext<'_> {
         }
     }
     fn list(
-        &self,
+        &mut self,
         element: &Element,
         path: &str,
         out: &mut String,
@@ -440,7 +530,7 @@ impl RenderContext<'_> {
         Ok(())
     }
     fn media(
-        &self,
+        &mut self,
         element: &Element,
         path: &str,
         out: &mut String,
@@ -489,7 +579,11 @@ impl RenderContext<'_> {
             return Err(blocked(path, "unsafe or empty resource filename"));
         }
         if resource.mime.starts_with("image/") {
-            out.push_str("<img src=\":/");
+            if inline {
+                out.push_str("<img src=\":/");
+            } else {
+                out.push_str("<img data-joplin-lite-block-image=\"true\" src=\":/");
+            }
             out.push_str(resource.resource_id.as_str());
             out.push_str("\" alt=\"");
             escape(&resource.filename, out);
@@ -530,6 +624,34 @@ impl RenderContext<'_> {
             }
         }
         Ok(())
+    }
+}
+
+fn contains_media(child: &Child) -> bool {
+    match child {
+        Child::Text(_) => false,
+        Child::Element(element) => {
+            element.name == "en-media" || element.children.iter().any(contains_media)
+        }
+    }
+}
+
+fn contains_anchor(child: &Child) -> bool {
+    match child {
+        Child::Text(_) => false,
+        Child::Element(element) => {
+            element.name == "a" || element.children.iter().any(contains_anchor)
+        }
+    }
+}
+
+// A conservative upper bound on canonical text runs after whitespace and
+// line-break normalization. Over-rejection is explicit; silent link loss is not.
+fn conservative_link_runs(child: &Child) -> usize {
+    match child {
+        Child::Text(text) if text.is_empty() => 0,
+        Child::Text(text) => 2 + text.chars().filter(|c| matches!(c, '\n' | '\r')).count(),
+        Child::Element(element) => element.children.iter().map(conservative_link_runs).sum(),
     }
 }
 

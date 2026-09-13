@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use app_lite_core::document::Block;
 use app_lite_core::import_export::{EnmlFidelityBlocker, VerifiedEnmlResource, convert_enml};
 use app_lite_core::resource::ResourceId;
 
@@ -120,4 +121,65 @@ fn malformed_xml_and_inline_checkbox_are_fidelity_blockers() {
     ] {
         assert!(convert_enml(enml, &BTreeMap::new()).is_err());
     }
+}
+
+#[test]
+fn root_text_cdata_and_inline_media_keep_one_flow() {
+    // Mutation caught: each root Text/CDATA callback becoming a separate paragraph.
+    let plain = convert_enml("<en-note>前<![CDATA[后]]></en-note>", &BTreeMap::new()).unwrap();
+    assert_eq!(plain.html.as_str(), "<p>前后</p>");
+    assert_eq!(plain.search_text.as_str(), "前后");
+    let enml = format!(
+        "<en-note>甲<em>乙</em><en-media hash=\"{IMAGE_MD5}\" type=\"image/png\"/>丙</en-note>"
+    );
+    let mixed = convert_enml(&enml, &resources()).unwrap();
+    assert_eq!(
+        mixed.html.as_str(),
+        format!("<p>甲<em>乙</em><img src=\":/{IMAGE_ID}\" alt=\"图.png\">丙</p>")
+    );
+    assert_eq!(mixed.search_text.as_str(), "甲乙图.png丙");
+    let broken = convert_enml("<en-note>前<br/>后</en-note>", &BTreeMap::new()).unwrap();
+    assert_eq!(broken.html.as_str(), "<p>前<br>后</p>");
+    assert_eq!(broken.search_text.as_str(), "前\n后");
+    let spaced = format!(
+        "<en-note><en-media hash=\"{IMAGE_MD5}\" type=\"image/png\"/> <![CDATA[后]]></en-note>"
+    );
+    let spaced = convert_enml(&spaced, &resources()).unwrap();
+    assert_eq!(
+        spaced.html.as_str(),
+        format!("<p><img src=\":/{IMAGE_ID}\" alt=\"图.png\"> 后</p>")
+    );
+}
+
+#[test]
+fn blocks_link_budget_overflow_and_linked_images_before_canonical_projection() {
+    // Mutation caught: canonical projection silently removing a link mark or
+    // a link surrounding an image while conversion still reports success.
+    let href = format!("https://example.com/{}", "a".repeat(180));
+    let links = (0..400)
+        .map(|_| format!("<a href=\"{href}\">x</a>"))
+        .collect::<String>();
+    let enml = format!("<en-note><div>{links}</div></en-note>");
+    assert!(convert_enml(&enml, &BTreeMap::new()).is_err());
+    let linked = format!(
+        "<en-note><div><a href=\"https://example.com\"><en-media hash=\"{IMAGE_MD5}\" type=\"image/png\"/></a></div></en-note>"
+    );
+    assert!(convert_enml(&linked, &resources()).is_err());
+    let nested = "<en-note><div><a href=\"https://example.com/a\">甲<a href=\"https://example.com/b\">乙</a>丙</a></div></en-note>";
+    assert!(convert_enml(nested, &BTreeMap::new()).is_err());
+}
+
+#[test]
+fn a_div_containing_only_an_image_becomes_a_structural_image_block() {
+    // Mutation caught: an isolated image being projected as a paragraph with
+    // inline image instead of the editor's structural image block.
+    let enml = format!(
+        "<en-note><div><en-media hash=\"{IMAGE_MD5}\" type=\"image/png\"/></div></en-note>"
+    );
+    let converted = convert_enml(&enml, &resources()).unwrap();
+    assert_eq!(
+        converted.html.as_str(),
+        format!("<img data-joplin-lite-block-image=\"true\" src=\":/{IMAGE_ID}\" alt=\"图.png\">")
+    );
+    assert!(matches!(converted.document.blocks(), [Block::Image { .. }]));
 }
