@@ -73,8 +73,9 @@ separate queue-order test verifies PDF-first/new-image-first behavior.
   `editor::selection::tests::cross_block_cut_writes_markdown_deletes_range_and_undo_restores`.
   Both crate format checks and `git diff --check` passed.
 - Explicit ignored ordinary-GUI smoke, serialized: Debug **2/2** and fresh
-  Release **2/2** (PDF plus real-image OCR). The Release build timestamp is
-  2026-09-13 08:09:16 +0800, 9,424,736-byte executable, SHA-256
+  Release **2/2** (PDF plus real-image OCR). A second Release build after the
+  checkpoint's test-only formatting change retained the same hash; its final
+  timestamp is 2026-09-13 08:15:07 +0800, 9,424,736-byte executable, SHA-256
   `14d9a8a3de8833f0c7e26559a40490d63a5fd298f5e6ed79959495104e8d8376`.
   `otool -L` lists existing ImageIO, but no direct Vision or PDFKit link.
 - Release smoke's informational, post-index parent RSS sample: PDF profile
