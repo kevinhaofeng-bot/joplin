@@ -1316,9 +1316,11 @@ impl LibraryShell {
             let _derived_text_task_lifetime = derived_text_task_lifetime;
             let mut scheduled = true;
             let mut image_not_before = Instant::now() + DERIVED_IMAGE_STARTUP_DELAY;
+            let mut deferred_image = false;
             loop {
                 if scheduled {
                     scheduled = false;
+                    deferred_image = false;
                     let worker_repository = Arc::clone(&repository);
                     let worker_cancelled = Arc::clone(&derived_text_cancelled);
                     let defer_images_until = image_not_before;
@@ -1348,6 +1350,8 @@ impl LibraryShell {
                         .await;
                     match result {
                         Some(Ok((outcome, kind))) => {
+                            deferred_image = outcome.is_none()
+                                && kind == Some(crate::extractor::DerivedTextWorkKind::Image);
                             if kind == Some(crate::extractor::DerivedTextWorkKind::Image)
                                 && outcome.is_some()
                             {
@@ -1404,7 +1408,8 @@ impl LibraryShell {
                         _ => {}
                     }
                 }
-                if !scheduled && Instant::now() >= image_not_before {
+                if deferred_image && !scheduled && Instant::now() >= image_not_before {
+                    deferred_image = false;
                     scheduled = true;
                 }
                 if refresh_search_route
