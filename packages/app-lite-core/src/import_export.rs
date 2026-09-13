@@ -27,6 +27,7 @@ mod jex_body;
 pub use jex_body::*;
 mod jex_html;
 mod jex_qualification;
+mod jex_qualification_source;
 pub use jex_qualification::*;
 
 /// Maximum number of tar entries accepted by a preflight scan.

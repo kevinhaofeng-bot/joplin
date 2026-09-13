@@ -23,6 +23,7 @@ const ROOT_B: &str = "99999999999999999999999999999999";
 const CHILD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BAD_TIME: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const GIF_RESOURCE: &str = "cccccccccccccccccccccccccccccccc";
+const MISSING_TARGET: &str = "dddddddddddddddddddddddddddddddd";
 
 fn append(tar: &mut Builder<File>, path: &str, bytes: &[u8]) {
     let mut header = Header::new_gnu();
@@ -405,9 +406,10 @@ fn preflight_semantic_gate_has_classified_counts_without_opening_spool() {
     let parent = tempdir().unwrap();
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     let report = qualify_jex_archive(&source, parent.path()).unwrap();
-    assert!(!report.semantic_scan_completed);
+    assert!(report.semantic_scan_completed);
     assert!(!report.ready_for_current_stage);
     assert_eq!(report.metadata_item_type_counts, vec![(1, 1), (7, 1)]);
+    assert_eq!(report.unclassifiable_item_type_counts, vec![(1, 1), (7, 1)]);
     assert_eq!(
         report
             .category(JexQualificationBlockerKind::PreflightEncrypted)
@@ -514,4 +516,178 @@ fn clean_archive_without_notes_is_not_reported_ready_for_the_strict_stage() {
         fs::read(parent.path().join("sentinel.bin")).unwrap(),
         b"keep"
     );
+}
+
+fn nonclean_fixture(reverse: bool) -> TempPath {
+    let resource_metadata = format!(
+        "图.png\n\nid: {RESOURCE}\ntype_: 4\nmime: image/png\nfile_extension: png\nsize: -1\ncreated_time: 2023-11-14T22:13:21.000Z\nupdated_time: 2023-11-14T22:13:22.000Z\n"
+    );
+    let mut png = vec![0_u8; 10 * 1024 * 1024 + 1];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut entries = vec![
+        (
+            format!("{ROOT_A}.md"),
+            exporter_folder(ROOT_A, "", "项目").into_bytes(),
+        ),
+        (
+            format!("{CHILD}.md"),
+            exporter_folder(CHILD, ROOT_A, "子本").into_bytes(),
+        ),
+        (
+            format!("{CLEAN}.md"),
+            exporter_note(
+                CLEAN,
+                &format!("[缺失](:/{MISSING_TARGET})\n\n![图](:/{RESOURCE})"),
+                &[("parent_id", ROOT_A)],
+            )
+            .into_bytes(),
+        ),
+        (
+            format!("{URL_ORDER}.md"),
+            exporter_note(
+                URL_ORDER,
+                "来源",
+                &[("source_url", "https://example.org"), ("order", "9")],
+            )
+            .into_bytes(),
+        ),
+        (
+            format!("{TODO}.md"),
+            exporter_note(
+                TODO,
+                "任务",
+                &[("is_todo", "1"), ("todo_due", "1700000000000")],
+            )
+            .into_bytes(),
+        ),
+        (format!("{RESOURCE}.md"), resource_metadata.into_bytes()),
+        (format!("resources/{RESOURCE}.png"), png),
+    ];
+    if reverse {
+        entries.reverse();
+    }
+    archive(|tar| {
+        for (path, bytes) in entries {
+            append(tar, &path, &bytes);
+        }
+    })
+}
+
+#[test]
+fn nonclean_jex_still_aggregates_later_semantics_without_creating_a_profile() {
+    // Mutation caught: returning the preflight-only report immediately after
+    // an unresolved internal link or a resource over the current Store cap.
+    let source = nonclean_fixture(false);
+    let original = fs::read(&source).unwrap();
+    let parent = tempdir().unwrap();
+    fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
+    let report = qualify_jex_archive(&source, parent.path()).unwrap();
+    assert_eq!(report.counts.notes, 3);
+    assert!(report.semantic_scan_completed);
+    assert!(!report.ready_for_current_stage);
+    assert_eq!(
+        report
+            .category(JexQualificationBlockerKind::PreflightIntegrity)
+            .unwrap()
+            .item_count,
+        1
+    );
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::PreflightIntegrity)
+            .unwrap()
+            .samples
+            .iter()
+            .any(|sample| sample.source_id == CLEAN
+                && sample.related_source_id.as_deref() == Some(MISSING_TARGET))
+    );
+    assert_eq!(
+        report
+            .category(JexQualificationBlockerKind::PreflightStoreLimit)
+            .unwrap()
+            .item_count,
+        1
+    );
+    assert_eq!(
+        report
+            .category(JexQualificationBlockerKind::UnmappedSemanticField)
+            .unwrap()
+            .item_count,
+        2
+    );
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::UnmappedSemanticField)
+            .unwrap()
+            .samples
+            .iter()
+            .any(|sample| sample.source_id == URL_ORDER
+                && sample.field.as_deref() == Some("source_url"))
+    );
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::UnmappedSemanticField)
+            .unwrap()
+            .samples
+            .iter()
+            .any(|sample| sample.source_id == TODO && sample.field.as_deref() == Some("is_todo"))
+    );
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::FolderHierarchy)
+            .unwrap()
+            .samples
+            .iter()
+            .any(|sample| sample.source_id == ROOT_A && sample.reason.contains("both own notes"))
+    );
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::ExporterFieldGap)
+            .is_some()
+    );
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(
+        listing(parent.path()),
+        vec![std::ffi::OsString::from("sentinel.bin")]
+    );
+    assert_eq!(
+        fs::read(parent.path().join("sentinel.bin")).unwrap(),
+        b"keep"
+    );
+    let reversed = nonclean_fixture(true);
+    let reversed_report = qualify_jex_archive(&reversed, parent.path()).unwrap();
+    assert_eq!(report, reversed_report);
+    assert_eq!(
+        listing(parent.path()),
+        vec![std::ffi::OsString::from("sentinel.bin")]
+    );
+}
+
+#[test]
+fn unknown_exporter_fields_have_bounded_report_memory() {
+    // Mutation caught: retaining every attacker-controlled property name in
+    // the report rather than the single unknown-field aggregate bucket.
+    let mut note = exporter_note(CLEAN, "正文", &[]);
+    for index in 0..500 {
+        note.push_str(&format!("\n{}{:04}: value", "x".repeat(4000), index));
+    }
+    let source = archive(|tar| append(tar, &format!("{CLEAN}.md"), note.as_bytes()));
+    let parent = tempdir().unwrap();
+    let report = qualify_jex_archive(&source, parent.path()).unwrap();
+    assert!(report.semantic_scan_completed);
+    let unknown = report
+        .category(JexQualificationBlockerKind::UnknownField)
+        .unwrap();
+    assert_eq!(unknown.item_count, 1);
+    assert_eq!(unknown.finding_count, 500);
+    assert_eq!(unknown.samples.len(), 8);
+    assert!(unknown.samples.iter().all(|sample| sample.field.is_none()));
+    assert!(report.fields.len() < 50);
+    assert!(
+        report
+            .fields
+            .iter()
+            .any(|field| field.field == "<unknown>" && field.occurrence_count == 500)
+    );
+    assert!(listing(parent.path()).is_empty());
 }

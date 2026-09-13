@@ -467,11 +467,12 @@ pub(super) fn validate_source_item(raw: &super::JexRawSourceItem) -> Result<(), 
     }
 }
 
-pub(super) fn validate_source_resource(
-    prepared: &super::JexPreparedSource,
-    source: &super::JexScannedResource,
+pub(super) fn verify_source_signature_prefix(
+    source_id: &str,
+    mime: &str,
+    prefix: &[u8],
 ) -> Result<(), JexStageError> {
-    resources::validate_source_resource(prepared, source)
+    resources::verify_signature_prefix(source_id, mime, prefix)
 }
 
 fn count(db: &Connection, table: &str) -> Result<i64, JexStageError> {

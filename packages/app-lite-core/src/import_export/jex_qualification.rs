@@ -4,6 +4,7 @@
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::Path,
     sync::{
         Arc,
@@ -12,10 +13,10 @@ use std::{
 };
 use thiserror::Error;
 
+use super::jex_qualification_source::{JexQualificationSource, prepare_jex_qualification_source};
 use super::{
-    JexPrepareError, JexPreparedSource, JexScanCounts, JexScanReport, JexVerifiedResource,
-    convert_jex_note_body, parse_item, prepare_jex_source_archive,
-    prepare_jex_source_archive_with_cancel,
+    JexPrepareError, JexPreparedSource, JexRawSourceItem, JexScanCounts, JexScanReport,
+    JexScannedResource, JexVerifiedResource, convert_jex_note_body, parse_item,
 };
 use crate::ResourceId;
 
@@ -57,6 +58,8 @@ pub struct JexQualifiedField {
 pub struct JexQualificationSample {
     pub source_id: String,
     pub source_path: String,
+    /// Referenced internal target when the blocker is a dangling source link.
+    pub related_source_id: Option<String>,
     pub field: Option<String>,
     pub reason: String,
 }
@@ -75,6 +78,9 @@ pub struct JexQualificationReport {
     /// Every metadata item seen by the scanner, including encrypted and
     /// unsupported types excluded from the legacy supported-class counts.
     pub metadata_item_type_counts: Vec<(i64, usize)>,
+    /// Types whose encrypted payload or unsupported class cannot be
+    /// semantically classified, even though their raw bytes were verified.
+    pub unclassifiable_item_type_counts: Vec<(i64, usize)>,
     /// Bounded MIME distribution for the completed semantic pass only.
     pub resource_mime_counts: Vec<(String, usize)>,
     pub categories: Vec<JexQualificationCategory>,
@@ -136,6 +142,7 @@ impl ReportBuilder {
             category.samples.push(JexQualificationSample {
                 source_id: id.to_owned(),
                 source_path: path.to_owned(),
+                related_source_id: None,
                 field: field.map(str::to_owned),
                 reason: reason.into(),
             });
@@ -175,6 +182,7 @@ impl ReportBuilder {
         JexQualificationReport {
             counts: source.counts.clone(),
             metadata_item_type_counts: item_type_counts(source),
+            unclassifiable_item_type_counts: unclassifiable_counts(source),
             resource_mime_counts: Vec::new(),
             ready_for_current_stage: categories.is_empty(),
             categories,
@@ -188,6 +196,23 @@ fn item_type_counts(source: &JexScanReport) -> Vec<(i64, usize)> {
     let mut counts = BTreeMap::new();
     for item in &source.metadata_items {
         *counts.entry(item.item_type).or_insert(0) += 1;
+    }
+    counts.into_iter().collect()
+}
+
+fn unclassifiable_counts(source: &JexScanReport) -> Vec<(i64, usize)> {
+    let encrypted = source
+        .encrypted_item_ids
+        .iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut counts = BTreeMap::new();
+    for item in &source.metadata_items {
+        if encrypted.contains(&item.source_id.to_ascii_lowercase())
+            || ![1, 2, 4, 5, 6].contains(&item.item_type)
+        {
+            *counts.entry(item.item_type).or_insert(0) += 1;
+        }
     }
     counts.into_iter().collect()
 }
@@ -207,7 +232,12 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
     let mut seen = BTreeMap::<JexQualificationBlockerKind, BTreeSet<String>>::new();
     // A preflight report is a coverage boundary, not a claim that later
     // exporter fields or bodies were inspected. Samples remain ID/path only.
-    let mut add = |kind, id: &str, path: &str, field: Option<&str>, reason: &'static str| {
+    let mut add = |kind,
+                   id: &str,
+                   path: &str,
+                   related: Option<&str>,
+                   field: Option<&str>,
+                   reason: &'static str| {
         let key = if id.is_empty() { path } else { id };
         let category = builder
             .categories
@@ -226,6 +256,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
             category.samples.push(JexQualificationSample {
                 source_id: id.to_owned(),
                 source_path: path.to_owned(),
+                related_source_id: related.map(str::to_owned),
                 field: field.map(str::to_owned),
                 reason: reason.to_owned(),
             });
@@ -236,6 +267,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
             JexQualificationBlockerKind::PreflightEncrypted,
             id,
             paths.get(&id.to_ascii_lowercase()).copied().unwrap_or(""),
+            None,
             None,
             "encrypted source item blocks verified spool",
         );
@@ -248,6 +280,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
                 .get(&item.source_id.to_ascii_lowercase())
                 .copied()
                 .unwrap_or(""),
+            None,
             Some("type_"),
             "item type is outside supported JEX classes",
         );
@@ -258,6 +291,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
             &item.source_id,
             &item.archive_path,
             None,
+            None,
             "resource exceeds current store compatibility limit",
         );
     }
@@ -266,6 +300,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
             JexQualificationBlockerKind::PreflightIntegrity,
             "",
             path,
+            None,
             None,
             "duplicate archive path",
         );
@@ -276,6 +311,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
             id,
             paths.get(&id.to_ascii_lowercase()).copied().unwrap_or(""),
             None,
+            None,
             "duplicate source item ID",
         );
     }
@@ -284,6 +320,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
             JexQualificationBlockerKind::PreflightIntegrity,
             "",
             path,
+            None,
             None,
             "resource metadata has no physical file",
         );
@@ -294,6 +331,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
             "",
             path,
             None,
+            None,
             "physical resource has no metadata",
         );
     }
@@ -302,6 +340,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
             JexQualificationBlockerKind::PreflightIntegrity,
             id,
             paths.get(&id.to_ascii_lowercase()).copied().unwrap_or(""),
+            None,
             None,
             "relation endpoint is absent",
         );
@@ -314,6 +353,7 @@ fn preflight_report(source: JexScanReport) -> JexQualificationReport {
                 .get(&reference.note_id.to_ascii_lowercase())
                 .copied()
                 .unwrap_or(""),
+            Some(&reference.resource_id),
             Some("body"),
             "note body refers to missing internal item",
         );
@@ -715,10 +755,66 @@ fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), JexQualificationError
     }
 }
 
+trait QualificationRead {
+    fn report(&self) -> &JexScanReport;
+    fn raw_item(&self, id: &str) -> Result<Option<JexRawSourceItem>, JexPrepareError>;
+    fn verified_resource_prefix(
+        &self,
+        source: &JexScannedResource,
+    ) -> Result<Vec<u8>, JexPrepareError>;
+}
+
+impl QualificationRead for JexPreparedSource {
+    fn report(&self) -> &JexScanReport {
+        self.report()
+    }
+    fn raw_item(&self, id: &str) -> Result<Option<JexRawSourceItem>, JexPrepareError> {
+        self.raw_item(id)
+    }
+    fn verified_resource_prefix(
+        &self,
+        source: &JexScannedResource,
+    ) -> Result<Vec<u8>, JexPrepareError> {
+        let (physical, mut file) = self
+            .open_verified_resource(&source.source_id)?
+            .ok_or_else(|| JexPrepareError::Verification("verified resource disappeared".into()))?;
+        if physical.archive_path != source.archive_path
+            || physical.byte_count != source.byte_count
+            || physical.sha256 != source.sha256
+        {
+            return Err(JexPrepareError::Verification(
+                "resource source evidence differs".into(),
+            ));
+        }
+        let mut prefix = [0u8; 8];
+        let count = file.read(&mut prefix)?;
+        Ok(prefix[..count].to_vec())
+    }
+}
+
+impl QualificationRead for JexQualificationSource {
+    fn report(&self) -> &JexScanReport {
+        self.report()
+    }
+    fn raw_item(&self, id: &str) -> Result<Option<JexRawSourceItem>, JexPrepareError> {
+        self.raw_item(id)
+    }
+    fn verified_resource_prefix(
+        &self,
+        source: &JexScannedResource,
+    ) -> Result<Vec<u8>, JexPrepareError> {
+        self.verified_prefix(&source.source_id)
+            .map(|prefix| prefix.to_vec())
+            .ok_or_else(|| {
+                JexPrepareError::Verification("qualified resource prefix disappeared".into())
+            })
+    }
+}
+
 /// Inspects one bounded UTF-8 raw item at a time; only IDs, parent IDs,
 /// titles, counts and bounded samples persist, never aggregate note bodies.
-fn qualify_prepared(
-    prepared: &JexPreparedSource,
+fn qualify_prepared<S: QualificationRead>(
+    prepared: &S,
     cancel: Option<&AtomicBool>,
 ) -> Result<JexQualificationReport, JexQualificationError> {
     let source = prepared.report();
@@ -731,6 +827,11 @@ fn qualify_prepared(
     let mut resource_map = BTreeMap::new();
     let mut resource_validation = BTreeMap::new();
     let mut mime_counts = BTreeMap::<String, usize>::new();
+    let encrypted = source
+        .encrypted_item_ids
+        .iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
     for scanned in &source.resources {
         check_cancel(cancel)?;
         let raw = prepared
@@ -780,7 +881,10 @@ fn qualify_prepared(
                 },
             },
         );
-        if let Err(error) = super::jex_stage::validate_source_resource(prepared, scanned) {
+        let prefix = prepared.verified_resource_prefix(scanned)?;
+        if let Err(error) = super::jex_stage::validate_source_item(&raw).and_then(|_| {
+            super::jex_stage::verify_source_signature_prefix(&scanned.source_id, mime, &prefix)
+        }) {
             resource_validation.insert(scanned.source_id.to_ascii_lowercase(), error.to_string());
         }
     }
@@ -791,6 +895,11 @@ fn qualify_prepared(
             .ok_or_else(|| JexQualificationError::Source(item.source_id.clone()))?;
         if raw.archive_path != item.archive_path || raw.raw_sha256 != item.raw_sha256 {
             return Err(JexQualificationError::Source(item.source_id.clone()));
+        }
+        if encrypted.contains(&item.source_id.to_ascii_lowercase())
+            || ![1, 2, 4, 5, 6].contains(&item.item_type)
+        {
+            continue;
         }
         let content = std::str::from_utf8(&raw.raw_bytes)
             .map_err(|_| JexQualificationError::Source(raw.archive_path.clone()))?;
@@ -1103,11 +1212,7 @@ pub fn qualify_jex_archive(
     source: impl AsRef<Path>,
     staging_parent: impl AsRef<Path>,
 ) -> Result<JexQualificationReport, JexQualificationError> {
-    match prepare_jex_source_archive(source, staging_parent) {
-        Ok(prepared) => qualify_prepared(&prepared, None),
-        Err(JexPrepareError::PreflightBlocked { report }) => Ok(preflight_report(*report)),
-        Err(error) => Err(error.into()),
-    }
+    qualify_archive_inner(source.as_ref(), staging_parent.as_ref(), None)
 }
 
 pub fn qualify_jex_archive_with_cancel(
@@ -1115,9 +1220,21 @@ pub fn qualify_jex_archive_with_cancel(
     staging_parent: impl AsRef<Path>,
     cancel: Arc<AtomicBool>,
 ) -> Result<JexQualificationReport, JexQualificationError> {
-    match prepare_jex_source_archive_with_cancel(source, staging_parent, cancel.clone()) {
-        Ok(prepared) => qualify_prepared(&prepared, Some(&cancel)),
-        Err(JexPrepareError::PreflightBlocked { report }) => Ok(preflight_report(*report)),
-        Err(error) => Err(error.into()),
+    qualify_archive_inner(source.as_ref(), staging_parent.as_ref(), Some(cancel))
+}
+
+fn qualify_archive_inner(
+    archive: &Path,
+    staging_parent: &Path,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<JexQualificationReport, JexQualificationError> {
+    let source = prepare_jex_qualification_source(archive, staging_parent, cancel.clone())?;
+    let mut report = qualify_prepared(&source, cancel.as_deref())?;
+    if !source.report().is_clean() {
+        let preflight = preflight_report(source.report().clone());
+        report.categories.extend(preflight.categories);
+        report.categories.sort_by_key(|category| category.kind);
+        report.ready_for_current_stage = false;
     }
+    Ok(report)
 }

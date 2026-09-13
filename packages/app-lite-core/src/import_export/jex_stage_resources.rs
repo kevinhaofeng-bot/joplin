@@ -105,13 +105,22 @@ pub(super) fn validate_source_item(raw: &JexRawSourceItem) -> Result<(), JexStag
 fn verify_signature(source_id: &str, mime: &str, file: &mut File) -> Result<(), JexStageError> {
     let mut prefix = [0_u8; 8];
     let count = file.read(&mut prefix)?;
+    let result = verify_signature_prefix(source_id, mime, &prefix[..count]);
+    file.seek(SeekFrom::Start(0))?;
+    result
+}
+
+pub(super) fn verify_signature_prefix(
+    source_id: &str,
+    mime: &str,
+    prefix: &[u8],
+) -> Result<(), JexStageError> {
     let valid = match mime {
-        "image/png" => count >= 8 && prefix == *b"\x89PNG\r\n\x1a\n",
-        "image/jpeg" => count >= 3 && prefix[..3] == [0xff, 0xd8, 0xff],
-        "application/pdf" => count >= 5 && prefix[..5] == *b"%PDF-",
+        "image/png" => prefix.len() >= 8 && prefix[..8] == *b"\x89PNG\r\n\x1a\n",
+        "image/jpeg" => prefix.len() >= 3 && prefix[..3] == [0xff, 0xd8, 0xff],
+        "application/pdf" => prefix.len() >= 5 && prefix[..5] == *b"%PDF-",
         _ => true,
     };
-    file.seek(SeekFrom::Start(0))?;
     if valid {
         Ok(())
     } else {
@@ -120,28 +129,6 @@ fn verify_signature(source_id: &str, mime: &str, file: &mut File) -> Result<(), 
             "physical resource signature does not match MIME",
         ))
     }
-}
-
-pub(super) fn validate_source_resource(
-    prepared: &JexPreparedSource,
-    source: &JexScannedResource,
-) -> Result<(), JexStageError> {
-    let raw = prepared.raw_item(&source.source_id)?.ok_or_else(|| {
-        JexStageError::Verification("verified resource metadata disappeared".into())
-    })?;
-    let fields = parse_metadata(&raw)?;
-    let (physical, mut file) = prepared
-        .open_verified_resource(&source.source_id)?
-        .ok_or_else(|| JexStageError::Verification("verified resource file disappeared".into()))?;
-    if physical.archive_path != source.archive_path
-        || physical.byte_count != source.byte_count
-        || physical.sha256 != source.sha256
-    {
-        return Err(JexStageError::Verification(
-            "resource source evidence differs".into(),
-        ));
-    }
-    verify_signature(&source.source_id, &fields.mime, &mut file)
 }
 
 pub(super) fn import_one(
