@@ -84,6 +84,34 @@ fn write_tar_octal(field: &mut [u8], value: u64) {
 }
 
 #[test]
+fn reports_raw_item_bytes_separately_from_canonical_note_body() {
+    // Mutation caught: hashing the parsed lines as though they preserved CRLF.
+    let raw = format!("中文标题\r\n\r\n正文\r\n第二行\r\n\r\nid: {NOTE}\r\ntype_: 1\r\n");
+    let archive = write_archive(|builder| {
+        append_bytes(builder, &format!("{NOTE}.md"), raw.as_bytes());
+    });
+    let report = scan_jex_archive(&archive).unwrap();
+    assert_eq!(report.metadata_items.len(), 1);
+    let item = &report.metadata_items[0];
+    assert_eq!(item.archive_path, format!("{NOTE}.md"));
+    assert_eq!(item.source_id, NOTE);
+    assert_eq!(item.item_type, 1);
+    assert_eq!(item.byte_count, raw.len() as u64);
+    assert_eq!(
+        item.raw_sha256,
+        format!("{:x}", Sha256::digest(raw.as_bytes()))
+    );
+    assert_eq!(
+        item.canonical_note_body_sha256.as_deref(),
+        Some(format!("{:x}", Sha256::digest("正文\n第二行".as_bytes())).as_str())
+    );
+    assert_ne!(
+        item.raw_sha256,
+        item.canonical_note_body_sha256.clone().unwrap()
+    );
+}
+
+#[test]
 fn scans_complete_jex_without_reading_resource_into_item_memory() {
     let resource_bytes = b"a small resource";
     let archive = write_archive(|builder| {

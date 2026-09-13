@@ -19,6 +19,8 @@ mod enex;
 pub use enex::*;
 mod enml;
 pub use enml::*;
+mod jex_spool;
+pub use jex_spool::*;
 
 /// Maximum number of tar entries accepted by a preflight scan.
 pub const MAX_JEX_ARCHIVE_ENTRIES: usize = 50_000;
@@ -91,6 +93,19 @@ pub struct JexPhysicalResourceFile {
     pub sha256: String,
 }
 
+/// Evidence for one bounded UTF-8 raw exporter item. The raw digest covers
+/// its exact archive bytes; the optional body digest covers Joplin's parsed,
+/// newline-normalized note body and is not a byte-exact source digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexScannedMetadataItem {
+    pub archive_path: String,
+    pub source_id: String,
+    pub item_type: i64,
+    pub byte_count: u64,
+    pub raw_sha256: String,
+    pub canonical_note_body_sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JexStoreCompatibilityBlocker {
     pub source_id: String,
@@ -114,7 +129,9 @@ pub struct JexNoteBodyResourceReference {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JexScanReport {
     pub counts: JexScanCounts,
+    pub archive_entry_count: usize,
     pub source_ids: JexSourceIds,
+    pub metadata_items: Vec<JexScannedMetadataItem>,
     pub resources: Vec<JexScannedResource>,
     pub physical_resource_files: Vec<JexPhysicalResourceFile>,
     /// Resources that are structurally valid JEX entries but exceed the
@@ -204,6 +221,7 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
             return Err(JexScanError::TooManyEntries);
         }
         let mut entry = entry?;
+        report.archive_entry_count += 1;
         let entry_type = entry.header().entry_type();
         // Raw iteration exposes extension records before tar can materialize
         // their payload. JEX's fixed ASCII paths never require them.
@@ -225,13 +243,25 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
         }
 
         if let Some(id) = root_item_id(&archive_path) {
-            let item = parse_item(&archive_path, read_item(&mut entry, &archive_path)?)?;
+            let raw = read_item(&mut entry, &archive_path)?;
+            let raw_sha256 = format!("{:x}", Sha256::digest(raw.as_bytes()));
+            let byte_count = raw.len() as u64;
+            let item = parse_item(&archive_path, &raw)?;
             if item.normalized_id != id.to_ascii_lowercase() {
                 return Err(JexScanError::MalformedItem {
                     path: archive_path,
                     reason: "metadata id does not match its root file name".to_owned(),
                 });
             }
+            report.metadata_items.push(JexScannedMetadataItem {
+                archive_path: archive_path.clone(),
+                source_id: item.id.clone(),
+                item_type: item.item_type,
+                byte_count,
+                raw_sha256,
+                canonical_note_body_sha256: (item.item_type == 1)
+                    .then(|| format!("{:x}", Sha256::digest(item.note_body.as_bytes()))),
+            });
             if !seen_ids.insert(item.normalized_id.clone()) {
                 report.duplicate_item_ids.push(item.id.clone());
             }
@@ -481,7 +511,7 @@ fn read_item<R: Read>(entry: &mut tar::Entry<'_, R>, path: &str) -> Result<Strin
     })
 }
 
-fn parse_item(path: &str, content: String) -> Result<ParsedItem, JexScanError> {
+fn parse_item(path: &str, content: &str) -> Result<ParsedItem, JexScanError> {
     let lines: Vec<&str> = content.lines().collect();
     let properties_start = lines
         .iter()
@@ -898,6 +928,9 @@ fn tar_entry_kind(entry_type: EntryType) -> String {
 }
 
 fn sort_report(report: &mut JexScanReport) {
+    report
+        .metadata_items
+        .sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
     report.source_ids.notes.sort();
     report.source_ids.folders.sort();
     report.source_ids.resource_metadata.sort();
