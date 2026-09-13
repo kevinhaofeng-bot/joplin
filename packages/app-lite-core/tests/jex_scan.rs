@@ -191,6 +191,48 @@ fn uses_joplins_jpeg_fallback_not_a_nearby_mime_tables_first_suffix() {
 }
 
 #[test]
+fn uses_joplins_generated_mime_table_for_audio_mpeg_without_file_extension() {
+    let archive = write_archive(|builder| {
+        append_bytes(
+            builder,
+            &format!("{RESOURCE}.md"),
+            item(RESOURCE, 4, "mime: audio/mpeg").as_bytes(),
+        );
+        // Joplin's source table lists mpga, mp2, mp2a, mp3... and its
+        // serializer selects the first three-character value: mp2.
+        append_bytes(builder, &format!("resources/{RESOURCE}.mp2"), b"audio");
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert!(report.is_clean());
+    assert_eq!(
+        report.resources[0].archive_path,
+        format!("resources/{RESOURCE}.mp2")
+    );
+}
+
+#[test]
+fn uses_extensionless_filename_when_mime_is_not_in_joplins_table() {
+    let archive = write_archive(|builder| {
+        append_bytes(
+            builder,
+            &format!("{RESOURCE}.md"),
+            item(RESOURCE, 4, "mime: application/x-not-in-joplin-table").as_bytes(),
+        );
+        append_bytes(builder, &format!("resources/{RESOURCE}"), b"unknown");
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert!(report.is_clean());
+    assert_eq!(
+        report.resources[0].archive_path,
+        format!("resources/{RESOURCE}")
+    );
+}
+
+#[test]
 fn rejects_duplicate_archive_paths() {
     let archive = write_archive(|builder| {
         append_bytes(builder, &format!("{NOTE}.md"), item(NOTE, 1, "").as_bytes());

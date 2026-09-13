@@ -106,7 +106,6 @@ pub struct JexScanReport {
     pub duplicate_archive_paths: Vec<String>,
     pub duplicate_item_ids: Vec<String>,
     pub missing_resource_files: Vec<String>,
-    pub unresolved_resource_filenames: Vec<String>,
     pub orphan_note_tag_relations: Vec<String>,
     pub orphan_physical_resource_files: Vec<String>,
     pub unsupported_items: Vec<JexUnsupportedItem>,
@@ -122,7 +121,6 @@ impl JexScanReport {
         self.duplicate_archive_paths.is_empty()
             && self.duplicate_item_ids.is_empty()
             && self.missing_resource_files.is_empty()
-            && self.unresolved_resource_filenames.is_empty()
             && self.orphan_note_tag_relations.is_empty()
             && self.orphan_physical_resource_files.is_empty()
             && self.unsupported_items.is_empty()
@@ -142,7 +140,7 @@ struct ParsedItem {
 #[derive(Debug)]
 struct ResourceMetadata {
     source_id: String,
-    archive_path: Option<String>,
+    archive_path: String,
     mime: String,
 }
 
@@ -282,12 +280,7 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
 
     let mut resource_paths_with_metadata = BTreeSet::new();
     for metadata in metadata_resources {
-        let Some(archive_path) = metadata.archive_path else {
-            report
-                .unresolved_resource_filenames
-                .push(metadata.source_id);
-            continue;
-        };
+        let archive_path = metadata.archive_path;
         if let Some(physical) = physical_resources.get(&archive_path) {
             resource_paths_with_metadata.insert(archive_path.clone());
             add_compatibility_blocker(
@@ -500,10 +493,7 @@ fn parse_item(path: &str, content: String) -> Result<ParsedItem, JexScanError> {
     })
 }
 
-fn resource_archive_path(
-    item: &ParsedItem,
-    item_path: &str,
-) -> Result<Option<String>, JexScanError> {
+fn resource_archive_path(item: &ParsedItem, item_path: &str) -> Result<String, JexScanError> {
     let encrypted_blob = is_truthy(item.properties.get("encryption_blob_encrypted"));
     let extension = if encrypted_blob {
         Some("crypted".to_owned())
@@ -520,36 +510,23 @@ fn resource_archive_path(
         }
         Some(extension.clone())
     } else {
-        match joplin_extension_for_mime(item.properties.get("mime").map(String::as_str)) {
-            MimeExtension::Exact(extension) => extension.map(str::to_owned),
-            MimeExtension::Unresolved => return Ok(None),
-        }
+        joplin_extension_for_mime(item.properties.get("mime").map(String::as_str))
+            .map(str::to_owned)
     };
-    Ok(Some(match extension {
+    Ok(match extension {
         Some(extension) => format!("resources/{}.{}", item.id, extension),
         None => format!("resources/{}", item.id),
-    }))
+    })
 }
 
-enum MimeExtension {
-    Exact(Option<&'static str>),
-    Unresolved,
-}
+const JOPLIN_MIME_EXTENSIONS: &str = include_str!("joplin_mime_extensions.tsv");
 
-fn joplin_extension_for_mime(mime: Option<&str>) -> MimeExtension {
-    // Exact choices from Joplin's mime-utils-types.ts after its documented
-    // three-character preference. Unknown MIME values remain explicit rather
-    // than borrowing a differently ordered MIME database.
-    match mime.map(str::to_ascii_lowercase).as_deref() {
-        None | Some("application/x-unknown") => MimeExtension::Exact(None),
-        Some("application/octet-stream") => MimeExtension::Exact(Some("bin")),
-        Some("application/pdf") => MimeExtension::Exact(Some("pdf")),
-        Some("image/jpeg") | Some("image/jpg") => MimeExtension::Exact(Some("jpg")),
-        Some("image/png") => MimeExtension::Exact(Some("png")),
-        Some("image/gif") => MimeExtension::Exact(Some("gif")),
-        Some("text/plain") => MimeExtension::Exact(Some("txt")),
-        _ => MimeExtension::Unresolved,
-    }
+fn joplin_extension_for_mime(mime: Option<&str>) -> Option<&'static str> {
+    let mime = mime?.to_ascii_lowercase();
+    JOPLIN_MIME_EXTENSIONS.lines().find_map(|line| {
+        let (known_mime, extension) = line.split_once('\t')?;
+        (known_mime == mime).then_some(extension)
+    })
 }
 
 fn stream_resource<R: Read>(
@@ -661,11 +638,27 @@ fn sort_report(report: &mut JexScanReport) {
     report.duplicate_archive_paths.sort();
     report.duplicate_item_ids.sort();
     report.missing_resource_files.sort();
-    report.unresolved_resource_filenames.sort();
     report.orphan_note_tag_relations.sort();
     report.orphan_physical_resource_files.sort();
     report
         .unsupported_items
         .sort_by(|left, right| left.source_id.cmp(&right.source_id));
     report.encrypted_item_ids.sort();
+}
+
+#[cfg(test)]
+mod generated_mime_table_tests {
+    use super::JOPLIN_MIME_EXTENSIONS;
+
+    #[test]
+    fn retains_the_full_generated_joplin_projection_and_key_suffix_choices() {
+        let rows: Vec<_> = JOPLIN_MIME_EXTENSIONS
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        assert_eq!(rows.len(), 770);
+        assert!(rows.contains(&"audio/mpeg\tmp2"));
+        assert!(rows.contains(&"image/jpeg\tjpg"));
+        assert!(rows.contains(&"text/markdown\tmd"));
+    }
 }
