@@ -106,17 +106,25 @@ pub struct JexScanReport {
     pub duplicate_archive_paths: Vec<String>,
     pub duplicate_item_ids: Vec<String>,
     pub missing_resource_files: Vec<String>,
+    pub unresolved_resource_filenames: Vec<String>,
+    pub orphan_note_tag_relations: Vec<String>,
+    pub orphan_physical_resource_files: Vec<String>,
     pub unsupported_items: Vec<JexUnsupportedItem>,
     pub encrypted_item_ids: Vec<String>,
 }
 
 impl JexScanReport {
     /// A clean scan is structurally safe and contains no skipped or incomplete
-    /// source data. It still says nothing about a later import operation.
+    /// source archive entities. It does not parse note bodies, so it does not
+    /// prove every `:/<id>` inline body link has resource metadata. It also
+    /// says nothing about a later import operation.
     pub fn is_clean(&self) -> bool {
         self.duplicate_archive_paths.is_empty()
             && self.duplicate_item_ids.is_empty()
             && self.missing_resource_files.is_empty()
+            && self.unresolved_resource_filenames.is_empty()
+            && self.orphan_note_tag_relations.is_empty()
+            && self.orphan_physical_resource_files.is_empty()
             && self.unsupported_items.is_empty()
             && self.encrypted_item_ids.is_empty()
             && self.store_compatibility_blockers.is_empty()
@@ -134,8 +142,15 @@ struct ParsedItem {
 #[derive(Debug)]
 struct ResourceMetadata {
     source_id: String,
-    archive_path: String,
+    archive_path: Option<String>,
     mime: String,
+}
+
+#[derive(Debug)]
+struct NoteTagRelation {
+    source_id: String,
+    note_id: String,
+    tag_id: String,
 }
 
 #[derive(Debug)]
@@ -157,25 +172,30 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
     let mut seen_ids = BTreeSet::new();
     let mut metadata_resources = Vec::new();
     let mut physical_resources = BTreeMap::new();
+    let mut note_tag_relations = Vec::new();
+    let mut note_ids = BTreeSet::new();
+    let mut tag_ids = BTreeSet::new();
 
-    for (index, entry) in archive.entries()?.enumerate() {
+    for (index, entry) in archive.entries()?.raw(true).enumerate() {
         if index >= MAX_JEX_ARCHIVE_ENTRIES {
             return Err(JexScanError::TooManyEntries);
         }
         let mut entry = entry?;
-        let archive_path = checked_archive_path(&entry)?;
         let entry_type = entry.header().entry_type();
+        // Raw iteration exposes extension records before tar can materialize
+        // their payload. JEX's fixed ASCII paths never require them.
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(JexScanError::UnsafeArchiveEntry {
+                path: raw_archive_path_for_error(&entry),
+                kind: tar_entry_kind(entry_type),
+            });
+        }
+        let archive_path = checked_archive_path(&entry)?;
         if entry_type.is_dir() {
             if archive_path != "resources" && archive_path != "resources/" {
                 return Err(JexScanError::UnexpectedArchivePath(archive_path));
             }
             continue;
-        }
-        if !entry_type.is_file() {
-            return Err(JexScanError::UnsafeArchiveEntry {
-                path: archive_path,
-                kind: tar_entry_kind(entry_type),
-            });
         }
         if !seen_paths.insert(archive_path.clone()) {
             return Err(JexScanError::DuplicateArchivePath(archive_path));
@@ -197,11 +217,14 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
                 continue;
             }
             match item.item_type {
-                1 => add_id(
-                    &mut report.source_ids.notes,
-                    &mut report.counts.notes,
-                    item.id,
-                ),
+                1 => {
+                    note_ids.insert(item.normalized_id);
+                    add_id(
+                        &mut report.source_ids.notes,
+                        &mut report.counts.notes,
+                        item.id,
+                    );
+                }
                 2 => add_id(
                     &mut report.source_ids.folders,
                     &mut report.counts.folders,
@@ -220,13 +243,21 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
                         item.id,
                     );
                 }
-                5 => add_id(
-                    &mut report.source_ids.tags,
-                    &mut report.counts.tags,
-                    item.id,
-                ),
+                5 => {
+                    tag_ids.insert(item.normalized_id);
+                    add_id(
+                        &mut report.source_ids.tags,
+                        &mut report.counts.tags,
+                        item.id,
+                    );
+                }
                 6 => {
                     validate_note_tag(&item, &archive_path)?;
+                    note_tag_relations.push(NoteTagRelation {
+                        source_id: item.id.clone(),
+                        note_id: item.properties["note_id"].to_ascii_lowercase(),
+                        tag_id: item.properties["tag_id"].to_ascii_lowercase(),
+                    });
                     add_id(
                         &mut report.source_ids.note_tag_relations,
                         &mut report.counts.note_tag_relations,
@@ -251,28 +282,43 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
 
     let mut resource_paths_with_metadata = BTreeSet::new();
     for metadata in metadata_resources {
-        if let Some(physical) = physical_resources.get(&metadata.archive_path) {
-            resource_paths_with_metadata.insert(metadata.archive_path.clone());
+        let Some(archive_path) = metadata.archive_path else {
+            report
+                .unresolved_resource_filenames
+                .push(metadata.source_id);
+            continue;
+        };
+        if let Some(physical) = physical_resources.get(&archive_path) {
+            resource_paths_with_metadata.insert(archive_path.clone());
             add_compatibility_blocker(
                 &mut report,
                 &metadata.source_id,
-                &metadata.archive_path,
+                &archive_path,
                 physical.byte_count,
                 resource_store_limit_for_mime(&metadata.mime),
             );
             report.resources.push(JexScannedResource {
                 source_id: metadata.source_id,
-                archive_path: metadata.archive_path,
+                archive_path,
                 byte_count: physical.byte_count,
                 sha256: physical.sha256.clone(),
             });
         } else {
-            report.missing_resource_files.push(metadata.archive_path);
+            report.missing_resource_files.push(archive_path);
+        }
+    }
+
+    for relation in note_tag_relations {
+        if !note_ids.contains(&relation.note_id) || !tag_ids.contains(&relation.tag_id) {
+            report.orphan_note_tag_relations.push(relation.source_id);
         }
     }
 
     for (archive_path, physical) in physical_resources {
         if !resource_paths_with_metadata.contains(&archive_path) {
+            report
+                .orphan_physical_resource_files
+                .push(archive_path.clone());
             add_compatibility_blocker(
                 &mut report,
                 &physical.source_id,
@@ -295,6 +341,10 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
     Ok(report)
 }
 
+fn raw_archive_path_for_error<R: Read>(entry: &tar::Entry<'_, R>) -> String {
+    String::from_utf8_lossy(entry.path_bytes().as_ref()).into_owned()
+}
+
 fn resource_store_limit_for_mime(mime: &str) -> u64 {
     if mime.to_ascii_lowercase().starts_with("image/") {
         crate::resource::MAX_IMAGE_BYTES as u64
@@ -310,14 +360,18 @@ fn add_compatibility_blocker(
     byte_count: u64,
     limit: u64,
 ) {
-    if byte_count > limit {
+    if byte_count == 0 || byte_count > limit {
         report
             .store_compatibility_blockers
             .push(JexStoreCompatibilityBlocker {
                 source_id: source_id.to_owned(),
                 archive_path: archive_path.to_owned(),
                 byte_count,
-                reason: format!("exceeds current ResourceStore limit of {limit} bytes"),
+                reason: if byte_count == 0 {
+                    "zero-byte resource is rejected by the current ResourceStore".to_owned()
+                } else {
+                    format!("exceeds current ResourceStore limit of {limit} bytes")
+                },
             });
     }
 }
@@ -446,7 +500,10 @@ fn parse_item(path: &str, content: String) -> Result<ParsedItem, JexScanError> {
     })
 }
 
-fn resource_archive_path(item: &ParsedItem, item_path: &str) -> Result<String, JexScanError> {
+fn resource_archive_path(
+    item: &ParsedItem,
+    item_path: &str,
+) -> Result<Option<String>, JexScanError> {
     let encrypted_blob = is_truthy(item.properties.get("encryption_blob_encrypted"));
     let extension = if encrypted_blob {
         Some("crypted".to_owned())
@@ -463,26 +520,36 @@ fn resource_archive_path(item: &ParsedItem, item_path: &str) -> Result<String, J
         }
         Some(extension.clone())
     } else {
-        joplin_extension_for_mime(item.properties.get("mime").map(String::as_str))
+        match joplin_extension_for_mime(item.properties.get("mime").map(String::as_str)) {
+            MimeExtension::Exact(extension) => extension.map(str::to_owned),
+            MimeExtension::Unresolved => return Ok(None),
+        }
     };
-    Ok(match extension {
+    Ok(Some(match extension {
         Some(extension) => format!("resources/{}.{}", item.id, extension),
         None => format!("resources/{}", item.id),
-    })
+    }))
 }
 
-fn joplin_extension_for_mime(mime: Option<&str>) -> Option<String> {
-    // Joplin's mime-utils table chooses the first three-character suffix and
-    // otherwise its first suffix. `mime_guess` supplies the corresponding
-    // broad MIME table so a scanner does not falsely report ordinary resource
-    // files missing merely because they are not PDF or image files.
-    let mime = mime?.to_ascii_lowercase();
-    let extensions = mime_guess::get_mime_extensions_str(&mime)?;
-    extensions
-        .iter()
-        .find(|extension| extension.len() == 3)
-        .or_else(|| extensions.first())
-        .map(|extension| (*extension).to_owned())
+enum MimeExtension {
+    Exact(Option<&'static str>),
+    Unresolved,
+}
+
+fn joplin_extension_for_mime(mime: Option<&str>) -> MimeExtension {
+    // Exact choices from Joplin's mime-utils-types.ts after its documented
+    // three-character preference. Unknown MIME values remain explicit rather
+    // than borrowing a differently ordered MIME database.
+    match mime.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("application/x-unknown") => MimeExtension::Exact(None),
+        Some("application/octet-stream") => MimeExtension::Exact(Some("bin")),
+        Some("application/pdf") => MimeExtension::Exact(Some("pdf")),
+        Some("image/jpeg") | Some("image/jpg") => MimeExtension::Exact(Some("jpg")),
+        Some("image/png") => MimeExtension::Exact(Some("png")),
+        Some("image/gif") => MimeExtension::Exact(Some("gif")),
+        Some("text/plain") => MimeExtension::Exact(Some("txt")),
+        _ => MimeExtension::Unresolved,
+    }
 }
 
 fn stream_resource<R: Read>(
@@ -565,6 +632,12 @@ fn tar_entry_kind(entry_type: EntryType) -> String {
         "symlink".to_owned()
     } else if entry_type.is_hard_link() {
         "hardlink".to_owned()
+    } else if entry_type.is_gnu_longname() {
+        "gnu-longname".to_owned()
+    } else if entry_type.is_gnu_longlink() {
+        "gnu-longlink".to_owned()
+    } else if entry_type.is_pax_local_extensions() || entry_type.is_pax_global_extensions() {
+        "pax-extension".to_owned()
     } else {
         format!("{:?}", entry_type)
     }
@@ -588,6 +661,9 @@ fn sort_report(report: &mut JexScanReport) {
     report.duplicate_archive_paths.sort();
     report.duplicate_item_ids.sort();
     report.missing_resource_files.sort();
+    report.unresolved_resource_filenames.sort();
+    report.orphan_note_tag_relations.sort();
+    report.orphan_physical_resource_files.sort();
     report
         .unsupported_items
         .sort_by(|left, right| left.source_id.cmp(&right.source_id));

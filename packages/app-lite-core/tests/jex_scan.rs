@@ -60,6 +60,24 @@ fn write_unsafe_parent_path_archive() -> TempPath {
     path
 }
 
+fn write_oversized_gnu_longname_header() -> TempPath {
+    let archive = NamedTempFile::new().unwrap();
+    let path = archive.into_temp_path();
+    let mut file = File::create(&path).unwrap();
+    let mut header = [0u8; 512];
+    header[..14].copy_from_slice(b"././@LongLink\0");
+    write_tar_octal(&mut header[100..108], 0o644);
+    write_tar_octal(&mut header[124..136], 16 * 1024 * 1024);
+    header[148..156].fill(b' ');
+    header[156] = b'L';
+    header[257..263].copy_from_slice(b"ustar\0");
+    let checksum: u64 = header.iter().map(|byte| *byte as u64).sum();
+    write_tar_octal(&mut header[148..156], checksum);
+    file.write_all(&header).unwrap();
+    file.write_all(&[0; 1024]).unwrap();
+    path
+}
+
 fn write_tar_octal(field: &mut [u8], value: u64) {
     let encoded = format!("{:0width$o}\0", value, width = field.len() - 1);
     field.copy_from_slice(encoded.as_bytes());
@@ -153,6 +171,26 @@ fn reports_missing_resource_with_extensionless_joplin_filename() {
 }
 
 #[test]
+fn uses_joplins_jpeg_fallback_not_a_nearby_mime_tables_first_suffix() {
+    let archive = write_archive(|builder| {
+        append_bytes(
+            builder,
+            &format!("{RESOURCE}.md"),
+            item(RESOURCE, 4, "mime: image/jpeg").as_bytes(),
+        );
+        append_bytes(builder, &format!("resources/{RESOURCE}.jpg"), b"jpeg");
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert!(report.is_clean());
+    assert_eq!(
+        report.resources[0].archive_path,
+        format!("resources/{RESOURCE}.jpg")
+    );
+}
+
+#[test]
 fn rejects_duplicate_archive_paths() {
     let archive = write_archive(|builder| {
         append_bytes(builder, &format!("{NOTE}.md"), item(NOTE, 1, "").as_bytes());
@@ -235,6 +273,51 @@ fn records_unsupported_and_encrypted_items_without_counting_them_as_supported() 
     assert_eq!(report.unsupported_items[0].source_id, unsupported);
     assert_eq!(report.encrypted_item_ids, vec![encrypted]);
     assert_eq!(report.counts.notes, 0);
+}
+
+#[test]
+fn reports_note_tag_whose_note_or_tag_is_absent_from_archive() {
+    let archive = write_archive(|builder| {
+        append_bytes(
+            builder,
+            &format!("{NOTE_TAG}.md"),
+            item(NOTE_TAG, 6, &format!("note_id: {NOTE}\ntag_id: {TAG}")).as_bytes(),
+        );
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert_eq!(report.orphan_note_tag_relations, vec![NOTE_TAG]);
+    assert!(!report.is_clean());
+}
+
+#[test]
+fn reports_physical_resource_without_metadata_as_orphan() {
+    let archive = write_archive(|builder| {
+        append_bytes(builder, &format!("resources/{RESOURCE}.bin"), b"orphan");
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert_eq!(
+        report.orphan_physical_resource_files,
+        vec![format!("resources/{RESOURCE}.bin")]
+    );
+    assert!(!report.is_clean());
+}
+
+#[test]
+fn rejects_longname_extension_before_reading_its_declared_payload() {
+    let archive = write_oversized_gnu_longname_header();
+    let error = scan_jex_archive(&archive).unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            JexScanError::UnsafeArchiveEntry { ref kind, .. } if kind == "gnu-longname"
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -340,6 +423,28 @@ fn records_image_above_current_image_store_limit_as_compatibility_blocker() {
             .reason
             .contains("10485760")
     );
+}
+
+#[test]
+fn records_zero_byte_resource_as_current_store_compatibility_blocker() {
+    let archive = write_archive(|builder| {
+        append_bytes(
+            builder,
+            &format!("{RESOURCE}.md"),
+            item(RESOURCE, 4, "file_extension: bin").as_bytes(),
+        );
+        append_bytes(builder, &format!("resources/{RESOURCE}.bin"), b"");
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert_eq!(report.store_compatibility_blockers.len(), 1);
+    assert!(
+        report.store_compatibility_blockers[0]
+            .reason
+            .contains("zero-byte")
+    );
+    assert!(!report.is_clean());
 }
 
 struct RepeatingReader {
