@@ -1144,6 +1144,84 @@ async fn mounted_attachment_text_search_shows_its_attachment_in_palette_and_sear
 }
 
 #[gpui::test]
+async fn mounted_mixed_attachment_filter_and_body_search_keeps_both_snippet_sources(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let resource = repository
+        .import_resource(b"pdf", "invoice.pdf", "application/pdf", "pdf")
+        .expect("import attachment");
+    let note = repository
+        .create_note(CreateNote {
+            title: "meeting title".into(),
+            notebook_id: None,
+            document: rich_document("meeting body summary"),
+        })
+        .expect("create searchable note");
+    repository
+        .associate_resource(app_lite_core::AssociateResource {
+            snapshot: SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: note.title.clone(),
+                document: CanonicalDocument::from_blocks(vec![
+                    Block::Paragraph {
+                        style: BlockStyle::default(),
+                        inlines: vec![Inline::Text {
+                            text: "meeting body summary".into(),
+                            marks: Default::default(),
+                        }],
+                    },
+                    Block::Attachment {
+                        resource_id: resource.clone(),
+                        filename: "invoice.pdf".into(),
+                        media_type: "application/pdf".into(),
+                    },
+                ]),
+                resource_ids: vec![resource.clone()],
+                selected_thumbnail_id: None,
+            },
+        })
+        .expect("associate matching attachment");
+    repository.process_search_jobs().expect("index body text");
+
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_input("filename:invoice meeting");
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.search_palette_results.len(), 1);
+        let hit = &shell.search_palette_results[0];
+        assert_eq!(hit.note.id, note.id);
+        assert_eq!(hit.matched_resource, Some(resource.clone()));
+        assert_eq!(hit.snippet, "meeting body summary\n匹配附件：invoice.pdf");
+        assert_eq!(
+            hit.note.snippet,
+            "meeting body summary\n匹配附件：invoice.pdf"
+        );
+    });
+
+    cx.simulate_keystrokes("enter");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(
+            model.navigation().search_query(),
+            Some("filename:invoice meeting")
+        );
+        assert_eq!(model.projections().len(), 1);
+        assert_eq!(
+            model.projections()[0].snippet,
+            "meeting body summary\n匹配附件：invoice.pdf"
+        );
+    });
+}
+
+#[gpui::test]
 async fn search_palette_keyboard_reveals_a_wrapping_tail_row_in_the_real_scroll_viewport(
     cx: &mut TestAppContext,
 ) {

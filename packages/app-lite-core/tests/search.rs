@@ -506,6 +506,53 @@ fn resource_filters_require_current_attachments_and_report_deterministic_provena
 }
 
 #[test]
+fn mixed_filename_filter_and_body_term_keep_both_snippet_sources() {
+    // `filename:` proves the attachment relation, while the ordinary term is
+    // satisfied only by the note body. Replacing the body snippet here would
+    // falsely imply that every term matched attachment-derived text.
+    let (_profile, repo) = repository();
+    let resource = repo
+        .import_resource(b"pdf", "invoice.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = create(&repo, "meeting title", "meeting body summary");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title.clone(),
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "meeting body summary".into(),
+                        marks: Default::default(),
+                    }],
+                },
+                Block::Attachment {
+                    resource_id: resource.clone(),
+                    filename: "invoice.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+            ]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    repo.process_search_jobs().unwrap();
+
+    let hit = repo
+        .search(SearchQuery::parse("filename:invoice meeting"))
+        .unwrap()
+        .pop()
+        .expect("mixed query result");
+    assert_eq!(hit.note.id, note.id);
+    assert_eq!(hit.matched_resource, Some(resource));
+    assert_eq!(hit.snippet, "meeting body summary\n匹配附件：invoice.pdf");
+    assert_eq!(hit.note.snippet, "meeting body summary\n匹配附件：invoice.pdf");
+}
+
+#[test]
 fn ordinary_terms_find_live_attachment_filenames_with_provenance() {
     // This fails if ordinary terms only search the note-owned title/body FTS
     // instead of the bounded resource-owned filename projection.

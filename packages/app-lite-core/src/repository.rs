@@ -3251,7 +3251,9 @@ impl LibraryRepository {
                         .transpose()
                         .map_err(invalid_column)?;
                     let snippet = match (&matched_resource, row.get::<_, Option<String>>(9)?) {
-                        (Some(_), Some(filename)) => attachment_match_snippet(&filename),
+                        (Some(_), Some(filename)) => {
+                            attachment_provenance_snippet(&row.get::<_, String>(2)?, &filename)
+                        }
                         _ => row.get(2)?,
                     };
                     let mut note = row_to_projection(row)?;
@@ -3488,8 +3490,10 @@ fn restore_journal_mode_on_connection(
     }
 }
 
+const SEARCH_SNIPPET_LIMIT: usize = 160;
+
 fn snippet(text: &str) -> String {
-    text.chars().take(160).collect()
+    text.chars().take(SEARCH_SNIPPET_LIMIT).collect()
 }
 
 const MATCHED_ATTACHMENT_FILENAME_LIMIT: usize = 72;
@@ -3498,12 +3502,48 @@ const MATCHED_ATTACHMENT_FILENAME_LIMIT: usize = 72;
 /// user-visible name compact without splitting a UTF-8 character or losing a
 /// recognizable file extension.
 fn attachment_match_snippet(filename: &str) -> String {
-    let filename = filename
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>();
+    let filename = safe_attachment_filename(filename);
     let filename = truncate_attachment_filename(&filename);
     format!("匹配附件：{filename}")
+}
+
+/// Keep ordinary title/body context visible when another query predicate (for
+/// example `filename:`) selected an attachment. A filename-only card summary
+/// is not useful context, so it remains the compact attachment source line.
+fn attachment_provenance_snippet(note_snippet: &str, filename: &str) -> String {
+    let source = attachment_match_snippet(filename);
+    let safe_filename = safe_attachment_filename(filename);
+    // Canonical attachment blocks contribute their filename as the final
+    // search-text line. The selected attachment is already shown below, so
+    // remove only that exact terminal line from the display context.
+    let context = note_snippet
+        .strip_suffix(&format!("\n{safe_filename}"))
+        .unwrap_or(note_snippet);
+    if context.trim().is_empty() || context == safe_filename {
+        return source;
+    }
+    let body_limit = SEARCH_SNIPPET_LIMIT.saturating_sub(source.chars().count() + 1);
+    let body = truncate_search_snippet(context, body_limit);
+    format!("{body}\n{source}")
+}
+
+fn safe_attachment_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+fn truncate_search_snippet(value: &str, limit: usize) -> String {
+    let count = value.chars().count();
+    if count <= limit {
+        return value.to_owned();
+    }
+    value
+        .chars()
+        .take(limit.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
 fn truncate_attachment_filename(filename: &str) -> String {
@@ -4021,6 +4061,10 @@ mod tests {
             attachment_match_snippet("收据\n扫描.png"),
             "匹配附件：收据 扫描.png"
         );
+        let combined = attachment_provenance_snippet(&"正文".repeat(160), "invoice.pdf");
+        assert!(combined.chars().count() <= SEARCH_SNIPPET_LIMIT);
+        assert!(combined.starts_with("正文"));
+        assert!(combined.ends_with("\n匹配附件：invoice.pdf"));
     }
 
     #[test]
@@ -4041,7 +4085,9 @@ mod tests {
                 }]),
             })
             .expect("create ordinary note");
-        repository.process_search_jobs().expect("index ordinary note");
+        repository
+            .process_search_jobs()
+            .expect("index ordinary note");
 
         let hits = repository
             .search(SearchQuery::parse("ordinary"))
