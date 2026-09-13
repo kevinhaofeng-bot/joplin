@@ -169,8 +169,8 @@ fn stages_two_real_notes_then_reopens_audited_searchable_zero_outbox_profile() {
 }
 
 #[test]
-fn blocks_invalid_folder_tags_relations_and_mismatched_resource_without_returning_a_profile() {
-    // Mutation caught: silently skipping unsupported entity classes or accepting bytes
+fn blocks_invalid_folder_and_mismatched_resource_without_returning_a_profile() {
+    // Mutation caught: silently accepting malformed folder or resource bytes
     // whose signature contradicts declared resource MIME.
     let parent = tempdir().unwrap();
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
@@ -179,11 +179,6 @@ fn blocks_invalid_folder_tags_relations_and_mismatched_resource_without_returnin
         (
             4,
             format!("图.png\n\nid: {OTHER}\ntype_: 4\nmime: image/png\nfile_extension: png\n"),
-        ),
-        (5, format!("标签\n\nid: {OTHER}\ntype_: 5\n")),
-        (
-            6,
-            format!("id: {OTHER}\ntype_: 6\nnote_id: {MD}\ntag_id: {HTML}\n"),
         ),
     ];
     for (kind, metadata) in cases {
@@ -197,22 +192,13 @@ fn blocks_invalid_folder_tags_relations_and_mismatched_resource_without_returnin
             if kind == 4 {
                 append(tar, &format!("resources/{OTHER}.png"), b"physical-resource");
             }
-            if kind == 6 {
-                append(
-                    tar,
-                    &format!("{HTML}.md"),
-                    format!("标签\n\nid: {HTML}\ntype_: 5\n").as_bytes(),
-                );
-            }
         });
         let error = stage_jex_file(&source, parent.path()).unwrap_err();
         assert!(
             if kind == 4 {
                 matches!(error, JexStageError::UnsupportedResource { .. })
-            } else if kind == 2 {
-                matches!(error, JexStageError::UnsupportedFolder { .. })
             } else {
-                matches!(error, JexStageError::UnsupportedEntity { item_type, .. } if item_type == kind)
+                matches!(error, JexStageError::UnsupportedFolder { .. })
             },
             "kind {kind}: {error:?}"
         );

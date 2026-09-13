@@ -1,5 +1,4 @@
-//! C2c-3c-1: a bounded note, resource, and two-level folder JEX stage.
-//! Tags and note-tag relations still block before publication.
+//! C2c-3c: a bounded note, resource, two-level folder, tag and relation JEX stage.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,13 +11,18 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 use thiserror::Error;
 
-use crate::{CreateNote, LibraryError, LibraryRepository, NoteId, NotebookId, ResourceId, StackId};
+use crate::{
+    CreateNote, LibraryError, LibraryRepository, NoteId, NotebookId, ResourceId, StackId, TagId,
+};
 
 #[path = "jex_stage_folders.rs"]
 mod folders;
 
 #[path = "jex_stage_resources.rs"]
 mod resources;
+
+#[path = "jex_stage_tags.rs"]
+mod tags;
 
 use super::{
     JexBodyFidelityBlocker, JexPrepareError, JexScanCounts, JexVerifiedResource,
@@ -83,12 +87,42 @@ pub struct JexStagedFolder {
     pub updated_time: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexStagedTag {
+    pub source_id: String,
+    pub source_path: String,
+    pub title: String,
+    pub destination_id: TagId,
+    pub raw_sha256: String,
+    pub created_time: i64,
+    pub updated_time: i64,
+    pub user_created_time: Option<i64>,
+    pub user_updated_time: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexStagedRelation {
+    pub source_id: String,
+    pub source_path: String,
+    pub source_note_id: String,
+    pub source_tag_id: String,
+    pub destination_note_id: NoteId,
+    pub destination_tag_id: TagId,
+    pub raw_sha256: String,
+    pub created_time: i64,
+    pub updated_time: i64,
+    pub user_created_time: Option<i64>,
+    pub user_updated_time: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JexStageReport {
     pub preflight_counts: JexScanCounts,
     pub notes: Vec<JexStagedNote>,
     pub resources: Vec<JexStagedResource>,
     pub folders: Vec<JexStagedFolder>,
+    pub tags: Vec<JexStagedTag>,
+    pub relations: Vec<JexStagedRelation>,
     pub verified_sync_outbox_rows: i64,
     pub search_index_drained: bool,
 }
@@ -114,6 +148,18 @@ pub enum JexStageError {
     },
     #[error("JEX folder {source_id} at {source_path} is not supported: {reason}")]
     UnsupportedFolder {
+        source_id: String,
+        source_path: String,
+        reason: &'static str,
+    },
+    #[error("JEX tag {source_id} at {source_path} is not supported: {reason}")]
+    UnsupportedTag {
+        source_id: String,
+        source_path: String,
+        reason: &'static str,
+    },
+    #[error("JEX note-tag relation {source_id} at {source_path} is not supported: {reason}")]
+    UnsupportedRelation {
         source_id: String,
         source_path: String,
         reason: &'static str,
@@ -381,6 +427,8 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
     if report.notes.len() != report.preflight_counts.notes
         || report.resources.len() != report.preflight_counts.resource_metadata
         || report.folders.len() != report.preflight_counts.folders
+        || report.tags.len() != report.preflight_counts.tags
+        || report.relations.len() != report.preflight_counts.note_tag_relations
         || count(&db, "notes")? != report.notes.len() as i64
         || count(&db, "jex_stage_note_audit")? != report.notes.len() as i64
         || count(&db, "note_resources")?
@@ -399,8 +447,10 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
                 .len() as i64
         || count(&db, "jex_stage_resource_audit")? != report.resources.len() as i64
         || count(&db, "jex_stage_folder_audit")? != report.folders.len() as i64
-        || count(&db, "tags")? != 0
-        || count(&db, "note_tags")? != 0
+        || count(&db, "tags")? != report.tags.len() as i64
+        || count(&db, "jex_stage_tag_audit")? != report.tags.len() as i64
+        || count(&db, "note_tags")? != report.relations.len() as i64
+        || count(&db, "jex_stage_relation_audit")? != report.relations.len() as i64
         || count(&db, "stacks")?
             != report
                 .folders
@@ -444,6 +494,14 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
         .collect::<BTreeMap<_, _>>();
     for folder in &report.folders {
         folders::verify_one(&db, folder, &folder_destinations)?;
+    }
+    tags::verify_all(&db, report)?;
+    let mut expected_tag_membership = BTreeMap::<String, Vec<TagId>>::new();
+    for relation in &report.relations {
+        expected_tag_membership
+            .entry(relation.destination_note_id.as_str().to_owned())
+            .or_default()
+            .push(relation.destination_tag_id.clone());
     }
     for resource in &report.resources {
         resources::verify_one(&repo, &db, resource)?;
@@ -504,7 +562,11 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
             || note.updated_time != user_updated
             || note.resource_ids != entry.resource_ids
             || note.resource_ids != converted.ordered_resource_occurrences
-            || !note.tag_ids.is_empty()
+            || note.tag_ids
+                != expected_tag_membership
+                    .get(note.id.as_str())
+                    .cloned()
+                    .unwrap_or_default()
         {
             return Err(JexStageError::Verification(
                 "reopened note content or times differ".into(),
@@ -577,33 +639,49 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
     Ok(())
 }
 
-/// Creates a uniquely owned note, resource and bounded-folder profile after
-/// verified JEX source spooling. Tags and relations fail closed until 3c-2.
+/// Creates a uniquely owned note, resource and bounded-organization profile
+/// after verified JEX source spooling. No live profile is opened or promoted.
 pub fn stage_jex_file(
     source: impl AsRef<Path>,
     staging_parent: impl AsRef<Path>,
 ) -> Result<JexStagedProfile, JexStageError> {
     let parent = fs::canonicalize(staging_parent.as_ref())
         .map_err(|_| JexStageError::Prepare(JexPrepareError::InvalidStagingParent))?;
-    let prepared = prepare_jex_source_archive(source, &parent)?;
-    let scanned = prepared.report();
-    for (ids, kind) in [
-        (&scanned.source_ids.note_tag_relations, 6),
-        (&scanned.source_ids.tags, 5),
-    ] {
-        if let Some(source_id) = ids.first() {
-            return Err(JexStageError::UnsupportedEntity {
-                source_id: source_id.clone(),
-                item_type: kind,
-            });
+    let prepared = match prepare_jex_source_archive(source, &parent) {
+        Ok(prepared) => prepared,
+        Err(JexPrepareError::PreflightBlocked { report })
+            if !report.orphan_note_tag_relations.is_empty() =>
+        {
+            let mut remainder = (*report).clone();
+            remainder.orphan_note_tag_relations.clear();
+            if remainder.is_clean() {
+                let id = &report.orphan_note_tag_relations[0];
+                let path = report
+                    .metadata_items
+                    .iter()
+                    .find(|item| item.source_id.eq_ignore_ascii_case(id))
+                    .map(|item| item.archive_path.as_str())
+                    .unwrap_or("");
+                return Err(tags::blocked_relation(
+                    id,
+                    path,
+                    "relation endpoint is missing",
+                ));
+            }
+            return Err(JexStageError::Prepare(JexPrepareError::PreflightBlocked {
+                report,
+            }));
         }
-    }
+        Err(error) => return Err(JexStageError::Prepare(error)),
+    };
+    let scanned = prepared.report();
     if scanned.counts.notes == 0 {
         return Err(JexStageError::Verification(
             "JEX contains no supported notes".into(),
         ));
     }
     let folder_plan = folders::preflight(&prepared)?;
+    let tag_plan = tags::preflight(&prepared)?;
     let directory = Builder::new().prefix("jex-stage-").tempdir_in(&parent)?;
     let database: PathBuf = directory.path().join("library.sqlite");
     let repo = LibraryRepository::open(&database)?;
@@ -643,13 +721,39 @@ pub fn stage_jex_file(
         destination_kind TEXT NOT NULL CHECK(destination_kind IN ('stack','notebook')),
         destination_id TEXT NOT NULL UNIQUE,
         created_time INTEGER NOT NULL,
-        updated_time INTEGER NOT NULL);",
+        updated_time INTEGER NOT NULL);
+        CREATE TABLE jex_stage_tag_audit (
+        source_id TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+        source_path TEXT NOT NULL UNIQUE,
+        tag_id TEXT NOT NULL UNIQUE REFERENCES tags(id),
+        title TEXT NOT NULL,
+        raw_item_bytes BLOB NOT NULL,
+        raw_sha256 TEXT NOT NULL,
+        created_time INTEGER NOT NULL,
+        updated_time INTEGER NOT NULL,
+        user_created_time INTEGER,
+        user_updated_time INTEGER);
+        CREATE TABLE jex_stage_relation_audit (
+        source_id TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+        source_path TEXT NOT NULL UNIQUE,
+        source_note_id TEXT NOT NULL,
+        source_tag_id TEXT NOT NULL,
+        note_id TEXT NOT NULL REFERENCES notes(id),
+        tag_id TEXT NOT NULL REFERENCES tags(id),
+        raw_item_bytes BLOB NOT NULL,
+        raw_sha256 TEXT NOT NULL,
+        created_time INTEGER NOT NULL,
+        updated_time INTEGER NOT NULL,
+        user_created_time INTEGER,
+        user_updated_time INTEGER,
+        UNIQUE(note_id,tag_id));",
     )?;
     let mut report = JexStageReport {
         preflight_counts: scanned.counts.clone(),
         ..Default::default()
     };
     let notebook_map = folders::create_all(&folder_plan, &prepared, &repo, &audit, &mut report)?;
+    let tag_map = tags::create_tags(&tag_plan, &prepared, &repo, &audit, &mut report)?;
     let mut verified_resources = BTreeMap::new();
     for source in &scanned.resources {
         let (mapped, verified) = resources::import_one(&prepared, source, &repo, &audit)?;
@@ -704,6 +808,7 @@ pub fn stage_jex_file(
             resource_ids,
         });
     }
+    tags::create_relations(&tag_plan, &prepared, &repo, &audit, &mut report, &tag_map)?;
     drop(audit);
     drop(repo);
     let mut db = Connection::open(&database)?;
