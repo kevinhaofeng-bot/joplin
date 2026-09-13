@@ -233,6 +233,213 @@ fn uses_extensionless_filename_when_mime_is_not_in_joplins_table() {
 }
 
 #[test]
+fn validates_canonical_note_body_resource_refs_across_joplins_link_forms() {
+    let archive = write_archive(|builder| {
+        let body = format!(
+            "Refs\n\n![inline](:/{RESOURCE}#page)\n[ref]: joplin://{RESOURCE} \"title\"\n<img src=\":/{RESOURCE}\"/>\n```jsoncanvas\n{{\"nodes\":[{{\"id\":\"card\",\"type\":\"file\",\"x\":0,\"y\":0,\"width\":1,\"height\":1,\"file\":\":/{RESOURCE}\"}}],\"edges\":[]}}\n```\n\n{}",
+            item(NOTE, 1, "")
+        );
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+        append_bytes(
+            builder,
+            &format!("{RESOURCE}.md"),
+            item(RESOURCE, 4, "file_extension: bin").as_bytes(),
+        );
+        append_bytes(builder, &format!("resources/{RESOURCE}.bin"), b"resource");
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert_eq!(report.note_body_resource_references.len(), 1);
+    assert_eq!(report.note_body_resource_references[0].note_id, NOTE);
+    assert_eq!(
+        report.note_body_resource_references[0].resource_id,
+        RESOURCE
+    );
+    assert!(report.unresolved_note_body_internal_references.is_empty());
+}
+
+#[test]
+fn reports_unresolved_canonical_note_body_internal_reference() {
+    let missing = "99999999999999999999999999999999";
+    let archive = write_archive(|builder| {
+        let body = format!("Broken\n\n![](:/{missing})\n\n{}", item(NOTE, 1, ""));
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert_eq!(report.unresolved_note_body_internal_references.len(), 1);
+    assert_eq!(
+        report.unresolved_note_body_internal_references[0].note_id,
+        NOTE
+    );
+    assert_eq!(
+        report.unresolved_note_body_internal_references[0].resource_id,
+        missing
+    );
+    assert!(!report.is_clean());
+}
+
+#[test]
+fn does_not_misclassify_exported_note_link_as_missing_resource_reference() {
+    let target_note = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let archive = write_archive(|builder| {
+        let body = format!(
+            "Links\n\n[target](:/{target_note})\n\n{}",
+            item(NOTE, 1, "")
+        );
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+        append_bytes(
+            builder,
+            &format!("{target_note}.md"),
+            format!("Target\n\n{}", item(target_note, 1, "")).as_bytes(),
+        );
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert!(report.note_body_resource_references.is_empty());
+    assert!(report.unresolved_note_body_internal_references.is_empty());
+    assert!(report.is_clean());
+}
+
+#[test]
+fn ignores_non_img_and_non_anchor_html_attributes_that_look_like_resource_urls() {
+    let missing = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let archive = write_archive(|builder| {
+        let body = format!(
+            "HTML\n\n<div data-src=\":/{missing}\"></div>\n\n{}",
+            item(NOTE, 1, "")
+        );
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert!(report.unresolved_note_body_internal_references.is_empty());
+    assert!(report.is_clean());
+}
+
+#[test]
+fn recognizes_html_resource_after_greater_than_inside_quoted_attribute() {
+    let missing = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let archive = write_archive(|builder| {
+        let body = format!(
+            "HTML\n\n<img alt=\"a > b\" src=\":/{missing}\">\n\n{}",
+            item(NOTE, 1, "")
+        );
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert_eq!(report.unresolved_note_body_internal_references.len(), 1);
+    assert_eq!(
+        report.unresolved_note_body_internal_references[0].resource_id,
+        missing
+    );
+}
+
+#[test]
+fn ignores_joplin_scheme_inside_html_like_joplins_html_resource_regex() {
+    let missing = "ffffffffffffffffffffffffffffffff";
+    let archive = write_archive(|builder| {
+        let body = format!(
+            "HTML\n\n<img src=\"joplin://{missing}\">\n\n{}",
+            item(NOTE, 1, "")
+        );
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert!(report.unresolved_note_body_internal_references.is_empty());
+    assert!(report.is_clean());
+}
+
+#[test]
+fn recognizes_reference_definition_when_quoted_title_contains_closing_parenthesis() {
+    let missing = "abababababababababababababababab";
+    let archive = write_archive(|builder| {
+        let body = format!(
+            "Ref\n\n[ref]: :/{missing} \"title)\"\n\n{}",
+            item(NOTE, 1, "")
+        );
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert_eq!(report.unresolved_note_body_internal_references.len(), 1);
+    assert_eq!(
+        report.unresolved_note_body_internal_references[0].resource_id,
+        missing
+    );
+}
+
+#[test]
+fn recognizes_other_exported_item_types_as_known_internal_links() {
+    let folder = "cccccccccccccccccccccccccccccccc";
+    let archive = write_archive(|builder| {
+        let body = format!("Folder\n\n[folder](:/{folder})\n\n{}", item(NOTE, 1, ""));
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+        append_bytes(
+            builder,
+            &format!("{folder}.md"),
+            format!("Folder\n\n{}", item(folder, 2, "")).as_bytes(),
+        );
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert!(report.unresolved_note_body_internal_references.is_empty());
+    assert!(report.is_clean());
+}
+
+#[test]
+fn ignores_malformed_unicode_internal_link_without_panicking() {
+    let archive = write_archive(|builder| {
+        let body = format!(
+            "Unicode\n\n[](:/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa中)\n\n{}",
+            item(NOTE, 1, "")
+        );
+        append_bytes(builder, &format!("{NOTE}.md"), body.as_bytes());
+    });
+
+    let report = scan_jex_archive(&archive).unwrap();
+
+    assert!(report.unresolved_note_body_internal_references.is_empty());
+    assert!(report.is_clean());
+}
+
+#[test]
+fn stops_before_later_invalid_item_when_cross_note_reference_budget_is_exceeded() {
+    let archive = write_archive(|builder| {
+        for index in 0..25_001usize {
+            let note_id = format!("{index:032x}");
+            let first = format!("{:032x}", index + 100_000);
+            let second = format!("{:032x}", index + 200_000);
+            let body = format!(
+                "N\n\n[](:/{first}) [](:/{second})\n\n{}",
+                item(&note_id, 1, "")
+            );
+            append_bytes(builder, &format!("{note_id}.md"), body.as_bytes());
+        }
+        append_bytes(
+            builder,
+            "dddddddddddddddddddddddddddddddd.md",
+            b"not valid metadata",
+        );
+    });
+
+    assert!(matches!(
+        scan_jex_archive(&archive),
+        Err(JexScanError::TooManyNoteBodyResourceReferences)
+    ));
+}
+
+#[test]
 fn rejects_duplicate_archive_paths() {
     let archive = write_archive(|builder| {
         append_bytes(builder, &format!("{NOTE}.md"), item(NOTE, 1, "").as_bytes());

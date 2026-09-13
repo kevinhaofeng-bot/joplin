@@ -21,6 +21,8 @@ pub const MAX_JEX_ARCHIVE_ENTRIES: usize = 50_000;
 pub const MAX_JEX_ITEM_BYTES: u64 = 4 * 1024 * 1024;
 /// Maximum bytes accepted for one physical resource file.
 pub const MAX_JEX_RESOURCE_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum canonical internal resource references retained across note bodies.
+pub const MAX_JEX_NOTE_RESOURCE_REFERENCES: usize = 50_000;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
@@ -43,6 +45,10 @@ pub enum JexScanError {
     ResourceTooLarge { path: String, size: u64 },
     #[error("malformed JEX item at {path}: {reason}")]
     MalformedItem { path: String, reason: String },
+    #[error(
+        "JEX archive contains more than {MAX_JEX_NOTE_RESOURCE_REFERENCES} note-body resource references"
+    )]
+    TooManyNoteBodyResourceReferences,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -94,6 +100,12 @@ pub struct JexUnsupportedItem {
     pub item_type: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexNoteBodyResourceReference {
+    pub note_id: String,
+    pub resource_id: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JexScanReport {
     pub counts: JexScanCounts,
@@ -108,6 +120,9 @@ pub struct JexScanReport {
     pub missing_resource_files: Vec<String>,
     pub orphan_note_tag_relations: Vec<String>,
     pub orphan_physical_resource_files: Vec<String>,
+    pub note_body_resource_references: Vec<JexNoteBodyResourceReference>,
+    /// Canonical `:/<id>` refs with no exported note or resource metadata.
+    pub unresolved_note_body_internal_references: Vec<JexNoteBodyResourceReference>,
     pub unsupported_items: Vec<JexUnsupportedItem>,
     pub encrypted_item_ids: Vec<String>,
 }
@@ -123,6 +138,7 @@ impl JexScanReport {
             && self.missing_resource_files.is_empty()
             && self.orphan_note_tag_relations.is_empty()
             && self.orphan_physical_resource_files.is_empty()
+            && self.unresolved_note_body_internal_references.is_empty()
             && self.unsupported_items.is_empty()
             && self.encrypted_item_ids.is_empty()
             && self.store_compatibility_blockers.is_empty()
@@ -135,6 +151,7 @@ struct ParsedItem {
     normalized_id: String,
     item_type: i64,
     properties: BTreeMap<String, String>,
+    note_body: String,
 }
 
 #[derive(Debug)]
@@ -173,6 +190,9 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
     let mut note_tag_relations = Vec::new();
     let mut note_ids = BTreeSet::new();
     let mut tag_ids = BTreeSet::new();
+    let mut resource_ids = BTreeSet::new();
+    let mut known_item_ids = BTreeSet::new();
+    let mut pending_note_body_references = Vec::new();
 
     for (index, entry) in archive.entries()?.raw(true).enumerate() {
         if index >= MAX_JEX_ARCHIVE_ENTRIES {
@@ -210,6 +230,7 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
             if !seen_ids.insert(item.normalized_id.clone()) {
                 report.duplicate_item_ids.push(item.id.clone());
             }
+            known_item_ids.insert(item.normalized_id.clone());
             if is_encrypted(&item.properties) {
                 report.encrypted_item_ids.push(item.id);
                 continue;
@@ -217,6 +238,16 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
             match item.item_type {
                 1 => {
                     note_ids.insert(item.normalized_id);
+                    let remaining = MAX_JEX_NOTE_RESOURCE_REFERENCES
+                        .checked_sub(pending_note_body_references.len())
+                        .ok_or(JexScanError::TooManyNoteBodyResourceReferences)?;
+                    let references = extract_canonical_resource_refs(&item.note_body, remaining)?;
+                    pending_note_body_references.extend(references.into_iter().map(
+                        |resource_id| JexNoteBodyResourceReference {
+                            note_id: item.id.clone(),
+                            resource_id,
+                        },
+                    ));
                     add_id(
                         &mut report.source_ids.notes,
                         &mut report.counts.notes,
@@ -229,6 +260,7 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
                     item.id,
                 ),
                 4 => {
+                    resource_ids.insert(item.normalized_id.clone());
                     let archive_path = resource_archive_path(&item, &archive_path)?;
                     metadata_resources.push(ResourceMetadata {
                         source_id: item.id.clone(),
@@ -304,6 +336,16 @@ pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScan
     for relation in note_tag_relations {
         if !note_ids.contains(&relation.note_id) || !tag_ids.contains(&relation.tag_id) {
             report.orphan_note_tag_relations.push(relation.source_id);
+        }
+    }
+
+    for reference in pending_note_body_references {
+        if resource_ids.contains(&reference.resource_id.to_ascii_lowercase()) {
+            report.note_body_resource_references.push(reference);
+        } else if !known_item_ids.contains(&reference.resource_id.to_ascii_lowercase()) {
+            report
+                .unresolved_note_body_internal_references
+                .push(reference);
         }
     }
 
@@ -485,12 +527,242 @@ fn parse_item(path: &str, content: String) -> Result<ParsedItem, JexScanError> {
             path: path.to_owned(),
             reason: "malformed type_".to_owned(),
         })?;
+    // Mirrors BaseItem.unserialize: title consumes the first two pre-property
+    // lines, leaving the remainder as a Note body. Property-only NoteTag
+    // files have no separator and therefore no body.
+    let note_body = if item_type == 1 {
+        let before_properties = &lines[..properties_start.saturating_sub(1)];
+        before_properties
+            .get(2..)
+            .map(|lines| lines.join("\n"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     Ok(ParsedItem {
         normalized_id: id.to_ascii_lowercase(),
         id,
         item_type,
         properties,
+        note_body,
     })
+}
+
+fn extract_canonical_resource_refs(
+    body: &str,
+    limit: usize,
+) -> Result<BTreeSet<String>, JexScanError> {
+    let mut ids = BTreeSet::new();
+    for marker in ["]("] {
+        let mut remainder = body;
+        while let Some(index) = remainder.find(marker) {
+            let candidate = &remainder[index + marker.len()..];
+            let end = candidate.find([')', '\n', '\r']).unwrap_or(candidate.len());
+            if let Some(id) = parse_resource_url(candidate[..end].trim()) {
+                insert_reference(&mut ids, id, limit)?;
+            }
+            remainder = &candidate[end..];
+            if remainder.is_empty() {
+                break;
+            }
+        }
+    }
+    let mut remainder = body;
+    while let Some(index) = remainder.find("]:") {
+        let candidate = &remainder[index + 2..];
+        let end = candidate.find(['\n', '\r']).unwrap_or(candidate.len());
+        if let Some(id) = parse_resource_url(candidate[..end].trim()) {
+            insert_reference(&mut ids, id, limit)?;
+        }
+        remainder = &candidate[end..];
+        if remainder.is_empty() {
+            break;
+        }
+    }
+    extract_html_resource_refs(body, &mut ids, limit)?;
+    extract_jsoncanvas_resource_refs(body, &mut ids, limit)?;
+    Ok(ids)
+}
+
+fn insert_reference(
+    ids: &mut BTreeSet<String>,
+    id: String,
+    limit: usize,
+) -> Result<(), JexScanError> {
+    if !ids.contains(&id) && ids.len() >= limit {
+        return Err(JexScanError::TooManyNoteBodyResourceReferences);
+    }
+    ids.insert(id);
+    Ok(())
+}
+
+fn extract_html_resource_refs(
+    body: &str,
+    ids: &mut BTreeSet<String>,
+    limit: usize,
+) -> Result<(), JexScanError> {
+    let lowercase = body.to_ascii_lowercase();
+    for (tag_name, attribute) in [("img", "src"), ("a", "href")] {
+        let mut offset = 0;
+        let marker = format!("<{tag_name}");
+        while let Some(found) = lowercase[offset..].find(&marker) {
+            let start = offset + found;
+            let after_name = start + marker.len();
+            if lowercase
+                .as_bytes()
+                .get(after_name)
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>' && *byte != b'/')
+            {
+                offset = after_name;
+                continue;
+            }
+            let Some(end) = html_tag_end(body, after_name) else {
+                break;
+            };
+            let tag = &body[after_name..end];
+            if let Some(value) = html_attribute_value(tag, attribute) {
+                if let Some(id) = parse_html_resource_url(value) {
+                    insert_reference(ids, id, limit)?;
+                }
+            }
+            offset = end + 1;
+        }
+    }
+    Ok(())
+}
+
+fn html_tag_end(body: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, character) in body[start..].char_indices() {
+        match (quote, character) {
+            (None, '\'' | '"') => quote = Some(character),
+            (Some(open), close) if open == close => quote = None,
+            (None, '>') => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn html_attribute_value<'a>(tag: &'a str, attribute: &str) -> Option<&'a str> {
+    let lowercase = tag.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(found) = lowercase[offset..].find(attribute) {
+        let start = offset + found;
+        let preceding = lowercase.as_bytes().get(start.wrapping_sub(1));
+        let after = start + attribute.len();
+        if preceding
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_')
+            && lowercase.as_bytes().get(after) == Some(&b'=')
+            && matches!(
+                lowercase.as_bytes().get(after + 1),
+                Some(b'\'') | Some(b'"')
+            )
+        {
+            let quote = lowercase.as_bytes()[after + 1] as char;
+            let value_start = after + 2;
+            let value_end = tag[value_start..].find(quote)? + value_start;
+            return Some(&tag[value_start..value_end]);
+        }
+        offset = after;
+    }
+    None
+}
+
+fn parse_html_resource_url(value: &str) -> Option<String> {
+    value
+        .starts_with(":/")
+        .then(|| parse_resource_url(value))
+        .flatten()
+}
+
+fn parse_resource_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    let id = value
+        .strip_prefix(":/")
+        .or_else(|| value.strip_prefix("joplin://"))?;
+    let id_prefix = id.get(..32)?;
+    let suffix = id.get(32..)?;
+    if !valid_joplin_reference_id(id_prefix) {
+        return None;
+    }
+    let suffix = if suffix.starts_with('#') {
+        let hash_end = suffix.find(char::is_whitespace).unwrap_or(suffix.len());
+        &suffix[hash_end..]
+    } else {
+        suffix
+    };
+    if suffix.is_empty()
+        || (suffix.chars().next().is_some_and(char::is_whitespace)
+            && suffix.trim().starts_with('"')
+            && suffix.trim().ends_with('"'))
+    {
+        return Some(id_prefix.to_owned());
+    }
+    None
+}
+
+fn valid_joplin_reference_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn extract_jsoncanvas_resource_refs(
+    body: &str,
+    ids: &mut BTreeSet<String>,
+    limit: usize,
+) -> Result<(), JexScanError> {
+    let Some(open) = body.find("```jsoncanvas") else {
+        return Ok(());
+    };
+    let Some(json_start) = body[open..].find('\n').map(|offset| open + offset + 1) else {
+        return Ok(());
+    };
+    let Some(close) = body[json_start..]
+        .find("\n```")
+        .map(|offset| json_start + offset)
+    else {
+        return Ok(());
+    };
+    let Ok(canvas) = serde_json::from_str::<serde_json::Value>(&body[json_start..close]) else {
+        return Ok(());
+    };
+    let Some(nodes) = canvas.get("nodes").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    for node in nodes {
+        if node.get("type").and_then(serde_json::Value::as_str) != Some("file") {
+            continue;
+        }
+        if node
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+            || !["x", "y", "width", "height"]
+                .iter()
+                .all(|key| node.get(*key).and_then(serde_json::Value::as_f64).is_some())
+        {
+            continue;
+        }
+        if let Some(id) = node
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_whiteboard_resource_url)
+        {
+            insert_reference(ids, id, limit)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_whiteboard_resource_url(value: &str) -> Option<String> {
+    let id = value.strip_prefix(":/")?;
+    let id_prefix = id.get(..32)?;
+    let suffix = id.get(32..)?;
+    if valid_joplin_id(id_prefix) && (suffix.is_empty() || suffix.starts_with('#')) {
+        Some(id_prefix.to_owned())
+    } else {
+        None
+    }
 }
 
 fn resource_archive_path(item: &ParsedItem, item_path: &str) -> Result<String, JexScanError> {
@@ -640,6 +912,14 @@ fn sort_report(report: &mut JexScanReport) {
     report.missing_resource_files.sort();
     report.orphan_note_tag_relations.sort();
     report.orphan_physical_resource_files.sort();
+    report.note_body_resource_references.sort_by(|left, right| {
+        (&left.note_id, &left.resource_id).cmp(&(&right.note_id, &right.resource_id))
+    });
+    report
+        .unresolved_note_body_internal_references
+        .sort_by(|left, right| {
+            (&left.note_id, &left.resource_id).cmp(&(&right.note_id, &right.resource_id))
+        });
     report
         .unsupported_items
         .sort_by(|left, right| left.source_id.cmp(&right.source_id));
