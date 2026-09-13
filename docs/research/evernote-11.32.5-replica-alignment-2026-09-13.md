@@ -1,6 +1,6 @@
 # Evernote 逆向与 Rust 复刻对齐审计（2026-09-13）
 
-本页以 `codex/joplin-lite-native-rust` 的 v0.21 检查点为基线，并跟踪其后已通过限界复审的 ENEX C1b 只读扫描、C2a 纯内容转换、C2b 隔离暂存、JEX C2c-1 原始资料暂存、C2c-2a/2b 纯正文转换及 C2c-3a/3b/3c-1 隔离资料库。它更新
+本页以 `codex/joplin-lite-native-rust` 的 v0.21 检查点为基线，并跟踪其后已通过限界复审的 ENEX C1b 只读扫描、C2a 纯内容转换、C2b 隔离暂存、JEX C2c-1 原始资料暂存、C2c-2a/2b 纯正文转换及 C2c-3a/3b/3c-1/3c-2 隔离资料库。它更新
 `evernote-11.32.5-core-product-behavior-map.md` 第 4 节在 2026-09-11 写下的
 「当前实现差距」快照；逆向资料、代码落地与真实产品验收是三种不同状态。
 
@@ -9,7 +9,7 @@
 | 新建、标题、编辑、保存、图片 | `69451` create、`21288` select、common-editor `title`、`content/changesplugin`、`resource/image`、`textbetweenblocks` | `app-lite-core` 的 repository/规范 HTML/资源事务与 GPUI `AppModel`/`NoteSession`/原生编辑器；Task 5 三篇中文笔记及图片在隔离 Release 资料库重启后保留，见 `task-5-m1-release-acceptance-2026-09-12.md` | 该真实操作验收属于当时二进制；当前 HEAD 未对个人资料库重演完整 M1 流程。模型只有粗/斜/下划/删除/高亮/链接等有限 mark，尚无 Evernote 的字体、字号、颜色、上/下标与表格等完整样式保真，不能把基本编辑可用说成完美复刻 |
 | 笔记列表、笔记本、标签、回收站、栏位 | `76905` list modes、Conduit NoteDAO simple projection、`74300` selected GUID reducer、Notebook/Tag mutators | GPUI typed route、轻量列表投影、保留 NoteId 的切换、组织操作、三/二/一栏；Task 6 报告有挂载测试及部分隔离 Release 操作 | 全部 Task 6/M2 的个人资料库浏览与性能门槛尚未签收；Evernote TOP_LIST、多标签层级等非首版能力也未照搬 |
 | 全库搜索、笔记内查找、附件文字 | `83028` search AST/SQL、offline index queue、common-editor `find`、`34309`/`45897`/`59009` 资源搜索文字 | 本地 FTS、Cmd-K、Cmd-F、文件名、可选中文字 PDF 与图片 OCR；v0.19/v0.21 之前的隔离 Release 检索冒烟通过 | 以历史 1,662 篇规模作真实 Release 延迟/RSS 验收、建议与历史完整体验、HEIC/扫描 PDF OCR 和 M2 总验收未完成；中文短词策略与提示文案是本产品改进，不是 Evernote 原样算法 |
-| Joplin 归档迁移 | Evernote `36364` 导入流程仅提供解析与 mutation 分离的行为参考 | C2c-1 `cd8632cfd..4c059b889` 对 JEX 原件做字节哈希、二次 tar 核验和原件暂存；C2c-2a/2b `7065d360e..057b700ba` 对受限 Markdown 与严格 XHTML-like HTML 作纯保真转换；C2c-3a/3b `73f02f512..ef6e45c25` 已将含图片/PDF/重复引用的 JEX 笔记写成可重开的隔离 SQLite＋blob 资料库；C2c-3c-1 `dab1b920a` 又把受限两级 JEX 文件夹及所属笔记映射为 Stack/Notebook，并重开核对原始字节、时间、父子关系、资源、搜索及零迁移 outbox。独立复审 0 Critical/Important/Minor，控制者 core 200/200。JEX 格式细节来自 Joplin Raw importer、Resource 和 renderer | **尚无完整组织关系 JEX 导入**：标签、笔记—标签关联仍明确阻断；超过两级、父文件夹兼有笔记与子文件夹等未能保真的结构也阻断。完整 HTML5/插件保真、正式切换、可读导出/恢复及真实个人归档核验均待完成。不能将 Joplin 源码语法细节称为 Evernote 逆向成果 |
+| Joplin 归档迁移 | Evernote `36364` 导入流程仅提供解析与 mutation 分离的行为参考 | C2c-1 `cd8632cfd..4c059b889` 对 JEX 原件做字节哈希、二次 tar 核验和原件暂存；C2c-2a/2b `7065d360e..057b700ba` 对受限 Markdown 与严格 XHTML-like HTML 作纯保真转换；C2c-3a/3b `73f02f512..ef6e45c25` 已将含图片/PDF/重复引用的 JEX 笔记写成可重开的隔离 SQLite＋blob 资料库；C2c-3c-1/2 `dab1b920a..7232faaf0` 增加受限两级文件夹、所属笔记、标签和 note-tag 关联，重开核对来源原始字节、时间、关系、资源、搜索及零迁移 outbox。独立复审 0 Critical/Important/Minor，控制者 core 203/203。JEX 格式细节来自 Joplin Raw importer、Resource 和 renderer | **真实 JEX 尚不能视为可迁**：Joplin `BaseItem.serialize` 写出模型全字段，而当前 stage 是窄字段白名单；现用库还有待办、来源 URL、自定义排序、已删除笔记及一个父文件夹兼有 187 篇直属笔记和子文件夹的结构，均需资格扫描和保真策略。完整 HTML5/插件保真、正式切换、可读导出/恢复及真实个人归档核验仍待完成。不能将 Joplin 源码语法细节称为 Evernote 逆向成果 |
 | ENEX 导入与可读导出 | `36364` SAX 导入、`916042` ENML 清洗、`11354` ENEX 导出、`12524`/`18882` HTML 导出 | C1b 分块扫描与 C2a 保真阻断转换已复审；`05dd34bdd..882107152` 的 C2b 将 ENEX 流式导入**独立临时 SQLite+blob 资料库**，逐笔记核对附件 MD5/SHA-256、保留原 ENML/时间/标签与图文顺序，重开检查完整性、正文索引和零迁移 outbox；22 MiB 附件及后续笔记失败清理均有测试，独立复审 0 Critical/Important，控制者最终 core 168/168。`xml-syntax-reader` 短文本回调缺陷经本地窄幅补丁修复并由扫描边界测试锁定 | **尚无正式资料库切换、JEX 导入、可读导出/恢复或真实个人归档验收**；C2b 不是完整迁移。字体/表格等不支持 ENML 仍明确阻断，而非静默丢内容 |
 | NAS 同步与恢复 | Conduit `MutationUpsyncActivity`、`RteSession`、`ResourceManager` | 本地 schema/outbox/cursor 的基础契约已在 core；普通写笔记不依赖网络 | Rust 客户端 transport、NAS server、冲突副本、断点资源和恢复演练仍属 Task 9/10，不能称为“同步完成” |
 
@@ -25,6 +25,6 @@
 
 ## 执行裁定
 
-Task 8 的 C2b 已完成 ENEX **隔离暂存**：保留 ENML 审计原文、逐篇只用同笔记的已验证附件转换，遇不支持结构返回具路径的错误，失败不返回可发布句柄；正式资料库完全未进入此轮。C2c-1 完成 JEX 原件暂存，C2c-2a/2b 完成受限 Markdown/HTML 的纯转换，C2c-3a/3b 已能导入含图片、重复图文引用和 PDF 的 JEX 笔记至新建临时资料库；C2c-3c-1 增加受限两级文件夹和真实笔记归属。下一段补标签与笔记—标签关联，再做正式资料库切换及可读导出/恢复。同步从 Task 9 独立推进，不能混入导入事务。
+Task 8 的 C2b 已完成 ENEX **隔离暂存**：保留 ENML 审计原文、逐篇只用同笔记的已验证附件转换，遇不支持结构返回具路径的错误，失败不返回可发布句柄；正式资料库完全未进入此轮。C2c-1 完成 JEX 原件暂存，C2c-2a/2b 完成受限 Markdown/HTML 的纯转换，C2c-3a/3b 已能导入含图片、重复图文引用和 PDF 的 JEX 笔记至新建临时资料库；C2c-3c-1/2 增加受限两级文件夹、标签和关联。下一段须先让真实 JEX 副本产生完整资格/阻断报告，逐项补保真映射，再做正式资料库切换及可读导出/恢复。同步从 Task 9 独立推进，不能混入导入事务。
 
 `LibraryRepository::create_note` 仍在普通写入事务中插入 `sync_outbox`，稳定链未被改写。C2b 只在新建的 ENEX staging 资料库中用收尾事务保留源时间并清掉迁移产生的 outbox，重开断言其为零；JEX 路径必须沿用这个局部初始同步基线，不能把迁入实体当作日常待上行修改。
