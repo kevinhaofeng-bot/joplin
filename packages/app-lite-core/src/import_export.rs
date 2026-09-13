@@ -21,6 +21,8 @@ mod enml;
 pub use enml::*;
 mod jex_spool;
 pub use jex_spool::*;
+mod jex_stage;
+pub use jex_stage::*;
 mod jex_body;
 pub use jex_body::*;
 mod jex_html;
