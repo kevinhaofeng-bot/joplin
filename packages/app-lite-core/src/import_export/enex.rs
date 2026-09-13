@@ -22,6 +22,8 @@ pub const MAX_ENEX_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 /// Kept for API compatibility; this is the input callback capacity, not a data limit.
 pub const MAX_ENEX_DATA_BASE64_BYTES: usize = 64 * 1024;
 const MAX_FIELD_BYTES: usize = 16 * 1024;
+const MAX_XML_NAME_BYTES: usize = 256;
+const MAX_RETAINED_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
 const MAX_TAGS_PER_NOTE: usize = 1024;
 const INPUT_BYTES: usize = 64 * 1024;
@@ -51,6 +53,8 @@ pub enum EnexScanError {
         resource_ordinal: usize,
         limit: usize,
     },
+    #[error("ENEX report-retained metadata exceeds {limit} bytes")]
+    ReportTooLarge { limit: usize },
     #[error("ENEX exceeds the {MAX_ENEX_ENTITIES} entity limit")]
     TooManyEntities,
     #[error("invalid base64 data in resource {resource_ordinal}: {reason}")]
@@ -239,6 +243,7 @@ struct EnexVisitor {
     attr_text: String,
     attr_seen: BTreeSet<String>,
     ignored_text_bytes: usize,
+    retained_report_bytes: usize,
     doctype: Vec<u8>,
     comment_bytes: usize,
     pi_bytes: usize,
@@ -247,6 +252,11 @@ struct EnexVisitor {
 
 impl EnexVisitor {
     fn name(name: QName<'_>) -> Result<String, EnexScanError> {
+        if name.as_bytes().len() > MAX_XML_NAME_BYTES {
+            return Err(EnexScanError::FieldTooLarge {
+                limit: MAX_XML_NAME_BYTES,
+            });
+        }
         let raw = std::str::from_utf8(name.as_bytes())
             .map_err(|e| EnexScanError::MalformedXml(e.to_string()))?;
         if raw.is_empty() || raw.contains(':') || raw != raw.to_ascii_lowercase() {
@@ -255,6 +265,16 @@ impl EnexVisitor {
             )));
         }
         Ok(raw.to_owned())
+    }
+    fn charge_report(&mut self, amount: usize) -> Result<(), EnexScanError> {
+        self.retained_report_bytes = self.retained_report_bytes.saturating_add(amount);
+        if self.retained_report_bytes > MAX_RETAINED_REPORT_BYTES {
+            Err(EnexScanError::ReportTooLarge {
+                limit: MAX_RETAINED_REPORT_BYTES,
+            })
+        } else {
+            Ok(())
+        }
     }
     fn begin(&mut self, name: String) -> Result<(), EnexScanError> {
         if self.stack.len() >= 64 {
@@ -295,10 +315,22 @@ impl EnexVisitor {
                 }
                 true
             }
-            (Some("resource"), "data" | "mime" | "resource-attributes") => true,
+            (
+                Some("resource"),
+                "data" | "mime" | "resource-attributes" | "width" | "height" | "duration",
+            ) => true,
             (Some("resource-attributes"), "file-name") => true,
-            // Known ENEX metadata is bounded even if we do not report it yet.
-            (Some("note-attributes"), _) | (Some("resource-attributes"), _) => true,
+            (
+                Some("note-attributes"),
+                "subject-date" | "latitude" | "longitude" | "altitude" | "author" | "source"
+                | "source-url" | "source-application" | "share-date" | "reminder-order"
+                | "reminder-time" | "reminder-done-time" | "place-name" | "content-class",
+            ) => true,
+            (
+                Some("resource-attributes"),
+                "source-url" | "timestamp" | "latitude" | "longitude" | "altitude" | "camera-make"
+                | "camera-model" | "client-will-index" | "reco-type" | "attachment",
+            ) => true,
             _ => false,
         };
         if !valid {
@@ -339,6 +371,12 @@ impl EnexVisitor {
         }
         if self.field.as_deref() == Some(name) {
             let text = std::mem::take(&mut self.field_text);
+            if matches!(
+                name,
+                "title" | "created" | "updated" | "tag" | "mime" | "file-name"
+            ) {
+                self.charge_report(text.len() + if name == "tag" { 24 } else { 0 })?;
+            }
             if let Some(resource) = self.resource.as_mut() {
                 match name {
                     "data" => {
@@ -361,12 +399,23 @@ impl EnexVisitor {
         }
         if name == "resource" {
             let resource = self.resource.take().unwrap().finish()?;
+            self.charge_report(256)?;
             self.report.resources.push(resource);
             self.report.counts.resource_occurrences += 1;
         }
         if name == "note" {
             let note = self.note.take().unwrap();
-            let (media_references, unsupported_fidelity_constructs) = inspect_enml(&note.content)?;
+            let (media_references, unsupported_fidelity_constructs) = if note.content.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                inspect_enml(&note.content)?
+            };
+            self.charge_report(
+                256 + media_references
+                    .iter()
+                    .map(|r| 64 + r.hash_md5.len() + r.mime.len())
+                    .sum::<usize>(),
+            )?;
             self.report.notes.push(EnexScannedNote {
                 ordinal: note.ordinal,
                 title: note.title,
@@ -409,8 +458,14 @@ impl EnexVisitor {
             None if value.trim().is_empty() => Ok(()),
             None if self
                 .stack
-                .last()
-                .is_some_and(|s| s == "note-attributes" || s == "resource-attributes") =>
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(|s| s == "note-attributes" || s == "resource-attributes")
+                || self
+                    .stack
+                    .last()
+                    .is_some_and(|s| s == "width" || s == "height" || s == "duration") =>
             {
                 self.ignored_text_bytes = self.ignored_text_bytes.saturating_add(value.len());
                 if self.ignored_text_bytes > MAX_FIELD_BYTES {
@@ -538,6 +593,11 @@ impl Visitor for EnexVisitor {
         }
     }
     fn pi_start(&mut self, target: &[u8], _: Span) -> Result<(), Self::Error> {
+        if target.len() > MAX_XML_NAME_BYTES {
+            return Err(EnexScanError::FieldTooLarge {
+                limit: MAX_XML_NAME_BYTES,
+            });
+        }
         self.pi_bytes = target.len();
         Ok(())
     }
@@ -627,11 +687,22 @@ pub fn scan_enex_file(path: impl AsRef<Path>) -> Result<EnexScanReport, EnexScan
     {
         return Err(EnexScanError::MalformedXml("unexpected EOF".into()));
     }
-    correlate_resources(&mut visitor.report);
+    correlate_resources(&mut visitor.report, &mut visitor.retained_report_bytes)?;
     Ok(visitor.report)
 }
 
-fn correlate_resources(report: &mut EnexScanReport) {
+fn charge_derived(used: &mut usize, amount: usize) -> Result<(), EnexScanError> {
+    *used = used.saturating_add(amount);
+    if *used > MAX_RETAINED_REPORT_BYTES {
+        Err(EnexScanError::ReportTooLarge {
+            limit: MAX_RETAINED_REPORT_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn correlate_resources(report: &mut EnexScanReport, used: &mut usize) -> Result<(), EnexScanError> {
     let mut by_md5 = BTreeMap::<String, Vec<&EnexScannedResource>>::new();
     let mut by_note_and_md5 = BTreeMap::<(usize, String), Vec<&EnexScannedResource>>::new();
     for resource in &report.resources {
@@ -644,21 +715,26 @@ fn correlate_resources(report: &mut EnexScanReport) {
             .or_default()
             .push(resource);
     }
-    report.duplicate_resource_md5s = by_md5
-        .iter()
-        .filter_map(|(hash, entries)| (entries.len() > 1).then_some(hash.clone()))
-        .collect();
+    for (hash, entries) in &by_md5 {
+        if entries.len() > 1 {
+            charge_derived(used, 24 + hash.len())?;
+            report.duplicate_resource_md5s.push(hash.clone());
+        }
+    }
     let mut referenced = BTreeSet::new();
     for note in &report.notes {
         for media in &note.media_references {
             match by_note_and_md5.get(&(note.ordinal, media.hash_md5.clone())) {
-                None => report
-                    .unresolved_media_references
-                    .push(EnexUnresolvedMediaReference {
-                        note_ordinal: note.ordinal,
-                        hash_md5: media.hash_md5.clone(),
-                        mime: media.mime.clone(),
-                    }),
+                None => {
+                    charge_derived(used, 64 + media.hash_md5.len() + media.mime.len())?;
+                    report
+                        .unresolved_media_references
+                        .push(EnexUnresolvedMediaReference {
+                            note_ordinal: note.ordinal,
+                            hash_md5: media.hash_md5.clone(),
+                            mime: media.mime.clone(),
+                        });
+                }
                 Some(resources) => {
                     for resource in resources {
                         referenced.insert(resource.ordinal);
@@ -666,6 +742,7 @@ fn correlate_resources(report: &mut EnexScanReport) {
                             && !media.mime.is_empty()
                             && resource.mime != media.mime
                         {
+                            charge_derived(used, 64 + resource.mime.len() + media.mime.len())?;
                             report.mime_mismatches.push(EnexMimeMismatch {
                                 note_ordinal: note.ordinal,
                                 resource_ordinal: resource.ordinal,
@@ -678,13 +755,13 @@ fn correlate_resources(report: &mut EnexScanReport) {
             }
         }
     }
-    report.unreferenced_resource_ordinals = report
-        .resources
-        .iter()
-        .filter_map(|resource| {
-            (!referenced.contains(&resource.ordinal)).then_some(resource.ordinal)
-        })
-        .collect();
+    for resource in &report.resources {
+        if !referenced.contains(&resource.ordinal) {
+            charge_derived(used, 8)?;
+            report.unreferenced_resource_ordinals.push(resource.ordinal);
+        }
+    }
+    Ok(())
 }
 
 fn inspect_enml(enml: &str) -> Result<(Vec<EnexMediaReference>, Vec<String>), EnexScanError> {
@@ -693,14 +770,35 @@ fn inspect_enml(enml: &str) -> Result<(Vec<EnexMediaReference>, Vec<String>), En
     let mut stack = Vec::<String>::new();
     let mut references = Vec::new();
     let mut unsupported = BTreeSet::new();
+    let mut root_seen = false;
     loop {
         match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => stack.push(inspect_enml_start(
-                &event,
-                &mut references,
-                &mut unsupported,
-            )?),
+            Ok(Event::Start(event)) => {
+                let name = event_name(event.name().as_ref())?;
+                if stack.is_empty() {
+                    if root_seen || name != "en-note" {
+                        return Err(EnexScanError::Structure(
+                            "ENML requires one en-note root".into(),
+                        ));
+                    }
+                    root_seen = true;
+                }
+                stack.push(inspect_enml_start(
+                    &event,
+                    &mut references,
+                    &mut unsupported,
+                )?);
+            }
             Ok(Event::Empty(event)) => {
+                let name = event_name(event.name().as_ref())?;
+                if stack.is_empty() {
+                    if root_seen || name != "en-note" {
+                        return Err(EnexScanError::Structure(
+                            "ENML requires one en-note root".into(),
+                        ));
+                    }
+                    root_seen = true;
+                }
                 inspect_enml_start(&event, &mut references, &mut unsupported)?;
             }
             Ok(Event::End(event)) => {
@@ -712,14 +810,26 @@ fn inspect_enml(enml: &str) -> Result<(Vec<EnexMediaReference>, Vec<String>), En
                 }
             }
             Ok(Event::DocType(doctype)) => {
-                if doctype
-                    .as_ref()
-                    .windows(8)
-                    .any(|part| part.eq_ignore_ascii_case(b"<!ENTITY"))
-                {
+                if root_seen || !doctype.as_ref().starts_with(b"en-note") {
+                    return Err(EnexScanError::UnsafeXml("unexpected ENML DOCTYPE".into()));
+                }
+                if doctype.as_ref().contains(&b'[') {
                     return Err(EnexScanError::UnsafeXml(
                         "internal ENML entity declaration".into(),
                     ));
+                }
+            }
+            Ok(Event::Text(text)) => {
+                let decoded = text
+                    .unescape()
+                    .map_err(|error| EnexScanError::UnsafeXml(error.to_string()))?;
+                if stack.is_empty() && !decoded.trim().is_empty() {
+                    return Err(EnexScanError::Structure("text outside ENML root".into()));
+                }
+            }
+            Ok(Event::CData(text)) => {
+                if stack.is_empty() && !text.as_ref().iter().all(u8::is_ascii_whitespace) {
+                    return Err(EnexScanError::Structure("CDATA outside ENML root".into()));
                 }
             }
             Ok(Event::Eof) => break,
@@ -728,7 +838,7 @@ fn inspect_enml(enml: &str) -> Result<(Vec<EnexMediaReference>, Vec<String>), En
         }
         buffer.clear();
     }
-    if !stack.is_empty() {
+    if !root_seen || !stack.is_empty() {
         return Err(EnexScanError::MalformedXml("unexpected ENML EOF".into()));
     }
     Ok((references, unsupported.into_iter().collect()))

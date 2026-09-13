@@ -29,3 +29,39 @@ The sole outer parser reads with 64 KiB capacity. The base64 decoder retains onl
 Remaining concerns: the scanner does not preserve unsupported ENEX metadata for import, does not canonicalize ENML, and rejects some valid-but-unmodeled structures fail-closed. An ENEX resource above 50 MiB is explicitly rejected to match the current future ResourceStore limit. The retained `NeedsContext` variant and `MAX_ENEX_DATA_BASE64_BYTES` symbol are legacy API compatibility only; the latter now names callback capacity, not an attachment limit. No real personal export was scanned under this stage's scope.
 
 Commands: `cargo fmt`, focused RED/GREEN commands above, `cargo test --test enex_scan`, `cargo test --quiet`, Release RSS sample, and `git diff --check` (clean).
+
+## Independent review round 1 correction
+
+The review of `b5ae370de` requested two Important corrections, and the controller
+identified two more fail-closed/aggregate-memory cases. No part of the JEX or
+editor baseline was changed.
+
+RED tests observed before the correction:
+
+1. A 300-byte valid element/attribute/PI target name did not return the new
+   name-bound error. The companion 17 KiB name fixtures assert rejection even
+   when the syntax reader's own atomic-name cap fires before a visitor callback.
+2. `<div/>` in `<content>` was accepted as ENML without an `en-note` root.
+   The same test covers bare text, a custom entity, and two roots.
+3. `<note>` inside `<note-attributes>` panicked on `Option::unwrap()` in
+   `close()`; the test uses `catch_unwind` and requires a structured error.
+4. Two notes with 600 large tags each were accepted despite unbounded total
+   retained metadata; 400 media references multiplied by 400 same-MD5
+   mismatched resources also produced an unbounded derived report.
+
+GREEN: names are capped at 256 bytes before conversion to owned `String`, and
+PI targets are checked at callback start. ENML inspection requires exactly one
+`en-note` root and validates text entity expansion through `quick-xml`'s
+`unescape`; unknown entities fail closed. Attribute containers now allow only
+explicit leaf metadata fields, so semantic `note`/`resource` cannot nest there.
+An 8 MiB aggregate report-retained budget charges metadata, entity overhead,
+media references and derived mismatch/unresolved/duplicate rows before each
+append. This budget limits the scanner's report, not the size of a valid ENEX
+source; sources over it receive `ReportTooLarge` with no partial report.
+
+Focused `cargo test --test enex_scan` after the correction: **16 passed**,
+including the original 22 MiB decoded-resource success case. Final
+`cargo test --quiet`: 67 unit, 4 document, 16 ENEX, 27 JEX, 15 migration,
+8 organization, 7 repository flow and 7 resource-store tests passed; empty
+integration/doc groups also passed. `git diff --check` was clean. This remains
+synthetic-fixture-only, read-only Stage C1b, pending independent re-review.

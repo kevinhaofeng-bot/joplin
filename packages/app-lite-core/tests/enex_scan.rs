@@ -261,3 +261,86 @@ fn rejects_unbounded_repeated_attributes_and_tags() {
         Err(EnexScanError::TooManyEntities)
     ));
 }
+
+#[test]
+fn rejects_oversized_xml_names_before_owned_copy() {
+    // Mutation caught: a syntactically valid but oversized name entering an owned String.
+    let name = "n".repeat(300);
+    for xml in [
+        format!("<en-export><{name}/></en-export>"),
+        format!("<en-export {name}=\"x\"/>"),
+        format!("<?{name} content?><en-export/>"),
+    ] {
+        assert!(matches!(
+            scan_fixture(&xml),
+            Err(EnexScanError::FieldTooLarge { .. })
+        ));
+    }
+    let huge = "n".repeat(17 * 1024);
+    for xml in [
+        format!("<en-export><{huge}/></en-export>"),
+        format!("<en-export {huge}=\"x\"/>"),
+        format!("<?{huge} content?><en-export/>"),
+    ] {
+        assert!(scan_fixture(&xml).is_err());
+    }
+}
+
+#[test]
+fn enml_requires_one_en_note_root_and_no_custom_entities() {
+    // Mutation caught: a well-formed fragment or unexpanded entity appearing clean.
+    for body in [
+        "<div/>",
+        "plain text",
+        "<en-note>&boom;</en-note>",
+        "<en-note/><en-note/>",
+    ] {
+        let xml =
+            format!("<en-export><note><content><![CDATA[{body}]]></content></note></en-export>");
+        assert!(scan_fixture(&xml).is_err(), "{body}");
+    }
+}
+
+#[test]
+fn nested_note_or_resource_under_attributes_fails_without_panic() {
+    // Mutation caught: nested semantic names taking the active builder and
+    // causing a later outer close to panic.
+    for inner in ["<note/>", "<resource><data>YQ==</data></resource>"] {
+        let xml = format!(
+            "<en-export><note><note-attributes>{inner}</note-attributes></note></en-export>"
+        );
+        let outcome = std::panic::catch_unwind(|| scan_fixture(&xml));
+        assert!(matches!(outcome, Ok(Err(EnexScanError::Structure(_)))));
+    }
+}
+
+#[test]
+fn aggregate_retained_metadata_budget_stops_repeated_large_tags() {
+    // Mutation caught: per-field and per-note limits permitting unlimited
+    // retained report growth across notes.
+    let tag = format!("<tag>{}</tag>", "x".repeat(8 * 1024));
+    let notes = (0..2)
+        .map(|_| format!("<note>{}</note>", tag.repeat(600)))
+        .collect::<String>();
+    let xml = format!("<en-export>{notes}</en-export>");
+    assert!(matches!(
+        scan_fixture(&xml),
+        Err(EnexScanError::ReportTooLarge { .. })
+    ));
+}
+
+#[test]
+fn aggregate_budget_also_bounds_derived_mime_mismatches() {
+    // Mutation caught: bounded input references still expanding into an
+    // unbounded report through reference-by-resource cross products.
+    let media =
+        "<en-media hash=\"900150983cd24fb0d6963f7d28e17f72\" type=\"image/png\"/>".repeat(400);
+    let resources = "<resource><data>YWJj</data><mime>text/plain</mime></resource>".repeat(400);
+    let xml = format!(
+        "<en-export><note><content><![CDATA[<en-note>{media}</en-note>]]></content>{resources}</note></en-export>"
+    );
+    assert!(matches!(
+        scan_fixture(&xml),
+        Err(EnexScanError::ReportTooLarge { .. })
+    ));
+}
