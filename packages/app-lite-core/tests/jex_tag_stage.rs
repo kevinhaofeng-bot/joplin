@@ -62,6 +62,24 @@ fn relation(id: &str, note_id: &str, tag_id: &str) -> String {
     )
 }
 
+fn folder_exporter_defaults(id: &str, title: &str) -> String {
+    format!(
+        "{title}\n\nid: {id}\nparent_id: \ncreated_time: 2023-11-14T22:13:21.000Z\nupdated_time: 2023-11-14T22:13:22.000Z\nuser_created_time: \nuser_updated_time: \ndeleted_time: 0\nencryption_applied: 0\nencryption_cipher_text: \nicon: \nis_shared: 0\nmaster_key_id: \nshare_id: \nuser_data: \ntype_: 2\n"
+    )
+}
+
+fn tag_exporter_defaults(id: &str, title: &str) -> String {
+    format!(
+        "{title}\n\nid: {id}\nparent_id: \ncreated_time: 2023-11-14T22:13:21.000Z\nupdated_time: 2023-11-14T22:13:22.000Z\nuser_created_time: \nuser_updated_time: \nencryption_applied: 0\nencryption_cipher_text: \nis_shared: 0\nuser_data: \ntype_: 5\n"
+    )
+}
+
+fn relation_exporter_defaults(id: &str, note_id: &str, tag_id: &str) -> String {
+    format!(
+        "id: {id}\nnote_id: {note_id}\ntag_id: {tag_id}\ncreated_time: 2023-11-14T22:13:21.000Z\nupdated_time: 2023-11-14T22:13:22.000Z\nuser_created_time: \nuser_updated_time: \nencryption_applied: 0\nencryption_cipher_text: \nis_shared: 0\ntype_: 6\n"
+    )
+}
+
 fn listing(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     let mut names = fs::read_dir(path)
         .unwrap()
@@ -69,6 +87,132 @@ fn listing(path: &std::path::Path) -> Vec<std::ffi::OsString> {
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+#[test]
+fn full_exporter_default_folder_tag_relation_stage_and_nondefaults_clean_up() {
+    let parent = tempdir().unwrap();
+    fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
+    let source = archive(|tar| {
+        append(
+            tar,
+            &format!("{ROOT_LEAF}.md"),
+            folder_exporter_defaults(ROOT_LEAF, "资料").as_bytes(),
+        );
+        append(
+            tar,
+            &format!("{NOTE_A}.md"),
+            note(NOTE_A, "笔记", "正文", 1, ROOT_LEAF).as_bytes(),
+        );
+        append(
+            tar,
+            &format!("{TAG_A}.md"),
+            tag_exporter_defaults(TAG_A, "要务").as_bytes(),
+        );
+        append(
+            tar,
+            &format!("{REL_A}.md"),
+            relation_exporter_defaults(REL_A, NOTE_A, TAG_A).as_bytes(),
+        );
+    });
+    let staged = stage_jex_file(&source, parent.path()).unwrap();
+    let path = staged.profile_path().to_path_buf();
+    let db = Connection::open(path.join("library.sqlite")).unwrap();
+    for table in [
+        "notes",
+        "tags",
+        "note_tags",
+        "jex_stage_folder_audit",
+        "jex_stage_tag_audit",
+        "jex_stage_relation_audit",
+    ] {
+        assert_eq!(
+            db.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap(),
+            1,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM notebooks", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM sync_outbox", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+    drop(db);
+    drop(staged);
+    assert!(!path.exists());
+
+    for (label, replace, expected) in [
+        (
+            "folder",
+            ("is_shared: 0", "is_shared: 1"),
+            "UnsupportedFolder",
+        ),
+        ("tag", ("user_data: ", "user_data: state"), "UnsupportedTag"),
+        (
+            "relation",
+            ("is_shared: 0", "is_shared: 1"),
+            "UnsupportedRelation",
+        ),
+    ] {
+        let folder = folder_exporter_defaults(ROOT_LEAF, "资料");
+        let tag = tag_exporter_defaults(TAG_A, "要务");
+        let relation = relation_exporter_defaults(REL_A, NOTE_A, TAG_A);
+        let (folder, tag, relation) = match label {
+            "folder" => (folder.replacen(replace.0, replace.1, 1), tag, relation),
+            "tag" => (folder, tag.replacen(replace.0, replace.1, 1), relation),
+            _ => (folder, tag, relation.replacen(replace.0, replace.1, 1)),
+        };
+        let source = archive(|tar| {
+            append(tar, &format!("{ROOT_LEAF}.md"), folder.as_bytes());
+            append(
+                tar,
+                &format!("{NOTE_A}.md"),
+                note(NOTE_A, "笔记", "正文", 1, ROOT_LEAF).as_bytes(),
+            );
+            append(tar, &format!("{TAG_A}.md"), tag.as_bytes());
+            append(tar, &format!("{REL_A}.md"), relation.as_bytes());
+        });
+        let error = stage_jex_file(&source, parent.path()).unwrap_err();
+        assert!(
+            format!("{error:?}").contains(expected),
+            "{label}: {error:?}"
+        );
+        assert_eq!(
+            listing(parent.path()),
+            vec![std::ffi::OsString::from("sentinel.bin")]
+        );
+    }
+
+    // BaseItem.serialize_format writes a falsy timestamp as an empty value,
+    // never as literal `0`; do not broaden that spelling by convenience.
+    let source = archive(|tar| {
+        append(
+            tar,
+            &format!("{ROOT_LEAF}.md"),
+            folder_exporter_defaults(ROOT_LEAF, "资料")
+                .replace("user_created_time: \n", "user_created_time: 0\n")
+                .as_bytes(),
+        );
+        append(
+            tar,
+            &format!("{NOTE_A}.md"),
+            note(NOTE_A, "笔记", "正文", 1, ROOT_LEAF).as_bytes(),
+        );
+    });
+    assert!(matches!(
+        stage_jex_file(&source, parent.path()),
+        Err(JexStageError::UnsupportedFolder { .. })
+    ));
+    assert_eq!(
+        listing(parent.path()),
+        vec![std::ffi::OsString::from("sentinel.bin")]
+    );
 }
 
 #[test]

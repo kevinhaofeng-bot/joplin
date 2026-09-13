@@ -233,7 +233,9 @@ pub(super) fn accepts_known_exporter_default(kind: i64, key: &str, value: &str) 
 }
 
 pub(super) fn is_optional_timestamp_default(value: &str) -> bool {
-    value.is_empty() || value == "0"
+    // `BaseItem.serialize_format` emits an empty text value for a falsy
+    // source timestamp; literal `0` is not an exporter-default spelling.
+    value.is_empty()
 }
 
 // BaseItem.serialize_format emits UTC ISO milliseconds, while
