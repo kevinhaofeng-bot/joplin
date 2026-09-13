@@ -677,8 +677,6 @@ dependencies = [
 [[package]]
 name = "xml-syntax-reader"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eef46790b8e567934c7b00a0e688d611c375f7f4518798800c40dc0e6322609"
 dependencies = [
  "memchr",
 ]

@@ -124,12 +124,14 @@ fn streams_a_resource_over_20_mib_and_reports_decoded_digests() {
         fixture.write_all(&chunk).unwrap();
     }
     fixture
-        .write_all(b"</data></resource></note></en-export>")
+        .write_all(b"</data><mime>application/pdf</mime><resource-attributes><file-name>large.pdf</file-name></resource-attributes></resource></note></en-export>")
         .unwrap();
 
     let report = scan_enex_file(fixture.path()).unwrap();
     let resource = &report.resources[0];
     assert_eq!(resource.byte_count, 22_020_096);
+    assert_eq!(resource.mime, "application/pdf");
+    assert_eq!(resource.filename, "large.pdf");
     assert_eq!(
         resource.md5,
         format!("{:x}", Md5::digest(vec![b'A'; 22_020_096]))
@@ -138,6 +140,34 @@ fn streams_a_resource_over_20_mib_and_reports_decoded_digests() {
         resource.sha256,
         format!("{:x}", Sha256::digest(vec![b'A'; 22_020_096]))
     );
+}
+
+#[test]
+fn retains_resource_metadata_across_parser_refill_boundaries() {
+    // Mutation caught: xml-syntax-reader's larger refill mode can issue tag
+    // callbacks but omit the following short character callbacks.
+    for size in [63, 64, 127, 128, 511, 512, 1024, 8192] {
+        let data = STANDARD.encode(vec![b'x'; size]);
+        for offset in [0, 1, 31, 255, 510, 511, 512, 513] {
+            let gap = " ".repeat(offset);
+            let xml = format!(
+                "<en-export><note><resource><data>{data}</data>{gap}<mime>application/pdf</mime><resource-attributes><file-name>边界.pdf</file-name></resource-attributes></resource></note></en-export>"
+            );
+            let report = scan_fixture(&xml).unwrap();
+            assert_eq!(
+                report.resources[0].byte_count, size,
+                "size={size}, offset={offset}"
+            );
+            assert_eq!(
+                report.resources[0].mime, "application/pdf",
+                "size={size}, offset={offset}"
+            );
+            assert_eq!(
+                report.resources[0].filename, "边界.pdf",
+                "size={size}, offset={offset}"
+            );
+        }
+    }
 }
 
 #[test]

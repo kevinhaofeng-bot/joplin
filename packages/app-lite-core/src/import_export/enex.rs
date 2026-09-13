@@ -1,19 +1,28 @@
 //! Read-only ENEX evidence scanner. The outer XML has exactly one bounded,
 //! chunk-callback parser; only a retained (at most 4 MiB) ENML body uses quick-xml.
 
+use crate::{
+    CanonicalDocument, CreateNote, LibraryError, LibraryRepository, NoteId, ResourceId, TagId,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use md5::Md5;
 use quick_xml::{
     Reader,
     events::{BytesStart, Event},
 };
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io,
-    path::Path,
+    fs::{self, File},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 use xml_syntax_reader::{QName, Span, Visitor, parse_read_with_capacity};
 
@@ -68,6 +77,8 @@ pub enum EnexScanError {
     MissingResourceData { resource_ordinal: usize },
     #[error("unexpected ENEX structure: {0}")]
     Structure(String),
+    #[error(transparent)]
+    Stage(Box<EnexStageError>),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -150,9 +161,11 @@ struct ResourceBuilder {
     carry: [u8; 4],
     carry_len: usize,
     padded: bool,
+    spool: Option<NamedTempFile>,
+    spool_buffer: Vec<u8>,
 }
 impl ResourceBuilder {
-    fn new(ordinal: usize, note_ordinal: usize) -> Self {
+    fn new(ordinal: usize, note_ordinal: usize, spool: Option<NamedTempFile>) -> Self {
         Self {
             ordinal,
             note_ordinal,
@@ -166,6 +179,8 @@ impl ResourceBuilder {
             carry: [0; 4],
             carry_len: 0,
             padded: false,
+            spool,
+            spool_buffer: Vec::with_capacity(64 * 1024),
         }
     }
     fn decode(&mut self, bytes: &[u8]) -> Result<(), EnexScanError> {
@@ -196,6 +211,13 @@ impl ResourceBuilder {
                 }
                 self.md5.update(&out[..len]);
                 self.sha256.update(&out[..len]);
+                if let Some(spool) = self.spool.as_mut() {
+                    self.spool_buffer.extend_from_slice(&out[..len]);
+                    if self.spool_buffer.len() >= 64 * 1024 {
+                        spool.write_all(&self.spool_buffer)?;
+                        self.spool_buffer.clear();
+                    }
+                }
                 self.byte_count += len;
                 self.padded = self.carry.contains(&b'=');
                 self.carry_len = 0;
@@ -209,7 +231,7 @@ impl ResourceBuilder {
             reason: reason.to_owned(),
         }
     }
-    fn finish(self) -> Result<EnexScannedResource, EnexScanError> {
+    fn finish(mut self) -> Result<(EnexScannedResource, Option<NamedTempFile>), EnexScanError> {
         if !self.saw_data {
             return Err(EnexScanError::MissingResourceData {
                 resource_ordinal: self.ordinal,
@@ -218,7 +240,11 @@ impl ResourceBuilder {
         if self.carry_len != 0 {
             return Err(self.bad_base64("incomplete base64 quartet"));
         }
-        Ok(EnexScannedResource {
+        if let Some(spool) = self.spool.as_mut() {
+            spool.write_all(&self.spool_buffer)?;
+            spool.as_file_mut().sync_all()?;
+        }
+        let resource = EnexScannedResource {
             ordinal: self.ordinal,
             note_ordinal: self.note_ordinal,
             mime: self.mime,
@@ -226,7 +252,8 @@ impl ResourceBuilder {
             md5: format!("{:x}", self.md5.finalize()),
             sha256: format!("{:x}", self.sha256.finalize()),
             byte_count: self.byte_count,
-        })
+        };
+        Ok((resource, self.spool))
     }
 }
 
@@ -248,6 +275,8 @@ struct EnexVisitor {
     comment_bytes: usize,
     pi_bytes: usize,
     report: EnexScanReport,
+    stage: Option<StageIngestion>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl EnexVisitor {
@@ -277,6 +306,13 @@ impl EnexVisitor {
         }
     }
     fn begin(&mut self, name: String) -> Result<(), EnexScanError> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+        {
+            return Err(EnexScanError::Stage(Box::new(EnexStageError::Cancelled)));
+        }
         if self.stack.len() >= 64 {
             return Err(EnexScanError::Structure("XML nesting exceeds 64".into()));
         }
@@ -300,9 +336,15 @@ impl EnexVisitor {
                 if self.report.counts.resource_occurrences >= MAX_ENEX_ENTITIES {
                     return Err(EnexScanError::TooManyEntities);
                 }
+                let spool = self
+                    .stage
+                    .as_ref()
+                    .map(|stage| NamedTempFile::new_in(&stage.profile_path))
+                    .transpose()?;
                 self.resource = Some(ResourceBuilder::new(
                     self.report.counts.resource_occurrences + 1,
                     self.note.as_ref().unwrap().ordinal,
+                    spool,
                 ));
                 true
             }
@@ -398,7 +440,19 @@ impl EnexVisitor {
             self.field = None;
         }
         if name == "resource" {
-            let resource = self.resource.take().unwrap().finish()?;
+            let (resource, spool) = self.resource.take().unwrap().finish()?;
+            if let Some(stage) = self.stage.as_mut() {
+                stage
+                    .process_resource(
+                        &resource,
+                        spool.ok_or_else(|| {
+                            EnexScanError::Stage(Box::new(EnexStageError::Verification(
+                                "missing resource spool".into(),
+                            )))
+                        })?,
+                    )
+                    .map_err(|e| EnexScanError::Stage(Box::new(e)))?;
+            }
             self.charge_report(256)?;
             self.report.resources.push(resource);
             self.report.counts.resource_occurrences += 1;
@@ -416,7 +470,7 @@ impl EnexVisitor {
                     .map(|r| 64 + r.hash_md5.len() + r.mime.len())
                     .sum::<usize>(),
             )?;
-            self.report.notes.push(EnexScannedNote {
+            let scanned = EnexScannedNote {
                 ordinal: note.ordinal,
                 title: note.title,
                 created_raw: note.created_raw,
@@ -426,12 +480,25 @@ impl EnexVisitor {
                 content_sha256: format!("{:x}", Sha256::digest(note.content.as_bytes())),
                 media_references,
                 unsupported_fidelity_constructs,
-            });
+            };
+            if let Some(stage) = self.stage.as_mut() {
+                stage
+                    .process_note(&scanned, &note.content)
+                    .map_err(|e| EnexScanError::Stage(Box::new(e)))?;
+            }
+            self.report.notes.push(scanned);
             self.report.counts.notes += 1;
         }
         Ok(())
     }
     fn text(&mut self, value: &[u8]) -> Result<(), EnexScanError> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+        {
+            return Err(EnexScanError::Stage(Box::new(EnexStageError::Cancelled)));
+        }
         let value =
             std::str::from_utf8(value).map_err(|e| EnexScanError::MalformedXml(e.to_string()))?;
         match self.field.as_deref() {
@@ -670,7 +737,17 @@ fn char_ref(value: &[u8]) -> Result<String, EnexScanError> {
 }
 
 pub fn scan_enex_file(path: impl AsRef<Path>) -> Result<EnexScanReport, EnexScanError> {
-    let mut visitor = EnexVisitor::default();
+    scan_enex_file_inner(path.as_ref(), None)
+}
+
+fn scan_enex_file_inner(
+    path: &Path,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<EnexScanReport, EnexScanError> {
+    let mut visitor = EnexVisitor {
+        cancel,
+        ..Default::default()
+    };
     parse_read_with_capacity(File::open(path)?, &mut visitor, INPUT_BYTES).map_err(|error| {
         match error {
             xml_syntax_reader::ReadError::Visitor(error) => error,
@@ -759,6 +836,710 @@ fn correlate_resources(report: &mut EnexScanReport, used: &mut usize) -> Result<
         if !referenced.contains(&resource.ordinal) {
             charge_derived(used, 8)?;
             report.unreferenced_resource_ordinals.push(resource.ordinal);
+        }
+    }
+    Ok(())
+}
+
+/// A staged profile owns a newly created temporary directory. Dropping the
+/// handle removes only that directory; it never names or mutates a live one.
+pub struct EnexStagedProfile {
+    directory: TempDir,
+    report: EnexStageReport,
+}
+
+impl EnexStagedProfile {
+    pub fn profile_path(&self) -> &Path {
+        self.directory.path()
+    }
+    pub fn report(&self) -> &EnexStageReport {
+        &self.report
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EnexStagedNote {
+    pub source_ordinal: usize,
+    pub destination_id: NoteId,
+    pub resource_ids: Vec<ResourceId>,
+    pub tag_ids: Vec<TagId>,
+}
+#[derive(Debug, Clone)]
+pub struct EnexStagedResource {
+    pub source_ordinal: usize,
+    pub note_ordinal: usize,
+    pub destination_id: ResourceId,
+    pub sha256: String,
+    pub byte_count: usize,
+}
+#[derive(Debug, Clone)]
+pub struct EnexStagedTagOccurrence {
+    pub note_ordinal: usize,
+    pub title: String,
+    pub destination_id: TagId,
+}
+#[derive(Debug, Clone, Default)]
+pub struct EnexStageReport {
+    pub notes: Vec<EnexStagedNote>,
+    pub resources: Vec<EnexStagedResource>,
+    pub tag_occurrences: Vec<EnexStagedTagOccurrence>,
+    pub duplicate_resource_md5s: Vec<String>,
+    pub pre_sync_outbox_rows: i64,
+    pub search_index_drained: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum EnexStageError {
+    #[error("ENEX scan blocked: {0}")]
+    Scan(#[from] EnexScanError),
+    #[error("staging I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("staging SQLite failed: {0}")]
+    Storage(#[from] rusqlite::Error),
+    #[error("staging repository failed: {0}")]
+    Repository(#[from] LibraryError),
+    #[error("canonical document failed: {0}")]
+    Document(#[from] crate::DocumentError),
+    #[error("staging parent must be an existing non-profile directory")]
+    InvalidStagingParent,
+    #[error("ENML fidelity blocker in note {note_ordinal} at {path}: {reason}")]
+    Fidelity {
+        note_ordinal: usize,
+        path: String,
+        reason: String,
+    },
+    #[error("missing attachment for note {note_ordinal}: {hash_md5}")]
+    MissingResource {
+        note_ordinal: usize,
+        hash_md5: String,
+    },
+    #[error("source ENEX changed between preflight and ingestion at {entity}")]
+    SourceChanged { entity: String },
+    #[error("invalid ENEX timestamp in note {note_ordinal}: {raw}")]
+    InvalidDate { note_ordinal: usize, raw: String },
+    #[error("staging cancelled")]
+    Cancelled,
+    #[error("staging verification failed: {0}")]
+    Verification(String),
+}
+
+struct StageIngestion {
+    profile_path: PathBuf,
+    repository: Arc<LibraryRepository>,
+    audit: Connection,
+    preflight: EnexScanReport,
+    report: EnexStageReport,
+    tags: BTreeMap<String, TagId>,
+    same_note_resources: BTreeMap<String, Vec<crate::VerifiedEnmlResource>>,
+}
+
+impl StageIngestion {
+    fn process_resource(
+        &mut self,
+        source: &EnexScannedResource,
+        spool: NamedTempFile,
+    ) -> Result<(), EnexStageError> {
+        if self.preflight.resources.get(source.ordinal - 1) != Some(source) {
+            return Err(EnexStageError::SourceChanged {
+                entity: format!("resource {}", source.ordinal),
+            });
+        }
+        let title = if source.filename.is_empty() {
+            format!("resource_{}", source.ordinal)
+        } else {
+            source.filename.clone()
+        };
+        let mime = if source.mime.is_empty() {
+            "application/octet-stream"
+        } else {
+            &source.mime
+        };
+        let extension = title
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .filter(|ext| {
+                !ext.is_empty()
+                    && ext.len() <= 16
+                    && ext
+                        .bytes()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            })
+            .unwrap_or_else(|| "bin".into());
+        let id = self.repository.import_resource_reader(
+            File::open(spool.path())?,
+            source.byte_count,
+            &title,
+            mime,
+            &extension,
+        )?;
+        let metadata = self.repository.resource_metadata(&id)?.ok_or_else(|| {
+            EnexStageError::Verification("resource disappeared after import".into())
+        })?;
+        if metadata.sha256.as_str() != source.sha256 || metadata.size != source.byte_count as i64 {
+            return Err(EnexStageError::Verification(format!(
+                "resource {} hash or size mismatch",
+                source.ordinal
+            )));
+        }
+        self.same_note_resources
+            .entry(source.md5.clone())
+            .or_default()
+            .push(crate::VerifiedEnmlResource {
+                resource_id: id.clone(),
+                mime: mime.into(),
+                filename: title,
+            });
+        self.report.resources.push(EnexStagedResource {
+            source_ordinal: source.ordinal,
+            note_ordinal: source.note_ordinal,
+            destination_id: id,
+            sha256: source.sha256.clone(),
+            byte_count: source.byte_count,
+        });
+        Ok(())
+    }
+
+    fn process_note(
+        &mut self,
+        source: &EnexScannedNote,
+        raw_enml: &str,
+    ) -> Result<(), EnexStageError> {
+        if self.preflight.notes.get(source.ordinal - 1) != Some(source) {
+            return Err(EnexStageError::SourceChanged {
+                entity: format!("note {}", source.ordinal),
+            });
+        }
+        for missing in self
+            .preflight
+            .unresolved_media_references
+            .iter()
+            .filter(|r| r.note_ordinal == source.ordinal)
+        {
+            return Err(EnexStageError::MissingResource {
+                note_ordinal: source.ordinal,
+                hash_md5: missing.hash_md5.clone(),
+            });
+        }
+        let converted = if raw_enml.is_empty() {
+            CanonicalDocument::parse_html("")?
+        } else {
+            crate::convert_enml(raw_enml, &self.same_note_resources)
+                .map_err(|e| EnexStageError::Fidelity {
+                    note_ordinal: source.ordinal,
+                    path: e.path,
+                    reason: e.reason,
+                })?
+                .document
+        };
+        let document = with_unreferenced_attachment_cards(
+            converted,
+            self.report
+                .resources
+                .iter()
+                .filter(|r| r.note_ordinal == source.ordinal)
+                .map(|mapped| {
+                    let original = &self.preflight.resources[mapped.source_ordinal - 1];
+                    (
+                        mapped.destination_id.clone(),
+                        if original.filename.is_empty() {
+                            format!("resource_{}", original.ordinal)
+                        } else {
+                            original.filename.clone()
+                        },
+                        if original.mime.is_empty() {
+                            "application/octet-stream".into()
+                        } else {
+                            original.mime.clone()
+                        },
+                    )
+                }),
+        );
+        let mut tag_ids = Vec::new();
+        for title in &source.tags {
+            let id = if let Some(id) = self.tags.get(title) {
+                id.clone()
+            } else {
+                let id = self.repository.create_tag(title)?.id;
+                self.tags.insert(title.clone(), id.clone());
+                id
+            };
+            self.report.tag_occurrences.push(EnexStagedTagOccurrence {
+                note_ordinal: source.ordinal,
+                title: title.clone(),
+                destination_id: id.clone(),
+            });
+            if !tag_ids.contains(&id) {
+                tag_ids.push(id);
+            }
+        }
+        let note = self.repository.create_note(CreateNote {
+            title: source.title.clone(),
+            notebook_id: None,
+            document,
+        })?;
+        if !tag_ids.is_empty() {
+            self.repository.set_note_tags(&note.id, &tag_ids)?;
+        }
+        let created =
+            parse_enex_date(&source.created_raw).ok_or_else(|| EnexStageError::InvalidDate {
+                note_ordinal: source.ordinal,
+                raw: source.created_raw.clone(),
+            })?;
+        let updated =
+            parse_enex_date(&source.updated_raw).ok_or_else(|| EnexStageError::InvalidDate {
+                note_ordinal: source.ordinal,
+                raw: source.updated_raw.clone(),
+            })?;
+        self.audit.execute("INSERT INTO enex_stage_audit (note_ordinal, note_id, raw_enml, created_time, updated_time) VALUES (?1, ?2, ?3, ?4, ?5)", params![source.ordinal as i64, note.id.as_str(), raw_enml, created, updated])?;
+        self.report.notes.push(EnexStagedNote {
+            source_ordinal: source.ordinal,
+            destination_id: note.id,
+            resource_ids: note.resource_ids,
+            tag_ids,
+        });
+        self.same_note_resources.clear();
+        Ok(())
+    }
+}
+
+/// Preflights the ENEX and writes only to a new, uniquely owned child of the
+/// caller's existing staging parent. The returned handle owns cleanup.
+pub fn stage_enex_file(
+    source: impl AsRef<Path>,
+    staging_parent: impl AsRef<Path>,
+) -> Result<EnexStagedProfile, EnexStageError> {
+    stage_enex_file_inner(source.as_ref(), staging_parent.as_ref(), None)
+}
+
+pub fn stage_enex_file_with_cancel(
+    source: impl AsRef<Path>,
+    staging_parent: impl AsRef<Path>,
+    cancel: Arc<AtomicBool>,
+) -> Result<EnexStagedProfile, EnexStageError> {
+    stage_enex_file_inner(source.as_ref(), staging_parent.as_ref(), Some(cancel))
+}
+
+fn stage_enex_file_inner(
+    source: &Path,
+    staging_parent: &Path,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<EnexStagedProfile, EnexStageError> {
+    let parent =
+        fs::canonicalize(staging_parent).map_err(|_| EnexStageError::InvalidStagingParent)?;
+    if !parent.is_dir()
+        || parent.join("library.sqlite").exists()
+        || parent.join("resources").exists()
+    {
+        return Err(EnexStageError::InvalidStagingParent);
+    }
+    if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(EnexStageError::Cancelled);
+    }
+    let preflight = scan_enex_file_inner(source, cancel.clone()).map_err(|error| match error {
+        EnexScanError::Stage(error) => *error,
+        other => EnexStageError::Scan(other),
+    })?;
+    if let Some(missing) = preflight.unresolved_media_references.first() {
+        return Err(EnexStageError::MissingResource {
+            note_ordinal: missing.note_ordinal,
+            hash_md5: missing.hash_md5.clone(),
+        });
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("enex-stage-")
+        .tempdir_in(&parent)?;
+    let profile_path = directory.path().to_path_buf();
+    let database = profile_path.join("library.sqlite");
+    let repository = Arc::new(LibraryRepository::open(&database)?);
+    let audit = Connection::open(&database)?;
+    audit.execute_batch("CREATE TABLE enex_stage_audit (note_ordinal INTEGER PRIMARY KEY NOT NULL, note_id TEXT NOT NULL UNIQUE REFERENCES notes(id), raw_enml TEXT NOT NULL, created_time INTEGER NOT NULL, updated_time INTEGER NOT NULL);")?;
+    let stage = StageIngestion {
+        profile_path,
+        repository,
+        audit,
+        preflight: preflight.clone(),
+        report: EnexStageReport {
+            duplicate_resource_md5s: preflight.duplicate_resource_md5s.clone(),
+            ..Default::default()
+        },
+        tags: BTreeMap::new(),
+        same_note_resources: BTreeMap::new(),
+    };
+    let mut visitor = EnexVisitor {
+        stage: Some(stage),
+        cancel,
+        ..Default::default()
+    };
+    parse_read_with_capacity(File::open(source)?, &mut visitor, INPUT_BYTES).map_err(|error| {
+        match error {
+            xml_syntax_reader::ReadError::Visitor(EnexScanError::Stage(error)) => *error,
+            xml_syntax_reader::ReadError::Visitor(error) => EnexStageError::Scan(error),
+            xml_syntax_reader::ReadError::Io(error) => EnexStageError::Io(error),
+            xml_syntax_reader::ReadError::Xml(error) => {
+                EnexStageError::Scan(EnexScanError::MalformedXml(format!("{error:?}")))
+            }
+        }
+    })?;
+    if !visitor.root_seen
+        || !visitor.stack.is_empty()
+        || visitor.note.is_some()
+        || visitor.resource.is_some()
+    {
+        return Err(EnexStageError::SourceChanged {
+            entity: "ENEX structure".into(),
+        });
+    }
+    if visitor
+        .cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        return Err(EnexStageError::Cancelled);
+    }
+    let stage = visitor.stage.take().unwrap();
+    if visitor.report.notes != preflight.notes
+        || visitor.report.resources != preflight.resources
+        || visitor.report.counts != preflight.counts
+    {
+        return Err(EnexStageError::SourceChanged {
+            entity: "entity counts or hashes".into(),
+        });
+    }
+    drop(stage.audit);
+    drop(stage.repository);
+    finalize_staging_database(&database)?;
+    let mut report = stage.report;
+    verify_staging_profile(&database, &preflight, &mut report)?;
+    if visitor
+        .cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        return Err(EnexStageError::Cancelled);
+    }
+    Ok(EnexStagedProfile { directory, report })
+}
+
+fn parse_enex_date(raw: &str) -> Option<i64> {
+    if raw.is_empty() {
+        return Some(0);
+    }
+    let bytes = raw.as_bytes();
+    if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
+        return None;
+    }
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| index != 8 && index != 15 && !byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| raw.get(range)?.parse::<i64>().ok();
+    let (year, month, day, hour, minute, second) = (
+        number(0..4)?,
+        number(4..6)?,
+        number(6..8)?,
+        number(9..11)?,
+        number(11..13)?,
+        number(13..15)?,
+    );
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some((days * 86400 + hour * 3600 + minute * 60 + second) * 1000)
+}
+
+fn with_unreferenced_attachment_cards(
+    document: CanonicalDocument,
+    resources: impl Iterator<Item = (ResourceId, String, String)>,
+) -> CanonicalDocument {
+    let mut blocks = document.blocks().to_vec();
+    let mut associated = document.resource_ids();
+    for (resource_id, filename, media_type) in resources {
+        if !associated.contains(&resource_id) {
+            blocks.push(crate::document::Block::Attachment {
+                resource_id: resource_id.clone(),
+                filename,
+                media_type,
+            });
+            associated.push(resource_id);
+        }
+    }
+    CanonicalDocument::from_blocks(blocks)
+}
+
+fn finalize_staging_database(database: &Path) -> Result<(), EnexStageError> {
+    let mut db = Connection::open(database)?;
+    let tx = db.transaction()?;
+    tx.execute("UPDATE notes SET created_time=(SELECT created_time FROM enex_stage_audit WHERE note_id=notes.id), updated_time=(SELECT updated_time FROM enex_stage_audit WHERE note_id=notes.id) WHERE id IN (SELECT note_id FROM enex_stage_audit)", [])?;
+    tx.execute("UPDATE note_revisions SET created_time=(SELECT updated_time FROM enex_stage_audit WHERE note_id=note_revisions.note_id) WHERE note_id IN (SELECT note_id FROM enex_stage_audit)", [])?;
+    tx.execute("DELETE FROM sync_outbox", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_staging_profile(
+    database: &Path,
+    preflight: &EnexScanReport,
+    report: &mut EnexStageReport,
+) -> Result<(), EnexStageError> {
+    let repo = LibraryRepository::open(database)?;
+    let db = Connection::open(database)?;
+    let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(EnexStageError::Verification(format!(
+            "integrity_check: {integrity}"
+        )));
+    }
+    let foreign_errors: i64 =
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_errors != 0 {
+        return Err(EnexStageError::Verification(
+            "foreign_key_check failed".into(),
+        ));
+    }
+    let count = |table: &str| -> Result<i64, EnexStageError> {
+        Ok(
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })?,
+        )
+    };
+    if report.notes.len() != preflight.notes.len()
+        || report.resources.len() != preflight.resources.len()
+        || count("notes")? != preflight.notes.len() as i64
+        || count("resources")? != preflight.resources.len() as i64
+        || count("resource_blobs")?
+            != preflight
+                .resources
+                .iter()
+                .map(|resource| resource.sha256.as_str())
+                .collect::<BTreeSet<_>>()
+                .len() as i64
+        || count("tags")?
+            != report
+                .tag_occurrences
+                .iter()
+                .map(|t| t.destination_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len() as i64
+        || count("note_tags")? != report.notes.iter().map(|n| n.tag_ids.len()).sum::<usize>() as i64
+        || count("note_resources")?
+            != report
+                .notes
+                .iter()
+                .map(|n| n.resource_ids.len())
+                .sum::<usize>() as i64
+        || count("enex_stage_audit")? != preflight.notes.len() as i64
+    {
+        return Err(EnexStageError::Verification(
+            "entity or relation count mismatch".into(),
+        ));
+    }
+    for (source, mapped) in preflight.notes.iter().zip(&report.notes) {
+        if source.ordinal != mapped.source_ordinal {
+            return Err(EnexStageError::Verification(
+                "note ordinal mapping mismatch".into(),
+            ));
+        }
+        let note = repo
+            .load_note(&mapped.destination_id)?
+            .ok_or_else(|| EnexStageError::Verification("reopened note missing".into()))?;
+        let raw: String = db.query_row(
+            "SELECT raw_enml FROM enex_stage_audit WHERE note_ordinal=?1 AND note_id=?2",
+            params![source.ordinal as i64, note.id.as_str()],
+            |row| row.get(0),
+        )?;
+        if format!("{:x}", Sha256::digest(raw.as_bytes())) != source.content_sha256 {
+            return Err(EnexStageError::Verification(
+                "ENML audit hash mismatch".into(),
+            ));
+        }
+        let resources = report
+            .resources
+            .iter()
+            .filter(|r| r.note_ordinal == source.ordinal)
+            .map(|r| {
+                let original = &preflight.resources[r.source_ordinal - 1];
+                (
+                    original.md5.clone(),
+                    crate::VerifiedEnmlResource {
+                        resource_id: r.destination_id.clone(),
+                        mime: if original.mime.is_empty() {
+                            "application/octet-stream".into()
+                        } else {
+                            original.mime.clone()
+                        },
+                        filename: if original.filename.is_empty() {
+                            format!("resource_{}", original.ordinal)
+                        } else {
+                            original.filename.clone()
+                        },
+                    },
+                )
+            })
+            .fold(
+                BTreeMap::<String, Vec<crate::VerifiedEnmlResource>>::new(),
+                |mut map, (hash, resource)| {
+                    map.entry(hash).or_default().push(resource);
+                    map
+                },
+            );
+        let converted = if raw.is_empty() {
+            CanonicalDocument::parse_html("")?
+        } else {
+            crate::convert_enml(&raw, &resources)
+                .map_err(|e| EnexStageError::Fidelity {
+                    note_ordinal: source.ordinal,
+                    path: e.path,
+                    reason: e.reason,
+                })?
+                .document
+        };
+        let document = with_unreferenced_attachment_cards(
+            converted,
+            report
+                .resources
+                .iter()
+                .filter(|r| r.note_ordinal == source.ordinal)
+                .map(|mapped| {
+                    let original = &preflight.resources[mapped.source_ordinal - 1];
+                    (
+                        mapped.destination_id.clone(),
+                        if original.filename.is_empty() {
+                            format!("resource_{}", original.ordinal)
+                        } else {
+                            original.filename.clone()
+                        },
+                        if original.mime.is_empty() {
+                            "application/octet-stream".into()
+                        } else {
+                            original.mime.clone()
+                        },
+                    )
+                }),
+        );
+        if note.title != source.title
+            || note.created_time != parse_enex_date(&source.created_raw).unwrap_or_default()
+            || note.updated_time != parse_enex_date(&source.updated_raw).unwrap_or_default()
+            || note.body_html != document.to_canonical_html().as_str()
+            || note.body_text != document.search_text().as_str()
+            || note.resource_ids != mapped.resource_ids
+            || note.tag_ids != mapped.tag_ids
+        {
+            return Err(EnexStageError::Verification(format!(
+                "reopened note {} differs",
+                source.ordinal
+            )));
+        }
+        let thumbnail: Option<String> = db.query_row(
+            "SELECT selected_thumbnail_id FROM notes WHERE id=?1",
+            [note.id.as_str()],
+            |row| row.get(0),
+        )?;
+        let mut expected_thumbnail = None;
+        for id in &mapped.resource_ids {
+            let resource = repo.resource_metadata(id)?.ok_or_else(|| {
+                EnexStageError::Verification("thumbnail candidate resource missing".into())
+            })?;
+            if resource.mime.starts_with("image/") {
+                expected_thumbnail = Some(id.as_str().to_owned());
+                break;
+            }
+        }
+        if thumbnail != expected_thumbnail {
+            return Err(EnexStageError::Verification(format!(
+                "selected thumbnail differs for note {}",
+                source.ordinal
+            )));
+        }
+    }
+    for (source, mapped) in preflight.resources.iter().zip(&report.resources) {
+        if source.ordinal != mapped.source_ordinal
+            || source.sha256 != mapped.sha256
+            || source.byte_count != mapped.byte_count
+        {
+            return Err(EnexStageError::Verification(
+                "resource mapping mismatch".into(),
+            ));
+        }
+        let (metadata, mut file) = repo
+            .open_verified_resource_file(&mapped.destination_id)?
+            .ok_or_else(|| EnexStageError::Verification("reopened resource missing".into()))?;
+        let mut hash = Sha256::new();
+        let size = io::copy(&mut file, &mut hash)?;
+        if metadata.sha256.as_str() != source.sha256
+            || size != source.byte_count as u64
+            || format!("{:x}", hash.finalize()) != source.sha256
+        {
+            return Err(EnexStageError::Verification(format!(
+                "resource {} blob mismatch",
+                source.ordinal
+            )));
+        }
+    }
+    report.pre_sync_outbox_rows = repo.outbox_count()?;
+    if report.pre_sync_outbox_rows != 0 {
+        return Err(EnexStageError::Verification(
+            "migration outbox not empty".into(),
+        ));
+    }
+    while repo.has_pending_search_jobs()? {
+        if repo.process_search_jobs()? == 0 {
+            return Err(EnexStageError::Verification(
+                "search index did not drain".into(),
+            ));
+        }
+    }
+    report.search_index_drained = !repo.has_pending_search_jobs()?;
+    if count("search_unicode")? != preflight.notes.len() as i64
+        || count("search_trigram")? != preflight.notes.len() as i64
+    {
+        return Err(EnexStageError::Verification(
+            "search projection count mismatch".into(),
+        ));
+    }
+    for mapped in &report.notes {
+        let note = repo
+            .load_note(&mapped.destination_id)?
+            .ok_or_else(|| EnexStageError::Verification("indexed note missing".into()))?;
+        for table in ["search_unicode", "search_trigram"] {
+            let (title, body): (String, String) = db.query_row(
+                &format!("SELECT title, body FROM {table} WHERE note_id=?1"),
+                [note.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if title != note.title || body != note.body_text {
+                return Err(EnexStageError::Verification(format!(
+                    "{table} projection differs for note {}",
+                    mapped.source_ordinal
+                )));
+            }
         }
     }
     Ok(())
