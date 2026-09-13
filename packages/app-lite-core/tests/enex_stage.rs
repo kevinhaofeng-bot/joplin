@@ -190,6 +190,40 @@ fn rejects_unsupported_or_missing_attachments_without_touching_existing_profile(
 }
 
 #[test]
+fn second_note_fidelity_failure_discards_previously_staged_note_and_attachment() {
+    // Mutation caught: an error after a successful note/resource leaves a
+    // partially populated stage child or changes a sibling profile.
+    let parent = tempdir().unwrap();
+    let sentinel = parent.path().join("live-profile");
+    fs::create_dir(&sentinel).unwrap();
+    fs::write(sentinel.join("keep.bin"), b"unchanged").unwrap();
+    let bytes = b"first-note-attachment";
+    let hash = format!("{:x}", Md5::digest(bytes));
+    let xml = format!(
+        "<en-export><note><title>已写入的笔记</title><content><![CDATA[<en-note><div>第一条<en-media hash=\"{hash}\" type=\"image/png\"/></div></en-note>]]></content>{}</note><note><title>失败的笔记</title><content><![CDATA[<en-note><table><tr><td>不支持</td></tr></table></en-note>]]></content></note></en-export>",
+        resource(bytes, "image/png", "first.png"),
+    );
+    let source = archive(&xml);
+    let scanned = scan_enex_file(source.path()).unwrap();
+    assert_eq!(scanned.notes.len(), 2);
+    assert_eq!(scanned.resources.len(), 1);
+    assert!(matches!(
+        stage_enex_file(source.path(), parent.path()),
+        Err(EnexStageError::Fidelity {
+            note_ordinal: 2,
+            path,
+            ..
+        }) if path == "/en-note/0"
+    ));
+    assert_eq!(fs::read(sentinel.join("keep.bin")).unwrap(), b"unchanged");
+    let entries = fs::read_dir(parent.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec![sentinel.file_name().unwrap()]);
+}
+
+#[test]
 fn streams_attachment_larger_than_metadata_cap_to_owned_profile() {
     // Mutation caught: collecting <data> through the 16 KiB metadata buffer.
     let bytes = vec![b'x'; 256 * 1024];
@@ -227,13 +261,15 @@ fn stages_a_twenty_two_mib_resource_without_a_full_base64_buffer() {
     let mut source = NamedTempFile::new().unwrap();
     source.write_all("<en-export><note><title>大文件</title><content><![CDATA[<en-note><div>可读</div></en-note>]]></content><resource><data encoding=\"base64\">".as_bytes()).unwrap();
     let encoded = b"QUFB".repeat(16 * 1024);
-    for _ in 0..448 {
+    for _ in 0..469 {
         source.write_all(&encoded).unwrap();
     }
+    source.write_all(&b"QUFB".repeat(5_461)).unwrap();
+    source.write_all(b"QQ==").unwrap();
     source.write_all(b"</data><mime>application/pdf</mime><resource-attributes><file-name>large.pdf</file-name></resource-attributes></resource></note></en-export>").unwrap();
     let parent = tempdir().unwrap();
     let stage = stage_enex_file(source.path(), parent.path()).unwrap();
-    assert_eq!(stage.report().resources[0].byte_count, 22_020_096);
+    assert_eq!(stage.report().resources[0].byte_count, 22 * 1024 * 1024);
     let repo = LibraryRepository::open(stage.profile_path().join("library.sqlite")).unwrap();
     let (metadata, mut file) = repo
         .open_verified_resource_file(&stage.report().resources[0].destination_id)
@@ -243,7 +279,7 @@ fn stages_a_twenty_two_mib_resource_without_a_full_base64_buffer() {
     assert_eq!(metadata.title, "large.pdf");
     let mut digest = Sha256::new();
     let copied = std::io::copy(&mut file, &mut digest).unwrap();
-    assert_eq!(copied, 22_020_096);
+    assert_eq!(copied, 22 * 1024 * 1024);
     assert_eq!(
         format!("{:x}", digest.finalize()),
         stage.report().resources[0].sha256

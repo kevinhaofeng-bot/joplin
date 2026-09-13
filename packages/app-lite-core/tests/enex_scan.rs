@@ -120,25 +120,27 @@ fn streams_a_resource_over_20_mib_and_reports_decoded_digests() {
         .write_all(b"<en-export><note><title>large</title><resource><data encoding=\"base64\">")
         .unwrap();
     let chunk = b"QUFB".repeat(16 * 1024);
-    for _ in 0..448 {
+    for _ in 0..469 {
         fixture.write_all(&chunk).unwrap();
     }
+    fixture.write_all(&b"QUFB".repeat(5_461)).unwrap();
+    fixture.write_all(b"QQ==").unwrap();
     fixture
         .write_all(b"</data><mime>application/pdf</mime><resource-attributes><file-name>large.pdf</file-name></resource-attributes></resource></note></en-export>")
         .unwrap();
 
     let report = scan_enex_file(fixture.path()).unwrap();
     let resource = &report.resources[0];
-    assert_eq!(resource.byte_count, 22_020_096);
+    assert_eq!(resource.byte_count, 22 * 1024 * 1024);
     assert_eq!(resource.mime, "application/pdf");
     assert_eq!(resource.filename, "large.pdf");
     assert_eq!(
         resource.md5,
-        format!("{:x}", Md5::digest(vec![b'A'; 22_020_096]))
+        format!("{:x}", Md5::digest(vec![b'A'; 22 * 1024 * 1024]))
     );
     assert_eq!(
         resource.sha256,
-        format!("{:x}", Sha256::digest(vec![b'A'; 22_020_096]))
+        format!("{:x}", Sha256::digest(vec![b'A'; 22 * 1024 * 1024]))
     );
 }
 

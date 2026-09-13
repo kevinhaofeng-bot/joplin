@@ -4,6 +4,8 @@ This directory retains the `xml-syntax-reader` 0.2.0 crate source and README
 from crates.io. Its Cargo metadata declares `MIT/Apache-2.0` licensing and
 identifies https://github.com/dholroyd/xml-syntax-reader as upstream. The
 published crate did not include separate license files.
+The published `tests/reader_tests.rs` is retained so the existing `[[test]]`
+target in its Cargo manifest remains independently runnable.
 
 Only `src/reader.rs::try_inline_with_peek` changes parser behavior: after an
 inline tag it marks the following text start before scanning for the next tag.

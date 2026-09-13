@@ -1033,26 +1033,7 @@ impl StageIngestion {
         };
         let document = with_unreferenced_attachment_cards(
             converted,
-            self.report
-                .resources
-                .iter()
-                .filter(|r| r.note_ordinal == source.ordinal)
-                .map(|mapped| {
-                    let original = &self.preflight.resources[mapped.source_ordinal - 1];
-                    (
-                        mapped.destination_id.clone(),
-                        if original.filename.is_empty() {
-                            format!("resource_{}", original.ordinal)
-                        } else {
-                            original.filename.clone()
-                        },
-                        if original.mime.is_empty() {
-                            "application/octet-stream".into()
-                        } else {
-                            original.mime.clone()
-                        },
-                    )
-                }),
+            attachment_card_inputs(&self.preflight, &self.report.resources, source.ordinal),
         );
         let mut tag_ids = Vec::new();
         for title in &source.tags {
@@ -1291,6 +1272,32 @@ fn with_unreferenced_attachment_cards(
     CanonicalDocument::from_blocks(blocks)
 }
 
+fn attachment_card_inputs<'a>(
+    preflight: &'a EnexScanReport,
+    staged_resources: &'a [EnexStagedResource],
+    note_ordinal: usize,
+) -> impl Iterator<Item = (ResourceId, String, String)> + 'a {
+    staged_resources
+        .iter()
+        .filter(move |resource| resource.note_ordinal == note_ordinal)
+        .map(move |mapped| {
+            let original = &preflight.resources[mapped.source_ordinal - 1];
+            (
+                mapped.destination_id.clone(),
+                if original.filename.is_empty() {
+                    format!("resource_{}", original.ordinal)
+                } else {
+                    original.filename.clone()
+                },
+                if original.mime.is_empty() {
+                    "application/octet-stream".into()
+                } else {
+                    original.mime.clone()
+                },
+            )
+        })
+}
+
 fn finalize_staging_database(database: &Path) -> Result<(), EnexStageError> {
     let mut db = Connection::open(database)?;
     let tx = db.transaction()?;
@@ -1423,26 +1430,7 @@ fn verify_staging_profile(
         };
         let document = with_unreferenced_attachment_cards(
             converted,
-            report
-                .resources
-                .iter()
-                .filter(|r| r.note_ordinal == source.ordinal)
-                .map(|mapped| {
-                    let original = &preflight.resources[mapped.source_ordinal - 1];
-                    (
-                        mapped.destination_id.clone(),
-                        if original.filename.is_empty() {
-                            format!("resource_{}", original.ordinal)
-                        } else {
-                            original.filename.clone()
-                        },
-                        if original.mime.is_empty() {
-                            "application/octet-stream".into()
-                        } else {
-                            original.mime.clone()
-                        },
-                    )
-                }),
+            attachment_card_inputs(preflight, &report.resources, source.ordinal),
         );
         if note.title != source.title
             || note.created_time != parse_enex_date(&source.created_raw).unwrap_or_default()
