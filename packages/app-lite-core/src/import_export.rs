@@ -26,6 +26,8 @@ pub use jex_stage::*;
 mod jex_body;
 pub use jex_body::*;
 mod jex_html;
+mod jex_qualification;
+pub use jex_qualification::*;
 
 /// Maximum number of tar entries accepted by a preflight scan.
 pub const MAX_JEX_ARCHIVE_ENTRIES: usize = 50_000;

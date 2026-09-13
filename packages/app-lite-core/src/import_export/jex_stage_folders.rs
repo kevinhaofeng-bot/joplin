@@ -128,6 +128,10 @@ fn parse_folder(raw: &JexRawSourceItem) -> Result<Folder, JexStageError> {
     })
 }
 
+pub(super) fn validate_source_item(raw: &JexRawSourceItem) -> Result<(), JexStageError> {
+    parse_folder(raw).map(|_| ())
+}
+
 /// Reads one bounded raw item at a time and rejects any folder topology that
 /// cannot be represented exactly by root notebooks or stack/child notebooks.
 pub(super) fn preflight(prepared: &JexPreparedSource) -> Result<FolderPlan, JexStageError> {

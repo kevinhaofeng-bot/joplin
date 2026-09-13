@@ -98,6 +98,10 @@ fn parse_metadata(raw: &JexRawSourceItem) -> Result<ResourceFields, JexStageErro
     })
 }
 
+pub(super) fn validate_source_item(raw: &JexRawSourceItem) -> Result<(), JexStageError> {
+    parse_metadata(raw).map(|_| ())
+}
+
 fn verify_signature(source_id: &str, mime: &str, file: &mut File) -> Result<(), JexStageError> {
     let mut prefix = [0_u8; 8];
     let count = file.read(&mut prefix)?;
@@ -116,6 +120,28 @@ fn verify_signature(source_id: &str, mime: &str, file: &mut File) -> Result<(), 
             "physical resource signature does not match MIME",
         ))
     }
+}
+
+pub(super) fn validate_source_resource(
+    prepared: &JexPreparedSource,
+    source: &JexScannedResource,
+) -> Result<(), JexStageError> {
+    let raw = prepared.raw_item(&source.source_id)?.ok_or_else(|| {
+        JexStageError::Verification("verified resource metadata disappeared".into())
+    })?;
+    let fields = parse_metadata(&raw)?;
+    let (physical, mut file) = prepared
+        .open_verified_resource(&source.source_id)?
+        .ok_or_else(|| JexStageError::Verification("verified resource file disappeared".into()))?;
+    if physical.archive_path != source.archive_path
+        || physical.byte_count != source.byte_count
+        || physical.sha256 != source.sha256
+    {
+        return Err(JexStageError::Verification(
+            "resource source evidence differs".into(),
+        ));
+    }
+    verify_signature(&source.source_id, &fields.mime, &mut file)
 }
 
 pub(super) fn import_one(

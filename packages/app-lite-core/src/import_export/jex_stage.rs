@@ -200,7 +200,7 @@ fn invalid_note(source_id: &str, source_path: &str, reason: &'static str) -> Jex
 // BaseItem.unserialize_format converts the same value back to Unix millis.
 // Empty/missing values are refused in this bounded stage instead of becoming
 // a new profile's current time.
-fn parse_joplin_utc_millis(raw: &str) -> Option<i64> {
+pub(super) fn parse_joplin_utc_millis(raw: &str) -> Option<i64> {
     let bytes = raw.as_bytes();
     if bytes.len() != 24
         || [
@@ -348,6 +348,38 @@ fn parse_note<'a>(
     let updated = source_time(&parsed.properties, "updated_time", source_id, path)?;
     let user_created = source_time(&parsed.properties, "user_created_time", source_id, path)?;
     let user_updated = source_time(&parsed.properties, "user_updated_time", source_id, path)?;
+    let raw_body = validate_raw_note_body(&content, &parsed.note_body, source_id, path)?;
+    let body = if content.contains("\r\n") {
+        String::from_utf8(raw_body.clone())
+            .expect("source UTF-8 checked")
+            .replace("\r\n", "\n")
+    } else {
+        String::from_utf8(raw_body.clone()).expect("source UTF-8 checked")
+    };
+    let title = content.lines().next().unwrap_or_default().to_owned();
+    Ok(ParsedNote {
+        source_id,
+        source_path: path,
+        title,
+        body,
+        raw_body,
+        parent_id,
+        markup,
+        created,
+        updated,
+        user_created,
+        user_updated,
+    })
+}
+
+/// Exact source separator/body check shared by stage and exporter qualification.
+/// It does not perform any metadata-field acceptance or user-visible mapping.
+fn validate_raw_note_body(
+    content: &str,
+    parsed_body: &str,
+    source_id: &str,
+    path: &str,
+) -> Result<Vec<u8>, JexStageError> {
     let separator = if content.contains("\r\n") {
         "\r\n\r\n"
     } else {
@@ -384,27 +416,62 @@ fn parse_note<'a>(
     } else {
         String::from_utf8(raw_body.clone()).expect("source UTF-8 checked")
     };
-    if body != parsed.note_body {
+    if body != parsed_body {
         return Err(invalid_note(
             source_id,
             path,
             "raw body and Joplin note parser disagree",
         ));
     }
-    let title = content.lines().next().unwrap_or_default().to_owned();
-    Ok(ParsedNote {
-        source_id,
-        source_path: path,
-        title,
-        body,
-        raw_body,
-        parent_id,
-        markup,
-        created,
-        updated,
-        user_created,
-        user_updated,
-    })
+    Ok(raw_body)
+}
+
+pub(super) fn validate_source_note_body(
+    raw: &super::JexRawSourceItem,
+) -> Result<(), JexStageError> {
+    let content = std::str::from_utf8(&raw.raw_bytes).map_err(|_| {
+        invalid_note(
+            &raw.source_id,
+            &raw.archive_path,
+            "source item is not UTF-8",
+        )
+    })?;
+    let parsed = super::parse_item(&raw.archive_path, content).map_err(|_| {
+        invalid_note(
+            &raw.source_id,
+            &raw.archive_path,
+            "source note parser rejected item",
+        )
+    })?;
+    validate_raw_note_body(
+        content,
+        &parsed.note_body,
+        &raw.source_id,
+        &raw.archive_path,
+    )
+    .map(|_| ())
+}
+
+/// Reuses the exact stage parsers for pure qualification without opening a
+/// destination repository. Graph and body checks are performed separately.
+pub(super) fn validate_source_item(raw: &super::JexRawSourceItem) -> Result<(), JexStageError> {
+    match raw.item_type {
+        1 => parse_note(&raw.source_id, &raw.archive_path, &raw.raw_bytes).map(|_| ()),
+        2 => folders::validate_source_item(raw),
+        4 => resources::validate_source_item(raw),
+        5 | 6 => tags::validate_source_item(raw),
+        _ => Err(JexStageError::UnsupportedEntity {
+            source_id: raw.source_id.clone(),
+            item_type: raw.item_type,
+        }),
+    }
+}
+
+pub(super) fn validate_source_resource(
+    prepared: &super::JexPreparedSource,
+    source: &super::JexScannedResource,
+) -> Result<(), JexStageError> {
+    resources::validate_source_resource(prepared, source)
 }
 
 fn count(db: &Connection, table: &str) -> Result<i64, JexStageError> {

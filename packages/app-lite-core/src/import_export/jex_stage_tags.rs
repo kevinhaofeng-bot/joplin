@@ -279,6 +279,18 @@ fn parse_relation(raw: &JexRawSourceItem) -> Result<SourceRelation, JexStageErro
     })
 }
 
+pub(super) fn validate_source_item(raw: &JexRawSourceItem) -> Result<(), JexStageError> {
+    match raw.item_type {
+        5 => parse_tag(raw).map(|_| ()),
+        6 => parse_relation(raw).map(|_| ()),
+        _ => Err(blocked_relation(
+            &raw.source_id,
+            &raw.archive_path,
+            "source item is not a tag or relation",
+        )),
+    }
+}
+
 /// All relationships are validated before any library child is created.
 pub(super) fn preflight(prepared: &JexPreparedSource) -> Result<TagPlan, JexStageError> {
     let source = prepared.report();
