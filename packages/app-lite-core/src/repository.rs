@@ -4352,9 +4352,11 @@ mod tests {
             })
             .unwrap();
         let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
-        assert!(repository
-            .fail_derived_text(&job, DerivedTextFailure::Unsupported)
-            .unwrap());
+        assert!(
+            repository
+                .fail_derived_text(&job, DerivedTextFailure::Unsupported)
+                .unwrap()
+        );
         {
             let connection = repository.connection.lock().unwrap();
             connection
@@ -4380,7 +4382,10 @@ mod tests {
         let requeued = reopened.take_derived_text_jobs(1).unwrap();
         assert_eq!(requeued.len(), 1);
         assert_eq!(requeued[0].resource_id, resource);
-        assert_eq!(requeued[0].extractor_version, DERIVED_TEXT_EXTRACTOR_VERSION);
+        assert_eq!(
+            requeued[0].extractor_version,
+            DERIVED_TEXT_EXTRACTOR_VERSION
+        );
     }
 
     #[cfg(unix)]
