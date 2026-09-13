@@ -32,7 +32,7 @@ pub struct JexBodyConversion {
     pub ordered_resource_occurrences: Vec<ResourceId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JexBodyBlockerKind {
     UnsupportedStructure,
     RawHtml,

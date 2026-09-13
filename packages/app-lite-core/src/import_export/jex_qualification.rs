@@ -15,8 +15,8 @@ use thiserror::Error;
 
 use super::jex_qualification_source::{JexQualificationSource, prepare_jex_qualification_source};
 use super::{
-    JexPrepareError, JexPreparedSource, JexRawSourceItem, JexScanCounts, JexScanReport,
-    JexScannedResource, JexVerifiedResource, convert_jex_note_body, parse_item,
+    JexBodyBlockerKind, JexPrepareError, JexPreparedSource, JexRawSourceItem, JexScanCounts,
+    JexScanReport, JexScannedResource, JexVerifiedResource, convert_jex_note_body, parse_item,
 };
 use crate::ResourceId;
 
@@ -83,6 +83,9 @@ pub struct JexQualificationReport {
     pub unclassifiable_item_type_counts: Vec<(i64, usize)>,
     /// Bounded MIME distribution for the completed semantic pass only.
     pub resource_mime_counts: Vec<(String, usize)>,
+    /// Aggregate enum-only body conversion blockers. No body, title, or
+    /// source-dependent reason is included; one failed note contributes one.
+    pub body_blocker_kind_counts: Vec<(JexBodyBlockerKind, usize)>,
     pub categories: Vec<JexQualificationCategory>,
     pub fields: Vec<JexQualifiedField>,
     /// False means C2c-1 preflight prevented the item-by-item semantic pass.
@@ -113,6 +116,7 @@ pub enum JexQualificationError {
 struct ReportBuilder {
     categories: BTreeMap<JexQualificationBlockerKind, JexQualificationCategory>,
     fields: BTreeMap<(i64, String, JexFieldDisposition), (usize, usize)>,
+    body_blocker_kind_counts: BTreeMap<JexBodyBlockerKind, usize>,
 }
 
 impl ReportBuilder {
@@ -162,6 +166,9 @@ impl ReportBuilder {
         counts.0 += 1;
         counts.1 += usize::from(nondefault);
     }
+    fn body_blocker_kind(&mut self, kind: JexBodyBlockerKind) {
+        *self.body_blocker_kind_counts.entry(kind).or_default() += 1;
+    }
     fn finish(self, source: &JexScanReport) -> JexQualificationReport {
         let categories = self.categories.into_values().collect::<Vec<_>>();
         let fields = self
@@ -184,6 +191,7 @@ impl ReportBuilder {
             metadata_item_type_counts: item_type_counts(source),
             unclassifiable_item_type_counts: unclassifiable_counts(source),
             resource_mime_counts: Vec::new(),
+            body_blocker_kind_counts: self.body_blocker_kind_counts.into_iter().collect(),
             ready_for_current_stage: categories.is_empty(),
             categories,
             fields,
@@ -995,6 +1003,7 @@ fn qualify_prepared<S: QualificationRead>(
                     &parsed.note_body,
                     &resource_map,
                 ) {
+                    builder.body_blocker_kind(error.kind);
                     builder.finding(
                         &mut seen,
                         JexQualificationBlockerKind::BodyFidelity,

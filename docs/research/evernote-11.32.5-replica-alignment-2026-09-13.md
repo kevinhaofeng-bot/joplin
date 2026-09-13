@@ -16,6 +16,7 @@
 ## 本轮直接重读的导入/导出细节
 
 - C2c-5a `33d48898f..ce7403188` 从 Joplin `BaseItem.serialize` 的全字段输出与 `Note.filter` 的坐标格式出发，逐字段放行精确零/空默认值，且拒绝带空格值或伪装属性名的非规范源字节；真实备份只读复扫使 `ExporterFieldGap` 发现次数 32,403→7,486，仍 ready=false。独立复审关闭最初两项 Important，剩余两项 Minor 已记录；控制者重跑 core 全测试、CLI 示例、fmt/diff。这里减少的是误报，**不是新增已迁笔记**。详见 `joplin-live-profile-metadata-qualification-2026-09-13.md`。
+- C2c-5b 只读 `--body-kinds` 以转换器固定枚举汇总 490 篇正文的首个保真阻断，不读取标题/正文到输出：`UnsupportedStructure` 170、`UnsafeLink` 165、`LinkedImage` 48、`RawHtml` 42、`AmbiguousAttachment` 40，余 25 篇分布在其它枚举。前两项合计 335 篇但类型还不能证明它们是同一种表格或链接；下一切片应针对源解析分支做保真实现和回归。扫描没有改变真实 JEX 的 ready=false，也不是 Evernote 源码已落地的功能。
 
 - C2c-4b `487211f6e` 以独立只读 SQLite 元数据与资源流第二遍核验替代「预检不 clean 就停止语义扫描」，没有放宽 `stage_jex_file`、Source spool 或 ResourceStore。独立复审 0 Critical/Important/Minor；控制者在该 HEAD 重跑 core 217 项和 CLI 示例测试。真实 1.1 GB JEX 的 `semantic_scan_completed=true`，`ready_for_current_stage=false`：字段集合差距 2,185 个实体、非默认未映射字段 4,610 个实体、严格 stage 校验阻断 3,878 个实体、正文保真阻断 490 篇、混合父文件夹 1 个；类别重叠，不能相加。完整数字、运行耗时/RSS、原档哈希及清理见 `joplin-live-profile-metadata-qualification-2026-09-13.md`。这些是 Joplin 导出语义与本产品的实现差距，**不是 Evernote 逆向已经落地的功能**，也不是正式迁移验收。
 
@@ -23,6 +24,7 @@
 - `renderer-readable/chunks/9093.js::916042`：导入前的 ENML sanitizer 去注释，解析 XML，并使用 tag/attribute allowlist；`en-media` 的 `hash`、`type` 与 `en-todo` 的 checked 是有效内容，不可当成普通文本丢弃。
 - `common-editor-sourcemap/.../modules/resource/resource.ts::getAttributeResourceFromElement`：编辑器以 `en-media` hash 寻找资源；缺少客户端资源资料时保留 hash+MIME 的 fallback。这解释了为什么内容和附件元数据必须交叉核对并报告悬空引用。
 - `main-readable/src/modules/11354__enex-exporter.js`：导出按 note 写标题、创建/更新时间、标签、note-attributes、CDATA ENML 和 base64 资源；`getNoteInfoForExport` 还取得 attachment 列表。可读 HTML/JSON+原附件仍是本产品的恢复出口，不应让 ENEX 成为唯一备份格式。
+- 同一 `11354` 的资源读取分支会在获取失败时记错并返回，不使整份 ENEX 失败；它也把单个资源读入内存再做 base64。这两处不是我们要照搬的质量标准：本产品的导出必须在引用资源缺失、哈希不符时拒绝发布成功 bundle，并对原字节资源采用分块复制与复核。这个裁定是 Rust 产品设计，不声称 Evernote 已如此实现。
 - 对照开源 Joplin `packages/lib/import-enex.ts::parseNotes/processNoteResource` 与 `packages/lib/import-enex-html-gen.ts::enexXmlToHtml_`：它按 note 批次处理，将资源 `<data>` 流写临时文件、base64 解码，再以实际字节的 MD5 对应正文 `<en-media hash>`；HTML 路径保留图片/附件及 checklist 的区分。它自己的预处理注释明确说整体载入 1GB+ ENEX 会耗尽内存，因此我们的 Rust 路径不得整体读取归档。这里属于 Joplin 可借鉴实现，不属于 Evernote 逆向成果。
 - Rust `CanonicalDocument` 目前只有段落、H1–H3、列表/清单、引文、代码、图片、附件和分隔线，没有表格块。ENML 表格、未知样式若直接投影为当前规范 HTML 会有保真风险；应先保留原 ENML，并在正式导入前用明确的“受支持/不支持”清单阻断静默损失。
 - `main-readable/src/modules/68232__sync-manager.js::ENSyncManager`：任务队列区分初始下行与后台活动，暂停/恢复、鉴权变更和队列持久状态各有边界；`66578__n-sync-event-manager.js::NSyncEventManager`：连接信息保存于 sync state，重连退避，接收/处理/可见是不同的完成状态，暂存资源还有 finalize 阶段。我们只借鉴“持久队列、游标、资源发布与可解释状态”的机制；个人 NAS 不复制 Evernote 的鉴权平台、云端预建 datastore、协同会话复杂度。当前 Rust `schema.rs` 已有 `sync_outbox`、`sync_cursor`、`sync_conflicts` 表，但没有传输、服务端或双端重试验收。

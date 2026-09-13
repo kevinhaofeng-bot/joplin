@@ -6,7 +6,11 @@ use std::{env, fmt::Write as _, process::ExitCode};
 
 use app_lite_core::{JexQualificationError, JexQualificationReport, qualify_jex_archive};
 
-fn render_report(report: &JexQualificationReport, include_fields: bool) -> String {
+fn render_report(
+    report: &JexQualificationReport,
+    include_fields: bool,
+    include_body_kinds: bool,
+) -> String {
     let mut output = String::new();
     writeln!(
         output,
@@ -46,6 +50,11 @@ fn render_report(report: &JexQualificationReport, include_fields: bool) -> Strin
             .unwrap();
         }
     }
+    if include_body_kinds {
+        for (kind, count) in &report.body_blocker_kind_counts {
+            writeln!(output, "body_blocker_kind={kind:?} count={count}").unwrap();
+        }
+    }
     for category in &report.categories {
         writeln!(
             output,
@@ -75,22 +84,31 @@ fn main() -> ExitCode {
     let mut args = env::args_os();
     let _program = args.next();
     let (Some(archive), Some(parent)) = (args.next(), args.next()) else {
-        eprintln!("usage: qualify_jex <explicit-archive.jex> <existing-staging-parent> [--fields]");
+        eprintln!(
+            "usage: qualify_jex <explicit-archive.jex> <existing-staging-parent> [--fields] [--body-kinds]"
+        );
         return ExitCode::from(2);
     };
-    let include_fields = match args.next() {
-        None => false,
-        Some(flag) if flag == "--fields" && args.next().is_none() => true,
-        _ => {
+    let mut include_fields = false;
+    let mut include_body_kinds = false;
+    for flag in args {
+        if flag == "--fields" && !include_fields {
+            include_fields = true;
+        } else if flag == "--body-kinds" && !include_body_kinds {
+            include_body_kinds = true;
+        } else {
             eprintln!(
-                "usage: qualify_jex <explicit-archive.jex> <existing-staging-parent> [--fields]"
+                "usage: qualify_jex <explicit-archive.jex> <existing-staging-parent> [--fields] [--body-kinds]"
             );
             return ExitCode::from(2);
         }
-    };
+    }
     match qualify_jex_archive(archive, parent) {
         Ok(report) => {
-            print!("{}", render_report(&report, include_fields));
+            print!(
+                "{}",
+                render_report(&report, include_fields, include_body_kinds)
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -110,8 +128,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use app_lite_core::{
-        JexQualificationBlockerKind, JexQualificationCategory, JexQualificationReport,
-        JexQualificationSample, JexScanCounts,
+        JexBodyBlockerKind, JexQualificationBlockerKind, JexQualificationCategory,
+        JexQualificationReport, JexQualificationSample, JexScanCounts,
     };
 
     #[test]
@@ -134,12 +152,18 @@ mod tests {
                 }],
             }],
             fields: Vec::new(),
+            body_blocker_kind_counts: vec![(JexBodyBlockerKind::UnsupportedStructure, 1)],
             semantic_scan_completed: true,
             ready_for_current_stage: false,
         };
-        let output = render_report(&report, false);
+        let output = render_report(&report, false, false);
         assert!(output.contains("related_source_id=22222222222222222222222222222222"));
         assert!(!output.contains("secret title and body"));
+        assert!(!output.contains("body_blocker_kind="));
+        assert!(
+            render_report(&report, false, true)
+                .contains("body_blocker_kind=UnsupportedStructure count=1")
+        );
     }
 
     #[test]
@@ -157,10 +181,11 @@ mod tests {
                 occurrence_count: 4,
                 nondefault_count: 1,
             }],
+            body_blocker_kind_counts: Vec::new(),
             semantic_scan_completed: true,
             ready_for_current_stage: false,
         };
-        let output = render_report(&report, true);
+        let output = render_report(&report, true, false);
         assert!(
             output.contains(
                 "name:source_url occurrence_count:4 nondefault_count:1 disposition:Blocked"
@@ -168,6 +193,6 @@ mod tests {
         );
         assert!(!output.contains("https://example.org"));
         report.fields.clear();
-        assert!(!render_report(&report, false).contains("name:source_url"));
+        assert!(!render_report(&report, false, false).contains("name:source_url"));
     }
 }

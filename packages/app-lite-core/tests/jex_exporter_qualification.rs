@@ -5,8 +5,8 @@ use std::{
 };
 
 use app_lite_core::{
-    JexFieldDisposition, JexPrepareError, JexQualificationBlockerKind, JexQualificationError,
-    qualify_jex_archive, qualify_jex_archive_with_cancel,
+    JexBodyBlockerKind, JexFieldDisposition, JexPrepareError, JexQualificationBlockerKind,
+    JexQualificationError, qualify_jex_archive, qualify_jex_archive_with_cancel,
 };
 use tar::{Builder, Header};
 use tempfile::{NamedTempFile, TempPath, tempdir};
@@ -197,6 +197,10 @@ fn exporter_defaults_and_later_semantic_blockers_are_aggregated_independent_of_t
                 .unwrap()
                 .item_count,
             1
+        );
+        assert_eq!(
+            report.body_blocker_kind_counts,
+            vec![(JexBodyBlockerKind::UnsupportedStructure, 1)]
         );
         assert_eq!(
             report

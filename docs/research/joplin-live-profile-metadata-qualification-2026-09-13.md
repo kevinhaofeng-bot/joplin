@@ -59,3 +59,9 @@
 字段级非默认分布暴露了下一段真正要保留的内容：来源 URL 425 条、非零排序 1,471 条、待办 40 篇（截止时间 16、完成时间 38）、非空资源 `filename` 2,945 条，以及 note `source`/`source_application` 各 1,664 条。坐标非默认也确实存在：latitude/longitude 各 626，altitude 490；不能一律当作零。`--fields` 只打印已知字段名、数量和处理类别，不打印标题、正文或属性值。单次复扫 74.38 秒，最大 RSS `55,918,592` 字节（约 53.3 MiB）；原备份 SHA 前后仍为 `1d0feb4fe025379db3a869bc348d0769de4b9b23b3a752580d0eb522c607d6cd`，临时子目录及空父目录已清理。
 
 此轮减少的是 **24,917 次默认字段假性 gap**，不是成功迁入 24,917 条数据。下一阶段需要按真实内容价值处理来源/排序/待办/资源文件名及 490 篇正文保真，仍不得跳过 1 处缺失内部引用、1 张 14,050,700 字节超限 PNG 和混合父文件夹。
+
+## C2c-5b 正文阻断类型的只读细分
+
+在原 490 篇 `BodyFidelity` 不变的情况下，增加只输出转换器固定枚举名的 `--body-kinds`，不输出标题、正文、链接目标或附件名称。对同一备份再次只读复扫，得到首个失败类型的互斥计数：`UnsupportedStructure` 170、`UnsafeLink` 165、`LinkedImage` 48、`RawHtml` 42、`AmbiguousAttachment` 40、`UnsupportedImageSource` 12、`UnsupportedHeading` 6、`UnsupportedAttribute` 5、`UnverifiedResource` 1、`InternalNoteLink` 1，总和正好为 490。前两类合占 335/490，但类型还不足以断言 170 篇全是表格，或 165 篇全是同一种链接；下一步必须结合源解析器的具体分支写保真测试，再扩充转换，而不是粗暴放宽 URL/结构白名单。
+
+本次输出仍为 `semantic_scan_completed=true`、`ready_for_current_stage=false`，其他资格类别计数与 5a 一致；用时 75.06 秒，最大 RSS 55,361,536 字节。原 JEX 前后 SHA-256 均为 `1d0feb4fe025379db3a869bc348d0769de4b9b23b3a752580d0eb522c607d6cd`，显式临时父目录确认为空后已删除。该分类只用于排定实现优先级，不构成正文已迁入。
