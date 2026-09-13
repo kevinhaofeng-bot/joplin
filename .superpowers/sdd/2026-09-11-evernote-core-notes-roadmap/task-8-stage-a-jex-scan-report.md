@@ -1,7 +1,7 @@
 # Task 8 Stage A: read-only JEX preflight checkpoint
 
-Date: 2026-09-13. Candidate HEAD: `210262361` on
-`codex/joplin-lite-native-rust`. Scope is **archive preflight only**—not an
+Date: 2026-09-13. Branch: `codex/joplin-lite-native-rust`. Scope is
+**archive preflight only**—not an
 importer, profile switch, readable export, personal-library migration, or M3.
 
 ## Source-to-implementation crosswalk
@@ -53,6 +53,12 @@ core-only cut; the isolated test then passed, and a second full run passed
 **1,314/0/1 exact pre-existing donor test filtered**. The scheduler flake
 has not been called fixed. GUI Cargo.lock was regenerated to include the new
 `tar` core dependency and committed.
+
+The release binary rebuilt successfully after the JEX dependency change
+(SHA-256 `8917fdcf5cea106562cd180e2254c336cdf7bd08eca1901fb15b88f63decb7a3`).
+Two ignored, disposable-profile release smoke tests for actual image OCR and
+selectable-PDF indexing passed **2/2**. These exercise the existing derived
+search path, not JEX import or a personal profile.
 
 ## Explicit limits
 
