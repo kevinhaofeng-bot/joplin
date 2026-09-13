@@ -1,6 +1,6 @@
 # Evernote 逆向与 Rust 复刻对齐审计（2026-09-13）
 
-本页以 `codex/joplin-lite-native-rust` 的 v0.21 检查点为基线，并跟踪其后已通过限界复审的 ENEX C1b 只读扫描、C2a 纯内容转换、C2b 隔离暂存、JEX C2c-1 原始资料暂存、C2c-2a/2b 纯正文转换、C2c-3a/3b/3c-1/3c-2 隔离资料库及 C2c-4a/4b 只读资格检查。它更新
+本页以 `codex/joplin-lite-native-rust` 的 v0.21 检查点为基线，并跟踪其后已通过限界复审的 ENEX C1b 只读扫描、C2a 纯内容转换、C2b 隔离暂存、JEX C2c-1 原始资料暂存、C2c-2a/2b 纯正文转换、C2c-3a/3b/3c-1/3c-2 隔离资料库、C2c-4a/4b 只读资格检查及 C2c-5a 导出器精确默认值兼容。它更新
 `evernote-11.32.5-core-product-behavior-map.md` 第 4 节在 2026-09-11 写下的
 「当前实现差距」快照；逆向资料、代码落地与真实产品验收是三种不同状态。
 
@@ -9,11 +9,13 @@
 | 新建、标题、编辑、保存、图片 | `69451` create、`21288` select、common-editor `title`、`content/changesplugin`、`resource/image`、`textbetweenblocks` | `app-lite-core` 的 repository/规范 HTML/资源事务与 GPUI `AppModel`/`NoteSession`/原生编辑器；Task 5 三篇中文笔记及图片在隔离 Release 资料库重启后保留，见 `task-5-m1-release-acceptance-2026-09-12.md` | 该真实操作验收属于当时二进制；当前 HEAD 未对个人资料库重演完整 M1 流程。模型只有粗/斜/下划/删除/高亮/链接等有限 mark，尚无 Evernote 的字体、字号、颜色、上/下标与表格等完整样式保真，不能把基本编辑可用说成完美复刻 |
 | 笔记列表、笔记本、标签、回收站、栏位 | `76905` list modes、Conduit NoteDAO simple projection、`74300` selected GUID reducer、Notebook/Tag mutators | GPUI typed route、轻量列表投影、保留 NoteId 的切换、组织操作、三/二/一栏；Task 6 报告有挂载测试及部分隔离 Release 操作 | 全部 Task 6/M2 的个人资料库浏览与性能门槛尚未签收；Evernote TOP_LIST、多标签层级等非首版能力也未照搬 |
 | 全库搜索、笔记内查找、附件文字 | `83028` search AST/SQL、offline index queue、common-editor `find`、`34309`/`45897`/`59009` 资源搜索文字 | 本地 FTS、Cmd-K、Cmd-F、文件名、可选中文字 PDF 与图片 OCR；v0.19/v0.21 之前的隔离 Release 检索冒烟通过 | 以历史 1,662 篇规模作真实 Release 延迟/RSS 验收、建议与历史完整体验、HEIC/扫描 PDF OCR 和 M2 总验收未完成；中文短词策略与提示文案是本产品改进，不是 Evernote 原样算法 |
-| Joplin 归档迁移 | Evernote `36364` 导入流程仅提供解析与 mutation 分离的行为参考 | C2c-1/2/3 已完成受限 JEX 原件暂存、纯正文转换和含资源/两级文件夹/标签的**合成样本隔离资料库**；C2c-4a/4b `f0eda7aa6..487211f6e` 增加 exporter-shaped 全量只读资格分类。对现成 1.1 GB JEX 备份实测：1,665 笔记、31 文件夹、4,153 资源、64 标签、425 关联；二次核验 78.19 秒、峰值 RSS 56,000,512 字节，`semantic_scan_completed=true`、ready=false。JEX 格式细节来自 Joplin Raw importer、exporter、Resource 和 renderer | **真实 JEX 尚不能视为可迁**：缺失内部引用 1 处、超当前图片上限 PNG 1 张、正文保真阻断 490 篇、混合父文件夹 1 个，以及大量导出默认字段/非默认属性和资源类型未映射。现用库另有 4 篇普通 JEX 未导出的已删除笔记。正式切换、可读导出/恢复及真实个人归档验收未完成；Joplin 语法不能称为 Evernote 逆向成果 |
+| Joplin 归档迁移 | Evernote `36364` 导入流程仅提供解析与 mutation 分离的行为参考 | C2c-1/2/3 已完成受限 JEX 原件暂存、纯正文转换和含资源/两级文件夹/标签的**合成样本隔离资料库**；C2c-4a/4b 增加全量只读资格分类，C2c-5a `33d48898f..ce7403188` 精确接受 Joplin 真正写出的默认字段并保留原始审计。对现成 1.1 GB JEX 备份实测：1,665 笔记、31 文件夹、4,153 资源、64 标签、425 关联；最新核验 74.38 秒、峰值 RSS 55,918,592 字节，`semantic_scan_completed=true`、ready=false；默认字段假性 gap 从 32,403 降到 7,486 次。JEX 格式细节来自 Joplin Raw importer、exporter、`BaseItem.serialize`、`Note.filter`、Resource 和 renderer | **真实 JEX 尚不能视为可迁**：缺失内部引用 1 处、超当前图片上限 PNG 1 张、正文保真阻断 490 篇、混合父文件夹 1 个，以及非默认来源/排序/待办/坐标/资源文件名与资源类型未映射。现用库另有 4 篇普通 JEX 未导出的已删除笔记。正式切换、可读导出/恢复及真实个人归档验收未完成；Joplin 语法不能称为 Evernote 逆向成果 |
 | ENEX 导入与可读导出 | `36364` SAX 导入、`916042` ENML 清洗、`11354` ENEX 导出、`12524`/`18882` HTML 导出 | C1b 分块扫描与 C2a 保真阻断转换已复审；`05dd34bdd..882107152` 的 C2b 将 ENEX 流式导入**独立临时 SQLite+blob 资料库**，逐笔记核对附件 MD5/SHA-256、保留原 ENML/时间/标签与图文顺序，重开检查完整性、正文索引和零迁移 outbox；22 MiB 附件及后续笔记失败清理均有测试，独立复审 0 Critical/Important，控制者最终 core 168/168。`xml-syntax-reader` 短文本回调缺陷经本地窄幅补丁修复并由扫描边界测试锁定 | **尚无正式资料库切换、JEX 导入、可读导出/恢复或真实个人归档验收**；C2b 不是完整迁移。字体/表格等不支持 ENML 仍明确阻断，而非静默丢内容 |
 | NAS 同步与恢复 | Conduit `MutationUpsyncActivity`、`RteSession`、`ResourceManager` | 本地 schema/outbox/cursor 的基础契约已在 core；普通写笔记不依赖网络 | Rust 客户端 transport、NAS server、冲突副本、断点资源和恢复演练仍属 Task 9/10，不能称为“同步完成” |
 
 ## 本轮直接重读的导入/导出细节
+
+- C2c-5a `33d48898f..ce7403188` 从 Joplin `BaseItem.serialize` 的全字段输出与 `Note.filter` 的坐标格式出发，逐字段放行精确零/空默认值，且拒绝带空格值或伪装属性名的非规范源字节；真实备份只读复扫使 `ExporterFieldGap` 发现次数 32,403→7,486，仍 ready=false。独立复审关闭最初两项 Important，剩余两项 Minor 已记录；控制者重跑 core 全测试、CLI 示例、fmt/diff。这里减少的是误报，**不是新增已迁笔记**。详见 `joplin-live-profile-metadata-qualification-2026-09-13.md`。
 
 - C2c-4b `487211f6e` 以独立只读 SQLite 元数据与资源流第二遍核验替代「预检不 clean 就停止语义扫描」，没有放宽 `stage_jex_file`、Source spool 或 ResourceStore。独立复审 0 Critical/Important/Minor；控制者在该 HEAD 重跑 core 217 项和 CLI 示例测试。真实 1.1 GB JEX 的 `semantic_scan_completed=true`，`ready_for_current_stage=false`：字段集合差距 2,185 个实体、非默认未映射字段 4,610 个实体、严格 stage 校验阻断 3,878 个实体、正文保真阻断 490 篇、混合父文件夹 1 个；类别重叠，不能相加。完整数字、运行耗时/RSS、原档哈希及清理见 `joplin-live-profile-metadata-qualification-2026-09-13.md`。这些是 Joplin 导出语义与本产品的实现差距，**不是 Evernote 逆向已经落地的功能**，也不是正式迁移验收。
 
