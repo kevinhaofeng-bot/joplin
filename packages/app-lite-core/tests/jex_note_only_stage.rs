@@ -46,6 +46,37 @@ fn listing(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     names
 }
 
+fn exporter_defaults(note: String) -> String {
+    note.replace(
+        "type_: 1\n",
+        "is_conflict: 0\nlatitude: 0\nlongitude: 0\naltitude: 0\nauthor: \nsource_url: \nis_todo: 0\ntodo_due: 0\ntodo_completed: 0\nsource: \nsource_application: \napplication_data: \norder: 0\ndeleted_time: 0\nencryption_applied: 0\nencryption_cipher_text: \nmaster_key_id: \nshare_id: \nis_shared: 0\nis_locked: 0\nextracted_resource_ids: \nconflict_original_id: \nuser_data: \ntype_: 1\n",
+    )
+}
+
+#[test]
+fn known_joplin_note_defaults_stage_but_nondefault_source_url_remains_refused() {
+    let parent = tempdir().unwrap();
+    fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
+    let ordinary = exporter_defaults(note(MD, "默认字段", "正文", 1, ""));
+    let source = archive(|tar| append(tar, &format!("{MD}.md"), ordinary.as_bytes()));
+    let staged = stage_jex_file(&source, parent.path()).unwrap();
+    let profile = staged.profile_path().to_path_buf();
+    assert_eq!(staged.report().notes.len(), 1);
+    drop(staged);
+    assert!(!profile.exists());
+
+    let nondefault = ordinary.replace("source_url: \n", "source_url: https://example.org\n");
+    let source = archive(|tar| append(tar, &format!("{MD}.md"), nondefault.as_bytes()));
+    assert!(matches!(
+        stage_jex_file(&source, parent.path()),
+        Err(JexStageError::UnsupportedNote { .. })
+    ));
+    assert_eq!(
+        listing(parent.path()),
+        vec![std::ffi::OsString::from("sentinel.bin")]
+    );
+}
+
 #[test]
 fn stages_two_real_notes_then_reopens_audited_searchable_zero_outbox_profile() {
     // Mutation caught: returning a scan report, using a source-only spool DB,

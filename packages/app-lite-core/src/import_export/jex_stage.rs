@@ -196,6 +196,46 @@ fn invalid_note(source_id: &str, source_path: &str, reason: &'static str) -> Jex
     }
 }
 
+/// Known zero/empty fields emitted by Joplin `BaseItem.serialize` for an
+/// ordinary item.  These are accepted only at this exact default; a value
+/// carrying user state must still be rejected by the narrow stage.  Keep this
+/// table shared with qualification so its field-gap report reflects reality.
+pub(super) fn accepts_known_exporter_default(kind: i64, key: &str, value: &str) -> bool {
+    let expected = match (kind, key) {
+        (
+            1,
+            "is_conflict" | "latitude" | "longitude" | "altitude" | "todo_due" | "todo_completed"
+            | "order" | "deleted_time" | "is_shared" | "is_locked",
+        ) => "0",
+        (
+            1,
+            "author"
+            | "source_url"
+            | "source"
+            | "source_application"
+            | "application_data"
+            | "encryption_cipher_text"
+            | "master_key_id"
+            | "share_id"
+            | "extracted_resource_ids"
+            | "conflict_original_id"
+            | "user_data",
+        ) => "",
+        (2, "deleted_time" | "is_shared") => "0",
+        (2, "encryption_cipher_text" | "icon" | "master_key_id" | "share_id" | "user_data") => "",
+        (5, "parent_id" | "encryption_cipher_text" | "user_data") => "",
+        (5, "is_shared") => "0",
+        (6, "encryption_cipher_text") => "",
+        (6, "is_shared") => "0",
+        _ => return false,
+    };
+    value == expected
+}
+
+pub(super) fn is_optional_timestamp_default(value: &str) -> bool {
+    value.is_empty() || value == "0"
+}
+
 // BaseItem.serialize_format emits UTC ISO milliseconds, while
 // BaseItem.unserialize_format converts the same value back to Unix millis.
 // Empty/missing values are refused in this bounded stage instead of becoming
@@ -302,11 +342,9 @@ fn parse_note<'a>(
         "encryption_applied",
         "is_todo",
     ];
-    if parsed
-        .properties
-        .keys()
-        .any(|key| !allowed.contains(&key.as_str()))
-    {
+    if parsed.properties.iter().any(|(key, value)| {
+        !allowed.contains(&key.as_str()) && !accepts_known_exporter_default(1, key, value)
+    }) {
         return Err(invalid_note(
             source_id,
             path,

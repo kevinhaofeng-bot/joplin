@@ -9,7 +9,8 @@ use crate::{LibraryRepository, TagId};
 
 use super::super::{JexPreparedSource, JexRawSourceItem, parse_item, valid_joplin_id};
 use super::{
-    JexStageError, JexStageReport, JexStagedRelation, JexStagedTag, parse_joplin_utc_millis,
+    JexStageError, JexStageReport, JexStagedRelation, JexStagedTag, accepts_known_exporter_default,
+    is_optional_timestamp_default, parse_joplin_utc_millis,
 };
 
 struct SourceTag {
@@ -77,7 +78,7 @@ fn source_times(
     };
     let optional = |key| match props.get(key) {
         None => Ok(None),
-        Some(value) if value.is_empty() => Ok(None),
+        Some(value) if is_optional_timestamp_default(value) => Ok(None),
         Some(value) => parse_joplin_utc_millis(value)
             .map(Some)
             .ok_or_else(|| blocked("invalid optional source timestamp")),
@@ -150,11 +151,9 @@ fn parse_tag(raw: &JexRawSourceItem) -> Result<SourceTag, JexStageError> {
         "is_shared",
         "user_data",
     ];
-    if parsed
-        .properties
-        .keys()
-        .any(|key| !allowed.contains(&key.as_str()))
-    {
+    if parsed.properties.iter().any(|(key, value)| {
+        !allowed.contains(&key.as_str()) && !accepts_known_exporter_default(5, key, value)
+    }) {
         return Err(blocked_tag(
             id,
             path,
@@ -220,11 +219,9 @@ fn parse_relation(raw: &JexRawSourceItem) -> Result<SourceRelation, JexStageErro
         "encryption_applied",
         "is_shared",
     ];
-    if parsed
-        .properties
-        .keys()
-        .any(|key| !allowed.contains(&key.as_str()))
-    {
+    if parsed.properties.iter().any(|(key, value)| {
+        !allowed.contains(&key.as_str()) && !accepts_known_exporter_default(6, key, value)
+    }) {
         return Err(blocked_relation(
             id,
             path,

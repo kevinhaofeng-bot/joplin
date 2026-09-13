@@ -9,7 +9,8 @@ use crate::{LibraryRepository, NotebookId, StackId};
 
 use super::super::{JexPreparedSource, JexRawSourceItem, parse_item, valid_joplin_id};
 use super::{
-    JexFolderDestination, JexStageError, JexStageReport, JexStagedFolder, invalid_note,
+    JexFolderDestination, JexStageError, JexStageReport, JexStagedFolder,
+    accepts_known_exporter_default, invalid_note, is_optional_timestamp_default,
     parse_joplin_utc_millis, parse_note,
 };
 
@@ -53,13 +54,15 @@ fn parse_folder(raw: &JexRawSourceItem) -> Result<Folder, JexStageError> {
         "parent_id",
         "created_time",
         "updated_time",
+        "user_created_time",
+        "user_updated_time",
         "encryption_applied",
     ];
-    if parsed
-        .properties
-        .keys()
-        .any(|key| !allowed.contains(&key.as_str()))
-    {
+    if parsed.properties.iter().any(|(key, value)| {
+        (!allowed.contains(&key.as_str()) && !accepts_known_exporter_default(2, key, value))
+            || (matches!(key.as_str(), "user_created_time" | "user_updated_time")
+                && !is_optional_timestamp_default(value))
+    }) {
         return Err(blocked(
             id,
             path,

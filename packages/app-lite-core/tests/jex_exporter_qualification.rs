@@ -215,12 +215,15 @@ fn exporter_defaults_and_later_semantic_blockers_are_aggregated_independent_of_t
                     && s.source_path == format!("{BAD_TIME}.md")
                     && s.field.as_deref() == Some("updated_time"))
         );
-        assert!(
+        // Ordinary BaseItem.serialize defaults are now accepted by the same
+        // strict parser.  Only the two notes carrying nondefault business
+        // state retain a stage gap.
+        assert_eq!(
             report
                 .category(JexQualificationBlockerKind::ExporterFieldGap)
                 .unwrap()
-                .item_count
-                >= 5
+                .item_count,
+            2
         );
         assert_eq!(fs::read(&source).unwrap(), original);
         assert_eq!(

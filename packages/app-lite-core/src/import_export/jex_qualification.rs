@@ -479,7 +479,21 @@ fn exporter_fields(kind: i64) -> &'static [&'static str] {
     }
 }
 
-fn stage_accepts(kind: i64, key: &str) -> bool {
+fn stage_accepts(kind: i64, key: &str, value: &str) -> bool {
+    if super::jex_stage::accepts_known_exporter_default(kind, key, value) {
+        return true;
+    }
+    if matches!(
+        (kind, key),
+        (1, "encryption_applied" | "is_todo")
+            | (2, "encryption_applied")
+            | (5 | 6, "encryption_applied" | "is_shared")
+    ) {
+        return value.is_empty() || value == "0";
+    }
+    if matches!((kind, key), (2, "user_created_time" | "user_updated_time")) {
+        return super::jex_stage::is_optional_timestamp_default(value);
+    }
     let accepted: &[&str] = match kind {
         1 => &[
             "id",
@@ -648,7 +662,7 @@ fn classify_fields(
                 "nondefault exporter field has no user-visible native mapping",
             );
         }
-        if !stage_accepts(kind, key) {
+        if !stage_accepts(kind, key, value) {
             has_gap = true;
             builder.finding(
                 seen,
