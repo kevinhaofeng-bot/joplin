@@ -1,10 +1,11 @@
 use std::{
     fs::{self, File},
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
 };
 
 use app_lite_core::{
-    JexPrepareError, prepare_jex_source_archive, prepare_jex_source_archive_with_cancel,
+    JexPrepareError, JexScanError, prepare_jex_source_archive,
+    prepare_jex_source_archive_with_cancel,
 };
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -33,6 +34,33 @@ fn archive(entries: impl FnOnce(&mut Builder<File>)) -> TempPath {
     let mut builder = Builder::new(File::create(&path).unwrap());
     entries(&mut builder);
     builder.finish().unwrap();
+    path
+}
+
+fn truncated_resource_archive() -> TempPath {
+    let path = NamedTempFile::new().unwrap().into_temp_path();
+    let mut file = File::create(&path).unwrap();
+    let metadata =
+        format!("图.png\n\nid: {RESOURCE}\ntype_: 4\nmime: image/png\nfile_extension: png\n");
+    let mut item_header = Header::new_gnu();
+    item_header.set_path(format!("{RESOURCE}.md")).unwrap();
+    item_header.set_size(metadata.len() as u64);
+    item_header.set_mode(0o644);
+    item_header.set_cksum();
+    file.write_all(item_header.as_bytes()).unwrap();
+    file.write_all(metadata.as_bytes()).unwrap();
+    file.write_all(&vec![0; (512 - metadata.len() % 512) % 512])
+        .unwrap();
+
+    let mut resource_header = Header::new_gnu();
+    resource_header
+        .set_path(format!("resources/{RESOURCE}.png"))
+        .unwrap();
+    resource_header.set_size(32 * 1024);
+    resource_header.set_mode(0o644);
+    resource_header.set_cksum();
+    file.write_all(resource_header.as_bytes()).unwrap();
+    file.write_all(b"truncated resource bytes").unwrap();
     path
 }
 
@@ -181,6 +209,32 @@ fn refuses_preflight_blockers_and_existing_profile_parent_without_touching_sibli
         fs::read(live.path().join("library.sqlite")).unwrap(),
         b"sentinel"
     );
+}
+
+#[test]
+fn rejects_truncated_resource_tar_without_creating_a_stage_child() {
+    // Mutation caught: treating a damaged resource as an empty/partial file,
+    // or leaving a stage child behind when preflight returns a typed error.
+    let source = truncated_resource_archive();
+    let parent = tempdir().unwrap();
+    let sentinel = parent.path().join("sibling");
+    fs::create_dir(&sentinel).unwrap();
+    fs::write(sentinel.join("keep.bin"), b"unchanged").unwrap();
+    let before = fs::read_dir(parent.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        prepare_jex_source_archive(&source, parent.path()),
+        Err(JexPrepareError::Scan(JexScanError::Io(_)))
+    ));
+    assert_eq!(fs::read(sentinel.join("keep.bin")).unwrap(), b"unchanged");
+    let after = fs::read_dir(parent.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
 }
 
 #[test]
