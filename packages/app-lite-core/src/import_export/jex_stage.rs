@@ -204,9 +204,11 @@ pub(super) fn accepts_known_exporter_default(kind: i64, key: &str, value: &str) 
     let expected = match (kind, key) {
         (
             1,
-            "is_conflict" | "latitude" | "longitude" | "altitude" | "todo_due" | "todo_completed"
-            | "order" | "deleted_time" | "is_shared" | "is_locked",
+            "is_conflict" | "todo_due" | "todo_completed" | "order" | "deleted_time" | "is_shared"
+            | "is_locked",
         ) => "0",
+        (1, "latitude" | "longitude") => "0.00000000",
+        (1, "altitude") => "0.0000",
         (
             1,
             "author"
@@ -230,6 +232,10 @@ pub(super) fn accepts_known_exporter_default(kind: i64, key: &str, value: &str) 
         _ => return false,
     };
     value == expected
+}
+
+pub(super) fn canonical_exporter_properties(item: &super::ParsedItem) -> bool {
+    !item.noncanonical_property_syntax
 }
 
 pub(super) fn is_optional_timestamp_default(value: &str) -> bool {
@@ -330,6 +336,13 @@ fn parse_note<'a>(
             source_id,
             path,
             "source note ID or item type changed",
+        ));
+    }
+    if !canonical_exporter_properties(&parsed) {
+        return Err(invalid_note(
+            source_id,
+            path,
+            "source note property syntax or value whitespace is not exporter-canonical",
         ));
     }
     let allowed = [

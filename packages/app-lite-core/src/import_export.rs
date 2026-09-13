@@ -181,6 +181,11 @@ struct ParsedItem {
     normalized_id: String,
     item_type: i64,
     properties: BTreeMap<String, String>,
+    /// Exact bytes after Joplin's single `": "` separator, before the
+    /// legacy scan parser trims values. Strict staging must not treat a
+    /// whitespace-bearing source value as an empty exporter default.
+    exporter_properties: BTreeMap<String, String>,
+    noncanonical_property_syntax: bool,
     note_body: String,
 }
 
@@ -527,6 +532,8 @@ fn parse_item(path: &str, content: &str) -> Result<ParsedItem, JexScanError> {
         .map(|index| index + 1)
         .unwrap_or(0);
     let mut properties = BTreeMap::new();
+    let mut exporter_properties = BTreeMap::new();
+    let mut noncanonical_property_syntax = false;
     for line in &lines[properties_start..] {
         let (key, value) = line
             .split_once(':')
@@ -534,12 +541,22 @@ fn parse_item(path: &str, content: &str) -> Result<ParsedItem, JexScanError> {
                 path: path.to_owned(),
                 reason: format!("invalid property line: {line:?}"),
             })?;
+        let raw_key = key;
         let key = key.trim();
         if key.is_empty() {
             return Err(JexScanError::MalformedItem {
                 path: path.to_owned(),
                 reason: "empty property name".to_owned(),
             });
+        }
+        let exact_value = if let Some(value) = value.strip_prefix(' ') {
+            value
+        } else {
+            noncanonical_property_syntax = true;
+            value
+        };
+        if raw_key != key || exact_value.trim() != exact_value {
+            noncanonical_property_syntax = true;
         }
         if properties
             .insert(key.to_owned(), value.trim().to_owned())
@@ -550,6 +567,7 @@ fn parse_item(path: &str, content: &str) -> Result<ParsedItem, JexScanError> {
                 reason: format!("duplicate property: {key}"),
             });
         }
+        exporter_properties.insert(key.to_owned(), exact_value.to_owned());
     }
     let id = properties
         .get("id")
@@ -587,6 +605,8 @@ fn parse_item(path: &str, content: &str) -> Result<ParsedItem, JexScanError> {
         id,
         item_type,
         properties,
+        exporter_properties,
+        noncanonical_property_syntax,
         note_body,
     })
 }

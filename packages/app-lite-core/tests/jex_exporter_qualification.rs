@@ -54,9 +54,9 @@ fn exporter_note(id: &str, body: &str, overrides: &[(&str, &str)]) -> String {
         ("user_updated_time", "2023-11-14T22:13:24.000Z"),
         ("markup_language", "1"),
         ("is_conflict", "0"),
-        ("latitude", "0"),
-        ("longitude", "0"),
-        ("altitude", "0"),
+        ("latitude", "0.00000000"),
+        ("longitude", "0.00000000"),
+        ("altitude", "0.0000"),
         ("author", ""),
         ("source_url", ""),
         ("is_todo", "0"),
@@ -518,6 +518,61 @@ fn clean_archive_without_notes_is_not_reported_ready_for_the_strict_stage() {
     assert_eq!(
         fs::read(parent.path().join("sentinel.bin")).unwrap(),
         b"keep"
+    );
+}
+
+#[test]
+fn real_zero_coordinates_are_defaults_but_author_space_is_not() {
+    let parent = tempdir().unwrap();
+    let clean = exporter_note(CLEAN, "正文", &[]);
+    let source = archive(|tar| append(tar, &format!("{CLEAN}.md"), clean.as_bytes()));
+    let report = qualify_jex_archive(&source, parent.path()).unwrap();
+    assert!(report.semantic_scan_completed);
+    assert!(report.ready_for_current_stage);
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::UnmappedSemanticField)
+            .is_none()
+    );
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::StageValidation)
+            .is_none()
+    );
+
+    let moved = exporter_note(CLEAN, "正文", &[("latitude", "1.00000000")]);
+    let source = archive(|tar| append(tar, &format!("{CLEAN}.md"), moved.as_bytes()));
+    let report = qualify_jex_archive(&source, parent.path()).unwrap();
+    assert!(!report.ready_for_current_stage);
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::UnmappedSemanticField)
+            .is_some()
+    );
+
+    let spaced = exporter_note(CLEAN, "正文", &[("author", " ")]);
+    let source = archive(|tar| append(tar, &format!("{CLEAN}.md"), spaced.as_bytes()));
+    let report = qualify_jex_archive(&source, parent.path()).unwrap();
+    assert!(!report.ready_for_current_stage);
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::UnmappedSemanticField)
+            .is_some()
+    );
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::ExporterFieldGap)
+            .is_some()
+    );
+
+    let disguised = clean.replace("author: \n", "author : \n");
+    let source = archive(|tar| append(tar, &format!("{CLEAN}.md"), disguised.as_bytes()));
+    let report = qualify_jex_archive(&source, parent.path()).unwrap();
+    assert!(!report.ready_for_current_stage);
+    assert!(
+        report
+            .category(JexQualificationBlockerKind::StageValidation)
+            .is_some()
     );
 }
 

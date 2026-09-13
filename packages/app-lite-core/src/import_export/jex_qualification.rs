@@ -612,6 +612,8 @@ fn nondefault(kind: i64, key: &str, value: &str) -> bool {
     let schema_default = match (kind, key) {
         (4, "size") => "-1",
         (1, "markup_language") | (4, "ocr_driver_id") => "1",
+        (1, "latitude" | "longitude") => "0.00000000",
+        (1, "altitude") => "0.0000",
         _ => "0",
     };
     !value.is_empty() && value != schema_default
@@ -926,7 +928,7 @@ fn qualify_prepared<S: QualificationRead>(
             raw.item_type,
             &raw.source_id,
             &raw.archive_path,
-            &parsed.properties,
+            &parsed.exporter_properties,
         );
         check_times(
             &mut builder,

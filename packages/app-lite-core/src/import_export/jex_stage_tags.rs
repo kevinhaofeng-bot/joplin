@@ -10,7 +10,7 @@ use crate::{LibraryRepository, TagId};
 use super::super::{JexPreparedSource, JexRawSourceItem, parse_item, valid_joplin_id};
 use super::{
     JexStageError, JexStageReport, JexStagedRelation, JexStagedTag, accepts_known_exporter_default,
-    is_optional_timestamp_default, parse_joplin_utc_millis,
+    canonical_exporter_properties, is_optional_timestamp_default, parse_joplin_utc_millis,
 };
 
 struct SourceTag {
@@ -139,6 +139,13 @@ fn parse_tag(raw: &JexRawSourceItem) -> Result<SourceTag, JexStageError> {
     if parsed.item_type != 5 || !parsed.id.eq_ignore_ascii_case(id) {
         return Err(blocked_tag(id, path, "tag identity changed"));
     }
+    if !canonical_exporter_properties(&parsed) {
+        return Err(blocked_tag(
+            id,
+            path,
+            "tag property syntax or value whitespace is not exporter-canonical",
+        ));
+    }
     let allowed = [
         "id",
         "type_",
@@ -206,6 +213,13 @@ fn parse_relation(raw: &JexRawSourceItem) -> Result<SourceRelation, JexStageErro
         .map_err(|_| blocked_relation(id, path, "relation metadata is malformed"))?;
     if parsed.item_type != 6 || !parsed.id.eq_ignore_ascii_case(id) {
         return Err(blocked_relation(id, path, "relation identity changed"));
+    }
+    if !canonical_exporter_properties(&parsed) {
+        return Err(blocked_relation(
+            id,
+            path,
+            "relation property syntax or value whitespace is not exporter-canonical",
+        ));
     }
     let allowed = [
         "id",

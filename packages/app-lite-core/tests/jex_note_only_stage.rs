@@ -49,7 +49,7 @@ fn listing(path: &std::path::Path) -> Vec<std::ffi::OsString> {
 fn exporter_defaults(note: String) -> String {
     note.replace(
         "type_: 1\n",
-        "is_conflict: 0\nlatitude: 0\nlongitude: 0\naltitude: 0\nauthor: \nsource_url: \nis_todo: 0\ntodo_due: 0\ntodo_completed: 0\nsource: \nsource_application: \napplication_data: \norder: 0\ndeleted_time: 0\nencryption_applied: 0\nencryption_cipher_text: \nmaster_key_id: \nshare_id: \nis_shared: 0\nis_locked: 0\nextracted_resource_ids: \nconflict_original_id: \nuser_data: \ntype_: 1\n",
+        "is_conflict: 0\nlatitude: 0.00000000\nlongitude: 0.00000000\naltitude: 0.0000\nauthor: \nsource_url: \nis_todo: 0\ntodo_due: 0\ntodo_completed: 0\nsource: \nsource_application: \napplication_data: \norder: 0\ndeleted_time: 0\nencryption_applied: 0\nencryption_cipher_text: \nmaster_key_id: \nshare_id: \nis_shared: 0\nis_locked: 0\nextracted_resource_ids: \nconflict_original_id: \nuser_data: \ntype_: 1\n",
     )
 }
 
@@ -62,19 +62,58 @@ fn known_joplin_note_defaults_stage_but_nondefault_source_url_remains_refused() 
     let staged = stage_jex_file(&source, parent.path()).unwrap();
     let profile = staged.profile_path().to_path_buf();
     assert_eq!(staged.report().notes.len(), 1);
+    let mapped = &staged.report().notes[0];
+    let repo = LibraryRepository::open(profile.join("library.sqlite")).unwrap();
+    let stored = repo.load_note(&mapped.destination_id).unwrap().unwrap();
+    assert_eq!(stored.title, "默认字段");
+    assert_eq!(stored.body_text, "正文");
+    let db = Connection::open(profile.join("library.sqlite")).unwrap();
+    let raw: Vec<u8> = db
+        .query_row(
+            "SELECT raw_item_bytes FROM jex_stage_note_audit WHERE source_id=?1",
+            [MD],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, ordinary.as_bytes());
+    assert_eq!(mapped.raw_sha256, format!("{:x}", Sha256::digest(&raw)));
+    drop(db);
+    drop(repo);
     drop(staged);
     assert!(!profile.exists());
 
-    let nondefault = ordinary.replace("source_url: \n", "source_url: https://example.org\n");
-    let source = archive(|tar| append(tar, &format!("{MD}.md"), nondefault.as_bytes()));
-    assert!(matches!(
-        stage_jex_file(&source, parent.path()),
-        Err(JexStageError::UnsupportedNote { .. })
-    ));
-    assert_eq!(
-        listing(parent.path()),
-        vec![std::ffi::OsString::from("sentinel.bin")]
-    );
+    for nondefault in [
+        ordinary.replace("source_url: \n", "source_url: https://example.org\n"),
+        ordinary.replace("latitude: 0.00000000", "latitude: 1.00000000"),
+        ordinary.replace("altitude: 0.0000", "altitude: 1.0000"),
+    ] {
+        let source = archive(|tar| append(tar, &format!("{MD}.md"), nondefault.as_bytes()));
+        assert!(matches!(
+            stage_jex_file(&source, parent.path()),
+            Err(JexStageError::UnsupportedNote { .. })
+        ));
+        assert_eq!(
+            listing(parent.path()),
+            vec![std::ffi::OsString::from("sentinel.bin")]
+        );
+    }
+
+    // A nonempty whitespace-only author is real Joplin source content, not
+    // the empty exporter default; a disguised key is not canonical either.
+    for noncanonical in [
+        ordinary.replace("author: \n", "author:  \n"),
+        ordinary.replace("author: \n", "author : \n"),
+    ] {
+        let source = archive(|tar| append(tar, &format!("{MD}.md"), noncanonical.as_bytes()));
+        assert!(matches!(
+            stage_jex_file(&source, parent.path()),
+            Err(JexStageError::UnsupportedNote { .. })
+        ));
+        assert_eq!(
+            listing(parent.path()),
+            vec![std::ffi::OsString::from("sentinel.bin")]
+        );
+    }
 }
 
 #[test]

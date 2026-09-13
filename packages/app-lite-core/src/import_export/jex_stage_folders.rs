@@ -10,8 +10,8 @@ use crate::{LibraryRepository, NotebookId, StackId};
 use super::super::{JexPreparedSource, JexRawSourceItem, parse_item, valid_joplin_id};
 use super::{
     JexFolderDestination, JexStageError, JexStageReport, JexStagedFolder,
-    accepts_known_exporter_default, invalid_note, is_optional_timestamp_default,
-    parse_joplin_utc_millis, parse_note,
+    accepts_known_exporter_default, canonical_exporter_properties, invalid_note,
+    is_optional_timestamp_default, parse_joplin_utc_millis, parse_note,
 };
 
 #[derive(Clone)]
@@ -47,6 +47,13 @@ fn parse_folder(raw: &JexRawSourceItem) -> Result<Folder, JexStageError> {
         parse_item(path, content).map_err(|_| blocked(id, path, "folder metadata is malformed"))?;
     if parsed.item_type != 2 || !parsed.id.eq_ignore_ascii_case(id) {
         return Err(blocked(id, path, "folder identity changed"));
+    }
+    if !canonical_exporter_properties(&parsed) {
+        return Err(blocked(
+            id,
+            path,
+            "folder property syntax or value whitespace is not exporter-canonical",
+        ));
     }
     let allowed = [
         "id",
