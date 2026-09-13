@@ -1,8 +1,8 @@
-//! C2c-3a: a deliberately note-only JEX stage. Unsupported entity classes
+//! C2c-3b: a bounded note-and-resource JEX stage. Folder and tag classes
 //! block before publication; this is not a complete JEX importer.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -12,11 +12,14 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 use thiserror::Error;
 
-use crate::{CreateNote, LibraryError, LibraryRepository, NoteId};
+use crate::{CreateNote, LibraryError, LibraryRepository, NoteId, ResourceId};
+
+#[path = "jex_stage_resources.rs"]
+mod resources;
 
 use super::{
-    JexBodyFidelityBlocker, JexPrepareError, JexScanCounts, convert_jex_note_body, parse_item,
-    prepare_jex_source_archive,
+    JexBodyFidelityBlocker, JexPrepareError, JexScanCounts, JexVerifiedResource,
+    convert_jex_note_body, parse_item, prepare_jex_source_archive,
 };
 
 #[derive(Debug)]
@@ -41,12 +44,28 @@ pub struct JexStagedNote {
     pub destination_id: NoteId,
     pub markup_language: i64,
     pub raw_sha256: String,
+    pub resource_ids: Vec<ResourceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexStagedResource {
+    pub source_id: String,
+    pub source_path: String,
+    pub physical_path: String,
+    pub destination_id: ResourceId,
+    pub title: String,
+    pub mime: String,
+    pub file_extension: String,
+    pub raw_metadata_sha256: String,
+    pub sha256: String,
+    pub byte_count: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JexStageReport {
     pub preflight_counts: JexScanCounts,
     pub notes: Vec<JexStagedNote>,
+    pub resources: Vec<JexStagedResource>,
     pub verified_sync_outbox_rows: i64,
     pub search_index_drained: bool,
 }
@@ -55,7 +74,7 @@ pub struct JexStageReport {
 pub enum JexStageError {
     #[error("JEX source preparation failed: {0}")]
     Prepare(#[from] JexPrepareError),
-    #[error("JEX item class {item_type} at {source_id} is not supported by note-only staging")]
+    #[error("JEX item class {item_type} at {source_id} is not supported by this staging cut")]
     UnsupportedEntity { source_id: String, item_type: i64 },
     #[error("JEX note {source_id} at {source_path} is not supported: {reason}")]
     UnsupportedNote {
@@ -65,6 +84,11 @@ pub enum JexStageError {
     },
     #[error("JEX body fidelity blocked: {0:?}")]
     Fidelity(JexBodyFidelityBlocker),
+    #[error("JEX resource {source_id} is not supported: {reason}")]
+    UnsupportedResource {
+        source_id: String,
+        reason: &'static str,
+    },
     #[error("JEX staging I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("JEX staging SQLite failed: {0}")]
@@ -322,10 +346,25 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
             "SQLite integrity or foreign keys failed".into(),
         ));
     }
-    if count(&db, "notes")? != report.notes.len() as i64
+    if report.notes.len() != report.preflight_counts.notes
+        || report.resources.len() != report.preflight_counts.resource_metadata
+        || count(&db, "notes")? != report.notes.len() as i64
         || count(&db, "jex_stage_note_audit")? != report.notes.len() as i64
-        || count(&db, "note_resources")? != 0
-        || count(&db, "resources")? != 0
+        || count(&db, "note_resources")?
+            != report
+                .notes
+                .iter()
+                .map(|note| note.resource_ids.len())
+                .sum::<usize>() as i64
+        || count(&db, "resources")? != report.resources.len() as i64
+        || count(&db, "resource_blobs")?
+            != report
+                .resources
+                .iter()
+                .map(|resource| resource.sha256.as_str())
+                .collect::<BTreeSet<_>>()
+                .len() as i64
+        || count(&db, "jex_stage_resource_audit")? != report.resources.len() as i64
         || count(&db, "tags")? != 0
         || count(&db, "note_tags")? != 0
         || count(&db, "stacks")? != 0
@@ -334,6 +373,23 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
         return Err(JexStageError::Verification(
             "staged entity count mismatch".into(),
         ));
+    }
+    let verified_resources = report
+        .resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.source_id.to_ascii_lowercase(),
+                JexVerifiedResource {
+                    destination_id: resource.destination_id.clone(),
+                    mime: resource.mime.clone(),
+                    filename: resource.title.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for resource in &report.resources {
+        resources::verify_one(&repo, &db, resource)?;
     }
     for entry in &report.notes {
         let note = repo
@@ -367,7 +423,7 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
             &entry.source_path,
             markup,
             &parsed.body,
-            &BTreeMap::new(),
+            &verified_resources,
         )
         .map_err(JexStageError::Fidelity)?;
         if note.title != parsed.title
@@ -375,12 +431,32 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
             || note.body_text != converted.search_text
             || note.created_time != user_created
             || note.updated_time != user_updated
-            || !note.resource_ids.is_empty()
+            || note.resource_ids != entry.resource_ids
+            || note.resource_ids != converted.ordered_resource_occurrences
             || !note.tag_ids.is_empty()
-            || !converted.ordered_resource_occurrences.is_empty()
         {
             return Err(JexStageError::Verification(
                 "reopened note content or times differ".into(),
+            ));
+        }
+        let selected: Option<String> = db.query_row(
+            "SELECT selected_thumbnail_id FROM notes WHERE id=?1",
+            [note.id.as_str()],
+            |row| row.get(0),
+        )?;
+        let mut expected_thumbnail = None;
+        for resource_id in &entry.resource_ids {
+            let resource = repo.resource_metadata(resource_id)?.ok_or_else(|| {
+                JexStageError::Verification("note resource metadata missing".into())
+            })?;
+            if resource.mime.starts_with("image/") {
+                expected_thumbnail = Some(resource_id.as_str().to_owned());
+                break;
+            }
+        }
+        if selected != expected_thumbnail {
+            return Err(JexStageError::Verification(
+                "reopened selected thumbnail differs".into(),
             ));
         }
     }
@@ -422,11 +498,16 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
         }
     }
     report.verified_sync_outbox_rows = repo.outbox_count()?;
+    if report.verified_sync_outbox_rows != 0 {
+        return Err(JexStageError::Verification(
+            "migration outbox changed during indexing".into(),
+        ));
+    }
     Ok(())
 }
 
-/// Creates a uniquely owned note-only profile after verified JEX source
-/// spooling. Unsupported JEX entity classes fail closed in C2c-3a.
+/// Creates a uniquely owned note-and-resource profile after verified JEX
+/// source spooling. Folder and tag classes fail closed until C2c-3c.
 pub fn stage_jex_file(
     source: impl AsRef<Path>,
     staging_parent: impl AsRef<Path>,
@@ -438,7 +519,6 @@ pub fn stage_jex_file(
     for (ids, kind) in [
         (&scanned.source_ids.note_tag_relations, 6),
         (&scanned.source_ids.folders, 2),
-        (&scanned.source_ids.resource_metadata, 4),
         (&scanned.source_ids.tags, 5),
     ] {
         if let Some(source_id) = ids.first() {
@@ -469,12 +549,30 @@ pub fn stage_jex_file(
         created_time INTEGER NOT NULL,
         updated_time INTEGER NOT NULL,
         user_created_time INTEGER NOT NULL,
-        user_updated_time INTEGER NOT NULL);",
+        user_updated_time INTEGER NOT NULL);
+        CREATE TABLE jex_stage_resource_audit (
+        source_id TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+        source_path TEXT NOT NULL UNIQUE,
+        physical_path TEXT NOT NULL UNIQUE,
+        resource_id TEXT NOT NULL UNIQUE REFERENCES resources(id),
+        raw_metadata_bytes BLOB NOT NULL,
+        raw_metadata_sha256 TEXT NOT NULL,
+        title TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        file_extension TEXT NOT NULL,
+        physical_sha256 TEXT NOT NULL,
+        physical_size INTEGER NOT NULL);",
     )?;
     let mut report = JexStageReport {
         preflight_counts: scanned.counts.clone(),
         ..Default::default()
     };
+    let mut verified_resources = BTreeMap::new();
+    for source in &scanned.resources {
+        let (mapped, verified) = resources::import_one(&prepared, source, &repo, &audit)?;
+        verified_resources.insert(mapped.source_id.to_ascii_lowercase(), verified);
+        report.resources.push(mapped);
+    }
     for source_id in &scanned.source_ids.notes {
         let raw = prepared
             .raw_item(source_id)?
@@ -485,16 +583,10 @@ pub fn stage_jex_file(
             parsed.source_path,
             parsed.markup,
             &parsed.body,
-            &BTreeMap::new(),
+            &verified_resources,
         )
         .map_err(JexStageError::Fidelity)?;
-        if !converted.ordered_resource_occurrences.is_empty() {
-            return Err(invalid_note(
-                source_id,
-                &raw.archive_path,
-                "resources require a later staging cut",
-            ));
-        }
+        let resource_ids = converted.ordered_resource_occurrences;
         let note = repo.create_note(CreateNote {
             title: parsed.title.clone(),
             notebook_id: None,
@@ -509,6 +601,7 @@ pub fn stage_jex_file(
             destination_id: note.id,
             markup_language: parsed.markup,
             raw_sha256: raw.raw_sha256,
+            resource_ids,
         });
     }
     drop(audit);
