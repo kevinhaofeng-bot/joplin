@@ -265,16 +265,10 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
 }
 
 #[test]
-fn blocks_html_unknown_markup_and_body_or_url_budgets() {
+fn blocks_unknown_markup_and_markdown_body_or_url_budgets() {
     let map = resources();
-    for (markup, kind) in [
-        (2, JexBodyBlockerKind::HtmlNotImplemented),
-        (3, JexBodyBlockerKind::UnsupportedMarkupLanguage),
-    ] {
-        let error =
-            convert_jex_note_body(NOTE, "source.md", markup, "<p>正文</p>", &map).unwrap_err();
-        assert_eq!(error.kind, kind);
-    }
+    let error = convert_jex_note_body(NOTE, "source.md", 3, "<p>正文</p>", &map).unwrap_err();
+    assert_eq!(error.kind, JexBodyBlockerKind::UnsupportedMarkupLanguage);
     let oversized = "中".repeat(1_400_000);
     assert_eq!(
         convert_jex_note_body(NOTE, "source.md", 1, &oversized, &map)

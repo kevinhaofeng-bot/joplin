@@ -488,13 +488,7 @@ pub fn convert_jex_note_body(
         source_path: source_path.to_owned(),
         reason: reason.to_owned(),
     };
-    if markup_language == 2 {
-        return Err(blocked(
-            JexBodyBlockerKind::HtmlNotImplemented,
-            "HTML JEX body conversion belongs to C2c-2b",
-        ));
-    }
-    if markup_language != 1 {
+    if markup_language != 1 && markup_language != 2 {
         return Err(blocked(
             JexBodyBlockerKind::UnsupportedMarkupLanguage,
             "Unknown JEX markup language",
@@ -519,6 +513,14 @@ pub fn convert_jex_note_body(
                 "Case-fold conflict in verified source resource map",
             ));
         }
+    }
+    if markup_language == 2 {
+        return super::jex_html::convert_html_body(
+            source_note_id,
+            source_path,
+            body,
+            &normalized_resources,
+        );
     }
     if body
         .lines()
