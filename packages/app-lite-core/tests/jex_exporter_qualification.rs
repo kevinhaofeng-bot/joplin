@@ -406,6 +406,7 @@ fn preflight_semantic_gate_has_classified_counts_without_opening_spool() {
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     let report = qualify_jex_archive(&source, parent.path()).unwrap();
     assert!(!report.semantic_scan_completed);
+    assert!(!report.ready_for_current_stage);
     assert_eq!(report.metadata_item_type_counts, vec![(1, 1), (7, 1)]);
     assert_eq!(
         report
@@ -475,5 +476,42 @@ fn resource_mime_distribution_and_nonzero_schema_default_are_distinct_from_seman
         report
             .category(JexQualificationBlockerKind::UnmappedSemanticField)
             .is_none()
+    );
+}
+
+#[test]
+fn clean_archive_without_notes_is_not_reported_ready_for_the_strict_stage() {
+    // Mutation caught: computing readiness from categories.is_empty alone,
+    // while stage_jex_archive rejects every source with zero supported notes.
+    let resource = format!(
+        "附件.pdf\n\nid: {RESOURCE}\ntype_: 4\nmime: application/pdf\nfile_extension: pdf\ncreated_time: 2023-11-14T22:13:21.000Z\nupdated_time: 2023-11-14T22:13:22.000Z\n"
+    );
+    let empty = archive(|_| {});
+    let resource_only = archive(|tar| {
+        append(tar, &format!("{RESOURCE}.md"), resource.as_bytes());
+        append(tar, &format!("resources/{RESOURCE}.pdf"), b"%PDF-1.4\n");
+    });
+    let parent = tempdir().unwrap();
+    fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
+    for source in [&empty, &resource_only] {
+        let report = qualify_jex_archive(source, parent.path()).unwrap();
+        assert_eq!(report.counts.notes, 0);
+        assert!(report.semantic_scan_completed);
+        assert!(!report.ready_for_current_stage);
+        let blocker = report
+            .category(JexQualificationBlockerKind::StageValidation)
+            .unwrap();
+        assert_eq!(blocker.item_count, 1);
+        assert_eq!(blocker.finding_count, 1);
+        assert_eq!(blocker.samples[0].source_path, "<archive>");
+        assert!(blocker.samples[0].reason.contains("no supported notes"));
+        assert_eq!(
+            listing(parent.path()),
+            vec![std::ffi::OsString::from("sentinel.bin")]
+        );
+    }
+    assert_eq!(
+        fs::read(parent.path().join("sentinel.bin")).unwrap(),
+        b"keep"
     );
 }

@@ -1076,6 +1076,17 @@ fn qualify_prepared(
             );
         }
     }
+    if source.counts.notes == 0 {
+        let mut seen = BTreeSet::new();
+        builder.finding(
+            &mut seen,
+            JexQualificationBlockerKind::StageValidation,
+            "",
+            "<archive>",
+            None,
+            "JEX contains no supported notes",
+        );
+    }
     check_cancel(cancel)?;
     let mut report = builder.finish(source);
     report.resource_mime_counts = mime_counts.into_iter().collect();
