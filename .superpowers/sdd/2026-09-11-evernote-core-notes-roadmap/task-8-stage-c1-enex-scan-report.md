@@ -56,6 +56,30 @@ no whitespace errors
 
 ## Limits and explicit follow-up gate
 
+### Re-review status: NEEDS_CONTEXT (not C1 acceptance)
+
+This report must not be read as claiming successful large-attachment scanning.
+The current generated 21 MiB fixture proves only the rejection path:
+`NeedsContext`, not decoded-byte MD5/SHA-256/size evidence. That does **not**
+meet the later review requirement to scan a >20 MiB resource successfully.
+
+Although the syntax-reader preflight receives text/CDATA in bounded chunks,
+the current public scanner still subsequently uses `quick-xml`. Its unchecked
+attribute-value, character-reference, comment, processing-instruction, and
+DOCTYPE-system-id callbacks could be materialized by that second parser.
+Therefore the current C1 scanner remains restricted to the bounded small-file
+contract and is **not approved as a production large-ENEX scanner**.
+
+To clear this gate, replace outer `quick-xml` parsing entirely with one
+`xml-syntax-reader::Visitor` state machine: cap every retained metadata and
+attribute accumulator, reject/ignore bounded comment/PI/DTD bodies without
+passing them to another parser, and incrementally base64-decode each `data`
+callback using at most a carry of three base64 characters. The decoder must
+update MD5, SHA-256, and byte count per decoded chunk. A generated >20 MiB
+fixture must then succeed and assert both digests, byte count, and an
+observable fixed maximum callback/buffer size. Until that implementation and
+test exist, the correct status is `NEEDS_CONTEXT`.
+
 ### Review correction: bounded outer syntax preflight
 
 The initial raw-byte preflight was replaced after independent review: it could
