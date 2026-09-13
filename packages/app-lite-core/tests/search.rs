@@ -549,7 +549,10 @@ fn mixed_filename_filter_and_body_term_keep_both_snippet_sources() {
     assert_eq!(hit.note.id, note.id);
     assert_eq!(hit.matched_resource, Some(resource));
     assert_eq!(hit.snippet, "meeting body summary\n匹配附件：invoice.pdf");
-    assert_eq!(hit.note.snippet, "meeting body summary\n匹配附件：invoice.pdf");
+    assert_eq!(
+        hit.note.snippet,
+        "meeting body summary\n匹配附件：invoice.pdf"
+    );
 }
 
 #[test]
