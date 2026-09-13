@@ -2797,6 +2797,7 @@ impl LibraryRepository {
                AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=j.resource_id AND nr.is_associated=1 AND n.deleted_time=0)
              ORDER BY CASE r.mime WHEN 'application/pdf' THEN 0 ELSE 1 END,
                       CASE WHEN r.mime='application/pdf' THEN j.updated_time ELSE -j.updated_time END,
+                      CASE WHEN r.mime='application/pdf' THEN 0 ELSE -j.rowid END,
                       j.resource_id LIMIT ?2",
         )?;
         statement

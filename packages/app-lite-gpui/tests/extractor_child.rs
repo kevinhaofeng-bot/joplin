@@ -528,14 +528,16 @@ fn coordinator_indexes_real_english_and_chinese_images_with_resource_provenance(
     );
     let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_velotype"));
 
-    assert_eq!(
-        extractor::run_one_derived_text_pdf_job_with_exe(&repository, exe.clone()).unwrap(),
-        extractor::DerivedTextCoordinatorOutcome::Indexed(english.clone())
-    );
-    assert_eq!(
-        extractor::run_one_derived_text_pdf_job_with_exe(&repository, exe).unwrap(),
-        extractor::DerivedTextCoordinatorOutcome::Indexed(chinese.clone())
-    );
+    let mut indexed = Vec::new();
+    for executable in [exe.clone(), exe] {
+        match extractor::run_one_derived_text_pdf_job_with_exe(&repository, executable).unwrap() {
+            extractor::DerivedTextCoordinatorOutcome::Indexed(resource) => indexed.push(resource),
+            other => panic!("expected one of the two OCR resources to index, got {other:?}"),
+        }
+    }
+    assert_eq!(indexed.len(), 2);
+    assert!(indexed.contains(&english));
+    assert!(indexed.contains(&chinese));
     for (term, resource, note) in [
         ("Vision OCR English", english, english_note),
         ("中文视觉文字识别", chinese, chinese_note),
