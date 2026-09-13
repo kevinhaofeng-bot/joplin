@@ -16,12 +16,18 @@ change the user's live Joplin profile in this cut.
 - Joplin's checked-out
   `packages/lib/services/interop/InteropService_Exporter_Jex.ts` creates a
   portable tar from Raw export. `InteropService_Exporter_Raw.ts` emits one
-  serialized root `.md` item per entity plus `resources/<id>.<extension>`.
+  serialized root `.md` item per entity plus resource files named by
+  `Resource.filename`: normally `resources/<id>.<file_extension>`, falling
+  back to an extension inferred from MIME, or `resources/<id>` if neither
+  supplies one.
   `InteropService_Importer_Jex.ts` extracts it then runs
   `InteropService_Importer_Raw.ts`, which remaps item IDs and relationships,
-  and warns on absent resources. `BaseItem.ts::serialize/unserialize` puts
-  title/body first and typed property lines after a blank separator; Joplin
+  and warns on absent resources. `BaseItem.ts::serialize/unserialize` puts a
+  note's title/body before typed property lines, separated by a blank line;
+  property-only items such as NoteTag can start directly with `id:`. Joplin
   `ModelType` values 1/2/4/5/6 denote note/folder/resource/tag/note-tag.
+  JEX includes only resources linked from exported note bodies and skips
+  still-encrypted items; archive counts are not live-profile counts.
 
 ## Narrow deliverable
 
