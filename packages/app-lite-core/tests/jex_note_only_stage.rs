@@ -169,8 +169,8 @@ fn stages_two_real_notes_then_reopens_audited_searchable_zero_outbox_profile() {
 }
 
 #[test]
-fn blocks_unimplemented_entity_classes_and_mismatched_resource_without_returning_a_profile() {
-    // Mutation caught: silently skipping 3c entity classes or accepting bytes
+fn blocks_invalid_folder_tags_relations_and_mismatched_resource_without_returning_a_profile() {
+    // Mutation caught: silently skipping unsupported entity classes or accepting bytes
     // whose signature contradicts declared resource MIME.
     let parent = tempdir().unwrap();
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
@@ -209,6 +209,8 @@ fn blocks_unimplemented_entity_classes_and_mismatched_resource_without_returning
         assert!(
             if kind == 4 {
                 matches!(error, JexStageError::UnsupportedResource { .. })
+            } else if kind == 2 {
+                matches!(error, JexStageError::UnsupportedFolder { .. })
             } else {
                 matches!(error, JexStageError::UnsupportedEntity { item_type, .. } if item_type == kind)
             },

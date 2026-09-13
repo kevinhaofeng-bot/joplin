@@ -1,5 +1,5 @@
-//! C2c-3b: a bounded note-and-resource JEX stage. Folder and tag classes
-//! block before publication; this is not a complete JEX importer.
+//! C2c-3c-1: a bounded note, resource, and two-level folder JEX stage.
+//! Tags and note-tag relations still block before publication.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 use thiserror::Error;
 
-use crate::{CreateNote, LibraryError, LibraryRepository, NoteId, ResourceId};
+use crate::{CreateNote, LibraryError, LibraryRepository, NoteId, NotebookId, ResourceId, StackId};
+
+#[path = "jex_stage_folders.rs"]
+mod folders;
 
 #[path = "jex_stage_resources.rs"]
 mod resources;
@@ -41,6 +44,7 @@ impl JexStagedProfile {
 pub struct JexStagedNote {
     pub source_id: String,
     pub source_path: String,
+    pub source_parent_id: String,
     pub destination_id: NoteId,
     pub markup_language: i64,
     pub raw_sha256: String,
@@ -61,11 +65,30 @@ pub struct JexStagedResource {
     pub byte_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JexFolderDestination {
+    Stack(StackId),
+    Notebook(NotebookId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexStagedFolder {
+    pub source_id: String,
+    pub source_path: String,
+    pub source_parent_id: String,
+    pub title: String,
+    pub destination: JexFolderDestination,
+    pub raw_sha256: String,
+    pub created_time: i64,
+    pub updated_time: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JexStageReport {
     pub preflight_counts: JexScanCounts,
     pub notes: Vec<JexStagedNote>,
     pub resources: Vec<JexStagedResource>,
+    pub folders: Vec<JexStagedFolder>,
     pub verified_sync_outbox_rows: i64,
     pub search_index_drained: bool,
 }
@@ -89,6 +112,12 @@ pub enum JexStageError {
         source_id: String,
         reason: &'static str,
     },
+    #[error("JEX folder {source_id} at {source_path} is not supported: {reason}")]
+    UnsupportedFolder {
+        source_id: String,
+        source_path: String,
+        reason: &'static str,
+    },
     #[error("JEX staging I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("JEX staging SQLite failed: {0}")]
@@ -105,6 +134,7 @@ struct ParsedNote<'a> {
     title: String,
     body: String,
     raw_body: Vec<u8>,
+    parent_id: String,
     markup: i64,
     created: i64,
     updated: i64,
@@ -234,18 +264,19 @@ fn parse_note<'a>(
         return Err(invalid_note(
             source_id,
             path,
-            "source note has metadata not yet mapped by note-only staging",
+            "source note has metadata not yet mapped by bounded staging",
         ));
     }
-    if parsed
+    let parent_id = parsed
         .properties
         .get("parent_id")
-        .is_some_and(|value| !value.is_empty())
-    {
+        .ok_or_else(|| invalid_note(source_id, path, "source parent_id is missing"))?
+        .clone();
+    if !parent_id.is_empty() && !super::valid_joplin_id(&parent_id) {
         return Err(invalid_note(
             source_id,
             path,
-            "source notebook mapping requires a later staging cut",
+            "source parent_id is malformed",
         ));
     }
     for flag in ["encryption_applied", "is_todo"] {
@@ -257,7 +288,7 @@ fn parse_note<'a>(
             return Err(invalid_note(
                 source_id,
                 path,
-                "encrypted or task note is unsupported by note-only staging",
+                "encrypted or task note is unsupported by bounded staging",
             ));
         }
     }
@@ -321,6 +352,7 @@ fn parse_note<'a>(
         title,
         body,
         raw_body,
+        parent_id,
         markup,
         created,
         updated,
@@ -348,6 +380,7 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
     }
     if report.notes.len() != report.preflight_counts.notes
         || report.resources.len() != report.preflight_counts.resource_metadata
+        || report.folders.len() != report.preflight_counts.folders
         || count(&db, "notes")? != report.notes.len() as i64
         || count(&db, "jex_stage_note_audit")? != report.notes.len() as i64
         || count(&db, "note_resources")?
@@ -365,10 +398,21 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
                 .collect::<BTreeSet<_>>()
                 .len() as i64
         || count(&db, "jex_stage_resource_audit")? != report.resources.len() as i64
+        || count(&db, "jex_stage_folder_audit")? != report.folders.len() as i64
         || count(&db, "tags")? != 0
         || count(&db, "note_tags")? != 0
-        || count(&db, "stacks")? != 0
-        || count(&db, "notebooks")? != 1
+        || count(&db, "stacks")?
+            != report
+                .folders
+                .iter()
+                .filter(|f| matches!(f.destination, JexFolderDestination::Stack(_)))
+                .count() as i64
+        || count(&db, "notebooks")?
+            != 1 + report
+                .folders
+                .iter()
+                .filter(|f| matches!(f.destination, JexFolderDestination::Notebook(_)))
+                .count() as i64
     {
         return Err(JexStageError::Verification(
             "staged entity count mismatch".into(),
@@ -388,6 +432,19 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let folder_destinations = report
+        .folders
+        .iter()
+        .map(|folder| {
+            (
+                folder.source_id.to_ascii_lowercase(),
+                folder.destination.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for folder in &report.folders {
+        folders::verify_one(&db, folder, &folder_destinations)?;
+    }
     for resource in &report.resources {
         resources::verify_one(&repo, &db, resource)?;
     }
@@ -407,6 +464,7 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
         }
         let parsed = parse_note(&entry.source_id, &entry.source_path, &raw_item)?;
         if parsed.raw_body != raw_body
+            || parsed.parent_id != entry.source_parent_id
             || parsed.markup != markup
             || parsed.title != source_title
             || parsed.created != source_created
@@ -426,7 +484,20 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
             &verified_resources,
         )
         .map_err(JexStageError::Fidelity)?;
+        let expected_notebook = if entry.source_parent_id.is_empty() {
+            repo.default_notebook()?.id
+        } else {
+            match folder_destinations.get(&entry.source_parent_id.to_ascii_lowercase()) {
+                Some(JexFolderDestination::Notebook(id)) => id.clone(),
+                _ => {
+                    return Err(JexStageError::Verification(
+                        "note source parent is not a mapped notebook".into(),
+                    ));
+                }
+            }
+        };
         if note.title != parsed.title
+            || note.notebook_id != expected_notebook
             || note.body_html != converted.canonical_html
             || note.body_text != converted.search_text
             || note.created_time != user_created
@@ -506,8 +577,8 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
     Ok(())
 }
 
-/// Creates a uniquely owned note-and-resource profile after verified JEX
-/// source spooling. Folder and tag classes fail closed until C2c-3c.
+/// Creates a uniquely owned note, resource and bounded-folder profile after
+/// verified JEX source spooling. Tags and relations fail closed until 3c-2.
 pub fn stage_jex_file(
     source: impl AsRef<Path>,
     staging_parent: impl AsRef<Path>,
@@ -518,7 +589,6 @@ pub fn stage_jex_file(
     let scanned = prepared.report();
     for (ids, kind) in [
         (&scanned.source_ids.note_tag_relations, 6),
-        (&scanned.source_ids.folders, 2),
         (&scanned.source_ids.tags, 5),
     ] {
         if let Some(source_id) = ids.first() {
@@ -533,6 +603,7 @@ pub fn stage_jex_file(
             "JEX contains no supported notes".into(),
         ));
     }
+    let folder_plan = folders::preflight(&prepared)?;
     let directory = Builder::new().prefix("jex-stage-").tempdir_in(&parent)?;
     let database: PathBuf = directory.path().join("library.sqlite");
     let repo = LibraryRepository::open(&database)?;
@@ -561,12 +632,24 @@ pub fn stage_jex_file(
         mime TEXT NOT NULL,
         file_extension TEXT NOT NULL,
         physical_sha256 TEXT NOT NULL,
-        physical_size INTEGER NOT NULL);",
+        physical_size INTEGER NOT NULL);
+        CREATE TABLE jex_stage_folder_audit (
+        source_id TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+        source_path TEXT NOT NULL UNIQUE,
+        source_parent_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        raw_item_bytes BLOB NOT NULL,
+        raw_sha256 TEXT NOT NULL,
+        destination_kind TEXT NOT NULL CHECK(destination_kind IN ('stack','notebook')),
+        destination_id TEXT NOT NULL UNIQUE,
+        created_time INTEGER NOT NULL,
+        updated_time INTEGER NOT NULL);",
     )?;
     let mut report = JexStageReport {
         preflight_counts: scanned.counts.clone(),
         ..Default::default()
     };
+    let notebook_map = folders::create_all(&folder_plan, &prepared, &repo, &audit, &mut report)?;
     let mut verified_resources = BTreeMap::new();
     for source in &scanned.resources {
         let (mapped, verified) = resources::import_one(&prepared, source, &repo, &audit)?;
@@ -587,9 +670,25 @@ pub fn stage_jex_file(
         )
         .map_err(JexStageError::Fidelity)?;
         let resource_ids = converted.ordered_resource_occurrences;
+        let notebook_id = if parsed.parent_id.is_empty() {
+            None
+        } else {
+            Some(
+                notebook_map
+                    .get(&parsed.parent_id.to_ascii_lowercase())
+                    .cloned()
+                    .ok_or_else(|| {
+                        invalid_note(
+                            source_id,
+                            &raw.archive_path,
+                            "source note parent is not a leaf notebook",
+                        )
+                    })?,
+            )
+        };
         let note = repo.create_note(CreateNote {
             title: parsed.title.clone(),
-            notebook_id: None,
+            notebook_id,
             document: converted.document,
         })?;
         audit.execute("INSERT INTO jex_stage_note_audit (source_id,source_path,note_id,source_title,raw_item_bytes,raw_body_bytes,markup_language,created_time,updated_time,user_created_time,user_updated_time)
@@ -598,6 +697,7 @@ pub fn stage_jex_file(
         report.notes.push(JexStagedNote {
             source_id: source_id.clone(),
             source_path: raw.archive_path.clone(),
+            source_parent_id: parsed.parent_id,
             destination_id: note.id,
             markup_language: parsed.markup,
             raw_sha256: raw.raw_sha256,
