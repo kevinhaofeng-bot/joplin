@@ -61,7 +61,7 @@ use std::sync::mpsc::Receiver;
 #[cfg(test)]
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // These are presentation-only library actions. They intentionally do not
 // mirror an `AppAction`: the model remains the sole owner of durable note,
@@ -100,6 +100,13 @@ pub(crate) enum IndexingStatus {
 // competing PDFKit/Vision helpers. A busy window leaves its durable job pending and
 // retries on a later bounded scheduler turn.
 static DERIVED_TEXT_WORKER_LOCK: Mutex<()> = Mutex::new(());
+
+// Initial Cards/list construction must not compete with a historical image
+// OCR backlog for verified descriptors. PDFs stay interactive-startup work;
+// images begin only after this quiet window and then advance one at a time.
+const DERIVED_IMAGE_STARTUP_DELAY: Duration = Duration::from_secs(5);
+const DERIVED_IMAGE_INTER_JOB_DELAY: Duration = Duration::from_millis(250);
+const DERIVED_IMAGE_INTERACTION_QUIET_DELAY: Duration = Duration::from_millis(500);
 
 /// Test-only async barrier placed before the synchronous core batch. It proves
 /// that a running scheduler waits off the GPUI foreground executor.
@@ -1308,31 +1315,51 @@ impl LibraryShell {
         cx.spawn(async move |this, cx| {
             let _derived_text_task_lifetime = derived_text_task_lifetime;
             let mut scheduled = true;
+            let mut image_not_before = Instant::now() + DERIVED_IMAGE_STARTUP_DELAY;
             loop {
                 if scheduled {
                     scheduled = false;
                     let worker_repository = Arc::clone(&repository);
                     let worker_cancelled = Arc::clone(&derived_text_cancelled);
+                    let defer_images_until = image_not_before;
                     let result = cx
                         .background_executor()
                         .spawn(async move {
                             let Ok(_single_child) = DERIVED_TEXT_WORKER_LOCK.try_lock() else {
                                 return None;
                             };
+                            let kind =
+                                crate::extractor::next_derived_text_work_kind(&worker_repository)
+                                    .ok()
+                                    .flatten();
+                            if kind == Some(crate::extractor::DerivedTextWorkKind::Image)
+                                && Instant::now() < defer_images_until
+                            {
+                                return Some(Ok((None, kind)));
+                            }
                             Some(
                                 crate::extractor::run_one_derived_text_pdf_job_with_cancellation(
                                     &worker_repository,
                                     &worker_cancelled,
-                                ),
+                                )
+                                .map(|outcome| (Some(outcome), kind)),
                             )
                         })
                         .await;
                     match result {
-                        Some(Ok(outcome)) => {
+                        Some(Ok((outcome, kind))) => {
+                            if kind == Some(crate::extractor::DerivedTextWorkKind::Image)
+                                && outcome.is_some()
+                            {
+                                image_not_before = Instant::now() + DERIVED_IMAGE_INTER_JOB_DELAY;
+                            }
                             scheduled = !matches!(
                                 outcome,
-                                crate::extractor::DerivedTextCoordinatorOutcome::Idle
-                                    | crate::extractor::DerivedTextCoordinatorOutcome::Cancelled
+                                Some(crate::extractor::DerivedTextCoordinatorOutcome::Idle)
+                                    | Some(
+                                        crate::extractor::DerivedTextCoordinatorOutcome::Cancelled
+                                    )
+                                    | None
                             );
                             if this
                                 .update(cx, |shell, shell_cx| {
@@ -1364,12 +1391,21 @@ impl LibraryShell {
                 let mut refresh_search_route = false;
                 for event in receiver.try_iter().take(128) {
                     match event {
-                        app_lite_core::LibraryEvent::SearchProjectionQueued(_) => scheduled = true,
+                        app_lite_core::LibraryEvent::SearchProjectionQueued(_) => {
+                            // A normal text save uses this broad event too. Keep PDFs
+                            // eligible, but debounce image OCR until interaction is quiet.
+                            image_not_before =
+                                Instant::now() + DERIVED_IMAGE_INTERACTION_QUIET_DELAY;
+                            scheduled = true;
+                        }
                         app_lite_core::LibraryEvent::DerivedTextIndexed(_) => {
                             refresh_search_route = true
                         }
                         _ => {}
                     }
+                }
+                if !scheduled && Instant::now() >= image_not_before {
+                    scheduled = true;
                 }
                 if refresh_search_route
                     && this

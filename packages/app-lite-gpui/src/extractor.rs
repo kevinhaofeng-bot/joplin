@@ -52,6 +52,33 @@ pub enum DerivedTextCoordinatorOutcome {
     Stale(ResourceId),
 }
 
+/// The next durable resource category, read from metadata only. The shell
+/// uses this to let an initial interactive viewport settle before starting an
+/// older image OCR backlog; it never opens a blob here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerivedTextWorkKind {
+    Pdf,
+    Image,
+    Other,
+}
+
+pub fn next_derived_text_work_kind(
+    repository: &LibraryRepository,
+) -> Result<Option<DerivedTextWorkKind>, LibraryError> {
+    let Some(job) = repository.take_derived_text_jobs(1)?.pop() else {
+        return Ok(None);
+    };
+    let kind = repository
+        .resource_metadata(&job.resource_id)?
+        .map(|resource| match resource.mime.as_str() {
+            "application/pdf" => DerivedTextWorkKind::Pdf,
+            "image/png" | "image/jpeg" => DerivedTextWorkKind::Image,
+            _ => DerivedTextWorkKind::Other,
+        })
+        .unwrap_or(DerivedTextWorkKind::Other);
+    Ok(Some(kind))
+}
+
 /// Takes and processes at most one durable D3a job. Call this only from a
 /// background worker; it can spend up to `CHILD_TIMEOUT` in the PDF child.
 pub fn run_one_derived_text_pdf_job(

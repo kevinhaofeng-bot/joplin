@@ -2795,7 +2795,9 @@ impl LibraryRepository {
              FROM derived_text_jobs j JOIN resources r ON r.id=j.resource_id
              WHERE j.state='pending' AND j.extractor_version=?1 AND j.sha256=r.sha256 AND r.deleted_time=0
                AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=j.resource_id AND nr.is_associated=1 AND n.deleted_time=0)
-             ORDER BY j.updated_time,j.resource_id LIMIT ?2",
+             ORDER BY CASE r.mime WHEN 'application/pdf' THEN 0 ELSE 1 END,
+                      CASE WHEN r.mime='application/pdf' THEN j.updated_time ELSE -j.updated_time END,
+                      j.resource_id LIMIT ?2",
         )?;
         statement
             .query_map(params![DERIVED_TEXT_EXTRACTOR_VERSION, limit], |row| {
@@ -4211,6 +4213,67 @@ mod tests {
         );
         repository.purge_note(&note.id).unwrap();
         assert_eq!(repository.derived_text_status(&resource).unwrap(), None);
+    }
+
+    #[test]
+    fn derived_text_queue_prioritizes_pdf_then_new_images_ahead_of_historical_backlog() {
+        let profile = tempdir().unwrap();
+        let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+        let old_image = repository
+            .import_resource(b"image", "old.png", "image/png", "png")
+            .unwrap();
+        repository
+            .create_note(CreateNote {
+                title: "image owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: old_image.clone(),
+                        filename: "old.png".into(),
+                        media_type: "image/png".into(),
+                    },
+                ]),
+            })
+            .unwrap();
+        let pdf = repository
+            .import_resource(b"pdf", "urgent.pdf", "application/pdf", "pdf")
+            .unwrap();
+        repository
+            .create_note(CreateNote {
+                title: "PDF owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: pdf.clone(),
+                        filename: "urgent.pdf".into(),
+                        media_type: "application/pdf".into(),
+                    },
+                ]),
+            })
+            .unwrap();
+
+        let new_image = repository
+            .import_resource(b"new image", "new.png", "image/png", "png")
+            .unwrap();
+        repository
+            .create_note(CreateNote {
+                title: "new image owner".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![
+                    crate::document::Block::Attachment {
+                        resource_id: new_image.clone(),
+                        filename: "new.png".into(),
+                        media_type: "image/png".into(),
+                    },
+                ]),
+            })
+            .unwrap();
+
+        let jobs = repository.take_derived_text_jobs(3).unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].resource_id, pdf);
+        assert_eq!(jobs[1].resource_id, new_image);
+        assert_eq!(jobs[2].resource_id, old_image);
     }
 
     #[test]
