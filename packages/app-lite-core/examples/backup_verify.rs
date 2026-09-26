@@ -35,9 +35,8 @@ fn main() {
         report.bytes
     );
     let started = Instant::now();
-    let restored =
-        restore_library_backup(&work.join("backup"), &work.join("restored"), &cancel)
-            .expect("restore");
+    let restored = restore_library_backup(&work.join("backup"), &work.join("restored"), &cancel)
+        .expect("restore");
     println!("restore.elapsed_ms {}", started.elapsed().as_millis());
     let source = library_counts(&profile).unwrap();
     println!("source.counts {source:?}");
