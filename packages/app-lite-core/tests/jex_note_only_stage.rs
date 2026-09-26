@@ -54,7 +54,7 @@ fn exporter_defaults(note: String) -> String {
 }
 
 #[test]
-fn known_joplin_note_defaults_stage_but_nondefault_source_url_remains_refused() {
+fn known_joplin_note_defaults_stage_but_trash_or_conflict_state_remains_refused() {
     let parent = tempdir().unwrap();
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     let ordinary = exporter_defaults(note(MD, "默认字段", "正文", 1, ""));
@@ -82,10 +82,12 @@ fn known_joplin_note_defaults_stage_but_nondefault_source_url_remains_refused() 
     drop(staged);
     assert!(!profile.exists());
 
+    // Since task 2 such metadata is retained in the raw audit and counted
+    // (see real_note_metadata_is_retained_in_the_raw_audit_and_reported_not_rejected);
+    // trash/conflict state still refuses.
     for nondefault in [
-        ordinary.replace("source_url: \n", "source_url: https://example.org\n"),
-        ordinary.replace("latitude: 0.00000000", "latitude: 1.00000000"),
-        ordinary.replace("altitude: 0.0000", "altitude: 1.0000"),
+        ordinary.replace("deleted_time: 0\n", "deleted_time: 1\n"),
+        ordinary.replace("is_conflict: 0\n", "is_conflict: 1\n"),
     ] {
         let source = archive(|tar| append(tar, &format!("{MD}.md"), nondefault.as_bytes()));
         assert!(matches!(
@@ -239,7 +241,7 @@ fn stages_two_real_notes_then_reopens_audited_searchable_zero_outbox_profile() {
 }
 
 #[test]
-fn blocks_invalid_folder_and_mismatched_resource_without_returning_a_profile() {
+fn blocks_invalid_folder_and_demotes_mismatched_resource_without_leaking_a_profile() {
     // Mutation caught: silently accepting malformed folder or resource bytes
     // whose signature contradicts declared resource MIME.
     let parent = tempdir().unwrap();
@@ -263,15 +265,23 @@ fn blocks_invalid_folder_and_mismatched_resource_without_returning_a_profile() {
                 append(tar, &format!("resources/{OTHER}.png"), b"physical-resource");
             }
         });
-        let error = stage_jex_file(&source, parent.path()).unwrap_err();
-        assert!(
-            if kind == 4 {
-                matches!(error, JexStageError::UnsupportedResource { .. })
-            } else {
-                matches!(error, JexStageError::UnsupportedFolder { .. })
-            },
-            "kind {kind}: {error:?}"
-        );
+        if kind == 4 {
+            // Since task 2 bytes contradicting a verifiable MIME are kept as
+            // a generic attachment (never shown as an image) and reported.
+            let staged = stage_jex_file(&source, parent.path()).unwrap();
+            assert_eq!(
+                staged.report().resources[0].mime,
+                "application/octet-stream"
+            );
+            assert_eq!(staged.report().normalized_resources.len(), 1);
+            drop(staged);
+        } else {
+            let error = stage_jex_file(&source, parent.path()).unwrap_err();
+            assert!(
+                matches!(error, JexStageError::UnsupportedFolder { .. }),
+                "kind {kind}: {error:?}"
+            );
+        }
         assert_eq!(
             listing(parent.path()),
             vec![std::ffi::OsString::from("sentinel.bin")]
@@ -320,12 +330,9 @@ fn malformed_or_empty_joplin_utc_time_blocks_and_cleans_after_first_note() {
 #[test]
 fn failed_second_note_cleans_only_owned_children_and_existing_profile_parent_is_rejected() {
     let first = note(MD, "先成功", "正文", 1, "");
-    let second = note(
-        HTML,
-        "后失败",
-        "![缺失](:/99999999999999999999999999999999)",
-        1,
-        "",
+    let second = format!(
+        "{}deleted_time: 1700000000000\n",
+        note(HTML, "后失败", "后失败正文", 1, "",)
     );
     let source = archive(|tar| {
         append(tar, &format!("{MD}.md"), first.as_bytes());
@@ -335,7 +342,7 @@ fn failed_second_note_cleans_only_owned_children_and_existing_profile_parent_is_
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     assert!(matches!(
         stage_jex_file(&source, parent.path()),
-        Err(JexStageError::Prepare(_))
+        Err(JexStageError::UnsupportedNote { .. })
     ));
     assert_eq!(
         listing(parent.path()),
@@ -384,4 +391,57 @@ fn unsupported_markdown_degrades_to_readable_source_text_with_report() {
     for visible in ["|A|B|", "|1|<b>2</b>|"] {
         assert!(body.contains(visible), "{visible} in {body:?}");
     }
+}
+
+#[test]
+fn real_note_metadata_is_retained_in_the_raw_audit_and_reported_not_rejected() {
+    // Found in the user's export: 1665/1666 notes carry provenance, order,
+    // location, author, source URL or to-do fields the schema has no column
+    // for. They import; the fields stay in the raw audit and are counted.
+    let ordinary = exporter_defaults(note(MD, "网页剪藏", "正文", 1, ""));
+    let rich = ordinary
+        .replace("source_url: \n", "source_url: https://example.org/a\n")
+        .replace("author: \n", "author: 某人\n")
+        .replace("latitude: 0.00000000", "latitude: 35.68000000")
+        .replace("order: 0\n", "order: -62167248343000\n")
+        .replace("is_todo: 0\n", "is_todo: 1\n")
+        .replace("todo_completed: 0\n", "todo_completed: 1659891183430\n")
+        .replace(
+            "source_application: \n",
+            "source_application: net.cozic.joplin-desktop\n",
+        );
+    let source = archive(|tar| append(tar, &format!("{MD}.md"), rich.as_bytes()));
+    let parent = tempdir().unwrap();
+    let stage = stage_jex_file(&source, parent.path()).unwrap();
+    let fields = &stage.report().retained_only_note_fields;
+    for key in [
+        "source_url",
+        "author",
+        "latitude",
+        "order",
+        "is_todo",
+        "todo_completed",
+        "source_application",
+    ] {
+        assert_eq!(fields.get(key), Some(&1), "{key} in {fields:?}");
+    }
+    let db = Connection::open(stage.profile_path().join("library.sqlite")).unwrap();
+    let raw: Vec<u8> = db
+        .query_row(
+            "SELECT raw_item_bytes FROM jex_stage_note_audit WHERE source_id=?1",
+            [MD],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, rich.as_bytes(), "raw item kept byte-for-byte");
+    drop(db);
+    drop(stage);
+
+    // Trash/conflict state must not be silently resurrected as a live note.
+    let trashed = ordinary.replace("deleted_time: 0\n", "deleted_time: 1700000000000\n");
+    let source = archive(|tar| append(tar, &format!("{MD}.md"), trashed.as_bytes()));
+    assert!(matches!(
+        stage_jex_file(&source, parent.path()),
+        Err(JexStageError::UnsupportedNote { .. })
+    ));
 }

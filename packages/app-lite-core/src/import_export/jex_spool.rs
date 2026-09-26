@@ -196,7 +196,7 @@ fn prepare_inner(
     }
     check_cancel(&cancel)?;
     let report = scan_jex_archive(source)?;
-    if !report.is_clean() {
+    if !report.is_importable() {
         return Err(JexPrepareError::PreflightBlocked {
             report: Box::new(report),
         });

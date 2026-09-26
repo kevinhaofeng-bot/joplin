@@ -382,10 +382,19 @@ fn missing_file_and_ambiguous_name_refuse_without_touching_sibling() {
         );
         append(tar, &format!("resources/{IMAGE_A}.png"), &png);
     });
-    assert!(matches!(
-        stage_jex_file(&mismatched, parent.path()),
-        Err(JexStageError::UnsupportedResource { .. })
-    ));
+    // A title whose suffix disagrees with the MIME is only a display name
+    // since task 2: the verified PNG keeps its MIME and extension.
+    let staged = stage_jex_file(&mismatched, parent.path()).unwrap();
+    let resource = &staged.report().resources[0];
+    assert_eq!(
+        (
+            resource.title.as_str(),
+            resource.mime.as_str(),
+            resource.file_extension.as_str()
+        ),
+        ("图.pdf", "image/png", "png")
+    );
+    drop(staged);
     assert_eq!(
         listing(parent.path()),
         vec![std::ffi::OsString::from("sentinel.bin")]
@@ -402,11 +411,9 @@ fn failed_second_note_after_resource_and_first_note_cleans_owned_profile() {
     // later Markdown converter rejects a fidelity-risk structure.
     let png = large_png();
     let first = note(MD, "先成功", &format!("图![图](:/{IMAGE_A})"), 1);
-    let second = note(
-        HTML,
-        "后失败",
-        "![缺失](:/99999999999999999999999999999999)",
-        1,
+    let second = format!(
+        "{}deleted_time: 1700000000000\n",
+        note(HTML, "后失败", "后失败正文", 1,)
     );
     let source = archive(|tar| {
         append(tar, &format!("{MD}.md"), first.as_bytes());
@@ -422,7 +429,7 @@ fn failed_second_note_after_resource_and_first_note_cleans_owned_profile() {
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     assert!(matches!(
         stage_jex_file(&source, parent.path()),
-        Err(JexStageError::Prepare(_))
+        Err(JexStageError::UnsupportedNote { .. })
     ));
     assert_eq!(
         listing(parent.path()),
@@ -432,4 +439,81 @@ fn failed_second_note_after_resource_and_first_note_cleans_owned_profile() {
         fs::read(parent.path().join("sentinel.bin")).unwrap(),
         b"keep"
     );
+}
+
+/// Shapes found in the user's real Joplin export: titles without the
+/// extension or with ':', Office/GIF MIME types, a >10 MiB image and a link
+/// to an item that is not in the export. None may block the library.
+#[test]
+fn real_library_resource_metadata_is_normalized_and_reported_not_rejected() {
+    const DOC: &str = "77777777777777777777777777777777";
+    const GIF: &str = "88888888888888888888888888888888";
+    const HUGE: &str = "99999999999999999999999999999999";
+    const GONE: &str = "abababababababababababababababab";
+    let doc_bytes = b"\xd0\xcf\x11\xe0 legacy word".to_vec();
+    let gif_bytes = b"GIF89a tiny".to_vec();
+    let mut huge = large_png();
+    huge.resize(12 * 1024 * 1024, 0);
+    let body = format!(
+        "![]({}) 与 [合同](:/{DOC})\n\n![](:/{GIF})\n\n![](:/{HUGE})\n\n[已删除的笔记](:/{GONE})",
+        format!(":/{IMAGE_A}")
+    );
+    let source = archive(|tar| {
+        append(
+            tar,
+            &format!("{MD}.md"),
+            note(MD, "真实形态", &body, 1).as_bytes(),
+        );
+        append(
+            tar,
+            &format!("{IMAGE_A}.md"),
+            metadata(IMAGE_A, "截图 10:30", "image/png", "png").as_bytes(),
+        );
+        append(tar, &format!("resources/{IMAGE_A}.png"), &large_png());
+        append(
+            tar,
+            &format!("{DOC}.md"),
+            metadata(DOC, "合同", "application/msword", "doc").as_bytes(),
+        );
+        append(tar, &format!("resources/{DOC}.doc"), &doc_bytes);
+        append(
+            tar,
+            &format!("{GIF}.md"),
+            metadata(GIF, "动图.GIF", "image/gif", "gif").as_bytes(),
+        );
+        append(tar, &format!("resources/{GIF}.gif"), &gif_bytes);
+        append(
+            tar,
+            &format!("{HUGE}.md"),
+            metadata(HUGE, "大图.png", "image/png", "png").as_bytes(),
+        );
+        append(tar, &format!("resources/{HUGE}.png"), &huge);
+    });
+    let parent = tempdir().unwrap();
+    let stage = stage_jex_file(&source, parent.path()).unwrap();
+    let report = stage.report();
+    assert_eq!(report.resources.len(), 4);
+    let by_source = |id: &str| report.resources.iter().find(|r| r.source_id == id).unwrap();
+    assert_eq!(by_source(IMAGE_A).title, "截图 10:30");
+    assert_eq!(by_source(IMAGE_A).file_extension, "png");
+    assert_eq!(by_source(DOC).mime, "application/msword");
+    assert_eq!(by_source(GIF).mime, "image/gif");
+    assert_eq!(by_source(HUGE).mime, "application/octet-stream");
+    assert_eq!(by_source(HUGE).file_extension, "png");
+    assert!(
+        report
+            .normalized_resources
+            .iter()
+            .any(|n| n.source_id == HUGE),
+        "oversized image demotion is reported"
+    );
+    // The dangling link degrades that note to readable text; nothing lost.
+    assert_eq!(report.degraded_notes.len(), 1);
+    let repo = LibraryRepository::open(stage.profile_path().join("library.sqlite")).unwrap();
+    let note = repo
+        .load_note(&report.notes[0].destination_id)
+        .unwrap()
+        .unwrap();
+    assert!(note.body_text.contains("已删除的笔记"));
+    assert_eq!(note.resource_ids.len(), 4, "every attachment is kept");
 }

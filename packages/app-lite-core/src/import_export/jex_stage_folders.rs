@@ -24,6 +24,7 @@ struct Folder {
     updated: i64,
     raw_sha256: String,
     has_children: bool,
+    has_notes: bool,
 }
 
 pub(super) struct FolderPlan {
@@ -68,7 +69,8 @@ fn parse_folder(raw: &JexRawSourceItem) -> Result<Folder, JexStageError> {
     if parsed.properties.iter().any(|(key, value)| {
         (!allowed.contains(&key.as_str()) && !accepts_known_exporter_default(2, key, value))
             || (matches!(key.as_str(), "user_created_time" | "user_updated_time")
-                && !is_optional_timestamp_default(value))
+                && !is_optional_timestamp_default(value)
+                && parse_joplin_utc_millis(value).is_none())
     }) {
         return Err(blocked(
             id,
@@ -119,10 +121,13 @@ fn parse_folder(raw: &JexRawSourceItem) -> Result<Folder, JexStageError> {
     {
         return Err(blocked(id, path, "encrypted folder is unsupported"));
     }
+    // Like notes, a set user_*_time is the person-visible time.
     let time = |key: &str| {
         parsed
             .properties
-            .get(key)
+            .get(&format!("user_{key}"))
+            .filter(|raw| !is_optional_timestamp_default(raw))
+            .or_else(|| parsed.properties.get(key))
             .and_then(|raw| parse_joplin_utc_millis(raw))
             .ok_or_else(|| blocked(id, path, "missing or invalid folder timestamp"))
     };
@@ -135,6 +140,7 @@ fn parse_folder(raw: &JexRawSourceItem) -> Result<Folder, JexStageError> {
         updated: time("updated_time")?,
         raw_sha256: raw.raw_sha256.clone(),
         has_children: false,
+        has_notes: false,
     })
 }
 
@@ -233,13 +239,9 @@ pub(super) fn preflight(prepared: &JexPreparedSource) -> Result<FolderPlan, JexS
             *note_counts.entry(parent).or_default() += 1;
         }
     }
-    for (id, folder) in &folders {
-        if folder.has_children && note_counts.get(id).is_some_and(|count| *count > 0) {
-            return Err(blocked(
-                &folder.source_id,
-                &folder.source_path,
-                "folder has both child folders and own notes",
-            ));
+    for (id, count) in note_counts {
+        if count > 0 {
+            folders.get_mut(&id).expect("parent validated").has_notes = true;
         }
     }
     Ok(FolderPlan { folders })
@@ -306,6 +308,22 @@ pub(super) fn create_all(
                 audit,
                 report,
             )?;
+            if folder.has_notes {
+                // Stacks hold no notes: the folder's own notes go to a
+                // same-named notebook inside its stack (reported).
+                let notebook = repo.create_notebook(&folder.title, Some(&stack.id))?;
+                audit.execute(
+                    "UPDATE notebooks SET created_time=?2,updated_time=?3 WHERE id=?1",
+                    params![notebook.id.as_str(), folder.created, folder.updated],
+                )?;
+                report
+                    .synthetic_notebooks
+                    .push(super::JexSyntheticNotebook {
+                        source_folder_id: folder.source_id.clone(),
+                        notebook_id: notebook.id.clone(),
+                    });
+                notebooks.insert(key.clone(), notebook.id);
+            }
             stacks.insert(key.clone(), stack.id);
         }
     }

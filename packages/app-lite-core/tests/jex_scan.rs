@@ -665,8 +665,10 @@ fn records_resource_above_current_store_limit_as_compatibility_blocker() {
 }
 
 #[test]
-fn records_image_above_current_image_store_limit_as_compatibility_blocker() {
-    let byte_count = 10 * 1024 * 1024 + 1;
+fn records_image_above_attachment_store_limit_as_compatibility_blocker() {
+    // Images over the 10 MiB inline cap are staged as attachments since
+    // task 2, so only the 50 MiB attachment limit blocks.
+    let byte_count = 50 * 1024 * 1024 + 1;
     let archive = write_archive(|builder| {
         append_bytes(
             builder,
@@ -698,7 +700,7 @@ fn records_image_above_current_image_store_limit_as_compatibility_blocker() {
     assert!(
         report.store_compatibility_blockers[0]
             .reason
-            .contains("10485760")
+            .contains("52428800")
     );
 }
 

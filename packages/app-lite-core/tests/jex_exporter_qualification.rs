@@ -473,13 +473,14 @@ fn resource_mime_distribution_and_nonzero_schema_default_are_distinct_from_seman
         && field.field == "ocr_driver_id"
         && field.disposition == JexFieldDisposition::SourceAuditOnly
         && field.nondefault_count == 0));
+    // GIF metadata passes stage validation since task 2 normalization.
     assert!(
         report
             .category(JexQualificationBlockerKind::StageValidation)
-            .unwrap()
-            .samples
-            .iter()
-            .any(|sample| sample.source_id == GIF_RESOURCE)
+            .is_none_or(|category| category
+                .samples
+                .iter()
+                .all(|sample| sample.source_id != GIF_RESOURCE))
     );
     assert!(
         report
@@ -663,12 +664,12 @@ fn nonclean_jex_still_aggregates_later_semantics_without_creating_a_profile() {
             .any(|sample| sample.source_id == CLEAN
                 && sample.related_source_id.as_deref() == Some(MISSING_TARGET))
     );
-    assert_eq!(
+    // Images above 10 MiB are staged as attachments since task 2, so the
+    // fixture's oversized image no longer hits a store limit.
+    assert!(
         report
             .category(JexQualificationBlockerKind::PreflightStoreLimit)
-            .unwrap()
-            .item_count,
-        1
+            .is_none()
     );
     assert_eq!(
         report

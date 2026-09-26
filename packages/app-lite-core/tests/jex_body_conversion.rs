@@ -145,7 +145,7 @@ fn rejects_case_fold_collision_in_verified_source_resource_map() {
     );
     let source = format!("![图](:/{IMAGE})");
     let error = convert_jex_note_body(NOTE, "collision.md", 1, &source, &map).unwrap_err();
-    assert_eq!(error.kind, JexBodyBlockerKind::UnverifiedResource);
+    assert_eq!(error.kind, JexBodyBlockerKind::ResourceIdCollision);
     assert_eq!(error.source_note_id, NOTE);
     assert_eq!(error.source_path, "collision.md");
     assert!(error.reason.contains("conflict"));
@@ -306,5 +306,16 @@ fn blocks_excess_parser_nesting_before_block_mapping() {
             .unwrap_err()
             .kind,
         JexBodyBlockerKind::ParserBudget
+    );
+}
+
+#[test]
+fn empty_and_fragment_links_keep_text_and_tel_links_convert() {
+    // 1425 `[t](#…)`/`[t]()` and 410 `tel:` links in the user's export.
+    let source = "[空链接]() 与 [锚点](#section) 与 [电话](tel:010-12345678)";
+    let conversion = convert_jex_note_body(NOTE, "links.md", 1, source, &resources()).unwrap();
+    assert_eq!(
+        conversion.canonical_html,
+        "<p>空链接 与 锚点 与 <a href=\"tel:010-12345678\">电话</a></p>"
     );
 }

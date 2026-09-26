@@ -657,12 +657,9 @@ fn later_note_failure_after_tag_and_resource_creation_cleans_only_owned_child() 
         append(
             tar,
             &format!("{NOTE_B}.md"),
-            note(
-                NOTE_B,
-                "后失败",
-                "![缺失](:/99999999999999999999999999999999)",
-                1,
-                "",
+            format!(
+                "{}deleted_time: 1700000000000\n",
+                note(NOTE_B, "后失败", "后失败正文", 1, "",)
             )
             .as_bytes(),
         );
@@ -674,7 +671,7 @@ fn later_note_failure_after_tag_and_resource_creation_cleans_only_owned_child() 
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     assert!(matches!(
         stage_jex_file(&source, parent.path()),
-        Err(JexStageError::Prepare(_))
+        Err(JexStageError::UnsupportedNote { .. })
     ));
     assert_eq!(
         listing(parent.path()),

@@ -177,6 +177,15 @@ impl JexScanReport {
             && self.encrypted_item_ids.is_empty()
             && self.store_compatibility_blockers.is_empty()
     }
+
+    /// Like [`Self::is_clean`], but a note-body link to an item missing from
+    /// the export does not block the library: that note's body falls back
+    /// to readable source text during staging and is reported there.
+    pub fn is_importable(&self) -> bool {
+        let mut rest = self.clone();
+        rest.unresolved_note_body_internal_references.clear();
+        rest.is_clean()
+    }
 }
 
 #[derive(Debug)]
@@ -432,12 +441,10 @@ fn raw_archive_path_for_error<R: Read>(entry: &tar::Entry<'_, R>) -> String {
     String::from_utf8_lossy(entry.path_bytes().as_ref()).into_owned()
 }
 
-fn resource_store_limit_for_mime(mime: &str) -> u64 {
-    if mime.to_ascii_lowercase().starts_with("image/") {
-        crate::resource::MAX_IMAGE_BYTES as u64
-    } else {
-        crate::resource::MAX_RESOURCE_BYTES as u64
-    }
+// Images above the inline-image cap are staged as ordinary attachments
+// (see jex_stage_resources::normalize_metadata), so one limit applies.
+fn resource_store_limit_for_mime(_mime: &str) -> u64 {
+    crate::resource::MAX_RESOURCE_BYTES as u64
 }
 
 fn add_compatibility_blocker(

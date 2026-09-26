@@ -28,7 +28,7 @@ fn unsupported(source_id: &str, reason: &'static str) -> JexStageError {
     }
 }
 
-fn parse_metadata(raw: &JexRawSourceItem) -> Result<ResourceFields, JexStageError> {
+fn parse_metadata(raw: &JexRawSourceItem) -> Result<(String, String, String), JexStageError> {
     let content = std::str::from_utf8(&raw.raw_bytes)
         .map_err(|_| unsupported(&raw.source_id, "resource metadata is not UTF-8"))?;
     let item = parse_item(&raw.archive_path, content)
@@ -44,70 +44,175 @@ fn parse_metadata(raw: &JexRawSourceItem) -> Result<ResourceFields, JexStageErro
     } else {
         "\n\n"
     };
-    let (title, _) = content
+    let title = content
         .split_once(separator)
-        .ok_or_else(|| unsupported(&raw.source_id, "resource title is missing"))?;
-    if title.is_empty()
-        || title != title.trim()
-        || title.len() > 255
-        || title.contains(['/', '\\', ':', '\n', '\r'])
-        || title
-            .bytes()
-            .any(|byte| byte == 0 || byte.is_ascii_control())
-    {
-        return Err(unsupported(
-            &raw.source_id,
-            "resource title is not a safe filename",
-        ));
-    }
-    let mime = item
-        .properties
-        .get("mime")
-        .ok_or_else(|| unsupported(&raw.source_id, "resource MIME is missing"))?;
+        .map(|(title, _)| title.to_owned())
+        .unwrap_or_default();
+    let mime = item.properties.get("mime").cloned().unwrap_or_default();
     let extension = item
         .properties
         .get("file_extension")
-        .ok_or_else(|| unsupported(&raw.source_id, "resource extension is missing"))?;
-    let expected_extensions: &[&str] = match mime.as_str() {
-        "image/png" => &["png"],
-        "image/jpeg" => &["jpg", "jpeg"],
-        "application/pdf" => &["pdf"],
-        "text/plain" => &["txt"],
-        "application/octet-stream" => &["bin"],
-        _ => {
-            return Err(unsupported(
-                &raw.source_id,
-                "resource MIME is outside the verified 3b subset",
-            ));
+        .cloned()
+        .unwrap_or_default();
+    Ok((title, mime, extension))
+}
+
+/// Make real exporter metadata storable without rejecting the library.
+/// Pure in (raw metadata, byte count, first bytes) so verification can
+/// replay it. Every change is reported.
+fn normalize_metadata(
+    raw: &JexRawSourceItem,
+    byte_count: u64,
+    prefix: &[u8],
+) -> Result<(ResourceFields, Vec<&'static str>), JexStageError> {
+    let (raw_title, raw_mime, raw_extension) = parse_metadata(raw)?;
+    let mut changes = Vec::new();
+
+    let mut title: String = raw_title
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if title.len() > 255 {
+        let mut end = 255;
+        while !title.is_char_boundary(end) {
+            end -= 1;
         }
-    };
-    if !expected_extensions.contains(&extension.as_str())
-        || !title
-            .rsplit_once('.')
-            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(extension))
-    {
-        return Err(unsupported(
-            &raw.source_id,
-            "resource title, MIME and extension disagree",
-        ));
+        title.truncate(end);
+        title = title.trim_end().to_owned();
     }
-    Ok(ResourceFields {
-        title: title.to_owned(),
-        mime: mime.clone(),
-        extension: extension.clone(),
+    if title.is_empty() {
+        title = format!("resource-{}", &raw.source_id[..raw.source_id.len().min(8)]);
+    }
+    if title != raw_title {
+        changes.push("title");
+    }
+
+    let mut mime = raw_mime.trim().to_ascii_lowercase();
+    if mime == "image/jpg" {
+        mime = "image/jpeg".into();
+    }
+    if !valid_mime(&mime) {
+        mime = "application/octet-stream".into();
+    }
+    // For formats with a reliable signature the bytes decide: a mislabeled
+    // file gets its real type, unrecognizable bytes become a generic
+    // attachment so they are never decoded as an image.
+    let verifiable = matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "application/pdf"
+    );
+    match sniff_mime(prefix) {
+        Some(sniffed) if sniffed != mime && (verifiable || mime == "application/octet-stream") => {
+            mime = sniffed.to_owned();
+        }
+        None if verifiable => mime = "application/octet-stream".into(),
+        _ => {}
+    }
+    if mime.starts_with("image/") && byte_count > crate::MAX_IMAGE_BYTES as u64 {
+        // Too large to decode inline; keep it as an ordinary attachment.
+        mime = "application/octet-stream".into();
+        changes.push("oversized image stored as attachment");
+    }
+    if mime != raw_mime {
+        changes.push("mime");
+    }
+
+    let from_title = title
+        .rsplit_once('.')
+        .map(|(_, suffix)| suffix.to_ascii_lowercase());
+    let extension = [
+        Some(raw_extension.trim().to_ascii_lowercase()),
+        from_title,
+        extension_for_mime(&mime).map(str::to_owned),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| valid_extension(candidate))
+    .unwrap_or_else(|| "bin".into());
+    if extension != raw_extension {
+        changes.push("extension");
+    }
+    Ok((
+        ResourceFields {
+            title,
+            mime,
+            extension,
+        },
+        changes,
+    ))
+}
+
+fn sniff_mime(prefix: &[u8]) -> Option<&'static str> {
+    if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if prefix.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if prefix.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else {
+        None
+    }
+}
+
+fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    Some(match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        _ => return None,
     })
+}
+
+// Mirrors `resource.rs` store validation so normalized fields always store.
+fn valid_mime(mime: &str) -> bool {
+    let Some((kind, subtype)) = mime.split_once('/') else {
+        return false;
+    };
+    !kind.is_empty()
+        && !subtype.is_empty()
+        && mime.len() <= 127
+        && !subtype.contains('/')
+        && mime.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-' | b'/'
+                )
+        })
+}
+
+fn valid_extension(extension: &str) -> bool {
+    !extension.is_empty()
+        && extension.len() <= 16
+        && extension
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
 
 pub(super) fn validate_source_item(raw: &JexRawSourceItem) -> Result<(), JexStageError> {
     parse_metadata(raw).map(|_| ())
 }
 
-fn verify_signature(source_id: &str, mime: &str, file: &mut File) -> Result<(), JexStageError> {
+fn read_prefix(file: &mut File) -> io::Result<Vec<u8>> {
     let mut prefix = [0_u8; 8];
-    let count = file.read(&mut prefix)?;
-    let result = verify_signature_prefix(source_id, mime, &prefix[..count]);
+    let mut filled = 0;
+    while filled < prefix.len() {
+        let count = file.read(&mut prefix[filled..])?;
+        if count == 0 {
+            break;
+        }
+        filled += count;
+    }
     file.seek(SeekFrom::Start(0))?;
-    result
+    Ok(prefix[..filled].to_vec())
 }
 
 pub(super) fn verify_signature_prefix(
@@ -136,11 +241,10 @@ pub(super) fn import_one(
     source: &JexScannedResource,
     repo: &LibraryRepository,
     audit: &Connection,
-) -> Result<(JexStagedResource, JexVerifiedResource), JexStageError> {
+) -> Result<(JexStagedResource, JexVerifiedResource, Vec<&'static str>), JexStageError> {
     let raw = prepared.raw_item(&source.source_id)?.ok_or_else(|| {
         JexStageError::Verification("verified resource metadata disappeared".into())
     })?;
-    let fields = parse_metadata(&raw)?;
     let (physical, mut file) = prepared
         .open_verified_resource(&source.source_id)?
         .ok_or_else(|| JexStageError::Verification("verified resource file disappeared".into()))?;
@@ -152,7 +256,8 @@ pub(super) fn import_one(
             "resource source evidence differs".into(),
         ));
     }
-    verify_signature(&source.source_id, &fields.mime, &mut file)?;
+    let prefix = read_prefix(&mut file)?;
+    let (fields, changes) = normalize_metadata(&raw, source.byte_count, &prefix)?;
     let size = usize::try_from(source.byte_count)
         .map_err(|_| unsupported(&source.source_id, "resource exceeds addressable size"))?;
     let destination_id =
@@ -190,6 +295,7 @@ pub(super) fn import_one(
             mime: fields.mime,
             filename: fields.title,
         },
+        changes,
     ))
 }
 
@@ -227,15 +333,16 @@ pub(super) fn verify_one(
         canonical_note_body_sha256: None,
         raw_bytes: raw,
     };
-    let parsed = parse_metadata(&raw_item)?;
+    let (stored, mut file) = repo
+        .open_verified_resource_file(&mapped.destination_id)?
+        .ok_or_else(|| JexStageError::Verification("reopened resource disappeared".into()))?;
+    let prefix = read_prefix(&mut file)?;
+    let (parsed, _) = normalize_metadata(&raw_item, size as u64, &prefix)?;
     if parsed.title != title || parsed.mime != mime || parsed.extension != extension {
         return Err(JexStageError::Verification(
             "resource metadata replay differs".into(),
         ));
     }
-    let (stored, mut file) = repo
-        .open_verified_resource_file(&mapped.destination_id)?
-        .ok_or_else(|| JexStageError::Verification("reopened resource disappeared".into()))?;
     let mut digest = Sha256::new();
     let copied = io::copy(&mut file, &mut digest)?;
     if stored.title != title

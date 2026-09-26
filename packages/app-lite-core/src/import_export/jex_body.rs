@@ -39,6 +39,8 @@ pub enum JexBodyBlockerKind {
     UnsupportedHeading,
     PluginDirective,
     UnverifiedResource,
+    /// Two source resource IDs differ only by ASCII case.
+    ResourceIdCollision,
     InternalNoteLink,
     LinkedImage,
     UnsupportedImageSource,
@@ -124,8 +126,10 @@ impl<'a> Converter<'a> {
 
     fn external_link(&mut self, url: &str) -> Result<String> {
         self.url(url)?;
-        let safe_scheme =
-            url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:");
+        let safe_scheme = url.starts_with("https://")
+            || url.starts_with("http://")
+            || url.starts_with("mailto:")
+            || (url.starts_with("tel:") && crate::document::valid_link(url));
         let safe_bytes = !url.bytes().any(|byte| {
             byte.is_ascii_control()
                 || byte == b' '
@@ -208,6 +212,12 @@ impl<'a> Converter<'a> {
                             JexBodyBlockerKind::AmbiguousAttachment,
                             "Resource attachment must occupy its own paragraph",
                         );
+                    }
+                    // An empty or in-note fragment target points nowhere the
+                    // product can represent; the link text is the content.
+                    if dest_url.is_empty() || dest_url.starts_with('#') {
+                        out.extend(self.inlines(TagEnd::Link, marks.clone(), true)?);
+                        continue;
                     }
                     let url = self.external_link(&dest_url)?;
                     let mut nested = marks.clone();
@@ -478,8 +488,8 @@ impl<'a> Converter<'a> {
 /// Like [`convert_jex_note_body`], but a note whose body uses constructs the
 /// canonical document cannot represent is imported as its source text (one
 /// paragraph per line) plus attachment cards, and the blocker is returned for
-/// the import report. An oversized body and unverified or ambiguous
-/// resources stay hard errors: degrading them would hide data loss.
+/// the import report. An oversized body and case-colliding resource IDs stay
+/// hard errors: the fallback could not attach the right files.
 pub fn convert_jex_note_body_or_degrade(
     source_note_id: &str,
     source_path: &str,
@@ -499,9 +509,7 @@ pub fn convert_jex_note_body_or_degrade(
     };
     if matches!(
         blocker.kind,
-        JexBodyBlockerKind::BodyTooLarge
-            | JexBodyBlockerKind::UnverifiedResource
-            | JexBodyBlockerKind::AmbiguousAttachment
+        JexBodyBlockerKind::BodyTooLarge | JexBodyBlockerKind::ResourceIdCollision
     ) {
         return Err(blocker);
     }
@@ -594,7 +602,7 @@ pub fn convert_jex_note_body(
             .is_some()
         {
             return Err(blocked(
-                JexBodyBlockerKind::UnverifiedResource,
+                JexBodyBlockerKind::ResourceIdCollision,
                 "Case-fold conflict in verified source resource map",
             ));
         }

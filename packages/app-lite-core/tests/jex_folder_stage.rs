@@ -283,16 +283,9 @@ fn root_leaf_and_stack_child_notes_reopen_in_their_source_folders() {
 
 #[test]
 fn ambiguous_folder_graphs_and_missing_note_parent_block_without_leaking_a_profile() {
+    // "root notes plus children" imports since task 2 (see
+    // folder_user_times_and_a_folder_with_notes_and_children_import).
     let cases = [
-        (
-            "root notes plus children",
-            vec![
-                folder(ROOT_STACK, "项目", ""),
-                folder(CHILD, "合同", ROOT_STACK),
-            ],
-            ROOT_STACK,
-            true,
-        ),
         (
             "missing folder parent",
             vec![folder(CHILD, "合同", ROOT_STACK)],
@@ -414,12 +407,9 @@ fn blocked_body_after_folder_creation_cleans_owned_child_only() {
         append(
             tar,
             &format!("{NOTE_LEAF}.md"),
-            note(
-                NOTE_LEAF,
-                "危险",
-                "![缺失](:/99999999999999999999999999999999)",
-                1,
-                ROOT_LEAF,
+            format!(
+                "{}deleted_time: 1700000000000\n",
+                note(NOTE_LEAF, "危险", "后失败正文", 1, ROOT_LEAF,)
             )
             .as_bytes(),
         );
@@ -428,7 +418,7 @@ fn blocked_body_after_folder_creation_cleans_owned_child_only() {
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     assert!(matches!(
         stage_jex_file(&source, parent.path()),
-        Err(JexStageError::Prepare(_))
+        Err(JexStageError::UnsupportedNote { .. })
     ));
     assert_eq!(
         listing(parent.path()),
@@ -438,4 +428,60 @@ fn blocked_body_after_folder_creation_cleans_owned_child_only() {
         fs::read(parent.path().join("sentinel.bin")).unwrap(),
         b"keep"
     );
+}
+
+/// Real Joplin exports set user_*_time on folders, and a top-level folder
+/// can hold notes and sub-folders at once. Both must import.
+#[test]
+fn folder_user_times_and_a_folder_with_notes_and_children_import() {
+    let mixed = folder(ROOT_STACK, "混合", "").replace(
+        "updated_time: 2023-01-01T00:00:01.000Z\n",
+        "updated_time: 2023-01-01T00:00:01.000Z\nuser_created_time: 2020-04-20T18:39:19.561Z\nuser_updated_time: 2020-04-21T18:39:19.561Z\n",
+    );
+    let source = archive(|tar| {
+        append(tar, &format!("{ROOT_STACK}.md"), mixed.as_bytes());
+        append(
+            tar,
+            &format!("{CHILD}.md"),
+            folder(CHILD, "子", ROOT_STACK).as_bytes(),
+        );
+        append(
+            tar,
+            &format!("{NOTE_LEAF}.md"),
+            note(NOTE_LEAF, "直属", "正文", 1, ROOT_STACK).as_bytes(),
+        );
+        append(
+            tar,
+            &format!("{NOTE_CHILD}.md"),
+            note(NOTE_CHILD, "子笔记", "正文", 1, CHILD).as_bytes(),
+        );
+    });
+    let parent = tempdir().unwrap();
+    let stage = stage_jex_file(&source, parent.path()).unwrap();
+    let db = Connection::open(stage.profile_path().join("library.sqlite")).unwrap();
+    let (stack_id, stack_created): (String, i64) = db
+        .query_row(
+            "SELECT id, created_time FROM stacks WHERE title='混合'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stack_created, 1_587_407_959_561, "user_created_time wins");
+    let in_stack: Vec<String> = db
+        .prepare("SELECT title FROM notebooks WHERE stack_id=?1 ORDER BY title")
+        .unwrap()
+        .query_map([&stack_id], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(in_stack, vec!["子".to_owned(), "混合".to_owned()]);
+    let direct_notebook: String = db
+        .query_row(
+            "SELECT nb.title FROM notes n JOIN notebooks nb ON nb.id=n.notebook_id WHERE n.title='直属'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(direct_notebook, "混合");
+    assert_eq!(stage.report().synthetic_notebooks.len(), 1);
 }

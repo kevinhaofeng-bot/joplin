@@ -131,6 +131,27 @@ pub struct JexStageReport {
     /// Notes imported as readable source text because their body used
     /// constructs the editor cannot represent; the raw item stays audited.
     pub degraded_notes: Vec<JexDegradedNote>,
+    /// Resources whose title/MIME/extension were normalized to be storable.
+    pub normalized_resources: Vec<JexResourceNormalization>,
+    /// Notebooks created inside a stack for a source folder that holds both
+    /// notes and child folders; the folder itself maps to the stack.
+    pub synthetic_notebooks: Vec<JexSyntheticNotebook>,
+    /// Source note fields with non-default values that have no column in the
+    /// product schema, by field name → number of notes. They are preserved
+    /// only in the raw note audit.
+    pub retained_only_note_fields: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexSyntheticNotebook {
+    pub source_folder_id: String,
+    pub notebook_id: NotebookId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexResourceNormalization {
+    pub source_id: String,
+    pub changes: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +220,7 @@ struct ParsedNote<'a> {
     updated: i64,
     user_created: i64,
     user_updated: i64,
+    retained_only_fields: Vec<String>,
 }
 
 fn invalid_note(source_id: &str, source_path: &str, reason: &'static str) -> JexStageError {
@@ -368,16 +390,34 @@ fn parse_note<'a>(
         "user_created_time",
         "user_updated_time",
         "encryption_applied",
-        "is_todo",
     ];
-    if parsed.properties.iter().any(|(key, value)| {
-        !allowed.contains(&key.as_str()) && !accepts_known_exporter_default(1, key, value)
-    }) {
-        return Err(invalid_note(
-            source_id,
-            path,
-            "source note has metadata not yet mapped by bounded staging",
-        ));
+    // Trash, conflict and encryption state change what the note *is*;
+    // importing them as an ordinary live note would be wrong, so they block.
+    let must_be_default = [
+        "deleted_time",
+        "is_conflict",
+        "conflict_original_id",
+        "encryption_cipher_text",
+    ];
+    let mut retained_only_fields = Vec::new();
+    for (key, value) in &parsed.properties {
+        if allowed.contains(&key.as_str()) || accepts_known_exporter_default(1, key, value) {
+            continue;
+        }
+        if must_be_default.contains(&key.as_str()) {
+            return Err(invalid_note(
+                source_id,
+                path,
+                "trashed, conflicted or encrypted source note is unsupported",
+            ));
+        }
+        // No column in the product schema (provenance, order, location,
+        // author, source URL, to-do state…): the raw item stays in the
+        // stage audit and the field is counted in the report.
+        if key == "is_todo" && value == "0" {
+            continue;
+        }
+        retained_only_fields.push(key.clone());
     }
     let parent_id = parsed
         .properties
@@ -391,7 +431,7 @@ fn parse_note<'a>(
             "source parent_id is malformed",
         ));
     }
-    for flag in ["encryption_applied", "is_todo"] {
+    for flag in ["encryption_applied"] {
         if parsed
             .properties
             .get(flag)
@@ -435,6 +475,7 @@ fn parse_note<'a>(
         updated,
         user_created,
         user_updated,
+        retained_only_fields,
     })
 }
 
@@ -597,6 +638,7 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
                 .iter()
                 .filter(|f| matches!(f.destination, JexFolderDestination::Notebook(_)))
                 .count() as i64
+                + report.synthetic_notebooks.len() as i64
     {
         return Err(JexStageError::Verification(
             "staged entity count mismatch".into(),
@@ -679,8 +721,16 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
         let expected_notebook = if entry.source_parent_id.is_empty() {
             repo.default_notebook()?.id
         } else {
+            let synthetic = report.synthetic_notebooks.iter().find(|synthetic| {
+                synthetic
+                    .source_folder_id
+                    .eq_ignore_ascii_case(&entry.source_parent_id)
+            });
             match folder_destinations.get(&entry.source_parent_id.to_ascii_lowercase()) {
                 Some(JexFolderDestination::Notebook(id)) => id.clone(),
+                Some(JexFolderDestination::Stack(_)) if synthetic.is_some() => {
+                    synthetic.expect("checked").notebook_id.clone()
+                }
                 _ => {
                     return Err(JexStageError::Verification(
                         "note source parent is not a mapped notebook".into(),
@@ -890,7 +940,13 @@ pub fn stage_jex_file(
     let tag_map = tags::create_tags(&tag_plan, &prepared, &repo, &audit, &mut report)?;
     let mut verified_resources = BTreeMap::new();
     for source in &scanned.resources {
-        let (mapped, verified) = resources::import_one(&prepared, source, &repo, &audit)?;
+        let (mapped, verified, changes) = resources::import_one(&prepared, source, &repo, &audit)?;
+        if !changes.is_empty() {
+            report.normalized_resources.push(JexResourceNormalization {
+                source_id: mapped.source_id.clone(),
+                changes,
+            });
+        }
         verified_resources.insert(mapped.source_id.to_ascii_lowercase(), verified);
         report.resources.push(mapped);
     }
@@ -899,6 +955,12 @@ pub fn stage_jex_file(
             .raw_item(source_id)?
             .ok_or_else(|| JexStageError::Verification("verified note item disappeared".into()))?;
         let parsed = parse_note(source_id, &raw.archive_path, &raw.raw_bytes)?;
+        for field in &parsed.retained_only_fields {
+            *report
+                .retained_only_note_fields
+                .entry(field.clone())
+                .or_default() += 1;
+        }
         let (converted, degraded) = convert_jex_note_body_or_degrade(
             parsed.source_id,
             parsed.source_path,
