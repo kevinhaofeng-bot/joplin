@@ -252,7 +252,7 @@ fn parse_enml(input: &str) -> Result<Element, EnmlFidelityBlocker> {
         return Err(blocked("/", "root must be en-note"));
     }
     for name in root.attrs.keys() {
-        if name != "xmlns" {
+        if name != "xmlns" && !is_presentational_attribute(name) {
             return Err(blocked(
                 "/en-note",
                 format!("unsupported root attribute {name}"),
@@ -332,6 +332,58 @@ impl RenderContext<'_> {
             Child::Element(element) => match element.name.as_str() {
                 "div" | "p" | "h1" | "h2" | "h3" => {
                     self.attrs(element, &[], path)?;
+                    // Evernote's native checkbox line: `<div><en-todo/>text</div>`.
+                    let first = element.children.iter().enumerate().find(|(_, child)| {
+                        !matches!(child, Child::Text(text) if is_xml_formatting_whitespace(text))
+                    });
+                    if let Some((todo_index, Child::Element(todo))) = first
+                        && todo.name == "en-todo"
+                    {
+                        let todo_path = format!("{path}/{todo_index}");
+                        self.attrs(todo, &["checked"], &todo_path)?;
+                        if !todo.children.is_empty() {
+                            return Err(blocked(&todo_path, "en-todo must be empty"));
+                        }
+                        let checked = match todo.attrs.get("checked").map(String::as_str) {
+                            Some("true") => "true",
+                            None | Some("false") => "false",
+                            Some(_) => {
+                                return Err(blocked(&todo_path, "invalid en-todo checked value"));
+                            }
+                        };
+                        // Evernote sometimes repeats the leading checkbox; identical
+                        // repeats collapse, conflicting states are not representable.
+                        let mut content_start = todo_index + 1;
+                        while let Some(child) = element.children.get(content_start) {
+                            match child {
+                                Child::Text(text) if is_xml_formatting_whitespace(text) => {}
+                                Child::Element(repeat) if repeat.name == "en-todo" => {
+                                    let repeat_checked =
+                                        repeat.attrs.get("checked").map(String::as_str);
+                                    let same = matches!(
+                                        (checked, repeat_checked),
+                                        ("true", Some("true")) | ("false", None | Some("false"))
+                                    );
+                                    if !same || !repeat.children.is_empty() {
+                                        return Err(blocked(
+                                            &format!("{path}/{content_start}"),
+                                            "conflicting repeated en-todo",
+                                        ));
+                                    }
+                                }
+                                _ => break,
+                            }
+                            content_start += 1;
+                        }
+                        out.push_str("<ul data-type=\"checklist\"><li data-checked=\"");
+                        out.push_str(checked);
+                        out.push_str("\">");
+                        for (i, item) in element.children.iter().enumerate().skip(content_start) {
+                            self.inline(item, &format!("{path}/{i}"), out)?;
+                        }
+                        out.push_str("</li></ul>");
+                        return Ok(());
+                    }
                     if element.name == "div" && element.children.iter().filter(|child| !matches!(child, Child::Text(text) if is_xml_formatting_whitespace(text))).count() == 1 {
                         if let Some((media_index, Child::Element(media))) = element.children.iter().enumerate().find(|(_, child)| !matches!(child, Child::Text(text) if is_xml_formatting_whitespace(text))) {
                             if media.name == "en-media" {
@@ -387,7 +439,7 @@ impl RenderContext<'_> {
                     "u" => "u",
                     "s" | "strike" | "del" => "s",
                     "mark" => "mark",
-                    "span" => "span",
+                    "span" | "font" => "span",
                     "a" => "a",
                     "br" => "br",
                     "en-media" => return self.media(element, path, out, true),
@@ -397,6 +449,12 @@ impl RenderContext<'_> {
                             format!("unsupported inline <{}>", element.name),
                         ));
                     }
+                };
+                // A named anchor without href carries no link; keep its text.
+                let tag = if tag == "a" && !element.attrs.contains_key("href") {
+                    "span"
+                } else {
+                    tag
                 };
                 if tag == "a" {
                     self.attrs(element, &["href"], path)?;
@@ -433,6 +491,23 @@ impl RenderContext<'_> {
                     out.push_str("<a href=\"");
                     escape(href, out);
                     out.push_str("\">");
+                } else if tag == "span" {
+                    self.attrs(element, &["name"], path)?;
+                    let marks = style_marks(element.attrs.get("style").map(String::as_str));
+                    for mark in &marks {
+                        out.push('<');
+                        out.push_str(mark);
+                        out.push('>');
+                    }
+                    for (i, item) in element.children.iter().enumerate() {
+                        self.inline(item, &format!("{path}/{i}"), out)?;
+                    }
+                    for mark in marks.iter().rev() {
+                        out.push_str("</");
+                        out.push_str(mark);
+                        out.push('>');
+                    }
+                    return Ok(());
                 } else {
                     self.attrs(element, &[], path)?;
                     out.push('<');
@@ -616,7 +691,7 @@ impl RenderContext<'_> {
         path: &str,
     ) -> Result<(), EnmlFidelityBlocker> {
         for name in element.attrs.keys() {
-            if !allowed.contains(&name.as_str()) {
+            if !allowed.contains(&name.as_str()) && !is_presentational_attribute(name) {
                 return Err(blocked(
                     path,
                     format!("unsupported {} attribute {name}", element.name),
@@ -625,6 +700,50 @@ impl RenderContext<'_> {
         }
         Ok(())
     }
+}
+
+/// Attributes Evernote writes for appearance only. The canonical document has
+/// no font, size, colour or box model, so these are accepted and dropped;
+/// semantic `style` properties are mapped by [`style_marks`].
+fn is_presentational_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "style" | "class" | "dir" | "lang" | "title" | "id" | "align" | "face" | "color" | "size"
+    )
+}
+
+/// Canonical mark tags implied by an inline `style` declaration list.
+fn style_marks(style: Option<&str>) -> Vec<&'static str> {
+    let mut marks = Vec::new();
+    for declaration in style.unwrap_or_default().split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let property = property.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        let mark = match property.as_str() {
+            "font-weight"
+                if value == "bold"
+                    || value == "bolder"
+                    || value.parse::<u16>().is_ok_and(|weight| weight >= 600) =>
+            {
+                Some("strong")
+            }
+            "font-style" if value == "italic" || value == "oblique" => Some("em"),
+            "text-decoration" | "text-decoration-line" if value.contains("underline") => Some("u"),
+            "text-decoration" | "text-decoration-line" if value.contains("line-through") => {
+                Some("s")
+            }
+            "--en-highlight" => Some("mark"),
+            _ => None,
+        };
+        if let Some(mark) = mark
+            && !marks.contains(&mark)
+        {
+            marks.push(mark);
+        }
+    }
+    marks
 }
 
 fn contains_media(child: &Child) -> bool {

@@ -59,13 +59,13 @@ fn converts_ordered_chinese_rich_text_checklist_and_media() {
 }
 
 #[test]
-fn blocks_unsupported_semantics_styles_and_unverified_media() {
-    // Mutation caught: HTML recovery silently flattening a table/style, or
+fn blocks_unsupported_semantics_and_unverified_media() {
+    // Mutation caught: HTML recovery silently flattening a table, or
     // resolving media from outside the explicit same-note verified map.
+    // Presentational colour/font styles are accepted since task 2 (see
+    // evernote_presentational_styles_map_to_marks_instead_of_blocking).
     for body in [
         "<table><tr><td>x</td></tr></table>",
-        "<div style=\"color:red\">x</div>",
-        "<font color=\"red\">x</font>",
         "<div><sub>x</sub></div>",
         "<div><a href=\"javascript:alert(1)\">x</a></div>",
         "<div><a href=\"https://host:bad/x\">x</a></div>",
@@ -112,7 +112,9 @@ fn malformed_xml_and_inline_checkbox_are_fidelity_blockers() {
     // Mutation caught: XML recovery and inline todo conversion to a lossy glyph.
     for enml in [
         "<en-note><div>x</en-note>",
-        "<en-note><div><en-todo checked=\"true\"/>x</div></en-note>",
+        // A leading div checkbox is a checklist item since task 2; one in
+        // the middle of a line is still not representable.
+        "<en-note><div>x<en-todo checked=\"true\"/>y</div></en-note>",
         "<en-note><ul><li><en-todo checked=\"maybe\"/>x</li></ul></en-note>",
         "<en-note><?custom action?><div>x</div></en-note>",
         "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><en-note><div>x</div></en-note>",
@@ -209,4 +211,54 @@ fn media_blocker_path_uses_its_actual_child_index() {
     let enml = "<en-note><div> \n<en-media hash=\"cccccccccccccccccccccccccccccccc\" type=\"image/png\"/></div></en-note>";
     let error = convert_enml(enml, &BTreeMap::new()).unwrap_err();
     assert_eq!(error.path, "/en-note/0/1");
+}
+
+#[test]
+fn evernote_presentational_styles_map_to_marks_instead_of_blocking() {
+    // Real Evernote ENML wraps almost every run in styled div/span/font.
+    // Semantic styles become marks; font/size/colour are presentational and
+    // are not representable, so they are dropped rather than blocking.
+    let enml = r##"<en-note><div style="text-align:left;font-family:Arial"><span style="font-weight: bold; color: rgb(0, 0, 0);">粗</span><span style="font-style:italic">斜</span><span style="text-decoration: underline;">下</span><span style="text-decoration:line-through">删</span><span style="--en-highlight:yellow;background-color: #ffef9e;">亮</span><font face="Arial" color="#333333">字</font><span style="font-size:14px">普通</span></div></en-note>"##;
+    let result = convert_enml(enml, &resources()).unwrap();
+    assert_eq!(
+        result.html.as_str(),
+        "<p><strong>粗</strong><em>斜</em><u>下</u><s>删</s><mark>亮</mark>字普通</p>"
+    );
+}
+
+#[test]
+fn evernote_div_checkboxes_and_tel_links_convert() {
+    // Evernote writes checkboxes as `<div><en-todo/>text</div>` rather than
+    // inside `<ul><li>`, and phone numbers as `tel:` links.
+    let enml = r#"<en-note><div><en-todo checked="true"/>已办</div><div><en-todo/>待办</div><div><a href="tel:+81-3-1234-5678">电话</a></div></en-note>"#;
+    let result = convert_enml(enml, &resources()).unwrap();
+    assert_eq!(
+        result.html.as_str(),
+        "<ul data-type=\"checklist\"><li data-checked=\"true\">已办</li><li data-checked=\"false\">待办</li></ul><p><a href=\"tel:+81-3-1234-5678\">电话</a></p>"
+    );
+}
+
+#[test]
+fn repeated_leading_checkboxes_collapse_and_hrefless_anchor_keeps_text() {
+    let enml = r#"<en-note><div><en-todo checked="true"/><en-todo checked="true"/>重复</div><div><a name="x">锚点</a>文字</div></en-note>"#;
+    let result = convert_enml(enml, &resources()).unwrap();
+    assert_eq!(
+        result.html.as_str(),
+        "<ul data-type=\"checklist\"><li data-checked=\"true\">重复</li></ul><p>锚点文字</p>"
+    );
+    let conflicting = r#"<en-note><div><en-todo checked="true"/><en-todo/>冲突</div></en-note>"#;
+    assert!(convert_enml(conflicting, &resources()).is_err());
+}
+
+#[test]
+fn tel_links_accept_percent_encoded_separators_only() {
+    let ok = r#"<en-note><div><a href="tel:(010)%2012345678">电话</a></div></en-note>"#;
+    assert_eq!(
+        convert_enml(ok, &resources()).unwrap().html.as_str(),
+        "<p><a href=\"tel:(010)%2012345678\">电话</a></p>"
+    );
+    for bad in ["tel:12%zz", "tel:12%2", "tel:abc"] {
+        let enml = format!(r#"<en-note><div><a href="{bad}">x</a></div></en-note>"#);
+        assert!(convert_enml(&enml, &resources()).is_err(), "{bad}");
+    }
 }

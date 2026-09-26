@@ -1973,7 +1973,33 @@ pub(crate) fn valid_link(value: &str) -> bool {
     {
         return valid_http_target(target);
     }
+    if let Some(number) = strip_ascii_prefix(value, "tel:") {
+        return valid_tel_target(number);
+    }
     strip_ascii_prefix(value, "mailto:").is_some_and(valid_mailto_target)
+}
+
+/// Dial characters plus `%XX` escapes (exporters encode spaces as `%20`).
+fn valid_tel_target(number: &str) -> bool {
+    let bytes = number.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 || !bytes.iter().any(u8::is_ascii_digit) {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let escape = bytes.get(index + 1..index + 3);
+                if !escape.is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
+                    return false;
+                }
+                index += 3;
+            }
+            byte if byte.is_ascii_digit() || b"+-.()#*,;pw".contains(&byte) => index += 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
