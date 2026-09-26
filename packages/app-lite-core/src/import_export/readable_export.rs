@@ -36,14 +36,14 @@ use tempfile::Builder;
 use thiserror::Error;
 
 const BUNDLE_VERSION: u32 = 2;
-const COPY_BUFFER_BYTES: usize = 64 * 1024;
+pub(super) const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_BUNDLE_NOTES: usize = 10_000;
-const MAX_BUNDLE_RESOURCES: usize = 50_000;
-const MAX_NOTE_HTML_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_NOTE_TEXT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_NOTE_REVISIONS: usize = 10_000;
-const MAX_NOTE_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_BUNDLE_NOTES: usize = 10_000;
+pub(super) const MAX_BUNDLE_RESOURCES: usize = 50_000;
+pub(super) const MAX_NOTE_HTML_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAX_NOTE_TEXT_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_NOTE_REVISIONS: usize = 10_000;
+pub(super) const MAX_NOTE_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadableExportReport {
@@ -847,7 +847,7 @@ fn validate_manifest(bundle: &Path) -> Result<ValidatedBundle, ReadableExportErr
     })
 }
 
-fn ensure_existing_empty_directory(path: &Path) -> Result<(), ReadableExportError> {
+pub(super) fn ensure_existing_empty_directory(path: &Path) -> Result<(), ReadableExportError> {
     if !path.is_dir() || fs::read_dir(path)?.next().is_some() {
         return Err(ReadableExportError::RestoreDestinationNotEmpty);
     }
@@ -973,36 +973,7 @@ fn verify_restored(
 
 impl BundleDirs {
     fn open(bundle: &Path) -> Result<Self, ReadableExportError> {
-        // A trailing slash or `/.` makes the kernel resolve a symlink before
-        // applying O_NOFOLLOW to the final component. Strip only those suffixes;
-        // normal parent components retain their ordinary filesystem meaning.
-        let mut path_bytes = bundle.as_os_str().as_bytes();
-        loop {
-            if path_bytes.ends_with(b"/") {
-                path_bytes = &path_bytes[..path_bytes.len() - 1];
-            } else if path_bytes.ends_with(b"/.") {
-                path_bytes = &path_bytes[..path_bytes.len() - 2];
-            } else {
-                break;
-            }
-        }
-        if path_bytes.is_empty() {
-            return Err(ReadableExportError::InvalidManifest(
-                "invalid bundle path".into(),
-            ));
-        }
-        let path = std::ffi::CString::new(path_bytes)
-            .map_err(|_| ReadableExportError::InvalidManifest("invalid bundle path".into()))?;
-        let root_fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if root_fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let root = unsafe { File::from_raw_fd(root_fd) };
+        let root = open_bundle_root(bundle)?;
         let notes = open_child_directory(&root, "notes")?;
         let resources = open_child_directory(&root, "resources")?;
         Ok(Self {
@@ -1011,6 +982,39 @@ impl BundleDirs {
             resources,
         })
     }
+}
+
+pub(super) fn open_bundle_root(bundle: &Path) -> Result<File, ReadableExportError> {
+    // A trailing slash or `/.` makes the kernel resolve a symlink before
+    // applying O_NOFOLLOW to the final component. Strip only those suffixes;
+    // normal parent components retain their ordinary filesystem meaning.
+    let mut path_bytes = bundle.as_os_str().as_bytes();
+    loop {
+        if path_bytes.ends_with(b"/") {
+            path_bytes = &path_bytes[..path_bytes.len() - 1];
+        } else if path_bytes.ends_with(b"/.") {
+            path_bytes = &path_bytes[..path_bytes.len() - 2];
+        } else {
+            break;
+        }
+    }
+    if path_bytes.is_empty() {
+        return Err(ReadableExportError::InvalidManifest(
+            "invalid bundle path".into(),
+        ));
+    }
+    let path = std::ffi::CString::new(path_bytes)
+        .map_err(|_| ReadableExportError::InvalidManifest("invalid bundle path".into()))?;
+    let root_fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(root_fd) })
 }
 
 fn expected_html_path(note_id: &str) -> String {
@@ -1030,11 +1034,11 @@ fn resource_file_name(resource: &ManifestResource) -> String {
     )
 }
 
-fn open_child_directory(parent: &File, name: &str) -> Result<File, ReadableExportError> {
+pub(super) fn open_child_directory(parent: &File, name: &str) -> Result<File, ReadableExportError> {
     open_child(parent, name, libc::O_DIRECTORY)
 }
 
-fn open_child_regular(parent: &File, name: &str) -> Result<File, ReadableExportError> {
+pub(super) fn open_child_regular(parent: &File, name: &str) -> Result<File, ReadableExportError> {
     let file = open_child(parent, name, libc::O_NONBLOCK)?;
     if !file.metadata()?.is_file() {
         return Err(ReadableExportError::InvalidManifest(
@@ -1065,7 +1069,10 @@ fn open_child(parent: &File, name: &str, extra_flags: i32) -> Result<File, Reada
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn read_regular_file_bounded(file: File, maximum: u64) -> Result<Vec<u8>, ReadableExportError> {
+pub(super) fn read_regular_file_bounded(
+    file: File,
+    maximum: u64,
+) -> Result<Vec<u8>, ReadableExportError> {
     let expected_size = file.metadata()?.len();
     read_bounded_stream(file, expected_size, maximum)
 }
@@ -1092,7 +1099,7 @@ fn read_bounded_stream(
     Ok(bytes)
 }
 
-fn safe_display_name(title: &str, extension: &str) -> String {
+pub(super) fn safe_display_name(title: &str, extension: &str) -> String {
     let mut value = title
         .chars()
         .map(|character| {
@@ -1114,7 +1121,7 @@ fn safe_display_name(title: &str, extension: &str) -> String {
     value
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
@@ -1136,7 +1143,7 @@ fn write_readable_index(path: &Path, notes: &[ManifestNote]) -> Result<(), Reada
     Ok(())
 }
 
-fn write_readable_page(
+pub(super) fn write_readable_page(
     path: &Path,
     title: &str,
     body_html: &str,
@@ -1319,7 +1326,11 @@ fn write_projected_token<W: Write>(
     Ok(())
 }
 
-fn write_html_escaped<W: Write>(output: &mut W, value: &str, quotes: bool) -> io::Result<()> {
+pub(super) fn write_html_escaped<W: Write + ?Sized>(
+    output: &mut W,
+    value: &str,
+    quotes: bool,
+) -> io::Result<()> {
     let mut start = 0;
     for (offset, character) in value.char_indices() {
         let escape = match character {
@@ -1338,7 +1349,7 @@ fn write_html_escaped<W: Write>(output: &mut W, value: &str, quotes: bool) -> io
     output.write_all(&value.as_bytes()[start..])
 }
 
-fn copy_and_hash(
+pub(super) fn copy_and_hash(
     input: &mut dyn Read,
     destination: &Path,
     captured_size: u64,
@@ -1375,7 +1386,7 @@ fn copy_and_hash(
     Ok((format!("{:x}", digest.finalize()), size))
 }
 
-fn hash_regular_file_bounded(
+pub(super) fn hash_regular_file_bounded(
     file: File,
     maximum: u64,
 ) -> Result<(String, u64), ReadableExportError> {
@@ -1404,11 +1415,11 @@ fn hash_regular_file_bounded(
     Ok((format!("{:x}", digest.finalize()), size))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn snippet(text: &str) -> String {
+pub(super) fn snippet(text: &str) -> String {
     text.chars().take(280).collect()
 }
 

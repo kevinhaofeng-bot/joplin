@@ -35,6 +35,8 @@ mod import_commit;
 pub use import_commit::*;
 mod library_backup;
 pub use library_backup::*;
+mod library_readable_export;
+pub use library_readable_export::*;
 
 /// Maximum number of tar entries accepted by a preflight scan.
 pub const MAX_JEX_ARCHIVE_ENTRIES: usize = 50_000;

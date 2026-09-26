@@ -104,6 +104,48 @@ Codex 已独立核验 `becdff6d6`：core 345 通过；GUI 1362 通过、1 忽略
 
 说明：第一次运行 `backup_verify` 因工作目录不存在报 `TargetParentMissing`（退出101）；创建目录后重跑通过，属于调用方式问题，不是产品缺陷。原生审计编译时工作树里有另一会话未提交的 `app-lite-gpui/src/native_editor/toolbar.rs`，审计入口与它无关，但仍不是纯净构建。原生审计只比较资源顺序和文字，不代替排版、表格的视觉验收。
 
+| 自链接资源图片 `[![alt](:/id)](:/id)` 去掉冗余链接（链接指向图片自身）；链到别处的仍阻断 | `6bff4936c` | 1442 / 224（真实副本 0 增益：这些笔记同时有其他阻断） |
+
 跳过空包装块是一个判断，需要 Codex 确认。审计曾发现我自己写的包装块检测会在中文字符的字节边界上 panic，已修复，并加了回归用例 `<html>中文标题`。
 
 特征组合里仍未处理的：带链接图片 51+、表格 30+、HTML 块跨空行导致的“未闭合元素” 20、外链图片 11、有序列表起始号 11、数学 11、H4 及以上 5。其中带链接图片、表格、列表起始号和 H4 以上都要改原生编辑器（`app-lite-gpui`，现归另一个会话负责），需要先协调。尚未用新代码重新做隔离导入，也没跑原生加载审计：新转换出的笔记还没有在编辑器里验证过打开和回写。
+
+### 剩余警告的真实分布（HEAD `6bff4936c`，只读探针）
+
+用临时诊断打印（只打印事件变体名，运行后已还原，源文件无残留）确认：块级 `Table` 57 篇；行内 `InlineMath` 12；列表项内嵌套 `List` 7；列表项内 `CodeBlock`/`BlockQuote` 各 1；`DefinitionList` 1。按特征组合统计：带链接图片 51 篇（组合约 85 篇）、表格 30 篇（组合更多）、外链图片 11、有序列表起始号 11、数学 11、H4 及以上 5、HTML 属性/表格 11。
+
+需要原生编辑器新增表示的类别（表格、带链接图片、列表嵌套深度、H4+、列表起始号）已发方案给负责 `app-lite-gpui` 的会话，本会话不改 gpui。另外发现一个疑似产品缺陷，已转交该会话确认：原生模型允许列表缩进（depth 1），但 `codec.rs:664` 导出遇 depth≠0 返回 `UnsupportedListDepth`，导入也固定为 depth 0。canonical 的 `ListItem.style.indent` 已存在，可以直接映射。
+
+## 全库可读导出与恢复（区别于 SQLite 备份）
+
+依据：Evernote `main-readable/src/modules/11354__enex-exporter.js`（SHA256 见 03 号证据）的 `k()` 在读不到附件时只记日志、跳过该附件；本实现有意不同：任一资源缺失或字节不符都会中止导出或恢复。ENEX 不含笔记本组层级，这里的组/笔记本/标签/回收站/历史结构属于本项目独立设计。
+
+新增 `app-lite-core/src/import_export/library_readable_export.rs`：`export_library_readable`、`restore_library_readable`，格式 `app-lite-library-readable-export` v1，与原有选区格式 v2（`export_readable_selection`）并存，原格式不变。
+
+- 导出内容：`index.html`（按组 → 笔记本 → 笔记列出，另有回收站一节，显示标签）、`readable/<id>.html` 浏览页（资源用相对链接）、`notes/<id>.html` 规范正文、`history/<id>.json` 全部历史修订、`resources/<sha>--<id>--<名>` 原始字节、`manifest.json`（组、笔记本、标签、笔记与关系、正文/历史摘要、资源元数据、快捷方式）。
+- 不导出：同步身份、待发 outbox、未刷新的编辑日志（存在时拒绝导出，要求先 flush）、本机视图设置。
+- 恢复流程：先校验全部 ID、关系、资源哈希与大小、正文/历史摘要和规范性；在同级临时目录重建；做逐项核对以及 `integrity_check` 和外键检查；全部通过才移到目标空目录，失败时目标目录保持为空。
+- 为复用做的改动：`readable_export.rs` 中有界读取、防符号链接打开、哈希复制等 helper 改为 `pub(super)`；抽出 `open_bundle_root`；`write_html_escaped` 允许 `?Sized`。这些只是可见性和结构调整，行为不变，原选区导出的测试全部通过。
+
+实现中发现并修正的问题：
+1. 移动、打标签、移入回收站会递增 `notes.revision` 但不写历史行，所以历史修订号不连续。不变式改为：修订号严格递增，最后一条的标题和正文等于当前值，且修订号不超过当前修订号。
+2. 恢复时如果和资源 ID 重命名一起写 `deleted_time`，会先触发 `resource_filename_search_update` 插入搜索行，导致唯一约束冲突。改为先重命名，再单独写 `deleted_time`。夹具加了软删除资源和快捷方式；变异核验去掉单独写入这一步后，测试失败。
+
+测试：`tests/library_readable_export.rs` 共 2 项。
+- 全库往返：比较 10 张表的逻辑行（组、笔记本、标签及顺序、笔记含回收站、资源关系、历史、资源含软删除、blob、快捷方式），检查 outbox 为 0、恢复后能搜到。
+- 失败时关闭：目标已存在、恢复目标非空；篡改资源、正文、历史或版本号都会被拒绝，目标目录保持为空。
+
+先失败证据：接口不存在时编译失败（E0432）。core 全套 349 通过、0 失败，日志 `/tmp/joplin-stage2-claude/core-readable.log`。
+
+真实副本验证（隔离导入库，不是原库）：
+
+| 命令（`packages/app-lite-core`） | 结果 | 日志 |
+| --- | --- | --- |
+| `mkdir -p /tmp/joplin-stage2-import.GsdfVk/readable && cargo run -q --release --locked --example library_readable_verify -- /tmp/joplin-stage2-import.GsdfVk/imports/all_notebooks-1790457765 /tmp/joplin-stage2-import.GsdfVk/readable` | 退出0，总 114.8 s；导出 55.1 s、恢复 44.3 s；1666 笔记、4153 资源。stacks 2、notebooks 31、tags 64、note_tags 425、notes 1666、note_resources 4591、note_revisions 1666、resources 4153、resource_blobs 4127、shortcuts 0，**逐表逻辑行摘要全部相等**；恢复后 4153 个资源逐一读出重新哈希，全部一致 | `/tmp/joplin-stage2-import.GsdfVk/readable-verify.log` |
+
+日志中有一行 `restored_blob_dir_entries 0`，是探针自身的统计错误（blob 不在 `blobs/` 目录下），已从探针删除，不影响上面的表摘要和重新哈希结论。
+
+未完成：
+- 界面入口（“导出整个资料库为可读 HTML…”“从可读导出恢复到新资料库…”）属于 `app-lite-gpui`，已把 API 和建议文案发给负责会话，尚未接线。
+- 可读页面的浏览效果没有在浏览器里实际查看。
+- 导出期间没有取消接口；备份（`library_backup`）已有取消，这里还没有。
