@@ -77,6 +77,7 @@ pub(crate) enum FlushReason {
     Quit,
     Delete,
     ManualSync,
+    Export,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

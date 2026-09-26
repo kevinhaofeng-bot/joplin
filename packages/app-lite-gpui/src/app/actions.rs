@@ -10,6 +10,7 @@ gpui::actions!(
         CycleListViewMode,
         CycleSort,
         SyncCurrent,
+        ExportCurrentNote,
     ]
 );
 

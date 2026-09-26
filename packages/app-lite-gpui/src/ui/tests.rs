@@ -43,6 +43,22 @@ fn rich_document(text: &str) -> CanonicalDocument {
     }])
 }
 
+#[test]
+fn product_dependency_graph_retains_enex_resource_mime_and_filename() {
+    // This runs through velotype's Cargo root. A dependency-local Cargo patch
+    // alone would resolve the uncorrected registry parser in this graph.
+    let fixture = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        fixture.path(),
+        b"<en-export><note><title>x</title><resource><data encoding=\"base64\">YWJj</data><mime>application/pdf</mime><resource-attributes><file-name>evidence.pdf</file-name></resource-attributes></resource></note></en-export>",
+    )
+    .unwrap();
+    let report = app_lite_core::scan_enex_file(fixture.path()).unwrap();
+    assert_eq!(report.resources.len(), 1);
+    assert_eq!(report.resources[0].mime, "application/pdf");
+    assert_eq!(report.resources[0].filename, "evidence.pdf");
+}
+
 fn scale_document(index: usize, resource_ids: &[ResourceId]) -> CanonicalDocument {
     let body = format!("规模正文 {index:04} 不得由列表投影读取。").repeat(192);
     let mut blocks = vec![Block::Paragraph {
@@ -387,6 +403,564 @@ fn mount_shell_with_save_clock<'a>(
     cx.add_window_view(move |window, cx| {
         LibraryShell::new_with_save_clock(model, None, clock, window, cx)
     })
+}
+
+#[gpui::test]
+async fn mounted_readable_export_uses_captured_note_and_reports_real_bundle(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "私密标题不应成为默认路径".into(),
+            notebook_id: None,
+            document: rich_document("第一篇正文"),
+        })
+        .unwrap();
+    let second = repository
+        .create_note(CreateNote {
+            title: "另一篇".into(),
+            notebook_id: None,
+            document: rich_document("第二篇正文"),
+        })
+        .unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("captured-selection");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(first.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let menu_action = crate::library_menu::library_menu()
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            gpui::MenuItem::Action { name, action, .. } if name == "导出当前笔记…" => {
+                Some(action)
+            }
+            _ => None,
+        })
+        .expect("production native export menu action");
+    cx.update(|window, app| window.dispatch_action(menu_action, app));
+    cx.run_until_parked();
+    let token = view.read_with(cx, |shell, _| {
+        shell.pending_readable_export.as_ref().unwrap().token
+    });
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .contains("尚不存在")
+    }));
+    redraw(cx);
+    assert!(cx.debug_bounds("library-readable-export-status").is_some());
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_readable_export_picker(token, Ok(Some(destination.clone())), shell_cx);
+    });
+    cx.run_until_parked();
+    assert!(destination.join("index.html").exists());
+    assert!(destination.join("manifest.json").exists());
+    let status = view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .to_owned()
+    });
+    assert!(status.contains("1 篇笔记，0 个资源"), "{status}");
+    assert!(status.contains("不能代替全库备份"), "{status}");
+    let manifest = std::fs::read_to_string(destination.join("manifest.json")).unwrap();
+    assert!(manifest.contains(first.id.as_str()));
+    assert!(!manifest.contains(second.id.as_str()));
+}
+
+#[gpui::test]
+async fn mounted_readable_export_cancel_duplicate_and_switch_do_not_publish(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "导出 A".into(),
+            notebook_id: None,
+            document: rich_document("A 正文"),
+        })
+        .unwrap();
+    let second = repository
+        .create_note(CreateNote {
+            title: "导出 B".into(),
+            notebook_id: None,
+            document: rich_document("B 正文"),
+        })
+        .unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("should-not-exist");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(first.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.dispatch_action(ExportCurrentNote);
+    let first_token = view.read_with(cx, |shell, _| {
+        shell.pending_readable_export.as_ref().unwrap().token
+    });
+    cx.dispatch_action(ExportCurrentNote);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.next_readable_export_token),
+        first_token
+    );
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_readable_export_picker(first_token, Ok(None), shell_cx);
+    });
+    assert!(view.read_with(cx, |shell, _| shell.pending_readable_export.is_none()));
+    assert!(view.read_with(cx, |shell, _| shell.readable_export_notice.is_none()));
+    cx.dispatch_action(ExportCurrentNote);
+    let switched_token = view.read_with(cx, |shell, _| {
+        shell.pending_readable_export.as_ref().unwrap().token
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(second.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_readable_export_picker(
+            switched_token,
+            Ok(Some(destination.clone())),
+            shell_cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(!destination.exists());
+    assert!(view.read_with(cx, |shell, _| shell.pending_readable_export.is_none()));
+}
+
+#[gpui::test]
+async fn mounted_readable_export_save_failure_never_starts_job(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "保存失败".into(),
+            notebook_id: None,
+            document: rich_document("必须先保存"),
+        })
+        .unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("not-exported");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    session.update(cx, |session, _| {
+        session.force_save_failure_for_test("模拟写入失败")
+    });
+    cx.dispatch_action(ExportCurrentNote);
+    let status = view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .to_owned()
+    });
+    assert!(status.contains("模拟写入失败"), "{status}");
+    assert!(view.read_with(cx, |shell, _| shell.pending_readable_export.is_none()));
+    assert!(!destination.exists());
+}
+
+#[gpui::test]
+async fn mounted_readable_export_picker_completion_after_window_close_is_discarded(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "关闭窗口".into(),
+            notebook_id: None,
+            document: rich_document("不应迟到导出"),
+        })
+        .unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("stale-picker");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.dispatch_action(ExportCurrentNote);
+    let (window, token) = view.read_with(cx, |shell, _| {
+        let pending = shell.pending_readable_export.as_ref().unwrap();
+        (pending.window, pending.token)
+    });
+    assert!(cx.simulate_close());
+    cx.update(|window, _| window.remove_window());
+    let late_completion = cx.cx.update(|app| {
+        window.update(app, |shell, _, shell_cx| {
+            shell.complete_readable_export_picker(token, Ok(Some(destination.clone())), shell_cx);
+        })
+    });
+    assert!(late_completion.is_err());
+    assert!(!destination.exists());
+}
+
+#[gpui::test]
+async fn mounted_readable_export_waits_for_flush_then_picker_and_rechecks_new_edits(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "等待保存".into(),
+            notebook_id: None,
+            document: rich_document("初始正文"),
+        })
+        .unwrap();
+    let clock = Arc::new(ManualSaveClock::default());
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("after-two-saves");
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    let first_release = session.update(cx, |session, _| {
+        session.enable_deadline_tasks_for_test();
+        session.stall_next_background_save_for_test()
+    });
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 第一段");
+    cx.dispatch_action(ExportCurrentNote);
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .contains("等待")
+    }));
+    assert!(!destination.exists());
+    first_release.send(()).unwrap();
+    cx.run_until_parked();
+    let token = view.read_with(cx, |shell, _| {
+        shell.pending_readable_export.as_ref().unwrap().token
+    });
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .contains("尚不存在")
+    }));
+
+    let second_release = session.update(cx, |session, _| {
+        session.stall_next_background_save_for_test()
+    });
+    redraw(cx);
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 第二段");
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_readable_export_picker(token, Ok(Some(destination.clone())), shell_cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        !destination.exists(),
+        "the second edit must flush before export starts"
+    );
+    second_release.send(()).unwrap();
+    cx.run_until_parked();
+    let manifest = std::fs::read_to_string(destination.join("manifest.json")).unwrap();
+    assert!(
+        manifest.contains("第一段"),
+        "first edit missing from export"
+    );
+    assert!(
+        manifest.contains("第二段"),
+        "picker-period edit missing from export"
+    );
+}
+
+#[gpui::test]
+async fn mounted_readable_export_existing_target_and_tagged_note_report_limits(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "范围限制".into(),
+            notebook_id: None,
+            document: rich_document("保留原样"),
+        })
+        .unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let existing = output.path().join("existing");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("sentinel"), b"do not change").unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.dispatch_action(ExportCurrentNote);
+    let first = view.read_with(cx, |shell, _| {
+        shell.pending_readable_export.as_ref().unwrap().token
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_readable_export_picker(first, Ok(Some(existing.clone())), shell_cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read(existing.join("sentinel")).unwrap(),
+        b"do not change"
+    );
+    let existing_status = view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .to_owned()
+    });
+    assert!(existing_status.contains("已存在"), "{existing_status}");
+
+    let tag = repository.create_tag("不要剥离标签").unwrap();
+    repository
+        .set_note_tags(&note.id, &[tag.id.clone()])
+        .unwrap();
+    cx.dispatch_action(ExportCurrentNote);
+    let second = view.read_with(cx, |shell, _| {
+        shell.pending_readable_export.as_ref().unwrap().token
+    });
+    let rejected = output.path().join("tagged-rejected");
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_readable_export_picker(second, Ok(Some(rejected.clone())), shell_cx);
+    });
+    cx.run_until_parked();
+    assert!(!rejected.exists());
+    let tagged_status = view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .to_owned()
+    });
+    assert!(tagged_status.contains("未加标签"), "{tagged_status}");
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().tag_ids,
+        vec![tag.id]
+    );
+}
+
+#[gpui::test]
+async fn mounted_readable_export_waits_for_queued_image_commit(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "资源边界".into(),
+            notebook_id: None,
+            document: rich_document("正文"),
+        })
+        .unwrap();
+    let image_path = profile.path().join("queued-image.png");
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .unwrap()
+        .bytes;
+    std::fs::write(&image_path, bytes).unwrap();
+    let clock = Arc::new(ManualSaveClock::default());
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("with-queued-image");
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    let release = session.update(cx, |session, _| {
+        session.enable_deadline_tasks_for_test();
+        session.stall_next_background_save_for_test()
+    });
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(" 等待图片");
+    let saved_drop_point = session
+        .update(cx, |session, session_cx| {
+            session.capture_resource_insert_intent(session_cx)
+        })
+        .unwrap();
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .complete_resource_drop_paths(
+                    vec![image_path.clone()],
+                    saved_drop_point,
+                    window,
+                    shell_cx,
+                )
+                .unwrap();
+        });
+    });
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.queued_resource_inserts.len()),
+        1
+    );
+    cx.dispatch_action(ExportCurrentNote);
+    assert!(!destination.exists());
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.queued_resource_inserts.len()),
+        0
+    );
+    let token = view.read_with(cx, |shell, _| {
+        shell.pending_readable_export.as_ref().unwrap().token
+    });
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .contains("尚不存在")
+    }));
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_readable_export_picker(token, Ok(Some(destination.clone())), shell_cx);
+    });
+    cx.run_until_parked();
+    let manifest = std::fs::read_to_string(destination.join("manifest.json")).unwrap();
+    assert!(manifest.contains("等待图片"));
+    let status = view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .to_owned()
+    });
+    assert!(status.contains("1 个资源"), "{status}");
+}
+
+#[gpui::test]
+async fn mounted_readable_export_cancels_picker_after_resource_staging_failure(
+    cx: &mut TestAppContext,
+) {
+    let (profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "暂存失败".into(),
+            notebook_id: None,
+            document: rich_document("正文保持原样"),
+        })
+        .unwrap();
+    let image_path = profile.path().join("vanishing-image.png");
+    let bytes = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .unwrap()
+        .bytes;
+    std::fs::write(&image_path, bytes).unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("must-not-exist");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.dispatch_action(ExportCurrentNote);
+    let token = view.read_with(cx, |shell, _| {
+        shell.pending_readable_export.as_ref().unwrap().token
+    });
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    let release = session.update(cx, |session, _| {
+        session.stall_next_resource_stage_for_test()
+    });
+    let saved_point = session
+        .update(cx, |session, session_cx| {
+            session.capture_resource_insert_intent(session_cx)
+        })
+        .unwrap();
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .complete_resource_drop_paths(
+                    vec![image_path.clone()],
+                    saved_point,
+                    window,
+                    shell_cx,
+                )
+                .unwrap();
+        });
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |shell, _| shell.pending_readable_export.is_some()));
+    std::fs::remove_file(&image_path).unwrap();
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    let status = view.read_with(cx, |shell, _| {
+        shell
+            .readable_export_notice
+            .as_ref()
+            .unwrap()
+            .message()
+            .to_owned()
+    });
+    assert!(status.contains("资源保存失败"), "{status}");
+    assert!(view.read_with(cx, |shell, _| shell.pending_readable_export.is_none()));
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_readable_export_picker(token, Ok(Some(destination.clone())), shell_cx);
+    });
+    cx.run_until_parked();
+    assert!(!destination.exists());
+    assert!(
+        repository
+            .load_note(&note.id)
+            .unwrap()
+            .unwrap()
+            .resource_ids
+            .is_empty()
+    );
 }
 
 #[gpui::test]
@@ -4752,6 +5326,13 @@ async fn mounted_library_chrome_insert_image_event_uses_the_saved_selection_dura
         view.read_with(cx, |shell, _| shell.pending_resource_insert.is_some()),
         "the typed Chrome event must synchronously capture the LibraryShell saved Selection before presenting a picker"
     );
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell
+            .resource_picker_presentations_for_test
+            .load(Ordering::Relaxed)),
+        1,
+        "the Chrome dispatch must hand the saved picker request to the platform presenter"
+    );
 
     cx.update(|window, app| {
         view.update(app, |shell, shell_cx| {
@@ -4780,6 +5361,90 @@ async fn mounted_library_chrome_insert_image_event_uses_the_saved_selection_dura
         persisted.body_html.contains("<img"),
         "the staged durable snapshot must contain the inserted image atom"
     );
+}
+
+#[gpui::test]
+async fn mounted_library_insert_resource_button_presents_and_cancel_discards_its_request(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "顶栏资源选择".into(),
+            notebook_id: None,
+            document: rich_document("正文"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+
+    let button = cx
+        .debug_bounds("library-insert-resource")
+        .expect("library insert resource button");
+    cx.simulate_click(button.center(), Modifiers::default());
+    redraw(cx);
+    let token = view.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell
+                .resource_picker_presentations_for_test
+                .load(Ordering::Relaxed),
+            1,
+            "the library button must present the native picker"
+        );
+        shell
+            .pending_resource_insert
+            .as_ref()
+            .expect("pending picker")
+            .token
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.cancel_resource_picker(token, shell_cx)
+    });
+    view.read_with(cx, |shell, _| {
+        assert!(shell.pending_resource_insert.is_none());
+        assert!(shell.resource_notice.is_none());
+    });
+
+    cx.simulate_click(button.center(), Modifiers::default());
+    redraw(cx);
+    let failed_token = view.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell
+                .resource_picker_presentations_for_test
+                .load(Ordering::Relaxed),
+            2
+        );
+        shell
+            .pending_resource_insert
+            .as_ref()
+            .expect("second picker")
+            .token
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.finish_resource_picker_prompt(
+                failed_token,
+                ResourcePickerCompletion::Failed("面板不可用".to_owned()),
+                window,
+                shell_cx,
+            )
+        });
+    });
+    view.read_with(cx, |shell, _| {
+        assert!(shell.pending_resource_insert.is_none());
+        assert_eq!(
+            shell.resource_notice.as_deref(),
+            Some("资源未插入：面板不可用")
+        );
+    });
 }
 
 #[gpui::test]

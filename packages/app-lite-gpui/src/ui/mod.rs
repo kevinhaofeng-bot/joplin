@@ -1,18 +1,20 @@
 mod card_thumbnail;
 pub mod note_card;
 pub mod note_list;
+mod readable_export;
 pub mod sidebar;
 
 use self::card_thumbnail::{
     CARD_THUMBNAIL_CACHE_BUDGET, CARD_THUMBNAIL_PROXY_EDGE, CardThumbnailManager,
 };
+use self::readable_export::{ExportNotice, PendingReadableExport};
 #[cfg(test)]
 use crate::app::note_session::AttachmentOpener;
 use crate::app::note_session::{InsertIntent, NoteSession, ResourceImportRequest};
 use crate::app::save_coordinator::{FlushReason, SaveState, SystemSaveClock};
 use crate::app::{
-    AppAction, AppModel, AppStatus, CreateNote, CycleListViewMode, CycleSort, ListViewMode,
-    NoteSort, SyncCurrent, ToggleNoteList, ToggleSidebar, TrashSelected,
+    AppAction, AppModel, AppStatus, CreateNote, CycleListViewMode, CycleSort, ExportCurrentNote,
+    ListViewMode, NoteSort, SyncCurrent, ToggleNoteList, ToggleSidebar, TrashSelected,
 };
 use crate::components::Paste;
 use crate::native_editor::chrome::{EVERNOTE_GREEN, TitleInput};
@@ -263,6 +265,14 @@ struct PendingResourcePicker {
 struct ResourcePickerPrompt {
     window: WindowHandle<LibraryShell>,
     token: ResourcePickerToken,
+    #[cfg(test)]
+    presentation_count: Arc<AtomicUsize>,
+}
+
+enum ResourcePickerCompletion {
+    Selected(PathBuf),
+    Cancelled,
+    Failed(String),
 }
 
 /// A real platform completion whose saved document point must survive a
@@ -502,6 +512,8 @@ pub struct LibraryShell {
     /// never an arbitrary caret that may have moved while the picker owned
     /// focus.
     pending_resource_insert: Option<PendingResourcePicker>,
+    #[cfg(test)]
+    resource_picker_presentations_for_test: Arc<AtomicUsize>,
     /// A native picker can complete after a committed organization action has
     /// frozen the retained session.  Its old tracked selection was discarded
     /// at the lock transition; retain only this one-shot reason so the late
@@ -520,6 +532,9 @@ pub struct LibraryShell {
     /// successful boundary, whereas this transient blocker clears on the
     /// completion-confirmed Clean transition.
     save_pending: bool,
+    pending_readable_export: Option<PendingReadableExport>,
+    next_readable_export_token: u64,
+    readable_export_notice: Option<ExportNotice>,
     startup_notice: Option<String>,
     save_clock: Arc<dyn crate::app::save_coordinator::SaveClock>,
     focus_handle: FocusHandle,
@@ -931,6 +946,7 @@ impl LibraryShell {
             shell.pending_destructive_action = None;
             shell.toolbar_more_open = false;
             shell.sync_editor_surface(cx);
+            shell.cancel_readable_export_after_note_change(cx);
             shell.scroll_selected_into_view(cx);
             cx.notify();
         });
@@ -1024,6 +1040,8 @@ impl LibraryShell {
             surface_note_id: None,
             remount_current_surface_after_organization_commit: false,
             pending_resource_insert: None,
+            #[cfg(test)]
+            resource_picker_presentations_for_test: Arc::new(AtomicUsize::new(0)),
             last_resource_picker_cancelled_by_reconciliation: None,
             next_resource_picker_token: 1,
             queued_resource_inserts: VecDeque::new(),
@@ -1033,6 +1051,9 @@ impl LibraryShell {
             unsupported_document: None,
             save_error: None,
             save_pending: false,
+            pending_readable_export: None,
+            next_readable_export_token: 0,
+            readable_export_notice: None,
             startup_notice,
             save_clock,
             focus_handle,
@@ -2429,6 +2450,7 @@ impl LibraryShell {
                         // retained-session notification. The queued intent is
                         // the original saved DocPoint, never the live caret.
                         shell.schedule_queued_resource_completion(cx);
+                        shell.advance_readable_export_after_session_notification(cx);
                         // A native menu/Cmd-Q request may have started this
                         // session's exact background snapshot. Defer the
                         // cross-window completion check until this entity
@@ -2659,6 +2681,7 @@ impl LibraryShell {
             }
             Err(error) => {
                 self.resource_notice = Some(format!("资源未插入：{error}"));
+                self.abort_readable_export_for_resource_failure(&error.to_string(), cx);
             }
         }
     }
@@ -2833,6 +2856,7 @@ impl LibraryShell {
             let _ = window.update(app, |shell, window, shell_cx| {
                 shell.resource_queue_completion_scheduled = false;
                 shell.complete_next_queued_resource(window, shell_cx);
+                shell.advance_readable_export_after_session_notification(shell_cx);
             });
         });
     }
@@ -2862,6 +2886,7 @@ impl LibraryShell {
             cx,
         ) {
             self.resource_notice = Some(format!("资源未插入：{error}"));
+            self.abort_readable_export_for_resource_failure(&error, cx);
             cx.notify();
         }
         self.schedule_queued_resource_completion(cx);
@@ -2884,7 +2909,12 @@ impl LibraryShell {
             .window_handle()
             .downcast::<LibraryShell>()
             .ok_or_else(|| "无法关联资源选择器到当前资料库窗口".to_owned())?;
-        Ok(ResourcePickerPrompt { window, token })
+        Ok(ResourcePickerPrompt {
+            window,
+            token,
+            #[cfg(test)]
+            presentation_count: Arc::clone(&self.resource_picker_presentations_for_test),
+        })
     }
 
     /// The shared Chrome already captured the selection before it emitted its
@@ -2903,7 +2933,12 @@ impl LibraryShell {
             .window_handle()
             .downcast::<LibraryShell>()
             .ok_or_else(|| "无法关联资源选择器到当前资料库窗口".to_owned())?;
-        Ok(ResourcePickerPrompt { window, token })
+        Ok(ResourcePickerPrompt {
+            window,
+            token,
+            #[cfg(test)]
+            presentation_count: Arc::clone(&self.resource_picker_presentations_for_test),
+        })
     }
 
     fn cancel_resource_picker(&mut self, token: ResourcePickerToken, cx: &mut Context<Self>) {
@@ -2917,6 +2952,31 @@ impl LibraryShell {
             Self::discard_resource_insert_intent(session, pending.intent, cx);
         }
         cx.notify();
+    }
+
+    fn finish_resource_picker_prompt(
+        &mut self,
+        token: ResourcePickerToken,
+        completion: ResourcePickerCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match completion {
+            ResourcePickerCompletion::Selected(path) => {
+                if let Err(error) =
+                    self.complete_resource_picker_path_for_token(token, path, window, cx)
+                {
+                    self.resource_notice = Some(format!("资源未插入：{error}"));
+                    cx.notify();
+                }
+            }
+            ResourcePickerCompletion::Cancelled => self.cancel_resource_picker(token, cx),
+            ResourcePickerCompletion::Failed(error) => {
+                self.cancel_resource_picker(token, cx);
+                self.resource_notice = Some(format!("资源未插入：{error}"));
+                cx.notify();
+            }
+        }
     }
 
     /// Native `Paste` is intentionally handled by the library shell, not by
@@ -6243,62 +6303,74 @@ impl LibraryShell {
 /// strongly, so closing a window while the panel is open simply discards its
 /// eventual completion.
 fn prompt_for_resource_path(prompt_request: ResourcePickerPrompt, cx: &mut App) {
-    let ResourcePickerPrompt {
-        window: window_handle,
-        token,
-    } = prompt_request;
-    let prompt = cx.prompt_for_paths(PathPromptOptions {
-        files: true,
-        directories: false,
-        multiple: false,
-        prompt: Some("插入图片或附件".into()),
-    });
-    cx.spawn(async move |cx| {
-        let completion = match prompt.await {
-            Ok(Ok(Some(paths))) => paths.into_iter().next(),
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
-        };
-        let _ = cx.update(move |app| {
-            let _ = window_handle.update(app, |shell, window, shell_cx| {
-                if let Some(path) = completion {
-                    if let Err(error) =
-                        shell.complete_resource_picker_path_for_token(token, path, window, shell_cx)
-                    {
-                        shell.resource_notice = Some(format!("资源未插入：{error}"));
-                        shell_cx.notify();
-                    }
-                } else {
-                    shell.cancel_resource_picker(token, shell_cx);
-                }
-            });
+    #[cfg(test)]
+    {
+        prompt_request
+            .presentation_count
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = (prompt_request.window, prompt_request.token);
+        let _ = cx;
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let ResourcePickerPrompt {
+            window: window_handle,
+            token,
+        } = prompt_request;
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("插入图片或附件".into()),
         });
-    })
-    .detach();
+        cx.spawn(async move |cx| {
+            let completion = match prompt.await {
+                Ok(Ok(Some(paths))) => paths
+                    .into_iter()
+                    .next()
+                    .map(ResourcePickerCompletion::Selected)
+                    .unwrap_or(ResourcePickerCompletion::Cancelled),
+                Ok(Ok(None)) => ResourcePickerCompletion::Cancelled,
+                Ok(Err(error)) => ResourcePickerCompletion::Failed(error.to_string()),
+                Err(error) => ResourcePickerCompletion::Failed(error.to_string()),
+            };
+            let _ = cx.update(move |app| {
+                let _ = window_handle.update(app, |shell, window, shell_cx| {
+                    shell.finish_resource_picker_prompt(token, completion, window, shell_cx);
+                });
+            });
+        })
+        .detach();
+    }
 }
 
 /// The shared command Chrome only emits an intent; the library owns the
 /// platform picker and its Task-5 saved-selection/durable-import policy.
 ///
-/// The typed event is emitted first by `EditorCommandChrome`. Its retained
-/// subscription captures the current `InsertIntent` synchronously, then this
-/// host adapter opens the native panel. Tests intentionally exercise the
-/// completion seam rather than an operating-system panel, so the test build
-/// leaves panel presentation to the injected completion path.
+/// `EditorCommandChrome` queues its typed event before calling this adapter.
+/// Defer the window lookup until that event has captured the `InsertIntent`
+/// and the current window update has returned to GPUI.
 fn dispatch_library_resource_picker(window: AnyWindowHandle, cx: &mut App) {
-    #[cfg(not(test))]
-    if let Some(window) = window.downcast::<LibraryShell>() {
-        let prompt = window.update(cx, |shell, window, _| {
+    cx.defer(move |app| {
+        let Some(window) = window.downcast::<LibraryShell>() else {
+            return;
+        };
+        match window.update(app, |shell, window, _| {
             shell.pending_resource_picker_prompt(window)
-        });
-        if let Ok(Ok(prompt)) = prompt {
-            prompt_for_resource_path(prompt, cx);
+        }) {
+            Ok(Ok(prompt)) => prompt_for_resource_path(prompt, app),
+            Ok(Err(error)) => {
+                let _ = window.update(app, |shell, _, shell_cx| {
+                    if shell.resource_notice.is_none() {
+                        shell.resource_notice = Some(format!("资源未插入：{error}"));
+                        shell_cx.notify();
+                    }
+                });
+            }
+            Err(_) => {} // The window may have closed before the queued request.
         }
-    }
-
-    #[cfg(test)]
-    {
-        let _ = (window, cx);
-    }
+    });
 }
 
 /// AppKit's image paste bridge may create a private temporary file. It is not
@@ -6449,6 +6521,7 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::cycle_list_view_mode))
             .on_action(cx.listener(Self::cycle_sort))
             .on_action(cx.listener(Self::sync_current))
+            .on_action(cx.listener(Self::export_current_note))
             .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_find_in_note))
             .on_action(cx.listener(Self::find_next_in_note))
@@ -6546,6 +6619,22 @@ impl Render for LibraryShell {
                 .text_size(px(11.0))
                 .text_color(rgba(0xa34838ff))
                 .child(notice.clone())
+        }))
+        .children(self.readable_export_notice.as_ref().map(|notice| {
+            div()
+                .id("library-readable-export-status")
+                .debug_selector(|| "library-readable-export-status".to_owned())
+                .absolute()
+                .bottom(px(130.0))
+                .right(px(14.0))
+                .max_w(px(560.0))
+                .text_size(px(11.0))
+                .text_color(if notice.is_error() {
+                    rgba(0xa34838ff)
+                } else {
+                    rgba(0x536f59ff)
+                })
+                .child(notice.message().to_owned())
         }))
         .children(self.history_search_notice.as_ref().map(|notice| {
             let retry_available = self.search_refresh_retry_available;

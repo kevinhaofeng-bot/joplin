@@ -26,10 +26,7 @@ sha2 = "0.10"
 tar = "0.4"
 thiserror = "2"
 tempfile = "3"
-xml-syntax-reader = "0.2"
+xml-syntax-reader = { path = "vendor/xml-syntax-reader-0.2.0" }
 
 [dev-dependencies]
 tempfile = "3"
-
-[patch.crates-io]
-xml-syntax-reader = { path = "vendor/xml-syntax-reader-0.2.0" }

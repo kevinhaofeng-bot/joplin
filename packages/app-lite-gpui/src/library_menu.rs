@@ -7,8 +7,8 @@
 
 use crate::app::save_coordinator::FlushReason;
 use crate::app::{
-    CreateNote, CycleListViewMode, CycleSort, SyncCurrent, ToggleNoteList, ToggleSidebar,
-    TrashSelected,
+    CreateNote, CycleListViewMode, CycleSort, ExportCurrentNote, SyncCurrent, ToggleNoteList,
+    ToggleSidebar, TrashSelected,
 };
 use crate::components::QuitApplication;
 use crate::file_url::parse_file_url;
@@ -131,7 +131,7 @@ pub(crate) fn init(cx: &mut App, profile: PathBuf, open_url_receiver: Receiver<V
     cx.global_mut::<LibraryMenuLifecycle>().open_url_task = Some(task);
 }
 
-fn library_menu() -> Menu {
+pub(crate) fn library_menu() -> Menu {
     Menu {
         name: "Joplin Lite".into(),
         items: vec![
@@ -143,6 +143,7 @@ fn library_menu() -> Menu {
             MenuItem::action("切换列表视图", CycleListViewMode),
             MenuItem::action("切换排序", CycleSort),
             MenuItem::action("保存当前笔记", SyncCurrent),
+            MenuItem::action("导出当前笔记…", ExportCurrentNote),
             MenuItem::separator(),
             MenuItem::action("退出 Joplin Lite", QuitApplication),
         ],
@@ -349,6 +350,19 @@ mod tests {
                 item,
                 gpui::MenuItem::Action { name, action, .. }
                     if name == "退出 Joplin Lite" && action.as_any().is::<QuitApplication>()
+            )
+        }));
+    }
+
+    #[test]
+    fn visible_library_export_menu_dispatches_the_library_action() {
+        let menu = library_menu();
+        assert!(menu.items.iter().any(|item| {
+            matches!(
+                item,
+                gpui::MenuItem::Action { name, action, .. }
+                    if name == "导出当前笔记…"
+                        && action.as_any().is::<crate::app::ExportCurrentNote>()
             )
         }));
     }

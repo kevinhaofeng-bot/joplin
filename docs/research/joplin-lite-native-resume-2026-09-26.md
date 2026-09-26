@@ -2,6 +2,8 @@
 
 用户「继续推进」已解除 2026-09-13 的暂停。旧暂停交底保留为历史现场；本记录是后续进展入口。
 
+最新入口验收见 [原生导出与图片修复记录](native-export-ui-acceptance-2026-09-26.md)：实机导出 1 篇/2 资源、取消与重开通过，图片按钮修复通过实机；浏览器本地文件受工具策略阻止，未绕过，未标为验收。全套测试 SIGSEGV 正在独立定位，不能声称整款产品完成。
+
 ## 基线与本轮范围
 
 - 工作树：`/Users/kevinhao/Projects/joplin/.worktrees/joplin-lite-native-rust-mvp`，分支 `codex/joplin-lite-native-rust`，恢复时 HEAD `a338ae328`。
