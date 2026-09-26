@@ -79,6 +79,7 @@ fn scale_document(index: usize, resource_ids: &[ResourceId]) -> CanonicalDocumen
                     natural_size: Some((16, 12)),
                     display_width: Some(16),
                 },
+                link: None,
             }),
     );
     CanonicalDocument::from_blocks(blocks)
@@ -2500,6 +2501,7 @@ async fn mounted_typed_sidebar_routes_use_durable_ids_without_hydrating_cards(
                 resource_id: cover,
                 alt: "卡片缩略图只应作为 projection key".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create scoped note");
@@ -4438,6 +4440,7 @@ async fn mounted_trash_legacy_image_hydrates_for_presentation_without_repairing_
                 resource_id: image,
                 alt: "vertical".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create legacy image note");
@@ -6566,6 +6569,7 @@ async fn mounted_persisted_images_paint_before_only_visible_blob_hydrates(cx: &m
                     resource_id: first.clone(),
                     alt: "首屏".into(),
                     presentation: Default::default(),
+                    link: None,
                 },
                 Block::Paragraph {
                     style: BlockStyle::default(),
@@ -6578,6 +6582,7 @@ async fn mounted_persisted_images_paint_before_only_visible_blob_hydrates(cx: &m
                     resource_id: second.clone(),
                     alt: "远处".into(),
                     presentation: Default::default(),
+                    link: None,
                 },
             ]),
         })
@@ -6667,6 +6672,7 @@ async fn mounted_missing_persisted_image_fails_only_after_paint_and_keeps_the_no
                     resource_id: resource.clone(),
                     alt: "丢失的图片".into(),
                     presentation: Default::default(),
+                    link: None,
                 },
                 Block::Paragraph {
                     style: BlockStyle::default(),
@@ -6845,6 +6851,7 @@ async fn mounted_text_image_text_uses_surface_keys_for_atomic_boundaries_and_his
                     resource_id: image_id.clone(),
                     alt: "边界图".into(),
                     presentation: Default::default(),
+                    link: None,
                 },
                 Block::Paragraph {
                     style: BlockStyle::default(),
@@ -8208,6 +8215,7 @@ async fn selecting_an_unsupported_resource_note_never_reads_blob_bytes(cx: &mut 
                     resource_id: image,
                     alt: "unsupported indent prevents decode".into(),
                     display_width: None,
+                    link: None,
                 }],
             }]),
         })
@@ -8252,6 +8260,7 @@ async fn mounted_list_inline_photo_hydrates_at_real_size_without_reopen_or_save(
                             resource_id: image.clone(),
                             alt: "photo".into(),
                             display_width: None,
+                            link: None,
                         },
                         Inline::Text {
                             text: "图后".into(),
@@ -8345,6 +8354,7 @@ async fn switching_to_an_unsupported_body_removes_the_previous_native_surface(
                     resource_id: image,
                     alt: "Task 5 image".into(),
                     display_width: None,
+                    link: None,
                 }],
             }]),
         })

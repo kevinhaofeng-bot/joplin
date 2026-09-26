@@ -152,6 +152,8 @@ pub enum BlockContent {
         natural_size_known: bool,
         natural_size: (u32, u32),
         display_width: Option<u32>,
+        /// Canonical `<a href>` around the image, carried through unchanged.
+        link: Option<String>,
     },
     Attachment {
         resource_id: String,
@@ -427,6 +429,7 @@ impl StructuralInsert {
                     natural_size_known: true,
                     natural_size: *natural_size,
                     display_width: None,
+                    link: None,
                 },
             ),
             Self::Attachment {

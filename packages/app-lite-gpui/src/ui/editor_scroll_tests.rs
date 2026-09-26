@@ -446,6 +446,7 @@ async fn mounted_long_image_before_pdf_has_a_scrollable_editor_viewport_and_page
                         natural_size: Some((1218, 2494)),
                         display_width: None,
                     },
+                    link: None,
                 },
                 Block::Attachment {
                     resource_id: pdf_id,

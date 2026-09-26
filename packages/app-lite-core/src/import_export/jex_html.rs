@@ -379,6 +379,7 @@ impl Context<'_> {
             resource_id: resource.destination_id,
             alt: element.attrs.get("alt").cloned().unwrap_or_default(),
             display_width,
+            link: None,
         })
     }
 
@@ -671,6 +672,7 @@ impl Context<'_> {
                     resource_id,
                     alt,
                     display_width,
+                    link,
                 } = image
                 {
                     Ok(Block::Image {
@@ -680,6 +682,7 @@ impl Context<'_> {
                             display_width,
                             ..ImagePresentation::default()
                         },
+                        link,
                     })
                 } else {
                     unreachable!()

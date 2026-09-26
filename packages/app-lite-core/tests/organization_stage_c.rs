@@ -52,6 +52,7 @@ fn image_document(resource_ids: &[app_lite_core::ResourceId]) -> CanonicalDocume
                 resource_id: resource_id.clone(),
                 alt: format!("resource-{position}"),
                 display_width: None,
+                link: None,
             })
             .collect(),
     }])

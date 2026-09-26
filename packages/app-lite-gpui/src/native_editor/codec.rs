@@ -154,6 +154,7 @@ pub fn import_canonical_with_resources(
                             resource_id,
                             alt,
                             display_width,
+                            link,
                         } = inline
                         {
                             ensure_resource(resource_id, available_resources, block_index)?;
@@ -182,6 +183,7 @@ pub fn import_canonical_with_resources(
                                     natural_size_known: false,
                                     natural_size: (1024, 768),
                                     display_width: *display_width,
+                                    link: link.clone(),
                                 },
                                 alignment: match style.alignment {
                                     Alignment::Left => TextAlignment::Left,
@@ -346,6 +348,7 @@ pub fn import_canonical_with_resources(
                 resource_id,
                 alt,
                 presentation,
+                link,
             } => {
                 ensure_resource(resource_id, available_resources, block_index)?;
                 native.push(Block {
@@ -360,6 +363,7 @@ pub fn import_canonical_with_resources(
                         natural_size_known: presentation.natural_size.is_some(),
                         natural_size: presentation.natural_size.unwrap_or((1024, 768)),
                         display_width: presentation.display_width,
+                        link: link.clone(),
                     },
                     alignment: TextAlignment::Left,
                     revision: 0,
@@ -451,6 +455,7 @@ fn push_inline_group(
                 resource_id,
                 alt,
                 display_width,
+                link,
             } => {
                 ensure_resource(resource_id, available_resources, block_index)?;
                 let id = next_node_id(next_id);
@@ -468,6 +473,7 @@ fn push_inline_group(
                         natural_size_known: false,
                         natural_size: (1024, 768),
                         display_width: *display_width,
+                        link: link.clone(),
                     },
                     alignment: TextAlignment::Left,
                     revision: 0,
@@ -569,6 +575,7 @@ pub fn export_canonical_with_resources(
                         resource_id,
                         alt,
                         display_width,
+                        link,
                         ..
                     } => {
                         inlines.push(Inline::Image {
@@ -579,6 +586,7 @@ pub fn export_canonical_with_resources(
                             )?,
                             alt: alt.clone(),
                             display_width: *display_width,
+                            link: link.clone(),
                         });
                     }
                     BlockContent::Attachment {
@@ -726,6 +734,7 @@ pub fn export_canonical_with_resources(
                     natural_size_known,
                     natural_size,
                     display_width,
+                    link,
                 } = &block.content
                 else {
                     return Err(CanonicalExportError::InvalidTextContent { block_index });
@@ -739,6 +748,7 @@ pub fn export_canonical_with_resources(
                         natural_size: (*natural_size_known).then_some(*natural_size),
                         display_width: *display_width,
                     },
+                    link: link.clone(),
                 });
             }
             BlockKind::Attachment => {
@@ -1197,6 +1207,7 @@ mod tests {
                     .expect("valid resource id"),
                 alt: "尚未支持的图片".into(),
                 display_width: None,
+                link: None,
             }],
         }]);
         let imported = import_canonical(&image).expect("legacy inline image must open");
@@ -1228,6 +1239,7 @@ mod tests {
             resource_id: resource.clone(),
             alt: "图".into(),
             display_width: None,
+            link: None,
         };
         let text = |value: &str| Inline::Text {
             text: value.into(),
@@ -1411,6 +1423,41 @@ mod tests {
             });
         assert_eq!(width, Some(Some(320)));
         assert_eq!(super::export_canonical(&reopened).unwrap(), exported);
+    }
+
+    #[test]
+    fn linked_images_keep_their_link_through_open_resize_and_save() {
+        use crate::native_editor::transaction::Transaction;
+        let html = "<ul><li>图前<a href=\"https://example.com/a\"><img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\"></a>图后</li></ul><a href=\"https://example.com/b\"><img data-joplin-lite-block-image=\"true\" src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\"></a>";
+        let canonical = CanonicalDocument::parse_html(html).unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap(), canonical);
+        let images: Vec<_> = document
+            .blocks()
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::Image))
+            .map(|block| block.id)
+            .collect();
+        for node_id in images {
+            document
+                .apply(Transaction::SetImageDisplayWidth {
+                    node_id,
+                    display_width: Some(200),
+                })
+                .unwrap();
+        }
+        let html = super::export_canonical(&document)
+            .unwrap()
+            .to_canonical_html();
+        assert!(
+            html.as_str()
+                .contains("<a href=\"https://example.com/a\"><img src=")
+                && html.as_str().contains(
+                    "<a href=\"https://example.com/b\"><img data-joplin-lite-block-image"
+                ),
+            "{}",
+            html.as_str()
+        );
     }
 
     #[test]
@@ -1812,6 +1859,7 @@ mod tests {
                 resource_id: resource_id.clone(),
                 alt: "截图.png".into(),
                 presentation: ImagePresentation::default(),
+                link: None,
             },
             CanonicalBlock::Attachment {
                 resource_id: resource_id.clone(),
@@ -1865,6 +1913,7 @@ mod tests {
                 natural_size: Some((4032, 3024)),
                 display_width: Some(960),
             },
+            link: None,
         }]);
 
         let imported = import_canonical_with_resources(&canonical, &[resource_id.clone()])
@@ -1892,6 +1941,7 @@ mod tests {
             resource_id: resource_id.clone(),
             alt: "不能偷偷导入".into(),
             presentation: ImagePresentation::default(),
+            link: None,
         }]);
         assert!(matches!(
             import_canonical_with_resources(&document, &[]),

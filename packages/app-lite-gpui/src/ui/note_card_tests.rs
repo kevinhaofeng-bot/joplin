@@ -73,6 +73,7 @@ fn card_document(snippet: &str, thumbnail: Option<ResourceId>) -> CanonicalDocum
             resource_id,
             alt: "卡片封面".into(),
             presentation: Default::default(),
+            link: None,
         });
     }
     CanonicalDocument::from_blocks(blocks)
@@ -493,6 +494,7 @@ async fn mounted_cards_materialize_only_the_uniform_list_visible_thumbnail_set(
                     resource_id,
                     alt: "卡片缩略图".into(),
                     presentation: Default::default(),
+                    link: None,
                 }]),
             })
             .expect("create covered note");
@@ -586,6 +588,7 @@ async fn mounted_cards_scrolled_tail_does_not_schedule_the_measurement_probe_thu
                     resource_id,
                     alt: "卡片缩略图".into(),
                     presentation: Default::default(),
+                    link: None,
                 }]),
             })
             .expect("create tail card note");
@@ -666,6 +669,7 @@ async fn mounted_cards_uniform_list_reuses_bounded_a_proxy_after_viewport_b_roun
                 resource_id: thumbnail_a.clone(),
                 alt: "A 封面".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create A card");
@@ -694,6 +698,7 @@ async fn mounted_cards_uniform_list_reuses_bounded_a_proxy_after_viewport_b_roun
                 resource_id: thumbnail_b.clone(),
                 alt: "B 封面".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create B card");
@@ -929,6 +934,7 @@ async fn mounted_cards_stable_viewport_reaches_idle_without_reinstalling_thumbna
                 resource_id: thumbnail_id,
                 alt: "稳定卡片封面".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create covered note");
@@ -1035,6 +1041,7 @@ async fn mounted_cards_render_selected_thumbnail_without_projection_body_or_blob
                 resource_id: thumbnail_id.clone(),
                 alt: "卡片封面".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create covered note");
@@ -1182,6 +1189,7 @@ async fn mounted_card_thumbnail_failure_is_visible_and_recovers_after_viewport_r
                 resource_id: thumbnail_id.clone(),
                 alt: "损坏封面".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create covered note");
@@ -1278,6 +1286,7 @@ async fn mounted_card_proxy_decode_failure_is_visible_instead_of_a_neutral_tile(
                 resource_id: thumbnail_id.clone(),
                 alt: "代理缓存封面".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create covered note");

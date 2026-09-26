@@ -31,6 +31,7 @@ fn with_image(prefix: &str, resource: app_lite_core::ResourceId) -> CanonicalDoc
                 resource_id: resource,
                 alt: "图".into(),
                 display_width: None,
+                link: None,
             },
         ],
     }])

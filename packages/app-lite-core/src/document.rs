@@ -120,6 +120,8 @@ pub enum Block {
         resource_id: ResourceId,
         alt: String,
         presentation: ImagePresentation,
+        /// Target of an enclosing `<a href>`; None for unlinked images.
+        link: Option<String>,
     },
     /// A resource-backed attachment card at block position.
     Attachment {
@@ -207,6 +209,8 @@ pub enum Inline {
         /// User-chosen display width, like `Block::Image`'s presentation;
         /// None for legacy HTML and untouched images.
         display_width: Option<u32>,
+        /// Target of an enclosing `<a href>`; None for unlinked images.
+        link: Option<String>,
     },
     /// A file card inside a heading/quote/list item. Block-level cards stay
     /// `Block::Attachment`; this keeps a card's position inside its parent.
@@ -324,7 +328,9 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                 resource_id,
                 alt,
                 presentation,
+                link,
             } => {
+                let link = open_image_link(link.as_deref(), &mut output);
                 output.push_str("<img data-joplin-lite-block-image=\"true\" src=\":/");
                 escape_attribute(resource_id.as_str(), &mut output);
                 output.push_str("\" alt=\"");
@@ -332,6 +338,9 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                 output.push('\"');
                 serialize_image_presentation(presentation, &mut output);
                 output.push('>');
+                if link {
+                    output.push_str("</a>");
+                }
             }
             Block::Attachment {
                 resource_id,
@@ -554,10 +563,12 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 resource_id,
                 alt,
                 presentation,
+                link,
             } => Block::Image {
                 resource_id,
                 alt,
                 presentation: normalize_image_presentation(presentation),
+                link: link.filter(|value| valid_link(value)),
             },
             Block::Attachment {
                 resource_id,
@@ -645,6 +656,17 @@ fn normalize_inlines(inlines: Vec<Inline>) -> Vec<Inline> {
                 }
                 append_normalized_text(&mut normalized, &current, &marks);
             }
+            Inline::Image {
+                resource_id,
+                alt,
+                display_width,
+                link,
+            } => normalized.push(Inline::Image {
+                resource_id,
+                alt,
+                display_width,
+                link: link.filter(|value| valid_link(value)),
+            }),
             other => normalized.push(other),
         }
     }
@@ -707,7 +729,9 @@ fn serialize_inlines(inlines: &[Inline], output: &mut String) {
                 resource_id,
                 alt,
                 display_width,
+                link,
             } => {
+                let link = open_image_link(link.as_deref(), output);
                 output.push_str("<img src=\":/");
                 escape_attribute(resource_id.as_str(), output);
                 output.push_str("\" alt=\"");
@@ -719,6 +743,9 @@ fn serialize_inlines(inlines: &[Inline], output: &mut String) {
                     output.push('\"');
                 }
                 output.push('>');
+                if link {
+                    output.push_str("</a>");
+                }
             }
             Inline::Attachment {
                 resource_id,
@@ -737,6 +764,18 @@ fn serialize_inlines(inlines: &[Inline], output: &mut String) {
             }
         }
     }
+}
+
+/// Writes `<a href>` for a safe image link and reports whether it must be
+/// closed after the `<img>`.
+fn open_image_link(link: Option<&str>, output: &mut String) -> bool {
+    let Some(link) = link.filter(|link| valid_link(link)) else {
+        return false;
+    };
+    output.push_str("<a href=\"");
+    escape_attribute(link, output);
+    output.push_str("\">");
+    true
 }
 
 fn serialize_text(
@@ -1335,7 +1374,7 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                         && attribute(&attrs.borrow(), "data-joplin-lite-block-image").as_deref()
                             == Some("true")
                     {
-                        projection.block_image(&attrs.borrow());
+                        projection.block_image(&attrs.borrow(), &marks);
                         continue;
                     }
                     if projection.list_contexts.is_empty()
@@ -1912,16 +1951,18 @@ impl Projection {
         };
         self.flush_pending_space();
         let display_width = image_dimension_attribute(attrs, "data-joplin-lite-display-width");
+        let link = self.materialize_marks(marks).link;
         self.ensure_current().push(Inline::Image {
             resource_id,
             alt,
             display_width,
+            link,
         });
         self.flow_has_visible = true;
         self.current_item_has_content = true;
     }
 
-    fn block_image(&mut self, attrs: &[Attribute]) {
+    fn block_image(&mut self, attrs: &[Attribute], marks: &ProjectionMarks) {
         let source = attribute(attrs, "src");
         let alt = attribute(attrs, "alt").unwrap_or_default();
         let Some(resource_id) =
@@ -1933,10 +1974,12 @@ impl Projection {
             return;
         };
         self.flush();
+        let link = self.materialize_marks(marks).link;
         self.document.blocks.push(Block::Image {
             resource_id,
             alt,
             presentation: image_presentation(attrs),
+            link,
         });
         self.pending_space = false;
         self.pending_marks = None;
@@ -2214,6 +2257,7 @@ mod tests {
                 natural_size: Some((4032, 3024)),
                 display_width: Some(960),
             },
+            link: None,
         }]);
 
         let html = document.to_canonical_html();
@@ -2655,6 +2699,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                     resource_id: ResourceId::new(RESOURCE_ID).unwrap(),
                     alt: "截图 & 证据.png".into(),
                     display_width: None,
+                    link: None,
                 },
                 Inline::Text {
                     text: "后".into(),
@@ -2711,6 +2756,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                     resource_id: ResourceId::new(RESOURCE_ID).unwrap(),
                     alt: "ok".into(),
                     display_width: None,
+                    link: None,
                 },
                 Inline::Text {
                     text: "dataremoteinvalid".into(),

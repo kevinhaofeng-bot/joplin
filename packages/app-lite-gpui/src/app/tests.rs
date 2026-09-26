@@ -1068,6 +1068,7 @@ fn active_resource_commit_clears_a_removed_thumbnail_without_waiting_for_event_r
                 resource_id: old_cover.clone(),
                 alt: "old cover".into(),
                 presentation: Default::default(),
+                link: None,
             }]),
         })
         .expect("create covered note");

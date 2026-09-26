@@ -373,6 +373,7 @@ fn resource_filters_require_current_attachments_and_report_deterministic_provena
                     resource_id: image.clone(),
                     alt: "separate image".into(),
                     display_width: None,
+                    link: None,
                 }],
             }]),
             resource_ids: vec![image.clone()],
@@ -403,6 +404,7 @@ fn resource_filters_require_current_attachments_and_report_deterministic_provena
                         resource_id: mixed_image.clone(),
                         alt: "mixed image".into(),
                         display_width: None,
+                        link: None,
                     }],
                 },
             ]),
@@ -1093,6 +1095,7 @@ fn search_projection_uses_the_same_thumbnail_choice_as_list() {
             resource_id: image.clone(),
             alt: "cover".into(),
             display_width: None,
+            link: None,
         }],
     }]);
     repo.associate_resource(AssociateResource {

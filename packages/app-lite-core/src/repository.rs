@@ -5226,6 +5226,7 @@ mod tests {
                         resource_id: old,
                         alt: "old".into(),
                         presentation: crate::document::ImagePresentation::default(),
+                        link: None,
                     },
                 ]),
             })
@@ -5238,6 +5239,7 @@ mod tests {
             resource_id: replacement.clone(),
             alt: "new".into(),
             presentation: crate::document::ImagePresentation::default(),
+            link: None,
         }]);
 
         let committed = repository

@@ -320,6 +320,7 @@ async fn deleting_a_persisted_image_then_undo_redo_journals_and_compacts_the_cur
                 resource_id: image.clone(),
                 alt: "要删除的图片".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Paragraph {
                 style: BlockStyle::default(),
@@ -506,6 +507,7 @@ async fn undoing_a_durable_resource_deletion_keeps_the_original_id_authorized_fo
                 resource_id: image.clone(),
                 alt: "可撤销图片".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Paragraph {
                 style: BlockStyle::default(),
@@ -628,16 +630,19 @@ async fn crash_journal_recovers_an_ordered_a_b_a_resource_deletion_without_losin
                 resource_id: a.clone(),
                 alt: "first A".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Image {
                 resource_id: b.clone(),
                 alt: "B".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Image {
                 resource_id: a.clone(),
                 alt: "second A".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Paragraph {
                 style: BlockStyle::default(),
@@ -779,16 +784,19 @@ async fn crash_journal_recovers_historical_a_b_a_after_durable_deletion_then_und
                 resource_id: a.clone(),
                 alt: "first A".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Image {
                 resource_id: b.clone(),
                 alt: "B".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Image {
                 resource_id: a.clone(),
                 alt: "second A".into(),
                 presentation: Default::default(),
+                link: None,
             },
         ]),
     );
@@ -949,12 +957,14 @@ async fn crash_journal_rejects_a_resource_outside_same_note_durable_provenance(
             resource_id: associated.clone(),
             alt: "associated".into(),
             presentation: Default::default(),
+            link: None,
         }]),
     );
     let forged_document = CanonicalDocument::from_blocks(vec![Block::Image {
         resource_id: foreign.clone(),
         alt: "forged foreign".into(),
         presentation: Default::default(),
+        link: None,
     }]);
     let writer_token = "forged-same-base-writer";
     let forged_delta = replace_all_recovery_payload(&note, writer_token, 1, &forged_document);
@@ -1024,11 +1034,13 @@ async fn crash_journal_recovers_a_same_note_resource_reorder_within_durable_coun
                 resource_id: b.clone(),
                 alt: "B".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Image {
                 resource_id: a.clone(),
                 alt: "A".into(),
                 presentation: Default::default(),
+                link: None,
             },
         ]),
     );
@@ -1037,11 +1049,13 @@ async fn crash_journal_recovers_a_same_note_resource_reorder_within_durable_coun
             resource_id: a.clone(),
             alt: "A".into(),
             presentation: Default::default(),
+            link: None,
         },
         Block::Image {
             resource_id: b.clone(),
             alt: "B".into(),
             presentation: Default::default(),
+            link: None,
         },
     ]);
     let writer_token = "same-note-reorder-writer";
@@ -1106,6 +1120,7 @@ async fn crash_journal_rejects_same_note_resource_occurrence_amplification(
             resource_id: a.clone(),
             alt: "only A".into(),
             presentation: Default::default(),
+            link: None,
         }]),
     );
     let amplified = CanonicalDocument::from_blocks(vec![
@@ -1113,11 +1128,13 @@ async fn crash_journal_rejects_same_note_resource_occurrence_amplification(
             resource_id: a.clone(),
             alt: "first A".into(),
             presentation: Default::default(),
+            link: None,
         },
         Block::Image {
             resource_id: a.clone(),
             alt: "forged second A".into(),
             presentation: Default::default(),
+            link: None,
         },
     ]);
     let writer_token = "same-note-amplification-writer";
@@ -1225,6 +1242,7 @@ async fn opening_missing_persisted_image_keeps_other_body_editable_until_surface
                 resource_id: resource.clone(),
                 alt: "丢失的图片".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Paragraph {
                 style: BlockStyle::default(),
@@ -1322,11 +1340,13 @@ async fn opening_many_images_keeps_all_original_blobs_unverified_until_surface_r
                 resource_id: first.clone(),
                 alt: "一".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Image {
                 resource_id: second.clone(),
                 alt: "二".into(),
                 presentation: Default::default(),
+                link: None,
             },
         ]),
     );
@@ -1386,6 +1406,7 @@ async fn dropped_session_hydration_worker_never_recreates_its_image_cache_root(
             resource_id: image.clone(),
             alt: "late".into(),
             presentation: Default::default(),
+            link: None,
         }]),
     );
     let active = session(
@@ -1457,16 +1478,19 @@ async fn hydration_scroll_coalesces_queued_work_to_the_latest_resident_image(
                 resource_id: first.clone(),
                 alt: "first".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Image {
                 resource_id: stale.clone(),
                 alt: "stale".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Image {
                 resource_id: final_image.clone(),
                 alt: "final".into(),
                 presentation: Default::default(),
+                link: None,
             },
         ]),
     );
@@ -1542,6 +1566,7 @@ async fn visible_legacy_image_repairs_its_geometry_once_then_reopens_without_lay
             resource_id: image.clone(),
             alt: "vertical".into(),
             presentation: Default::default(),
+            link: None,
         }]),
     );
     let clock = Arc::new(ManualSaveClock::default());
@@ -1657,6 +1682,7 @@ async fn offscreen_legacy_image_keeps_unknown_geometry_until_visible_repair(
                 resource_id: image.clone(),
                 alt: "vertical".into(),
                 presentation: Default::default(),
+                link: None,
             },
             Block::Paragraph {
                 style: BlockStyle::default(),

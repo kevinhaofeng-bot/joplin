@@ -155,6 +155,7 @@ fn repository_flow_persists_ids_relationships_html_text_and_resource_order() {
                         resource_id: image.clone(),
                         alt: "receipt".into(),
                         display_width: None,
+                        link: None,
                     },
                     Inline::Text {
                         text: " 已保存".into(),
@@ -256,6 +257,7 @@ fn failed_transaction_never_publishes_its_library_events() {
             resource_id: missing,
             alt: "missing".into(),
             display_width: None,
+            link: None,
         }],
     }]);
     assert!(

@@ -295,6 +295,7 @@ impl<'a> Converter<'a> {
                         resource_id: resource.destination_id,
                         alt,
                         display_width: None,
+                        link: None,
                     });
                 }
                 Event::InlineHtml(html) if is_line_break(&html) => out.push(Inline::SoftBreak),
@@ -436,6 +437,7 @@ impl<'a> Converter<'a> {
                 resource_id: resource.destination_id,
                 alt: resource.filename,
                 display_width: None,
+                link: None,
             });
         } else {
             out.push(Inline::Attachment {

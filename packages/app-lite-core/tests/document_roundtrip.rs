@@ -83,6 +83,7 @@ fn public_constructor_keeps_document_canonical_and_rejects_invalid_image_ids() {
                 resource_id: valid,
                 alt: "receipt".into(),
                 display_width: None,
+                link: None,
             },
             Inline::Text {
                 text: " linked".into(),
@@ -188,4 +189,65 @@ fn inline_attachment_round_trips_inside_list_items_and_is_searchable() {
     ))
     .unwrap();
     assert!(matches!(block.blocks()[0], Block::Attachment { .. }));
+}
+
+/// Linked images (`<a href><img></a>`, Markdown `[![alt](:/img)](url)`)
+/// keep their link on the image itself; unlinked legacy HTML parses to None.
+#[test]
+fn linked_inline_and_block_images_round_trip_their_link() {
+    let inline_html = format!(
+        "<p>前<a href=\"https://example.com/x?a=1&amp;b=2\"><img src=\":/{FIRST_RESOURCE}\" alt=\"图\"></a>后</p>"
+    );
+    let document = CanonicalDocument::parse_html(&inline_html).unwrap();
+    match &document.blocks()[0] {
+        Block::Paragraph { inlines, .. } => assert!(inlines.iter().any(|inline| matches!(
+            inline,
+            Inline::Image { link: Some(link), .. } if link == "https://example.com/x?a=1&b=2"
+        ))),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(document.to_canonical_html().as_str(), inline_html);
+
+    let block_html = format!(
+        "<a href=\"https://example.com/y\"><img data-joplin-lite-block-image=\"true\" src=\":/{SECOND_RESOURCE}\" alt=\"块图\"></a>"
+    );
+    let document = CanonicalDocument::parse_html(&block_html).unwrap();
+    assert!(matches!(
+        document.blocks(),
+        [Block::Image { link: Some(link), .. }] if link == "https://example.com/y"
+    ));
+    assert_eq!(document.to_canonical_html().as_str(), block_html);
+
+    let legacy = CanonicalDocument::parse_html(&format!(
+        "<p><img src=\":/{FIRST_RESOURCE}\" alt=\"旧\"></p><img data-joplin-lite-block-image=\"true\" src=\":/{SECOND_RESOURCE}\" alt=\"旧块\">"
+    ))
+    .unwrap();
+    assert!(matches!(
+        legacy.blocks(),
+        [Block::Paragraph { inlines, .. }, Block::Image { link: None, .. }]
+            if matches!(inlines.as_slice(), [Inline::Image { link: None, .. }])
+    ));
+}
+
+#[test]
+fn unsafe_image_links_are_dropped_not_serialized() {
+    let document = CanonicalDocument::parse_html(&format!(
+        "<p><a href=\"javascript:alert(1)\"><img src=\":/{FIRST_RESOURCE}\" alt=\"x\"></a></p>"
+    ))
+    .unwrap();
+    let html = document.to_canonical_html();
+    assert!(!html.as_str().contains("javascript"), "{}", html.as_str());
+    assert!(!html.as_str().contains("<a "), "{}", html.as_str());
+
+    let constructed = CanonicalDocument::from_blocks(vec![Block::Image {
+        resource_id: ResourceId::new(FIRST_RESOURCE).unwrap(),
+        alt: "x".into(),
+        presentation: Default::default(),
+        link: Some("javascript:alert(1)".into()),
+    }]);
+    assert!(matches!(
+        constructed.blocks(),
+        [Block::Image { link: None, .. }]
+    ));
+    assert!(!constructed.to_canonical_html().as_str().contains("<a "));
 }

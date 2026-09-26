@@ -38,6 +38,7 @@ fn document_with_repeated_attachment(
                 resource_id: resource.clone(),
                 alt: "收据".into(),
                 display_width: None,
+                link: None,
             },
             Inline::Text {
                 text: " 与 ".into(),
@@ -47,6 +48,7 @@ fn document_with_repeated_attachment(
                 resource_id: resource,
                 alt: "再次引用".into(),
                 display_width: None,
+                link: None,
             },
         ],
     }])
@@ -82,6 +84,7 @@ fn readable_export_builds_escaped_browsable_pages_with_relative_resource_links()
                             resource_id: image.clone(),
                             alt: "行内 \"<&>".into(),
                             display_width: None,
+                            link: None,
                         },
                         Inline::Text {
                             text: literal.clone(),
@@ -111,6 +114,7 @@ fn readable_export_builds_escaped_browsable_pages_with_relative_resource_links()
                     resource_id: image.clone(),
                     alt: "块图".into(),
                     presentation: ImagePresentation::default(),
+                    link: None,
                 },
                 Block::Attachment {
                     resource_id: pdf.clone(),
@@ -250,6 +254,7 @@ fn readable_page_applies_canonical_alignment_indent_and_image_display_width() {
                         natural_size: Some((1000, 500)),
                         display_width: Some(320),
                     },
+                    link: None,
                 },
             ]),
         })

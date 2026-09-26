@@ -19,6 +19,7 @@ fn note(repo: &LibraryRepository, title: &str, bytes: &[u8], name: &str, mime: &
                 resource_id: id,
                 alt: name.into(),
                 display_width: None,
+                link: None,
             }],
         }
     } else {
