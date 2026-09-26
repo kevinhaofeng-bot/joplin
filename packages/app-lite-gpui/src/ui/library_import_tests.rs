@@ -178,3 +178,37 @@ async fn mounted_backup_then_restore_creates_a_new_library_and_keeps_the_active_
     assert_eq!(library_counts(&restored).unwrap(), before);
     assert_eq!(library_counts(&fixture.base).unwrap(), before);
 }
+
+#[gpui::test]
+async fn mounted_copy_note_menu_action_creates_and_selects_a_copy(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    cx.dispatch_action(crate::app::CreateNote);
+    cx.run_until_parked();
+    let before = library_counts(&fixture.base).unwrap().notes;
+    let source = view.read_with(cx, |shell, app| {
+        shell
+            .model
+            .read(app)
+            .navigation()
+            .selected_note_id()
+            .cloned()
+    });
+
+    cx.dispatch_action(crate::app::CopyNote);
+    cx.run_until_parked();
+
+    assert_eq!(library_counts(&fixture.base).unwrap().notes, before + 1);
+    let selected = view.read_with(cx, |shell, app| {
+        shell
+            .model
+            .read(app)
+            .navigation()
+            .selected_note_id()
+            .cloned()
+    });
+    assert!(
+        selected.is_some() && selected != source,
+        "the copy is selected"
+    );
+}

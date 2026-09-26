@@ -113,6 +113,8 @@ pub struct AppModel {
     repository: Arc<LibraryRepository>,
     navigation: NavigationState,
     projections: Vec<NoteProjection>,
+    /// Notes Cmd-clicked in addition to the navigation selection.
+    extra_selection: Vec<NoteId>,
     /// Monotonic fence for retained background search work. A completed query
     /// may only publish if it still names the currently requested search.
     search_generation: u64,
@@ -183,6 +185,7 @@ impl AppModel {
             ListQuery::for_route(navigation.route().clone()).with_sort(navigation.sort()),
         )?;
         let mut model = Self {
+            extra_selection: Vec::new(),
             repository,
             navigation,
             projections,
@@ -222,6 +225,31 @@ impl AppModel {
     }
 
     pub fn dispatch(&mut self, action: AppAction) -> Result<(), LibraryError> {
+        // A plain click, navigation or a lifecycle change starts a new
+        // selection; organization edits keep it so tag-then-move works.
+        let clears_multi_selection = matches!(
+            action,
+            AppAction::SelectNote(_)
+                | AppAction::NavigateTo { .. }
+                | AppAction::NavigateBack
+                | AppAction::NavigateForward
+                | AppAction::CreateNote
+                | AppAction::CopySelectedNote
+                | AppAction::TrashNote(_)
+                | AppAction::TrashSelected
+                | AppAction::RestoreNote(_)
+                | AppAction::RestoreSelected
+                | AppAction::PurgeNote(_)
+                | AppAction::PurgeSelected
+        );
+        let result = self.dispatch_inner(action);
+        if clears_multi_selection {
+            self.extra_selection.clear();
+        }
+        result
+    }
+
+    fn dispatch_inner(&mut self, action: AppAction) -> Result<(), LibraryError> {
         let action_can_recover_partial = matches!(
             &action,
             AppAction::CreateNote
@@ -288,9 +316,10 @@ impl AppModel {
                     repository.delete_tag(&id)
                 }),
             AppAction::MoveSelectedNote(notebook_id) => {
-                self.selected_note_for_organization().and_then(|note_id| {
+                self.selected_note_for_organization().and_then(|_| {
+                    let note_ids = self.selected_note_ids();
                     self.apply_organization_mutation("笔记已移动", move |repository| {
-                        repository.move_selected_note(&note_id, &notebook_id)
+                        repository.move_notes(&note_ids, &notebook_id)
                     })
                 })
             }
@@ -302,9 +331,10 @@ impl AppModel {
                 })
             }
             AppAction::AddTagToSelectedNote(tag_id) => {
-                self.selected_note_for_organization().and_then(|note_id| {
+                self.selected_note_for_organization().and_then(|_| {
+                    let note_ids = self.selected_note_ids();
                     self.apply_organization_mutation("笔记标签已更新", move |repository| {
-                        repository.add_note_tag(&note_id, &tag_id)
+                        repository.add_tag_to_notes(&note_ids, &tag_id)
                     })
                 })
             }
@@ -316,6 +346,8 @@ impl AppModel {
                 })
             }
             AppAction::SelectNote(id) => self.select_note(id),
+            AppAction::ToggleNoteInSelection(id) => self.toggle_note_in_selection(id),
+            AppAction::CopySelectedNote => self.copy_selected_note(),
             AppAction::NavigateTo {
                 route,
                 selected_note_id,
@@ -507,6 +539,53 @@ impl AppModel {
             }
             Err(error) => {
                 self.record_reconciliation_partial_commit("笔记已移至废纸篓", &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// The navigation selection followed by Cmd-clicked notes still listed.
+    pub fn selected_note_ids(&self) -> Vec<NoteId> {
+        let mut ids: Vec<NoteId> = self
+            .navigation
+            .selected_note_id()
+            .cloned()
+            .into_iter()
+            .collect();
+        for id in &self.extra_selection {
+            if !ids.contains(id) && self.projections.iter().any(|p| &p.id == id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    fn toggle_note_in_selection(&mut self, id: NoteId) -> Result<(), LibraryError> {
+        match self.navigation.selected_note_id() {
+            None => self.select_note(id),
+            Some(primary) if *primary == id => Ok(()),
+            Some(_) => {
+                if let Some(index) = self.extra_selection.iter().position(|extra| *extra == id) {
+                    self.extra_selection.remove(index);
+                } else if self.projections.iter().any(|p| p.id == id) {
+                    self.extra_selection.push(id);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn copy_selected_note(&mut self) -> Result<(), LibraryError> {
+        let source = self.selected_note_for_organization()?;
+        let note = self.repository.copy_note(&source, None)?;
+        let route = self.navigation.route().clone();
+        match self.prepare_create_note_reconciliation_commit(note.clone(), route.clone()) {
+            Ok(prepared) => {
+                self.commit_organization(prepared);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_create_note_reconciliation_partial_commit(note, route, &error);
                 Err(error)
             }
         }

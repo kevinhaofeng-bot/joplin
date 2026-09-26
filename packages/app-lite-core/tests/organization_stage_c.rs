@@ -713,3 +713,85 @@ fn purge_removes_the_notes_own_history_and_its_history_only_resource() {
     assert_eq!(remaining, 0, "purged history bodies are gone");
     assert!(repository.resource_metadata(&old).unwrap().is_none());
 }
+
+#[test]
+fn copy_note_creates_a_new_id_sharing_attachments_tags_and_survives_purging_the_source() {
+    let (_profile, path, repository) = repository();
+    let image = repository
+        .import_image(b"copied image", "copy", "image/png", "png")
+        .unwrap();
+    let target = repository.create_notebook("目标", None).unwrap();
+    let tag = repository.create_tag("保留").unwrap();
+    let source = repository
+        .create_note(CreateNote {
+            title: "原笔记".into(),
+            notebook_id: None,
+            document: image_document(std::slice::from_ref(&image)),
+        })
+        .unwrap();
+    repository
+        .set_note_tags(&source.id, &[tag.id.clone()])
+        .unwrap();
+
+    let copy = repository.copy_note(&source.id, Some(&target.id)).unwrap();
+
+    assert_ne!(copy.id, source.id);
+    assert_eq!(copy.title, source.title);
+    assert_eq!(copy.body_html, source.body_html);
+    assert_eq!(copy.resource_ids, vec![image.clone()]);
+    assert_eq!(copy.tag_ids, vec![tag.id.clone()]);
+    assert_eq!(copy.notebook_id, target.id);
+    assert_eq!(copy.revision, 1);
+    let reopened = LibraryRepository::open(&path).unwrap();
+    assert_eq!(
+        reopened.load_note(&copy.id).unwrap().unwrap().body_html,
+        source.body_html
+    );
+
+    repository.trash_note(&source.id).unwrap();
+    repository.purge_note(&source.id).unwrap();
+    assert_eq!(
+        repository.read_resource_bytes(&image).unwrap().unwrap(),
+        b"copied image",
+        "the copy still owns its attachment"
+    );
+}
+
+#[test]
+fn batch_tagging_is_all_or_nothing() {
+    let (_profile, _path, repository) = repository();
+    let tag = repository.create_tag("批量").unwrap();
+    let first = create_note(&repository, "一", None);
+    let second = create_note(&repository, "二", None);
+    let trashed = create_note(&repository, "三", None);
+    repository.trash_note(&trashed).unwrap();
+
+    assert!(
+        repository
+            .add_tag_to_notes(&[first.clone(), trashed.clone()], &tag.id)
+            .is_err()
+    );
+    assert!(
+        repository
+            .load_note(&first)
+            .unwrap()
+            .unwrap()
+            .tag_ids
+            .is_empty(),
+        "a failing member rolls back the whole batch"
+    );
+
+    repository
+        .add_tag_to_notes(&[first.clone(), second.clone()], &tag.id)
+        .unwrap();
+    for id in [&first, &second] {
+        assert_eq!(
+            repository.load_note(id).unwrap().unwrap().tag_ids,
+            vec![tag.id.clone()]
+        );
+    }
+    // Idempotent for notes that already carry the tag.
+    repository
+        .add_tag_to_notes(&[first.clone()], &tag.id)
+        .unwrap();
+}

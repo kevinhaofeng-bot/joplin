@@ -18,9 +18,9 @@ use crate::app::note_session::AttachmentOpener;
 use crate::app::note_session::{InsertIntent, NoteSession, ResourceImportRequest};
 use crate::app::save_coordinator::{FlushReason, SaveState, SystemSaveClock};
 use crate::app::{
-    AppAction, AppModel, AppStatus, CancelLibraryImport, CreateNote, CycleListViewMode, CycleSort,
-    ExportCurrentNote, ListViewMode, NoteSort, OpenImportedLibrary, SyncCurrent, ToggleNoteList,
-    ToggleSidebar, TrashSelected,
+    AppAction, AppModel, AppStatus, CancelLibraryImport, CopyNote, CreateNote, CycleListViewMode,
+    CycleSort, ExportCurrentNote, ListViewMode, NoteSort, OpenImportedLibrary, SyncCurrent,
+    ToggleNoteList, ToggleSidebar, TrashSelected,
 };
 use crate::components::Paste;
 use crate::native_editor::chrome::{EVERNOTE_GREEN, TitleInput};
@@ -2068,6 +2068,8 @@ impl LibraryShell {
             }
             AppAction::TrashSelected => active_id.map(|_| FlushReason::Delete),
             AppAction::TrashNote(id) if active_id.as_ref() == Some(id) => Some(FlushReason::Delete),
+            // The copy must contain the latest typed text.
+            AppAction::CopySelectedNote => active_id.map(|_| FlushReason::NoteSwitch),
             AppAction::MoveSelectedNote(_)
             | AppAction::SetSelectedNoteTags(_)
             | AppAction::AddTagToSelectedNote(_)
@@ -3347,6 +3349,7 @@ impl LibraryShell {
         let processor_shell = shell.clone();
         let viewport_state_for_processor = Rc::clone(&self.card_thumbnail_viewport_state);
         let selected_for_processor = selected.clone();
+        let multi_selected = Arc::new(self.model.read(cx).selected_note_ids());
         let items = Arc::new(items);
         let items_for_processor = Arc::clone(&items);
         let item_count = items.len();
@@ -3371,6 +3374,7 @@ impl LibraryShell {
                         let projection = items_for_processor.get(index)?.clone();
                         let id = projection.id.clone();
                         let selected = selected_for_processor.as_ref() == Some(&id);
+                        let highlighted = selected || multi_selected.contains(&id);
                         let thumbnail_is_actually_visible = !matches!(mode, ListViewMode::Cards)
                             || viewport_state_for_processor
                                 .borrow()
@@ -3406,18 +3410,21 @@ impl LibraryShell {
                                 .h(px(note_list::fixed_card_height(mode)))
                                 .px(px(6.0))
                                 .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                                    // Cmd-click extends the multi-selection
+                                    // used by batch move/tag.
+                                    let action = if event.modifiers.platform {
+                                        AppAction::ToggleNoteInSelection(id.clone())
+                                    } else {
+                                        AppAction::SelectNote(id.clone())
+                                    };
                                     let _ = click_shell.update(cx, |shell, cx| {
-                                        shell.apply_action(
-                                            AppAction::SelectNote(id.clone()),
-                                            window,
-                                            cx,
-                                        );
+                                        shell.apply_action(action, window, cx);
                                     });
                                 })
                                 .child(note_card::render(
                                     &projection,
-                                    selected,
+                                    highlighted,
                                     mode,
                                     thumbnail_source,
                                     thumbnail_failed,
@@ -6549,6 +6556,9 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::cancel_library_import))
             .on_action(cx.listener(Self::open_imported_library))
             .on_action(cx.listener(Self::backup_library_action))
+            .on_action(cx.listener(|shell, _: &CopyNote, window, cx| {
+                shell.apply_action(AppAction::CopySelectedNote, window, cx);
+            }))
             .on_action(cx.listener(Self::restore_library_action))
             .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_find_in_note))

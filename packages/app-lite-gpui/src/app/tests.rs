@@ -2438,3 +2438,72 @@ fn trash_route_restore_and_purge_are_typed_and_do_not_revive_a_wrong_session() {
     assert!(model.projections().is_empty());
     assert_eq!(model.active_session_note_id(), None);
 }
+
+#[test]
+fn cmd_click_multi_selection_moves_and_tags_every_selected_note_through_the_same_actions() {
+    let (profile, repository) = repository();
+    let first = create(&repository, "一");
+    let second = create(&repository, "二");
+    let third = create(&repository, "三");
+    let target = repository.create_notebook("归档", None).unwrap();
+    let tag = repository.create_tag("批量").unwrap();
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    model
+        .dispatch(AppAction::SelectNote(first.clone()))
+        .unwrap();
+    model
+        .dispatch(AppAction::ToggleNoteInSelection(second.clone()))
+        .unwrap();
+    assert_eq!(
+        model.selected_note_ids(),
+        vec![first.clone(), second.clone()]
+    );
+
+    model
+        .dispatch(AppAction::AddTagToSelectedNote(tag.id.clone()))
+        .unwrap();
+    model
+        .dispatch(AppAction::MoveSelectedNote(target.id.clone()))
+        .unwrap();
+
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    for id in [&first, &second] {
+        let note = reopened.load_note(id).unwrap().unwrap();
+        assert_eq!(note.notebook_id, target.id);
+        assert_eq!(note.tag_ids, vec![tag.id.clone()]);
+    }
+    let untouched = reopened.load_note(&third).unwrap().unwrap();
+    assert_ne!(untouched.notebook_id, target.id);
+    assert!(untouched.tag_ids.is_empty());
+
+    // A plain click collapses the multi-selection.
+    model
+        .dispatch(AppAction::SelectNote(third.clone()))
+        .unwrap();
+    assert_eq!(model.selected_note_ids(), vec![third]);
+}
+
+#[test]
+fn copy_selected_note_selects_a_new_note_with_the_same_content() {
+    let (_profile, repository) = repository();
+    let source = create(&repository, "被复制");
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    model
+        .dispatch(AppAction::SelectNote(source.clone()))
+        .unwrap();
+
+    model.dispatch(AppAction::CopySelectedNote).unwrap();
+
+    let copy = model
+        .navigation()
+        .selected_note_id()
+        .cloned()
+        .expect("copy is selected");
+    assert_ne!(copy, source);
+    assert_eq!(
+        repository.load_note(&copy).unwrap().unwrap().title,
+        "被复制"
+    );
+    assert!(model.projections().iter().any(|p| p.id == copy));
+    assert!(model.projections().iter().any(|p| p.id == source));
+}

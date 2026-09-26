@@ -294,7 +294,7 @@ impl LibraryShell {
 #[cfg(not(test))]
 fn prompt_for_backup_target(window: WindowHandle<LibraryShell>, token: u64, cx: &mut App) {
     let default_dir = directories::UserDirs::new()
-        .and_then(|dirs| dirs.document_dir().map(Path::to_path_buf))
+        .and_then(|dirs| dirs.document_dir().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let prompt = cx.prompt_for_new_path(&default_dir, Some("Joplin-Lite-资料库备份"));
     cx.spawn(async move |cx| {

@@ -2050,6 +2050,152 @@ impl LibraryRepository {
         Ok(())
     }
 
+    /// Adds one tag to many notes in a single transaction: a missing or
+    /// trashed member fails the whole batch. Already-tagged notes are left
+    /// untouched.
+    pub fn add_tag_to_notes(
+        &self,
+        note_ids: &[NoteId],
+        tag_id: &TagId,
+    ) -> Result<(), LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        require_tag(&transaction, tag_id)?;
+        let mut changed = Vec::new();
+        for note_id in note_ids {
+            let mut tag_ids = active_note_tag_ids(&transaction, note_id)?;
+            if tag_ids.contains(tag_id) {
+                continue;
+            }
+            tag_ids.push(tag_id.clone());
+            replace_note_tags_in_transaction(
+                &transaction,
+                self.id_source.as_ref(),
+                note_id,
+                &tag_ids,
+                now,
+                "tags",
+            )?;
+            changed.push(note_id.clone());
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.publish(changed.iter().flat_map(note_tag_events).collect());
+        Ok(())
+    }
+
+    /// Copies an active note into `notebook_id` (default: the source's
+    /// notebook) as a new note: same title, body, attachments (shared
+    /// resource references) and tags; fresh history. One transaction.
+    pub fn copy_note(
+        &self,
+        id: &NoteId,
+        notebook_id: Option<&NotebookId>,
+    ) -> Result<Note, LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        let (title, html, text, note_snippet, source_notebook, thumbnail): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = transaction
+            .query_row(
+                "SELECT title, body_html, body_text, snippet, notebook_id, selected_thumbnail_id
+                 FROM notes WHERE id = ?1 AND deleted_time = 0",
+                [id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(LibraryError::NotFound)?;
+        let notebook_id = match notebook_id {
+            Some(notebook_id) => {
+                require_notebook(&transaction, notebook_id)?;
+                notebook_id.clone()
+            }
+            None => {
+                NotebookId::parse(source_notebook).map_err(|_| LibraryError::InvalidSnapshot)?
+            }
+        };
+        let (raw_id, _) = self.insert_with_unique_id(&transaction, "notes", |candidate| {
+            transaction.execute(
+                "INSERT INTO notes (id, title, body_html, body_text, snippet, notebook_id, selected_thumbnail_id, created_time, updated_time, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1)",
+                params![candidate, &title, &html, &text, &note_snippet, notebook_id.as_str(), thumbnail, now],
+            )
+        })?;
+        let copy_id = NoteId::parse(raw_id).expect("validated generated ID is valid");
+        transaction.execute(
+            "INSERT INTO note_resources (note_id, position, resource_id, is_associated)
+             SELECT ?1, position, resource_id, is_associated FROM note_resources WHERE note_id = ?2",
+            params![copy_id.as_str(), id.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO note_tags (note_id, tag_id, position)
+             SELECT ?1, tag_id, position FROM note_tags WHERE note_id = ?2",
+            params![copy_id.as_str(), id.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO note_revisions (note_id, revision, title, body_html, body_text, created_time)
+             SELECT id, revision, title, body_html, body_text, updated_time FROM notes WHERE id = ?1",
+            [copy_id.as_str()],
+        )?;
+        queue_search(&transaction, &copy_id, now, "snapshot")?;
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Note(copy_id.clone()),
+            1,
+            "create",
+            now,
+        )?;
+        let resource_ids = transaction
+            .prepare(
+                "SELECT resource_id FROM note_resources WHERE note_id = ?1 AND is_associated = 1 ORDER BY position",
+            )?
+            .query_map([copy_id.as_str()], |row| row.get::<_, String>(0))?
+            .map(|id| id.map_err(LibraryError::from).and_then(|id| ResourceId::new(id).map_err(|_| LibraryError::InvalidSnapshot)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tag_ids = active_note_tag_ids(&transaction, &copy_id)?;
+        let note = Note {
+            id: copy_id.clone(),
+            title,
+            body_html: html,
+            body_text: text,
+            snippet: note_snippet,
+            notebook_id,
+            resource_ids,
+            tag_ids,
+            created_time: now,
+            updated_time: now,
+            deleted_time: None,
+            revision: 1,
+        };
+        transaction.commit()?;
+        drop(connection);
+        self.publish(vec![
+            LibraryEvent::NoteCreated(copy_id.clone()),
+            LibraryEvent::NoteProjectionChanged(copy_id.clone()),
+            LibraryEvent::SearchProjectionQueued(copy_id.clone()),
+            LibraryEvent::SyncQueued(EntityRef::Note(copy_id)),
+            LibraryEvent::OrganizationChanged,
+        ]);
+        Ok(note)
+    }
+
     /// Removes exactly one active relation. It does not silently edit a
     /// deleted note or a non-existent tag, so the UI can display a truthful
     /// failure without publishing a partial navigation refresh.

@@ -16,6 +16,7 @@ gpui::actions!(
         OpenImportedLibrary,
         BackupLibrary,
         RestoreLibrary,
+        CopyNote,
     ]
 );
 
@@ -108,6 +109,11 @@ pub enum AppAction {
     AddTagToSelectedNote(TagId),
     RemoveTagFromSelectedNote(TagId),
     SelectNote(NoteId),
+    /// Cmd-click: add/remove a note from the multi-selection. Move and tag
+    /// actions on the "selected note" apply to every selected note.
+    ToggleNoteInSelection(NoteId),
+    /// Copy the selected note into its notebook and select the copy.
+    CopySelectedNote,
     NavigateTo {
         route: LibraryRoute,
         selected_note_id: Option<NoteId>,
