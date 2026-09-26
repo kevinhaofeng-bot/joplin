@@ -52,6 +52,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(_) => passed += 1,
             Err(error) => {
                 let reason: String = error.reason.into();
+                if std::env::var_os("JOPLIN_LITE_AUDIT_HTML_SKELETON").is_some()
+                    && reason == "Unclosed HTML element"
+                {
+                    // Tag names only; text and attribute values are dropped.
+                    let mut skeleton = String::new();
+                    for event in
+                        pulldown_cmark::Parser::new_ext(body, pulldown_cmark::Options::all())
+                    {
+                        match event {
+                            pulldown_cmark::Event::Html(html)
+                            | pulldown_cmark::Event::InlineHtml(html) => {
+                                for part in html.split('<').skip(1) {
+                                    let closing = part.starts_with('/');
+                                    let name: String = part
+                                        .trim_start_matches('/')
+                                        .chars()
+                                        .take_while(|c| c.is_ascii_alphanumeric())
+                                        .collect();
+                                    let attrs =
+                                        part.split('>').next().is_some_and(|tag| tag.contains('='));
+                                    skeleton.push_str(&format!(
+                                        "<{}{}{}>",
+                                        if closing { "/" } else { "" },
+                                        name.to_ascii_lowercase(),
+                                        if attrs { " …" } else { "" }
+                                    ));
+                                }
+                            }
+                            pulldown_cmark::Event::Start(pulldown_cmark::Tag::HtmlBlock) => {
+                                skeleton.push('[')
+                            }
+                            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::HtmlBlock) => {
+                                skeleton.push(']')
+                            }
+                            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Paragraph) => {
+                                skeleton.push('P')
+                            }
+                            _ => {}
+                        }
+                    }
+                    println!(
+                        "skeleton\t{}",
+                        skeleton.chars().take(400).collect::<String>()
+                    );
+                }
                 *failures.entry(reason.clone()).or_default() += 1;
                 // Structural categories only, never source text or titles.
                 if markup == 1 {

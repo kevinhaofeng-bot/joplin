@@ -588,11 +588,56 @@ fn joplin_resized_image_keeps_width_and_bare_html_wrappers_render_nothing() {
         format!("<img height=\"200\" src=\":/{IMAGE}\"/>"),
         format!("<img width=\"50%\" src=\":/{IMAGE}\"/>"),
         "<html lang=\"zh\">\n\n正文".to_owned(),
-        "<html>中文标题".to_owned(),
     ] {
         assert!(
             convert_jex_note_body(NOTE, "bad.md", 1, &body, &resources()).is_err(),
             "body={body}"
         );
     }
+}
+
+/// CommonMark swallows text after a bare `<html>` up to the next blank line
+/// into one HTML block; Joplin shows that text (the browser ignores the tag).
+#[test]
+fn bare_html_wrapper_block_keeps_the_text_it_swallowed() {
+    let converted = convert_jex_note_body(
+        NOTE,
+        "mail.md",
+        1,
+        "前文\n\n<html>转发正文\n第二行\n\n后文",
+        &resources(),
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.document,
+        CanonicalDocument::parse_html("<p>前文</p><p>转发正文<br>第二行</p><p>后文</p>").unwrap()
+    );
+    let converted = convert_jex_note_body(NOTE, "mail.md", 1, "<html>中文标题", &resources())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.document,
+        CanonicalDocument::parse_html("<p>中文标题</p>").unwrap()
+    );
+    let converted = convert_jex_note_body(
+        NOTE,
+        "mail.md",
+        1,
+        "<html><body><p>甲</p><p>乙</p></body></html>",
+        &resources(),
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.document,
+        CanonicalDocument::parse_html("<p>甲</p><p>乙</p>").unwrap()
+    );
+    assert!(
+        convert_jex_note_body(
+            NOTE,
+            "mail.md",
+            1,
+            "<html>正文<font color=\"red\">红</font>",
+            &resources()
+        )
+        .is_err()
+    );
 }

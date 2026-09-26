@@ -576,9 +576,18 @@ impl<'a> Converter<'a> {
                             }
                         }
                     }
-                    if is_bare_document_wrapper(&fragment) {
+                    let stripped = strip_bare_document_wrappers(&fragment);
+                    if stripped.trim().is_empty() {
                         continue;
                     }
+                    // The browser puts text left after the wrapper in an
+                    // anonymous block; a div is the canonical equivalent.
+                    let fragment = if stripped == fragment || stripped.trim_start().starts_with('<')
+                    {
+                        stripped
+                    } else {
+                        format!("<div>{}</div>", stripped.trim_end())
+                    };
                     let converted = super::jex_html::convert_html_body(
                         self.note_id,
                         self.path,
@@ -623,23 +632,29 @@ impl<'a> Converter<'a> {
     }
 }
 
-/// Only attribute-free `<html>`/`<body>` open/close tags, which Joplin renders
-/// as nothing (e.g. residue of forwarded mail).
-fn is_bare_document_wrapper(html: &str) -> bool {
-    let mut rest = html.trim();
-    while !rest.is_empty() {
-        let Some(tag) = ["<html>", "</html>", "<body>", "</body>"]
-            .into_iter()
-            .find(|tag| {
-                rest.get(..tag.len())
-                    .is_some_and(|head| head.eq_ignore_ascii_case(tag))
-            })
-        else {
-            return false;
-        };
-        rest = rest[tag.len()..].trim_start();
+/// Removes attribute-free `<html>`/`<body>` open/close tags, which Joplin's
+/// renderer leaves to the browser to ignore (e.g. residue of forwarded mail).
+/// Text they precede stays, as Joplin shows it.
+fn strip_bare_document_wrappers(html: &str) -> String {
+    const TAGS: [&str; 4] = ["<html>", "</html>", "<body>", "</body>"];
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(index) = rest.find('<') {
+        out.push_str(&rest[..index]);
+        rest = &rest[index..];
+        match TAGS.into_iter().find(|tag| {
+            rest.get(..tag.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(tag))
+        }) {
+            Some(tag) => rest = &rest[tag.len()..],
+            None => {
+                out.push('<');
+                rest = &rest[1..];
+            }
+        }
     }
-    true
+    out.push_str(rest);
+    out
 }
 
 fn is_line_break(html: &str) -> bool {

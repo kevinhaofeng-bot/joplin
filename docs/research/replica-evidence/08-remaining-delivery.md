@@ -90,6 +90,20 @@
 | 行内资源链接 `[标签](:/id)` 转为行内附件卡片或图片，标签与文件名不同时保留标签文字 | `c15c16d18` | 1421 / 245 |
 | HTML 块只有被严格 HTML 转换器接受时才转换；行内 `<br>` 转换行；`<img width>` 保存为显示宽度（height 不保存）；无属性的 `<html>`/`<body>` 空包装块跳过（Joplin 显示为空，原字节仍在审计表） | 本节提交 | 1422 / 244 |
 
+| `<html>` 后被 CommonMark 吞入同一 HTML 块的文字：剥离无属性 `<html>/<body>` 标签后，以文字开头的剩余部分包 `<div>`、以标签开头的直接交严格 HTML 转换器；两者混合仍阻断。源码换行沿用转换器约定保留为软换行（Joplin 浏览器会折叠为空格，这是可见差异，不丢文字） | 本步提交 | 1442 / 224 |
+
+### Codex 验收基线后的新鲜隔离导入（HEAD `becdff6d6`）
+
+Codex 已独立核验 `becdff6d6`：core 345 通过；GUI 1362 通过、1 忽略；只读审计 1422 严格 / 244 警告。这不等于整体产品验收。
+
+| 命令（目录） | 结果 | 日志 |
+| --- | --- | --- |
+| `cargo run -q --release --locked --example import_verify -- /tmp/joplin-lite-t2-accept/src/all_notebooks.jex /tmp/joplin-stage2-import.GsdfVk/imports`（`packages/app-lite-core`） | 退出0，91.1 s。源 SHA256 `8544080e…74906f500`（副本，原件只读未改）；1666 笔记/31 笔记本/2 组/64 标签/425 关系/4153 资源/4127 blob；**发布 blob 重新哈希 0 不符，源 blob 缺失 0、多余 0**；降级 244（与只读审计一致）；扫描 `unresolved_refs=1`（与“Internal link…”那 1 篇对应） | `/tmp/joplin-stage2-import.GsdfVk/verify.log` |
+| `JOPLIN_LITE_AUDIT_DATABASE=/tmp/joplin-stage2-import.GsdfVk/imports/all_notebooks-1790457765/library.sqlite cargo test --locked --bin velotype imported_real_copy_opens_and_round_trips_resources_in_native_editor -- --ignored --nocapture`（`packages/app-lite-gpui`） | 退出0；`real-copy notes=1666, failure_categories={}`（原生打开后导出，比较资源顺序和非空白文字） | `/tmp/joplin-stage2-claude/native-audit-becdff6d6.log` |
+| `mkdir -p /tmp/joplin-stage2-import.GsdfVk/backup && cargo run -q --release --locked --example backup_verify -- /tmp/joplin-stage2-import.GsdfVk/imports/all_notebooks-1790457765 /tmp/joplin-stage2-import.GsdfVk/backup`（`packages/app-lite-core`） | 退出0；备份→空目录恢复后计数一致、blob 集合一致，11 张内容表摘要全部相等，恢复后 4127 个 blob 重新哈希；备份/恢复共 66 s | `/tmp/joplin-stage2-import.GsdfVk/backup-verify.log` |
+
+说明：第一次运行 `backup_verify` 因工作目录不存在报 `TargetParentMissing`（退出101）；创建目录后重跑通过，属于调用方式问题，不是产品缺陷。原生审计编译时工作树里有另一会话未提交的 `app-lite-gpui/src/native_editor/toolbar.rs`，审计入口与它无关，但仍不是纯净构建。原生审计只比较资源顺序和文字，不代替排版、表格的视觉验收。
+
 跳过空包装块是一个判断，需要 Codex 确认。审计曾发现我自己写的包装块检测会在中文字符的字节边界上 panic，已修复，并加了回归用例 `<html>中文标题`。
 
 特征组合里仍未处理的：带链接图片 51+、表格 30+、HTML 块跨空行导致的“未闭合元素” 20、外链图片 11、有序列表起始号 11、数学 11、H4 及以上 5。其中带链接图片、表格、列表起始号和 H4 以上都要改原生编辑器（`app-lite-gpui`，现归另一个会话负责），需要先协调。尚未用新代码重新做隔离导入，也没跑原生加载审计：新转换出的笔记还没有在编辑器里验证过打开和回写。
