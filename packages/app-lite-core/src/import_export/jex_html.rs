@@ -352,6 +352,7 @@ impl Context<'_> {
         Ok(Inline::Image {
             resource_id: resource.destination_id,
             alt: element.attrs.get("alt").cloned().unwrap_or_default(),
+            display_width: None,
         })
     }
 
@@ -640,7 +641,10 @@ impl Context<'_> {
             }
             "img" => {
                 let image = self.image(element, false)?;
-                if let Inline::Image { resource_id, alt } = image {
+                if let Inline::Image {
+                    resource_id, alt, ..
+                } = image
+                {
                     Ok(Block::Image {
                         resource_id,
                         alt,

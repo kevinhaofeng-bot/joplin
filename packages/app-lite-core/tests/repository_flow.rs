@@ -154,6 +154,7 @@ fn repository_flow_persists_ids_relationships_html_text_and_resource_order() {
                     Inline::Image {
                         resource_id: image.clone(),
                         alt: "receipt".into(),
+                        display_width: None,
                     },
                     Inline::Text {
                         text: " 已保存".into(),
@@ -254,6 +255,7 @@ fn failed_transaction_never_publishes_its_library_events() {
         inlines: vec![Inline::Image {
             resource_id: missing,
             alt: "missing".into(),
+            display_width: None,
         }],
     }]);
     assert!(

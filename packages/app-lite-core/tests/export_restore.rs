@@ -37,6 +37,7 @@ fn document_with_repeated_attachment(
             Inline::Image {
                 resource_id: resource.clone(),
                 alt: "收据".into(),
+                display_width: None,
             },
             Inline::Text {
                 text: " 与 ".into(),
@@ -45,6 +46,7 @@ fn document_with_repeated_attachment(
             Inline::Image {
                 resource_id: resource,
                 alt: "再次引用".into(),
+                display_width: None,
             },
         ],
     }])
@@ -79,6 +81,7 @@ fn readable_export_builds_escaped_browsable_pages_with_relative_resource_links()
                         Inline::Image {
                             resource_id: image.clone(),
                             alt: "行内 \"<&>".into(),
+                            display_width: None,
                         },
                         Inline::Text {
                             text: literal.clone(),

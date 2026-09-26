@@ -8199,6 +8199,7 @@ async fn selecting_an_unsupported_resource_note_never_reads_blob_bytes(cx: &mut 
                 inlines: vec![Inline::Image {
                     resource_id: image,
                     alt: "unsupported indent prevents decode".into(),
+                    display_width: None,
                 }],
             }]),
         })
@@ -8242,6 +8243,7 @@ async fn mounted_list_inline_photo_hydrates_at_real_size_without_reopen_or_save(
                         Inline::Image {
                             resource_id: image.clone(),
                             alt: "photo".into(),
+                            display_width: None,
                         },
                         Inline::Text {
                             text: "图后".into(),
@@ -8334,6 +8336,7 @@ async fn switching_to_an_unsupported_body_removes_the_previous_native_surface(
                 inlines: vec![Inline::Image {
                     resource_id: image,
                     alt: "Task 5 image".into(),
+                    display_width: None,
                 }],
             }]),
         })

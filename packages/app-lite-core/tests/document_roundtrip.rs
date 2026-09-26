@@ -82,6 +82,7 @@ fn public_constructor_keeps_document_canonical_and_rejects_invalid_image_ids() {
             Inline::Image {
                 resource_id: valid,
                 alt: "receipt".into(),
+                display_width: None,
             },
             Inline::Text {
                 text: " linked".into(),
@@ -100,5 +101,46 @@ fn public_constructor_keeps_document_canonical_and_rejects_invalid_image_ids() {
     assert_eq!(
         CanonicalDocument::parse_html(html.as_str()).unwrap(),
         document
+    );
+}
+
+/// Handoff stage 1: an image inside a heading/quote/list keeps a user width.
+/// Evernote stores `width` on the image node itself (resource/image/
+/// imagecomponent.tsx:449-452), independent of the parent block.
+#[test]
+fn inline_image_display_width_round_trips_and_old_html_has_none() {
+    use app_lite_core::document::{Block, Inline};
+    let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let html = format!(
+        "<h2>前<img src=\":/{id}\" alt=\"图\" data-joplin-lite-display-width=\"320\">后</h2>"
+    );
+    let document = app_lite_core::CanonicalDocument::parse_html(&html).unwrap();
+    let width = |document: &app_lite_core::CanonicalDocument| match &document.blocks()[0] {
+        Block::Heading { inlines, .. } => inlines.iter().find_map(|inline| match inline {
+            Inline::Image { display_width, .. } => Some(*display_width),
+            _ => None,
+        }),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(width(&document), Some(Some(320)));
+    let serialized = document.to_canonical_html();
+    let reparsed = app_lite_core::CanonicalDocument::parse_html(serialized.as_str()).unwrap();
+    assert_eq!(reparsed, document);
+    assert!(
+        serialized
+            .as_str()
+            .contains("data-joplin-lite-display-width=\"320\"")
+    );
+
+    let legacy = app_lite_core::CanonicalDocument::parse_html(&format!(
+        "<h2>前<img src=\":/{id}\" alt=\"图\">后</h2>"
+    ))
+    .unwrap();
+    assert_eq!(width(&legacy), Some(None));
+    assert!(
+        !legacy
+            .to_canonical_html()
+            .as_str()
+            .contains("display-width")
     );
 }

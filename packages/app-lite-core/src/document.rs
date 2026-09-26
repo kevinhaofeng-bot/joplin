@@ -204,6 +204,9 @@ pub enum Inline {
     Image {
         resource_id: ResourceId,
         alt: String,
+        /// User-chosen display width, like `Block::Image`'s presentation;
+        /// None for legacy HTML and untouched images.
+        display_width: Option<u32>,
     },
 }
 
@@ -688,12 +691,22 @@ fn serialize_inlines(inlines: &[Inline], output: &mut String) {
         match inline {
             Inline::Text { text, marks } => serialize_text(text, marks, inlines, index, output),
             Inline::SoftBreak => output.push_str("<br>"),
-            Inline::Image { resource_id, alt } => {
+            Inline::Image {
+                resource_id,
+                alt,
+                display_width,
+            } => {
                 output.push_str("<img src=\":/");
                 escape_attribute(resource_id.as_str(), output);
                 output.push_str("\" alt=\"");
                 escape_attribute(alt, output);
-                output.push_str("\">");
+                output.push('\"');
+                if let Some(width) = display_width.filter(|&w| valid_persisted_image_dimension(w)) {
+                    output.push_str(" data-joplin-lite-display-width=\"");
+                    output.push_str(&width.to_string());
+                    output.push('\"');
+                }
+                output.push('>');
             }
         }
     }
@@ -1863,8 +1876,12 @@ impl Projection {
             return;
         };
         self.flush_pending_space();
-        self.ensure_current()
-            .push(Inline::Image { resource_id, alt });
+        let display_width = image_dimension_attribute(attrs, "data-joplin-lite-display-width");
+        self.ensure_current().push(Inline::Image {
+            resource_id,
+            alt,
+            display_width,
+        });
         self.flow_has_visible = true;
         self.current_item_has_content = true;
     }
@@ -2576,6 +2593,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                 Inline::Image {
                     resource_id: ResourceId::new(RESOURCE_ID).unwrap(),
                     alt: "截图 & 证据.png".into(),
+                    display_width: None,
                 },
                 Inline::Text {
                     text: "后".into(),
@@ -2631,6 +2649,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                 Inline::Image {
                     resource_id: ResourceId::new(RESOURCE_ID).unwrap(),
                     alt: "ok".into(),
+                    display_width: None,
                 },
                 Inline::Text {
                     text: "dataremoteinvalid".into(),

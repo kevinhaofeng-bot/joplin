@@ -153,7 +153,12 @@ pub fn import_canonical_with_resources(
                     // structural representation.
                     let mut text = Vec::new();
                     for inline in inlines {
-                        if let Inline::Image { resource_id, alt } = inline {
+                        if let Inline::Image {
+                            resource_id,
+                            alt,
+                            display_width,
+                        } = inline
+                        {
                             ensure_resource(resource_id, available_resources, block_index)?;
                             if !text.is_empty() {
                                 native.push(text_block(
@@ -179,7 +184,7 @@ pub fn import_canonical_with_resources(
                                     alt: alt.clone(),
                                     natural_size_known: false,
                                     natural_size: (1024, 768),
-                                    display_width: None,
+                                    display_width: *display_width,
                                 },
                                 alignment: match style.alignment {
                                     Alignment::Left => TextAlignment::Left,
@@ -397,7 +402,11 @@ fn push_inline_group(
     let mut text = Vec::new();
     for inline in inlines {
         match inline {
-            Inline::Image { resource_id, alt } => {
+            Inline::Image {
+                resource_id,
+                alt,
+                display_width,
+            } => {
                 ensure_resource(resource_id, available_resources, block_index)?;
                 let id = next_node_id(next_id);
                 members.push(id);
@@ -413,7 +422,7 @@ fn push_inline_group(
                         alt: alt.clone(),
                         natural_size_known: false,
                         natural_size: (1024, 768),
-                        display_width: None,
+                        display_width: *display_width,
                     },
                     alignment: TextAlignment::Left,
                     revision: 0,
@@ -503,12 +512,6 @@ pub fn export_canonical_with_resources(
                         display_width,
                         ..
                     } => {
-                        if display_width.is_some() {
-                            return Err(CanonicalExportError::UnsupportedBlockKind {
-                                block_index: index,
-                                kind: "列表、标题或引用内图片的调整宽度暂不能保存".into(),
-                            });
-                        }
                         inlines.push(Inline::Image {
                             resource_id: parse_allowed_resource(
                                 resource_id,
@@ -516,6 +519,7 @@ pub fn export_canonical_with_resources(
                                 index,
                             )?,
                             alt: alt.clone(),
+                            display_width: *display_width,
                         });
                     }
                     _ => return Err(CanonicalExportError::InvalidTextContent { block_index }),
@@ -1099,6 +1103,7 @@ mod tests {
                 resource_id: app_lite_core::ResourceId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                     .expect("valid resource id"),
                 alt: "尚未支持的图片".into(),
+                display_width: None,
             }],
         }]);
         let imported = import_canonical(&image).expect("legacy inline image must open");
@@ -1129,6 +1134,7 @@ mod tests {
         let image = Inline::Image {
             resource_id: resource.clone(),
             alt: "图".into(),
+            display_width: None,
         };
         let text = |value: &str| Inline::Text {
             text: value.into(),
@@ -1280,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_inline_image_resize_is_rejected_until_canonical_can_store_its_width() {
+    fn grouped_inline_image_resize_saves_and_reopens_with_its_width() {
         use crate::native_editor::transaction::Transaction;
         let canonical = CanonicalDocument::parse_html(
             "<h2>前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">后</h2>",
@@ -1299,10 +1305,19 @@ mod tests {
                 display_width: Some(320),
             })
             .unwrap();
-        assert!(matches!(
-            super::export_canonical(&document),
-            Err(CanonicalExportError::UnsupportedBlockKind { .. })
-        ));
+        let exported = super::export_canonical(&document).expect("width is storable");
+        let html = exported.to_canonical_html();
+        assert!(html.as_str().starts_with("<h2>前<img"), "{}", html.as_str());
+        let reopened = import_canonical(&exported).unwrap();
+        let width = reopened
+            .blocks()
+            .iter()
+            .find_map(|block| match &block.content {
+                BlockContent::Image { display_width, .. } => Some(*display_width),
+                _ => None,
+            });
+        assert_eq!(width, Some(Some(320)));
+        assert_eq!(super::export_canonical(&reopened).unwrap(), exported);
     }
 
     #[test]

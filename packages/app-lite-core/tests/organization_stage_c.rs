@@ -51,6 +51,7 @@ fn image_document(resource_ids: &[app_lite_core::ResourceId]) -> CanonicalDocume
             .map(|(position, resource_id)| Inline::Image {
                 resource_id: resource_id.clone(),
                 alt: format!("resource-{position}"),
+                display_width: None,
             })
             .collect(),
     }])

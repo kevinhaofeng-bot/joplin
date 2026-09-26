@@ -284,6 +284,7 @@ impl<'a> Converter<'a> {
                     out.push(Inline::Image {
                         resource_id: resource.destination_id,
                         alt,
+                        display_width: None,
                     });
                 }
                 Event::Html(_) | Event::InlineHtml(_) | Event::Start(Tag::HtmlBlock) => {
