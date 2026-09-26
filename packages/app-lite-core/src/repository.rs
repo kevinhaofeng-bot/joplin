@@ -1593,6 +1593,11 @@ impl LibraryRepository {
             .ok_or(LibraryError::InvalidSnapshot)?;
         let resource_candidates = purge_resource_candidates(&transaction, id)?;
         transaction.execute("INSERT INTO tombstones (entity_type, entity_id, final_revision, deleted_time, purged_time) VALUES ('note', ?1, ?2, ?3, ?4)", params![id.as_str(), final_revision, deleted_time, now])?;
+        // Permanent delete removes the retained history bodies as well.
+        transaction.execute(
+            "DELETE FROM note_revisions WHERE note_id = ?1",
+            [id.as_str()],
+        )?;
         transaction.execute("DELETE FROM notes WHERE id = ?1", [id.as_str()])?;
         queue_search(&transaction, id, now, "purge")?;
         enqueue_sync(
@@ -1633,10 +1638,14 @@ impl LibraryRepository {
     ) -> Result<Vec<ResourceId>, LibraryError> {
         let mut reclaimed = Vec::new();
         for candidate in candidates {
+            // Another note's retained history (canonical `:/<id>` reference)
+            // still displays this attachment; keep it.
             let deleted = transaction.execute(
                 "DELETE FROM resources
                  WHERE id = ?1
-                   AND NOT EXISTS(SELECT 1 FROM note_resources WHERE resource_id = ?1)",
+                   AND NOT EXISTS(SELECT 1 FROM note_resources WHERE resource_id = ?1)
+                   AND NOT EXISTS(SELECT 1 FROM note_revisions
+                                  WHERE instr(body_html, ':/' || ?1) > 0)",
                 [candidate.id.as_str()],
             )?;
             if deleted == 0 {
@@ -3873,9 +3882,11 @@ fn purge_resource_candidates(
     // including Trash rows that can still be restored.
     let mut statement = transaction.prepare(
         "SELECT DISTINCT r.id, r.sha256, r.revision
-         FROM note_resources nr
-         JOIN resources r ON r.id = nr.resource_id
-         WHERE nr.note_id = ?1 AND nr.is_associated = 1
+         FROM resources r
+         WHERE EXISTS(SELECT 1 FROM note_resources nr
+                      WHERE nr.resource_id = r.id AND nr.note_id = ?1 AND nr.is_associated = 1)
+            OR EXISTS(SELECT 1 FROM note_revisions nv
+                      WHERE nv.note_id = ?1 AND instr(nv.body_html, ':/' || r.id) > 0)
          ORDER BY r.id",
     )?;
     statement

@@ -628,3 +628,88 @@ fn organization_metadata_refresh_reads_no_canonical_body_or_resource_bytes() {
         "organization metadata must not hydrate body/blob columns: {reads:?}"
     );
 }
+
+/// Review focus 3: a resource still referenced by another note's retained
+/// history must survive purging the note that currently uses it.
+#[test]
+fn purge_keeps_a_resource_that_another_notes_history_still_references() {
+    let (_profile, _path, repository) = repository();
+    let shared = repository
+        .import_image(b"history shared payload", "shared", "image/png", "png")
+        .unwrap();
+    let historian = repository
+        .create_note(CreateNote {
+            title: "历史引用".into(),
+            notebook_id: None,
+            document: image_document(std::slice::from_ref(&shared)),
+        })
+        .unwrap();
+    repository
+        .save_note(SaveNote {
+            id: historian.id.clone(),
+            expected_revision: historian.revision,
+            title: "历史引用".into(),
+            document: CanonicalDocument::default(),
+            resource_ids: vec![],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    let current = repository
+        .create_note(CreateNote {
+            title: "当前引用".into(),
+            notebook_id: None,
+            document: image_document(std::slice::from_ref(&shared)),
+        })
+        .unwrap();
+    repository.trash_note(&current.id).unwrap();
+    repository.purge_note(&current.id).unwrap();
+
+    assert!(
+        repository.resource_metadata(&shared).unwrap().is_some(),
+        "history of another note still shows this attachment"
+    );
+    assert_eq!(
+        repository.read_resource_bytes(&shared).unwrap().unwrap(),
+        b"history shared payload"
+    );
+}
+
+/// Permanent delete removes the note's own history bodies, and a resource
+/// only its history referenced is reclaimed with it.
+#[test]
+fn purge_removes_the_notes_own_history_and_its_history_only_resource() {
+    let (_profile, path, repository) = repository();
+    let old = repository
+        .import_image(b"only in my history", "old", "image/png", "png")
+        .unwrap();
+    let note = repository
+        .create_note(CreateNote {
+            title: "将被永久删除".into(),
+            notebook_id: None,
+            document: image_document(std::slice::from_ref(&old)),
+        })
+        .unwrap();
+    let note = repository
+        .save_note(SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: "将被永久删除".into(),
+            document: CanonicalDocument::default(),
+            resource_ids: vec![],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    repository.trash_note(&note.id).unwrap();
+    repository.purge_note(&note.id).unwrap();
+
+    let remaining: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM note_revisions WHERE note_id = ?1",
+            [note.id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "purged history bodies are gone");
+    assert!(repository.resource_metadata(&old).unwrap().is_none());
+}
