@@ -88,9 +88,10 @@
 | --- | --- | --- |
 | 基线 | — | 1386 / 280 |
 | 行内资源链接 `[标签](:/id)` 转为行内附件卡片或图片，标签与文件名不同时保留标签文字 | `c15c16d18` | 1421 / 245 |
-| HTML 块只有被严格 HTML 转换器接受时才转换；行内 `<br>` 转换行；`<img width>` 保存为显示宽度（height 不保存）；无属性的 `<html>`/`<body>` 空包装块跳过（Joplin 显示为空，原字节仍在审计表） | 本节提交 | 1422 / 244 |
-
-| `<html>` 后被 CommonMark 吞入同一 HTML 块的文字：剥离无属性 `<html>/<body>` 标签后，以文字开头的剩余部分包 `<div>`、以标签开头的直接交严格 HTML 转换器；两者混合仍阻断。源码换行沿用转换器约定保留为软换行（Joplin 浏览器会折叠为空格，这是可见差异，不丢文字） | 本步提交 | 1442 / 224 |
+| HTML 块只有被严格 HTML 转换器接受时才转换；行内 `<br>` 转换行；`<img width>` 保存为显示宽度（height 不保存）；无属性的 `<html>`/`<body>` 空包装块跳过（Joplin 显示为空，原字节仍在审计表） | `becdff6d6` | 1422 / 244 |
+| `<html>` 后被 CommonMark 吞入同一 HTML 块的文字：剥离无属性 `<html>/<body>` 标签后，以文字开头的剩余部分包 `<div>`、以标签开头的直接交严格 HTML 转换器；两者混合仍阻断。源码换行沿用转换器约定保留为软换行（Joplin 浏览器会折叠为空格，这是可见差异，不丢文字） | `81b90cd7d` | 1442 / 224 |
+| 自链接资源图片 `[![alt](:/id)](:/id)` 去掉冗余链接；链到别处的仍阻断 | `6bff4936c` | 1442 / 224（真实副本 0 增益：这些笔记同时有其他阻断） |
+跳过空包装块、剥离包装标签都是判断，需要 Codex 确认。审计曾发现我自己写的包装块检测会在中文字符的字节边界上 panic，已修复并加回归。
 
 ### Codex 验收基线后的新鲜隔离导入（HEAD `becdff6d6`）
 
@@ -104,11 +105,7 @@ Codex 已独立核验 `becdff6d6`：core 345 通过；GUI 1362 通过、1 忽略
 
 说明：第一次运行 `backup_verify` 因工作目录不存在报 `TargetParentMissing`（退出101）；创建目录后重跑通过，属于调用方式问题，不是产品缺陷。原生审计编译时工作树里有另一会话未提交的 `app-lite-gpui/src/native_editor/toolbar.rs`，审计入口与它无关，但仍不是纯净构建。原生审计只比较资源顺序和文字，不代替排版、表格的视觉验收。
 
-| 自链接资源图片 `[![alt](:/id)](:/id)` 去掉冗余链接（链接指向图片自身）；链到别处的仍阻断 | `6bff4936c` | 1442 / 224（真实副本 0 增益：这些笔记同时有其他阻断） |
-
-跳过空包装块是一个判断，需要 Codex 确认。审计曾发现我自己写的包装块检测会在中文字符的字节边界上 panic，已修复，并加了回归用例 `<html>中文标题`。
-
-特征组合里仍未处理的：带链接图片 51+、表格 30+、HTML 块跨空行导致的“未闭合元素” 20、外链图片 11、有序列表起始号 11、数学 11、H4 及以上 5。其中带链接图片、表格、列表起始号和 H4 以上都要改原生编辑器（`app-lite-gpui`，现归另一个会话负责），需要先协调。尚未用新代码重新做隔离导入，也没跑原生加载审计：新转换出的笔记还没有在编辑器里验证过打开和回写。
+| 多段落引用 → 相邻多个引用块（只含段落时）；含列表或标题的引用仍阻断 | `cd9405a04` | 1444 / 222 |
 
 ### 剩余警告的真实分布（HEAD `6bff4936c`，只读探针）
 
@@ -149,3 +146,49 @@ Codex 已独立核验 `becdff6d6`：core 345 通过；GUI 1362 通过、1 忽略
 - 界面入口（“导出整个资料库为可读 HTML…”“从可读导出恢复到新资料库…”）属于 `app-lite-gpui`，已把 API 和建议文案发给负责会话，尚未接线。
 - 可读页面的浏览效果没有在浏览器里实际查看。
 - 导出期间没有取消接口；备份（`library_backup`）已有取消，这里还没有。
+
+## ENEX 缺失附件（与 JEX 处理对齐）
+
+依据：Evernote `main-readable/src/modules/11354__enex-exporter.js` 的 `k()`（86-146 行）在读不到附件时只记日志、跳过该附件，所以 Evernote 自己导出的 ENEX 可能含有没有数据的 `en-media`。旧实现遇到这种情况会拒绝整个导入（02 号证据列为未解决项）。
+
+`0cddd7182`：
+- 该位置写入可见占位 `[附件缺失：<类型> MD5 <哈希>]`（块级为段落，行内为文字）。
+- 笔记记入降级报告，原因 `Attachment data missing from ENEX: <md5…>`。
+- 同一笔记的其余格式和附件照常保留；导入后回读校验使用同一缺失集合。
+
+测试：
+- 新增 `missing_attachment_data_leaves_a_visible_placeholder_and_a_report`（粗体、另一张图片保留，占位可见，报告含 MD5）。先失败证据：旧代码返回 `MissingResource`。
+- 原“整库拒绝缺失附件”的断言按新策略删除。原子性测试 `second_note_failure_discards_previously_staged_note_and_attachment` 改用第二篇的非法时间戳（`InvalidDate`，在创建笔记后硬失败）作为触发，仍然断言失败后不留暂存目录、不改兄弟 profile。
+
+core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
+
+## 中间 HEAD `fb3de66cc` 的新鲜隔离导入与原生审计
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| `import_verify`（同上参数，输出 `/tmp/joplin-stage2-import2.lFpuSu/imports`） | 退出0，86.0 s；计数与上轮相同；降级 224（与只读审计一致）；发布 blob 0 不符，源 blob 缺失 0、多余 0 | `/tmp/joplin-stage2-import2.lFpuSu/verify.log` |
+| 原生加载/回写审计（同上命令，指向 `/tmp/joplin-stage2-import2.lFpuSu/imports/all_notebooks-1790458774/library.sqlite`） | 退出0；`real-copy notes=1666, failure_categories={}`；运行时 `app-lite-gpui` 无未提交改动（`gpui-dirty.txt` 为空） | `/tmp/joplin-stage2-import2.lFpuSu/native-audit.log` |
+
+## 阶段2 最终验证（HEAD `0cddd7182`，其后 `e171bbbf0` 只改导出侧历史大小检查）
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| `import_verify`：JEX 副本 → `/tmp/joplin-stage2-import3.4Ivyn1/imports` | 退出0，89.1 s；1666/31/2/64/425/4153/4127；**降级 222**（与只读审计 1444/222 一致）；发布 blob 0 不符，源 blob 缺失 0、多余 0 | `/tmp/joplin-stage2-import3.4Ivyn1/verify.log` |
+| `import_verify`：3 个 ENEX 副本（SHA256 `69d3d2c6…`、`df9b6210…`、`0576faba…`，与 02 号证据相同）→ `/tmp/joplin-stage2-import3.4Ivyn1/enex` | 3 个都退出0；各 1 篇；降级 0/0/1（与 02 号证据一致，那 1 篇是状态冲突的重复复选框）；这批 ENEX 没有附件，不能证明缺附件这条路径，该路径只有单元测试证据 | `/tmp/joplin-stage2-import3.4Ivyn1/enex.log` |
+| 原生加载/回写审计 → `/tmp/joplin-stage2-import3.4Ivyn1/imports/all_notebooks-1790459274/library.sqlite` | 退出0；`real-copy notes=1666, failure_categories={}`；运行时 `app-lite-gpui` 无未提交改动 | `/tmp/joplin-stage2-import3.4Ivyn1/native-audit.log` |
+| `cargo test --manifest-path packages/app-lite-core/Cargo.toml --features test-support --tests`（HEAD `e171bbbf0`） | 退出0；351 通过、0 失败 | `/tmp/joplin-stage2-claude/core-final.log` |
+| `cargo test --manifest-path packages/app-lite-server/Cargo.toml --offline` | 退出0；10 通过 | `/tmp/joplin-stage2-claude/server-final.log` |
+| `git diff --check` | 退出0 | — |
+
+本阶段没有重跑 GUI 全套：本会话没有改 `app-lite-gpui`，GUI 仍以 Codex 在 `becdff6d6` 的 1362 通过为最近一次全套结果。core 改动经 GUI 的原生审计间接覆盖。
+
+### 阶段2 未通过 / 未完成
+
+- 222 篇仍降级（13.3%）。主要是表格、带链接图片、列表嵌套深度、H4 及以上、有序列表起始号、数学公式、外链图片，都需要原生编辑器新增表示（表格、图片链接等），已发方案给负责 `app-lite-gpui` 的会话，尚未实现。降级笔记的文字和附件都保留，原始字节在审计表中。
+- 疑似产品缺陷未确认：嵌套列表在编辑器中能缩进，但 codec 导出拒绝 depth≠0，可能导致缩进后无法保存。已转交该会话。
+- 全库可读导出/恢复没有界面入口，由另一会话接线；导出没有取消；可读页面没有在浏览器里实际查看。
+- 以下项都属于 Codex 或实机验收，本会话没做：迁移的视觉验收（Release 实机、表格/图文/长文/中文特殊字符的排版）、“从菜单导入 → 搜索 → 重开”的实机流程。
+- `jex_qualification` 的预检报告仍按旧规则把 source_url、is_todo、混合文件夹列为阻断（02 号证据的遗留项），导入流程和验收都不用它，没有改。
+
+- Claude 实施状态：阶段2 进行中（core 部分已提交，待验收）
+- Codex 验收状态：未验收
