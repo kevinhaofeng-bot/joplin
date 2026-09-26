@@ -283,6 +283,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if std::env::var_os("JOPLIN_LITE_AUDIT_TABLES").is_some() {
+        table_inventory(&db)?;
+    }
     println!(
         "strict_passed={passed} warnings={}",
         failures.values().sum::<usize>()
@@ -304,5 +307,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("kinds\t{reason}\t{kinds:?}");
         }
     }
+    Ok(())
+}
+
+/// Structural inventory of Markdown tables across all notes: counts only.
+fn table_inventory(db: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    use pulldown_cmark::{Alignment, Event as E, Options, Parser, Tag as T, TagEnd};
+    let mut notes_with_tables = 0;
+    let mut tables = 0;
+    let mut columns = BTreeMap::<usize, usize>::new();
+    let mut rows = BTreeMap::<&'static str, usize>::new();
+    let mut alignments = BTreeMap::<&'static str, usize>::new();
+    let mut in_cell = BTreeMap::<String, usize>::new();
+    let mut statement = db.prepare("SELECT raw_body_bytes FROM jex_stage_note_audit")?;
+    for bytes in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
+        let bytes = bytes?;
+        let body = std::str::from_utf8(&bytes)?;
+        let mut note_has_table = false;
+        let mut cell = false;
+        let mut row_count = 0usize;
+        for event in Parser::new_ext(body, Options::all()) {
+            match &event {
+                E::Start(T::Table(aligns)) => {
+                    note_has_table = true;
+                    tables += 1;
+                    row_count = 0;
+                    *columns.entry(aligns.len().min(12)).or_default() += 1;
+                    for align in aligns {
+                        *alignments
+                            .entry(match align {
+                                Alignment::None => "none",
+                                Alignment::Left => "left",
+                                Alignment::Center => "center",
+                                Alignment::Right => "right",
+                            })
+                            .or_default() += 1;
+                    }
+                }
+                E::End(TagEnd::Table) => {
+                    let bucket = match row_count {
+                        0..=5 => "1-5",
+                        6..=20 => "6-20",
+                        21..=100 => "21-100",
+                        _ => ">100",
+                    };
+                    *rows.entry(bucket).or_default() += 1;
+                }
+                E::Start(T::TableRow) | E::Start(T::TableHead) => row_count += 1,
+                E::Start(T::TableCell) => cell = true,
+                E::End(TagEnd::TableCell) => cell = false,
+                _ => {}
+            }
+            if cell {
+                let kind = match &event {
+                    E::Start(tag) => format!("{tag:?}"),
+                    E::InlineHtml(html) => format!(
+                        "InlineHtml<{}>",
+                        html.trim_start_matches('<')
+                            .trim_start_matches('/')
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric())
+                            .collect::<String>()
+                            .to_ascii_lowercase()
+                    ),
+                    E::Code(_) => "Code".into(),
+                    E::InlineMath(_) => "InlineMath".into(),
+                    E::SoftBreak | E::HardBreak => "Break".into(),
+                    _ => continue,
+                };
+                let name = kind
+                    .split(|c: char| c == '(' || c == ' ' || c == '{')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                *in_cell.entry(name).or_default() += 1;
+            }
+        }
+        if note_has_table {
+            notes_with_tables += 1;
+        }
+    }
+    println!("tables notes={notes_with_tables} tables={tables}");
+    println!("tables columns(capped 12)={columns:?}");
+    println!("tables rows={rows:?}");
+    println!("tables column_alignments={alignments:?}");
+    println!("tables in_cell={in_cell:?}");
     Ok(())
 }
