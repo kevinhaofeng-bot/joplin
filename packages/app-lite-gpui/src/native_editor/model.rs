@@ -2118,34 +2118,61 @@ impl Document {
         if before.is_empty() {
             return self.apply_transaction_raw(transaction);
         }
-        let attachment_to_plain_parent = matches!(&transaction, Transaction::InsertAttachment { .. })
-            && before.iter().all(|group| group.kind == BlockKind::Paragraph && group.members.len() == 1);
-        if matches!(&transaction, Transaction::InsertAttachment { .. }) && !attachment_to_plain_parent {
+        let attachment_to_plain_parent =
+            matches!(&transaction, Transaction::InsertAttachment { .. })
+                && before
+                    .iter()
+                    .all(|group| group.kind == BlockKind::Paragraph && group.members.len() == 1);
+        if matches!(&transaction, Transaction::InsertAttachment { .. })
+            && !attachment_to_plain_parent
+        {
             return Err(DocumentError::InvalidOperation(
                 "含图的标题、引用或列表项内暂不支持文件附件，请在独立正文段落中插入".into(),
             ));
         }
         // Joining parents adopts the left parent's paragraph style. Its
         // remaining rows therefore belong to the local undo payload too.
-        let parent_restore = if before.len() > 1 && matches!(&transaction,
-            Transaction::DeleteRange { .. } | Transaction::InsertText { .. } | Transaction::MergeBlocks { .. }) {
-            let (start,end) = range.expect("selected parent range");
-            let (start,end) = self.semantic_parent_range(start,end);
-            Some((start, self.blocks.len(), self.blocks.collect_range(start..end + 1)))
-        } else { None };
+        let parent_restore = if before.len() > 1
+            && matches!(
+                &transaction,
+                Transaction::DeleteRange { .. }
+                    | Transaction::InsertText { .. }
+                    | Transaction::MergeBlocks { .. }
+            ) {
+            let (start, end) = range.expect("selected parent range");
+            let (start, end) = self.semantic_parent_range(start, end);
+            Some((
+                start,
+                self.blocks.len(),
+                self.blocks.collect_range(start..end + 1),
+            ))
+        } else {
+            None
+        };
         let split_at = if let Transaction::SplitBlock { at } = &transaction {
             Some(at.node_id)
         } else {
             None
         };
         let allocation_start = self.next_id;
-        let parent_alignments: Vec<_> = before.iter().map(|group|
-            group.members.iter().filter_map(|id| self.block(*id)).find(|block| is_text_block(block))
-                .map(|block| block.alignment).unwrap_or(TextAlignment::Left)).collect();
+        let parent_alignments: Vec<_> = before
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .filter_map(|id| self.block(*id))
+                    .find(|block| is_text_block(block))
+                    .map(|block| block.alignment)
+                    .unwrap_or(TextAlignment::Left)
+            })
+            .collect();
         let mut outcome = self.apply_transaction_raw(transaction)?;
         let mut after = Vec::new();
         for (group_index, group) in before.iter().enumerate() {
-            if attachment_to_plain_parent { continue; }
+            if attachment_to_plain_parent {
+                continue;
+            }
             if let Some(position) =
                 split_at.and_then(|id| group.members.iter().position(|member| *member == id))
             {
@@ -2166,7 +2193,9 @@ impl Document {
             }
             let mut members = group.members.clone();
             for splice in &outcome.structural_splices {
-                if splice.removed.is_empty() || splice.removed.iter().any(|id| group.members.contains(id)) {
+                if splice.removed.is_empty()
+                    || splice.removed.iter().any(|id| group.members.contains(id))
+                {
                     members.extend(splice.inserted.iter().copied());
                 }
             }
@@ -2183,7 +2212,10 @@ impl Document {
             // An insertion point materialized beside an image belongs to the
             // same semantic parent, not a fresh default-style paragraph.
             for id in members.iter().filter(|id| id.raw() >= allocation_start) {
-                let index = self.blocks.index_of_node(*id).expect("live inserted member");
+                let index = self
+                    .blocks
+                    .index_of_node(*id)
+                    .expect("live inserted member");
                 let mut block = self.blocks[index].clone();
                 if is_text_block(&block) {
                     block.kind = group.kind.clone();
@@ -2225,26 +2257,44 @@ impl Document {
         }
         if let Some((start, old_count, originals)) = parent_restore {
             for group in &mut after {
-                if before.iter().filter(|old| old.members.iter().any(|id| group.members.contains(id))).count() < 2 {
+                if before
+                    .iter()
+                    .filter(|old| old.members.iter().any(|id| group.members.contains(id)))
+                    .count()
+                    < 2
+                {
                     continue;
                 }
-                let Some((kind, alignment)) = group.members.iter().filter_map(|id| self.block(*id))
-                    .find(|block| is_text_block(block)).map(|block| (block.kind.clone(),block.alignment)) else { continue };
+                let Some((kind, alignment)) = group
+                    .members
+                    .iter()
+                    .filter_map(|id| self.block(*id))
+                    .find(|block| is_text_block(block))
+                    .map(|block| (block.kind.clone(), block.alignment))
+                else {
+                    continue;
+                };
                 group.kind = kind.clone();
                 for id in &group.members {
                     let index = self.blocks.index_of_node(*id).expect("live group member");
                     let mut block = self.blocks[index].clone();
-                    if is_text_block(&block) && (block.kind != kind || block.alignment != alignment) {
+                    if is_text_block(&block) && (block.kind != kind || block.alignment != alignment)
+                    {
                         block.kind = kind.clone();
                         block.alignment = alignment;
                         block.revision = self.revision;
                         self.blocks.replace(index, block);
-                        push_unique(&mut outcome.changed_nodes,*id);
+                        push_unique(&mut outcome.changed_nodes, *id);
                     }
                 }
             }
-            let remove_count = (originals.len() as isize + self.blocks.len() as isize - old_count as isize) as usize;
-            outcome.inverse = TransactionBatch(vec![Transaction::RestoreBlocks { index:start,remove_count,blocks:originals }]);
+            let remove_count = (originals.len() as isize + self.blocks.len() as isize
+                - old_count as isize) as usize;
+            outcome.inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
+                index: start,
+                remove_count,
+                blocks: originals,
+            }]);
         }
         let remove = before
             .iter()
@@ -4494,15 +4544,36 @@ fn push_unique(nodes: &mut SmallVec<[NodeId; 4]>, node_id: NodeId) {
 mod tests {
     #[test]
     fn inline_group_terminal_image_text_inherits_parent_alignment() {
-        let canonical = app_lite_core::CanonicalDocument::parse_html("<h2>before<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"></h2>").unwrap();
+        let canonical = app_lite_core::CanonicalDocument::parse_html(
+            "<h2>before<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"></h2>",
+        )
+        .unwrap();
         let mut doc = crate::native_editor::codec::import_canonical(&canonical).unwrap();
-        let point = |id| super::DocPoint { node_id: id, utf8_offset: 0, affinity: super::Affinity::After };
-        doc.apply(super::Transaction::SetAlignment { selection: super::Selection::caret(point(doc.blocks()[0].id)), alignment: super::TextAlignment::Center }).unwrap();
+        let point = |id| super::DocPoint {
+            node_id: id,
+            utf8_offset: 0,
+            affinity: super::Affinity::After,
+        };
+        doc.apply(super::Transaction::SetAlignment {
+            selection: super::Selection::caret(point(doc.blocks()[0].id)),
+            alignment: super::TextAlignment::Center,
+        })
+        .unwrap();
         let before = doc.semantic_snapshot();
-        let outcome = doc.apply(super::Transaction::EnsureParagraph { selection: super::Selection::caret(point(doc.blocks()[1].id)) }).unwrap();
+        let outcome = doc
+            .apply(super::Transaction::EnsureParagraph {
+                selection: super::Selection::caret(point(doc.blocks()[1].id)),
+            })
+            .unwrap();
         assert!(crate::native_editor::codec::export_canonical(&doc).is_ok());
-        assert_eq!(doc.blocks().last().unwrap().alignment, super::TextAlignment::Center);
-        assert_eq!(doc.blocks().last().unwrap().kind, super::BlockKind::Heading { level: 2 });
+        assert_eq!(
+            doc.blocks().last().unwrap().alignment,
+            super::TextAlignment::Center
+        );
+        assert_eq!(
+            doc.blocks().last().unwrap().kind,
+            super::BlockKind::Heading { level: 2 }
+        );
         doc.apply_batch(outcome.inverse).unwrap();
         assert_eq!(doc.semantic_snapshot(), before);
     }
@@ -4511,14 +4582,38 @@ mod tests {
         let mut doc = super::Document::from_paragraphs(["a", "b", "c", "d"]);
         let ids: Vec<_> = doc.blocks().iter().map(|block| block.id).collect();
         doc.set_inline_groups(vec![
-            super::InlineGroup { kind: super::BlockKind::Paragraph, members: ids[..2].to_vec() },
-            super::InlineGroup { kind: super::BlockKind::Paragraph, members: ids[2..].to_vec() },
+            super::InlineGroup {
+                kind: super::BlockKind::Paragraph,
+                members: ids[..2].to_vec(),
+            },
+            super::InlineGroup {
+                kind: super::BlockKind::Paragraph,
+                members: ids[2..].to_vec(),
+            },
         ]);
-        let point = |id, offset| super::DocPoint { node_id: id, utf8_offset: offset, affinity: super::Affinity::After };
-        doc.apply(super::Transaction::SetAlignment { selection: super::Selection::caret(point(ids[2], 0)), alignment: super::TextAlignment::Center }).unwrap();
+        let point = |id, offset| super::DocPoint {
+            node_id: id,
+            utf8_offset: offset,
+            affinity: super::Affinity::After,
+        };
+        doc.apply(super::Transaction::SetAlignment {
+            selection: super::Selection::caret(point(ids[2], 0)),
+            alignment: super::TextAlignment::Center,
+        })
+        .unwrap();
         let before = doc.semantic_snapshot();
-        let outcome = doc.apply(super::Transaction::DeleteRange { selection: super::Selection { anchor: point(ids[1],0), head: point(ids[2],1) } }).unwrap();
-        assert!(crate::native_editor::codec::export_canonical(&doc).is_ok(), "cross-parent edit must remain saveable");
+        let outcome = doc
+            .apply(super::Transaction::DeleteRange {
+                selection: super::Selection {
+                    anchor: point(ids[1], 0),
+                    head: point(ids[2], 1),
+                },
+            })
+            .unwrap();
+        assert!(
+            crate::native_editor::codec::export_canonical(&doc).is_ok(),
+            "cross-parent edit must remain saveable"
+        );
         let after = doc.semantic_snapshot();
         let undone = doc.apply_batch(outcome.inverse).unwrap();
         assert_eq!(doc.semantic_snapshot(), before);
@@ -4528,23 +4623,48 @@ mod tests {
 
     #[test]
     fn inline_group_atomic_image_insertion_is_saveable_and_attachment_rejects_before_mutation() {
-        let canonical = app_lite_core::CanonicalDocument::parse_html("<h2>before<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">after</h2>").unwrap();
+        let canonical = app_lite_core::CanonicalDocument::parse_html(
+            "<h2>before<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">after</h2>",
+        )
+        .unwrap();
         let mut doc = crate::native_editor::codec::import_canonical(&canonical).unwrap();
         let before = doc.semantic_snapshot();
         let image = doc.blocks()[1].id;
-        let outcome = doc.apply(super::Transaction::InsertImage {
-            selection: super::Selection::caret(super::DocPoint { node_id: image, utf8_offset: 0, affinity: super::Affinity::After }),
-            resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(), natural_size: (20,30),
-        }).unwrap();
-        assert_eq!(crate::native_editor::codec::export_canonical(&doc).unwrap().resource_ids().len(), 2);
+        let outcome = doc
+            .apply(super::Transaction::InsertImage {
+                selection: super::Selection::caret(super::DocPoint {
+                    node_id: image,
+                    utf8_offset: 0,
+                    affinity: super::Affinity::After,
+                }),
+                resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                natural_size: (20, 30),
+            })
+            .unwrap();
+        assert_eq!(
+            crate::native_editor::codec::export_canonical(&doc)
+                .unwrap()
+                .resource_ids()
+                .len(),
+            2
+        );
         doc.apply_batch(outcome.inverse).unwrap();
         assert_eq!(doc.semantic_snapshot(), before);
         let unchanged = doc.clone();
         let result = doc.apply(super::Transaction::InsertAttachment {
-            selection: super::Selection::caret(super::DocPoint { node_id: doc.blocks()[0].id, utf8_offset: 2, affinity: super::Affinity::After }),
-            resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(), filename: "file.pdf".into(), media_type: "application/pdf".into(),
+            selection: super::Selection::caret(super::DocPoint {
+                node_id: doc.blocks()[0].id,
+                utf8_offset: 2,
+                affinity: super::Affinity::After,
+            }),
+            resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            filename: "file.pdf".into(),
+            media_type: "application/pdf".into(),
         });
-        assert!(result.is_err(), "unsupported inline attachment must fail before editing");
+        assert!(
+            result.is_err(),
+            "unsupported inline attachment must fail before editing"
+        );
         assert_eq!(doc, unchanged);
     }
     #[test]
