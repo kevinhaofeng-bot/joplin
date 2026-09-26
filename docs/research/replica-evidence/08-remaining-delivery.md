@@ -145,7 +145,7 @@ Codex 已独立核验 `becdff6d6`：core 345 通过；GUI 1362 通过、1 忽略
 日志中有一行 `restored_blob_dir_entries 0`，是探针自身的统计错误（blob 不在 `blobs/` 目录下），已从探针删除，不影响上面的表摘要和重新哈希结论。
 
 未完成：
-- 界面入口（“导出整个资料库为可读 HTML…”“从可读导出恢复到新资料库…”）属于 `app-lite-gpui`，已把 API 和建议文案发给负责会话，尚未接线。
+- 界面入口（“导出整个资料库为可读 HTML…”“从可读导出恢复到新资料库…”）已由另一会话接线，见下文 C（`dd13ee9fc`）；本会话未做实机验证。
 - 可读页面的浏览效果没有在浏览器里实际查看。
 - 导出期间没有取消接口；备份（`library_backup`）已有取消，这里还没有。
 
@@ -217,3 +217,32 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 注意：这次原生审计的构建包含另一会话尚未提交的 C 菜单改动（`app/actions.rs`、`library_menu.rs`、`ui/library_backup.rs`、`ui/library_import.rs`、`ui/library_import_tests.rs`、`ui/mod.rs`，见 `/tmp/joplin-stage2-import4.1wdHFf/gpui-dirty.txt`），不是纯净构建。审计入口不经过菜单，但 Codex 仍需在干净检出上复核。`451f556a8` 这一步（+2 篇）只重跑了只读审计和 core 全套（356 通过，`/tmp/joplin-stage2-claude/core-nonimage.log`），没有另做新鲜导入。
 
 剩余 164 篇降级，已按收益发给负责 `app-lite-gpui` 的会话排期：表格 64、H4–H6 14、有序列表起始号 12、行内数学约 12、外链图片约 11（是否联网抓取涉及隐私，建议保持降级，由用户决定）。
+
+## C：全库可读导出/恢复的菜单入口（另一会话 `dd13ee9fc`）
+
+据该会话报告：菜单“导出整个资料库为可读 HTML…”“从可读导出恢复到新资料库…”已接上；导出前 flush，选择器返回时再 flush 一次；恢复到 `imported-libraries/` 下的新目录，失败时删除该目录，成功后走“打开导入的资料库”；新增两条挂载测试，GPUI 1368/1368。本会话没有改动或复核其实现，只在下方纯净构建中跑了全套。该会话提示：`mounted_scheduler_close_finishes_only_active_index_transaction` 在高负载下偶发卡死（钩子里 `recv()` 无超时），单独运行能通过。
+
+## 表格结构清单（供表格方案评估，`81b996885`）
+
+`JOPLIN_LITE_AUDIT_TABLES=1 cargo run -q --release --locked --example migration_fidelity_audit /tmp/joplin-migration-current.MeMdVA/all_notebooks-1790430342/library.sqlite`，只读，只输出计数：
+
+- 含表格笔记 76 篇，表格 290 张。
+- 列数：1 列 126、2 列 109、3 列 24、4 列 10、5 列 6、6–7 列 6、≥9 列 9。八成以上是 1–2 列，更像 Evernote 式“单格框/两栏”排版。
+- 行数：1–5 行 231、6–20 行 42、21–100 行 14、>100 行 3。
+- 列对齐：691 列全部未设置。
+- 单元格内：`<br>` 803、链接 532、行内代码 78、图片 68、粗体 62、斜体 7、行内数学 6、HTML `<a>` 14；GFM 单元格只能放行内内容，所以没有单元格内的块级内容。
+
+已把这份清单发给负责 `app-lite-gpui` 的会话作为表格方案输入；方案确认前双方都不改代码。H4–H6 与有序列表起始号由该会话改 `document.rs`（已锁定 `document.rs`、`jex_body.rs`、`jex_html.rs`、enml），完成后由本会话接导入映射（约 26 篇）。
+
+## 纯净构建回归（HEAD `81b996885`，含另一会话 A/B/C）
+
+为避免并行会话未提交改动混入，用 `git worktree add --detach <草稿区>/clean-81b996885 81b996885` 单独检出，`CARGO_TARGET_DIR` 指向独立目录从零编译；运行时检出无任何未提交改动。日志目录 `/tmp/joplin-stage2-claude/clean-81b996885/`。
+
+| 命令（在该检出内） | 结果 | 日志 |
+| --- | --- | --- |
+| `cargo test --locked --bin velotype`（`packages/app-lite-gpui`） | 退出0；1368 通过、0 失败、1 忽略；未遇到偶发卡死 | `gpui.log` |
+| 原生加载/回写审计 → `/tmp/joplin-stage2-import4.1wdHFf/imports/all_notebooks-1790460896/library.sqlite` | 退出0；`real-copy notes=1666, failure_categories={}` | `audit.log` |
+| `cargo test --manifest-path packages/app-lite-core/Cargo.toml --features test-support --tests` | 退出0；356 通过、0 失败 | `core.log` |
+| `cargo test --manifest-path packages/app-lite-server/Cargo.toml --offline` | 退出0；10 通过 | `server.log` |
+
+编译警告仍存在（GUI 测试构建输出 150 行 `warning`），未清零。临时检出用后已 `git worktree remove`。这是本会话自测，不代替 Codex 验收。
