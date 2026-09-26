@@ -48,13 +48,19 @@ impl Default for SearchQuery {
 }
 impl SearchQuery {
     pub const MAX_PAGE_SIZE: usize = 500;
+    /// Parses with the system time zone for calendar-day date filters.
     pub fn parse(input: &str) -> Self {
+        Self::parse_at(input, local_utc_offset_seconds())
+    }
+    /// Parses with an explicit UTC offset (seconds east of UTC) for
+    /// `created:YYYYMMDD` / `updated:YYYYMMDD..YYYYMMDD` / `day-N`.
+    pub fn parse_at(input: &str, utc_offset_seconds: i64) -> Self {
         let mut query = Self::default();
         for (raw, quoted) in tokens(input) {
             let (negated, value) = raw
                 .strip_prefix('-')
                 .map_or((false, raw.as_str()), |v| (true, v));
-            if let Some(filter) = parse_filter(value) {
+            if let Some(filter) = parse_filter(value, utc_offset_seconds) {
                 if !negated || matches!(filter, SearchFilter::Tag(_) | SearchFilter::Notebook(_)) {
                     query.filters.push(if negated {
                         SearchFilter::Not(Box::new(filter))
@@ -130,7 +136,7 @@ fn tokens(input: &str) -> Vec<(String, bool)> {
     }
     out
 }
-fn parse_filter(value: &str) -> Option<SearchFilter> {
+fn parse_filter(value: &str, utc_offset_seconds: i64) -> Option<SearchFilter> {
     let Some((name, raw)) = value.split_once(':') else {
         return None;
     };
@@ -146,16 +152,23 @@ fn parse_filter(value: &str) -> Option<SearchFilter> {
             "false" => SearchFilter::Trash(false),
             _ => return None,
         },
+        // Spec syntax `is:trash`; Evernote's own `intrash:` prefix.
+        "is" if raw.eq_ignore_ascii_case("trash") => SearchFilter::Trash(true),
+        "intrash" => SearchFilter::Trash(!raw.eq_ignore_ascii_case("false")),
+        // Spec `has:attachment`; Evernote `contains:attachment`.
+        "has" | "contains" if raw.eq_ignore_ascii_case("attachment") => {
+            SearchFilter::HasAttachment(true)
+        }
         "hasattachment" => match raw {
             "true" => SearchFilter::HasAttachment(true),
             "false" => SearchFilter::HasAttachment(false),
             _ => return None,
         },
-        "created" => match date_range(raw) {
+        "created" => match date_range(raw, utc_offset_seconds) {
             Some(range) => SearchFilter::Created(range),
             None => return None,
         },
-        "updated" => match date_range(raw) {
+        "updated" => match date_range(raw, utc_offset_seconds) {
             Some(range) => SearchFilter::Updated(range),
             None => return None,
         },
@@ -165,27 +178,99 @@ fn parse_filter(value: &str) -> Option<SearchFilter> {
     };
     Some(filter)
 }
-fn date_range(raw: &str) -> Option<DateRange> {
+/// Start of a local calendar day in epoch milliseconds, for `YYYYMMDD`.
+fn local_day_start(raw: &str, utc_offset_seconds: i64) -> Option<i64> {
+    if raw.len() != 8 || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (year, month, day): (i64, i64, i64) = (
+        raw[..4].parse().ok()?,
+        raw[4..6].parse().ok()?,
+        raw[6..].parse().ok()?,
+    );
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if year < 1 || !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 - utc_offset_seconds) * 1000)
+}
+
+/// One bound of a date range: `YYYYMMDD` (local day), `day-N` (start of
+/// the local day N days ago) or raw epoch milliseconds. `end` selects the
+/// last millisecond of a calendar day.
+fn date_bound(raw: &str, utc_offset_seconds: i64, end: bool) -> Option<i64> {
+    const DAY_MS: i64 = 86_400_000;
+    if let Some(start) = local_day_start(raw, utc_offset_seconds) {
+        return Some(if end { start + DAY_MS - 1 } else { start });
+    }
+    if let Some(days) = raw.strip_prefix("day-").and_then(|n| n.parse::<i64>().ok()) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i64;
+        let offset_ms = utc_offset_seconds * 1000;
+        let today = (now + offset_ms).div_euclid(DAY_MS) * DAY_MS - offset_ms;
+        let start = today - days * DAY_MS;
+        return Some(if end { start + DAY_MS - 1 } else { start });
+    }
+    raw.parse().ok()
+}
+
+fn date_range(raw: &str, utc_offset_seconds: i64) -> Option<DateRange> {
     if let Some((start, end)) = raw.split_once("..") {
         let start = if start.is_empty() {
             Some(None)
         } else {
-            start.parse().ok().map(Some)
+            date_bound(start, utc_offset_seconds, false).map(Some)
         }?;
         let end = if end.is_empty() {
             Some(None)
         } else {
-            end.parse().ok().map(Some)
+            date_bound(end, utc_offset_seconds, true).map(Some)
         }?;
         if start.is_none() && end.is_none() || matches!((start, end), (Some(a), Some(b)) if a > b) {
             return None;
         }
         return Some(DateRange { start, end });
     }
-    raw.parse().ok().map(|value| DateRange {
-        start: Some(value),
-        end: Some(value),
+    if raw.starts_with("day-") {
+        // Evernote `created:day-7`: from that day onward.
+        return Some(DateRange {
+            start: Some(date_bound(raw, utc_offset_seconds, false)?),
+            end: None,
+        });
+    }
+    Some(DateRange {
+        start: Some(date_bound(raw, utc_offset_seconds, false)?),
+        end: Some(date_bound(raw, utc_offset_seconds, true)?),
     })
+}
+
+fn local_utc_offset_seconds() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as libc::time_t)
+        .unwrap_or_default();
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r writes only into the provided struct.
+    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {

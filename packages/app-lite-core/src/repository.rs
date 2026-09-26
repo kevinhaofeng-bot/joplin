@@ -664,6 +664,7 @@ impl LibraryRepository {
         // transient filesystem refusal leaves this durable queue for a later
         // open. It must never make an already-published database unusable.
         let _ = repository.drain_resource_gc();
+        let _ = repository.requeue_transient_derived_text_failures();
         Ok(repository)
     }
 
@@ -3099,6 +3100,21 @@ impl LibraryRepository {
         let connection = self.connection.lock().expect("library mutex poisoned");
         let changed = connection.execute("UPDATE derived_text_jobs SET state='failed',failure=?4,attempts=attempts+1,updated_time=?5 WHERE resource_id=?1 AND sha256=?2 AND extractor_version=?3 AND extractor_version=?6 AND state='pending' AND EXISTS(SELECT 1 FROM resources r WHERE r.id=derived_text_jobs.resource_id AND r.sha256=derived_text_jobs.sha256 AND r.deleted_time=0) AND EXISTS(SELECT 1 FROM note_resources nr JOIN notes n ON n.id=nr.note_id WHERE nr.resource_id=derived_text_jobs.resource_id AND nr.is_associated=1 AND n.deleted_time=0)", params![job.resource_id.as_str(), job.sha256.as_str(), &job.extractor_version, failure.as_str(), now, DERIVED_TEXT_EXTRACTOR_VERSION])?;
         Ok(changed == 1)
+    }
+
+    /// Bounded automatic retry: a job that failed for a transient reason
+    /// (worker unavailable, timeout, unclassified) returns to pending on the
+    /// next open while it has fewer than three attempts. Deterministic
+    /// failures (unsupported, parse, locked, no text, too large) stay failed.
+    fn requeue_transient_derived_text_failures(&self) -> Result<usize, LibraryError> {
+        // Leaves updated_time (queue order) and the clock untouched.
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        Ok(connection.execute(
+            "UPDATE derived_text_jobs SET state='pending', failure=NULL
+             WHERE state='failed' AND attempts < 3
+               AND failure IN ('unavailable','timeout','failed')",
+            [],
+        )?)
     }
 
     pub fn retry_derived_text(&self, job: &DerivedTextJob) -> Result<bool, LibraryError> {

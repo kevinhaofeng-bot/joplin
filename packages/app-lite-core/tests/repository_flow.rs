@@ -651,3 +651,62 @@ fn closing_a_second_repository_on_the_same_file_keeps_the_first_ones_locks() {
         .unwrap();
     assert!(profile.path().join("library.sqlite-wal").exists());
 }
+
+/// Transient extraction failures are retried on the next open (bounded);
+/// deterministic ones stay failed and visible.
+#[test]
+fn reopening_requeues_transient_derived_text_failures_up_to_three_attempts() {
+    use app_lite_core::{DerivedTextFailure, DerivedTextStatus};
+    let profile = tempfile::tempdir().unwrap();
+    let db = profile.path().join("library.sqlite");
+    let repo = app_lite_core::LibraryRepository::open(&db).unwrap();
+    let image = repo
+        .import_resource(b"\x89PNG\r\n\x1a\nfake", "shot.png", "image/png", "png")
+        .unwrap();
+    let pdf = repo
+        .import_resource(b"%PDF-1.4 broken", "bad.pdf", "application/pdf", "pdf")
+        .unwrap();
+    for resource in [&image, &pdf] {
+        repo.create_note(app_lite_core::CreateNote {
+            title: "附件".into(),
+            notebook_id: None,
+            document: app_lite_core::CanonicalDocument::from_blocks(vec![
+                app_lite_core::document::Block::Attachment {
+                    resource_id: resource.clone(),
+                    filename: "x".into(),
+                    media_type: "application/octet-stream".into(),
+                },
+            ]),
+        })
+        .unwrap();
+    }
+    let fail_all = |repo: &app_lite_core::LibraryRepository| {
+        for job in repo.take_derived_text_jobs(10).unwrap() {
+            let failure = if job.resource_id == image {
+                DerivedTextFailure::Timeout
+            } else {
+                DerivedTextFailure::Parse
+            };
+            repo.fail_derived_text(&job, failure).unwrap();
+        }
+    };
+    let mut repo = repo;
+    for attempt in 1..=3 {
+        fail_all(&repo);
+        drop(repo);
+        repo = app_lite_core::LibraryRepository::open(&db).unwrap();
+        let expected_pending = attempt < 3;
+        assert_eq!(
+            matches!(
+                repo.derived_text_status(&image).unwrap(),
+                Some(DerivedTextStatus::Pending { .. })
+            ),
+            expected_pending,
+            "timeout after attempt {attempt}"
+        );
+        assert!(matches!(
+            repo.derived_text_status(&pdf).unwrap(),
+            Some(DerivedTextStatus::Failed { .. })
+        ));
+    }
+}

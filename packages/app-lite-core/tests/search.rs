@@ -1116,3 +1116,101 @@ fn search_projection_uses_the_same_thumbnail_choice_as_list() {
             .selected_thumbnail_id
     );
 }
+
+/// Task 5 matrix at execution level: spec `is:trash`/`has:attachment`,
+/// Evernote `intrash:`/`contains:attachment`, notebook/stack/tag scopes and
+/// human calendar days for created:/updated:.
+#[test]
+fn filter_matrix_executes_spec_and_evernote_syntax_with_calendar_days() {
+    // 2026-09-26 12:00 at UTC+9 is 03:00 UTC.
+    let noon_tokyo = 1_790_391_600_000_i64;
+    let profile = tempfile::tempdir().unwrap();
+    let repo = LibraryRepository::open_with_sources(
+        profile.path().join("library.sqlite"),
+        Arc::new(Clock(AtomicI64::new(noon_tokyo))),
+        Arc::new(Ids(AtomicU64::new(1))),
+    )
+    .unwrap();
+    let stack = repo.create_stack("工作组").unwrap();
+    let notebook = repo.create_notebook("合同", Some(&stack.id)).unwrap();
+    let tag = repo.create_tag("要务").unwrap();
+    let pdf = repo
+        .import_resource(b"%PDF-1.4 x", "条款.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let with_file = repo
+        .create_note(CreateNote {
+            title: "北京合同".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "甲方签字".into(),
+                        marks: Default::default(),
+                    }],
+                },
+                Block::Attachment {
+                    resource_id: pdf.clone(),
+                    filename: "条款.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+            ]),
+        })
+        .unwrap();
+    repo.set_note_tags(&with_file.id, &[tag.id.clone()])
+        .unwrap();
+    let plain = create(&repo, "北京日记", "今天晴");
+    let trashed = create(&repo, "北京旧稿", "作废");
+    repo.trash_note(&trashed.id).unwrap();
+    repo.process_search_jobs().unwrap();
+    let ids = |query: &str| -> Vec<app_lite_core::NoteId> {
+        let mut ids: Vec<_> = repo
+            .search(SearchQuery::parse_at(query, 9 * 3600))
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.note.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let mut live = vec![with_file.id.clone(), plain.id.clone()];
+    live.sort();
+
+    assert_eq!(ids("北京"), live, "trash excluded by default");
+    assert_eq!(ids("北京 is:trash"), vec![trashed.id.clone()]);
+    assert_eq!(ids("北京 intrash:true"), vec![trashed.id.clone()]);
+    assert_eq!(ids("has:attachment"), vec![with_file.id.clone()]);
+    assert_eq!(ids("contains:attachment"), vec![with_file.id.clone()]);
+    assert_eq!(ids("notebook:合同"), vec![with_file.id.clone()]);
+    assert_eq!(ids("stack:工作组"), vec![with_file.id.clone()]);
+    assert_eq!(ids("tag:要务"), vec![with_file.id.clone()]);
+    assert_eq!(ids("\"甲方签字\""), vec![with_file.id.clone()]);
+    assert_eq!(ids("北京 created:20260926"), live);
+    assert_eq!(
+        ids("北京 created:20260927"),
+        Vec::<app_lite_core::NoteId>::new()
+    );
+    assert_eq!(ids("北京 updated:20260925..20260926"), live);
+}
+
+#[test]
+fn relative_day_filter_starts_at_local_midnight_n_days_ago() {
+    let start = |query: &str| match &SearchQuery::parse_at(query, 9 * 3600).filters[..] {
+        [SearchFilter::Created(range)] => (range.start.unwrap(), range.end),
+        other => panic!("{other:?}"),
+    };
+    let (today, open_end) = start("created:day-0");
+    let (yesterday, _) = start("created:day-1");
+    assert_eq!(open_end, None, "day-N is open-ended like Evernote");
+    assert_eq!(today - yesterday, 86_400_000);
+    assert_eq!(
+        (today + 9 * 3_600_000) % 86_400_000,
+        0,
+        "local midnight at UTC+9"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(today <= now && now - today < 86_400_000);
+}
