@@ -1,4 +1,6 @@
-use app_lite_core::document::{Block, BlockStyle, Inline};
+use app_lite_core::document::{
+    Alignment, Block, BlockStyle, ImagePresentation, Inline, ListItem, ListKind, Marks,
+};
 use app_lite_core::{
     CanonicalDocument, CreateNote, LibraryError, LibraryRepository, ReadableExportError,
     ResourceError, SaveNote, export_readable_selection, restore_readable_export,
@@ -46,6 +48,222 @@ fn document_with_repeated_attachment(
             },
         ],
     }])
+}
+
+#[test]
+fn readable_export_builds_escaped_browsable_pages_with_relative_resource_links() {
+    let profile = tempdir().unwrap();
+    let source = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let image = source
+        .import_resource(b"image original bytes", "photo.png", "image/png", "png")
+        .unwrap();
+    let pdf = source
+        .import_resource(b"pdf original bytes", "quote.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let literal = format!("literal src=\":/{}\" remains text", image.as_str());
+    let note = source
+        .create_note(CreateNote {
+            title: "中文 \"<>& 标题".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![
+                        Inline::Text {
+                            text: "加粗".into(),
+                            marks: Marks {
+                                bold: true,
+                                ..Default::default()
+                            },
+                        },
+                        Inline::Image {
+                            resource_id: image.clone(),
+                            alt: "行内 \"<&>".into(),
+                        },
+                        Inline::Text {
+                            text: literal.clone(),
+                            marks: Marks::default(),
+                        },
+                        Inline::Text {
+                            text: "网页链接".into(),
+                            marks: Marks {
+                                link: Some("https://example.com/path?a=1&b=2".into()),
+                                ..Default::default()
+                            },
+                        },
+                    ],
+                },
+                Block::List {
+                    kind: ListKind::Checklist,
+                    items: vec![ListItem {
+                        checked: Some(true),
+                        style: BlockStyle::default(),
+                        inlines: vec![Inline::Text {
+                            text: "完成".into(),
+                            marks: Marks::default(),
+                        }],
+                    }],
+                },
+                Block::Image {
+                    resource_id: image.clone(),
+                    alt: "块图".into(),
+                    presentation: ImagePresentation::default(),
+                },
+                Block::Attachment {
+                    resource_id: pdf.clone(),
+                    filename: "文档 \"<&>.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+            ]),
+        })
+        .unwrap();
+    let bundle = profile.path().join("bundle");
+    export_readable_selection(&source, &[note.id.clone()], &bundle).unwrap();
+
+    let index = fs::read_to_string(bundle.join("index.html")).unwrap();
+    let page =
+        fs::read_to_string(bundle.join(format!("readable/{}.html", note.id.as_str()))).unwrap();
+    assert!(index.contains("中文 &quot;&lt;&gt;&amp; 标题"));
+    assert!(index.contains(&format!("href=\"readable/{}.html\"", note.id.as_str())));
+    assert!(page.contains("<meta charset=\"utf-8\">"));
+    assert!(page.contains("<title>中文 &quot;&lt;&gt;&amp; 标题</title>"));
+    assert!(page.contains("<strong>加粗</strong>"));
+    assert!(page.contains("<ul data-type=\"checklist\"><li data-checked=\"true\">完成</li></ul>"));
+    assert!(page.contains("alt=\"行内 &quot;&lt;&amp;&gt;\""));
+    assert!(page.contains(&literal));
+    assert!(page.contains("href=\"https://example.com/path?a=1&amp;b=2\""));
+    assert!(page.contains("文档 \"&lt;&amp;&gt;.pdf"));
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+    let resource_path = |id: &str| {
+        manifest["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|resource| resource["id"] == id)
+            .unwrap()["relative_path"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let image_path = resource_path(image.as_str());
+    let pdf_path = resource_path(pdf.as_str());
+    assert_eq!(page.matches(&format!("src=\"../{image_path}\"")).count(), 2);
+    assert!(page.contains(&format!("href=\"../{pdf_path}\"")));
+    let inline_image = page
+        .split_once("<img src=")
+        .unwrap()
+        .1
+        .split_once('>')
+        .unwrap()
+        .0;
+    assert!(!inline_image.contains("data-joplin-lite-block-image"));
+    assert!(page.contains("<img data-joplin-lite-block-image=\"true\""));
+    assert!(page.contains("img[data-joplin-lite-block-image=\"true\"]{display:block}"));
+    assert!(!page.contains("img{display:block}"));
+    for (path, expected) in [
+        (&image_path, b"image original bytes".as_slice()),
+        (&pdf_path, b"pdf original bytes".as_slice()),
+    ] {
+        let relative = std::path::Path::new("readable").join(format!("../{path}"));
+        let actual = fs::read(bundle.join(relative)).unwrap();
+        assert_eq!(actual, expected);
+        let manifest_hash = manifest["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|resource| resource["relative_path"] == path.as_str())
+            .unwrap()["sha256"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&actual)),
+            manifest_hash
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(bundle.join(format!("notes/{}.html", note.id.as_str()))).unwrap(),
+        note.body_html
+    );
+
+    // Browser projections are disposable: recovery reads only canonical files.
+    fs::write(
+        bundle.join(format!("readable/{}.html", note.id.as_str())),
+        "broken",
+    )
+    .unwrap();
+    fs::write(bundle.join("index.html"), "broken").unwrap();
+    let target = profile.path().join("empty");
+    fs::create_dir(&target).unwrap();
+    restore_readable_export(&bundle, &target).unwrap();
+    let restored = LibraryRepository::open(target.join("library.sqlite")).unwrap();
+    assert_eq!(
+        restored.load_note(&note.id).unwrap().unwrap().body_html,
+        note.body_html
+    );
+}
+
+#[test]
+fn readable_page_applies_canonical_alignment_indent_and_image_display_width() {
+    let profile = tempdir().unwrap();
+    let source = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let image = source
+        .import_resource(b"image bytes", "image.png", "image/png", "png")
+        .unwrap();
+    let note = source
+        .create_note(CreateNote {
+            title: "Layout".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Paragraph {
+                    style: BlockStyle {
+                        alignment: Alignment::Center,
+                        indent: 2,
+                    },
+                    inlines: vec![Inline::Text {
+                        text: "Centered".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                Block::List {
+                    kind: ListKind::Ordered,
+                    items: vec![ListItem {
+                        checked: None,
+                        style: BlockStyle {
+                            alignment: Alignment::Right,
+                            indent: 8,
+                        },
+                        inlines: vec![Inline::Text {
+                            text: "Right".into(),
+                            marks: Marks::default(),
+                        }],
+                    }],
+                },
+                Block::Image {
+                    resource_id: image,
+                    alt: "Sized".into(),
+                    presentation: ImagePresentation {
+                        natural_size: Some((1000, 500)),
+                        display_width: Some(320),
+                    },
+                },
+            ]),
+        })
+        .unwrap();
+    let bundle = profile.path().join("bundle");
+    export_readable_selection(&source, &[note.id.clone()], &bundle).unwrap();
+    let page =
+        fs::read_to_string(bundle.join(format!("readable/{}.html", note.id.as_str()))).unwrap();
+    assert!(page.contains("[data-align=center]{text-align:center}"));
+    assert!(page.contains("[data-align=right]{text-align:right}"));
+    assert!(page.contains("[data-indent=\"2\"]{margin-left:2em}"));
+    assert!(page.contains("[data-indent=\"8\"]{margin-left:8em}"));
+    assert!(page.contains("<p data-align=\"center\" data-indent=\"2\">Centered</p>"));
+    assert!(page.contains("<li data-align=\"right\" data-indent=\"8\">Right</li>"));
+    assert!(page.contains(
+        "data-joplin-lite-display-width=\"320\" style=\"width:320px;max-width:100%;height:auto\""
+    ));
 }
 
 #[test]

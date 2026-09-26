@@ -3,7 +3,7 @@
 //! This is the first deliberately narrow Task-8 restore slice: an explicit
 //! selection of active notes in the default notebook with no tags. It is not
 //! a full-library backup API. The JSON manifest is authoritative
-//! for recovery; the matching HTML files are there for a person to inspect.
+//! for recovery; `readable/` and `index.html` are derived browser pages.
 //! Every resource is copied as its original bytes and verified by SHA-256
 //! before an export is published or a restore profile is opened.
 //!
@@ -18,9 +18,14 @@ use crate::repository::{
     readable_export_query_note_state, readable_export_query_resource,
 };
 use crate::{BlobHash, CanonicalDocument, LibraryRepository, NoteId, ResourceId};
+use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::{
+    BufferQueue, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -454,6 +459,33 @@ fn export_readable_selection_with_hooks(
             )));
         }
     }
+    // Browser pages are a projection of the captured canonical snapshot. They
+    // are published in the same atomic directory rename but never consulted by
+    // restore or included in canonical hashes.
+    fs::create_dir(temporary.path().join("readable"))?;
+    let resource_paths = manifest
+        .resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                format!("../{}", resource.relative_path),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for note in &manifest.notes {
+        let current = note.revisions.last().expect("snapshot checked non-empty");
+        write_readable_page(
+            &temporary
+                .path()
+                .join("readable")
+                .join(format!("{}.html", note.id)),
+            &note.title,
+            &current.body_html,
+            &resource_paths,
+        )?;
+    }
+    write_readable_index(&temporary.path().join("index.html"), &manifest.notes)?;
     let mut manifest_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1088,6 +1120,224 @@ fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+fn write_readable_index(path: &Path, notes: &[ManifestNote]) -> Result<(), ReadableExportError> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut output = io::BufWriter::with_capacity(COPY_BUFFER_BYTES, &mut file);
+    output.write_all(b"<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Notes</title><style>body{font:16px/1.6 system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}li{margin:.4rem 0}</style></head><body><h1>Notes</h1><ul>")?;
+    for note in notes {
+        write!(output, "<li><a href=\"readable/{}.html\">", note.id)?;
+        write_html_escaped(&mut output, &note.title, true)?;
+        output.write_all(b"</a></li>\n")?;
+    }
+    output.write_all(b"</ul></body></html>\n")?;
+    output.flush()?;
+    drop(output);
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_readable_page(
+    path: &Path,
+    title: &str,
+    body_html: &str,
+    resource_paths: &BTreeMap<String, String>,
+) -> Result<(), ReadableExportError> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut output = io::BufWriter::with_capacity(COPY_BUFFER_BYTES, &mut file);
+    output.write_all(b"<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>")?;
+    write_html_escaped(&mut output, title, true)?;
+    output.write_all(b"</title><style>body{font:16px/1.65 system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem;color:#222}h1{line-height:1.3;overflow-wrap:anywhere}p,li{overflow-wrap:anywhere}img{max-width:100%;height:auto}img[data-joplin-lite-block-image=\"true\"]{display:block}a{overflow-wrap:anywhere}ul[data-type=checklist]{list-style:none;padding-left:1.5rem}ul[data-type=checklist]>li::before{content:'\xe2\x98\x90';margin-left:-1.5rem;margin-right:.5rem}ul[data-type=checklist]>li[data-checked=true]::before{content:'\xe2\x98\x91'}pre{white-space:pre-wrap;overflow-wrap:anywhere}[data-align=center]{text-align:center}[data-align=right]{text-align:right}")?;
+    for indent in 1..=8 {
+        write!(
+            output,
+            "[data-indent=\"{indent}\"]{{margin-left:{indent}em}}"
+        )?;
+    }
+    output.write_all(b"</style></head><body><main><h1>")?;
+    write_html_escaped(&mut output, title, true)?;
+    output.write_all(b"</h1><article>")?;
+    write_projected_fragment(&mut output, body_html, resource_paths)?;
+    output.write_all(b"</article></main></body></html>\n")?;
+    output.flush()?;
+    drop(output);
+    file.sync_all()?;
+    Ok(())
+}
+
+// Tokenize the trusted canonical fragment and write one token at a time. This
+// changes only real img[src] and a[href] values; text resembling markup and
+// external links retain their meaning. The editor's canonical serializer is
+// independent and remains unchanged.
+fn write_projected_fragment<W: Write>(
+    output: &mut W,
+    html: &str,
+    resource_paths: &BTreeMap<String, String>,
+) -> Result<(), ReadableExportError> {
+    let sink = BrowserFragmentSink {
+        output: RefCell::new(output),
+        resource_paths,
+        error: RefCell::new(None),
+    };
+    let tokenizer = Tokenizer::new(sink, TokenizerOpts::default());
+    let input = BufferQueue::default();
+    input.push_back(StrTendril::from(html));
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+    if !input.is_empty() {
+        return Err(ReadableExportError::InvalidManifest(
+            "canonical HTML tokenization did not finish".into(),
+        ));
+    }
+    tokenizer.sink.error.into_inner().map_or(Ok(()), Err)
+}
+
+struct BrowserFragmentSink<'a, W: Write> {
+    output: RefCell<&'a mut W>,
+    resource_paths: &'a BTreeMap<String, String>,
+    error: RefCell<Option<ReadableExportError>>,
+}
+
+impl<W: Write> TokenSink for BrowserFragmentSink<'_, W> {
+    type Handle = ();
+
+    fn process_token(&self, token: Token, _: u64) -> TokenSinkResult<Self::Handle> {
+        if self.error.borrow().is_none() {
+            let result =
+                write_projected_token(&mut **self.output.borrow_mut(), token, self.resource_paths);
+            if let Err(error) = result {
+                *self.error.borrow_mut() = Some(error);
+            }
+        }
+        TokenSinkResult::Continue
+    }
+}
+
+fn write_projected_token<W: Write>(
+    output: &mut W,
+    token: Token,
+    resource_paths: &BTreeMap<String, String>,
+) -> Result<(), ReadableExportError> {
+    match token {
+        Token::CharacterTokens(text) => write_html_escaped(output, &text, false)?,
+        Token::TagToken(tag) => {
+            let name = tag.name.as_ref();
+            if !matches!(
+                name,
+                "p" | "h1"
+                    | "h2"
+                    | "h3"
+                    | "ul"
+                    | "ol"
+                    | "li"
+                    | "blockquote"
+                    | "pre"
+                    | "img"
+                    | "a"
+                    | "hr"
+                    | "br"
+                    | "strong"
+                    | "em"
+                    | "u"
+                    | "s"
+                    | "mark"
+                    | "code"
+            ) {
+                return Err(ReadableExportError::InvalidManifest(
+                    "unexpected canonical HTML tag".into(),
+                ));
+            }
+            if tag.kind == html5ever::tokenizer::EndTag {
+                write!(output, "</{name}>")?;
+            } else {
+                let display_width = if name == "img" {
+                    tag.attrs
+                        .iter()
+                        .find(|attribute| {
+                            attribute.name.local.as_ref() == "data-joplin-lite-display-width"
+                        })
+                        .map(|attribute| {
+                            attribute
+                                .value
+                                .parse::<u32>()
+                                .ok()
+                                .filter(|width| (1..=100_000).contains(width))
+                                .ok_or_else(|| {
+                                    ReadableExportError::InvalidManifest(
+                                        "invalid browser image display width".into(),
+                                    )
+                                })
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                write!(output, "<{name}")?;
+                for attribute in tag.attrs {
+                    if attribute.name.prefix.is_some() || !attribute.name.ns.is_empty() {
+                        return Err(ReadableExportError::InvalidManifest(
+                            "unexpected canonical HTML attribute namespace".into(),
+                        ));
+                    }
+                    let attribute_name = attribute.name.local.as_ref();
+                    write!(output, " {attribute_name}=\"")?;
+                    let value = attribute.value.as_ref();
+                    let resource_value = if (name == "img" && attribute_name == "src")
+                        || (name == "a" && attribute_name == "href")
+                    {
+                        value
+                            .strip_prefix(":/")
+                            .map(|id| {
+                                resource_paths.get(id).ok_or_else(|| {
+                                    ReadableExportError::ResourceVerification(format!(
+                                        "browser resource mapping missing: {id}"
+                                    ))
+                                })
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    write_html_escaped(output, resource_value.map_or(value, String::as_str), true)?;
+                    output.write_all(b"\"")?;
+                }
+                if let Some(width) = display_width {
+                    write!(
+                        output,
+                        " style=\"width:{width}px;max-width:100%;height:auto\""
+                    )?;
+                }
+                output.write_all(b">")?;
+            }
+        }
+        Token::EOFToken => {}
+        _ => {
+            return Err(ReadableExportError::InvalidManifest(
+                "unexpected canonical HTML token".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_html_escaped<W: Write>(output: &mut W, value: &str, quotes: bool) -> io::Result<()> {
+    let mut start = 0;
+    for (offset, character) in value.char_indices() {
+        let escape = match character {
+            '&' => Some("&amp;"),
+            '<' => Some("&lt;"),
+            '>' => Some("&gt;"),
+            '"' if quotes => Some("&quot;"),
+            _ => None,
+        };
+        if let Some(escape) = escape {
+            output.write_all(&value.as_bytes()[start..offset])?;
+            output.write_all(escape.as_bytes())?;
+            start = offset + character.len_utf8();
+        }
+    }
+    output.write_all(&value.as_bytes()[start..])
+}
+
 fn copy_and_hash(
     input: &mut dyn Read,
     destination: &Path,
@@ -1264,6 +1514,26 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn browser_projection_refuses_an_unmapped_resource_attribute() {
+        let mut output = Vec::new();
+        let error = write_projected_fragment(
+            &mut output,
+            "<p>src=\":/unmapped\"</p><img src=\":/unmapped\" alt=\"x\">",
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ReadableExportError::ResourceVerification(_)
+        ));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("src=\":/unmapped\"")
+        );
+    }
 
     fn manifest_with_text(text: &str) -> BundleManifest {
         let html = "<p></p>";
