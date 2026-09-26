@@ -844,6 +844,10 @@ impl LayoutRegistry {
                 );
                 bounds.origin.x = px(inset);
                 bounds.size.width = px(image_width);
+            } else if matches!(block.content, BlockContent::Attachment { .. }) {
+                let inset = depth as f32 * LIST_DEPTH_INDENT + LIST_MARKER_WIDTH;
+                bounds.origin.x = px(inset);
+                bounds.size.width = px((self.estimate_width - inset).max(1.0));
             }
         }
         bounds.origin.y = px(top);
@@ -985,6 +989,10 @@ impl LayoutRegistry {
                         image_layout_size((width - inset).max(1.0), *natural_size, *display_width);
                     bounds.origin.x = px(inset);
                     bounds.size.width = px(image_width);
+                } else if matches!(block.content, BlockContent::Attachment { .. }) {
+                    let inset = depth as f32 * LIST_DEPTH_INDENT + LIST_MARKER_WIDTH;
+                    bounds.origin.x = px(inset);
+                    bounds.size.width = px((width - inset).max(1.0));
                 }
             }
             bounds.origin.y = px(y);

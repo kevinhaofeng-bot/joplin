@@ -208,6 +208,13 @@ pub enum Inline {
         /// None for legacy HTML and untouched images.
         display_width: Option<u32>,
     },
+    /// A file card inside a heading/quote/list item. Block-level cards stay
+    /// `Block::Attachment`; this keeps a card's position inside its parent.
+    Attachment {
+        resource_id: ResourceId,
+        filename: String,
+        media_type: String,
+    },
 }
 
 fn parse_html(input: &str) -> Result<CanonicalDocument, DocumentError> {
@@ -440,6 +447,7 @@ fn append_search_inlines(inlines: &[Inline], output: &mut String) {
             Inline::Text { text, .. } => output.push_str(text),
             Inline::SoftBreak => output.push('\n'),
             Inline::Image { alt, .. } => output.push_str(alt),
+            Inline::Attachment { filename, .. } => output.push_str(filename),
         }
     }
 }
@@ -455,7 +463,9 @@ fn resource_ids(document: &CanonicalDocument) -> Vec<ResourceId> {
             | Block::Code { inlines, .. } => inlines
                 .iter()
                 .filter_map(|inline| match inline {
-                    Inline::Image { resource_id, .. } => Some(resource_id.clone()),
+                    Inline::Image { resource_id, .. } | Inline::Attachment { resource_id, .. } => {
+                        Some(resource_id.clone())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -463,7 +473,9 @@ fn resource_ids(document: &CanonicalDocument) -> Vec<ResourceId> {
                 .iter()
                 .flat_map(|item| item.inlines.iter())
                 .filter_map(|inline| match inline {
-                    Inline::Image { resource_id, .. } => Some(resource_id.clone()),
+                    Inline::Image { resource_id, .. } | Inline::Attachment { resource_id, .. } => {
+                        Some(resource_id.clone())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -481,7 +493,7 @@ fn block_is_empty(block: &Block) -> bool {
             inlines.iter().all(|inline| match inline {
                 Inline::Text { text, .. } => text.is_empty(),
                 Inline::SoftBreak => false,
-                Inline::Image { .. } => false,
+                Inline::Image { .. } | Inline::Attachment { .. } => false,
             })
         }
         Block::Paragraph { .. } => false,
@@ -708,6 +720,21 @@ fn serialize_inlines(inlines: &[Inline], output: &mut String) {
                 }
                 output.push('>');
             }
+            Inline::Attachment {
+                resource_id,
+                filename,
+                media_type,
+            } => {
+                output.push_str("<a data-joplin-lite-inline-attachment=\"true\" href=\":/");
+                escape_attribute(resource_id.as_str(), output);
+                output.push_str("\" data-filename=\"");
+                escape_attribute(filename, output);
+                output.push_str("\" data-media-type=\"");
+                escape_attribute(media_type, output);
+                output.push_str("\">");
+                escape_text_run(filename, &[], 0, output);
+                output.push_str("</a>");
+            }
         }
     }
 }
@@ -813,7 +840,7 @@ fn previous_flow_char(inlines: &[Inline], index: usize) -> Option<char> {
         // Images occupy an inline position in the rendered flow. Treat them
         // as a non-whitespace boundary so ordinary spaces around an image do
         // not become NBSP merely because there is no adjacent text node.
-        Some(Inline::Image { .. }) => Some('\u{fffc}'),
+        Some(Inline::Image { .. } | Inline::Attachment { .. }) => Some('\u{fffc}'),
         _ => None,
     }
 }
@@ -821,7 +848,7 @@ fn previous_flow_char(inlines: &[Inline], index: usize) -> Option<char> {
 fn next_flow_char(inlines: &[Inline], index: usize) -> Option<char> {
     match inlines.get(index + 1) {
         Some(Inline::Text { text, .. }) => text.chars().next(),
-        Some(Inline::Image { .. }) => Some('\u{fffc}'),
+        Some(Inline::Image { .. } | Inline::Attachment { .. }) => Some('\u{fffc}'),
         _ => None,
     }
 }
@@ -1424,6 +1451,14 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                         projection.image(&attrs.borrow(), &marks);
                         continue;
                     }
+                    if tag == "a"
+                        && attribute(&attrs.borrow(), "data-joplin-lite-inline-attachment")
+                            .as_deref()
+                            == Some("true")
+                        && projection.inline_attachment(&attrs.borrow())
+                    {
+                        continue;
+                    }
                     let next_marks = ProjectionMarks {
                         bold: marks.bold || matches!(tag.as_str(), "strong" | "b"),
                         italic: marks.italic || matches!(tag.as_str(), "em" | "i"),
@@ -1906,6 +1941,32 @@ impl Projection {
         self.pending_space = false;
         self.pending_marks = None;
         self.flow_has_visible = false;
+    }
+
+    /// Returns false (fall back to an ordinary link) when the marker is
+    /// incomplete, so malformed input is never silently dropped.
+    fn inline_attachment(&mut self, attrs: &[Attribute]) -> bool {
+        let Some(resource_id) = attribute(attrs, "href")
+            .and_then(|href| href.strip_prefix(":/").map(str::to_owned))
+            .and_then(|id| ResourceId::new(id).ok())
+        else {
+            return false;
+        };
+        let (Some(filename), Some(media_type)) = (
+            attribute(attrs, "data-filename"),
+            attribute(attrs, "data-media-type"),
+        ) else {
+            return false;
+        };
+        self.flush_pending_space();
+        self.ensure_current().push(Inline::Attachment {
+            resource_id,
+            filename,
+            media_type,
+        });
+        self.flow_has_visible = true;
+        self.current_item_has_content = true;
+        true
     }
 
     fn block_attachment(&mut self, attrs: &[Attribute]) {

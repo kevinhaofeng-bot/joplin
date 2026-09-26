@@ -2123,13 +2123,6 @@ impl Document {
                 && before
                     .iter()
                     .all(|group| group.kind == BlockKind::Paragraph && group.members.len() == 1);
-        if matches!(&transaction, Transaction::InsertAttachment { .. })
-            && !attachment_to_plain_parent
-        {
-            return Err(DocumentError::InvalidOperation(
-                "含图的标题、引用或列表项内暂不支持文件附件，请在独立正文段落中插入".into(),
-            ));
-        }
         // Joining parents adopts the left parent's paragraph style. Its
         // remaining rows therefore belong to the local undo payload too.
         let parent_restore = if before.len() > 1
@@ -2203,7 +2196,9 @@ impl Document {
                 self.block(*id).is_some_and(|block| {
                     matches!(
                         block.content,
-                        BlockContent::Text { .. } | BlockContent::Image { .. }
+                        BlockContent::Text { .. }
+                            | BlockContent::Image { .. }
+                            | BlockContent::Attachment { .. }
                     )
                 })
             });
@@ -4622,7 +4617,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_group_atomic_image_insertion_is_saveable_and_attachment_rejects_before_mutation() {
+    fn inline_group_atomic_image_and_attachment_insertions_are_saveable_and_reversible() {
         let canonical = app_lite_core::CanonicalDocument::parse_html(
             "<h2>before<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">after</h2>",
         )
@@ -4650,22 +4645,31 @@ mod tests {
         );
         doc.apply_batch(outcome.inverse).unwrap();
         assert_eq!(doc.semantic_snapshot(), before);
-        let unchanged = doc.clone();
-        let result = doc.apply(super::Transaction::InsertAttachment {
-            selection: super::Selection::caret(super::DocPoint {
-                node_id: doc.blocks()[0].id,
-                utf8_offset: 2,
-                affinity: super::Affinity::After,
-            }),
-            resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-            filename: "file.pdf".into(),
-            media_type: "application/pdf".into(),
-        });
+        // Since handoff stage 1 a file card may live inside the parent too;
+        // it is saveable in place and its inverse restores exactly.
+        let outcome = doc
+            .apply(super::Transaction::InsertAttachment {
+                selection: super::Selection::caret(super::DocPoint {
+                    node_id: doc.blocks()[0].id,
+                    utf8_offset: 2,
+                    affinity: super::Affinity::After,
+                }),
+                resource_id: "cccccccccccccccccccccccccccccccc".into(),
+                filename: "file.pdf".into(),
+                media_type: "application/pdf".into(),
+            })
+            .unwrap();
+        let html = crate::native_editor::codec::export_canonical(&doc)
+            .unwrap()
+            .to_canonical_html();
         assert!(
-            result.is_err(),
-            "unsupported inline attachment must fail before editing"
+            html.as_str()
+                .starts_with("<h2>be<a data-joplin-lite-inline-attachment"),
+            "{}",
+            html.as_str()
         );
-        assert_eq!(doc, unchanged);
+        doc.apply_batch(outcome.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
     }
     #[test]
     fn inline_group_style_applies_to_parent_and_cross_merge_undo_keeps_owners() {

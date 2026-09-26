@@ -144,3 +144,48 @@ fn inline_image_display_width_round_trips_and_old_html_has_none() {
             .contains("display-width")
     );
 }
+
+/// Handoff stage 1: a file attachment can live inside a heading/quote/list
+/// item (Evernote list items hold any content, list/schema.ts:412). Legacy
+/// block attachment cards are unchanged.
+#[test]
+fn inline_attachment_round_trips_inside_list_items_and_is_searchable() {
+    use app_lite_core::document::{Block, Inline};
+    let pdf = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let html = format!(
+        "<ul><li>见<a data-joplin-lite-inline-attachment=\"true\" href=\":/{pdf}\" data-filename=\"合同.pdf\" data-media-type=\"application/pdf\">合同.pdf</a>附件</li></ul>"
+    );
+    let document = app_lite_core::CanonicalDocument::parse_html(&html).unwrap();
+    let Block::List { items, .. } = &document.blocks()[0] else {
+        panic!("{:?}", document.blocks());
+    };
+    assert!(matches!(
+        items[0].inlines.as_slice(),
+        [
+            Inline::Text { .. },
+            Inline::Attachment { filename, media_type, .. },
+            Inline::Text { .. }
+        ] if filename == "合同.pdf" && media_type == "application/pdf"
+    ));
+    assert_eq!(
+        document
+            .resource_ids()
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        vec![pdf]
+    );
+    assert!(document.search_text().as_str().contains("合同.pdf"));
+    let serialized = document.to_canonical_html();
+    assert_eq!(
+        app_lite_core::CanonicalDocument::parse_html(serialized.as_str()).unwrap(),
+        document
+    );
+
+    // A block-level card keeps its block representation.
+    let block = app_lite_core::CanonicalDocument::parse_html(&format!(
+        "<a data-joplin-lite-block-attachment=\"true\" href=\":/{pdf}\" data-resource-id=\"{pdf}\" data-filename=\"a.pdf\" data-media-type=\"application/pdf\">a.pdf</a>"
+    ))
+    .unwrap();
+    assert!(matches!(block.blocks()[0], Block::Attachment { .. }));
+}

@@ -142,10 +142,7 @@ pub fn import_canonical_with_resources(
     for (block_index, block) in document.blocks().iter().enumerate() {
         match block {
             CanonicalBlock::Paragraph { style, inlines } => {
-                if inlines
-                    .iter()
-                    .any(|inline| matches!(inline, Inline::Image { .. }))
-                {
+                if has_inline_atom(inlines) {
                     // The native document has image atoms at block boundaries.
                     // Split only this legacy flow, preserving text order/marks,
                     // repeated images and alt text. The persisted source isn't
@@ -193,6 +190,29 @@ pub fn import_canonical_with_resources(
                                 },
                                 revision: 0,
                             });
+                        } else if let Inline::Attachment {
+                            resource_id,
+                            filename,
+                            media_type,
+                        } = inline
+                        {
+                            ensure_resource(resource_id, available_resources, block_index)?;
+                            if !text.is_empty() {
+                                native.push(text_block(
+                                    next_node_id(&mut next_id),
+                                    BlockKind::Paragraph,
+                                    style,
+                                    &text,
+                                    block_index,
+                                )?);
+                                text.clear();
+                            }
+                            native.push(attachment_block(
+                                next_node_id(&mut next_id),
+                                resource_id,
+                                filename,
+                                media_type,
+                            ));
                         } else {
                             text.push(inline.clone());
                         }
@@ -383,9 +403,34 @@ pub fn import_canonical_with_resources(
 }
 
 fn has_inline_image(inlines: &[Inline]) -> bool {
+    has_inline_atom(inlines)
+}
+
+/// Images and file cards are block atoms natively; a parent holding either
+/// is imported as a semantic group of text and atom members.
+fn has_inline_atom(inlines: &[Inline]) -> bool {
     inlines
         .iter()
-        .any(|inline| matches!(inline, Inline::Image { .. }))
+        .any(|inline| matches!(inline, Inline::Image { .. } | Inline::Attachment { .. }))
+}
+
+fn attachment_block(
+    id: NodeId,
+    resource_id: &ResourceId,
+    filename: &str,
+    media_type: &str,
+) -> Block {
+    Block {
+        id,
+        kind: BlockKind::Attachment,
+        content: BlockContent::Attachment {
+            resource_id: resource_id.as_str().to_owned(),
+            filename: filename.to_owned(),
+            media_type: media_type.to_owned(),
+        },
+        alignment: TextAlignment::Left,
+        revision: 0,
+    }
 }
 
 fn push_inline_group(
@@ -427,6 +472,20 @@ fn push_inline_group(
                     alignment: TextAlignment::Left,
                     revision: 0,
                 });
+            }
+            Inline::Attachment {
+                resource_id,
+                filename,
+                media_type,
+            } => {
+                ensure_resource(resource_id, available_resources, block_index)?;
+                let id = next_node_id(next_id);
+                members.push(id);
+                native.push(text_block(id, kind.clone(), style, &text, block_index)?);
+                text.clear();
+                let id = next_node_id(next_id);
+                members.push(id);
+                native.push(attachment_block(id, resource_id, filename, media_type));
             }
             _ => text.push(inline.clone()),
         }
@@ -520,6 +579,21 @@ pub fn export_canonical_with_resources(
                             )?,
                             alt: alt.clone(),
                             display_width: *display_width,
+                        });
+                    }
+                    BlockContent::Attachment {
+                        resource_id,
+                        filename,
+                        media_type,
+                    } => {
+                        inlines.push(Inline::Attachment {
+                            resource_id: parse_allowed_resource(
+                                resource_id,
+                                available_resources,
+                                index,
+                            )?,
+                            filename: filename.clone(),
+                            media_type: media_type.clone(),
                         });
                     }
                     _ => return Err(CanonicalExportError::InvalidTextContent { block_index }),
@@ -876,7 +950,7 @@ fn import_inlines(
                 }
             }
             Inline::SoftBreak => text.push('\n'),
-            Inline::Image { .. } => {
+            Inline::Image { .. } | Inline::Attachment { .. } => {
                 return Err(CanonicalImportError::UnsupportedInlineImage { block_index });
             }
         }
@@ -1318,6 +1392,58 @@ mod tests {
             });
         assert_eq!(width, Some(Some(320)));
         assert_eq!(super::export_canonical(&reopened).unwrap(), exported);
+    }
+
+    #[test]
+    fn attachment_inserted_inside_an_image_list_item_saves_in_place_and_undoes() {
+        use crate::native_editor::history::History;
+        use crate::native_editor::model::{DocPoint, Selection};
+        use crate::native_editor::transaction::Transaction;
+        let canonical = CanonicalDocument::parse_html(
+            "<ul><li>图前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">图后</li></ul>",
+        )
+        .unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        let before = document.clone();
+        let tail = document
+            .blocks()
+            .iter()
+            .filter(|block| block.content.as_text().is_some())
+            .last()
+            .unwrap()
+            .id;
+        let caret = Selection::caret(DocPoint::new(tail, "图".len()));
+        let mut history = History::new(100, 1 << 20);
+        history
+            .apply_with_selection(
+                &mut document,
+                caret,
+                Transaction::InsertAttachment {
+                    selection: caret,
+                    resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    filename: "合同.pdf".into(),
+                    media_type: "application/pdf".into(),
+                },
+            )
+            .expect("attachments may live inside a grouped list item");
+        let exported = super::export_canonical(&document).expect("storable");
+        let html = exported.to_canonical_html();
+        assert!(
+            html.as_str().starts_with("<ul><li>图前<img")
+                && html
+                    .as_str()
+                    .contains("图<a data-joplin-lite-inline-attachment=\"true\"")
+                && html.as_str().ends_with("后</li></ul>"),
+            "{}",
+            html.as_str()
+        );
+        let reopened = import_canonical(&exported).unwrap();
+        assert_eq!(super::export_canonical(&reopened).unwrap(), exported);
+        history.undo_with_outcome(&mut document).unwrap();
+        assert_eq!(
+            super::export_canonical(&document).unwrap(),
+            super::export_canonical(&before).unwrap()
+        );
     }
 
     #[test]
