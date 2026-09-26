@@ -633,21 +633,13 @@ pub fn export_canonical_with_resources(
             } else {
                 flush_list(&mut output, &mut pending_list);
                 output.push(match kind {
-                    BlockKind::Heading { level: 1 } => CanonicalBlock::Heading {
-                        level: HeadingLevel::One,
-                        style,
-                        inlines,
-                    },
-                    BlockKind::Heading { level: 2 } => CanonicalBlock::Heading {
-                        level: HeadingLevel::Two,
-                        style,
-                        inlines,
-                    },
-                    BlockKind::Heading { level: 3 } => CanonicalBlock::Heading {
-                        level: HeadingLevel::Three,
-                        style,
-                        inlines,
-                    },
+                    BlockKind::Heading { level } if canonical_heading_level(level).is_some() => {
+                        CanonicalBlock::Heading {
+                            level: canonical_heading_level(level).expect("checked by the guard"),
+                            style,
+                            inlines,
+                        }
+                    }
                     BlockKind::Quote => CanonicalBlock::Quote { style, inlines },
                     BlockKind::Code => CanonicalBlock::Code { style, inlines },
                     BlockKind::Paragraph => CanonicalBlock::Paragraph { style, inlines },
@@ -702,16 +694,11 @@ pub fn export_canonical_with_resources(
             }
             BlockKind::Heading { level } => {
                 let (style, inlines) = export_text_block(block, block_index)?;
-                let level = match level {
-                    1 => HeadingLevel::One,
-                    2 => HeadingLevel::Two,
-                    3 => HeadingLevel::Three,
-                    other => {
-                        return Err(CanonicalExportError::UnsupportedBlockKind {
-                            block_index,
-                            kind: format!("Heading({other})"),
-                        });
-                    }
+                let Some(level) = canonical_heading_level(*level) else {
+                    return Err(CanonicalExportError::UnsupportedBlockKind {
+                        block_index,
+                        kind: format!("Heading({level})"),
+                    });
                 };
                 output.push(CanonicalBlock::Heading {
                     level,
@@ -914,11 +901,26 @@ fn next_node_id(next_id: &mut u64) -> NodeId {
     id
 }
 
+fn canonical_heading_level(level: u8) -> Option<HeadingLevel> {
+    Some(match level {
+        1 => HeadingLevel::One,
+        2 => HeadingLevel::Two,
+        3 => HeadingLevel::Three,
+        4 => HeadingLevel::Four,
+        5 => HeadingLevel::Five,
+        6 => HeadingLevel::Six,
+        _ => return None,
+    })
+}
+
 fn heading_level(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::One => 1,
         HeadingLevel::Two => 2,
         HeadingLevel::Three => 3,
+        HeadingLevel::Four => 4,
+        HeadingLevel::Five => 5,
+        HeadingLevel::Six => 6,
     }
 }
 
@@ -1423,6 +1425,27 @@ mod tests {
             });
         assert_eq!(width, Some(Some(320)));
         assert_eq!(super::export_canonical(&reopened).unwrap(), exported);
+    }
+
+    #[test]
+    fn h4_to_h6_open_as_native_headings_and_save_unchanged() {
+        let canonical =
+            CanonicalDocument::parse_html("<h4>四</h4><h5>五</h5><h6>六<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\"></h6>")
+                .unwrap();
+        let document = import_canonical(&canonical).unwrap();
+        assert!(matches!(
+            document.blocks()[0].kind,
+            BlockKind::Heading { level: 4 }
+        ));
+        assert!(matches!(
+            document.blocks()[1].kind,
+            BlockKind::Heading { level: 5 }
+        ));
+        assert!(matches!(
+            document.blocks()[2].kind,
+            BlockKind::Heading { level: 6 }
+        ));
+        assert_eq!(super::export_canonical(&document).unwrap(), canonical);
     }
 
     #[test]

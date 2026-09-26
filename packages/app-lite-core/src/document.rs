@@ -138,6 +138,9 @@ pub enum HeadingLevel {
     One,
     Two,
     Three,
+    Four,
+    Five,
+    Six,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +266,9 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                     HeadingLevel::One => "h1",
                     HeadingLevel::Two => "h2",
                     HeadingLevel::Three => "h3",
+                    HeadingLevel::Four => "h4",
+                    HeadingLevel::Five => "h5",
+                    HeadingLevel::Six => "h6",
                 };
                 serialize_block(tag, style, inlines, &mut output);
             }
@@ -2188,6 +2194,9 @@ fn heading_level(tag: &str) -> Option<HeadingLevel> {
         "h1" => Some(HeadingLevel::One),
         "h2" => Some(HeadingLevel::Two),
         "h3" => Some(HeadingLevel::Three),
+        "h4" => Some(HeadingLevel::Four),
+        "h5" => Some(HeadingLevel::Five),
+        "h6" => Some(HeadingLevel::Six),
         _ => None,
     }
 }

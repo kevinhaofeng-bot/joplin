@@ -7689,17 +7689,18 @@ async fn mounted_corrected_generation_clears_only_its_automatic_save_error(
         commands
             .execute(EditorCommand::BulletList, CommandArgument::None, editor)
             .expect("real list command");
-        // Indented lists now save as canonical `data-indent`; a level-4
-        // heading is still a native kind the canonical codec cannot store.
+        // A resource that does not belong to this note cannot be saved; the
+        // codec must refuse it instead of persisting a dangling reference.
         let selection = editor.selection();
         editor
             .apply(
-                crate::native_editor::transaction::Transaction::SetBlockKind {
+                crate::native_editor::transaction::Transaction::InsertImage {
                     selection,
-                    kind: crate::native_editor::model::BlockKind::Heading { level: 4 },
+                    resource_id: "ffffffffffffffffffffffffffffffff".into(),
+                    natural_size: (10, 10),
                 },
             )
-            .expect("make an unsupported heading level");
+            .expect("insert an image the note does not own");
         editor_cx.notify();
     });
     clock.advance(Duration::from_millis(100));
@@ -7712,7 +7713,7 @@ async fn mounted_corrected_generation_clears_only_its_automatic_save_error(
     );
 
     editor.update(cx, |editor, editor_cx| {
-        editor.undo().expect("undo unsupported heading level");
+        editor.undo().expect("undo the foreign image");
         editor_cx.notify();
     });
     clock.advance(Duration::from_millis(100));

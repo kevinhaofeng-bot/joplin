@@ -3183,17 +3183,18 @@ async fn unsupported_codec_save_failure_enters_failed_without_writing_a_journal(
         commands
             .execute(EditorCommand::BulletList, CommandArgument::None, editor)
             .expect("make a list through the production command path");
-        // Indented lists now save as canonical `data-indent`; a level-4
-        // heading is still a native kind the canonical codec cannot store.
+        // A resource that does not belong to this note cannot be saved; the
+        // codec must refuse it instead of persisting a dangling reference.
         let selection = editor.selection();
         editor
             .apply(
-                crate::native_editor::transaction::Transaction::SetBlockKind {
+                crate::native_editor::transaction::Transaction::InsertImage {
                     selection,
-                    kind: crate::native_editor::model::BlockKind::Heading { level: 4 },
+                    resource_id: "ffffffffffffffffffffffffffffffff".into(),
+                    natural_size: (10, 10),
                 },
             )
-            .expect("make an unsupported heading level");
+            .expect("insert an image the note does not own");
         editor_cx.notify();
     });
     // Codec work runs at the scheduled save boundary, not from the input
@@ -3202,7 +3203,7 @@ async fn unsupported_codec_save_failure_enters_failed_without_writing_a_journal(
     clock.advance(Duration::from_millis(100));
     poll_and_drain(&active, cx);
     let state = active.read_with(cx, |session, _| session.save_state());
-    assert!(matches!(state, SaveState::Failed(ref message) if message.contains("尚不能安全保存")));
+    assert!(matches!(state, SaveState::Failed(ref message) if message.contains("不属于当前笔记")));
     clock.advance(Duration::from_secs(20));
     poll_and_drain(&active, cx);
     assert_eq!(

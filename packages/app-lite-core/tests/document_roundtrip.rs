@@ -251,3 +251,25 @@ fn unsafe_image_links_are_dropped_not_serialized() {
     ));
     assert!(!constructed.to_canonical_html().as_str().contains("<a "));
 }
+
+/// Evernote and Markdown notes use h4–h6; they stay headings instead of
+/// being flattened into paragraphs.
+#[test]
+fn h4_to_h6_round_trip_as_headings() {
+    use app_lite_core::document::HeadingLevel;
+    let html = "<h4>四</h4><h5 data-align=\"center\">五</h5><h6>六</h6>";
+    let document = CanonicalDocument::parse_html(html).unwrap();
+    let levels: Vec<_> = document
+        .blocks()
+        .iter()
+        .map(|block| match block {
+            Block::Heading { level, .. } => *level,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        levels,
+        vec![HeadingLevel::Four, HeadingLevel::Five, HeadingLevel::Six]
+    );
+    assert_eq!(document.to_canonical_html().as_str(), html);
+}
