@@ -325,10 +325,6 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
         ),
         ("[相对](../other.md)".into(), JexBodyBlockerKind::UnsafeLink),
         (
-            format!("![附件.pdf](:/{PDF})"),
-            JexBodyBlockerKind::AmbiguousAttachment,
-        ),
-        (
             "[外链](https://example.com \"提示\")".into(),
             JexBodyBlockerKind::UnsupportedAttribute,
         ),
@@ -808,6 +804,31 @@ fn linked_resource_image_keeps_its_external_link() {
             CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
             converted.document,
             "body={body}"
+        );
+    }
+}
+
+/// Joplin writes `![name](:/id)` for any dropped file; a non-image resource in
+/// image syntax keeps its position as a file card, alt text visible when it
+/// differs from the filename.
+#[test]
+fn non_image_resource_in_image_syntax_becomes_an_inline_card() {
+    let card = format!(
+        "<a data-joplin-lite-inline-attachment=\"true\" href=\":/{TARGET_PDF}\" data-filename=\"附件.pdf\" data-media-type=\"application/pdf\">附件.pdf</a>"
+    );
+    for (body, html) in [
+        (
+            format!("见![附件.pdf](:/{PDF})"),
+            format!("<p>见{card}</p>"),
+        ),
+        (format!("![合同](:/{PDF})"), format!("<p>合同{card}</p>")),
+    ] {
+        let converted = convert_jex_note_body(NOTE, "file.md", 1, &body, &resources())
+            .unwrap_or_else(|error| panic!("body={body}: {error:?}"));
+        assert_eq!(converted.canonical_html, html, "body={body}");
+        assert_eq!(
+            converted.ordered_resource_occurrences,
+            vec![ResourceId::new(TARGET_PDF).unwrap()]
         );
     }
 }

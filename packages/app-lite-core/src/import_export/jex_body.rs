@@ -271,10 +271,12 @@ impl<'a> Converter<'a> {
                             );
                         }
                     };
-                    if !matches!(
+                    let is_image = matches!(
                         resource.mime.as_str(),
                         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                    ) {
+                    );
+                    // A file card has no link of its own.
+                    if !is_image && marks.link.is_some() {
                         return self.blocked(
                             JexBodyBlockerKind::AmbiguousAttachment,
                             "Non-image resource uses image syntax",
@@ -295,6 +297,19 @@ impl<'a> Converter<'a> {
                                 );
                             }
                         }
+                    }
+                    if !is_image {
+                        // Joplin writes `![name](:/id)` for any dropped file.
+                        let label = if alt.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![Inline::Text {
+                                text: alt,
+                                marks: marks.clone(),
+                            }]
+                        };
+                        self.resource_inline(resource, label, &marks, &mut out);
+                        continue;
                     }
                     self.occurrences.push(resource.destination_id.clone());
                     out.push(Inline::Image {
