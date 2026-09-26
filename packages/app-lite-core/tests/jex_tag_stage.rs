@@ -657,7 +657,14 @@ fn later_note_failure_after_tag_and_resource_creation_cleans_only_owned_child() 
         append(
             tar,
             &format!("{NOTE_B}.md"),
-            note(NOTE_B, "后失败", "<script>alert(1)</script>", 2, "").as_bytes(),
+            note(
+                NOTE_B,
+                "后失败",
+                "![缺失](:/99999999999999999999999999999999)",
+                1,
+                "",
+            )
+            .as_bytes(),
         );
         append(tar, &format!("{TAG_A}.md"), tag(TAG_A, "要务").as_bytes());
         append(tar, &format!("{PDF}.md"), pdf_meta.as_bytes());
@@ -667,7 +674,7 @@ fn later_note_failure_after_tag_and_resource_creation_cleans_only_owned_child() 
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     assert!(matches!(
         stage_jex_file(&source, parent.path()),
-        Err(JexStageError::Fidelity(_))
+        Err(JexStageError::Prepare(_))
     ));
     assert_eq!(
         listing(parent.path()),

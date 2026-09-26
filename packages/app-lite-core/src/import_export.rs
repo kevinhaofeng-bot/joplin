@@ -31,6 +31,8 @@ mod jex_qualification_source;
 pub use jex_qualification::*;
 mod readable_export;
 pub use readable_export::*;
+mod import_commit;
+pub use import_commit::*;
 
 /// Maximum number of tar entries accepted by a preflight scan.
 pub const MAX_JEX_ARCHIVE_ENTRIES: usize = 50_000;

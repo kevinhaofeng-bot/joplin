@@ -402,7 +402,12 @@ fn failed_second_note_after_resource_and_first_note_cleans_owned_profile() {
     // later Markdown converter rejects a fidelity-risk structure.
     let png = large_png();
     let first = note(MD, "先成功", &format!("图![图](:/{IMAGE_A})"), 1);
-    let second = note(HTML, "后失败", "|A|B|\n|-|-|\n|1|2|", 1);
+    let second = note(
+        HTML,
+        "后失败",
+        "![缺失](:/99999999999999999999999999999999)",
+        1,
+    );
     let source = archive(|tar| {
         append(tar, &format!("{MD}.md"), first.as_bytes());
         append(tar, &format!("{HTML}.md"), second.as_bytes());
@@ -417,7 +422,7 @@ fn failed_second_note_after_resource_and_first_note_cleans_owned_profile() {
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     assert!(matches!(
         stage_jex_file(&source, parent.path()),
-        Err(JexStageError::Fidelity(_))
+        Err(JexStageError::Prepare(_))
     ));
     assert_eq!(
         listing(parent.path()),

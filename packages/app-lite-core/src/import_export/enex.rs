@@ -852,6 +852,9 @@ impl EnexStagedProfile {
     pub fn profile_path(&self) -> &Path {
         self.directory.path()
     }
+    pub(crate) fn into_directory(self) -> TempDir {
+        self.directory
+    }
     pub fn report(&self) -> &EnexStageReport {
         &self.report
     }
@@ -886,6 +889,17 @@ pub struct EnexStageReport {
     pub duplicate_resource_md5s: Vec<String>,
     pub pre_sync_outbox_rows: i64,
     pub search_index_drained: bool,
+    /// Notes whose ENML used constructs the editor cannot represent. Their
+    /// body is imported as readable plain text (attachments as cards); the
+    /// original ENML stays in `enex_stage_audit`.
+    pub degraded_notes: Vec<EnexDegradedNote>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnexDegradedNote {
+    pub note_ordinal: usize,
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Error)]
@@ -1020,17 +1034,14 @@ impl StageIngestion {
                 hash_md5: missing.hash_md5.clone(),
             });
         }
-        let converted = if raw_enml.is_empty() {
-            CanonicalDocument::parse_html("")?
-        } else {
-            crate::convert_enml(raw_enml, &self.same_note_resources)
-                .map_err(|e| EnexStageError::Fidelity {
-                    note_ordinal: source.ordinal,
-                    path: e.path,
-                    reason: e.reason,
-                })?
-                .document
-        };
+        let (converted, degraded) = convert_or_degrade(raw_enml, &self.same_note_resources)?;
+        if let Some(blocker) = degraded {
+            self.report.degraded_notes.push(EnexDegradedNote {
+                note_ordinal: source.ordinal,
+                path: blocker.path,
+                reason: blocker.reason,
+            });
+        }
         let document = with_unreferenced_attachment_cards(
             converted,
             attachment_card_inputs(&self.preflight, &self.report.resources, source.ordinal),
@@ -1298,6 +1309,113 @@ fn attachment_card_inputs<'a>(
         })
 }
 
+/// Convert ENML, or fall back to its visible text when it contains
+/// constructs the canonical document cannot represent.
+fn convert_or_degrade(
+    raw: &str,
+    resources: &BTreeMap<String, Vec<crate::VerifiedEnmlResource>>,
+) -> Result<(CanonicalDocument, Option<crate::EnmlFidelityBlocker>), EnexStageError> {
+    if raw.is_empty() {
+        return Ok((CanonicalDocument::parse_html("")?, None));
+    }
+    match crate::convert_enml(raw, resources) {
+        Ok(conversion) => Ok((conversion.document, None)),
+        Err(blocker) => Ok((
+            CanonicalDocument::parse_html(&degraded_enml_html(raw))?,
+            Some(blocker),
+        )),
+    }
+}
+
+/// Visible text of arbitrary ENML as escaped paragraphs: block ends become
+/// paragraph breaks, table cells are joined with " | ", markup is dropped.
+fn degraded_enml_html(raw: &str) -> String {
+    let mut lines = vec![String::new()];
+    let mut rest = raw;
+    while let Some(start) = rest.find('<') {
+        push_decoded(lines.last_mut().unwrap(), &rest[..start]);
+        let Some(end) = rest[start..].find('>') else {
+            rest = "";
+            break;
+        };
+        let tag = rest[start + 1..start + end].trim().to_ascii_lowercase();
+        let name = tag
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("");
+        let closing = tag.starts_with('/');
+        match name {
+            "td" | "th" if !closing && !lines.last().unwrap().is_empty() => {
+                lines.last_mut().unwrap().push_str(" | ");
+            }
+            "br" | "div" | "p" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            | "table" | "blockquote" | "pre" | "en-crypt" | "hr" => lines.push(String::new()),
+            _ => {}
+        }
+        rest = &rest[start + end + 1..];
+    }
+    push_decoded(lines.last_mut().unwrap(), rest);
+    let mut html = String::new();
+    for line in lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+    {
+        html.push_str("<p>");
+        for ch in line.chars() {
+            match ch {
+                '&' => html.push_str("&amp;"),
+                '<' => html.push_str("&lt;"),
+                '>' => html.push_str("&gt;"),
+                '"' => html.push_str("&quot;"),
+                _ => html.push(ch),
+            }
+        }
+        html.push_str("</p>");
+    }
+    html
+}
+
+fn push_decoded(out: &mut String, text: &str) {
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let Some(semi) = after.find(';').filter(|semi| *semi <= 10) else {
+            out.push('&');
+            rest = after;
+            continue;
+        };
+        let entity = &after[..semi];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            _ => entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|dec| dec.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(ch) => {
+                out.push(ch);
+                rest = &after[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+}
+
 fn finalize_staging_database(database: &Path) -> Result<(), EnexStageError> {
     let mut db = Connection::open(database)?;
     let tx = db.transaction()?;
@@ -1417,17 +1535,7 @@ fn verify_staging_profile(
                     map
                 },
             );
-        let converted = if raw.is_empty() {
-            CanonicalDocument::parse_html("")?
-        } else {
-            crate::convert_enml(&raw, &resources)
-                .map_err(|e| EnexStageError::Fidelity {
-                    note_ordinal: source.ordinal,
-                    path: e.path,
-                    reason: e.reason,
-                })?
-                .document
-        };
+        let (converted, _) = convert_or_degrade(&raw, &resources)?;
         let document = with_unreferenced_attachment_cards(
             converted,
             attachment_card_inputs(preflight, &report.resources, source.ordinal),

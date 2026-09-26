@@ -475,6 +475,91 @@ impl<'a> Converter<'a> {
     }
 }
 
+/// Like [`convert_jex_note_body`], but a note whose body uses constructs the
+/// canonical document cannot represent is imported as its source text (one
+/// paragraph per line) plus attachment cards, and the blocker is returned for
+/// the import report. An oversized body and unverified or ambiguous
+/// resources stay hard errors: degrading them would hide data loss.
+pub fn convert_jex_note_body_or_degrade(
+    source_note_id: &str,
+    source_path: &str,
+    markup_language: i64,
+    body: &str,
+    resources: &BTreeMap<String, JexVerifiedResource>,
+) -> Result<(JexBodyConversion, Option<JexBodyFidelityBlocker>)> {
+    let blocker = match convert_jex_note_body(
+        source_note_id,
+        source_path,
+        markup_language,
+        body,
+        resources,
+    ) {
+        Ok(conversion) => return Ok((conversion, None)),
+        Err(blocker) => blocker,
+    };
+    if matches!(
+        blocker.kind,
+        JexBodyBlockerKind::BodyTooLarge
+            | JexBodyBlockerKind::UnverifiedResource
+            | JexBodyBlockerKind::AmbiguousAttachment
+    ) {
+        return Err(blocker);
+    }
+    let mut html = String::new();
+    for line in body
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+    {
+        html.push_str("<p>");
+        for ch in line.chars() {
+            match ch {
+                '&' => html.push_str("&amp;"),
+                '<' => html.push_str("&lt;"),
+                '>' => html.push_str("&gt;"),
+                '"' => html.push_str("&quot;"),
+                _ => html.push(ch),
+            }
+        }
+        html.push_str("</p>");
+    }
+    let parsed = CanonicalDocument::parse_html(&html).map_err(|_| blocker.clone())?;
+    let lowered: BTreeMap<String, &JexVerifiedResource> = resources
+        .iter()
+        .map(|(id, resource)| (id.to_ascii_lowercase(), resource))
+        .collect();
+    let mut blocks = parsed.blocks().to_vec();
+    let mut attached = Vec::new();
+    let bytes = body.as_bytes();
+    for (index, _) in body.match_indices(":/") {
+        let Some(id) = bytes.get(index + 2..index + 34) else {
+            continue;
+        };
+        if !id.iter().all(u8::is_ascii_hexdigit) {
+            continue;
+        }
+        let id = String::from_utf8_lossy(id).to_ascii_lowercase();
+        if let Some(resource) = lowered.get(&id)
+            && !attached.contains(&resource.destination_id)
+        {
+            attached.push(resource.destination_id.clone());
+            blocks.push(Block::Attachment {
+                resource_id: resource.destination_id.clone(),
+                filename: resource.filename.clone(),
+                media_type: resource.mime.clone(),
+            });
+        }
+    }
+    let document = CanonicalDocument::from_blocks(blocks);
+    let conversion = JexBodyConversion {
+        canonical_html: document.to_canonical_html().as_str().to_owned(),
+        search_text: document.search_text().as_str().to_owned(),
+        ordered_resource_occurrences: document.resource_ids(),
+        document,
+    };
+    Ok((conversion, Some(blocker)))
+}
+
 pub fn convert_jex_note_body(
     source_note_id: &str,
     source_path: &str,

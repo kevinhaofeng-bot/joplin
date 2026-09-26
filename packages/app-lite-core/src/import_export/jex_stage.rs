@@ -25,8 +25,8 @@ mod resources;
 mod tags;
 
 use super::{
-    JexBodyFidelityBlocker, JexPrepareError, JexScanCounts, JexVerifiedResource,
-    convert_jex_note_body, parse_item, prepare_jex_source_archive,
+    JexBodyBlockerKind, JexBodyFidelityBlocker, JexPrepareError, JexScanCounts,
+    JexVerifiedResource, convert_jex_note_body_or_degrade, parse_item, prepare_jex_source_archive,
 };
 
 #[derive(Debug)]
@@ -38,6 +38,9 @@ pub struct JexStagedProfile {
 impl JexStagedProfile {
     pub fn profile_path(&self) -> &Path {
         self.directory.path()
+    }
+    pub(crate) fn into_directory(self) -> TempDir {
+        self.directory
     }
     pub fn report(&self) -> &JexStageReport {
         &self.report
@@ -125,6 +128,16 @@ pub struct JexStageReport {
     pub relations: Vec<JexStagedRelation>,
     pub verified_sync_outbox_rows: i64,
     pub search_index_drained: bool,
+    /// Notes imported as readable source text because their body used
+    /// constructs the editor cannot represent; the raw item stays audited.
+    pub degraded_notes: Vec<JexDegradedNote>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JexDegradedNote {
+    pub source_id: String,
+    pub kind: JexBodyBlockerKind,
+    pub reason: String,
 }
 
 #[derive(Debug, Error)]
@@ -655,7 +668,7 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
                 "reopened source audit differs".into(),
             ));
         }
-        let converted = convert_jex_note_body(
+        let (converted, _) = convert_jex_note_body_or_degrade(
             &entry.source_id,
             &entry.source_path,
             markup,
@@ -886,7 +899,7 @@ pub fn stage_jex_file(
             .raw_item(source_id)?
             .ok_or_else(|| JexStageError::Verification("verified note item disappeared".into()))?;
         let parsed = parse_note(source_id, &raw.archive_path, &raw.raw_bytes)?;
-        let converted = convert_jex_note_body(
+        let (converted, degraded) = convert_jex_note_body_or_degrade(
             parsed.source_id,
             parsed.source_path,
             parsed.markup,
@@ -894,6 +907,13 @@ pub fn stage_jex_file(
             &verified_resources,
         )
         .map_err(JexStageError::Fidelity)?;
+        if let Some(blocker) = degraded {
+            report.degraded_notes.push(JexDegradedNote {
+                source_id: source_id.clone(),
+                kind: blocker.kind,
+                reason: blocker.reason,
+            });
+        }
         let resource_ids = converted.ordered_resource_occurrences;
         let notebook_id = if parsed.parent_id.is_empty() {
             None

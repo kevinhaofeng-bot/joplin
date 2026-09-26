@@ -320,7 +320,13 @@ fn malformed_or_empty_joplin_utc_time_blocks_and_cleans_after_first_note() {
 #[test]
 fn failed_second_note_cleans_only_owned_children_and_existing_profile_parent_is_rejected() {
     let first = note(MD, "先成功", "正文", 1, "");
-    let second = note(HTML, "后失败", "|A|B|\n|-|-|\n|1|2|", 1, "");
+    let second = note(
+        HTML,
+        "后失败",
+        "![缺失](:/99999999999999999999999999999999)",
+        1,
+        "",
+    );
     let source = archive(|tar| {
         append(tar, &format!("{MD}.md"), first.as_bytes());
         append(tar, &format!("{HTML}.md"), second.as_bytes());
@@ -329,7 +335,7 @@ fn failed_second_note_cleans_only_owned_children_and_existing_profile_parent_is_
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     assert!(matches!(
         stage_jex_file(&source, parent.path()),
-        Err(JexStageError::Fidelity(_))
+        Err(JexStageError::Prepare(_))
     ));
     assert_eq!(
         listing(parent.path()),
@@ -350,4 +356,32 @@ fn failed_second_note_cleans_only_owned_children_and_existing_profile_parent_is_
         fs::read(live.path().join("library.sqlite")).unwrap(),
         b"live-sentinel"
     );
+}
+
+#[test]
+fn unsupported_markdown_degrades_to_readable_source_text_with_report() {
+    // Plan task 2: a table/raw HTML note imports as readable text and is
+    // reported, instead of blocking every other note in the library.
+    let table = note(HTML, "表格", "|A|B|\n|-|-|\n|1|<b>2</b>|", 1, "");
+    let plain = note(MD, "普通", "正文", 1, "");
+    let source = archive(|tar| {
+        append(tar, &format!("{MD}.md"), plain.as_bytes());
+        append(tar, &format!("{HTML}.md"), table.as_bytes());
+    });
+    let parent = tempdir().unwrap();
+    let stage = stage_jex_file(&source, parent.path()).unwrap();
+    let report = stage.report();
+    assert_eq!(report.notes.len(), 2);
+    assert_eq!(report.degraded_notes.len(), 1);
+    assert_eq!(report.degraded_notes[0].source_id, HTML);
+    let repo = LibraryRepository::open(stage.profile_path().join("library.sqlite")).unwrap();
+    let staged = report.notes.iter().find(|n| n.source_id == HTML).unwrap();
+    let body = repo
+        .load_note(&staged.destination_id)
+        .unwrap()
+        .unwrap()
+        .body_text;
+    for visible in ["|A|B|", "|1|<b>2</b>|"] {
+        assert!(body.contains(visible), "{visible} in {body:?}");
+    }
 }

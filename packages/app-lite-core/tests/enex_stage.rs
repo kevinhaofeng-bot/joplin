@@ -164,14 +164,11 @@ fn rejects_unsupported_or_missing_attachments_without_touching_existing_profile(
     let unsupported = archive(
         "<en-export><note><title>x</title><content><![CDATA[<en-note><table><tr><td>x</td></tr></table></en-note>]]></content></note></en-export>",
     );
-    assert!(matches!(
-        stage_enex_file(unsupported.path(), parent.path()),
-        Err(EnexStageError::Fidelity {
-            note_ordinal: 1,
-            path,
-            ..
-        }) if path == "/en-note/0"
-    ));
+    // Unsupported ENML no longer blocks: it degrades and is reported.
+    let degraded = stage_enex_file(unsupported.path(), parent.path()).unwrap();
+    assert_eq!(degraded.report().degraded_notes.len(), 1);
+    assert_eq!(degraded.report().degraded_notes[0].path, "/en-note/0");
+    drop(degraded);
     let missing = archive(
         "<en-export><note><title>x</title><content><![CDATA[<en-note><en-media hash=\"900150983cd24fb0d6963f7d28e17f72\" type=\"image/png\"/></en-note>]]></content></note></en-export>",
     );
@@ -190,7 +187,7 @@ fn rejects_unsupported_or_missing_attachments_without_touching_existing_profile(
 }
 
 #[test]
-fn second_note_fidelity_failure_discards_previously_staged_note_and_attachment() {
+fn second_note_failure_discards_previously_staged_note_and_attachment() {
     // Mutation caught: an error after a successful note/resource leaves a
     // partially populated stage child or changes a sibling profile.
     let parent = tempdir().unwrap();
@@ -200,7 +197,7 @@ fn second_note_fidelity_failure_discards_previously_staged_note_and_attachment()
     let bytes = b"first-note-attachment";
     let hash = format!("{:x}", Md5::digest(bytes));
     let xml = format!(
-        "<en-export><note><title>已写入的笔记</title><content><![CDATA[<en-note><div>第一条<en-media hash=\"{hash}\" type=\"image/png\"/></div></en-note>]]></content>{}</note><note><title>失败的笔记</title><content><![CDATA[<en-note><table><tr><td>不支持</td></tr></table></en-note>]]></content></note></en-export>",
+        "<en-export><note><title>已写入的笔记</title><content><![CDATA[<en-note><div>第一条<en-media hash=\"{hash}\" type=\"image/png\"/></div></en-note>]]></content>{}</note><note><title>失败的笔记</title><content><![CDATA[<en-note><en-media hash=\"900150983cd24fb0d6963f7d28e17f72\" type=\"image/png\"/></en-note>]]></content></note></en-export>",
         resource(bytes, "image/png", "first.png"),
     );
     let source = archive(&xml);
@@ -209,11 +206,10 @@ fn second_note_fidelity_failure_discards_previously_staged_note_and_attachment()
     assert_eq!(scanned.resources.len(), 1);
     assert!(matches!(
         stage_enex_file(source.path(), parent.path()),
-        Err(EnexStageError::Fidelity {
+        Err(EnexStageError::MissingResource {
             note_ordinal: 2,
-            path,
             ..
-        }) if path == "/en-note/0"
+        })
     ));
     assert_eq!(fs::read(sentinel.join("keep.bin")).unwrap(), b"unchanged");
     let entries = fs::read_dir(parent.path())
@@ -342,4 +338,50 @@ fn existing_live_profile_is_rejected_as_parent_and_cancellation_leaves_no_child(
         Err(EnexStageError::Cancelled)
     ));
     assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn unsupported_enml_degrades_to_readable_text_with_report_and_keeps_attachments() {
+    // Plan task 2: unsupported content keeps a readable fallback and is
+    // reported; it neither blocks the whole library nor vanishes silently.
+    let bytes = b"table-note-attachment";
+    let hash = format!("{:x}", Md5::digest(bytes));
+    let xml = format!(
+        "<en-export><note><title>表格笔记</title><content><![CDATA[<en-note><div>表前</div><table><tr><td>甲 &amp; 乙</td><td>丙</td></tr><tr><td>丁</td><td>戊</td></tr></table><en-crypt>Q0lQSEVS</en-crypt><div><en-media hash=\"{hash}\" type=\"image/png\"/></div></en-note>]]></content>{}</note><note><title>正常</title><content><![CDATA[<en-note><div>正文</div></en-note>]]></content></note></en-export>",
+        resource(bytes, "image/png", "表.png"),
+    );
+    let source = archive(&xml);
+    let parent = tempdir().unwrap();
+    let stage = stage_enex_file(source.path(), parent.path()).unwrap();
+    let report = stage.report();
+    assert_eq!(report.notes.len(), 2);
+    assert_eq!(report.degraded_notes.len(), 1);
+    assert_eq!(report.degraded_notes[0].note_ordinal, 1);
+    assert!(report.degraded_notes[0].reason.contains("table"));
+    let repo = LibraryRepository::open(stage.profile_path().join("library.sqlite")).unwrap();
+    let note = repo
+        .load_note(&report.notes[0].destination_id)
+        .unwrap()
+        .unwrap();
+    for visible in ["表前", "甲 & 乙", "丙", "丁", "戊", "Q0lQSEVS"] {
+        assert!(
+            note.body_text.contains(visible),
+            "{visible} in {:?}",
+            note.body_text
+        );
+    }
+    assert_eq!(note.resource_ids, report.notes[0].resource_ids);
+    assert_eq!(note.resource_ids.len(), 1, "attachment kept as a card");
+    let raw: String = rusqlite::Connection::open(stage.profile_path().join("library.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT raw_enml FROM enex_stage_audit WHERE note_ordinal = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        raw.contains("<table>"),
+        "original ENML retained for later re-import"
+    );
 }

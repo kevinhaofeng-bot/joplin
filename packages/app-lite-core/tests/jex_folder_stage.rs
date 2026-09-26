@@ -414,14 +414,21 @@ fn blocked_body_after_folder_creation_cleans_owned_child_only() {
         append(
             tar,
             &format!("{NOTE_LEAF}.md"),
-            note(NOTE_LEAF, "危险", "<script>alert(1)</script>", 2, ROOT_LEAF).as_bytes(),
+            note(
+                NOTE_LEAF,
+                "危险",
+                "![缺失](:/99999999999999999999999999999999)",
+                1,
+                ROOT_LEAF,
+            )
+            .as_bytes(),
         );
     });
     let parent = tempdir().unwrap();
     fs::write(parent.path().join("sentinel.bin"), b"keep").unwrap();
     assert!(matches!(
         stage_jex_file(&source, parent.path()),
-        Err(JexStageError::Fidelity(_))
+        Err(JexStageError::Prepare(_))
     ));
     assert_eq!(
         listing(parent.path()),
