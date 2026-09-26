@@ -128,13 +128,13 @@ pub(crate) struct ProfileDir {
     inode: u64,
 }
 
-/// The SQLite main database file bound through the profile descriptor before
-/// SQLite's unavoidable pathname open.  The held descriptor makes the child
-/// identity authoritative throughout migration; SQLite's filename is checked
-/// back against this identity before any write and before publication.
+/// The SQLite main database file's identity (device, inode), taken through
+/// the profile descriptor before SQLite's unavoidable pathname open and
+/// checked back by `fstatat` before any write and before publication.
 pub(crate) struct DatabaseFile {
-    #[allow(dead_code)] // Keeps the inode bound for the repository lifetime.
-    file: File,
+    // Deliberately no open descriptor: closing any fd on the database file
+    // releases every POSIX lock SQLite holds in this process (including a
+    // second repository's), letting another process delete the live WAL.
     name: std::ffi::OsString,
     device: u64,
     inode: u64,
@@ -441,10 +441,16 @@ impl ProfileDir {
         &self,
         name: &std::ffi::OsStr,
     ) -> Result<DatabaseFile, ResourceError> {
-        let file = open_or_create_regular_file(self.fd.0, name)?;
-        let (device, inode) = fd_identity(file.as_raw_fd())?;
+        let (device, inode) = match stat_regular_child(self.fd.0, name) {
+            Ok(identity) => identity,
+            Err(ResourceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Nothing can hold SQLite locks on a file that did not exist.
+                let file = open_or_create_regular_file(self.fd.0, name)?;
+                fd_identity(file.as_raw_fd())?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(DatabaseFile {
-            file,
             name: name.to_owned(),
             device,
             inode,
@@ -468,12 +474,14 @@ impl ProfileDir {
 }
 
 impl DatabaseFile {
+    /// Identity check by `fstatat` without opening the file: closing any
+    /// extra descriptor on the database would drop every POSIX lock SQLite
+    /// holds in this process, letting another process delete the live WAL.
     pub(crate) fn matches_profile_child(
         &self,
         profile: &ProfileDir,
     ) -> Result<bool, ResourceError> {
-        let file = open_regular_file(profile.fd.0, &self.name)?;
-        let (device, inode) = fd_identity(file.as_raw_fd())?;
+        let (device, inode) = stat_regular_child(profile.fd.0, &self.name)?;
         Ok(device == self.device && inode == self.inode)
     }
 
@@ -702,6 +710,29 @@ fn open_dir_path(path: &Path) -> Result<DirFd, ResourceError> {
         return Err(io_error());
     }
     Ok(DirFd(fd))
+}
+
+/// (device, inode) of a regular, non-symlink child without opening it.
+fn stat_regular_child(dir_fd: RawFd, name: &std::ffi::OsStr) -> Result<(u64, u64), ResourceError> {
+    let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| ResourceError::UnsafePath)?;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: valid directory fd, NUL-terminated name, owned out-param.
+    if unsafe {
+        libc::fstatat(
+            dir_fd,
+            c_name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io_error());
+    }
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => Ok((stat.st_dev as u64, stat.st_ino as u64)),
+        libc::S_IFLNK => Err(ResourceError::Symlink),
+        _ => Err(ResourceError::UnsafePath),
+    }
 }
 
 fn fd_identity(fd: RawFd) -> Result<(u64, u64), ResourceError> {

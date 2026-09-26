@@ -574,3 +574,80 @@ fn recovered_checkpoint_claim_is_atomic_and_rejects_the_crashed_writer() {
         "recovered-a"
     );
 }
+
+/// Another process opening the library read-write must not be able to
+/// delete the live WAL: this process's SQLite locks have to stay held.
+/// Closing any extra descriptor on the database file drops every POSIX lock
+/// SQLite holds in the process (sqlite.org/howtocorrupt.html §2.2).
+#[test]
+fn another_process_cannot_delete_the_wal_while_the_repository_is_open() {
+    let profile = tempfile::tempdir().unwrap();
+    let db = profile.path().join("library.sqlite");
+    let repo = app_lite_core::LibraryRepository::open(&db).unwrap();
+    let doc = app_lite_core::CanonicalDocument::default();
+    repo.create_note(app_lite_core::CreateNote {
+        title: "一".into(),
+        notebook_id: None,
+        document: doc.clone(),
+    })
+    .unwrap();
+    repo.process_search_jobs().unwrap();
+
+    let status = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT count(*) FROM notes;")
+        .output()
+        .expect("sqlite3 CLI");
+    assert!(status.status.success());
+
+    repo.create_note(app_lite_core::CreateNote {
+        title: "二".into(),
+        notebook_id: None,
+        document: doc,
+    })
+    .unwrap();
+    assert!(
+        profile.path().join("library.sqlite-wal").exists(),
+        "the live WAL was deleted by another process"
+    );
+    let seen = std::process::Command::new("sqlite3")
+        .arg("-readonly")
+        .arg(&db)
+        .arg("SELECT count(*) FROM notes;")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&seen.stdout).trim(), "2");
+}
+
+/// Two windows on the same library in one process: closing one repository
+/// must not drop the SQLite locks of the one still open.
+#[test]
+fn closing_a_second_repository_on_the_same_file_keeps_the_first_ones_locks() {
+    let profile = tempfile::tempdir().unwrap();
+    let db = profile.path().join("library.sqlite");
+    let first = app_lite_core::LibraryRepository::open(&db).unwrap();
+    let doc = app_lite_core::CanonicalDocument::default();
+    first
+        .create_note(app_lite_core::CreateNote {
+            title: "一".into(),
+            notebook_id: None,
+            document: doc.clone(),
+        })
+        .unwrap();
+    drop(app_lite_core::LibraryRepository::open(&db).unwrap());
+
+    let status = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT count(*) FROM notes;")
+        .output()
+        .expect("sqlite3 CLI");
+    assert!(status.status.success());
+    first
+        .create_note(app_lite_core::CreateNote {
+            title: "二".into(),
+            notebook_id: None,
+            document: doc,
+        })
+        .unwrap();
+    assert!(profile.path().join("library.sqlite-wal").exists());
+}
