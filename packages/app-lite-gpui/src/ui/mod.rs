@@ -2601,6 +2601,15 @@ impl LibraryShell {
         self.complete_resource_picker_path_for_token(token, path, window, cx)
     }
 
+    #[cfg(test)]
+    pub(crate) fn cancel_resource_picker_for_test(
+        &mut self,
+        token: ResourcePickerToken,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_resource_picker(token, cx);
+    }
+
     /// Complete the one production resource transaction shared by picker,
     /// pasteboard and Finder drop. If a Task-4 writer owns the current
     /// immutable generation, retain the source and its captured DocPoint

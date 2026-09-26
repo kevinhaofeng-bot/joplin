@@ -6495,6 +6495,98 @@ fn link_argument_validation_is_atomic_for_empty_and_invalid_urls(cx: &mut gpui::
     assert_eq!(editor.undo_depth(), before_undo);
 }
 
+/// Evernote `list/list.ts::insertListAtSelection`: re-applying the list type
+/// that already covers the selection removes the list (`removeList`), so the
+/// toolbar's highlighted state and its click agree.
+#[gpui::test]
+fn same_list_command_on_matching_list_selection_toggles_back_to_paragraphs(
+    cx: &mut gpui::TestAppContext,
+) {
+    let catalogue = CommandCatalogue::default();
+    for command in [
+        EditorCommand::BulletList,
+        EditorCommand::OrderedList,
+        EditorCommand::CheckList,
+    ] {
+        let mut editor = EditorCore::for_test_paragraphs(["一", "二"], cx);
+        editor.select_all();
+        catalogue
+            .execute(command, CommandArgument::None, &mut editor)
+            .unwrap();
+        assert_eq!(
+            catalogue.state(command, &editor).toggle,
+            ToggleState::On,
+            "{command:?}"
+        );
+        let listed = editor.document().semantic_snapshot();
+        catalogue
+            .execute(command, CommandArgument::None, &mut editor)
+            .unwrap();
+        assert_eq!(
+            editor.document().block_kinds(),
+            vec![BlockKind::Paragraph, BlockKind::Paragraph],
+            "{command:?} should toggle off"
+        );
+        catalogue
+            .execute(EditorCommand::Undo, CommandArgument::None, &mut editor)
+            .unwrap();
+        assert_eq!(editor.document().semantic_snapshot(), listed, "{command:?}");
+    }
+}
+
+/// Evernote `insertOrToggleList` converts existing list items with
+/// `setNodeMarkup`, keeping their nesting; UL→OL must not flatten depth.
+#[gpui::test]
+fn switching_list_type_preserves_item_depth(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let mut editor = EditorCore::for_test_paragraphs(["一", "二"], cx);
+    editor.select_all();
+    catalogue
+        .execute(
+            EditorCommand::BulletList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    catalogue
+        .execute(
+            EditorCommand::IndentList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    catalogue
+        .execute(
+            EditorCommand::OrderedList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    assert_eq!(
+        editor.document().block_kinds(),
+        vec![
+            BlockKind::OrderedItem { depth: 1 },
+            BlockKind::OrderedItem { depth: 1 }
+        ]
+    );
+    catalogue
+        .execute(EditorCommand::CheckList, CommandArgument::None, &mut editor)
+        .unwrap();
+    assert_eq!(
+        editor.document().block_kinds(),
+        vec![
+            BlockKind::CheckItem {
+                depth: 1,
+                checked: false
+            },
+            BlockKind::CheckItem {
+                depth: 1,
+                checked: false
+            }
+        ]
+    );
+}
+
 #[gpui::test]
 fn list_boundary_editing_preserves_structure(cx: &mut gpui::TestAppContext) {
     let catalogue = CommandCatalogue::default();

@@ -1553,6 +1553,31 @@ impl EditorCore {
         Ok(outcome)
     }
 
+    /// Apply several block-local transactions as one undo entry while keeping
+    /// the user's selection (used by per-block list conversion).
+    pub fn apply_batch_keeping_selection(
+        &mut self,
+        batch: TransactionBatch,
+    ) -> Result<ApplyOutcome, DocumentError> {
+        #[cfg(test)]
+        if let Some(error) = self.next_apply_error_for_test.take() {
+            return Err(error);
+        }
+        let selection = self.selection;
+        let outcome = self.apply_batch_with_selection(selection, batch)?;
+        self.selection = selection;
+        self.preferred_x = None;
+        self.clear_composition();
+        self.layout.invalidate_nodes_with_delta(
+            &self.document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        Ok(outcome)
+    }
+
     /// Produce the exact post-transaction document/history before a resource
     /// association is allowed to commit. This intentionally clones only for
     /// the infrequent cross-store resource boundary; ordinary typing keeps

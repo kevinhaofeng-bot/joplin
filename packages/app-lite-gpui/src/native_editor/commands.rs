@@ -8,8 +8,8 @@
 use std::fmt;
 
 use super::core::EditorCore;
-use super::model::{BlockKind, DocumentError, Mark, TextAlignment};
-use super::transaction::Transaction;
+use super::model::{BlockKind, DocPoint, DocumentError, Mark, Selection, TextAlignment};
+use super::transaction::{Transaction, TransactionBatch};
 
 /// Commands visible in the native Evernote-order editor strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -376,8 +376,16 @@ impl CommandCatalogue {
                 if count == 0 || !text_only {
                     return disabled();
                 }
+                // A list command is never a no-op: it converts, or toggles
+                // an all-matching list back to paragraphs.
+                let is_list = matches!(
+                    command,
+                    EditorCommand::BulletList
+                        | EditorCommand::OrderedList
+                        | EditorCommand::CheckList
+                );
                 return CommandState {
-                    enabled: exact_matching != count,
+                    enabled: is_list || exact_matching != count,
                     toggle: toggle_state(type_matching > 0, type_matching == count),
                 };
             }
@@ -461,13 +469,13 @@ impl CommandCatalogue {
             }
             EditorCommand::Undo => editor.undo()?,
             EditorCommand::Redo => editor.redo()?,
+            EditorCommand::BulletList | EditorCommand::OrderedList | EditorCommand::CheckList => {
+                apply_list_command(command, editor)?;
+            }
             EditorCommand::Paragraph
             | EditorCommand::Heading1
             | EditorCommand::Heading2
-            | EditorCommand::Heading3
-            | EditorCommand::BulletList
-            | EditorCommand::OrderedList
-            | EditorCommand::CheckList => {
+            | EditorCommand::Heading3 => {
                 editor.apply(Transaction::SetBlockKind {
                     selection,
                     kind: block_kind_for_command(command),
@@ -623,6 +631,58 @@ fn alignment_for_command(command: EditorCommand) -> TextAlignment {
         EditorCommand::AlignRight => TextAlignment::Right,
         _ => unreachable!("{command:?} is not an alignment command"),
     }
+}
+
+/// Evernote `list/list.ts::insertListAtSelection`: when every selected block
+/// is already this list type the list is removed (`removeList`); otherwise
+/// each block converts, and existing list items keep their nesting
+/// (`insertOrToggleList` uses `setNodeMarkup`). One undo entry.
+fn apply_list_command(command: EditorCommand, editor: &mut EditorCore) -> Result<(), CommandError> {
+    let Some((start, end)) = editor.selected_block_indices() else {
+        return Ok(());
+    };
+    let blocks: Vec<_> = editor
+        .document()
+        .blocks()
+        .iter_range(start..end.saturating_add(1))
+        .map(|block| {
+            let len = block.content.as_text().map_or(0, str::len);
+            (block.id, block.kind.clone(), len)
+        })
+        .collect();
+    let remove = !blocks.is_empty()
+        && blocks
+            .iter()
+            .all(|(_, kind, _)| block_kind_matches_command(kind, command));
+    let transactions: Vec<_> = blocks
+        .into_iter()
+        .filter_map(|(id, kind, len)| {
+            let target = if remove {
+                BlockKind::Paragraph
+            } else {
+                let depth = list_depth(&kind).unwrap_or(0);
+                match command {
+                    EditorCommand::BulletList => BlockKind::BulletItem { depth },
+                    EditorCommand::OrderedList => BlockKind::OrderedItem { depth },
+                    _ => BlockKind::CheckItem {
+                        depth,
+                        checked: match kind {
+                            BlockKind::CheckItem { checked, .. } => checked,
+                            _ => false,
+                        },
+                    },
+                }
+            };
+            (target != kind).then(|| Transaction::SetBlockKind {
+                selection: Selection::new(DocPoint::new(id, 0), DocPoint::new(id, len)),
+                kind: target,
+            })
+        })
+        .collect();
+    if !transactions.is_empty() {
+        editor.apply_batch_keeping_selection(TransactionBatch(transactions))?;
+    }
+    Ok(())
 }
 
 fn list_depth(kind: &BlockKind) -> Option<u8> {

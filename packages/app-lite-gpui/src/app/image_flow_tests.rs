@@ -1575,3 +1575,106 @@ async fn mounted_attachment_picker_paints_a_durable_card_without_reopening_note(
         "attachment stays structural canonical body data rather than UI bytes"
     );
 }
+
+fn resource_row_count(profile: &tempfile::TempDir) -> i64 {
+    Connection::open(profile.path().join("library.sqlite"))
+        .expect("open sqlite")
+        .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+        .expect("count resources")
+}
+
+/// Review focus 1: an asynchronous picker that settles after the person has
+/// switched notes must not insert into either note, and cancelling must not
+/// leave a node or a resource row behind.
+#[gpui::test]
+async fn mounted_picker_completion_after_switching_notes_inserts_nowhere(cx: &mut TestAppContext) {
+    let (profile, repository) = repository();
+    let model = cx.new({
+        let repository = Arc::clone(&repository);
+        move |_| AppModel::open(repository).expect("open real app model")
+    });
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        LibraryShell::new_with_save_clock(model.clone(), None, clock, window, cx)
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::CreateNote, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let first = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::CreateNote, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let second = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert_ne!(first.note_id, second.note_id);
+
+    let path = picker_png(&profile);
+    let token = cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .begin_resource_picker(shell_cx)
+                .expect("picker opens on the second note")
+        })
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::SelectNote(first.note_id.clone()),
+                window,
+                shell_cx,
+            );
+        });
+    });
+    redraw(cx);
+    let result = cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_resource_picker_path_for_token_for_test(
+                token,
+                path.clone(),
+                window,
+                shell_cx,
+            )
+        })
+    });
+    assert!(result.is_err(), "a stale picker must be rejected");
+    cx.run_until_parked();
+    redraw(cx);
+    let shown = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert_eq!(shown.note_id, first.note_id);
+    assert!(
+        !shown.has_image_block,
+        "the newly selected note must not receive it"
+    );
+    for id in [&first.note_id, &second.note_id] {
+        assert!(
+            repository
+                .load_note(id)
+                .expect("load")
+                .expect("note")
+                .resource_ids
+                .is_empty()
+        );
+    }
+
+    // Cancel on the current note: no node, no resource row.
+    let token = cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.begin_resource_picker(shell_cx).expect("picker opens")
+        })
+    });
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.cancel_resource_picker_for_test(token, shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let after_cancel = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert!(!after_cancel.has_image_block);
+    assert_eq!(resource_row_count(&profile), 0);
+}
