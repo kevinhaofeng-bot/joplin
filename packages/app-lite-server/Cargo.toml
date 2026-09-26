@@ -1,0 +1,15 @@
+[package]
+name = "app-lite-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+app-lite-protocol = { path = "../app-lite-protocol" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
