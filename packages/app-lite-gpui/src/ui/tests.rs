@@ -9530,3 +9530,37 @@ async fn mounted_attachment_open_failure_is_visible_without_mutating_the_documen
     assert_eq!(after.revision, before.revision);
     assert_eq!(after.body_html, before.body_html);
 }
+
+/// Real-app check: typing right after Cmd-N was dropped because the old
+/// editor that held focus was unmounted. Evernote focuses the new note's
+/// title (title/title.ts moveSelectionToTitle); spec 7.1.
+#[gpui::test]
+async fn typing_right_after_cmd_n_goes_into_the_new_notes_title(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "已有笔记".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("existing note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|_, app| bind_library_keybindings(app));
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-n");
+    redraw(cx);
+    cx.simulate_input("新标题");
+    redraw(cx);
+    let title = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("new note mounted")
+            .read(app)
+            .title()
+            .read(app)
+            .text()
+            .to_owned()
+    });
+    assert_eq!(title, "新标题");
+}

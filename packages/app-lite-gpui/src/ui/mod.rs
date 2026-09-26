@@ -542,6 +542,7 @@ pub struct LibraryShell {
     next_readable_export_token: u64,
     readable_export_notice: Option<ExportNotice>,
     pending_library_import: Option<PendingLibraryImport>,
+    focus_title_after_mount: bool,
     next_library_import_token: u64,
     library_import_notice: Option<ExportNotice>,
     imported_library_ready: Option<PathBuf>,
@@ -1065,6 +1066,7 @@ impl LibraryShell {
             next_readable_export_token: 0,
             readable_export_notice: None,
             pending_library_import: None,
+            focus_title_after_mount: false,
             next_library_import_token: 0,
             library_import_notice: None,
             imported_library_ready: None,
@@ -1904,6 +1906,7 @@ impl LibraryShell {
         {
             return false;
         }
+        let is_create_note = matches!(action, AppAction::CreateNote);
         let remount_current_surface = self.action_can_change_active_session_revision(&action);
         if remount_current_surface {
             // Set this before the model notification so even an eager GPUI
@@ -1927,6 +1930,13 @@ impl LibraryShell {
                 // turn instead of waiting for the retained observer.
                 self.set_active_session_reconciliation_lock(true, cx);
             }
+        }
+        if result.is_ok() && is_create_note {
+            // The editor that held focus is unmounted with the old note;
+            // focus the new title once it mounts (Evernote title/title.ts
+            // moveSelectionToTitle), or typing right after Cmd-N is lost.
+            self.focus_title_after_mount = true;
+            cx.notify();
         }
         // The retained model observer owns surface synchronization, deferred
         // scrolling, and shell invalidation. Keeping this reducer to model
@@ -6417,6 +6427,16 @@ fn cleanup_owned_temporary_paths(paths: &[PathBuf]) {
 
 impl Render for LibraryShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.model.read(cx).navigation().selected_note_id().cloned();
+        if self.focus_title_after_mount
+            && selected.is_some()
+            && self.surface_note_id == selected
+            && let Some(session) = self.note_session.as_ref()
+        {
+            self.focus_title_after_mount = false;
+            let title = session.read(cx).title().clone();
+            title.read(cx).focus_handle().focus(window);
+        }
         #[cfg(test)]
         {
             for fill in &self
