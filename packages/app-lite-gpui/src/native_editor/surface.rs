@@ -344,6 +344,28 @@ impl EditorSurface {
             cx.propagate();
             return;
         }
+        if !self.mode.is_read_only() {
+            let on_handle = self.editor.update(cx, |editor, editor_cx| {
+                let on_handle = editor
+                    .image_resize_handle_bounds()
+                    .is_some_and(|handle| handle.contains(&event.position));
+                if on_handle {
+                    if event.click_count >= 2 {
+                        let _ = editor.restore_selected_image_natural_width();
+                    } else {
+                        editor.begin_image_resize(event.position);
+                    }
+                    editor_cx.notify();
+                }
+                on_handle
+            });
+            if on_handle {
+                self.pointer_anchor = None;
+                focus_editor(&self.editor, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         // Images and attachment cards are structural atoms in editing mode.
         // A click must produce a full NodeSelection-style range, not an
         // ambiguous before/after caret. The attachment's double-click is
@@ -415,6 +437,13 @@ impl EditorSurface {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.editor.read(cx).is_resizing_image() {
+            let _ = self.editor.update(cx, |editor, editor_cx| {
+                editor.update_image_resize(event.position);
+                editor_cx.notify();
+            });
+            return;
+        }
         if !event.dragging() {
             return;
         }
@@ -427,8 +456,16 @@ impl EditorSurface {
         });
     }
 
-    fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.pointer_anchor = None;
+        if self.editor.read(cx).is_resizing_image() {
+            let _ = self.editor.update(cx, |editor, editor_cx| {
+                if editor.finish_image_resize(event.position).is_err() {
+                    editor.cancel_image_resize();
+                }
+                editor_cx.notify();
+            });
+        }
         cx.notify();
     }
 

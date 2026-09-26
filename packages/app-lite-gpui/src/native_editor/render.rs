@@ -59,6 +59,8 @@ struct RenderSnapshot {
     selection_rects: Vec<Bounds<Pixels>>,
     selection: Selection,
     caret_bounds: Option<Bounds<Pixels>>,
+    image_resize_handle: Option<Bounds<Pixels>>,
+    image_resize_preview: Option<Bounds<Pixels>>,
 }
 
 /// Geometry is collected from the already-shaped visible block layouts. It is
@@ -345,6 +347,8 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
             .is_caret()
             .then(|| layout.caret_bounds_for_point(editor.selection().head))
             .flatten(),
+        image_resize_handle: editor.image_resize_handle_bounds(),
+        image_resize_preview: editor.image_resize_preview_bounds(),
     }
 }
 
@@ -645,6 +649,20 @@ fn paint_snapshot(
         if let Some(bounds) = snapshot.caret_bounds {
             window.paint_quad(fill(bounds, rgba(0x2167dfff)));
         }
+    }
+
+    // 5. Image resize: preview frame while dragging, handle when selected.
+    if let Some(preview) = snapshot.image_resize_preview {
+        let mut quad = outline(preview, rgba(0x2167dfcc), BorderStyle::Dashed);
+        quad.corner_radii = Corners::all(px(6.0));
+        window.paint_quad(quad);
+    }
+    if let Some(handle) = snapshot.image_resize_handle {
+        let mut quad = fill(handle, rgba(0xffffffff));
+        quad.border_widths = gpui::Edges::all(px(1.5));
+        quad.border_color = rgba(0x2167dfff).into();
+        quad.corner_radii = Corners::all(px(2.0));
+        window.paint_quad(quad);
     }
     Ok(())
 }

@@ -265,6 +265,8 @@ pub struct EditorCore {
     pending_resource_insert_anchors: HashMap<u64, PendingResourceInsertAnchor>,
     pub(crate) layout: LayoutRegistry,
     layout_offset: (f32, f32),
+    /// An in-progress image resize drag; only a preview until release.
+    image_resize: Option<ImageResizeDrag>,
     #[cfg(test)]
     shape_calls: usize,
     /// Test-only fault seam for the legacy post-commit `apply` path. Durable
@@ -306,6 +308,27 @@ pub enum EditorAccess {
 /// The pointer-facing identity of a section-level resource node. The shared
 /// surface uses this only to distinguish the attachment's platform open
 /// request; both variants are selected as one complete document atom.
+/// Evernote `ResizeHandle.tsx` `MIN_WIDTH`.
+pub(crate) const IMAGE_RESIZE_MIN_WIDTH: f32 = 50.0;
+const IMAGE_RESIZE_HANDLE_SIZE: f32 = 12.0;
+
+#[derive(Clone, Copy, Debug)]
+struct ImageResizeDrag {
+    node_id: NodeId,
+    origin: Point<Pixels>,
+    aspect: f32,
+    ceiling: f32,
+    start_width: f32,
+    preview_width: f32,
+}
+
+impl ImageResizeDrag {
+    fn clamped_width(&self, position: Point<Pixels>) -> f32 {
+        f32::from(position.x - self.origin.x)
+            .clamp(IMAGE_RESIZE_MIN_WIDTH.min(self.ceiling), self.ceiling)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AtomicBlockHit {
     Image,
@@ -456,6 +479,7 @@ impl EditorCore {
             pending_resource_insert_anchors: HashMap::new(),
             layout: LayoutRegistry::new(),
             layout_offset: (0.0, 0.0),
+            image_resize: None,
             #[cfg(test)]
             shape_calls: 0,
             #[cfg(test)]
@@ -2459,6 +2483,123 @@ impl EditorCore {
     /// donor's NodeSelection behavior: a click inside rendered resource
     /// content never fabricates a text caret; Delete/Backspace can therefore
     /// delete the selected resource through the ordinary range path.
+    /// The selected image block when the selection is exactly that one
+    /// structural image and editing is allowed.
+    fn selected_image_node(&self) -> Option<NodeId> {
+        if self.is_read_only() {
+            return None;
+        }
+        let (start, end) = self.selected_block_indices()?;
+        if start != end || self.selection != self.full_block_selection(start) {
+            return None;
+        }
+        let block = &self.document.blocks()[start];
+        matches!(block.content, BlockContent::Image { .. }).then_some(block.id)
+    }
+
+    /// Bottom-right resize handle of the selected image (Evernote
+    /// `ResizeHandle.tsx` shows handles only on a selected image).
+    pub(crate) fn image_resize_handle_bounds(&self) -> Option<Bounds<Pixels>> {
+        let node_id = self.selected_image_node()?;
+        let image = self.layout.block_layout(node_id)?.bounds;
+        let half = gpui::px(IMAGE_RESIZE_HANDLE_SIZE / 2.0);
+        Some(Bounds::new(
+            gpui::point(image.right() - half, image.bottom() - half),
+            gpui::size(
+                gpui::px(IMAGE_RESIZE_HANDLE_SIZE),
+                gpui::px(IMAGE_RESIZE_HANDLE_SIZE),
+            ),
+        ))
+    }
+
+    /// Starts a resize drag when `position` is on the selected image's handle.
+    pub(crate) fn begin_image_resize(&mut self, position: Point<Pixels>) -> bool {
+        let Some(handle) = self.image_resize_handle_bounds() else {
+            return false;
+        };
+        if !handle.contains(&position) {
+            return false;
+        }
+        let node_id = self.selected_image_node().expect("handle implies an image");
+        let image = self
+            .layout
+            .block_layout(node_id)
+            .expect("handle implies layout")
+            .bounds;
+        let width = f32::from(image.size.width).max(1.0);
+        self.image_resize = Some(ImageResizeDrag {
+            node_id,
+            origin: image.origin,
+            aspect: f32::from(image.size.height).max(1.0) / width,
+            ceiling: self.layout.image_available_width(&self.document, node_id),
+            start_width: width,
+            preview_width: width,
+        });
+        true
+    }
+
+    pub(crate) fn is_resizing_image(&self) -> bool {
+        self.image_resize.is_some()
+    }
+
+    /// Updates only the preview frame; the document is untouched.
+    pub(crate) fn update_image_resize(&mut self, position: Point<Pixels>) {
+        if let Some(drag) = self.image_resize.as_mut() {
+            drag.preview_width = drag.clamped_width(position);
+        }
+    }
+
+    pub(crate) fn image_resize_preview_bounds(&self) -> Option<Bounds<Pixels>> {
+        let drag = self.image_resize.as_ref()?;
+        Some(Bounds::new(
+            drag.origin,
+            gpui::size(
+                gpui::px(drag.preview_width),
+                gpui::px(drag.preview_width * drag.aspect),
+            ),
+        ))
+    }
+
+    /// Ends the drag and commits the width as one undoable transaction
+    /// (min 50px, capped at the available note width).
+    pub(crate) fn finish_image_resize(
+        &mut self,
+        position: Point<Pixels>,
+    ) -> Result<bool, DocumentError> {
+        let Some(drag) = self.image_resize.take() else {
+            return Ok(false);
+        };
+        let width = drag.clamped_width(position);
+        if (width - drag.start_width).abs() < 0.5 {
+            // A click without a drag (e.g. the first half of a double-click)
+            // must not leave an empty undo step.
+            return Ok(false);
+        }
+        let width = width.round() as u32;
+        self.apply(Transaction::SetImageDisplayWidth {
+            node_id: drag.node_id,
+            display_width: Some(width),
+        })?;
+        Ok(true)
+    }
+
+    pub(crate) fn cancel_image_resize(&mut self) {
+        self.image_resize = None;
+    }
+
+    /// Double-click on the handle: back to the natural size.
+    pub(crate) fn restore_selected_image_natural_width(&mut self) -> Result<bool, DocumentError> {
+        let Some(node_id) = self.selected_image_node() else {
+            return Ok(false);
+        };
+        self.image_resize = None;
+        self.apply(Transaction::SetImageDisplayWidth {
+            node_id,
+            display_width: None,
+        })?;
+        Ok(true)
+    }
+
     pub(crate) fn select_atomic_at(&mut self, position: Point<Pixels>) -> Option<AtomicBlockHit> {
         let node_id = self.layout.atomic_block_at(position)?;
         let index = self.block_index(node_id)?;

@@ -1678,3 +1678,134 @@ async fn mounted_picker_completion_after_switching_notes_inserts_nowhere(cx: &mu
     assert!(!after_cancel.has_image_block);
     assert_eq!(resource_row_count(&profile), 0);
 }
+
+/// Evernote `resource/image/ResizeHandle.tsx`: dragging a selected image's
+/// handle previews only, and release commits one width (min 50px, capped at
+/// the note width) as a single undoable step; double-click restores natural.
+#[gpui::test]
+async fn mounted_image_resize_handle_commits_one_undoable_width_that_persists(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, point, px};
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let model = cx.new({
+        let repository = Arc::clone(&repository);
+        move |_| AppModel::open(repository).expect("open real app model")
+    });
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        LibraryShell::new_with_save_clock(model.clone(), None, clock, window, cx)
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::CreateNote, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.begin_resource_picker(shell_cx).unwrap();
+            shell
+                .complete_resource_picker_path(picker_png(&profile), window, shell_cx)
+                .unwrap();
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let probe = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    let bounds = probe.image_block_bounds.expect("image laid out");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    redraw(cx);
+
+    let handle = point(bounds.right() - px(2.0), bounds.bottom() - px(2.0));
+    let target = point(bounds.left() + px(200.0), bounds.bottom() + px(40.0));
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: handle,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseMoveEvent {
+        position: target,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    let during = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert_eq!(
+        during.image_block_bounds.map(|b| b.size.width),
+        Some(bounds.size.width),
+        "dragging only previews; the document is unchanged until release"
+    );
+    cx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: target,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    redraw(cx);
+    let resized = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert_eq!(
+        resized
+            .image_block_bounds
+            .map(|b| f32::from(b.size.width).round()),
+        Some(200.0)
+    );
+
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    let undone = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert_eq!(
+        undone.image_block_bounds.map(|b| b.size.width),
+        Some(bounds.size.width),
+        "one undo step restores the previous width"
+    );
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx);
+        });
+    });
+    cx.run_until_parked();
+    let saved = repository.load_note(&probe.note_id).unwrap().unwrap();
+    assert!(
+        saved
+            .body_html
+            .contains("data-joplin-lite-display-width=\"200\""),
+        "{}",
+        saved.body_html
+    );
+
+    // Double-clicking the handle of the reselected image restores natural size.
+    let redone = view
+        .read_with(cx, |shell, app| shell.image_flow_probe_for_test(app))
+        .image_block_bounds
+        .unwrap();
+    cx.simulate_click(redone.center(), Modifiers::default());
+    redraw(cx);
+    let handle = point(redone.right() - px(2.0), redone.bottom() - px(2.0));
+    for event in [MouseDownEvent {
+        button: MouseButton::Left,
+        position: handle,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    }] {
+        cx.simulate_event(event);
+    }
+    cx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: handle,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    redraw(cx);
+    let natural = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert_eq!(
+        natural.image_block_bounds.map(|b| b.size.width),
+        Some(bounds.size.width)
+    );
+}

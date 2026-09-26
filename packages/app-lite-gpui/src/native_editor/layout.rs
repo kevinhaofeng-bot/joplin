@@ -1286,6 +1286,17 @@ impl LayoutRegistry {
         self.enforce_budget();
     }
 
+    /// Width an image block may occupy: the laid-out note width minus the
+    /// list inset when the image belongs to a list item.
+    pub(crate) fn image_available_width(&self, document: &Document, node_id: NodeId) -> f32 {
+        let inset = document
+            .inline_group_list_depth(node_id)
+            .map_or(0.0, |depth| {
+                depth as f32 * LIST_DEPTH_INDENT + LIST_MARKER_WIDTH
+            });
+        (self.estimate_width - inset).max(1.0)
+    }
+
     pub fn block_layout(&self, node_id: NodeId) -> Option<&BlockLayout> {
         self.cache.get(&node_id).map(|entry| &entry.layout)
     }
