@@ -788,7 +788,8 @@ impl EditorCore {
             | Transaction::IndentList { .. }
             | Transaction::OutdentList { .. }
             | Transaction::SetImageDisplayWidth { .. }
-            | Transaction::SetImageNaturalSize { .. } => None,
+            | Transaction::SetImageNaturalSize { .. }
+            | Transaction::RestoreInlineGroups { .. } => None,
         }
     }
 
@@ -1493,6 +1494,30 @@ impl EditorCore {
             &outcome.structural_splices,
             &outcome.numbering_ranges,
         );
+        Ok(true)
+    }
+
+    /// Measure an image embedded in one semantic text/list parent. Canonical
+    /// Inline::Image has no durable size field, so this is a layout update,
+    /// not a body edit or a history/save event.
+    pub(crate) fn measure_inline_group_images(
+        &mut self,
+        resource_id: &str,
+        node_ids: &[NodeId],
+        natural_size: (u32, u32),
+    ) -> Result<bool, DocumentError> {
+        let changed = self
+            .document
+            .set_inline_group_image_natural_size_presentation(
+                resource_id,
+                node_ids,
+                natural_size,
+            )?;
+        if changed.is_empty() {
+            return Ok(false);
+        }
+        self.layout
+            .invalidate_nodes_with_delta(&self.document, &changed, false, &[], &[]);
         Ok(true)
     }
 

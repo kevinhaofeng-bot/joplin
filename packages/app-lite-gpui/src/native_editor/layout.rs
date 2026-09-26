@@ -415,6 +415,7 @@ enum NumberingKind {
     Bullet(u8),
     Check(u8),
     Boundary,
+    Continuation,
 }
 
 type NumberingCounter = (u8, usize);
@@ -483,6 +484,14 @@ fn numbering_kind(kind: &BlockKind) -> NumberingKind {
         BlockKind::BulletItem { depth } => NumberingKind::Bullet(*depth),
         BlockKind::CheckItem { depth, .. } => NumberingKind::Check(*depth),
         _ => NumberingKind::Boundary,
+    }
+}
+
+fn numbering_kind_for(document: &Document, block: &super::model::Block) -> NumberingKind {
+    if document.is_inline_group_continuation(block.id) {
+        NumberingKind::Continuation
+    } else {
+        numbering_kind(&block.kind)
     }
 }
 
@@ -820,6 +829,23 @@ impl LayoutRegistry {
         let bottom = self.height_prefix(index.saturating_add(1));
         let block = document.block(node_id)?;
         let mut bounds = block_bounds(self.estimate_width.max(1.0), block);
+        if let Some(depth) = document.inline_group_list_depth(node_id) {
+            if let BlockContent::Image {
+                natural_size,
+                display_width,
+                ..
+            } = &block.content
+            {
+                let inset = depth as f32 * LIST_DEPTH_INDENT + LIST_MARKER_WIDTH;
+                let (image_width, _) = image_layout_size(
+                    (self.estimate_width - inset).max(1.0),
+                    *natural_size,
+                    *display_width,
+                );
+                bounds.origin.x = px(inset);
+                bounds.size.width = px(image_width);
+            }
+        }
         bounds.origin.y = px(top);
         bounds.size.height = px((bottom - top).max(1.0));
         Some(bounds)
@@ -947,6 +973,20 @@ impl LayoutRegistry {
             let (before, after, is_image) = block_points(block);
             let is_atomic = matches!(block.kind, BlockKind::Image | BlockKind::Attachment);
             let mut bounds = block_bounds(width, block);
+            if let Some(depth) = document.inline_group_list_depth(block.id) {
+                if let BlockContent::Image {
+                    natural_size,
+                    display_width,
+                    ..
+                } = &block.content
+                {
+                    let inset = depth as f32 * LIST_DEPTH_INDENT + LIST_MARKER_WIDTH;
+                    let (image_width, _) =
+                        image_layout_size((width - inset).max(1.0), *natural_size, *display_width);
+                    bounds.origin.x = px(inset);
+                    bounds.size.width = px(image_width);
+                }
+            }
             bounds.origin.y = px(y);
             bounds.size.height = px(height.max(1.0));
             let visual = block_visual_style(block, &TextStyle::default(), px(16.0));
@@ -1987,11 +2027,16 @@ impl LayoutRegistry {
                     display_width,
                     ..
                 } => {
+                    let grouped_inset = document
+                        .inline_group_list_depth(block.id)
+                        .map(|depth| depth as f32 * LIST_DEPTH_INDENT + LIST_MARKER_WIDTH);
                     image_layout_size(
                         (width
-                            - list_depth(&block.kind)
-                                .map(|depth| depth as f32 * LIST_DEPTH_INDENT)
-                                .unwrap_or(0.0))
+                            - grouped_inset.unwrap_or_else(|| {
+                                list_depth(&block.kind)
+                                    .map(|depth| depth as f32 * LIST_DEPTH_INDENT)
+                                    .unwrap_or(0.0)
+                            }))
                         .max(1.0),
                         *natural_size,
                         *display_width,
@@ -2057,7 +2102,7 @@ impl LayoutRegistry {
                     valid: true,
                 });
             }
-            let kind = numbering_kind(&block.kind);
+            let kind = numbering_kind_for(document, block);
             let number = advance_numbering(kind, &mut cursor);
             self.ordered_kinds.insert(block.id, kind);
             if let Some(number) = number {
@@ -2214,7 +2259,7 @@ impl LayoutRegistry {
             .enumerate()
         {
             let index = checkpoint_start.saturating_add(offset);
-            let kind = numbering_kind(&block.kind);
+            let kind = numbering_kind_for(document, block);
             let old_kind = self.ordered_kinds.get(&block.id).copied();
             let old_number = self.ordered_numbers.get(&block.id).copied();
             let number = advance_numbering(kind, &mut cursor);
@@ -2576,7 +2621,8 @@ pub(crate) fn ordered_number_summary(document: &Document) -> HashMap<NodeId, usi
     let mut numbers = HashMap::new();
     let mut counters = NumberingCursor::default();
     for block in document.blocks() {
-        if let Some(number) = advance_numbering(numbering_kind(&block.kind), &mut counters) {
+        if let Some(number) = advance_numbering(numbering_kind_for(document, block), &mut counters)
+        {
             numbers.insert(block.id, number);
         }
     }
@@ -2598,6 +2644,7 @@ fn advance_numbering(kind: NumberingKind, counters: &mut NumberingCursor) -> Opt
     }
 
     match kind {
+        NumberingKind::Continuation => None,
         NumberingKind::Ordered(depth) => {
             reset_from(counters, depth.saturating_add(1));
             if let Some((_, value)) = counters

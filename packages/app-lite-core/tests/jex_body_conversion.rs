@@ -12,6 +12,97 @@ const TARGET_PDF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const TEXT_FILE: &str = "44444444444444444444444444444444";
 const TARGET_TEXT_FILE: &str = "cccccccccccccccccccccccccccccccc";
 
+#[test]
+fn imports_divider_quote_and_untyped_code_as_native_semantic_blocks() {
+    use app_lite_core::document::Block;
+    let body = "前文\n\n---\n\n> **引用**\n\n```\nlet x = 1;\n第二行\n```\n\n后文";
+    let converted = convert_jex_note_body(NOTE, "blocks.md", 1, body, &resources()).unwrap();
+    assert!(matches!(converted.document.blocks()[1], Block::Divider));
+    assert!(matches!(
+        converted.document.blocks()[2],
+        Block::Quote { .. }
+    ));
+    assert!(matches!(converted.document.blocks()[3], Block::Code { .. }));
+    assert!(converted.canonical_html.contains("<strong>引用</strong>"));
+    assert!(converted.search_text.contains("let x = 1;\n第二行"));
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        converted.document
+    );
+}
+
+#[test]
+fn markdown_html_block_preserves_rich_text_instead_of_showing_tags() {
+    let body = format!(
+        "<div><p><strong>前文</strong></p><p><img src=\":/{IMAGE}\" alt=\"图\"></p></div>\n\n**后文**"
+    );
+    let (result, _) = app_lite_core::convert_jex_note_body_or_degrade(
+        NOTE,
+        "html-in-markdown.md",
+        1,
+        &body,
+        &resources(),
+    )
+    .unwrap();
+    assert!(
+        result.canonical_html.contains("<strong>前文</strong>"),
+        "{}",
+        result.canonical_html
+    );
+    assert!(result.canonical_html.contains("<img "));
+    assert!(!result.search_text.contains("<div>"));
+}
+
+#[test]
+fn unsupported_block_does_not_flatten_surrounding_rich_text_and_images() {
+    let body =
+        format!("**前文**\n\n![图](:/{IMAGE})\n\n| A | B |\n|---|---|\n| 甲 | 乙 |\n\n**后文**");
+    let (result, warning) =
+        app_lite_core::convert_jex_note_body_or_degrade(NOTE, "mixed.md", 1, &body, &resources())
+            .unwrap();
+    assert!(warning.is_some());
+    assert!(
+        result
+            .canonical_html
+            .starts_with("<p><strong>前文</strong></p>"),
+        "{}",
+        result.canonical_html
+    );
+    assert!(
+        result
+            .canonical_html
+            .ends_with("<p><strong>后文</strong></p>")
+    );
+    let image = result.canonical_html.find("<img ").unwrap();
+    assert!(image < result.canonical_html.find("---").unwrap());
+    assert_eq!(
+        result.ordered_resource_occurrences,
+        vec![ResourceId::new(TARGET_IMAGE).unwrap()]
+    );
+}
+
+#[test]
+fn html_unsupported_container_keeps_neighbor_marks_and_image_position() {
+    let body = format!(
+        "<div><p><strong>前文</strong></p><blockquote><p>引用</p></blockquote><p><img src=\":/{IMAGE}\" alt=\"图\"></p><p><em>后文</em></p></div>"
+    );
+    let (result, warning) = app_lite_core::convert_jex_note_body_or_degrade(
+        NOTE,
+        "mixed-html.md",
+        2,
+        &body,
+        &resources(),
+    )
+    .unwrap();
+    assert!(warning.is_some());
+    assert!(result.canonical_html.contains("<strong>前文</strong>"));
+    assert!(result.canonical_html.contains("<em>后文</em>"));
+    assert!(
+        result.canonical_html.find("<img ").unwrap() < result.canonical_html.find("后文").unwrap()
+    );
+    assert!(!result.search_text.contains("<p>"));
+}
+
 fn resources() -> BTreeMap<String, JexVerifiedResource> {
     BTreeMap::from([
         (
@@ -317,5 +408,27 @@ fn empty_and_fragment_links_keep_text_and_tel_links_convert() {
     assert_eq!(
         conversion.canonical_html,
         "<p>空链接 与 锚点 与 <a href=\"tel:010-12345678\">电话</a></p>"
+    );
+}
+#[test]
+fn html_semantic_blocks_keep_quote_code_and_divider() {
+    use app_lite_core::document::Block;
+    let result = convert_jex_note_body(
+        "semantic", "semantic.md", 2,
+        "<p>before</p><hr><blockquote><p><strong>quote</strong></p></blockquote><pre><code>  first\nsecond\n</code></pre><p>after</p>",
+        &BTreeMap::new(),
+    ).unwrap();
+    assert!(matches!(&result.document.blocks()[1], Block::Divider));
+    assert!(matches!(&result.document.blocks()[2], Block::Quote { .. }));
+    assert!(matches!(&result.document.blocks()[3], Block::Code { .. }));
+    assert!(
+        result
+            .search_text
+            .replace('\u{00a0}', " ")
+            .contains("  first\nsecond\n")
+    );
+    assert_eq!(
+        CanonicalDocument::parse_html(&result.canonical_html).unwrap(),
+        result.document
     );
 }

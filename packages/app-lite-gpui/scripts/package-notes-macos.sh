@@ -13,7 +13,9 @@ BUNDLE_ID="com.arielkevin.joplinlite"
 
 COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 SHORT="$(git -C "$REPO_ROOT" rev-parse --short=9 HEAD)"
-DIRTY="$(git -C "$REPO_ROOT" status --porcelain -- "$PROJECT_ROOT" ../app-lite-core | grep -q . && echo yes || echo no)"
+SOURCE_STATUS="$(git -C "$REPO_ROOT" status --porcelain -- "$PROJECT_ROOT" "$REPO_ROOT/packages/app-lite-core")"
+DIRTY=no
+if [[ -n "$SOURCE_STATUS" ]]; then DIRTY=yes; fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="$OUTPUT_PARENT/$STAMP-$SHORT"
 if [[ -e "$OUT_DIR" ]]; then

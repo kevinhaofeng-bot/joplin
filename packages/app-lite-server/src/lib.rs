@@ -235,6 +235,25 @@ impl ServerStore {
         if !valid_sha256(sha256) || size == 0 || size > MAX_BLOB_BYTES {
             return Err(ServerError::BadRequest("invalid blob identity or size"));
         }
+        // Keep this inode: unlinking a lock file would let a new request lock
+        // a different inode while an older request still owns the old lock.
+        // An OS lock covers separate ServerStore instances/processes too.
+        let mut lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.uploads.join(format!("{sha256}.lock")))?;
+        lock.lock()?;
+        let mut declared = String::new();
+        lock.read_to_string(&mut declared)?;
+        if declared.is_empty() {
+            write!(lock, "{size}")?;
+            lock.sync_all()?;
+            File::open(&self.uploads)?.sync_all()?;
+        } else if declared.parse::<u64>().ok() != Some(size) {
+            return Err(ServerError::BadRequest("upload size changed"));
+        }
         if self.blobs.join(sha256).is_file() {
             return Ok(BlobStatus::Complete);
         }

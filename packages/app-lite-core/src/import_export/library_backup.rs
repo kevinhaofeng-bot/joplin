@@ -148,7 +148,12 @@ fn free_target(target: &Path) -> Result<&Path, BackupError> {
 }
 
 /// Copy `source` to a new file at `target`, returning (sha256, bytes).
-fn copy_hashing(source: &mut impl Read, target: &Path) -> io::Result<(String, u64)> {
+fn copy_hashing_bounded(
+    source: &mut impl Read,
+    target: &Path,
+    expected_size: u64,
+    cancel: &AtomicBool,
+) -> Result<(String, u64), BackupError> {
     let mut out = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -157,9 +162,17 @@ fn copy_hashing(source: &mut impl Read, target: &Path) -> io::Result<(String, u6
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut total = 0_u64;
     loop {
-        let count = source.read(&mut buffer)?;
+        check(cancel)?;
+        let limit = (expected_size - total)
+            .saturating_add(1)
+            .min(buffer.len() as u64) as usize;
+        let count = source.read(&mut buffer[..limit])?;
+        check(cancel)?;
         if count == 0 {
             break;
+        }
+        if count as u64 > expected_size - total {
+            return Err(BackupError::InvalidManifest("文件超出声明大小".into()));
         }
         digest.update(&buffer[..count]);
         out.write_all(&buffer[..count])?;
@@ -228,7 +241,9 @@ pub fn backup_library(
             }
             Err(error) => return Err(error.into()),
         };
-        let (copied, len) = copy_hashing(&mut file, &blobs_dir.join(&sha256))?;
+        let expected = u64::try_from(size).map_err(|_| mismatch())?;
+        let (copied, len) =
+            copy_hashing_bounded(&mut file, &blobs_dir.join(&sha256), expected, cancel)?;
         if copied != sha256 || len != size as u64 {
             return Err(mismatch());
         }
@@ -334,7 +349,15 @@ fn prepare_restore(
         .tempdir_in(parent)?;
     let mut database =
         open_regular(&backup.join(DATABASE)).map_err(|_| BackupError::DatabaseMismatch)?;
-    let (sha, size) = copy_hashing(&mut database, &temp.path().join(DATABASE))?;
+    if database.metadata()?.len() != manifest.database.size {
+        return Err(BackupError::DatabaseMismatch);
+    }
+    let (sha, size) = copy_hashing_bounded(
+        &mut database,
+        &temp.path().join(DATABASE),
+        manifest.database.size,
+        cancel,
+    )?;
     if sha != manifest.database.sha256 || size != manifest.database.size {
         return Err(BackupError::DatabaseMismatch);
     }
@@ -351,7 +374,15 @@ fn prepare_restore(
         }
         let mut source =
             open_regular(&backup.join(BLOBS).join(&blob.sha256)).map_err(|_| mismatch())?;
-        let (sha, size) = copy_hashing(&mut source, &blobs_dir.join(&blob.sha256))?;
+        if source.metadata()?.len() != blob.size {
+            return Err(mismatch());
+        }
+        let (sha, size) = copy_hashing_bounded(
+            &mut source,
+            &blobs_dir.join(&blob.sha256),
+            blob.size,
+            cancel,
+        )?;
         if sha != blob.sha256 || size != blob.size {
             return Err(mismatch());
         }
@@ -397,4 +428,47 @@ pub fn restore_library_backup(
         destination,
         cancel,
     )?)
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_copy_stops_after_declared_size_plus_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = io::Cursor::new(vec![7_u8; 1024 * 1024]);
+        let error = copy_hashing_bounded(
+            &mut input,
+            &dir.path().join("out"),
+            10,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BackupError::InvalidManifest(_)));
+        assert_eq!(input.position(), 11);
+        assert!(fs::metadata(dir.path().join("out")).unwrap().len() <= 10);
+    }
+
+    #[test]
+    fn bounded_copy_observes_cancel_during_one_file() {
+        struct CancellingReader<'a>(&'a AtomicBool);
+        impl Read for CancellingReader<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.0.store(true, Ordering::Relaxed);
+                out[0] = 1;
+                Ok(1)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        let error = copy_hashing_bounded(
+            &mut CancellingReader(&cancel),
+            &dir.path().join("out"),
+            10,
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(error, BackupError::Cancelled));
+    }
 }

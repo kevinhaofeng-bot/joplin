@@ -242,3 +242,48 @@ fn interrupted_blob_upload_resumes_and_publishes_only_a_verified_whole() {
     assert!(store.put_chunk(&wrong, 4, 0, b"abcd").is_err());
     assert_eq!(store.blob_status(&wrong).unwrap(), BlobStatus::Missing);
 }
+
+#[test]
+fn partial_upload_size_cannot_change_after_reopen() {
+    let (dir, store) = store();
+    let sha = format!("{:x}", Sha256::digest(b"abcdef"));
+    store.put_chunk(&sha, 6, 0, b"abc").unwrap();
+    drop(store);
+    let store = ServerStore::open(dir.path()).unwrap();
+    assert!(store.put_chunk(&sha, 7, 3, b"d").is_err());
+    assert_eq!(
+        store.blob_status(&sha).unwrap(),
+        BlobStatus::Partial { bytes: 3 }
+    );
+    store.put_chunk(&sha, 6, 3, b"def").unwrap();
+}
+
+#[test]
+fn concurrent_clients_uploading_the_same_blob_do_not_duplicate_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = vec![42_u8; 256 * 1024];
+    let sha = format!("{:x}", Sha256::digest(&bytes));
+    let barrier = std::sync::Barrier::new(12);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        // Separate stores also exercise the multiple-process lock boundary.
+        let stores: Vec<_> = (0..12)
+            .map(|_| ServerStore::open(dir.path()).unwrap())
+            .collect();
+        for store in stores {
+            let (barrier, bytes, sha) = (&barrier, &bytes, &sha);
+            handles.push(scope.spawn(move || {
+                barrier.wait();
+                store.put_chunk(sha, bytes.len() as u64, 0, bytes)
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap(), BlobStatus::Complete);
+        }
+    });
+    let store = ServerStore::open(dir.path()).unwrap();
+    assert_eq!(
+        store.read_range(&sha, 0, bytes.len() as u64).unwrap(),
+        bytes
+    );
+}

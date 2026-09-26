@@ -9,11 +9,18 @@ use std::ops::Range;
 
 use smallvec::SmallVec;
 
-use super::model::{Affinity, Block, BlockKind, DocPoint, Mark, NodeId, Selection, TextAlignment};
+use super::model::{
+    Affinity, Block, BlockKind, DocPoint, InlineGroup, Mark, NodeId, Selection, TextAlignment,
+};
 
 /// A single validated edit to a [`Document`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Transaction {
+    /// Local semantic-parent metadata inverse, paired with RestoreBlocks.
+    RestoreInlineGroups {
+        remove: Vec<NodeId>,
+        groups: Vec<InlineGroup>,
+    },
     InsertText {
         selection: Selection,
         text: String,
@@ -117,6 +124,7 @@ impl Transaction {
             | Self::SetImageDisplayWidth { .. }
             | Self::SetImageNaturalSize { .. }
             | Self::RestoreBlocks { .. } => None,
+            Self::RestoreInlineGroups { .. } => None,
         }
     }
 
@@ -144,6 +152,16 @@ impl Transaction {
                     .map(Block::estimated_bytes)
                     .fold(0usize, usize::saturating_add),
             ),
+            Self::RestoreInlineGroups { remove, groups } => base
+                .saturating_add(remove.len() * size_of::<NodeId>())
+                .saturating_add(
+                    groups
+                        .iter()
+                        .map(|group| {
+                            size_of::<InlineGroup>() + group.members.len() * size_of::<NodeId>()
+                        })
+                        .sum::<usize>(),
+                ),
             _ => base,
         }
     }

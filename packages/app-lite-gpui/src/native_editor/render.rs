@@ -293,7 +293,11 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 is_image: layout.is_image(block.node_id),
                 shaped_background_run_count,
                 line_height: layout.line_height(block.node_id),
-                marker: list_marker(&kind, layout.ordered_number(block.node_id)),
+                marker: (!editor
+                    .document()
+                    .is_inline_group_continuation(block.node_id))
+                .then(|| list_marker(&kind, layout.ordered_number(block.node_id)))
+                .flatten(),
                 image_resource,
                 image_resource_id,
                 image_natural_max_edge,

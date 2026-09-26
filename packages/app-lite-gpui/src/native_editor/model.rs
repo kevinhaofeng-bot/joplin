@@ -456,6 +456,17 @@ impl StructuralInsert {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticSnapshot {
     pub blocks: Vec<Block>,
+    pub inline_groups: Vec<InlineGroup>,
+}
+
+/// Sparse provenance for an imported semantic parent containing block-sized
+/// images. Members remain ordinary editable native blocks; only their parent
+/// relationship is retained here. Structural edits journal affected groups
+/// alongside their block inverses; ordinary typing never copies this metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineGroup {
+    pub kind: BlockKind,
+    pub members: Vec<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -1164,6 +1175,7 @@ pub struct Document {
     blocks: BlockSequence,
     next_id: u64,
     revision: u64,
+    inline_groups: Vec<InlineGroup>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1251,6 +1263,7 @@ impl Document {
             blocks: BlockSequence::from_blocks(blocks),
             next_id,
             revision: 0,
+            inline_groups: Vec::new(),
         };
         debug_assert!(document.validate_invariants().is_ok());
         document
@@ -1269,6 +1282,7 @@ impl Document {
             blocks: BlockSequence::from_blocks(blocks),
             next_id: next_id.max(1),
             revision: 0,
+            inline_groups: Vec::new(),
         };
         document.validate_invariants()?;
         Ok(document)
@@ -1415,8 +1429,158 @@ impl Document {
         let mut blocks: Vec<Block> = self.blocks.iter().cloned().collect();
         for block in &mut blocks {
             block.revision = 0;
+            if self
+                .inline_groups
+                .iter()
+                .any(|group| group.members.contains(&block.id))
+            {
+                if let BlockContent::Image {
+                    natural_size_known,
+                    natural_size,
+                    ..
+                } = &mut block.content
+                {
+                    *natural_size_known = false;
+                    *natural_size = (1024, 768);
+                }
+            }
         }
-        SemanticSnapshot { blocks }
+        let inline_groups = self
+            .inline_groups
+            .iter()
+            .map(|group| InlineGroup {
+                kind: group.kind.clone(),
+                members: group
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|id| self.block(*id).is_some())
+                    .collect(),
+            })
+            .filter(|group| !group.members.is_empty())
+            .collect();
+        SemanticSnapshot {
+            blocks,
+            inline_groups,
+        }
+    }
+
+    pub(crate) fn set_inline_groups(&mut self, groups: Vec<InlineGroup>) {
+        self.inline_groups = groups;
+        self.inline_groups
+            .sort_by_key(|group| group.members.first().copied());
+    }
+
+    pub(crate) fn inline_groups(&self) -> &[InlineGroup] {
+        &self.inline_groups
+    }
+
+    pub(crate) fn set_inline_group_image_natural_size_presentation(
+        &mut self,
+        resource_id: &str,
+        node_ids: &[NodeId],
+        natural_size: (u32, u32),
+    ) -> Result<Vec<NodeId>, DocumentError> {
+        if natural_size.0 == 0 || natural_size.1 == 0 {
+            return Err(DocumentError::InvalidOperation(
+                "image dimensions must be positive".into(),
+            ));
+        }
+        let mut changed = Vec::new();
+        for node_id in node_ids {
+            if !self
+                .inline_groups
+                .iter()
+                .any(|group| group.members.contains(node_id))
+            {
+                continue;
+            }
+            let Some(index) = self.blocks.index_of_node(*node_id) else {
+                continue;
+            };
+            let mut block = self.blocks[index].clone();
+            if let BlockContent::Image {
+                resource_id: current,
+                natural_size_known,
+                natural_size: old,
+                ..
+            } = &mut block.content
+            {
+                if current == resource_id && (!*natural_size_known || *old != natural_size) {
+                    *natural_size_known = true;
+                    *old = natural_size;
+                    self.revision = self.revision.saturating_add(1);
+                    block.revision = self.revision;
+                    self.blocks.replace(index, block);
+                    changed.push(*node_id);
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    fn semantic_parent_range(&self, start: usize, end: usize) -> (usize, usize) {
+        let mut range = (start, end);
+        for group in &self.inline_groups {
+            let indices: Vec<_> = group
+                .members
+                .iter()
+                .filter_map(|id| self.blocks.index_of_node(*id))
+                .collect();
+            if indices.iter().any(|index| *index >= start && *index <= end) {
+                for index in indices {
+                    range.0 = range.0.min(index);
+                    range.1 = range.1.max(index);
+                }
+            }
+        }
+        range
+    }
+
+    pub(crate) fn is_inline_group_continuation(&self, node_id: NodeId) -> bool {
+        self.inline_groups.iter().any(|group| {
+            group.members.contains(&node_id)
+                && group
+                    .members
+                    .iter()
+                    .copied()
+                    .find(|id| self.block(*id).is_some())
+                    != Some(node_id)
+        })
+    }
+
+    pub(crate) fn inline_group_list_depth(&self, node_id: NodeId) -> Option<u8> {
+        self.inline_groups.iter().find_map(|group| {
+            if !group.members.contains(&node_id) {
+                return None;
+            }
+            match group.kind {
+                BlockKind::BulletItem { depth }
+                | BlockKind::OrderedItem { depth }
+                | BlockKind::CheckItem { depth, .. } => Some(depth),
+                _ => None,
+            }
+        })
+    }
+
+    fn replace_inline_groups(
+        &mut self,
+        remove: &[NodeId],
+        groups: Vec<InlineGroup>,
+    ) -> Vec<InlineGroup> {
+        let mut previous = Vec::new();
+        self.inline_groups.retain(|group| {
+            if group.members.first().is_some_and(|id| remove.contains(id)) {
+                previous.push(group.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.inline_groups.extend(groups);
+        self.inline_groups
+            .sort_by_key(|group| group.members.first().copied());
+        previous
     }
 
     /// Apply one operation atomically.
@@ -1593,6 +1757,9 @@ impl Document {
     fn restore_inverse_batch(&mut self, inverse: TransactionBatch) {
         for transaction in inverse.0.into_iter().rev() {
             match transaction {
+                Transaction::RestoreInlineGroups { remove, groups } => {
+                    self.replace_inline_groups(&remove, groups);
+                }
                 Transaction::RestoreBlocks {
                     index,
                     remove_count,
@@ -1831,7 +1998,8 @@ impl Document {
             | Transaction::IndentList { selection }
             | Transaction::OutdentList { selection } => {
                 let bounds = self.selection_bounds(*selection).ok()?;
-                Some(bounds.0..bounds.2.saturating_add(1))
+                let (start, end) = self.semantic_parent_range(bounds.0, bounds.2);
+                Some(start..end.saturating_add(1))
             }
             Transaction::RestoreBlocks {
                 index,
@@ -1868,12 +2036,256 @@ impl Document {
         &mut self,
         transaction: Transaction,
     ) -> Result<ApplyOutcome, DocumentError> {
+        if let Transaction::RestoreInlineGroups { remove, groups } = transaction {
+            let mut affected = groups
+                .iter()
+                .flat_map(|group| group.members.iter().copied())
+                .collect::<Vec<_>>();
+            let inverse_remove = groups
+                .iter()
+                .filter_map(|group| group.members.first().copied())
+                .collect();
+            let previous = self.replace_inline_groups(&remove, groups);
+            affected.extend(
+                previous
+                    .iter()
+                    .flat_map(|group| group.members.iter().copied()),
+            );
+            let mut outcome = ApplyOutcome::empty(self.end_selection());
+            for id in affected {
+                if let Some(index) = self.blocks.index_of_node(id) {
+                    push_unique(&mut outcome.changed_nodes, id);
+                    outcome.numbering_ranges.push(index..index + 1);
+                }
+            }
+            outcome.inverse = TransactionBatch(vec![Transaction::RestoreInlineGroups {
+                remove: inverse_remove,
+                groups: previous,
+            }]);
+            outcome.estimated_bytes = outcome.inverse.estimated_bytes();
+            outcome.structural = true;
+            return Ok(outcome);
+        }
+        // Ordinary typing/IME and media hydration do not touch parent metadata.
+        let changes_parent = match &transaction {
+            Transaction::InsertText { selection, .. } => !selection.is_caret(),
+            Transaction::DeleteRange { .. }
+            | Transaction::SplitBlock { .. }
+            | Transaction::MergeBlocks { .. }
+            | Transaction::SetBlockKind { .. }
+            | Transaction::SetAlignment { .. }
+            | Transaction::IndentList { .. }
+            | Transaction::OutdentList { .. }
+            | Transaction::InsertImage { .. }
+            | Transaction::InsertAttachment { .. }
+            | Transaction::EnsureParagraph { .. }
+            | Transaction::RemoveNode { .. } => true,
+            _ => false,
+        };
+        if self.inline_groups.is_empty() || !changes_parent {
+            return self.apply_transaction_raw(transaction);
+        }
+        let range = match &transaction {
+            Transaction::MergeBlocks { left, right } => {
+                Some((self.node_index(*left)?, self.node_index(*right)?))
+            }
+            Transaction::RemoveNode { node_id } => {
+                let index = self.node_index(*node_id)?;
+                Some((index, index))
+            }
+            _ => transaction
+                .selection_hint()
+                .map(|selection| {
+                    self.selection_bounds(selection)
+                        .map(|bounds| (bounds.0, bounds.2))
+                })
+                .transpose()?,
+        };
+        let before: Vec<_> = self
+            .inline_groups
+            .iter()
+            .filter(|group| {
+                range.is_some_and(|(start, end)| {
+                    group.members.iter().any(|id| {
+                        self.blocks
+                            .index_of_node(*id)
+                            .is_some_and(|index| index >= start && index <= end)
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        if before.is_empty() {
+            return self.apply_transaction_raw(transaction);
+        }
+        let attachment_to_plain_parent = matches!(&transaction, Transaction::InsertAttachment { .. })
+            && before.iter().all(|group| group.kind == BlockKind::Paragraph && group.members.len() == 1);
+        if matches!(&transaction, Transaction::InsertAttachment { .. }) && !attachment_to_plain_parent {
+            return Err(DocumentError::InvalidOperation(
+                "含图的标题、引用或列表项内暂不支持文件附件，请在独立正文段落中插入".into(),
+            ));
+        }
+        // Joining parents adopts the left parent's paragraph style. Its
+        // remaining rows therefore belong to the local undo payload too.
+        let parent_restore = if before.len() > 1 && matches!(&transaction,
+            Transaction::DeleteRange { .. } | Transaction::InsertText { .. } | Transaction::MergeBlocks { .. }) {
+            let (start,end) = range.expect("selected parent range");
+            let (start,end) = self.semantic_parent_range(start,end);
+            Some((start, self.blocks.len(), self.blocks.collect_range(start..end + 1)))
+        } else { None };
+        let split_at = if let Transaction::SplitBlock { at } = &transaction {
+            Some(at.node_id)
+        } else {
+            None
+        };
+        let allocation_start = self.next_id;
+        let parent_alignments: Vec<_> = before.iter().map(|group|
+            group.members.iter().filter_map(|id| self.block(*id)).find(|block| is_text_block(block))
+                .map(|block| block.alignment).unwrap_or(TextAlignment::Left)).collect();
+        let mut outcome = self.apply_transaction_raw(transaction)?;
+        let mut after = Vec::new();
+        for (group_index, group) in before.iter().enumerate() {
+            if attachment_to_plain_parent { continue; }
+            if let Some(position) =
+                split_at.and_then(|id| group.members.iter().position(|member| *member == id))
+            {
+                if outcome.selection.head.node_id != group.members[position] {
+                    after.push(InlineGroup {
+                        kind: group.kind.clone(),
+                        members: group.members[..=position].to_vec(),
+                    });
+                    let mut members = vec![outcome.selection.head.node_id];
+                    members.extend_from_slice(&group.members[position + 1..]);
+                    let kind = self
+                        .block(members[0])
+                        .map(|block| block.kind.clone())
+                        .unwrap_or_else(|| group.kind.clone());
+                    after.push(InlineGroup { kind, members });
+                    continue;
+                }
+            }
+            let mut members = group.members.clone();
+            for splice in &outcome.structural_splices {
+                if splice.removed.is_empty() || splice.removed.iter().any(|id| group.members.contains(id)) {
+                    members.extend(splice.inserted.iter().copied());
+                }
+            }
+            members.retain(|id| {
+                self.block(*id).is_some_and(|block| {
+                    matches!(
+                        block.content,
+                        BlockContent::Text { .. } | BlockContent::Image { .. }
+                    )
+                })
+            });
+            members.sort_by_key(|id| self.blocks.index_of_node(*id));
+            members.dedup();
+            // An insertion point materialized beside an image belongs to the
+            // same semantic parent, not a fresh default-style paragraph.
+            for id in members.iter().filter(|id| id.raw() >= allocation_start) {
+                let index = self.blocks.index_of_node(*id).expect("live inserted member");
+                let mut block = self.blocks[index].clone();
+                if is_text_block(&block) {
+                    block.kind = group.kind.clone();
+                    block.alignment = parent_alignments[group_index];
+                    self.blocks.replace(index, block);
+                }
+            }
+            if !members.is_empty() {
+                let kind = members
+                    .iter()
+                    .filter_map(|id| self.block(*id))
+                    .find(|block| is_text_block(block))
+                    .map(|block| block.kind.clone())
+                    .unwrap_or_else(|| group.kind.clone());
+                after.push(InlineGroup { kind, members });
+            }
+        }
+        // A cross-parent merge has one surviving text node: one owner, not two.
+        let mut index = 0;
+        while index < after.len() {
+            let mut other = index + 1;
+            while other < after.len() {
+                if after[index]
+                    .members
+                    .iter()
+                    .any(|id| after[other].members.contains(id))
+                {
+                    let merged = after.remove(other);
+                    after[index].members.extend(merged.members);
+                    after[index]
+                        .members
+                        .sort_by_key(|id| self.blocks.index_of_node(*id));
+                    after[index].members.dedup();
+                } else {
+                    other += 1;
+                }
+            }
+            index += 1;
+        }
+        if let Some((start, old_count, originals)) = parent_restore {
+            for group in &mut after {
+                if before.iter().filter(|old| old.members.iter().any(|id| group.members.contains(id))).count() < 2 {
+                    continue;
+                }
+                let Some((kind, alignment)) = group.members.iter().filter_map(|id| self.block(*id))
+                    .find(|block| is_text_block(block)).map(|block| (block.kind.clone(),block.alignment)) else { continue };
+                group.kind = kind.clone();
+                for id in &group.members {
+                    let index = self.blocks.index_of_node(*id).expect("live group member");
+                    let mut block = self.blocks[index].clone();
+                    if is_text_block(&block) && (block.kind != kind || block.alignment != alignment) {
+                        block.kind = kind.clone();
+                        block.alignment = alignment;
+                        block.revision = self.revision;
+                        self.blocks.replace(index, block);
+                        push_unique(&mut outcome.changed_nodes,*id);
+                    }
+                }
+            }
+            let remove_count = (originals.len() as isize + self.blocks.len() as isize - old_count as isize) as usize;
+            outcome.inverse = TransactionBatch(vec![Transaction::RestoreBlocks { index:start,remove_count,blocks:originals }]);
+        }
+        let remove = before
+            .iter()
+            .filter_map(|group| group.members.first().copied())
+            .collect::<Vec<_>>();
+        let inverse_remove = after
+            .iter()
+            .filter_map(|group| group.members.first().copied())
+            .collect();
+        // Membership changes can alter which row owns a list marker, even if
+        // that row's text itself did not change.
+        if after != before {
+            for id in after.iter().flat_map(|group| group.members.iter()) {
+                if let Some(index) = self.blocks.index_of_node(*id) {
+                    push_unique(&mut outcome.changed_nodes, *id);
+                    outcome.numbering_ranges.push(index..index + 1);
+                }
+            }
+        }
+        self.replace_inline_groups(&remove, after);
+        outcome.inverse.0.push(Transaction::RestoreInlineGroups {
+            remove: inverse_remove,
+            groups: before,
+        });
+        outcome.estimated_bytes = outcome.inverse.estimated_bytes();
+        Ok(outcome)
+    }
+
+    fn apply_transaction_raw(
+        &mut self,
+        transaction: Transaction,
+    ) -> Result<ApplyOutcome, DocumentError> {
         let original_revision = self.revision;
         let original_next_id = self.next_id;
         let block_count_before = self.blocks.len();
         let structural_plan = self.structural_plan_for(&transaction);
         let numbering_range = self.numbering_range_for(&transaction);
         let (selection, changed_nodes, inverse, inserted_span) = match transaction {
+            Transaction::RestoreInlineGroups { .. } => {
+                unreachable!("handled by metadata transaction wrapper")
+            }
             Transaction::InsertText { selection, text } => {
                 self.apply_insert_text(selection, text)?
             }
@@ -2737,14 +3149,27 @@ impl Document {
             ));
         }
         let (start_index, _, end_index, _) = self.selection_bounds(selection)?;
-        self.ensure_text_blocks(start_index, end_index)?;
+        let (start_index, end_index) = self.semantic_parent_range(start_index, end_index);
+        for block in self
+            .blocks
+            .iter_range(start_index..end_index.saturating_add(1))
+        {
+            if !is_text_block(block)
+                && !self
+                    .inline_groups
+                    .iter()
+                    .any(|group| group.members.contains(&block.id))
+            {
+                self.ensure_text_blocks(start_index, end_index)?;
+            }
+        }
         let originals = self
             .blocks
             .collect_range(start_index..end_index.saturating_add(1));
         let mut changed_nodes = SmallVec::new();
         let mut replacements = originals.clone();
         for block in &mut replacements {
-            if block.kind != kind {
+            if is_text_block(block) && block.kind != kind {
                 block.kind = kind.clone();
                 push_unique(&mut changed_nodes, block.id);
             }
@@ -2869,6 +3294,7 @@ impl Document {
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         self.validate_selection(selection)?;
         let (start_index, _, end_index, _) = self.selection_bounds(selection)?;
+        let (start_index, end_index) = self.semantic_parent_range(start_index, end_index);
         let originals = self
             .blocks
             .collect_range(start_index..end_index.saturating_add(1));
@@ -2914,6 +3340,7 @@ impl Document {
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         self.validate_selection(selection)?;
         let (start_index, _, end_index, _) = self.selection_bounds(selection)?;
+        let (start_index, end_index) = self.semantic_parent_range(start_index, end_index);
         if indent {
             for block in self
                 .blocks
@@ -4065,6 +4492,164 @@ fn push_unique(nodes: &mut SmallVec<[NodeId; 4]>, node_id: NodeId) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inline_group_terminal_image_text_inherits_parent_alignment() {
+        let canonical = app_lite_core::CanonicalDocument::parse_html("<h2>before<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"></h2>").unwrap();
+        let mut doc = crate::native_editor::codec::import_canonical(&canonical).unwrap();
+        let point = |id| super::DocPoint { node_id: id, utf8_offset: 0, affinity: super::Affinity::After };
+        doc.apply(super::Transaction::SetAlignment { selection: super::Selection::caret(point(doc.blocks()[0].id)), alignment: super::TextAlignment::Center }).unwrap();
+        let before = doc.semantic_snapshot();
+        let outcome = doc.apply(super::Transaction::EnsureParagraph { selection: super::Selection::caret(point(doc.blocks()[1].id)) }).unwrap();
+        assert!(crate::native_editor::codec::export_canonical(&doc).is_ok());
+        assert_eq!(doc.blocks().last().unwrap().alignment, super::TextAlignment::Center);
+        assert_eq!(doc.blocks().last().unwrap().kind, super::BlockKind::Heading { level: 2 });
+        doc.apply_batch(outcome.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
+    }
+    #[test]
+    fn inline_group_cross_alignment_delete_is_saveable_and_reversible() {
+        let mut doc = super::Document::from_paragraphs(["a", "b", "c", "d"]);
+        let ids: Vec<_> = doc.blocks().iter().map(|block| block.id).collect();
+        doc.set_inline_groups(vec![
+            super::InlineGroup { kind: super::BlockKind::Paragraph, members: ids[..2].to_vec() },
+            super::InlineGroup { kind: super::BlockKind::Paragraph, members: ids[2..].to_vec() },
+        ]);
+        let point = |id, offset| super::DocPoint { node_id: id, utf8_offset: offset, affinity: super::Affinity::After };
+        doc.apply(super::Transaction::SetAlignment { selection: super::Selection::caret(point(ids[2], 0)), alignment: super::TextAlignment::Center }).unwrap();
+        let before = doc.semantic_snapshot();
+        let outcome = doc.apply(super::Transaction::DeleteRange { selection: super::Selection { anchor: point(ids[1],0), head: point(ids[2],1) } }).unwrap();
+        assert!(crate::native_editor::codec::export_canonical(&doc).is_ok(), "cross-parent edit must remain saveable");
+        let after = doc.semantic_snapshot();
+        let undone = doc.apply_batch(outcome.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
+        doc.apply_batch(undone.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), after);
+    }
+
+    #[test]
+    fn inline_group_atomic_image_insertion_is_saveable_and_attachment_rejects_before_mutation() {
+        let canonical = app_lite_core::CanonicalDocument::parse_html("<h2>before<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">after</h2>").unwrap();
+        let mut doc = crate::native_editor::codec::import_canonical(&canonical).unwrap();
+        let before = doc.semantic_snapshot();
+        let image = doc.blocks()[1].id;
+        let outcome = doc.apply(super::Transaction::InsertImage {
+            selection: super::Selection::caret(super::DocPoint { node_id: image, utf8_offset: 0, affinity: super::Affinity::After }),
+            resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(), natural_size: (20,30),
+        }).unwrap();
+        assert_eq!(crate::native_editor::codec::export_canonical(&doc).unwrap().resource_ids().len(), 2);
+        doc.apply_batch(outcome.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
+        let unchanged = doc.clone();
+        let result = doc.apply(super::Transaction::InsertAttachment {
+            selection: super::Selection::caret(super::DocPoint { node_id: doc.blocks()[0].id, utf8_offset: 2, affinity: super::Affinity::After }),
+            resource_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(), filename: "file.pdf".into(), media_type: "application/pdf".into(),
+        });
+        assert!(result.is_err(), "unsupported inline attachment must fail before editing");
+        assert_eq!(doc, unchanged);
+    }
+    #[test]
+    fn inline_group_style_applies_to_parent_and_cross_merge_undo_keeps_owners() {
+        let mut doc = super::Document::from_paragraphs(["a", "b", "c", "d"]);
+        let ids: Vec<_> = doc.blocks().iter().map(|block| block.id).collect();
+        doc.set_inline_groups(vec![
+            super::InlineGroup {
+                kind: super::BlockKind::Paragraph,
+                members: ids[..2].to_vec(),
+            },
+            super::InlineGroup {
+                kind: super::BlockKind::Paragraph,
+                members: ids[2..].to_vec(),
+            },
+        ]);
+        let before = doc.semantic_snapshot();
+        let outcome = doc
+            .apply(super::Transaction::SetBlockKind {
+                selection: super::Selection::caret(super::DocPoint {
+                    node_id: ids[1],
+                    utf8_offset: 0,
+                    affinity: super::Affinity::After,
+                }),
+                kind: super::BlockKind::Quote,
+            })
+            .unwrap();
+        assert_eq!(doc.blocks()[0].kind, super::BlockKind::Quote);
+        assert_eq!(doc.blocks()[1].kind, super::BlockKind::Quote);
+        doc.apply_batch(outcome.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
+        let merged = doc
+            .apply(super::Transaction::MergeBlocks {
+                left: ids[1],
+                right: ids[2],
+            })
+            .unwrap();
+        assert_eq!(doc.inline_groups().len(), 1);
+        assert_eq!(doc.inline_groups()[0].members, vec![ids[0], ids[1], ids[3]]);
+        doc.apply_batch(merged.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
+    }
+    #[test]
+    fn inline_group_enter_splits_parent_and_undo_restores_membership() {
+        let mut doc = super::Document::from_paragraphs(["before", "after"]);
+        let first = doc.blocks()[0].id;
+        let second = doc.blocks()[1].id;
+        doc.set_inline_groups(vec![super::InlineGroup {
+            kind: super::BlockKind::Paragraph,
+            members: vec![first, second],
+        }]);
+        let before = doc.semantic_snapshot();
+        let split = doc
+            .apply(super::Transaction::SplitBlock {
+                at: super::DocPoint {
+                    node_id: first,
+                    utf8_offset: 3,
+                    affinity: super::Affinity::After,
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            doc.inline_groups().len(),
+            2,
+            "Enter creates a new semantic parent"
+        );
+        assert_eq!(doc.inline_groups()[0].members, vec![first]);
+        assert_eq!(
+            doc.inline_groups()[1].members,
+            vec![split.selection.head.node_id, second]
+        );
+        let after = doc.semantic_snapshot();
+        let undone = doc.apply_batch(split.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
+        doc.apply_batch(undone.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), after);
+    }
+
+    #[test]
+    fn inline_group_failed_batch_does_not_keep_recycled_ids() {
+        let mut doc = super::Document::from_paragraphs(["before", "after"]);
+        let first = doc.blocks()[0].id;
+        let second = doc.blocks()[1].id;
+        doc.set_inline_groups(vec![super::InlineGroup {
+            kind: super::BlockKind::Paragraph,
+            members: vec![first, second],
+        }]);
+        let before = doc.clone();
+        assert!(
+            doc.apply_batch(super::TransactionBatch(vec![
+                super::Transaction::SplitBlock {
+                    at: super::DocPoint {
+                        node_id: first,
+                        utf8_offset: 3,
+                        affinity: super::Affinity::After,
+                    }
+                },
+                super::Transaction::RemoveNode {
+                    node_id: super::NodeId::new_internal(999)
+                },
+            ]))
+            .is_err()
+        );
+        assert_eq!(doc, before);
+    }
     use super::{
         reset_validation_grapheme_counter, validation_grapheme_boundaries,
         validation_grapheme_counter,

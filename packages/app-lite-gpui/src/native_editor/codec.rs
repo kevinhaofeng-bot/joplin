@@ -10,7 +10,8 @@ use smallvec::SmallVec;
 use std::fmt;
 
 use super::model::{
-    Block, BlockContent, BlockKind, Document, DocumentError, Mark, NodeId, StyledRun, TextAlignment,
+    Block, BlockContent, BlockKind, Document, DocumentError, InlineGroup, Mark, NodeId, StyledRun,
+    TextAlignment,
 };
 
 /// The library shell deliberately imports only the canonical subset that can
@@ -135,11 +136,73 @@ pub fn import_canonical_with_resources(
     available_resources: &[ResourceId],
 ) -> Result<Document, CanonicalImportError> {
     let mut native = Vec::new();
+    let mut inline_groups = Vec::new();
     let mut next_id = 1_u64;
 
     for (block_index, block) in document.blocks().iter().enumerate() {
         match block {
             CanonicalBlock::Paragraph { style, inlines } => {
+                if inlines
+                    .iter()
+                    .any(|inline| matches!(inline, Inline::Image { .. }))
+                {
+                    // The native document has image atoms at block boundaries.
+                    // Split only this legacy flow, preserving text order/marks,
+                    // repeated images and alt text. The persisted source isn't
+                    // changed just by opening; a later edit saves this explicit
+                    // structural representation.
+                    let mut text = Vec::new();
+                    for inline in inlines {
+                        if let Inline::Image { resource_id, alt } = inline {
+                            ensure_resource(resource_id, available_resources, block_index)?;
+                            if !text.is_empty() {
+                                native.push(text_block(
+                                    next_node_id(&mut next_id),
+                                    BlockKind::Paragraph,
+                                    style,
+                                    &text,
+                                    block_index,
+                                )?);
+                                text.clear();
+                            }
+                            if style.indent != 0 {
+                                return Err(CanonicalImportError::UnsupportedIndent {
+                                    block_index,
+                                    indent: style.indent,
+                                });
+                            }
+                            native.push(Block {
+                                id: next_node_id(&mut next_id),
+                                kind: BlockKind::Image,
+                                content: BlockContent::Image {
+                                    resource_id: resource_id.as_str().to_owned(),
+                                    alt: alt.clone(),
+                                    natural_size_known: false,
+                                    natural_size: (1024, 768),
+                                    display_width: None,
+                                },
+                                alignment: match style.alignment {
+                                    Alignment::Left => TextAlignment::Left,
+                                    Alignment::Center => TextAlignment::Center,
+                                    Alignment::Right => TextAlignment::Right,
+                                },
+                                revision: 0,
+                            });
+                        } else {
+                            text.push(inline.clone());
+                        }
+                    }
+                    if !text.is_empty() {
+                        native.push(text_block(
+                            next_node_id(&mut next_id),
+                            BlockKind::Paragraph,
+                            style,
+                            &text,
+                            block_index,
+                        )?);
+                    }
+                    continue;
+                }
                 native.push(text_block(
                     next_node_id(&mut next_id),
                     BlockKind::Paragraph,
@@ -153,6 +216,21 @@ pub fn import_canonical_with_resources(
                 style,
                 inlines,
             } => {
+                if has_inline_image(inlines) {
+                    push_inline_group(
+                        &mut native,
+                        &mut inline_groups,
+                        &mut next_id,
+                        BlockKind::Heading {
+                            level: heading_level(*level),
+                        },
+                        style,
+                        inlines,
+                        available_resources,
+                        block_index,
+                    )?;
+                    continue;
+                }
                 native.push(text_block(
                     next_node_id(&mut next_id),
                     BlockKind::Heading {
@@ -173,6 +251,19 @@ pub fn import_canonical_with_resources(
                             checked: item.checked.unwrap_or(false),
                         },
                     };
+                    if has_inline_image(&item.inlines) {
+                        push_inline_group(
+                            &mut native,
+                            &mut inline_groups,
+                            &mut next_id,
+                            kind,
+                            &item.style,
+                            &item.inlines,
+                            available_resources,
+                            block_index,
+                        )?;
+                        continue;
+                    }
                     native.push(text_block(
                         next_node_id(&mut next_id),
                         kind,
@@ -183,6 +274,19 @@ pub fn import_canonical_with_resources(
                 }
             }
             CanonicalBlock::Quote { style, inlines } => {
+                if has_inline_image(inlines) {
+                    push_inline_group(
+                        &mut native,
+                        &mut inline_groups,
+                        &mut next_id,
+                        BlockKind::Quote,
+                        style,
+                        inlines,
+                        available_resources,
+                        block_index,
+                    )?;
+                    continue;
+                }
                 native.push(text_block(
                     next_node_id(&mut next_id),
                     BlockKind::Quote,
@@ -192,6 +296,19 @@ pub fn import_canonical_with_resources(
                 )?);
             }
             CanonicalBlock::Code { style, inlines } => {
+                if has_inline_image(inlines) {
+                    push_inline_group(
+                        &mut native,
+                        &mut inline_groups,
+                        &mut next_id,
+                        BlockKind::Code,
+                        style,
+                        inlines,
+                        available_resources,
+                        block_index,
+                    )?;
+                    continue;
+                }
                 native.push(text_block(
                     next_node_id(&mut next_id),
                     BlockKind::Code,
@@ -254,7 +371,64 @@ pub fn import_canonical_with_resources(
     if native.is_empty() {
         return Ok(Document::new());
     }
-    Document::from_blocks(native).map_err(CanonicalImportError::InvalidDocument)
+    let mut document =
+        Document::from_blocks(native).map_err(CanonicalImportError::InvalidDocument)?;
+    document.set_inline_groups(inline_groups);
+    Ok(document)
+}
+
+fn has_inline_image(inlines: &[Inline]) -> bool {
+    inlines
+        .iter()
+        .any(|inline| matches!(inline, Inline::Image { .. }))
+}
+
+fn push_inline_group(
+    native: &mut Vec<Block>,
+    groups: &mut Vec<InlineGroup>,
+    next_id: &mut u64,
+    kind: BlockKind,
+    style: &BlockStyle,
+    inlines: &[Inline],
+    available_resources: &[ResourceId],
+    block_index: usize,
+) -> Result<(), CanonicalImportError> {
+    let mut members = Vec::new();
+    let mut text = Vec::new();
+    for inline in inlines {
+        match inline {
+            Inline::Image { resource_id, alt } => {
+                ensure_resource(resource_id, available_resources, block_index)?;
+                let id = next_node_id(next_id);
+                members.push(id);
+                native.push(text_block(id, kind.clone(), style, &text, block_index)?);
+                text.clear();
+                let id = next_node_id(next_id);
+                members.push(id);
+                native.push(Block {
+                    id,
+                    kind: BlockKind::Image,
+                    content: BlockContent::Image {
+                        resource_id: resource_id.as_str().to_owned(),
+                        alt: alt.clone(),
+                        natural_size_known: false,
+                        natural_size: (1024, 768),
+                        display_width: None,
+                    },
+                    alignment: TextAlignment::Left,
+                    revision: 0,
+                });
+            }
+            _ => text.push(inline.clone()),
+        }
+    }
+    if !text.is_empty() {
+        let id = next_node_id(next_id);
+        members.push(id);
+        native.push(text_block(id, kind.clone(), style, &text, block_index)?);
+    }
+    groups.push(InlineGroup { kind, members });
+    Ok(())
 }
 
 /// Exports the semantic native document without ever consulting `body_text`.
@@ -284,6 +458,122 @@ pub fn export_canonical_with_resources(
         };
 
     for (block_index, block) in document.blocks().iter().enumerate() {
+        if let Some(group) = document
+            .inline_groups()
+            .iter()
+            .find(|group| group.members.contains(&block.id))
+        {
+            let active = document
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| group.members.contains(&candidate.id))
+                .collect::<Vec<_>>();
+            if active
+                .first()
+                .is_none_or(|(index, _)| *index != block_index)
+            {
+                continue;
+            }
+            if active.windows(2).any(|pair| pair[1].0 != pair[0].0 + 1) {
+                return Err(CanonicalExportError::InvalidTextContent { block_index });
+            }
+            let mut kind = group.kind.clone();
+            let mut style = None;
+            let mut inlines = Vec::new();
+            for (index, member) in active {
+                match &member.content {
+                    BlockContent::Text { .. } => {
+                        let (segment_style, segment) = export_text_block(member, index)?;
+                        if let Some(existing) = &style {
+                            if existing != &segment_style {
+                                return Err(CanonicalExportError::InvalidTextContent {
+                                    block_index,
+                                });
+                            }
+                        } else {
+                            kind = member.kind.clone();
+                            style = Some(segment_style);
+                        }
+                        inlines.extend(segment);
+                    }
+                    BlockContent::Image {
+                        resource_id,
+                        alt,
+                        display_width,
+                        ..
+                    } => {
+                        if display_width.is_some() {
+                            return Err(CanonicalExportError::UnsupportedBlockKind {
+                                block_index: index,
+                                kind: "列表、标题或引用内图片的调整宽度暂不能保存".into(),
+                            });
+                        }
+                        inlines.push(Inline::Image {
+                            resource_id: parse_allowed_resource(
+                                resource_id,
+                                available_resources,
+                                index,
+                            )?,
+                            alt: alt.clone(),
+                        });
+                    }
+                    _ => return Err(CanonicalExportError::InvalidTextContent { block_index }),
+                }
+            }
+            let style = style.unwrap_or_default();
+            let list = match kind {
+                BlockKind::BulletItem { depth: 0 } => Some((ListKind::Unordered, None)),
+                BlockKind::OrderedItem { depth: 0 } => Some((ListKind::Ordered, None)),
+                BlockKind::CheckItem { depth: 0, checked } => {
+                    Some((ListKind::Checklist, Some(checked)))
+                }
+                _ => None,
+            };
+            if let Some((list_kind, checked)) = list {
+                let item = app_lite_core::document::ListItem {
+                    checked,
+                    style,
+                    inlines,
+                };
+                match pending_list.as_mut() {
+                    Some((pending_kind, items)) if *pending_kind == list_kind => items.push(item),
+                    _ => {
+                        flush_list(&mut output, &mut pending_list);
+                        pending_list = Some((list_kind, vec![item]));
+                    }
+                }
+            } else {
+                flush_list(&mut output, &mut pending_list);
+                output.push(match kind {
+                    BlockKind::Heading { level: 1 } => CanonicalBlock::Heading {
+                        level: HeadingLevel::One,
+                        style,
+                        inlines,
+                    },
+                    BlockKind::Heading { level: 2 } => CanonicalBlock::Heading {
+                        level: HeadingLevel::Two,
+                        style,
+                        inlines,
+                    },
+                    BlockKind::Heading { level: 3 } => CanonicalBlock::Heading {
+                        level: HeadingLevel::Three,
+                        style,
+                        inlines,
+                    },
+                    BlockKind::Quote => CanonicalBlock::Quote { style, inlines },
+                    BlockKind::Code => CanonicalBlock::Code { style, inlines },
+                    BlockKind::Paragraph => CanonicalBlock::Paragraph { style, inlines },
+                    _ => {
+                        return Err(CanonicalExportError::UnsupportedBlockKind {
+                            block_index,
+                            kind: format!("{kind:?}"),
+                        });
+                    }
+                });
+            }
+            continue;
+        }
         let list_kind = match &block.kind {
             BlockKind::BulletItem { depth } => Some((ListKind::Unordered, *depth, None)),
             BlockKind::OrderedItem { depth } => Some((ListKind::Ordered, *depth, None)),
@@ -811,7 +1101,440 @@ mod tests {
                 alt: "尚未支持的图片".into(),
             }],
         }]);
-        assert!(import_canonical(&image).is_err());
+        let imported = import_canonical(&image).expect("legacy inline image must open");
+        assert!(matches!(imported.blocks()[0].kind, BlockKind::Image));
+    }
+
+    #[test]
+    fn legacy_image_between_marked_text_opens_in_order_and_exports_without_loss() {
+        let canonical = CanonicalDocument::parse_html(
+            "<p><strong>图前</strong><img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"图\"><em>图后</em></p>"
+        ).unwrap();
+        let native = import_canonical(&canonical).expect("imported JEX image must open");
+        assert_eq!(native.blocks().len(), 3);
+        assert!(matches!(native.blocks()[1].kind, BlockKind::Image));
+        let exported = super::export_canonical(&native).unwrap();
+        assert_eq!(exported.resource_ids(), canonical.resource_ids());
+        let html = exported.to_canonical_html();
+        assert!(html.as_str().contains("<strong>图前</strong>"));
+        assert!(html.as_str().contains("<em>图后</em>"));
+        assert!(html.as_str().find("图前").unwrap() < html.as_str().find("<img ").unwrap());
+        assert!(html.as_str().find("<img ").unwrap() < html.as_str().find("图后").unwrap());
+        assert!(import_canonical_with_resources(&canonical, &[]).is_err());
+    }
+
+    #[test]
+    fn images_inside_heading_quote_and_ordered_item_preserve_their_parent_structure() {
+        let resource = app_lite_core::ResourceId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let image = Inline::Image {
+            resource_id: resource.clone(),
+            alt: "图".into(),
+        };
+        let text = |value: &str| Inline::Text {
+            text: value.into(),
+            marks: Marks::default(),
+        };
+        let style = BlockStyle::default();
+        let canonical = CanonicalDocument::from_blocks(vec![
+            CanonicalBlock::Heading {
+                level: HeadingLevel::Two,
+                style: style.clone(),
+                inlines: vec![text("标题前"), image.clone(), text("标题后")],
+            },
+            CanonicalBlock::Quote {
+                style: style.clone(),
+                inlines: vec![text("引用前"), image.clone(), text("引用后")],
+            },
+            CanonicalBlock::List {
+                kind: ListKind::Ordered,
+                items: vec![
+                    ListItem {
+                        checked: None,
+                        style: style.clone(),
+                        inlines: vec![text("第一项")],
+                    },
+                    ListItem {
+                        checked: None,
+                        style,
+                        inlines: vec![text("图前"), image, text("图后")],
+                    },
+                ],
+            },
+        ]);
+        let native = import_canonical(&canonical).expect("inline images must load");
+        assert_eq!(
+            native
+                .blocks()
+                .iter()
+                .filter(|block| matches!(block.kind, BlockKind::Image))
+                .count(),
+            3
+        );
+        let numbers = crate::native_editor::layout::ordered_number_summary(&native);
+        let ordered = native
+            .blocks()
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::OrderedItem { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(numbers.get(&ordered[0].id), Some(&1));
+        assert_eq!(numbers.get(&ordered[1].id), Some(&2));
+        assert_eq!(
+            numbers.get(&ordered[2].id),
+            None,
+            "continuation must not add a list number"
+        );
+        assert_eq!(super::export_canonical(&native).unwrap(), canonical);
+    }
+
+    #[test]
+    fn grouped_list_image_survives_text_edits_image_delete_and_undo() {
+        use crate::native_editor::history::History;
+        use crate::native_editor::model::{Affinity, DocPoint, Selection};
+        use crate::native_editor::transaction::Transaction;
+        let canonical = CanonicalDocument::parse_html(
+            "<ol><li>图前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"照片\">图后</li><li>下一项</li></ol>"
+        ).unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        let before = document.blocks()[0].id;
+        let image = document.blocks()[1].id;
+        let after = document.blocks()[2].id;
+        let mut history = History::new(32, 4 * 1024 * 1024);
+        history
+            .apply(
+                &mut document,
+                Transaction::InsertText {
+                    selection: Selection::caret(DocPoint::new(before, "图".len())),
+                    text: "新".into(),
+                },
+            )
+            .unwrap();
+        history
+            .apply(
+                &mut document,
+                Transaction::InsertText {
+                    selection: Selection::caret(DocPoint::new(after, "图".len())),
+                    text: "增".into(),
+                },
+            )
+            .unwrap();
+        let exported = super::export_canonical(&document).unwrap();
+        let html = exported.to_canonical_html();
+        assert!(html.as_str().contains("图新前"));
+        assert!(html.as_str().contains("图增后"));
+        assert_eq!(
+            crate::native_editor::layout::ordered_number_summary(&document)
+                .get(&document.blocks()[3].id),
+            Some(&2)
+        );
+        let before_delete = document.semantic_snapshot();
+        history
+            .apply(
+                &mut document,
+                Transaction::DeleteRange {
+                    selection: Selection::new(
+                        DocPoint::with_affinity(image, 0, Affinity::Before),
+                        DocPoint::with_affinity(image, 0, Affinity::After),
+                    ),
+                },
+            )
+            .unwrap();
+        let without_image = super::export_canonical(&document).unwrap();
+        assert!(without_image.resource_ids().is_empty());
+        assert!(
+            without_image
+                .to_canonical_html()
+                .as_str()
+                .contains("图新前图增后")
+        );
+        history.undo(&mut document).unwrap();
+        assert_eq!(document.semantic_snapshot(), before_delete);
+        assert_eq!(
+            super::export_canonical(&document).unwrap().resource_ids(),
+            canonical.resource_ids()
+        );
+    }
+
+    #[test]
+    fn grouped_list_image_uses_full_image_row_inside_list_content_column() {
+        let canonical = CanonicalDocument::parse_html(
+            "<ol><li>前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">后</li><li>下一项</li></ol>",
+        )
+        .unwrap();
+        let document = import_canonical(&canonical).unwrap();
+        let image_id = document
+            .blocks()
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::Image))
+            .unwrap()
+            .id;
+        let mut layout = crate::native_editor::layout::LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 1_000.0, 680.0);
+        let image = layout
+            .visible()
+            .iter()
+            .find(|block| block.node_id == image_id)
+            .unwrap();
+        assert!(f32::from(image.bounds.left()) >= 22.0);
+        assert!(f32::from(image.bounds.size.width) > 300.0);
+        assert!(f32::from(image.bounds.size.height) > 200.0);
+    }
+
+    #[test]
+    fn grouped_inline_image_resize_is_rejected_until_canonical_can_store_its_width() {
+        use crate::native_editor::transaction::Transaction;
+        let canonical = CanonicalDocument::parse_html(
+            "<h2>前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">后</h2>",
+        )
+        .unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        let image_id = document
+            .blocks()
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::Image))
+            .unwrap()
+            .id;
+        document
+            .apply(Transaction::SetImageDisplayWidth {
+                node_id: image_id,
+                display_width: Some(320),
+            })
+            .unwrap();
+        assert!(matches!(
+            super::export_canonical(&document),
+            Err(CanonicalExportError::UnsupportedBlockKind { .. })
+        ));
+    }
+
+    #[test]
+    fn indenting_a_list_image_continuation_moves_its_whole_item_and_image_column() {
+        use crate::native_editor::model::{DocPoint, Selection};
+        use crate::native_editor::transaction::Transaction;
+        let canonical = CanonicalDocument::parse_html(
+            "<ol><li>首项</li><li>图前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">图后</li><li>尾项</li></ol>"
+        ).unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        let first = document.blocks()[1].id;
+        let image = document.blocks()[2].id;
+        let continuation = document.blocks()[3].id;
+        let tail = document.blocks()[4].id;
+        document
+            .apply(Transaction::IndentList {
+                selection: Selection::caret(DocPoint::new(continuation, 0)),
+            })
+            .unwrap();
+        assert!(matches!(
+            document.block(first).unwrap().kind,
+            BlockKind::OrderedItem { depth: 1 }
+        ));
+        assert!(matches!(
+            document.block(continuation).unwrap().kind,
+            BlockKind::OrderedItem { depth: 1 }
+        ));
+        let mut layout = crate::native_editor::layout::LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 1_000.0, 680.0);
+        let image_bounds = layout
+            .visible()
+            .iter()
+            .find(|block| block.node_id == image)
+            .unwrap()
+            .bounds;
+        assert!(f32::from(image_bounds.left()) >= 42.0);
+        let numbers = crate::native_editor::layout::ordered_number_summary(&document);
+        assert_eq!(numbers.get(&tail), Some(&2));
+    }
+
+    #[test]
+    fn enter_after_grouped_list_image_creates_a_second_list_item() {
+        use crate::native_editor::history::History;
+        use crate::native_editor::model::DocPoint;
+        use crate::native_editor::transaction::Transaction;
+        let canonical = CanonicalDocument::parse_html(
+            "<ol><li>前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">后续</li></ol>",
+        )
+        .unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        let trailing = document.blocks()[2].id;
+        let mut history = History::new(32, 4 * 1024 * 1024);
+        history
+            .apply(
+                &mut document,
+                Transaction::SplitBlock {
+                    at: DocPoint::new(trailing, "后".len()),
+                },
+            )
+            .unwrap();
+        let exported = super::export_canonical(&document).unwrap();
+        let [
+            CanonicalBlock::List {
+                kind: ListKind::Ordered,
+                items,
+            },
+        ] = exported.blocks()
+        else {
+            panic!("Enter must retain an ordered list");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(
+            items[0]
+                .inlines
+                .iter()
+                .any(|inline| matches!(inline, Inline::Image { .. }))
+        );
+        assert_eq!(
+            items[1].inlines,
+            vec![Inline::Text {
+                text: "续".into(),
+                marks: Marks::default()
+            }]
+        );
+        let numbers = crate::native_editor::layout::ordered_number_summary(&document);
+        assert_eq!(numbers.get(&document.blocks()[3].id), Some(&2));
+        history.undo(&mut document).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap(), canonical);
+    }
+
+    #[test]
+    fn merging_two_image_list_items_exports_each_resource_exactly_once() {
+        use crate::native_editor::transaction::Transaction;
+        let canonical = CanonicalDocument::parse_html(
+            "<ol><li>A<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">B</li><li>C<img src=\":/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\">D</li></ol>"
+        ).unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        let left = document.blocks()[2].id;
+        let right = document.blocks()[3].id;
+        document
+            .apply(Transaction::MergeBlocks { left, right })
+            .unwrap();
+        let exported = super::export_canonical(&document).unwrap();
+        let [
+            CanonicalBlock::List {
+                kind: ListKind::Ordered,
+                items,
+            },
+        ] = exported.blocks()
+        else {
+            panic!("merged image items must remain an ordered list");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            exported
+                .resource_ids()
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only real-copy audit; requires JOPLIN_LITE_AUDIT_DATABASE"]
+    fn imported_real_copy_opens_and_round_trips_resources_in_native_editor() {
+        use app_lite_core::{JexVerifiedResource, ResourceId, convert_jex_note_body_or_degrade};
+        use std::collections::BTreeMap;
+        let path = std::env::var("JOPLIN_LITE_AUDIT_DATABASE").expect("explicit isolated database");
+        let db =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut resources = BTreeMap::new();
+        let mut statement = db.prepare("SELECT a.source_id,r.id,r.mime,r.title FROM jex_stage_resource_audit a JOIN resources r ON r.id=a.resource_id").unwrap();
+        for row in statement
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+        {
+            let (source, id, mime, filename) = row.unwrap();
+            resources.insert(
+                source,
+                JexVerifiedResource {
+                    destination_id: ResourceId::new(id).unwrap(),
+                    mime,
+                    filename,
+                },
+            );
+        }
+        let mut statement = db.prepare("SELECT source_id,source_path,markup_language,raw_body_bytes FROM jex_stage_note_audit").unwrap();
+        let mut failures = BTreeMap::<String, usize>::new();
+        let mut total = 0;
+        for row in statement
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .unwrap()
+        {
+            let (id, path, markup, bytes) = row.unwrap();
+            total += 1;
+            let converted = match convert_jex_note_body_or_degrade(
+                &id,
+                &path,
+                markup,
+                std::str::from_utf8(&bytes).unwrap(),
+                &resources,
+            ) {
+                Ok((value, _)) => value,
+                Err(error) => {
+                    *failures
+                        .entry(format!("conversion: {:?}", error.kind))
+                        .or_default() += 1;
+                    continue;
+                }
+            };
+            match import_canonical(&converted.document) {
+                Ok(native) => match super::export_canonical(&native) {
+                    Ok(exported) => {
+                        if exported.resource_ids() != converted.document.resource_ids() {
+                            *failures.entry("resource order changed".into()).or_default() += 1;
+                        }
+                        let visible =
+                            |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+                        if visible(exported.search_text().as_str())
+                            != visible(&converted.search_text)
+                        {
+                            *failures
+                                .entry("visible non-whitespace text changed".into())
+                                .or_default() += 1;
+                        }
+                    }
+                    Err(_) => *failures.entry("export rejected".into()).or_default() += 1,
+                },
+                Err(error) => {
+                    let category = if let super::CanonicalImportError::UnsupportedInlineImage {
+                        block_index,
+                    } = &error
+                    {
+                        match &converted.document.blocks()[*block_index] {
+                            CanonicalBlock::List { .. } => "list image",
+                            CanonicalBlock::Heading { .. } => "heading image",
+                            CanonicalBlock::Quote { .. } => "quote image",
+                            _ => "other image",
+                        }
+                        .to_owned()
+                    } else {
+                        format!("native: {error}")
+                    };
+                    *failures.entry(category).or_default() += 1;
+                }
+            }
+        }
+        eprintln!("real-copy notes={total}, failure_categories={failures:?}");
+        assert!(total > 0);
+        assert!(
+            failures.is_empty(),
+            "real-copy native roundtrip failed; see count-only categories"
+        );
     }
 
     #[test]

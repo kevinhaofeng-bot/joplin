@@ -8181,8 +8181,8 @@ async fn mounted_ime_lifecycle_warning_survives_clean_ticks_until_commit_and_suc
 
 #[gpui::test]
 async fn selecting_an_unsupported_resource_note_never_reads_blob_bytes(cx: &mut TestAppContext) {
-    // Catches accidental Task-5-style blob hydration while Task 3 only needs
-    // metadata/canonical parsing to fail closed on image notes.
+    // Unsupported indentation must fail before blob hydration. Inline images
+    // themselves are now supported and must not be used as a rejection fixture.
     let (_profile, repository) = repository();
     let image = repository
         .import_image(b"resource observer fixture", "image", "image/png", "png")
@@ -8192,10 +8192,13 @@ async fn selecting_an_unsupported_resource_note_never_reads_blob_bytes(cx: &mut 
             title: "资源未加载".into(),
             notebook_id: None,
             document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
-                style: BlockStyle::default(),
+                style: BlockStyle {
+                    indent: 1,
+                    ..BlockStyle::default()
+                },
                 inlines: vec![Inline::Image {
                     resource_id: image,
-                    alt: "Task 5 owns decode".into(),
+                    alt: "unsupported indent prevents decode".into(),
                 }],
             }]),
         })
@@ -8212,6 +8215,91 @@ async fn selecting_an_unsupported_resource_note_never_reads_blob_bytes(cx: &mut 
 
     assert!(cx.debug_bounds("unsupported-native-document").is_some());
     assert_eq!(resource_reads.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[gpui::test]
+async fn mounted_list_inline_photo_hydrates_at_real_size_without_reopen_or_save(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_resource(&structural_png(675, 1200), "inline.png", "image/png", "png")
+        .unwrap();
+    let note = repository
+        .create_note(CreateNote {
+            title: "列表图片".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::List {
+                kind: app_lite_core::document::ListKind::Ordered,
+                items: vec![app_lite_core::document::ListItem {
+                    checked: None,
+                    style: BlockStyle::default(),
+                    inlines: vec![
+                        Inline::Text {
+                            text: "图前".into(),
+                            marks: Marks::default(),
+                        },
+                        Inline::Image {
+                            resource_id: image.clone(),
+                            alt: "photo".into(),
+                        },
+                        Inline::Text {
+                            text: "图后".into(),
+                            marks: Marks::default(),
+                        },
+                    ],
+                }],
+            }]),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(cx.debug_bounds("native-editor-surface").is_some());
+    assert!(cx.debug_bounds("unsupported-native-document").is_none());
+    view.read_with(cx, |shell, app| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .read(app);
+        assert!(
+            editor
+                .image_source_path(image.as_str())
+                .is_some_and(|path| path.is_file())
+        );
+        let photo = editor
+            .document()
+            .blocks()
+            .iter()
+            .find_map(|block| match &block.content {
+                crate::native_editor::model::BlockContent::Image {
+                    natural_size,
+                    natural_size_known,
+                    ..
+                } => Some((*natural_size, *natural_size_known)),
+                _ => None,
+            });
+        assert_eq!(photo, Some(((675, 1200), true)));
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx);
+    });
+    cx.run_until_parked();
+    let stored = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(
+        stored.revision, note.revision,
+        "opening an inline photo must not rewrite the note"
+    );
+    assert_eq!(stored.body_html, note.body_html);
 }
 
 #[gpui::test]
@@ -8239,7 +8327,10 @@ async fn switching_to_an_unsupported_body_removes_the_previous_native_surface(
             title: "含图像正文".into(),
             notebook_id: None,
             document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
-                style: BlockStyle::default(),
+                style: BlockStyle {
+                    indent: 1,
+                    ..BlockStyle::default()
+                },
                 inlines: vec![Inline::Image {
                     resource_id: image,
                     alt: "Task 5 image".into(),
@@ -8276,7 +8367,7 @@ async fn switching_to_an_unsupported_body_removes_the_previous_native_surface(
         assert!(
             view.unsupported_document
                 .as_deref()
-                .is_some_and(|message| message.contains("图片"))
+                .is_some_and(|message| message.contains("缩进"))
         );
     });
 }

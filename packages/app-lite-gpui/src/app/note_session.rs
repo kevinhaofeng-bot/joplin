@@ -97,6 +97,7 @@ struct PreparedImageSource {
     /// 1024×768 first frame from the codec, then the first successful visible
     /// hydration repairs *only* this node without adding a history entry.
     needs_legacy_geometry_repair: bool,
+    needs_inline_measurement: bool,
 }
 
 /// Aggregated by resource ID because a single durable blob may be referenced
@@ -107,6 +108,7 @@ struct PersistedImageHydration {
     resource_id: ResourceId,
     natural_size: (u32, u32),
     legacy_node_ids: Vec<NodeId>,
+    inline_node_ids: Vec<NodeId>,
 }
 
 struct ImageHydrationJob {
@@ -953,14 +955,39 @@ fn prepare_persisted_image_hydration(
     document: Document,
     canonical: &CanonicalDocument,
 ) -> Result<(Document, Vec<PreparedImageSource>), SaveError> {
-    let mut canonical_images = canonical.blocks().iter().filter_map(|block| match block {
-        app_lite_core::document::Block::Image {
-            resource_id,
-            presentation,
-            ..
-        } => Some((resource_id, presentation.natural_size.is_none())),
-        _ => None,
-    });
+    fn append_inline_images<'a>(
+        inlines: &'a [app_lite_core::document::Inline],
+        out: &mut Vec<(&'a ResourceId, bool)>,
+    ) {
+        for inline in inlines {
+            if let app_lite_core::document::Inline::Image { resource_id, .. } = inline {
+                out.push((resource_id, true));
+            }
+        }
+    }
+    let mut canonical_images = Vec::new();
+    for block in canonical.blocks() {
+        match block {
+            app_lite_core::document::Block::Image {
+                resource_id,
+                presentation,
+                ..
+            } => canonical_images.push((resource_id, presentation.natural_size.is_none())),
+            app_lite_core::document::Block::Paragraph { inlines, .. }
+            | app_lite_core::document::Block::Heading { inlines, .. }
+            | app_lite_core::document::Block::Quote { inlines, .. }
+            | app_lite_core::document::Block::Code { inlines, .. } => {
+                append_inline_images(inlines, &mut canonical_images)
+            }
+            app_lite_core::document::Block::List { items, .. } => {
+                for item in items {
+                    append_inline_images(&item.inlines, &mut canonical_images);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut canonical_images = canonical_images.into_iter();
     let mut sources = Vec::new();
     for block in document.blocks() {
         let BlockContent::Image {
@@ -983,13 +1010,95 @@ fn prepare_persisted_image_hydration(
             resource_id: id,
             node_id: block.id,
             natural_size: *natural_size,
-            needs_legacy_geometry_repair,
+            needs_legacy_geometry_repair: needs_legacy_geometry_repair
+                && !document
+                    .inline_groups()
+                    .iter()
+                    .any(|group| group.members.contains(&block.id)),
+            needs_inline_measurement: document
+                .inline_groups()
+                .iter()
+                .any(|group| group.members.contains(&block.id)),
         });
     }
     if canonical_images.next().is_some() {
         return Err(SaveError::new("图片节点与持久化正文数量不一致"));
     }
     Ok((document, sources))
+}
+
+#[cfg(test)]
+mod inline_image_hydration_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_inline_images_receive_lazy_hydration_descriptors_in_document_order() {
+        let canonical = CanonicalDocument::parse_html(
+            "<h2>前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">后</h2><ol><li>项<img src=\":/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"></li></ol>"
+        ).unwrap();
+        let native =
+            import_canonical_with_resources(&canonical, &canonical.resource_ids()).unwrap();
+        let (_, sources) = prepare_persisted_image_hydration(native, &canonical).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0].resource_id.as_str(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            sources[1].resource_id.as_str(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(sources.iter().all(|source| source.needs_inline_measurement));
+        assert!(
+            sources
+                .iter()
+                .all(|source| !source.needs_legacy_geometry_repair)
+        );
+    }
+
+    #[test]
+    fn measured_inline_image_changes_layout_without_changing_the_save_snapshot() {
+        let canonical = CanonicalDocument::parse_html(
+            "<h2>前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">后</h2>",
+        )
+        .unwrap();
+        let mut native =
+            import_canonical_with_resources(&canonical, &canonical.resource_ids()).unwrap();
+        let before = native.semantic_snapshot();
+        let image = native
+            .blocks()
+            .iter()
+            .find(|block| matches!(block.content, BlockContent::Image { .. }))
+            .unwrap()
+            .id;
+        assert_eq!(
+            native
+                .set_inline_group_image_natural_size_presentation(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[image],
+                    (600, 1200)
+                )
+                .unwrap(),
+            vec![image]
+        );
+        assert_eq!(native.semantic_snapshot(), before);
+        assert!(matches!(
+            &native.block(image).unwrap().content,
+            BlockContent::Image {
+                natural_size: (600, 1200),
+                ..
+            }
+        ));
+        let mut layout = crate::native_editor::layout::LayoutRegistry::new();
+        layout.layout_document(&native, 0.0, 2_000.0, 680.0);
+        let bounds = layout
+            .visible()
+            .iter()
+            .find(|block| block.node_id == image)
+            .unwrap()
+            .bounds;
+        assert!(f32::from(bounds.size.height) > f32::from(bounds.size.width) * 1.5);
+    }
 }
 
 /// Resolve cards independently from images. A missing attachment must not
@@ -1284,9 +1393,13 @@ impl NoteSession {
                     resource_id: source.resource_id.clone(),
                     natural_size: source.natural_size,
                     legacy_node_ids: Vec::new(),
+                    inline_node_ids: Vec::new(),
                 });
             if source.needs_legacy_geometry_repair {
                 entry.legacy_node_ids.push(source.node_id);
+            }
+            if source.needs_inline_measurement {
+                entry.inline_node_ids.push(source.node_id);
             }
         }
         for source in attachment_sources {
@@ -2768,6 +2881,24 @@ impl NoteSession {
                 });
                 match registration {
                     Ok(()) => {
+                        if !hydration.inline_node_ids.is_empty() {
+                            let measured = self.editor.update(cx, |editor, editor_cx| {
+                                let result = editor.measure_inline_group_images(
+                                    &resource_id,
+                                    &hydration.inline_node_ids,
+                                    measured_natural_size,
+                                );
+                                if result.as_ref().is_ok_and(|changed| *changed) {
+                                    editor_cx.notify();
+                                }
+                                result
+                            });
+                            if let Err(error) = measured {
+                                self.push_resource_load_warning(format!(
+                                    "无法测量行内图片：{error}"
+                                ));
+                            }
+                        }
                         if !hydration.legacy_node_ids.is_empty() {
                             self.pending_legacy_image_repairs.push_back(
                                 LegacyImageGeometryRepair {

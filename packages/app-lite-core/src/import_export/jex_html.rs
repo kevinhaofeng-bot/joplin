@@ -120,6 +120,9 @@ fn append(node: Node, stack: &mut [Element], root: &mut Vec<Node>) {
 
 fn parse(body: &str, note_id: &str, path: &str) -> Result<Vec<Node>> {
     let mut reader = Reader::from_reader(body.as_bytes());
+    // We validate non-void end tags against our own stack below. XML's stack
+    // incorrectly expects </img> for valid HTML <img> and </br> for <br>.
+    reader.config_mut().check_end_names = false;
     let mut buffer = Vec::new();
     let mut root = Vec::new();
     let mut stack: Vec<Element> = Vec::new();
@@ -142,7 +145,7 @@ fn parse(body: &str, note_id: &str, path: &str) -> Result<Vec<Node>> {
                         "HTML node budget exceeded",
                     ));
                 }
-                if matches!(element.tag.as_str(), "br" | "img") || is_empty {
+                if matches!(element.tag.as_str(), "br" | "img" | "hr") || is_empty {
                     append(Node::Element(element), &mut stack, &mut root);
                 } else {
                     if stack.len() >= MAX_DEPTH {
@@ -548,6 +551,43 @@ impl Context<'_> {
 
     fn element_block(&mut self, element: &Element) -> Result<Block> {
         match element.tag.as_str() {
+            "hr" => {
+                self.attrs(element, &[])?;
+                if !element.children.is_empty() {
+                    return self.block(
+                        Kind::UnsupportedStructure,
+                        "HTML divider cannot contain children",
+                    );
+                }
+                Ok(Block::Divider)
+            }
+            "blockquote" | "pre" => {
+                self.attrs(element, &[])?;
+                let children = if element.children.len() == 1 {
+                    match &element.children[0] {
+                        Node::Element(child)
+                            if (element.tag == "blockquote" && child.tag == "p")
+                                || (element.tag == "pre" && child.tag == "code") =>
+                        {
+                            self.attrs(child, &[])?;
+                            &child.children
+                        }
+                        _ => &element.children,
+                    }
+                } else {
+                    &element.children
+                };
+                let mut inlines = Vec::new();
+                for child in children {
+                    self.inline(child, &Marks::default(), false, &mut inlines)?;
+                }
+                let style = BlockStyle::default();
+                if element.tag == "pre" {
+                    Ok(Block::Code { style, inlines })
+                } else {
+                    Ok(Block::Quote { style, inlines })
+                }
+            }
             "p" | "div" | "h1" | "h2" | "h3" => {
                 self.attrs(element, &[])?;
                 if element.tag == "p" && element.children.len() == 1 {
@@ -633,6 +673,79 @@ fn source_visible_text(node: &Node) -> String {
             _ => element.children.iter().map(source_visible_text).collect(),
         },
     }
+}
+
+/// Preserve representable subtrees; unsupported containers lose only their
+/// wrapper, not their children's marks or their position relative to images.
+/// The staging audit retains the original bytes and the caller reports loss.
+pub(super) fn convert_html_locally_degraded(
+    note_id: &str,
+    path: &str,
+    body: &str,
+    resources: &BTreeMap<String, JexVerifiedResource>,
+) -> Result<JexBodyConversion> {
+    fn visit(node: &Node, context: &mut Context<'_>, blocks: &mut Vec<Block>) -> Result<()> {
+        if let Node::Text(text) = node {
+            if formatting_whitespace(text) {
+                return Ok(());
+            }
+        }
+        if let Node::Element(element) = node {
+            let checkpoint = context.occurrences.len();
+            if let Ok(block) = context.element_block(element) {
+                blocks.push(block);
+                return Ok(());
+            }
+            context.occurrences.truncate(checkpoint);
+        }
+        let mut inlines = Vec::new();
+        let checkpoint = context.occurrences.len();
+        if context
+            .inline(node, &Marks::default(), false, &mut inlines)
+            .is_ok()
+        {
+            blocks.push(Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines,
+            });
+            return Ok(());
+        }
+        context.occurrences.truncate(checkpoint);
+        if let Node::Element(element) = node {
+            // Preserve verified resources even when their visual attributes
+            // are unsupported. Never fetch an external image during import.
+            if let Some(resource) = element
+                .attrs
+                .get("src")
+                .or_else(|| element.attrs.get("href"))
+                .and_then(|url| context.resource(url))
+                .cloned()
+            {
+                blocks.push(Block::Attachment {
+                    resource_id: resource.destination_id,
+                    filename: resource.filename,
+                    media_type: resource.mime,
+                });
+            }
+            for child in &element.children {
+                visit(child, context, blocks)?;
+            }
+        }
+        Ok(())
+    }
+    let root = parse(body, note_id, path)?;
+    let mut context = Context {
+        note_id,
+        path,
+        resources,
+        occurrences: Vec::new(),
+        url_bytes: 0,
+    };
+    let mut blocks = Vec::new();
+    for node in &root {
+        visit(node, &mut context, &mut blocks)?;
+    }
+    Ok(super::jex_body::conversion_from_blocks(blocks))
 }
 
 pub(super) fn convert_html_body(
@@ -721,18 +834,33 @@ pub(super) fn convert_html_body(
             "Canonical HTML could not be reparsed",
         )
     })?;
-    if source_search_text != search_text
-        || document.blocks().len() != source_segments.len()
-        || roundtrip != document
-        || roundtrip.search_text().as_str() != search_text
-        || document.resource_ids() != context.occurrences
-    {
-        return Err(blocked(
-            note_id,
-            path,
-            Kind::UnsupportedStructure,
-            "HTML source text, structure, or resource order would be lost",
-        ));
+    for (failed, reason) in [
+        // Canonical HTML protects visible repeated/edge spaces with NBSP.
+        // Compare their display equivalents without collapsing whitespace.
+        (
+            source_search_text.replace('\u{00a0}', " ") != search_text.replace('\u{00a0}', " "),
+            "HTML source text would be lost",
+        ),
+        (
+            document.blocks().len() != source_segments.len(),
+            "HTML block boundaries would be lost",
+        ),
+        (
+            roundtrip != document,
+            "HTML canonical structure would not roundtrip",
+        ),
+        (
+            roundtrip.search_text().as_str() != search_text,
+            "HTML canonical text would not roundtrip",
+        ),
+        (
+            document.resource_ids() != context.occurrences,
+            "HTML resource order would be lost",
+        ),
+    ] {
+        if failed {
+            return Err(blocked(note_id, path, Kind::UnsupportedStructure, reason));
+        }
     }
     Ok(JexBodyConversion {
         document,

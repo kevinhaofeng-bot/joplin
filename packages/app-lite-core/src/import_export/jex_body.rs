@@ -427,6 +427,36 @@ impl<'a> Converter<'a> {
         let mut blocks = Vec::new();
         while let Some(event) = self.next() {
             match event {
+                Event::Rule => blocks.push(Block::Divider),
+                Event::Start(Tag::BlockQuote(kind)) => {
+                    if kind.is_some() {
+                        return self.blocked(
+                            JexBodyBlockerKind::UnsupportedStructure,
+                            "Alert quote type has no canonical mapping",
+                        );
+                    }
+                    self.expect_start_paragraph()?;
+                    let inlines = self.inlines(TagEnd::Paragraph, Marks::default(), false)?;
+                    self.expect_end(TagEnd::BlockQuote(kind))?;
+                    blocks.push(Block::Quote {
+                        style: BlockStyle::default(),
+                        inlines,
+                    });
+                }
+                Event::Start(Tag::CodeBlock(kind)) => {
+                    if matches!(&kind, pulldown_cmark::CodeBlockKind::Fenced(language) if !language.is_empty())
+                    {
+                        return self.blocked(
+                            JexBodyBlockerKind::UnsupportedStructure,
+                            "Code language metadata has no canonical mapping",
+                        );
+                    }
+                    let inlines = self.inlines(TagEnd::CodeBlock, Marks::default(), false)?;
+                    blocks.push(Block::Code {
+                        style: BlockStyle::default(),
+                        inlines,
+                    });
+                }
                 Event::Start(Tag::Paragraph) => blocks.push(self.paragraph()?),
                 Event::Start(Tag::Heading {
                     level,
@@ -483,13 +513,24 @@ impl<'a> Converter<'a> {
         }
         Ok(blocks)
     }
+
+    fn expect_start_paragraph(&mut self) -> Result<()> {
+        if matches!(self.next(), Some(Event::Start(Tag::Paragraph))) {
+            Ok(())
+        } else {
+            self.blocked(
+                JexBodyBlockerKind::UnsupportedStructure,
+                "Quote contains non-paragraph structure",
+            )
+        }
+    }
 }
 
-/// Like [`convert_jex_note_body`], but a note whose body uses constructs the
-/// canonical document cannot represent is imported as its source text (one
-/// paragraph per line) plus attachment cards, and the blocker is returned for
-/// the import report. An oversized body and case-colliding resource IDs stay
-/// hard errors: the fallback could not attach the right files.
+/// Like [`convert_jex_note_body`], but unsupported Markdown blocks degrade
+/// locally to source text/cards; representable neighboring blocks survive.
+/// HTML containers are traversed locally, preserving supported subtrees.
+/// The original blocker remains in the report; staging retains source bytes.
+/// Invalid trees, parser budgets and ambiguous resource identities fail closed.
 pub fn convert_jex_note_body_or_degrade(
     source_note_id: &str,
     source_path: &str,
@@ -509,10 +550,107 @@ pub fn convert_jex_note_body_or_degrade(
     };
     if matches!(
         blocker.kind,
-        JexBodyBlockerKind::BodyTooLarge | JexBodyBlockerKind::ResourceIdCollision
+        JexBodyBlockerKind::BodyTooLarge
+            | JexBodyBlockerKind::ResourceIdCollision
+            | JexBodyBlockerKind::ParserBudget
+            | JexBodyBlockerKind::UrlBudget
     ) {
         return Err(blocker);
     }
+    let normalized: BTreeMap<_, _> = resources
+        .iter()
+        .map(|(id, value)| (id.to_ascii_lowercase(), value.clone()))
+        .collect();
+    if markup_language == 1 {
+        // Use events from the full parser so reference-style links keep their
+        // resolved targets. Only the failing top-level block is degraded.
+        let mut blocks = Vec::new();
+        let mut events = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0;
+        let mut count = 0usize;
+        for (event, range) in Parser::new_ext(body, markdown_options()).into_offset_iter() {
+            count += 1;
+            if count > MAX_EVENTS {
+                return Err(blocker);
+            }
+            if events.is_empty() {
+                start = range.start;
+            }
+            match &event {
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if depth > MAX_DEPTH {
+                return Err(blocker);
+            }
+            events.push(event);
+            if depth == 0 {
+                let mut converter = Converter {
+                    note_id: source_note_id,
+                    path: source_path,
+                    events: std::mem::take(&mut events),
+                    cursor: 0,
+                    resources: &normalized,
+                    occurrences: Vec::new(),
+                    url_bytes: 0,
+                };
+                match converter.blocks() {
+                    Ok(part) => blocks.extend(part),
+                    Err(error) => {
+                        let fragment = &body[start..range.end];
+                        let html_part = if error.kind == JexBodyBlockerKind::RawHtml {
+                            super::jex_html::convert_html_locally_degraded(
+                                source_note_id,
+                                source_path,
+                                fragment,
+                                &normalized,
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
+                        let part = match html_part {
+                            Some(part) => part,
+                            None => degraded_fragment(fragment, &normalized, &error)?,
+                        };
+                        blocks.extend_from_slice(part.document.blocks());
+                    }
+                }
+            }
+        }
+        return Ok((conversion_from_blocks(blocks), Some(blocker)));
+    }
+    if markup_language == 2 {
+        // A malformed HTML tree cannot be safely split. Refuse it rather than
+        // silently turning the whole note into escaped markup.
+        let conversion = super::jex_html::convert_html_locally_degraded(
+            source_note_id,
+            source_path,
+            body,
+            &normalized,
+        )?;
+        return Ok((conversion, Some(blocker)));
+    }
+    Err(blocker)
+}
+
+pub(super) fn conversion_from_blocks(blocks: Vec<Block>) -> JexBodyConversion {
+    let document = CanonicalDocument::from_blocks(blocks);
+    JexBodyConversion {
+        canonical_html: document.to_canonical_html().as_str().to_owned(),
+        search_text: document.search_text().as_str().to_owned(),
+        ordered_resource_occurrences: document.resource_ids(),
+        document,
+    }
+}
+
+fn degraded_fragment(
+    body: &str,
+    resources: &BTreeMap<String, JexVerifiedResource>,
+    blocker: &JexBodyFidelityBlocker,
+) -> Result<JexBodyConversion> {
     let mut html = String::new();
     for line in body
         .lines()
@@ -565,7 +703,19 @@ pub fn convert_jex_note_body_or_degrade(
         ordered_resource_occurrences: document.resource_ids(),
         document,
     };
-    Ok((conversion, Some(blocker)))
+    Ok(conversion)
+}
+
+fn markdown_options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_GFM
+        | Options::ENABLE_MATH
+        | Options::ENABLE_DEFINITION_LIST
+        | Options::ENABLE_WIKILINKS
 }
 
 pub fn convert_jex_note_body(
