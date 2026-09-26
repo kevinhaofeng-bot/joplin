@@ -70,6 +70,28 @@ pub struct ReadableExportNoteState {
     pub revisions: Vec<ReadableExportRevision>,
 }
 
+/// Durable fields kept out of the normal notebook and resource presentation DTOs.
+pub(crate) struct ReadableExportNotebook {
+    pub id: NotebookId,
+    pub title: String,
+    pub has_stack: bool,
+    pub revision: i64,
+    pub created_time: i64,
+    pub updated_time: i64,
+}
+
+pub(crate) struct ReadableExportResource {
+    pub id: ResourceId,
+    pub sha256: BlobHash,
+    pub title: String,
+    pub mime: String,
+    pub file_extension: String,
+    pub size: i64,
+    pub revision: i64,
+    pub created_time: i64,
+    pub updated_time: i64,
+}
+
 impl LibraryShellState {
     pub const DEFAULT_SIDEBAR_WIDTH: u16 = 220;
     pub const DEFAULT_LIST_WIDTH: u16 = 360;
@@ -980,6 +1002,37 @@ impl LibraryRepository {
             .map_err(Into::into)
     }
 
+    /// Runs export metadata reads through the repository's existing SQLite
+    /// connection. The caller returns owned data; neither transaction nor
+    /// mutex may escape into file-copying work.
+    pub(crate) fn with_readable_export_snapshot<T, E>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<LibraryError>,
+    {
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(LibraryError::from)?;
+        let result = operation(&transaction)?;
+        transaction.commit().map_err(LibraryError::from)?;
+        Ok(result)
+    }
+
+    /// Opens only immutable blob bytes after the export metadata snapshot has
+    /// been released. No second resource-metadata query is made here.
+    pub(crate) fn open_readable_export_blob(
+        &self,
+        hash: &BlobHash,
+        captured_size: usize,
+    ) -> Result<File, LibraryError> {
+        self.resource_store
+            .open_verified_with_limit(hash, captured_size)
+            .map_err(Into::into)
+    }
+
     /// Returns only the durable organization metadata needed to render a
     /// typed library sidebar. This has no note-card authority: note rows stay
     /// exclusively behind `list_notes`, and this query intentionally never
@@ -1155,22 +1208,7 @@ impl LibraryRepository {
             return Err(error);
         }
         let connection = self.connection.lock().expect("library mutex poisoned");
-        let result = (|| {
-            let base = connection
-                .query_row(
-                    "SELECT id, title, body_html, body_text, snippet, notebook_id, created_time, updated_time, deleted_time, revision
-                     FROM notes WHERE id = ?1",
-                    [id.as_str()],
-                    row_to_note_base,
-                )
-                .optional()?;
-            let Some(mut note) = base else {
-                return Ok(None);
-            };
-            note.resource_ids = note_resource_ids(&connection, id)?;
-            note.tag_ids = note_tag_ids(&connection, id)?;
-            Ok(Some(note))
-        })();
+        let result = readable_export_query_note(&connection, id);
         drop(connection);
         self.note_load_observers
             .lock()
@@ -1194,57 +1232,7 @@ impl LibraryRepository {
         maximum_utf8_bytes: usize,
     ) -> Result<Option<ReadableExportNoteState>, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
-        let selected_thumbnail_id = connection
-            .query_row(
-                "SELECT selected_thumbnail_id FROM notes WHERE id=?1",
-                [id.as_str()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?;
-        let Some(selected_thumbnail_id) = selected_thumbnail_id else {
-            return Ok(None);
-        };
-        let selected_thumbnail_id = selected_thumbnail_id
-            .map(|value| ResourceId::new(value).map_err(invalid_column))
-            .transpose()?;
-        let pending_journal: i64 = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM edit_journal WHERE note_id=?1)",
-            [id.as_str()],
-            |row| row.get(0),
-        )?;
-        if pending_journal != 0 || maximum_revisions == 0 {
-            return Err(LibraryError::InvalidSnapshot);
-        }
-        let mut statement = connection.prepare(
-            "SELECT revision,title,body_html,body_text,created_time
-             FROM note_revisions WHERE note_id=?1 ORDER BY revision ASC LIMIT ?2",
-        )?;
-        let mut rows =
-            statement.query(rusqlite::params![id.as_str(), maximum_revisions as i64 + 1])?;
-        let mut revisions = Vec::new();
-        let mut total_utf8_bytes = 0_usize;
-        while let Some(row) = rows.next()? {
-            let revision = ReadableExportRevision {
-                revision: row.get(0)?,
-                title: row.get(1)?,
-                body_html: row.get(2)?,
-                body_text: row.get(3)?,
-                created_time: row.get(4)?,
-            };
-            total_utf8_bytes = total_utf8_bytes
-                .checked_add(revision.title.len())
-                .and_then(|value| value.checked_add(revision.body_html.len()))
-                .and_then(|value| value.checked_add(revision.body_text.len()))
-                .ok_or(LibraryError::InvalidSnapshot)?;
-            if revisions.len() >= maximum_revisions || total_utf8_bytes > maximum_utf8_bytes {
-                return Err(LibraryError::InvalidSnapshot);
-            }
-            revisions.push(revision);
-        }
-        Ok(Some(ReadableExportNoteState {
-            selected_thumbnail_id,
-            revisions,
-        }))
+        readable_export_query_note_state(&connection, id, maximum_revisions, maximum_utf8_bytes)
     }
 
     pub fn save_note(&self, input: SaveNote) -> Result<Note, LibraryError> {
@@ -5141,6 +5129,133 @@ fn row_to_note_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
         deleted_time: positive_time(row.get(8)?),
         revision: row.get(9)?,
     })
+}
+
+pub(crate) fn readable_export_query_default_notebook(
+    connection: &Connection,
+) -> Result<ReadableExportNotebook, LibraryError> {
+    connection
+        .query_row(
+            "SELECT id,title,stack_id IS NOT NULL,revision,created_time,updated_time FROM notebooks
+             WHERE is_default=1 AND deleted_time=0 ORDER BY id LIMIT 1",
+            [],
+            |row| {
+                Ok(ReadableExportNotebook {
+                    id: NotebookId::parse(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                    title: row.get(1)?,
+                    has_stack: row.get::<_, i64>(2)? != 0,
+                    revision: row.get(3)?,
+                    created_time: row.get(4)?,
+                    updated_time: row.get(5)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+}
+
+pub(crate) fn readable_export_query_note(
+    connection: &Connection,
+    id: &NoteId,
+) -> Result<Option<Note>, LibraryError> {
+    let base = connection
+        .query_row(
+            "SELECT id, title, body_html, body_text, snippet, notebook_id, created_time, updated_time, deleted_time, revision
+             FROM notes WHERE id = ?1",
+            [id.as_str()],
+            row_to_note_base,
+        )
+        .optional()?;
+    let Some(mut note) = base else {
+        return Ok(None);
+    };
+    note.resource_ids = note_resource_ids(connection, id)?;
+    note.tag_ids = note_tag_ids(connection, id)?;
+    Ok(Some(note))
+}
+
+pub(crate) fn readable_export_query_note_state(
+    connection: &Connection,
+    id: &NoteId,
+    maximum_revisions: usize,
+    maximum_utf8_bytes: usize,
+) -> Result<Option<ReadableExportNoteState>, LibraryError> {
+    let selected_thumbnail_id = connection
+        .query_row(
+            "SELECT selected_thumbnail_id FROM notes WHERE id=?1",
+            [id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    let Some(selected_thumbnail_id) = selected_thumbnail_id else {
+        return Ok(None);
+    };
+    let selected_thumbnail_id = selected_thumbnail_id
+        .map(|value| ResourceId::new(value).map_err(invalid_column))
+        .transpose()?;
+    let pending_journal: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM edit_journal WHERE note_id=?1)",
+        [id.as_str()],
+        |row| row.get(0),
+    )?;
+    if pending_journal != 0 || maximum_revisions == 0 {
+        return Err(LibraryError::InvalidSnapshot);
+    }
+    let mut statement = connection.prepare(
+        "SELECT revision,title,body_html,body_text,created_time
+         FROM note_revisions WHERE note_id=?1 ORDER BY revision ASC LIMIT ?2",
+    )?;
+    let mut rows = statement.query(rusqlite::params![id.as_str(), maximum_revisions as i64 + 1])?;
+    let mut revisions = Vec::new();
+    let mut total_utf8_bytes = 0_usize;
+    while let Some(row) = rows.next()? {
+        let revision = ReadableExportRevision {
+            revision: row.get(0)?,
+            title: row.get(1)?,
+            body_html: row.get(2)?,
+            body_text: row.get(3)?,
+            created_time: row.get(4)?,
+        };
+        total_utf8_bytes = total_utf8_bytes
+            .checked_add(revision.title.len())
+            .and_then(|value| value.checked_add(revision.body_html.len()))
+            .and_then(|value| value.checked_add(revision.body_text.len()))
+            .ok_or(LibraryError::InvalidSnapshot)?;
+        if revisions.len() >= maximum_revisions || total_utf8_bytes > maximum_utf8_bytes {
+            return Err(LibraryError::InvalidSnapshot);
+        }
+        revisions.push(revision);
+    }
+    Ok(Some(ReadableExportNoteState {
+        selected_thumbnail_id,
+        revisions,
+    }))
+}
+
+pub(crate) fn readable_export_query_resource(
+    connection: &Connection,
+    id: &ResourceId,
+) -> Result<Option<ReadableExportResource>, LibraryError> {
+    connection
+        .query_row(
+            "SELECT id,sha256,title,mime,file_extension,size,revision,created_time,updated_time
+             FROM resources WHERE id=?1",
+            [id.as_str()],
+            |row| {
+                Ok(ReadableExportResource {
+                    id: ResourceId::new(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                    sha256: BlobHash::new(row.get::<_, String>(1)?).map_err(invalid_column)?,
+                    title: row.get(2)?,
+                    mime: row.get(3)?,
+                    file_extension: row.get(4)?,
+                    size: row.get(5)?,
+                    revision: row.get(6)?,
+                    created_time: row.get(7)?,
+                    updated_time: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
 }
 fn row_to_projection(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteProjection> {
     Ok(NoteProjection {
