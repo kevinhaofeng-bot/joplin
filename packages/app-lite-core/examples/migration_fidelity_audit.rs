@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut kinds_by_reason = BTreeMap::<String, BTreeMap<String, usize>>::new();
     let mut feature_sets = BTreeMap::<Vec<&'static str>, usize>::new();
     let mut html_tags = BTreeMap::<String, usize>::new();
+    let mut unflagged_reasons = BTreeMap::<String, usize>::new();
     let mut html_block_shapes = BTreeMap::<String, usize>::new();
     let mut passed = 0;
     for row in stmt.query_map([], |row| {
@@ -164,6 +165,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 *html_tags.entry(key).or_default() += 1;
                             }
                         }
+                    }
+                    if features.is_empty() {
+                        *unflagged_reasons.entry(reason.clone()).or_default() += 1;
                     }
                     *feature_sets
                         .entry(features.into_iter().collect())
@@ -294,6 +298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("features\t{count}\t{set:?}");
         }
         println!("html_tags\t{html_tags:?}");
+        println!("unflagged_reasons\t{unflagged_reasons:?}");
         println!("html_block_shapes\t{html_block_shapes:?}");
         for (reason, kinds) in kinds_by_reason {
             println!("kinds\t{reason}\t{kinds:?}");

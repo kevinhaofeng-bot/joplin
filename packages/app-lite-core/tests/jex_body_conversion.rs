@@ -641,3 +641,33 @@ fn bare_html_wrapper_block_keeps_the_text_it_swallowed() {
         .is_err()
     );
 }
+
+/// A resource image linked to itself carries no second target; the link is
+/// redundant. An image linked elsewhere still blocks (needs an image link).
+#[test]
+fn self_linked_resource_image_drops_only_the_redundant_link() {
+    let body = format!("前[![图](:/{IMAGE})](:/{IMAGE})后");
+    let converted = convert_jex_note_body(NOTE, "self.md", 1, &body, &resources())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.document,
+        CanonicalDocument::parse_html(&format!(
+            "<p>前<img src=\":/{TARGET_IMAGE}\" alt=\"图\">后</p>"
+        ))
+        .unwrap()
+    );
+    assert_eq!(
+        converted.ordered_resource_occurrences,
+        vec![ResourceId::new(TARGET_IMAGE).unwrap()]
+    );
+    for body in [
+        format!("[![图](:/{IMAGE})](https://example.com)"),
+        format!("[![图](:/{IMAGE})](:/{PDF})"),
+        format!("[![图](:/{IMAGE})后](:/{IMAGE})"),
+    ] {
+        assert!(
+            convert_jex_note_body(NOTE, "linked.md", 1, &body, &resources()).is_err(),
+            "body={body}"
+        );
+    }
+}

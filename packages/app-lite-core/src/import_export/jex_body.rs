@@ -215,6 +215,10 @@ impl<'a> Converter<'a> {
                                 "Internal link is not a verified attachment resource",
                             );
                         };
+                        if self.is_self_linked_image(&dest_url) {
+                            out.extend(self.inlines(TagEnd::Link, marks.clone(), false)?);
+                            continue;
+                        }
                         let label = self.inlines(TagEnd::Link, marks.clone(), true)?;
                         self.resource_inline(resource, label, &marks, &mut out);
                         continue;
@@ -380,6 +384,24 @@ impl<'a> Converter<'a> {
             style: BlockStyle::default(),
             inlines,
         })
+    }
+
+    /// The link's only content is an image of the same resource, so the link
+    /// adds no second target.
+    fn is_self_linked_image(&self, link_target: &str) -> bool {
+        let Some(Event::Start(Tag::Image { dest_url, .. })) = self.peek() else {
+            return false;
+        };
+        if !dest_url.eq_ignore_ascii_case(link_target) {
+            return false;
+        }
+        let Some(end) = self.events[self.cursor..]
+            .iter()
+            .position(|event| *event == Event::End(TagEnd::Image))
+        else {
+            return false;
+        };
+        self.events.get(self.cursor + end + 1) == Some(&Event::End(TagEnd::Link))
     }
 
     /// Joplin resource link inside text. The resource keeps its position; a
