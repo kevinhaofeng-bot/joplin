@@ -114,12 +114,6 @@ fn rejects_unsupported_html_before_a_lossy_projection() {
             JexBodyBlockerKind::UnsupportedStructure,
         ),
         (
-            format!(
-                "<p><a href=\"https://example.com\"><img src=\":/{IMAGE}\" alt=\"图\"/></a></p>"
-            ),
-            JexBodyBlockerKind::LinkedImage,
-        ),
-        (
             format!("<p><img src=\":/{NOTE}\" alt=\"图\"/></p>"),
             JexBodyBlockerKind::UnverifiedResource,
         ),

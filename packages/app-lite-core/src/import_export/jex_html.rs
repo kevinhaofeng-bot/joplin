@@ -301,8 +301,8 @@ impl Context<'_> {
         Ok(url.to_owned())
     }
 
-    fn image(&mut self, element: &Element, in_link: bool) -> Result<Inline> {
-        if in_link {
+    fn image(&mut self, element: &Element, link: Option<&String>, in_link: bool) -> Result<Inline> {
+        if in_link && link.is_none() {
             return self.block(
                 Kind::LinkedImage,
                 "Linked image cannot preserve both targets",
@@ -379,7 +379,7 @@ impl Context<'_> {
             resource_id: resource.destination_id,
             alt: element.attrs.get("alt").cloned().unwrap_or_default(),
             display_width,
-            link: None,
+            link: link.cloned(),
         })
     }
 
@@ -401,7 +401,7 @@ impl Context<'_> {
             Node::Element(element) => element,
         };
         if element.tag == "img" {
-            out.push(self.image(element, in_link)?);
+            out.push(self.image(element, marks.link.as_ref(), in_link)?);
             return Ok(());
         }
         if element.tag == "br" {
@@ -667,7 +667,7 @@ impl Context<'_> {
                 self.attachment(element)
             }
             "img" => {
-                let image = self.image(element, false)?;
+                let image = self.image(element, None, false)?;
                 if let Inline::Image {
                     resource_id,
                     alt,

@@ -280,10 +280,6 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
             JexBodyBlockerKind::UnsupportedHeading,
         ),
         (
-            "- 一级\n  - 二级".into(),
-            JexBodyBlockerKind::UnsupportedStructure,
-        ),
-        (
             "- 普通\n- [x] 混排".into(),
             JexBodyBlockerKind::UnsupportedStructure,
         ),
@@ -312,7 +308,7 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
             JexBodyBlockerKind::InternalNoteLink,
         ),
         (
-            format!("[![图](:/{IMAGE})](https://example.com)"),
+            format!("[![图](:/{IMAGE})](:/{PDF})"),
             JexBodyBlockerKind::LinkedImage,
         ),
         (
@@ -644,7 +640,7 @@ fn bare_html_wrapper_block_keeps_the_text_it_swallowed() {
 }
 
 /// A resource image linked to itself carries no second target; the link is
-/// redundant. An image linked elsewhere still blocks (needs an image link).
+/// redundant. An image linked to another resource still blocks.
 #[test]
 fn self_linked_resource_image_drops_only_the_redundant_link() {
     let body = format!("前[![图](:/{IMAGE})](:/{IMAGE})后");
@@ -662,7 +658,6 @@ fn self_linked_resource_image_drops_only_the_redundant_link() {
         vec![ResourceId::new(TARGET_IMAGE).unwrap()]
     );
     for body in [
-        format!("[![图](:/{IMAGE})](https://example.com)"),
         format!("[![图](:/{IMAGE})](:/{PDF})"),
         format!("[![图](:/{IMAGE})后](:/{IMAGE})"),
     ] {
@@ -716,6 +711,102 @@ fn multi_paragraph_quote_becomes_adjacent_quote_blocks() {
     for body in ["> 引\n>\n> - 列表", "> # 标题"] {
         assert!(
             convert_jex_note_body(NOTE, "quote.md", 1, body, &resources()).is_err(),
+            "body={body}"
+        );
+    }
+}
+
+/// A nested list of the same kind becomes list items with `indent` = nesting
+/// level (the editor maps it to list depth, max 8). A nested list of another
+/// kind, or a second block inside an item, still blocks.
+#[test]
+fn same_kind_nested_markdown_list_keeps_levels_as_item_indent() {
+    use app_lite_core::document::Block;
+    let cases = [
+        ("- 一\n  - 二\n    - 三\n- 四", vec![0, 1, 2, 0]),
+        ("1. 一\n\n   1. 二\n\n2. 三", vec![0, 1, 0]),
+        ("- [ ] 一\n  - [x] 二", vec![0, 1]),
+    ];
+    for (body, indents) in cases {
+        let converted = convert_jex_note_body(NOTE, "nested.md", 1, body, &resources())
+            .unwrap_or_else(|error| panic!("body={body}: {error:?}"));
+        let [Block::List { items, .. }] = converted.document.blocks() else {
+            panic!("body={body}: {:?}", converted.document);
+        };
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.style.indent)
+                .collect::<Vec<_>>(),
+            indents,
+            "body={body}"
+        );
+        assert_eq!(
+            CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+            converted.document,
+            "body={body}"
+        );
+    }
+    for body in [
+        "- 一\n  1. 二",
+        "- 一\n\n  段落二",
+        "- 1\n  - 2\n    - 3\n      - 4\n        - 5\n          - 6\n            - 7\n              - 8\n                - 9\n                  - 10",
+    ] {
+        assert!(
+            convert_jex_note_body(NOTE, "nested.md", 1, body, &resources()).is_err(),
+            "body={body}"
+        );
+    }
+}
+
+/// `[![alt](:/img)](url)` keeps both targets: the image and its link (the
+/// canonical image `link`). Text in the same link keeps its link mark.
+#[test]
+fn linked_resource_image_keeps_its_external_link() {
+    use app_lite_core::document::Block;
+    let image_link = |document: &CanonicalDocument| match &document.blocks()[0] {
+        Block::Paragraph { inlines, .. } => inlines
+            .iter()
+            .find_map(|inline| match inline {
+                Inline::Image { link, .. } => Some(link.clone()),
+                _ => None,
+            })
+            .expect("image"),
+        other => panic!("{other:?}"),
+    };
+    for (path, markup, body) in [
+        (
+            "md",
+            1,
+            format!("[![图](:/{IMAGE})](https://example.com/a)"),
+        ),
+        (
+            "md",
+            1,
+            format!("[前![图](:/{IMAGE})后](https://example.com/a)"),
+        ),
+        (
+            "html",
+            1,
+            format!(
+                "<p><a href=\"https://example.com/a\"><img src=\":/{IMAGE}\" alt=\"图\"/></a></p>"
+            ),
+        ),
+    ] {
+        let converted = convert_jex_note_body(NOTE, path, markup, &body, &resources())
+            .unwrap_or_else(|error| panic!("body={body}: {error:?}"));
+        assert_eq!(
+            image_link(&converted.document),
+            Some("https://example.com/a".to_owned()),
+            "body={body}"
+        );
+        assert_eq!(
+            converted.ordered_resource_occurrences,
+            vec![ResourceId::new(TARGET_IMAGE).unwrap()]
+        );
+        assert_eq!(
+            CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+            converted.document,
             "body={body}"
         );
     }

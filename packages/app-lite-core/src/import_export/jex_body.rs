@@ -15,6 +15,8 @@ const MAX_EVENTS: usize = 20_000;
 const MAX_DEPTH: usize = 64;
 const MAX_URL_BYTES: usize = 8 * 1024;
 const MAX_TOTAL_URL_BYTES: usize = 64 * 1024;
+// Canonical data-indent and editor list depth both stop at 8.
+const MAX_LIST_INDENT: u8 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JexVerifiedResource {
@@ -155,6 +157,8 @@ impl<'a> Converter<'a> {
         loop {
             let event = match self.peek() {
                 Some(Event::End(found)) if *found == end => break,
+                // A tight item's text ends where its nested list starts.
+                Some(Event::Start(Tag::List(_))) if end == TagEnd::Item => return Ok(out),
                 Some(_) => self.next().expect("peeked event exists"),
                 None => {
                     return self.blocked(
@@ -237,7 +241,9 @@ impl<'a> Converter<'a> {
                 Event::Start(Tag::Image {
                     dest_url, title, ..
                 }) => {
-                    if in_link {
+                    // Only an external link survives as the image's own link;
+                    // a resource or fragment target has no image representation.
+                    if in_link && marks.link.is_none() {
                         return self.blocked(
                             JexBodyBlockerKind::LinkedImage,
                             "Linked image cannot retain both targets",
@@ -295,7 +301,7 @@ impl<'a> Converter<'a> {
                         resource_id: resource.destination_id,
                         alt,
                         display_width: None,
-                        link: None,
+                        link: marks.link.clone(),
                     });
                 }
                 Event::InlineHtml(html) if is_line_break(&html) => out.push(Inline::SoftBreak),
@@ -448,14 +454,20 @@ impl<'a> Converter<'a> {
         }
     }
 
-    fn list(&mut self, ordered_start: Option<u64>) -> Result<Block> {
+    /// Items of one Markdown list; a nested list of the same kind continues
+    /// the flat canonical list with `indent` = nesting level (editor depth).
+    fn list_items(
+        &mut self,
+        ordered_start: Option<u64>,
+        depth: u8,
+        items: &mut Vec<ListItem>,
+    ) -> Result<()> {
         if ordered_start.is_some_and(|start| start != 1) {
             return self.blocked(
                 JexBodyBlockerKind::UnsupportedStructure,
                 "Ordered list start number is not representable",
             );
         }
-        let mut items = Vec::new();
         while matches!(self.peek(), Some(Event::Start(Tag::Item))) {
             self.next();
             let has_paragraph = matches!(self.peek(), Some(Event::Start(Tag::Paragraph)));
@@ -475,7 +487,26 @@ impl<'a> Converter<'a> {
             } else {
                 self.inlines(TagEnd::Item, Marks::default(), false)?
             };
-            // Tight lists consume Item in inlines(); loose lists consume it here.
+            items.push(ListItem {
+                checked,
+                style: BlockStyle {
+                    indent: depth,
+                    ..BlockStyle::default()
+                },
+                inlines,
+            });
+            if let Some(Event::Start(Tag::List(nested))) = self.peek().cloned() {
+                if nested.is_some() != ordered_start.is_some() || depth >= MAX_LIST_INDENT {
+                    return self.blocked(
+                        JexBodyBlockerKind::UnsupportedStructure,
+                        "Nested list of another kind or too deep",
+                    );
+                }
+                self.next();
+                self.list_items(nested, depth + 1, items)?;
+            }
+            // Tight lists consume Item in inlines() unless a nested list
+            // follows; loose lists and nested lists end it here.
             if matches!(self.peek(), Some(Event::End(TagEnd::Item))) {
                 self.next();
             }
@@ -488,13 +519,13 @@ impl<'a> Converter<'a> {
                     "List item has multiple or nested blocks",
                 );
             }
-            items.push(ListItem {
-                checked,
-                style: BlockStyle::default(),
-                inlines,
-            });
         }
-        self.expect_end(TagEnd::List(ordered_start.is_some()))?;
+        self.expect_end(TagEnd::List(ordered_start.is_some()))
+    }
+
+    fn list(&mut self, ordered_start: Option<u64>) -> Result<Block> {
+        let mut items = Vec::new();
+        self.list_items(ordered_start, 0, &mut items)?;
         let all_checked = items.iter().all(|item| item.checked.is_some());
         let none_checked = items.iter().all(|item| item.checked.is_none());
         let kind = match ordered_start {
