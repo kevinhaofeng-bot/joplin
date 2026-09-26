@@ -14,6 +14,8 @@ gpui::actions!(
         ImportLibrary,
         CancelLibraryImport,
         OpenImportedLibrary,
+        BackupLibrary,
+        RestoreLibrary,
     ]
 );
 

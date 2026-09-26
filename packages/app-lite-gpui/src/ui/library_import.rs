@@ -12,15 +12,36 @@ use app_lite_core::{ImportLibraryError, ImportLibraryOutcome, PublishError, impo
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImportPhase {
+pub(super) enum ImportPhase {
     Picking,
     Working,
 }
 
+/// Import, whole-library backup and restore share one progress slot: only
+/// one long library job runs at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LibraryJob {
+    Import,
+    Backup,
+    Restore,
+}
+
 pub(super) struct PendingLibraryImport {
-    token: u64,
-    phase: ImportPhase,
-    cancel: Arc<AtomicBool>,
+    pub(super) token: u64,
+    pub(super) job: LibraryJob,
+    pub(super) phase: ImportPhase,
+    pub(super) cancel: Arc<AtomicBool>,
+}
+
+impl PendingLibraryImport {
+    pub(super) fn new(token: u64, job: LibraryJob) -> Self {
+        Self {
+            token,
+            job,
+            phase: ImportPhase::Picking,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl LibraryShell {
@@ -44,6 +65,7 @@ impl LibraryShell {
         let token = self.next_library_import_token;
         self.pending_library_import = Some(PendingLibraryImport {
             token,
+            job: LibraryJob::Import,
             phase: ImportPhase::Picking,
             cancel: Arc::new(AtomicBool::new(false)),
         });
@@ -70,7 +92,10 @@ impl LibraryShell {
         let Some(pending) = self.pending_library_import.as_mut() else {
             return;
         };
-        if pending.token != token || pending.phase != ImportPhase::Picking {
+        if pending.token != token
+            || pending.job != LibraryJob::Import
+            || pending.phase != ImportPhase::Picking
+        {
             return;
         }
         let source = match selection {

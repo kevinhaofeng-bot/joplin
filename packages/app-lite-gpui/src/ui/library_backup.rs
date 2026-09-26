@@ -1,0 +1,336 @@
+//! Whole-library backup and restore-to-a-new-library.
+//!
+//! Backup flushes the open note, then snapshots the active library in the
+//! background. Restore never replaces a library: it verifies the backup and
+//! publishes it under `imported-libraries/`, reusing the "打开导入的资料库"
+//! switch from the import flow.
+
+use super::library_import::{ImportPhase, LibraryJob, PendingLibraryImport};
+use super::*;
+use crate::app::{BackupLibrary, RestoreLibrary};
+use crate::library_profile::LibraryProfiles;
+use app_lite_core::{
+    BackupError, BackupReport, PublishedLibrary, backup_library, restore_library_backup,
+    unique_library_destination,
+};
+use std::sync::atomic::AtomicBool;
+
+impl LibraryShell {
+    fn begin_library_job(&mut self, job: LibraryJob, cx: &mut Context<Self>) -> Option<u64> {
+        if self.pending_library_import.is_some() {
+            return None;
+        }
+        if cx.try_global::<LibraryProfiles>().is_none() {
+            self.library_import_notice = Some(ExportNotice::Error(
+                "无法确定资料库位置，操作未开始。".into(),
+            ));
+            cx.notify();
+            return None;
+        }
+        self.next_library_import_token = self.next_library_import_token.wrapping_add(1);
+        let token = self.next_library_import_token;
+        self.pending_library_import = Some(PendingLibraryImport::new(token, job));
+        self.imported_library_ready = None;
+        Some(token)
+    }
+
+    pub(super) fn backup_library_action(
+        &mut self,
+        _: &BackupLibrary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_library_import.is_some() {
+            return;
+        }
+        if !self.flush_active_session(FlushReason::Export, cx) {
+            self.library_import_notice = Some(ExportNotice::Error(
+                "当前笔记尚未保存完成，暂不能备份；请稍后再试。".into(),
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(token) = self.begin_library_job(LibraryJob::Backup, cx) else {
+            return;
+        };
+        self.library_import_notice = Some(ExportNotice::Status(
+            "请选择一个尚不存在的备份目录。备份包含全部笔记（含回收站）、笔记本、标签、历史版本与全部附件。"
+                .into(),
+        ));
+        cx.notify();
+        #[cfg(not(test))]
+        if let Some(handle) = window.window_handle().downcast::<LibraryShell>() {
+            cx.defer(move |app| prompt_for_backup_target(handle, token, app));
+        }
+        #[cfg(test)]
+        let _ = (window, token);
+    }
+
+    pub(super) fn restore_library_action(
+        &mut self,
+        _: &RestoreLibrary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(token) = self.begin_library_job(LibraryJob::Restore, cx) else {
+            return;
+        };
+        self.library_import_notice = Some(ExportNotice::Status(
+            "请选择一个资料库备份目录。它将恢复为新的资料库，当前资料库不变。".into(),
+        ));
+        cx.notify();
+        #[cfg(not(test))]
+        if let Some(handle) = window.window_handle().downcast::<LibraryShell>() {
+            cx.defer(move |app| prompt_for_backup_source(handle, token, app));
+        }
+        #[cfg(test)]
+        let _ = (window, token);
+    }
+
+    /// Returns the cancel flag when `token`/`job` are the pending picker.
+    fn take_picker(
+        &mut self,
+        token: u64,
+        job: LibraryJob,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) -> Option<(PathBuf, Arc<AtomicBool>)> {
+        let pending = self.pending_library_import.as_mut()?;
+        if pending.token != token || pending.job != job || pending.phase != ImportPhase::Picking {
+            return None;
+        }
+        match selection {
+            Ok(Some(path)) => {
+                pending.phase = ImportPhase::Working;
+                Some((path, pending.cancel.clone()))
+            }
+            Ok(None) => {
+                self.pending_library_import = None;
+                self.library_import_notice = None;
+                cx.notify();
+                None
+            }
+            Err(error) => {
+                self.pending_library_import = None;
+                self.library_import_notice =
+                    Some(ExportNotice::Error(format!("无法选择目录：{error}")));
+                cx.notify();
+                None
+            }
+        }
+    }
+
+    pub(super) fn complete_library_backup_picker(
+        &mut self,
+        token: u64,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((target, cancel)) = self.take_picker(token, LibraryJob::Backup, selection, cx)
+        else {
+            return;
+        };
+        let Some(profile) = cx
+            .try_global::<LibraryProfiles>()
+            .map(|profiles| profiles.active.clone())
+        else {
+            self.pending_library_import = None;
+            return;
+        };
+        self.library_import_notice = Some(ExportNotice::Status(format!(
+            "正在后台备份整个资料库到 {}…",
+            target.display()
+        )));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let job_target = target.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { backup_library(&profile, &job_target, &cancel) })
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                shell.finish_library_backup(token, target, result, shell_cx);
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn complete_library_restore_picker(
+        &mut self,
+        token: u64,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((backup, cancel)) = self.take_picker(token, LibraryJob::Restore, selection, cx)
+        else {
+            return;
+        };
+        let Some(imports_dir) = cx
+            .try_global::<LibraryProfiles>()
+            .map(LibraryProfiles::imports_dir)
+        else {
+            self.pending_library_import = None;
+            return;
+        };
+        self.library_import_notice = Some(ExportNotice::Status(
+            "正在后台校验备份并恢复为新资料库…".into(),
+        ));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::create_dir_all(&imports_dir).map_err(BackupError::Io)?;
+                    let destination = unique_library_destination(&imports_dir, &backup)
+                        .map_err(BackupError::Io)?;
+                    restore_library_backup(&backup, &destination, &cancel)
+                })
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                shell.finish_library_restore(token, result, shell_cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_library_backup(
+        &mut self,
+        token: u64,
+        target: PathBuf,
+        result: Result<BackupReport, BackupError>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.finish_pending(token) {
+            return;
+        }
+        self.library_import_notice = Some(match result {
+            Ok(report) => ExportNotice::Status(format!(
+                "备份完成：{} 篇笔记（另有 {} 篇在废纸篓）、{} 个笔记本、{} 个标签、{} 个附件文件，共 {:.1} MB，位于 {}。",
+                report.counts.notes,
+                report.counts.trashed_notes,
+                report.counts.notebooks,
+                report.counts.tags,
+                report.blobs,
+                report.bytes as f64 / 1_048_576.0,
+                target.display()
+            )),
+            Err(BackupError::Cancelled) => {
+                ExportNotice::Status("备份已取消；未生成备份目录。".into())
+            }
+            Err(error) => ExportNotice::Error(format!(
+                "备份未完成：{error}。未生成备份目录，资料库未改动。"
+            )),
+        });
+        cx.notify();
+    }
+
+    fn finish_library_restore(
+        &mut self,
+        token: u64,
+        result: Result<PublishedLibrary, BackupError>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.finish_pending(token) {
+            return;
+        }
+        self.library_import_notice = Some(match result {
+            Ok(library) => {
+                let counts = library.counts;
+                let message = format!(
+                    "恢复完成：{} 篇笔记（另有 {} 篇在废纸篓）、{} 个笔记本、{} 个标签、{} 个附件，全部通过哈希校验，已保存为新资料库 {}。当前资料库未改动。",
+                    counts.notes,
+                    counts.trashed_notes,
+                    counts.notebooks,
+                    counts.tags,
+                    counts.resources,
+                    library.path.display()
+                );
+                self.imported_library_ready = Some(library.path);
+                ExportNotice::Status(message)
+            }
+            Err(BackupError::Cancelled) => {
+                ExportNotice::Status("恢复已取消；未创建新资料库。".into())
+            }
+            Err(error) => ExportNotice::Error(format!(
+                "恢复未完成：{error}。未创建新资料库，当前资料库未改动。"
+            )),
+        });
+        cx.notify();
+    }
+
+    fn finish_pending(&mut self, token: u64) -> bool {
+        if self
+            .pending_library_import
+            .as_ref()
+            .is_none_or(|pending| pending.token != token)
+        {
+            return false;
+        }
+        self.pending_library_import = None;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_library_backup_picker_for_test(
+        &mut self,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let token = self.next_library_import_token;
+        self.complete_library_backup_picker(token, selection, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_library_restore_picker_for_test(
+        &mut self,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let token = self.next_library_import_token;
+        self.complete_library_restore_picker(token, selection, cx);
+    }
+}
+
+#[cfg(not(test))]
+fn prompt_for_backup_target(window: WindowHandle<LibraryShell>, token: u64, cx: &mut App) {
+    let default_dir = directories::UserDirs::new()
+        .and_then(|dirs| dirs.document_dir().map(Path::to_path_buf))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let prompt = cx.prompt_for_new_path(&default_dir, Some("Joplin-Lite-资料库备份"));
+    cx.spawn(async move |cx| {
+        let selection = match prompt.await {
+            Ok(Ok(path)) => Ok(path),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = cx.update(move |app| {
+            let _ = window.update(app, |shell, _window, shell_cx| {
+                shell.complete_library_backup_picker(token, selection, shell_cx);
+            });
+        });
+    })
+    .detach();
+}
+
+#[cfg(not(test))]
+fn prompt_for_backup_source(window: WindowHandle<LibraryShell>, token: u64, cx: &mut App) {
+    let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some("恢复".into()),
+    });
+    cx.spawn(async move |cx| {
+        let selection = match prompt.await {
+            Ok(Ok(paths)) => Ok(paths.and_then(|paths| paths.into_iter().next())),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = cx.update(move |app| {
+            let _ = window.update(app, |shell, _window, shell_cx| {
+                shell.complete_library_restore_picker(token, selection, shell_cx);
+            });
+        });
+    })
+    .detach();
+}

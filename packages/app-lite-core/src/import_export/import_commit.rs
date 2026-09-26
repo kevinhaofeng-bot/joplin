@@ -31,6 +31,7 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for super::EnexStagedProfile {}
     impl Sealed for super::JexStagedProfile {}
+    impl Sealed for super::super::RestoredLibrary {}
 }
 
 impl StagedLibrary for EnexStagedProfile {
@@ -273,7 +274,7 @@ pub fn import_library_file(
     };
     let staging = imports_dir.join(".staging");
     fs::create_dir_all(&staging)?;
-    let destination = unique_destination(imports_dir, source)?;
+    let destination = unique_library_destination(imports_dir, source)?;
     if is_enex {
         let staged = super::stage_enex_file_with_cancel(source, &staging, cancel.clone())?;
         let degraded = staged
@@ -297,7 +298,9 @@ pub fn import_library_file(
     }
 }
 
-fn unique_destination(imports_dir: &Path, source: &Path) -> io::Result<PathBuf> {
+/// A not-yet-existing directory in `imports_dir` named after `source`'s
+/// stem plus a timestamp (and a counter if needed).
+pub fn unique_library_destination(imports_dir: &Path, source: &Path) -> io::Result<PathBuf> {
     let stem: String = source
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())

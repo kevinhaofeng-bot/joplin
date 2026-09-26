@@ -1,4 +1,5 @@
 mod card_thumbnail;
+mod library_backup;
 mod library_import;
 #[cfg(test)]
 mod library_import_tests;
@@ -6547,6 +6548,8 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::import_library))
             .on_action(cx.listener(Self::cancel_library_import))
             .on_action(cx.listener(Self::open_imported_library))
+            .on_action(cx.listener(Self::backup_library_action))
+            .on_action(cx.listener(Self::restore_library_action))
             .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_find_in_note))
             .on_action(cx.listener(Self::find_next_in_note))

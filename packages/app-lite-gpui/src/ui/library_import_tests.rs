@@ -135,3 +135,46 @@ async fn mounted_open_imported_library_records_it_and_replaces_the_window(cx: &m
     let windows = app.update(|app| app.windows());
     assert_eq!(windows.len(), 1, "old window closed, new one open");
 }
+
+#[gpui::test]
+async fn mounted_backup_then_restore_creates_a_new_library_and_keeps_the_active_one(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    cx.dispatch_action(crate::app::CreateNote);
+    cx.run_until_parked();
+    let before = library_counts(&fixture.base).unwrap();
+    let backup = fixture.base.parent().unwrap().join("整库备份");
+
+    cx.dispatch_action(crate::app::BackupLibrary);
+    cx.run_until_parked();
+    let target = backup.clone();
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_library_backup_picker_for_test(Ok(Some(target)), shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    let message = notice(&view, cx);
+    assert!(message.contains("备份完成"), "{message}");
+    assert!(backup.join("manifest.json").is_file());
+
+    cx.dispatch_action(crate::app::RestoreLibrary);
+    cx.run_until_parked();
+    let source = backup.clone();
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_library_restore_picker_for_test(Ok(Some(source)), shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    let message = notice(&view, cx);
+    assert!(message.contains("恢复完成"), "{message}");
+    let restored = view
+        .read_with(cx, |shell, _| shell.imported_library_ready_for_test())
+        .expect("restored library ready to open");
+    assert!(restored.starts_with(fixture.base.parent().unwrap().join("imported-libraries")));
+    assert_eq!(library_counts(&restored).unwrap(), before);
+    assert_eq!(library_counts(&fixture.base).unwrap(), before);
+}
