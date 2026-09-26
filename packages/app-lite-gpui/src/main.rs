@@ -20,6 +20,7 @@ mod extractor;
 mod file_url;
 mod i18n;
 mod library_menu;
+mod library_profile;
 mod native_editor;
 mod net;
 mod spike_app;
@@ -266,7 +267,9 @@ fn main() {
         // The ordinary route is a local library, never the editor spike or a
         // sample document. A temporary profile can be supplied for smoke tests,
         // but it must be an explicit absolute path.
-        let profile = match resolve_library_profile(std::env::var_os("JOPLIN_LITE_PROFILE")) {
+        let explicit_profile = std::env::var_os("JOPLIN_LITE_PROFILE");
+        let explicit = explicit_profile.is_some();
+        let base = match resolve_library_profile(explicit_profile) {
             Ok(profile) => profile,
             Err(error) => {
                 let _ = ui::open_startup_error_window(cx, error);
@@ -274,6 +277,17 @@ fn main() {
                 return;
             }
         };
+        // An explicit profile is always honoured; otherwise reopen the
+        // imported library the person last switched to, if still valid.
+        let profile = if explicit {
+            base.clone()
+        } else {
+            library_profile::resolve_active(&base)
+        };
+        cx.set_global(library_profile::LibraryProfiles {
+            base,
+            active: profile.clone(),
+        });
         if let Err(error) = initialize_library_runtime(cx, profile.clone(), open_url_receiver) {
             let _ = ui::open_startup_error_window(cx, error);
             cx.activate(true);

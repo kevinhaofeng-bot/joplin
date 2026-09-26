@@ -232,3 +232,108 @@ fn sync_tree(root: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportLibraryOutcome {
+    pub library: PublishedLibrary,
+    /// Human-readable descriptions of notes imported as plain text.
+    pub degraded: Vec<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum ImportLibraryError {
+    #[error("只支持 .enex（Evernote）或 .jex（Joplin）文件")]
+    UnsupportedFormat,
+    #[error("ENEX 暂存失败：{0}")]
+    Enex(#[from] super::EnexStageError),
+    #[error("JEX 暂存失败：{0:?}")]
+    Jex(super::JexStageError),
+    #[error(transparent)]
+    Publish(#[from] PublishError),
+    #[error("文件操作失败：{0}")]
+    Io(#[from] io::Error),
+}
+
+/// Stage `source` (.enex or .jex, chosen by extension) under
+/// `imports_dir/.staging` and publish it as a new directory in `imports_dir`
+/// named after the source file. The source is only read.
+pub fn import_library_file(
+    source: &Path,
+    imports_dir: &Path,
+    cancel: &std::sync::Arc<AtomicBool>,
+) -> Result<ImportLibraryOutcome, ImportLibraryError> {
+    let extension = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let is_enex = match extension.as_deref() {
+        Some("enex") => true,
+        Some("jex") => false,
+        _ => return Err(ImportLibraryError::UnsupportedFormat),
+    };
+    let staging = imports_dir.join(".staging");
+    fs::create_dir_all(&staging)?;
+    let destination = unique_destination(imports_dir, source)?;
+    if is_enex {
+        let staged = super::stage_enex_file_with_cancel(source, &staging, cancel.clone())?;
+        let degraded = staged
+            .report()
+            .degraded_notes
+            .iter()
+            .map(|note| format!("第 {} 篇：{}", note.note_ordinal, note.reason))
+            .collect();
+        let library = publish_staged_library(staged, &destination, cancel)?;
+        Ok(ImportLibraryOutcome { library, degraded })
+    } else {
+        let staged = super::stage_jex_file(source, &staging).map_err(ImportLibraryError::Jex)?;
+        let degraded = staged
+            .report()
+            .degraded_notes
+            .iter()
+            .map(|note| format!("{}：{}", note.source_id, note.reason))
+            .collect();
+        let library = publish_staged_library(staged, &destination, cancel)?;
+        Ok(ImportLibraryOutcome { library, degraded })
+    }
+}
+
+fn unique_destination(imports_dir: &Path, source: &Path) -> io::Result<PathBuf> {
+    let stem: String = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|ch| {
+            if ch == '/' || ch == '\\' || ch.is_control() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .take(64)
+        .collect();
+    let stem = if stem.trim().is_empty() || stem.starts_with('.') {
+        format!("导入{stem}")
+    } else {
+        stem
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    for attempt in 0..1000_u32 {
+        let name = if attempt == 0 {
+            format!("{stem}-{stamp}")
+        } else {
+            format!("{stem}-{stamp}-{attempt}")
+        };
+        let candidate = imports_dir.join(name);
+        if fs::symlink_metadata(&candidate).is_err() {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free import destination name",
+    ))
+}

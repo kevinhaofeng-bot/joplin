@@ -1,4 +1,7 @@
 mod card_thumbnail;
+mod library_import;
+#[cfg(test)]
+mod library_import_tests;
 pub mod note_card;
 pub mod note_list;
 mod readable_export;
@@ -7,14 +10,16 @@ pub mod sidebar;
 use self::card_thumbnail::{
     CARD_THUMBNAIL_CACHE_BUDGET, CARD_THUMBNAIL_PROXY_EDGE, CardThumbnailManager,
 };
+use self::library_import::PendingLibraryImport;
 use self::readable_export::{ExportNotice, PendingReadableExport};
 #[cfg(test)]
 use crate::app::note_session::AttachmentOpener;
 use crate::app::note_session::{InsertIntent, NoteSession, ResourceImportRequest};
 use crate::app::save_coordinator::{FlushReason, SaveState, SystemSaveClock};
 use crate::app::{
-    AppAction, AppModel, AppStatus, CreateNote, CycleListViewMode, CycleSort, ExportCurrentNote,
-    ListViewMode, NoteSort, SyncCurrent, ToggleNoteList, ToggleSidebar, TrashSelected,
+    AppAction, AppModel, AppStatus, CancelLibraryImport, CreateNote, CycleListViewMode, CycleSort,
+    ExportCurrentNote, ListViewMode, NoteSort, OpenImportedLibrary, SyncCurrent, ToggleNoteList,
+    ToggleSidebar, TrashSelected,
 };
 use crate::components::Paste;
 use crate::native_editor::chrome::{EVERNOTE_GREEN, TitleInput};
@@ -535,6 +540,10 @@ pub struct LibraryShell {
     pending_readable_export: Option<PendingReadableExport>,
     next_readable_export_token: u64,
     readable_export_notice: Option<ExportNotice>,
+    pending_library_import: Option<PendingLibraryImport>,
+    next_library_import_token: u64,
+    library_import_notice: Option<ExportNotice>,
+    imported_library_ready: Option<PathBuf>,
     startup_notice: Option<String>,
     save_clock: Arc<dyn crate::app::save_coordinator::SaveClock>,
     focus_handle: FocusHandle,
@@ -1054,6 +1063,10 @@ impl LibraryShell {
             pending_readable_export: None,
             next_readable_export_token: 0,
             readable_export_notice: None,
+            pending_library_import: None,
+            next_library_import_token: 0,
+            library_import_notice: None,
+            imported_library_ready: None,
             startup_notice,
             save_clock,
             focus_handle,
@@ -6531,6 +6544,9 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::cycle_sort))
             .on_action(cx.listener(Self::sync_current))
             .on_action(cx.listener(Self::export_current_note))
+            .on_action(cx.listener(Self::import_library))
+            .on_action(cx.listener(Self::cancel_library_import))
+            .on_action(cx.listener(Self::open_imported_library))
             .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_find_in_note))
             .on_action(cx.listener(Self::find_next_in_note))
@@ -6628,6 +6644,60 @@ impl Render for LibraryShell {
                 .text_size(px(11.0))
                 .text_color(rgba(0xa34838ff))
                 .child(notice.clone())
+        }))
+        .children(self.library_import_notice.as_ref().map(|notice| {
+            let working = self.library_import_working();
+            let ready = self.imported_library_ready.is_some();
+            div()
+                .id("library-import-status")
+                .debug_selector(|| "library-import-status".to_owned())
+                .absolute()
+                .bottom(px(154.0))
+                .right(px(14.0))
+                .max_w(px(560.0))
+                .text_size(px(11.0))
+                .text_color(if notice.is_error() {
+                    rgba(0xa34838ff)
+                } else {
+                    rgba(0x536f59ff)
+                })
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(notice.message().to_owned())
+                .children(working.then(|| {
+                    div()
+                        .id("library-import-cancel")
+                        .cursor_pointer()
+                        .px(px(6.0))
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0xa3483820))
+                        .child("取消导入")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event, window, cx| {
+                                shell.cancel_library_import(&CancelLibraryImport, window, cx);
+                            }),
+                        )
+                }))
+                .children(ready.then(|| {
+                    div()
+                        .id("library-import-open")
+                        .cursor_pointer()
+                        .px(px(6.0))
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0x00a82d20))
+                        .text_color(rgba(EVERNOTE_GREEN))
+                        .child("打开导入的资料库")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event, window, cx| {
+                                shell.open_imported_library(&OpenImportedLibrary, window, cx);
+                            }),
+                        )
+                }))
         }))
         .children(self.readable_export_notice.as_ref().map(|notice| {
             div()

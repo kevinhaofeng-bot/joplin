@@ -7,8 +7,8 @@
 
 use crate::app::save_coordinator::FlushReason;
 use crate::app::{
-    CreateNote, CycleListViewMode, CycleSort, ExportCurrentNote, SyncCurrent, ToggleNoteList,
-    ToggleSidebar, TrashSelected,
+    CreateNote, CycleListViewMode, CycleSort, ExportCurrentNote, ImportLibrary, SyncCurrent,
+    ToggleNoteList, ToggleSidebar, TrashSelected,
 };
 use crate::components::QuitApplication;
 use crate::file_url::parse_file_url;
@@ -112,8 +112,12 @@ pub(crate) fn init(cx: &mut App, profile: PathBuf, open_url_receiver: Receiver<V
                 continue;
             }
             let notice = import_notice(&paths);
-            let profile = profile.clone();
+            let fallback = profile.clone();
             match cx.update(|cx| {
+                let profile = cx
+                    .try_global::<crate::library_profile::LibraryProfiles>()
+                    .map(|profiles| profiles.active.clone())
+                    .unwrap_or(fallback);
                 let opened =
                     ui::open_library_window_with_notice(cx, profile, Some(notice)).map(|_| ());
                 present_open_request_result(cx, opened)
@@ -144,6 +148,7 @@ pub(crate) fn library_menu() -> Menu {
             MenuItem::action("切换排序", CycleSort),
             MenuItem::action("保存当前笔记", SyncCurrent),
             MenuItem::action("导出当前笔记…", ExportCurrentNote),
+            MenuItem::action("导入 Evernote / Joplin 资料…", ImportLibrary),
             MenuItem::separator(),
             MenuItem::action("退出 Joplin Lite", QuitApplication),
         ],

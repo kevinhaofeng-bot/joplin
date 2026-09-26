@@ -11,6 +11,9 @@ gpui::actions!(
         CycleSort,
         SyncCurrent,
         ExportCurrentNote,
+        ImportLibrary,
+        CancelLibraryImport,
+        OpenImportedLibrary,
     ]
 );
 

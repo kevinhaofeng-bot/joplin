@@ -201,3 +201,78 @@ fn failure_just_before_rename_leaves_no_half_published_library() {
     assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     assert_eq!(tree_hashes(&active), active_before);
 }
+
+#[test]
+fn import_library_file_stages_and_publishes_enex_into_a_new_named_library() {
+    let root = tempdir().unwrap();
+    let imports = root.path().join("imported-libraries");
+    let source_dir = tempdir().unwrap();
+    let source = source_dir.path().join("我的笔记.enex");
+    fs::copy(fixture().path(), &source).unwrap();
+    let source_before = fs::read(&source).unwrap();
+
+    let first = app_lite_core::import_library_file(
+        &source,
+        &imports,
+        &std::sync::Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let second = app_lite_core::import_library_file(
+        &source,
+        &imports,
+        &std::sync::Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        source_before,
+        "source is read-only"
+    );
+    assert_ne!(
+        first.library.path, second.library.path,
+        "never reuses a target"
+    );
+    for outcome in [&first, &second] {
+        assert!(outcome.library.path.starts_with(&imports));
+        assert!(
+            outcome
+                .library
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("我的笔记-")
+        );
+        assert_eq!(outcome.library.counts.notes, 2);
+        assert!(outcome.degraded.is_empty());
+    }
+    let leftovers: Vec<_> = fs::read_dir(imports.join(".staging")).unwrap().collect();
+    assert!(leftovers.is_empty(), "no staging leftovers");
+}
+
+#[test]
+fn import_library_file_rejects_unknown_extension_without_creating_a_library() {
+    let root = tempdir().unwrap();
+    let imports = root.path().join("imported-libraries");
+    let source = root.path().join("notes.txt");
+    fs::write(&source, b"x").unwrap();
+
+    let error = app_lite_core::import_library_file(
+        &source,
+        &imports,
+        &std::sync::Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(error, app_lite_core::ImportLibraryError::UnsupportedFormat),
+        "{error:?}"
+    );
+    assert!(
+        !imports.exists()
+            || fs::read_dir(&imports)
+                .unwrap()
+                .all(|e| e.unwrap().file_name() == ".staging")
+    );
+}
