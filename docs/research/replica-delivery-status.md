@@ -10,5 +10,5 @@
 | 3 完整备份与恢复 | [03-backup-restore.md](replica-evidence/03-backup-restore.md) | `3d4f209e7` | 往返与真实规模通过；实机未做 | 未独立验收 |
 | 4 生命周期/组织/浏览 | [04-lifecycle-organization.md](replica-evidence/04-lifecycle-organization.md) | `0b436b4d8`、`308546e3a` | 修复永久删除两处数据缺陷；复制/多选/批量已交；实机未做 | 未独立验收 |
 | 5 多模态与搜索 | [05-multimodal-search.md](replica-evidence/05-multimodal-search.md) | `a89acda94`、`224840804` | 修复 SQLite 锁丢失致写入丢失；OCR/PDF 端到端通过；界面实机未做 | 未独立验收 |
-| 6 NAS 同步 | — | — | 未开始 | 未独立验收 |
+| 6 NAS 同步 | [06-sync.md](replica-evidence/06-sync.md) | `e6a73c019` | 仅第一步：协议+契约 8/8；网络/客户端/部署待协议审核与用户同意 | 未独立验收 |
 | 7 安装与最终验收 | — | — | 未开始 | 未独立验收 |
