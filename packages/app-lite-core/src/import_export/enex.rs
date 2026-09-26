@@ -1023,18 +1023,21 @@ impl StageIngestion {
                 entity: format!("note {}", source.ordinal),
             });
         }
-        for missing in self
-            .preflight
-            .unresolved_media_references
-            .iter()
-            .filter(|r| r.note_ordinal == source.ordinal)
-        {
-            return Err(EnexStageError::MissingResource {
+        // Evernote's exporter skips attachments it cannot read, so these are
+        // placeholders plus a report, not a whole-import failure.
+        let missing = missing_media(&self.preflight, source.ordinal);
+        if !missing.is_empty() {
+            self.report.degraded_notes.push(EnexDegradedNote {
                 note_ordinal: source.ordinal,
-                hash_md5: missing.hash_md5.clone(),
+                path: "/en-note".into(),
+                reason: format!(
+                    "Attachment data missing from ENEX: {}",
+                    missing.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
             });
         }
-        let (converted, degraded) = convert_or_degrade(raw_enml, &self.same_note_resources)?;
+        let (converted, degraded) =
+            convert_or_degrade(raw_enml, &self.same_note_resources, &missing)?;
         if let Some(blocker) = degraded {
             self.report.degraded_notes.push(EnexDegradedNote {
                 note_ordinal: source.ordinal,
@@ -1131,12 +1134,6 @@ fn stage_enex_file_inner(
         EnexScanError::Stage(error) => *error,
         other => EnexStageError::Scan(other),
     })?;
-    if let Some(missing) = preflight.unresolved_media_references.first() {
-        return Err(EnexStageError::MissingResource {
-            note_ordinal: missing.note_ordinal,
-            hash_md5: missing.hash_md5.clone(),
-        });
-    }
     let directory = tempfile::Builder::new()
         .prefix("enex-stage-")
         .tempdir_in(&parent)?;
@@ -1309,16 +1306,29 @@ fn attachment_card_inputs<'a>(
         })
 }
 
+fn missing_media(
+    preflight: &EnexScanReport,
+    note_ordinal: usize,
+) -> std::collections::BTreeSet<String> {
+    preflight
+        .unresolved_media_references
+        .iter()
+        .filter(|r| r.note_ordinal == note_ordinal)
+        .map(|r| r.hash_md5.to_ascii_lowercase())
+        .collect()
+}
+
 /// Convert ENML, or fall back to its visible text when it contains
 /// constructs the canonical document cannot represent.
 fn convert_or_degrade(
     raw: &str,
     resources: &BTreeMap<String, Vec<crate::VerifiedEnmlResource>>,
+    missing_media: &std::collections::BTreeSet<String>,
 ) -> Result<(CanonicalDocument, Option<crate::EnmlFidelityBlocker>), EnexStageError> {
     if raw.is_empty() {
         return Ok((CanonicalDocument::parse_html("")?, None));
     }
-    match crate::convert_enml(raw, resources) {
+    match crate::convert_enml_with_missing_media(raw, resources, missing_media) {
         Ok(conversion) => Ok((conversion.document, None)),
         Err(blocker) => Ok((
             CanonicalDocument::parse_html(&degraded_enml_html(raw))?,
@@ -1535,7 +1545,8 @@ fn verify_staging_profile(
                     map
                 },
             );
-        let (converted, _) = convert_or_degrade(&raw, &resources)?;
+        let missing = missing_media(preflight, source.ordinal);
+        let (converted, _) = convert_or_degrade(&raw, &resources, &missing)?;
         let document = with_unreferenced_attachment_cards(
             converted,
             attachment_card_inputs(preflight, &report.resources, source.ordinal),

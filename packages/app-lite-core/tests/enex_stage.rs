@@ -169,16 +169,6 @@ fn rejects_unsupported_or_missing_attachments_without_touching_existing_profile(
     assert_eq!(degraded.report().degraded_notes.len(), 1);
     assert_eq!(degraded.report().degraded_notes[0].path, "/en-note/0");
     drop(degraded);
-    let missing = archive(
-        "<en-export><note><title>x</title><content><![CDATA[<en-note><en-media hash=\"900150983cd24fb0d6963f7d28e17f72\" type=\"image/png\"/></en-note>]]></content></note></en-export>",
-    );
-    assert!(matches!(
-        stage_enex_file(missing.path(), parent.path()),
-        Err(EnexStageError::MissingResource {
-            note_ordinal: 1,
-            ..
-        })
-    ));
     let corrupt =
         archive("<en-export><note><resource><data>!!!!</data></resource></note></en-export>");
     assert!(stage_enex_file(corrupt.path(), parent.path()).is_err());
@@ -197,7 +187,7 @@ fn second_note_failure_discards_previously_staged_note_and_attachment() {
     let bytes = b"first-note-attachment";
     let hash = format!("{:x}", Md5::digest(bytes));
     let xml = format!(
-        "<en-export><note><title>已写入的笔记</title><content><![CDATA[<en-note><div>第一条<en-media hash=\"{hash}\" type=\"image/png\"/></div></en-note>]]></content>{}</note><note><title>失败的笔记</title><content><![CDATA[<en-note><en-media hash=\"900150983cd24fb0d6963f7d28e17f72\" type=\"image/png\"/></en-note>]]></content></note></en-export>",
+        "<en-export><note><title>已写入的笔记</title><content><![CDATA[<en-note><div>第一条<en-media hash=\"{hash}\" type=\"image/png\"/></div></en-note>]]></content>{}</note><note><title>失败的笔记</title><content><![CDATA[<en-note><div>x</div></en-note>]]></content><created>not-a-date</created></note></en-export>",
         resource(bytes, "image/png", "first.png"),
     );
     let source = archive(&xml);
@@ -206,7 +196,7 @@ fn second_note_failure_discards_previously_staged_note_and_attachment() {
     assert_eq!(scanned.resources.len(), 1);
     assert!(matches!(
         stage_enex_file(source.path(), parent.path()),
-        Err(EnexStageError::MissingResource {
+        Err(EnexStageError::InvalidDate {
             note_ordinal: 2,
             ..
         })
@@ -384,4 +374,37 @@ fn unsupported_enml_degrades_to_readable_text_with_report_and_keeps_attachments(
         raw.contains("<table>"),
         "original ENML retained for later re-import"
     );
+}
+
+/// Evernote's own ENEX exporter skips an attachment it cannot read
+/// (11354__enex-exporter.js `k()`), so an en-media without data is real input.
+/// The note imports with a visible placeholder there and is reported; the
+/// rest of its formatting and other attachments survive.
+#[test]
+fn missing_attachment_data_leaves_a_visible_placeholder_and_a_report() {
+    let parent = tempdir().unwrap();
+    let bytes = b"kept-attachment";
+    let hash = format!("{:x}", Md5::digest(bytes));
+    let xml = format!(
+        "<en-export><note><title>缺附件</title><content><![CDATA[<en-note><div><b>粗体</b></div><en-media hash=\"900150983cd24fb0d6963f7d28e17f72\" type=\"application/pdf\"/><div>文字<en-media hash=\"{hash}\" type=\"image/png\"/></div></en-note>]]></content>{}</note></en-export>",
+        resource(bytes, "image/png", "kept.png"),
+    );
+    let source = archive(&xml);
+    let stage = stage_enex_file(source.path(), parent.path()).unwrap();
+    let report = stage.report();
+    assert_eq!(report.degraded_notes.len(), 1);
+    assert!(
+        report.degraded_notes[0]
+            .reason
+            .contains("900150983cd24fb0d6963f7d28e17f72"),
+        "{:?}",
+        report.degraded_notes
+    );
+    let db = rusqlite::Connection::open(stage.profile_path().join("library.sqlite")).unwrap();
+    let html: String = db
+        .query_row("SELECT body_html FROM notes", [], |row| row.get(0))
+        .unwrap();
+    assert!(html.contains("<strong>粗体</strong>"), "{html}");
+    assert!(html.contains("附件缺失"), "{html}");
+    assert!(html.contains("<img"), "{html}");
 }

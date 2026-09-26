@@ -9,7 +9,7 @@ use quick_xml::{
     Reader,
     events::{BytesStart, Event},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 const MAX_ENML_BYTES: usize = 4 * 1024 * 1024;
@@ -63,10 +63,22 @@ pub fn convert_enml(
     enml: &str,
     same_note_resources: &BTreeMap<String, Vec<VerifiedEnmlResource>>,
 ) -> Result<EnmlConversion, EnmlFidelityBlocker> {
+    convert_enml_with_missing_media(enml, same_note_resources, &BTreeSet::new())
+}
+
+/// Like [`convert_enml`], but an en-media whose MD5 is in `missing_media`
+/// (the export carried no data for it) becomes a visible placeholder instead
+/// of blocking. The caller reports those hashes.
+pub fn convert_enml_with_missing_media(
+    enml: &str,
+    same_note_resources: &BTreeMap<String, Vec<VerifiedEnmlResource>>,
+    missing_media: &BTreeSet<String>,
+) -> Result<EnmlConversion, EnmlFidelityBlocker> {
     let root = parse_enml(enml)?;
     let mut html = String::new();
     let mut context = RenderContext {
         resources: same_note_resources,
+        missing_media,
         conservative_link_bytes: 0,
     };
     let mut inline_run = false;
@@ -312,6 +324,7 @@ fn append_text(value: &str, stack: &mut [Element]) -> Result<(), EnmlFidelityBlo
 
 struct RenderContext<'a> {
     resources: &'a BTreeMap<String, Vec<VerifiedEnmlResource>>,
+    missing_media: &'a BTreeSet<String>,
     conservative_link_bytes: usize,
 }
 impl RenderContext<'_> {
@@ -622,6 +635,17 @@ impl RenderContext<'_> {
             .to_ascii_lowercase();
         if hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(blocked(path, "invalid en-media MD5 hash"));
+        }
+        if !self.resources.contains_key(&hash) && self.missing_media.contains(&hash) {
+            let kind = element.attrs.get("type").map(String::as_str).unwrap_or("");
+            if !inline {
+                out.push_str("<p>");
+            }
+            escape(&format!("[附件缺失：{kind} MD5 {hash}]"), out);
+            if !inline {
+                out.push_str("</p>");
+            }
+            return Ok(());
         }
         let candidates = self
             .resources
