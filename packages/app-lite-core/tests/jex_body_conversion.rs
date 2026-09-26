@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use app_lite_core::document::Inline;
 use app_lite_core::{
     CanonicalDocument, JexBodyBlockerKind, JexVerifiedResource, ResourceId, convert_jex_note_body,
 };
@@ -667,6 +668,54 @@ fn self_linked_resource_image_drops_only_the_redundant_link() {
     ] {
         assert!(
             convert_jex_note_body(NOTE, "linked.md", 1, &body, &resources()).is_err(),
+            "body={body}"
+        );
+    }
+}
+
+/// A quote of several paragraphs becomes adjacent quote blocks; a quote with
+/// any other structure (list, heading) still blocks.
+#[test]
+fn multi_paragraph_quote_becomes_adjacent_quote_blocks() {
+    let converted = convert_jex_note_body(
+        NOTE,
+        "quote.md",
+        1,
+        "> 第一段\n>\n> **第二段**\n\n正文",
+        &resources(),
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    use app_lite_core::document::Block;
+    let text = |block: &Block| match block {
+        Block::Quote { inlines, .. } | Block::Paragraph { inlines, .. } => inlines
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect::<String>(),
+        other => panic!("{other:?}"),
+    };
+    let blocks = converted.document.blocks();
+    assert!(matches!(
+        blocks,
+        [
+            Block::Quote { .. },
+            Block::Quote { .. },
+            Block::Paragraph { .. }
+        ]
+    ));
+    assert_eq!(
+        blocks.iter().map(text).collect::<Vec<_>>(),
+        ["第一段", "第二段", "正文"]
+    );
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        converted.document
+    );
+    for body in ["> 引\n>\n> - 列表", "> # 标题"] {
+        assert!(
+            convert_jex_note_body(NOTE, "quote.md", 1, body, &resources()).is_err(),
             "body={body}"
         );
     }

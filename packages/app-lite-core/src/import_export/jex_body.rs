@@ -521,13 +521,19 @@ impl<'a> Converter<'a> {
                             "Alert quote type has no canonical mapping",
                         );
                     }
-                    self.expect_start_paragraph()?;
-                    let inlines = self.inlines(TagEnd::Paragraph, Marks::default(), false)?;
+                    // Each paragraph of a quote becomes its own adjacent quote block.
+                    loop {
+                        self.expect_start_paragraph()?;
+                        let inlines = self.inlines(TagEnd::Paragraph, Marks::default(), false)?;
+                        blocks.push(Block::Quote {
+                            style: BlockStyle::default(),
+                            inlines,
+                        });
+                        if !matches!(self.peek(), Some(Event::Start(Tag::Paragraph))) {
+                            break;
+                        }
+                    }
                     self.expect_end(TagEnd::BlockQuote(kind))?;
-                    blocks.push(Block::Quote {
-                        style: BlockStyle::default(),
-                        inlines,
-                    });
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {
                     if matches!(&kind, pulldown_cmark::CodeBlockKind::Fenced(language) if !language.is_empty())
