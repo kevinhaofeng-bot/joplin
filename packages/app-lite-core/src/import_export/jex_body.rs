@@ -293,6 +293,7 @@ impl<'a> Converter<'a> {
                         display_width: None,
                     });
                 }
+                Event::InlineHtml(html) if is_line_break(&html) => out.push(Inline::SoftBreak),
                 Event::Html(_) | Event::InlineHtml(_) | Event::Start(Tag::HtmlBlock) => {
                     return self.blocked(
                         JexBodyBlockerKind::RawHtml,
@@ -560,7 +561,40 @@ impl<'a> Converter<'a> {
                     });
                 }
                 Event::Start(Tag::List(start)) => blocks.push(self.list(start)?),
-                Event::Html(_) | Event::InlineHtml(_) | Event::Start(Tag::HtmlBlock) => {
+                Event::Start(Tag::HtmlBlock) => {
+                    // Only what the strict HTML converter maps losslessly.
+                    let mut fragment = String::new();
+                    loop {
+                        match self.next() {
+                            Some(Event::Html(html)) => fragment.push_str(&html),
+                            Some(Event::End(TagEnd::HtmlBlock)) => break,
+                            _ => {
+                                return self.blocked(
+                                    JexBodyBlockerKind::RawHtml,
+                                    "Raw HTML in Markdown body is not supported",
+                                );
+                            }
+                        }
+                    }
+                    if is_bare_document_wrapper(&fragment) {
+                        continue;
+                    }
+                    let converted = super::jex_html::convert_html_body(
+                        self.note_id,
+                        self.path,
+                        &fragment,
+                        self.resources,
+                    )
+                    // RawHtml routes the degrade path to local HTML conversion.
+                    .map_err(|mut error| {
+                        error.kind = JexBodyBlockerKind::RawHtml;
+                        error
+                    })?;
+                    self.occurrences
+                        .extend(converted.ordered_resource_occurrences);
+                    blocks.extend_from_slice(converted.document.blocks());
+                }
+                Event::Html(_) | Event::InlineHtml(_) => {
                     return self.blocked(
                         JexBodyBlockerKind::RawHtml,
                         "Raw HTML in Markdown body is not supported",
@@ -587,6 +621,32 @@ impl<'a> Converter<'a> {
             )
         }
     }
+}
+
+/// Only attribute-free `<html>`/`<body>` open/close tags, which Joplin renders
+/// as nothing (e.g. residue of forwarded mail).
+fn is_bare_document_wrapper(html: &str) -> bool {
+    let mut rest = html.trim();
+    while !rest.is_empty() {
+        let Some(tag) = ["<html>", "</html>", "<body>", "</body>"]
+            .into_iter()
+            .find(|tag| {
+                rest.get(..tag.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(tag))
+            })
+        else {
+            return false;
+        };
+        rest = rest[tag.len()..].trim_start();
+    }
+    true
+}
+
+fn is_line_break(html: &str) -> bool {
+    matches!(
+        html.trim().to_ascii_lowercase().as_str(),
+        "<br>" | "<br/>" | "<br />"
+    )
 }
 
 /// Like [`convert_jex_note_body`], but unsupported Markdown blocks degrade

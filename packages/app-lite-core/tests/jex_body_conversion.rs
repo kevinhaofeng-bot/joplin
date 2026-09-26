@@ -504,3 +504,95 @@ fn inline_resource_links_keep_position_label_and_resource() {
         );
     }
 }
+
+/// Joplin Markdown often embeds HTML. A block the strict HTML converter maps
+/// losslessly, and inline `<br>`, are no longer blockers; anything that
+/// converter rejects still blocks.
+#[test]
+fn embedded_html_converts_only_when_the_strict_html_converter_accepts_it() {
+    let cases = [
+        ("前<br>中<br/>后", "<p>前<br>中<br>后</p>"),
+        (
+            "<div><strong>粗</strong> 文</div>\n\n段落",
+            "<p><strong>粗</strong> 文</p><p>段落</p>",
+        ),
+        (
+            "<ol>\n<li>一</li>\n<li>二</li>\n</ol>",
+            "<ol><li>一</li><li>二</li></ol>",
+        ),
+    ];
+    for (body, html) in cases {
+        let converted = convert_jex_note_body(NOTE, "html.md", 1, body, &resources())
+            .unwrap_or_else(|error| panic!("body={body}: {error:?}"));
+        assert_eq!(
+            converted.document,
+            CanonicalDocument::parse_html(html).unwrap(),
+            "body={body}"
+        );
+    }
+    let image = format!("<p>图<img src=\":/{IMAGE}\"></p>");
+    let converted = convert_jex_note_body(NOTE, "html.md", 1, &image, &resources()).unwrap();
+    assert_eq!(
+        converted.ordered_resource_occurrences,
+        vec![ResourceId::new(TARGET_IMAGE).unwrap()]
+    );
+    for body in [
+        "<font color=\"red\">红</font>",
+        "上<sup>标</sup>",
+        "<script>alert(1)</script>",
+    ] {
+        assert!(
+            convert_jex_note_body(NOTE, "html.md", 1, body, &resources()).is_err(),
+            "body={body}"
+        );
+    }
+}
+
+/// Joplin writes a resized image as `<img width height src=":/id"/>` and
+/// forwarded mail can leave bare `<html>` lines that Joplin renders as
+/// nothing. Width is kept as the image's display width (Evernote stores only
+/// width on the image node); anything else still blocks.
+#[test]
+fn joplin_resized_image_keeps_width_and_bare_html_wrappers_render_nothing() {
+    use app_lite_core::document::Block;
+    let body = format!("前文\n\n<img width=\"320\" height=\"200\" src=\":/{IMAGE}\"/>");
+    let converted = convert_jex_note_body(NOTE, "img.md", 1, &body, &resources())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert!(
+        matches!(
+            converted.document.blocks(),
+            [_, Block::Image { presentation, .. }] if presentation.display_width == Some(320)
+        ),
+        "{}",
+        converted.canonical_html
+    );
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        converted.document
+    );
+
+    let converted = convert_jex_note_body(
+        NOTE,
+        "wrap.md",
+        1,
+        "<html>\n\n正文\n\n<html>\n<html>\n\n</html>",
+        &resources(),
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.document,
+        CanonicalDocument::parse_html("<p>正文</p>").unwrap()
+    );
+
+    for body in [
+        format!("<img height=\"200\" src=\":/{IMAGE}\"/>"),
+        format!("<img width=\"50%\" src=\":/{IMAGE}\"/>"),
+        "<html lang=\"zh\">\n\n正文".to_owned(),
+        "<html>中文标题".to_owned(),
+    ] {
+        assert!(
+            convert_jex_note_body(NOTE, "bad.md", 1, &body, &resources()).is_err(),
+            "body={body}"
+        );
+    }
+}

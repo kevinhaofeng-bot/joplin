@@ -25,6 +25,8 @@
 
 ### 实现（均已提交）
 
+归属：`6ec89e0f2`、`99405b34c`、`3c260b9b3` 由并行会话“Claude Evernote 产品交付”提交；本会话补端到端回归与本证据（`56c48d6aa`）。该会话其后提交 `d3127d4d3`（空列表项回车退出、缩放后保持选中），不在本文件范围。
+
 | 提交 | 文件 | 作用 |
 | --- | --- | --- |
 | `6ec89e0f2` | `app-lite-core/src/document.rs`、`native_editor/codec.rs` 等 | `Inline::Image.display_width`；旧 HTML 解析为 `None`，打开不改正文；codec 组内图片读写宽度，取消原“拒绝导出” |
@@ -65,6 +67,8 @@
 | `cargo test --manifest-path packages/app-lite-server/Cargo.toml --offline`（根） | 退出0；10 通过 | `server.log` |
 | `git diff --check` | 退出0 | `diffcheck.log` |
 
+并行施工说明：同一工作树另有会话“Claude Evernote 产品交付”在改 `app-lite-gpui`（当时 `native_editor/toolbar.rs` 含其未提交的调试打印）。上表 GUI 全套编译进了这些未提交改动（仅 stderr 输出差异），不是纯净 `56c48d6aa` 构建；Codex 验收需在干净检出上重跑。两次变异核验期间曾临时改动 `codec.rs`/`model.rs` 数十秒，已还原。此后分工：该会话负责 `app-lite-gpui`，本会话只改 `app-lite-core` 迁移代码、审计示例与本文件。
+
 编译警告仍存在（GUI 测试构建输出 149 行 `warning`），未清零、不宣称清零。真实副本审计比较资源顺序与非空白文字，不代替排版/表格视觉验收。
 
 ### 未通过 / 未做
@@ -75,3 +79,17 @@
 
 - Claude 实施状态：阶段1提交待验收（实机未做）
 - Codex 验收状态：未验收
+
+## 阶段2：迁移警告（进行中，未完成）
+
+依据：Joplin JEX 格式适配，属本项目适配，不是 Evernote 行为；图片只存宽度参照 `resource/image/imagecomponent.tsx:449-452`。审计用只读探针 `examples/migration_fidelity_audit.rs`（`SQLITE_OPEN_READ_ONLY`，只输出计数；`JOPLIN_LITE_AUDIT_KINDS=1` 额外输出每篇的结构特征组合），库为 `/tmp/joplin-migration-current.MeMdVA/all_notebooks-1790430342/library.sqlite`（隔离副本，不是原库）。日志在 `/tmp/joplin-stage2-claude/`。
+
+| 步骤 | 提交 | 严格通过 / 警告 |
+| --- | --- | --- |
+| 基线 | — | 1386 / 280 |
+| 行内资源链接 `[标签](:/id)` 转为行内附件卡片或图片，标签与文件名不同时保留标签文字 | `c15c16d18` | 1421 / 245 |
+| HTML 块只有被严格 HTML 转换器接受时才转换；行内 `<br>` 转换行；`<img width>` 保存为显示宽度（height 不保存）；无属性的 `<html>`/`<body>` 空包装块跳过（Joplin 显示为空，原字节仍在审计表） | 本节提交 | 1422 / 244 |
+
+跳过空包装块是一个判断，需要 Codex 确认。审计曾发现我自己写的包装块检测会在中文字符的字节边界上 panic，已修复，并加了回归用例 `<html>中文标题`。
+
+特征组合里仍未处理的：带链接图片 51+、表格 30+、HTML 块跨空行导致的“未闭合元素” 20、外链图片 11、有序列表起始号 11、数学 11、H4 及以上 5。其中带链接图片、表格、列表起始号和 H4 以上都要改原生编辑器（`app-lite-gpui`，现归另一个会话负责），需要先协调。尚未用新代码重新做隔离导入，也没跑原生加载审计：新转换出的笔记还没有在编辑器里验证过打开和回写。

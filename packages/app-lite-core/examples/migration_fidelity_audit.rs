@@ -35,6 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut unsupported = BTreeMap::<String, usize>::new();
     let mut kinds_by_reason = BTreeMap::<String, BTreeMap<String, usize>>::new();
     let mut feature_sets = BTreeMap::<Vec<&'static str>, usize>::new();
+    let mut html_tags = BTreeMap::<String, usize>::new();
+    let mut html_block_shapes = BTreeMap::<String, usize>::new();
     let mut passed = 0;
     for row in stmt.query_map([], |row| {
         Ok((
@@ -100,10 +102,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(feature) = feature {
                             features.insert(feature);
                         }
+                        if let E::Html(html) | E::InlineHtml(html) = &event {
+                            // Tag names only, never attribute values or text.
+                            for part in html.split('<').skip(1) {
+                                let name: String = part
+                                    .trim_start_matches('/')
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_alphanumeric())
+                                    .collect::<String>()
+                                    .to_ascii_lowercase();
+                                let key = if name.is_empty() {
+                                    "<other>".into()
+                                } else {
+                                    name
+                                };
+                                *html_tags.entry(key).or_default() += 1;
+                            }
+                        }
                     }
                     *feature_sets
                         .entry(features.into_iter().collect())
                         .or_default() += 1;
+                    // Shape of each HTML block: its first tag and whether it is
+                    // a lone opening/closing wrapper line. Never text.
+                    let mut block = None::<String>;
+                    for event in
+                        pulldown_cmark::Parser::new_ext(body, pulldown_cmark::Options::all())
+                    {
+                        match event {
+                            pulldown_cmark::Event::Start(pulldown_cmark::Tag::HtmlBlock) => {
+                                block = Some(String::new())
+                            }
+                            pulldown_cmark::Event::Html(html) => {
+                                if let Some(block) = block.as_mut() {
+                                    block.push_str(&html);
+                                }
+                            }
+                            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::HtmlBlock) => {
+                                let html = block.take().unwrap_or_default();
+                                let trimmed = html.trim();
+                                let closing = trimmed.starts_with("</");
+                                let name: String = trimmed
+                                    .trim_start_matches('<')
+                                    .trim_start_matches('/')
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_alphanumeric())
+                                    .collect::<String>()
+                                    .to_ascii_lowercase();
+                                let lone = trimmed.matches('<').count() == 1;
+                                let attrs = trimmed.contains('=');
+                                let shape = match (lone, closing) {
+                                    (true, true) => format!("lone_close:{name}"),
+                                    (true, false) => format!(
+                                        "lone_open:{name}{}",
+                                        if attrs { "+attrs" } else { "" }
+                                    ),
+                                    _ => format!(
+                                        "fragment:{name}{}",
+                                        if attrs { "+attrs" } else { "" }
+                                    ),
+                                };
+                                *html_block_shapes.entry(shape).or_default() += 1;
+                            }
+                            _ => {}
+                        }
+                    }
                     let mut events =
                         pulldown_cmark::Parser::new_ext(body, pulldown_cmark::Options::all())
                             .peekable();
@@ -185,6 +248,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (set, count) in sets {
             println!("features\t{count}\t{set:?}");
         }
+        println!("html_tags\t{html_tags:?}");
+        println!("html_block_shapes\t{html_block_shapes:?}");
         for (reason, kinds) in kinds_by_reason {
             println!("kinds\t{reason}\t{kinds:?}");
         }

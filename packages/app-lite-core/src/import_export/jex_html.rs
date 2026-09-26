@@ -308,13 +308,39 @@ impl Context<'_> {
                 "Linked image cannot preserve both targets",
             );
         }
-        self.attrs(element, &["src", "alt"])?;
+        self.attrs(element, &["src", "alt", "width", "height"])?;
         if !element.children.is_empty() {
             return self.block(
                 Kind::UnsupportedStructure,
                 "HTML image cannot contain children",
             );
         }
+        // Joplin's resized image. Like Evernote, only width is kept; height
+        // follows the natural aspect ratio.
+        let display_width = match element.attrs.get("width") {
+            Some(width) => match width
+                .strip_suffix("px")
+                .unwrap_or(width)
+                .parse::<u32>()
+                .ok()
+                .filter(|width| (1..=10_000).contains(width))
+            {
+                Some(width) => Some(width),
+                None => {
+                    return self.block(
+                        Kind::UnsupportedAttribute,
+                        "HTML image width is not a pixel value",
+                    );
+                }
+            },
+            None if element.attrs.contains_key("height") => {
+                return self.block(
+                    Kind::UnsupportedAttribute,
+                    "HTML image height without width has no canonical mapping",
+                );
+            }
+            None => None,
+        };
         let src = element.attrs.get("src").ok_or_else(|| {
             blocked(
                 self.note_id,
@@ -352,7 +378,7 @@ impl Context<'_> {
         Ok(Inline::Image {
             resource_id: resource.destination_id,
             alt: element.attrs.get("alt").cloned().unwrap_or_default(),
-            display_width: None,
+            display_width,
         })
     }
 
@@ -642,13 +668,18 @@ impl Context<'_> {
             "img" => {
                 let image = self.image(element, false)?;
                 if let Inline::Image {
-                    resource_id, alt, ..
+                    resource_id,
+                    alt,
+                    display_width,
                 } = image
                 {
                     Ok(Block::Image {
                         resource_id,
                         alt,
-                        presentation: ImagePresentation::default(),
+                        presentation: ImagePresentation {
+                            display_width,
+                            ..ImagePresentation::default()
+                        },
                     })
                 } else {
                     unreachable!()
