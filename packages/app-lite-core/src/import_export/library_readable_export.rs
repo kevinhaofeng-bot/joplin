@@ -167,10 +167,11 @@ pub fn export_library_readable(
             &root.join(format!("notes/{}.html", note.id)),
             snapshot.bodies[&note.id].as_bytes(),
         )?;
-        write_synced(
-            &root.join(format!("history/{}.json", note.id)),
-            &serde_json::to_vec(&snapshot.histories[&note.id])?,
-        )?;
+        let history = serde_json::to_vec(&snapshot.histories[&note.id])?;
+        if history.len() as u64 > MAX_HISTORY_FILE_BYTES {
+            return Err(invalid("note history exceeds restore limit"));
+        }
+        write_synced(&root.join(format!("history/{}.json", note.id)), &history)?;
     }
     for resource in &snapshot.manifest.resources {
         let hash = BlobHash::new(&resource.sha256).map_err(|_| invalid("invalid captured hash"))?;
