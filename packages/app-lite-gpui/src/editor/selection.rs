@@ -1130,7 +1130,7 @@ mod tests {
                 Some("pha\n\nbeta\n\nga")
             );
         });
-        cx.quit();
+        cx.cx.clone().quit();
     }
 
     const TABLE_DOC: &str = "alpha\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\ngamma";
