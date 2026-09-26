@@ -4,6 +4,8 @@
 
 最新入口验收见 [原生导出与图片修复记录](native-export-ui-acceptance-2026-09-26.md)：实机导出 1 篇/2 资源、取消与重开通过，图片按钮修复通过实机；浏览器本地文件受工具策略阻止，未绕过，未标为验收。全套测试 SIGSEGV 正在独立定位，不能声称整款产品完成。
 
+后续：`6daa9d7e6` 已提交原生导出与图片按钮修复；`1f70bbde2` 修复了旧 selection 测试退出时的 use-after-free（仅测试一行）。独立 selection 12/12 通过；修复后整套检查进入后续 Cmd-V 测试，在 Cocoa 空指针 SIGABRT 中止，详见 [清理崩溃诊断](selection-test-cleanup-fix-2026-09-26.md)。下一步定位该粘贴测试边界；未推送、未标记全套通过。
+
 ## 基线与本轮范围
 
 - 工作树：`/Users/kevinhao/Projects/joplin/.worktrees/joplin-lite-native-rust-mvp`，分支 `codex/joplin-lite-native-rust`，恢复时 HEAD `a338ae328`。
