@@ -109,6 +109,7 @@ fn readable_export_builds_escaped_browsable_pages_with_relative_resource_links()
                             marks: Marks::default(),
                         }],
                     }],
+                    start: None,
                 },
                 Block::Image {
                     resource_id: image.clone(),
@@ -246,6 +247,7 @@ fn readable_page_applies_canonical_alignment_indent_and_image_display_width() {
                             marks: Marks::default(),
                         }],
                     }],
+                    start: None,
                 },
                 Block::Image {
                     resource_id: image,

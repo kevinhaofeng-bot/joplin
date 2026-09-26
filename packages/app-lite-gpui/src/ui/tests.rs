@@ -8269,6 +8269,7 @@ async fn mounted_list_inline_photo_hydrates_at_real_size_without_reopen_or_save(
                         },
                     ],
                 }],
+                start: None,
             }]),
         })
         .unwrap();

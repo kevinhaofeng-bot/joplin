@@ -574,7 +574,11 @@ impl Context<'_> {
                 "Empty HTML list has no canonical items",
             );
         }
-        Ok(Block::List { kind, items })
+        Ok(Block::List {
+            kind,
+            items,
+            start: None,
+        })
     }
 
     fn element_block(&mut self, element: &Element) -> Result<Block> {

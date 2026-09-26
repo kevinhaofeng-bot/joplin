@@ -273,3 +273,34 @@ fn h4_to_h6_round_trip_as_headings() {
     );
     assert_eq!(document.to_canonical_html().as_str(), html);
 }
+
+/// `<ol start="N">` keeps its first number; start 1 and unordered lists
+/// carry none, so existing bodies serialize byte-for-byte as before.
+#[test]
+fn ordered_list_start_round_trips_and_keeps_adjacent_lists_apart() {
+    let html = "<ol start=\"3\"><li>三</li><li>四</li></ol><ol start=\"10\"><li>十</li></ol>";
+    let document = CanonicalDocument::parse_html(html).unwrap();
+    let starts: Vec<_> = document
+        .blocks()
+        .iter()
+        .map(|block| match block {
+            Block::List { start, .. } => *start,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(starts, vec![Some(3), Some(10)]);
+    assert_eq!(document.to_canonical_html().as_str(), html);
+
+    for (input, expected) in [
+        ("<ol start=\"1\"><li>一</li></ol>", "<ol><li>一</li></ol>"),
+        ("<ol start=\"-2\"><li>一</li></ol>", "<ol><li>一</li></ol>"),
+        ("<ul start=\"3\"><li>点</li></ul>", "<ul><li>点</li></ul>"),
+        (
+            "<ol><li>一</li></ol><ol><li>二</li></ol>",
+            "<ol><li>一</li><li>二</li></ol>",
+        ),
+    ] {
+        let document = CanonicalDocument::parse_html(input).unwrap();
+        assert_eq!(document.to_canonical_html().as_str(), expected, "{input}");
+    }
+}

@@ -554,7 +554,11 @@ impl<'a> Converter<'a> {
                 );
             }
         };
-        Ok(Block::List { kind, items })
+        Ok(Block::List {
+            kind,
+            items,
+            start: None,
+        })
     }
 
     fn blocks(&mut self) -> Result<Vec<Block>> {

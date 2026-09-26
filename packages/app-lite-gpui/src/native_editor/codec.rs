@@ -137,6 +137,7 @@ pub fn import_canonical_with_resources(
 ) -> Result<Document, CanonicalImportError> {
     let mut native = Vec::new();
     let mut inline_groups = Vec::new();
+    let mut list_starts = std::collections::BTreeMap::new();
     let mut next_id = 1_u64;
 
     for (block_index, block) in document.blocks().iter().enumerate() {
@@ -268,7 +269,8 @@ pub fn import_canonical_with_resources(
                     block_index,
                 )?);
             }
-            CanonicalBlock::List { kind, items } => {
+            CanonicalBlock::List { kind, items, start } => {
+                let first = native.len();
                 for item in items {
                     let kind = match kind {
                         ListKind::Unordered => BlockKind::BulletItem { depth: 0 },
@@ -298,6 +300,9 @@ pub fn import_canonical_with_resources(
                         &item.inlines,
                         block_index,
                     )?);
+                }
+                if let (Some(start), Some(first)) = (start, native.get(first)) {
+                    list_starts.insert(first.id, *start);
                 }
             }
             CanonicalBlock::Quote { style, inlines } => {
@@ -403,6 +408,7 @@ pub fn import_canonical_with_resources(
     let mut document =
         Document::from_blocks(native).map_err(CanonicalImportError::InvalidDocument)?;
     document.set_inline_groups(inline_groups);
+    document.set_list_starts(list_starts);
     Ok(document)
 }
 
@@ -521,15 +527,13 @@ pub fn export_canonical_with_resources(
     available_resources: Option<&[ResourceId]>,
 ) -> Result<CanonicalDocument, CanonicalExportError> {
     let mut output = Vec::new();
-    let mut pending_list: Option<(ListKind, Vec<app_lite_core::document::ListItem>)> = None;
+    let mut pending_list: Option<PendingList> = None;
 
-    let flush_list =
-        |output: &mut Vec<CanonicalBlock>,
-         pending: &mut Option<(ListKind, Vec<app_lite_core::document::ListItem>)>| {
-            if let Some((kind, items)) = pending.take() {
-                output.push(CanonicalBlock::List { kind, items });
-            }
-        };
+    let flush_list = |output: &mut Vec<CanonicalBlock>, pending: &mut Option<PendingList>| {
+        if let Some((kind, items, start)) = pending.take() {
+            output.push(CanonicalBlock::List { kind, items, start });
+        }
+    };
 
     for (block_index, block) in document.blocks().iter().enumerate() {
         if let Some(group) = document
@@ -623,11 +627,16 @@ pub fn export_canonical_with_resources(
                     style,
                     inlines,
                 };
+                let start = document.list_start(block.id);
                 match pending_list.as_mut() {
-                    Some((pending_kind, items)) if *pending_kind == list_kind => items.push(item),
+                    Some((pending_kind, items, _))
+                        if *pending_kind == list_kind && start.is_none() =>
+                    {
+                        items.push(item)
+                    }
                     _ => {
                         flush_list(&mut output, &mut pending_list);
-                        pending_list = Some((list_kind, vec![item]));
+                        pending_list = Some((list_kind, vec![item], start));
                     }
                 }
             } else {
@@ -664,24 +673,19 @@ pub fn export_canonical_with_resources(
         if let Some((kind, depth, checked)) = list_kind {
             let (mut style, inlines) = export_text_block(block, block_index)?;
             style.indent = list_indent(depth, block_index)?;
+            let item = app_lite_core::document::ListItem {
+                checked,
+                style,
+                inlines,
+            };
+            let start = document.list_start(block.id);
             match pending_list.as_mut() {
-                Some((pending_kind, items)) if *pending_kind == kind => {
-                    items.push(app_lite_core::document::ListItem {
-                        checked,
-                        style,
-                        inlines,
-                    });
+                Some((pending_kind, items, _)) if *pending_kind == kind && start.is_none() => {
+                    items.push(item);
                 }
                 _ => {
                     flush_list(&mut output, &mut pending_list);
-                    pending_list = Some((
-                        kind,
-                        vec![app_lite_core::document::ListItem {
-                            checked,
-                            style,
-                            inlines,
-                        }],
-                    ));
+                    pending_list = Some((kind, vec![item], start));
                 }
             }
             continue;
@@ -888,6 +892,14 @@ fn canonical_marks(marks: &[Mark]) -> Marks {
     output
 }
 
+/// A canonical list being assembled from consecutive native items, with its
+/// `<ol start>` taken from the first item's recorded start.
+type PendingList = (
+    ListKind,
+    Vec<app_lite_core::document::ListItem>,
+    Option<u32>,
+);
+
 fn list_indent(depth: u8, block_index: usize) -> Result<u8, CanonicalExportError> {
     if depth > MAX_LIST_DEPTH {
         return Err(CanonicalExportError::UnsupportedListDepth { block_index, depth });
@@ -1081,6 +1093,7 @@ mod tests {
                         marks: Marks::default(),
                     }],
                 }],
+                start: None,
             },
         ]);
 
@@ -1160,14 +1173,17 @@ mod tests {
             CanonicalBlock::List {
                 kind: ListKind::Unordered,
                 items: vec![item("项目", None)],
+                start: None,
             },
             CanonicalBlock::List {
                 kind: ListKind::Ordered,
                 items: vec![item("编号", None)],
+                start: None,
             },
             CanonicalBlock::List {
                 kind: ListKind::Checklist,
                 items: vec![item("待办", Some(false))],
+                start: None,
             },
         ]);
 
@@ -1272,6 +1288,7 @@ mod tests {
                         inlines: vec![text("图前"), image, text("图后")],
                     },
                 ],
+                start: None,
             },
         ]);
         let native = import_canonical(&canonical).expect("inline images must load");
@@ -1425,6 +1442,31 @@ mod tests {
             });
         assert_eq!(width, Some(Some(320)));
         assert_eq!(super::export_canonical(&reopened).unwrap(), exported);
+    }
+
+    #[test]
+    fn ordered_list_start_numbers_the_editor_and_saves_unchanged() {
+        let canonical = CanonicalDocument::parse_html(
+            "<ol start=\"3\"><li>三</li><li>四</li></ol><p>间隔</p><ol start=\"10\"><li>图<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">后</li><li>十一</li></ol>",
+        )
+        .unwrap();
+        let document = import_canonical(&canonical).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap(), canonical);
+        let numbers = crate::native_editor::layout::ordered_number_summary(&document);
+        let numbered: Vec<_> = document
+            .blocks()
+            .iter()
+            .filter_map(|block| numbers.get(&block.id).copied())
+            .collect();
+        assert_eq!(numbered, vec![3, 4, 10, 11]);
+        let mut layout = crate::native_editor::layout::LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 1_000.0, 680.0);
+        let painted: Vec<_> = document
+            .blocks()
+            .iter()
+            .filter_map(|block| layout.ordered_number(block.id))
+            .collect();
+        assert_eq!(painted, vec![3, 4, 10, 11]);
     }
 
     #[test]
@@ -1645,6 +1687,7 @@ mod tests {
             CanonicalBlock::List {
                 kind: ListKind::Ordered,
                 items,
+                ..
             },
         ] = exported.blocks()
         else {
@@ -1687,6 +1730,7 @@ mod tests {
             CanonicalBlock::List {
                 kind: ListKind::Ordered,
                 items,
+                ..
             },
         ] = exported.blocks()
         else {
@@ -1853,6 +1897,7 @@ mod tests {
                     style: BlockStyle::default(),
                     inlines: vec![marked("项目")],
                 }],
+                start: None,
             },
             CanonicalBlock::List {
                 kind: ListKind::Ordered,
@@ -1861,6 +1906,7 @@ mod tests {
                     style: BlockStyle::default(),
                     inlines: vec![marked("序号")],
                 }],
+                start: None,
             },
             CanonicalBlock::List {
                 kind: ListKind::Checklist,
@@ -1869,6 +1915,7 @@ mod tests {
                     style: BlockStyle::default(),
                     inlines: vec![marked("清单")],
                 }],
+                start: None,
             },
             CanonicalBlock::Quote {
                 style: BlockStyle::default(),

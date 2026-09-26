@@ -412,6 +412,9 @@ struct FindLinePosition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NumberingKind {
     Ordered(u8),
+    /// An ordered item that restarts its depth's sequence at a recorded
+    /// `<ol start>` value.
+    OrderedFrom(u8, u32),
     Bullet(u8),
     Check(u8),
     Boundary,
@@ -491,7 +494,12 @@ fn numbering_kind_for(document: &Document, block: &super::model::Block) -> Numbe
     if document.is_inline_group_continuation(block.id) {
         NumberingKind::Continuation
     } else {
-        numbering_kind(&block.kind)
+        match (numbering_kind(&block.kind), document.list_start(block.id)) {
+            (NumberingKind::Ordered(depth), Some(start)) => {
+                NumberingKind::OrderedFrom(depth, start)
+            }
+            (kind, _) => kind,
+        }
     }
 }
 
@@ -2681,6 +2689,12 @@ fn advance_numbering(kind: NumberingKind, counters: &mut NumberingCursor) -> Opt
                 counters.counters.push((depth, value));
                 Some(value)
             }
+        }
+        NumberingKind::OrderedFrom(depth, start) => {
+            reset_from(counters, depth);
+            let value = start as usize;
+            counters.counters.push((depth, value));
+            Some(value)
         }
         NumberingKind::Bullet(depth) | NumberingKind::Check(depth) => {
             if depth == 0 {

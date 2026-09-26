@@ -99,6 +99,9 @@ pub enum Block {
     List {
         kind: ListKind,
         items: Vec<ListItem>,
+        /// First number of an ordered list (`<ol start>`); None means 1 and
+        /// is the only value unordered/checklist lists carry.
+        start: Option<u32>,
     },
     /// A quoted text block. Keeping quote as a first-class canonical node
     /// avoids representing it as indentation, which the native codec must
@@ -272,7 +275,7 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                 };
                 serialize_block(tag, style, inlines, &mut output);
             }
-            Block::List { kind, items } => {
+            Block::List { kind, items, start } => {
                 let (tag, checklist) = match kind {
                     ListKind::Unordered => ("ul", false),
                     ListKind::Ordered => ("ol", false),
@@ -282,6 +285,11 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                 output.push_str(tag);
                 if checklist {
                     output.push_str(" data-type=\"checklist\"");
+                }
+                if let Some(start) = start {
+                    output.push_str(" start=\"");
+                    output.push_str(&start.to_string());
+                    output.push('"');
                 }
                 output.push('>');
                 for item in items {
@@ -542,8 +550,9 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 style: normalize_style(style),
                 inlines: normalize_inlines(inlines),
             },
-            Block::List { kind, items } => Block::List {
+            Block::List { kind, items, start } => Block::List {
                 kind,
+                start: normalize_list_start(kind, start),
                 items: items
                     .into_iter()
                     .map(|item| ListItem {
@@ -592,8 +601,13 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 Some(Block::List {
                     kind: previous_kind,
                     items: previous_items,
+                    ..
                 }),
-                Block::List { kind, items },
+                Block::List {
+                    kind,
+                    items,
+                    start: None,
+                },
             ) = (normalized.last_mut(), &block)
                 && previous_kind == kind
             {
@@ -608,6 +622,10 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
 fn normalize_style(mut style: BlockStyle) -> BlockStyle {
     style.indent = style.indent.min(8);
     style
+}
+
+fn normalize_list_start(kind: ListKind, start: Option<u32>) -> Option<u32> {
+    start.filter(|&start| kind == ListKind::Ordered && start != 1)
 }
 
 fn normalize_image_presentation(presentation: ImagePresentation) -> ImagePresentation {
@@ -1300,7 +1318,9 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                         } else {
                             ListKind::Unordered
                         };
-                        projection.begin_list(kind);
+                        let start = attribute(&attrs.borrow(), "start")
+                            .and_then(|value| value.trim().parse::<u32>().ok());
+                        projection.begin_list(kind, start);
                         pending.push(ProjectionFrame::FinishList);
                         for child in children.into_iter().rev() {
                             pending.push(ProjectionFrame::Visit {
@@ -1600,6 +1620,9 @@ enum BlockKind {
 
 struct ListContext {
     kind: ListKind,
+    /// Consumed by the first emitted segment; later segments of a list split
+    /// around a nested list continue its numbering.
+    start: Option<u32>,
     items: Vec<ListItem>,
     pending_style: BlockStyle,
     pending_checked: Option<bool>,
@@ -1707,7 +1730,7 @@ impl Projection {
         });
     }
 
-    fn begin_list(&mut self, kind: ListKind) {
+    fn begin_list(&mut self, kind: ListKind, start: Option<u32>) {
         if !self.list_contexts.is_empty() {
             self.finish_item_before_nested_list();
             self.flush_list_segment();
@@ -1716,6 +1739,7 @@ impl Projection {
         }
         self.list_contexts.push(ListContext {
             kind,
+            start,
             items: Vec::new(),
             pending_style: BlockStyle::default(),
             pending_checked: (kind == ListKind::Checklist).then_some(false),
@@ -1749,6 +1773,7 @@ impl Projection {
                 self.document.blocks.push(Block::List {
                     kind: context.kind,
                     items,
+                    start: context.start.take(),
                 });
             }
         }
@@ -1807,6 +1832,7 @@ impl Projection {
             self.document.blocks.push(Block::List {
                 kind: context.kind,
                 items: context.items,
+                start: context.start,
             });
         }
         self.current = None;
@@ -2337,6 +2363,7 @@ mod tests {
                         }],
                     },
                 ],
+                start: None,
             },
         ]);
         let html = serialize_html(&document);
@@ -2823,6 +2850,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                     style: BlockStyle::default(),
                     inlines: Vec::new(),
                 }],
+                start: None,
             },
         ]);
         let html = serialize_html(&document);
@@ -2835,6 +2863,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
         let empty_list = CanonicalDocument::from_blocks(vec![Block::List {
             kind: ListKind::Ordered,
             items: Vec::new(),
+            start: None,
         }]);
         assert_eq!(serialize_html(&empty_list), "<ol></ol>");
         assert_eq!(parse_html("<ol></ol>").unwrap(), empty_list);
@@ -2856,6 +2885,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                         marks: Marks::default(),
                     }],
                 }],
+                start: None,
             },
             Block::List {
                 kind: ListKind::Ordered,
@@ -2867,6 +2897,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                         marks: Marks::default(),
                     }],
                 }],
+                start: None,
             },
         ]);
         let html = serialize_html(&document);

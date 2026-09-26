@@ -1180,6 +1180,9 @@ pub struct Document {
     next_id: u64,
     revision: u64,
     inline_groups: Vec<InlineGroup>,
+    /// First number of an ordered list that does not start at 1, keyed by
+    /// the list's first item. Keys of removed items are simply ignored.
+    list_starts: BTreeMap<NodeId, u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1268,6 +1271,7 @@ impl Document {
             next_id,
             revision: 0,
             inline_groups: Vec::new(),
+            list_starts: BTreeMap::new(),
         };
         debug_assert!(document.validate_invariants().is_ok());
         document
@@ -1287,6 +1291,7 @@ impl Document {
             next_id: next_id.max(1),
             revision: 0,
             inline_groups: Vec::new(),
+            list_starts: BTreeMap::new(),
         };
         document.validate_invariants()?;
         Ok(document)
@@ -1473,6 +1478,14 @@ impl Document {
         self.inline_groups = groups;
         self.inline_groups
             .sort_by_key(|group| group.members.first().copied());
+    }
+
+    pub(crate) fn set_list_starts(&mut self, starts: BTreeMap<NodeId, u32>) {
+        self.list_starts = starts;
+    }
+
+    pub(crate) fn list_start(&self, id: NodeId) -> Option<u32> {
+        self.list_starts.get(&id).copied()
     }
 
     pub(crate) fn inline_groups(&self) -> &[InlineGroup] {
