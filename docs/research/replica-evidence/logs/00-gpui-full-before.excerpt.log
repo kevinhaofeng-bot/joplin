@@ -1,0 +1,11 @@
+test ui::tests::mounted_cmd_f_opens_a_retained_cjk_find_panel ... ok
+test ui::tests::mounted_cmd_k_search_ignores_marked_enter_and_opens_the_thirteenth_result ... ok
+test ui::tests::mounted_cmd_v_after_typing_queues_saved_point_until_journal_worker_finishes ... 
+thread 'ui::tests::mounted_cmd_v_after_typing_queues_saved_point_until_journal_worker_finishes' (12786588) panicked at /Users/kevinhao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cocoa-0.26.0/src/appkit.rs:791:9:
+null pointer dereference occurred
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+thread caused non-unwinding panic. aborting.
+error: test failed, to rerun pass `--bin velotype`
+
+Caused by:
+  process didn't exit successfully: `/Users/kevinhao/Projects/joplin/.shared-target/debug/deps/velotype-3700aeffd9c35fd0 --test-threads=1` (signal: 6, SIGABRT: process abort signal)

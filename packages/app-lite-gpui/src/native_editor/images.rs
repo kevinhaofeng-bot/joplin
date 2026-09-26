@@ -3094,7 +3094,7 @@ unsafe fn native_image_payload(
         .unwrap_or(NativeImageRead::Rejected)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     // Narrow AppKit bridge: only pasteboard extraction happens here. The
     // editor model, layout, and rendering remain GPUI/native-editor owned.
@@ -3152,7 +3152,10 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+// GPUI's TestAppContext owns an in-memory clipboard but does not initialize
+// AppKit's general pasteboard. Keep the Paste action and payload resolution
+// real while replacing only the final OS read in unit tests.
+#[cfg(any(test, not(target_os = "macos")))]
 pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     None
 }

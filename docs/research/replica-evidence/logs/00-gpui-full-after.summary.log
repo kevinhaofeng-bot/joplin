@@ -1,0 +1,7 @@
+# full log: .superpowers/sdd/2026-09-26-claude-evernote-product-delivery/t0-gpui.log (git-ignored)
+ok lines: 1326
+2747:test ui::tests::mounted_cmd_v_after_typing_queues_saved_point_until_journal_worker_finishes ... ok
+
+test result: ok. 1326 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 82.57s
+
+gpui exit 0
