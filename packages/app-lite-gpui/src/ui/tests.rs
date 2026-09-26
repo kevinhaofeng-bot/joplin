@@ -7682,9 +7682,17 @@ async fn mounted_corrected_generation_clears_only_its_automatic_save_error(
         commands
             .execute(EditorCommand::BulletList, CommandArgument::None, editor)
             .expect("real list command");
-        commands
-            .execute(EditorCommand::IndentList, CommandArgument::None, editor)
-            .expect("real unsupported nested list command");
+        // Indented lists now save as canonical `data-indent`; a level-4
+        // heading is still a native kind the canonical codec cannot store.
+        let selection = editor.selection();
+        editor
+            .apply(
+                crate::native_editor::transaction::Transaction::SetBlockKind {
+                    selection,
+                    kind: crate::native_editor::model::BlockKind::Heading { level: 4 },
+                },
+            )
+            .expect("make an unsupported heading level");
         editor_cx.notify();
     });
     clock.advance(Duration::from_millis(100));
@@ -7697,7 +7705,7 @@ async fn mounted_corrected_generation_clears_only_its_automatic_save_error(
     );
 
     editor.update(cx, |editor, editor_cx| {
-        editor.undo().expect("undo unsupported nesting");
+        editor.undo().expect("undo unsupported heading level");
         editor_cx.notify();
     });
     clock.advance(Duration::from_millis(100));

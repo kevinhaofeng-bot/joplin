@@ -10,8 +10,8 @@ use smallvec::SmallVec;
 use std::fmt;
 
 use super::model::{
-    Block, BlockContent, BlockKind, Document, DocumentError, InlineGroup, Mark, NodeId, StyledRun,
-    TextAlignment,
+    Block, BlockContent, BlockKind, Document, DocumentError, InlineGroup, MAX_LIST_DEPTH, Mark,
+    NodeId, StyledRun, TextAlignment,
 };
 
 /// The library shell deliberately imports only the canonical subset that can
@@ -599,16 +599,17 @@ pub fn export_canonical_with_resources(
                     _ => return Err(CanonicalExportError::InvalidTextContent { block_index }),
                 }
             }
-            let style = style.unwrap_or_default();
+            let mut style = style.unwrap_or_default();
             let list = match kind {
-                BlockKind::BulletItem { depth: 0 } => Some((ListKind::Unordered, None)),
-                BlockKind::OrderedItem { depth: 0 } => Some((ListKind::Ordered, None)),
-                BlockKind::CheckItem { depth: 0, checked } => {
-                    Some((ListKind::Checklist, Some(checked)))
+                BlockKind::BulletItem { depth } => Some((ListKind::Unordered, depth, None)),
+                BlockKind::OrderedItem { depth } => Some((ListKind::Ordered, depth, None)),
+                BlockKind::CheckItem { depth, checked } => {
+                    Some((ListKind::Checklist, depth, Some(checked)))
                 }
                 _ => None,
             };
-            if let Some((list_kind, checked)) = list {
+            if let Some((list_kind, depth, checked)) = list {
+                style.indent = list_indent(depth, block_index)?;
                 let item = app_lite_core::document::ListItem {
                     checked,
                     style,
@@ -661,10 +662,8 @@ pub fn export_canonical_with_resources(
             _ => None,
         };
         if let Some((kind, depth, checked)) = list_kind {
-            if depth != 0 {
-                return Err(CanonicalExportError::UnsupportedListDepth { block_index, depth });
-            }
-            let (style, inlines) = export_text_block(block, block_index)?;
+            let (mut style, inlines) = export_text_block(block, block_index)?;
+            style.indent = list_indent(depth, block_index)?;
             match pending_list.as_mut() {
                 Some((pending_kind, items)) if *pending_kind == kind => {
                     items.push(app_lite_core::document::ListItem {
@@ -892,6 +891,13 @@ fn canonical_marks(marks: &[Mark]) -> Marks {
     output
 }
 
+fn list_indent(depth: u8, block_index: usize) -> Result<u8, CanonicalExportError> {
+    if depth > MAX_LIST_DEPTH {
+        return Err(CanonicalExportError::UnsupportedListDepth { block_index, depth });
+    }
+    Ok(depth)
+}
+
 fn next_node_id(next_id: &mut u64) -> NodeId {
     let id = NodeId::new(*next_id);
     *next_id = next_id.saturating_add(1);
@@ -913,12 +919,25 @@ fn text_block(
     inlines: &[Inline],
     block_index: usize,
 ) -> Result<Block, CanonicalImportError> {
-    if style.indent != 0 {
-        return Err(CanonicalImportError::UnsupportedIndent {
-            block_index,
-            indent: style.indent,
-        });
-    }
+    let kind = match kind {
+        BlockKind::BulletItem { .. } => BlockKind::BulletItem {
+            depth: style.indent,
+        },
+        BlockKind::OrderedItem { .. } => BlockKind::OrderedItem {
+            depth: style.indent,
+        },
+        BlockKind::CheckItem { checked, .. } => BlockKind::CheckItem {
+            depth: style.indent,
+            checked,
+        },
+        _ if style.indent != 0 => {
+            return Err(CanonicalImportError::UnsupportedIndent {
+                block_index,
+                indent: style.indent,
+            });
+        }
+        kind => kind,
+    };
     let (text, styles) = import_inlines(inlines, block_index)?;
     Ok(Block {
         id,
@@ -1482,6 +1501,53 @@ mod tests {
         assert!(f32::from(image_bounds.left()) >= 42.0);
         let numbers = crate::native_editor::layout::ordered_number_summary(&document);
         assert_eq!(numbers.get(&tail), Some(&2));
+    }
+
+    #[test]
+    fn indented_list_items_save_as_canonical_indent_and_reopen_at_their_depth() {
+        use crate::native_editor::model::{DocPoint, Selection};
+        use crate::native_editor::transaction::Transaction;
+        let canonical =
+            CanonicalDocument::parse_html("<ul><li>外层</li><li>内层</li></ul>").unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        let inner = document.blocks()[1].id;
+        document
+            .apply(Transaction::IndentList {
+                selection: Selection::caret(DocPoint::new(inner, 0)),
+            })
+            .unwrap();
+        let exported = super::export_canonical(&document).unwrap();
+        assert_eq!(
+            exported.to_canonical_html().as_str(),
+            "<ul><li>外层</li><li data-indent=\"1\">内层</li></ul>"
+        );
+        let reopened = import_canonical(&exported).unwrap();
+        assert!(matches!(
+            reopened.blocks()[1].kind,
+            BlockKind::BulletItem { depth: 1 }
+        ));
+        assert_eq!(super::export_canonical(&reopened).unwrap(), exported);
+    }
+
+    #[test]
+    fn indented_grouped_list_item_with_an_image_round_trips_its_depth() {
+        let html = "<ol><li>首项</li><li data-indent=\"2\">图前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">图后</li></ol>";
+        let canonical = CanonicalDocument::parse_html(html).unwrap();
+        let document = import_canonical(&canonical).unwrap();
+        assert!(matches!(
+            document.blocks()[1].kind,
+            BlockKind::OrderedItem { depth: 2 }
+        ));
+        assert_eq!(super::export_canonical(&document).unwrap(), canonical);
+    }
+
+    #[test]
+    fn indented_paragraphs_remain_an_explicit_import_error() {
+        let canonical = CanonicalDocument::parse_html("<p data-indent=\"1\">段落</p>").unwrap();
+        assert!(matches!(
+            import_canonical(&canonical),
+            Err(CanonicalImportError::UnsupportedIndent { indent: 1, .. })
+        ));
     }
 
     #[test]

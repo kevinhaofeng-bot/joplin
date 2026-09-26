@@ -25,8 +25,9 @@ use super::transaction::{
     ApplyOutcome, InsertedTextSpan, StructuralSplice, Transaction, TransactionBatch,
 };
 
-/// Maximum nesting depth accepted by list transactions.
-pub const MAX_LIST_DEPTH: u8 = 64;
+/// Maximum nesting depth accepted by list transactions. Matches the
+/// canonical `data-indent` ceiling so every reachable depth can be saved.
+pub const MAX_LIST_DEPTH: u8 = 8;
 
 /// Stable identity for a block in a document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
