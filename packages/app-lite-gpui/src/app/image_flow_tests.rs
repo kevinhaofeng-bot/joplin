@@ -1809,3 +1809,214 @@ async fn mounted_image_resize_handle_commits_one_undoable_width_that_persists(
         Some(bounds.size.width)
     );
 }
+
+/// Seed a note whose heading holds an image, plus a plain second note, and
+/// mount a shell on the note with the grouped image.
+fn grouped_image_library(
+    profile: &tempfile::TempDir,
+    repository: &LibraryRepository,
+) -> (app_lite_core::NoteId, app_lite_core::NoteId) {
+    use app_lite_core::{CanonicalDocument, CreateNote, SaveNote};
+    let bytes = std::fs::read(picker_png(profile)).unwrap();
+    let resource = repository
+        .import_image(&bytes, "图", "image/png", "png")
+        .unwrap();
+    let note = repository
+        .create_note(CreateNote {
+            title: "组内图".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(Vec::new()),
+        })
+        .unwrap();
+    let html = format!(
+        "<h2>前<img src=\":/{}\" alt=\"图\">后</h2><p>尾</p>",
+        resource.as_str()
+    );
+    repository
+        .save_note(SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title.clone(),
+            document: CanonicalDocument::parse_html(&html).unwrap(),
+            resource_ids: vec![resource],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    let other = repository
+        .create_note(CreateNote {
+            title: "另一篇".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(Vec::new()),
+        })
+        .unwrap();
+    (note.id, other.id)
+}
+
+fn mount_on<'a>(
+    cx: &'a mut TestAppContext,
+    repository: Arc<LibraryRepository>,
+    note: &app_lite_core::NoteId,
+) -> (gpui::Entity<LibraryShell>, &'a mut VisualTestContext) {
+    let model = cx.new(move |_| AppModel::open(repository).expect("open real app model"));
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        LibraryShell::new_with_save_clock(model.clone(), None, clock, window, cx)
+    });
+    select(&view, cx, note);
+    (view, cx)
+}
+
+fn select(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+    note: &app_lite_core::NoteId,
+) {
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.clone()), window, shell_cx);
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+}
+
+fn manual_save(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) {
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx);
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// Handoff stage 1: a user width on an image inside a heading survives save,
+/// switching notes and reopening the library in a fresh repository/session.
+#[gpui::test]
+async fn mounted_grouped_image_resize_persists_across_switch_and_reopen(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, point, px};
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let (note, other) = grouped_image_library(&profile, &repository);
+    let (view, vcx) = mount_on(cx, Arc::clone(&repository), &note);
+    let bounds = view
+        .read_with(vcx, |shell, app| shell.image_flow_probe_for_test(app))
+        .image_block_bounds
+        .expect("grouped image laid out");
+    vcx.simulate_click(bounds.center(), Modifiers::default());
+    redraw(vcx);
+    let handle = point(bounds.right() - px(2.0), bounds.bottom() - px(2.0));
+    let target = point(bounds.left() + px(120.0), bounds.bottom() + px(20.0));
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: handle,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseMoveEvent {
+        position: target,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    vcx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: target,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    redraw(vcx);
+    let width = |view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app))
+            .image_block_bounds
+            .map(|b| f32::from(b.size.width).round())
+    };
+    assert_eq!(width(&view, vcx), Some(120.0));
+    manual_save(&view, vcx);
+    let saved = repository.load_note(&note).unwrap().unwrap().body_html;
+    assert!(
+        saved.starts_with("<h2>前<img") && saved.contains("data-joplin-lite-display-width=\"120\""),
+        "{saved}"
+    );
+
+    select(&view, vcx, &other);
+    select(&view, vcx, &note);
+    assert_eq!(
+        width(&view, vcx),
+        Some(120.0),
+        "switching back keeps the width"
+    );
+
+    let reopened = Arc::new(
+        LibraryRepository::open(profile.path().join("library.sqlite")).expect("reopen library"),
+    );
+    let (fresh, fresh_cx) = mount_on(cx, reopened, &note);
+    assert_eq!(
+        width(&fresh, fresh_cx),
+        Some(120.0),
+        "reopen keeps the width"
+    );
+}
+
+/// Handoff stage 1: a file card inserted inside a heading is saved in place,
+/// undo removes it from the saved body, and redo brings it back.
+#[gpui::test]
+async fn mounted_grouped_attachment_insert_saves_undoes_and_redoes(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, point, px};
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let (note, _) = grouped_image_library(&profile, &repository);
+    let (view, vcx) = mount_on(cx, Arc::clone(&repository), &note);
+    let text = view
+        .read_with(vcx, |shell, app| shell.image_flow_probe_for_test(app))
+        .text_block_bounds
+        .expect("heading text laid out");
+    // Caret after "前", inside the heading and before its image.
+    vcx.simulate_click(
+        point(text.right() - px(1.0), text.center().y),
+        Modifiers::default(),
+    );
+    redraw(vcx);
+    let path = picker_pdf(&profile);
+    vcx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.begin_resource_picker(shell_cx).unwrap();
+            shell
+                .complete_resource_picker_path(path, window, shell_cx)
+                .unwrap();
+        });
+    });
+    vcx.run_until_parked();
+    redraw(vcx);
+    manual_save(&view, vcx);
+    let body = |repository: &LibraryRepository| repository.load_note(&note).unwrap().unwrap();
+    let inserted = body(&repository);
+    assert!(
+        inserted
+            .body_html
+            .starts_with("<h2>前<a data-joplin-lite-inline-attachment"),
+        "{}",
+        inserted.body_html
+    );
+    assert!(
+        inserted.body_html.contains("<img"),
+        "{}",
+        inserted.body_html
+    );
+    assert_eq!(inserted.resource_ids.len(), 2);
+
+    vcx.simulate_keystrokes("cmd-z");
+    redraw(vcx);
+    manual_save(&view, vcx);
+    let undone = body(&repository);
+    assert!(
+        !undone.body_html.contains("inline-attachment")
+            && undone.body_html.starts_with("<h2>前<img"),
+        "{}",
+        undone.body_html
+    );
+
+    vcx.simulate_keystrokes("cmd-shift-z");
+    redraw(vcx);
+    manual_save(&view, vcx);
+    assert_eq!(body(&repository).body_html, inserted.body_html);
+}

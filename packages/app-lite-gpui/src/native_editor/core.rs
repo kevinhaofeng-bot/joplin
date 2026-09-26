@@ -1522,7 +1522,7 @@ impl EditorCore {
     }
 
     /// Measure an image embedded in one semantic text/list parent. Canonical
-    /// Inline::Image has no durable size field, so this is a layout update,
+    /// Inline::Image stores no natural size, so this is a layout update,
     /// not a body edit or a history/save event.
     pub(crate) fn measure_inline_group_images(
         &mut self,

@@ -4672,6 +4672,53 @@ mod tests {
         assert_eq!(doc.semantic_snapshot(), before);
     }
     #[test]
+    fn inline_group_attachment_survives_typing_and_cross_parent_delete_with_exact_undo() {
+        let canonical = app_lite_core::CanonicalDocument::parse_html(
+            "<ul><li>一<a data-joplin-lite-inline-attachment=\"true\" href=\":/cccccccccccccccccccccccccccccccc\" data-filename=\"f.pdf\" data-media-type=\"application/pdf\">f.pdf</a>二</li></ul><h2>三四</h2>",
+        )
+        .unwrap();
+        let mut doc = crate::native_editor::codec::import_canonical(&canonical).unwrap();
+        let html = |doc: &super::Document| {
+            crate::native_editor::codec::export_canonical(doc)
+                .expect("every step stays saveable")
+                .to_canonical_html()
+                .as_str()
+                .to_owned()
+        };
+        assert_eq!(html(&doc), canonical.to_canonical_html().as_str());
+        let before = doc.semantic_snapshot();
+        let point = |node_id, utf8_offset| super::DocPoint {
+            node_id,
+            utf8_offset,
+            affinity: super::Affinity::After,
+        };
+        let ids: Vec<_> = doc.blocks().iter().map(|block| block.id).collect();
+        let typed = doc
+            .apply(super::Transaction::InsertText {
+                selection: super::Selection::caret(point(ids[2], 0)),
+                text: "后".into(),
+            })
+            .unwrap();
+        let typed_html = html(&doc);
+        assert!(typed_html.contains("f.pdf</a>后二</li>"), "{typed_html}");
+        doc.apply_batch(typed.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
+
+        let deleted = doc
+            .apply(super::Transaction::DeleteRange {
+                selection: super::Selection::new(point(ids[0], 0), point(ids[3], 3)),
+            })
+            .unwrap();
+        let deleted_html = html(&doc);
+        assert!(
+            !deleted_html.contains("inline-attachment") && deleted_html.contains("四"),
+            "{deleted_html}"
+        );
+        doc.apply_batch(deleted.inverse).unwrap();
+        assert_eq!(doc.semantic_snapshot(), before);
+        assert_eq!(html(&doc), canonical.to_canonical_html().as_str());
+    }
+    #[test]
     fn inline_group_style_applies_to_parent_and_cross_merge_undo_keeps_owners() {
         let mut doc = super::Document::from_paragraphs(["a", "b", "c", "d"]);
         let ids: Vec<_> = doc.blocks().iter().map(|block| block.id).collect();
