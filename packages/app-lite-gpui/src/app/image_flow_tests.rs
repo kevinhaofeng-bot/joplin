@@ -1752,6 +1752,18 @@ async fn mounted_image_resize_handle_commits_one_undoable_width_that_persists(
             .map(|b| f32::from(b.size.width).round()),
         Some(200.0)
     );
+    // The image stays selected after the resize (Evernote keeps its
+    // NodeSelection): Backspace removes it, undo brings it back.
+    cx.simulate_keystrokes("backspace");
+    redraw(cx);
+    assert!(
+        !view
+            .read_with(cx, |shell, app| shell.image_flow_probe_for_test(app))
+            .has_image_block,
+        "the resized image must still be selected"
+    );
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
 
     cx.simulate_keystrokes("cmd-z");
     redraw(cx);

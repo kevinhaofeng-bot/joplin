@@ -2432,6 +2432,34 @@ impl EditorCore {
     pub fn insert_paragraph_break(&mut self) -> Result<(), DocumentError> {
         self.ensure_editable()?;
         let selection = self.selection;
+        // Evernote list/keymap.ts handleEnter: an empty item outdents, and a
+        // top-level empty item leaves the list, instead of adding another.
+        if selection.is_caret()
+            && let Some(index) = self.block_index(selection.head.node_id)
+        {
+            let block = &self.document.blocks()[index];
+            let depth = match block.kind {
+                BlockKind::BulletItem { depth }
+                | BlockKind::OrderedItem { depth }
+                | BlockKind::CheckItem { depth, .. } => Some(depth),
+                _ => None,
+            };
+            if let Some(depth) = depth
+                && block.content.as_text() == Some("")
+                && !self.document.is_inline_group_continuation(block.id)
+            {
+                let transaction = if depth > 0 {
+                    Transaction::OutdentList { selection }
+                } else {
+                    Transaction::SetBlockKind {
+                        selection,
+                        kind: BlockKind::Paragraph,
+                    }
+                };
+                self.apply(transaction)?;
+                return Ok(());
+            }
+        }
         let point = if selection.is_caret() {
             selection.head
         } else {
@@ -2576,10 +2604,14 @@ impl EditorCore {
             return Ok(false);
         }
         let width = width.round() as u32;
+        let selection = self.selection;
         self.apply(Transaction::SetImageDisplayWidth {
             node_id: drag.node_id,
             display_width: Some(width),
         })?;
+        // The node is unchanged, so its selection stays valid (Evernote
+        // keeps the image selected after a resize).
+        self.selection = selection;
         Ok(true)
     }
 
@@ -2593,10 +2625,12 @@ impl EditorCore {
             return Ok(false);
         };
         self.image_resize = None;
+        let selection = self.selection;
         self.apply(Transaction::SetImageDisplayWidth {
             node_id,
             display_width: None,
         })?;
+        self.selection = selection;
         Ok(true)
     }
 

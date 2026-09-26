@@ -7891,3 +7891,60 @@ fn failed_optimistic_resource_replays_selected_text_and_later_input(cx: &mut gpu
         "redo must never resurrect the rejected resource transaction"
     );
 }
+
+/// Evernote `list/keymap.ts` handleEnter: Enter on an empty list item
+/// outdents it (a nested item) or leaves the list (a top-level item).
+#[gpui::test]
+fn enter_on_an_empty_list_item_outdents_or_leaves_the_list(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let mut editor = EditorCore::for_test_paragraphs(["一"], cx);
+    editor.select_all();
+    catalogue
+        .execute(
+            EditorCommand::OrderedList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    editor.move_end();
+    editor.insert_paragraph_break().unwrap();
+    assert_eq!(
+        editor.document().block_kinds(),
+        vec![
+            BlockKind::OrderedItem { depth: 0 },
+            BlockKind::OrderedItem { depth: 0 }
+        ]
+    );
+    editor.insert_paragraph_break().unwrap();
+    assert_eq!(
+        editor.document().block_kinds(),
+        vec![BlockKind::OrderedItem { depth: 0 }, BlockKind::Paragraph],
+        "an empty top-level item leaves the list"
+    );
+    editor.undo().unwrap();
+    assert_eq!(
+        editor.document().block_kinds(),
+        vec![
+            BlockKind::OrderedItem { depth: 0 },
+            BlockKind::OrderedItem { depth: 0 }
+        ],
+        "one undo step"
+    );
+
+    // Nested empty item: outdent one level first.
+    catalogue
+        .execute(
+            EditorCommand::IndentList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    editor.insert_paragraph_break().unwrap();
+    assert_eq!(
+        editor.document().block_kinds(),
+        vec![
+            BlockKind::OrderedItem { depth: 0 },
+            BlockKind::OrderedItem { depth: 0 }
+        ]
+    );
+}
