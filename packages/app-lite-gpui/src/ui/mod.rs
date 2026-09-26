@@ -6580,6 +6580,8 @@ impl Render for LibraryShell {
                 shell.apply_action(AppAction::CopySelectedNote, window, cx);
             }))
             .on_action(cx.listener(Self::restore_library_action))
+            .on_action(cx.listener(Self::export_library_readable_action))
+            .on_action(cx.listener(Self::restore_library_readable_action))
             .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_find_in_note))
             .on_action(cx.listener(Self::find_next_in_note))

@@ -8,7 +8,8 @@
 use crate::app::save_coordinator::FlushReason;
 use crate::app::{
     BackupLibrary, CopyNote, CreateNote, CycleListViewMode, CycleSort, ExportCurrentNote,
-    ImportLibrary, RestoreLibrary, SyncCurrent, ToggleNoteList, ToggleSidebar, TrashSelected,
+    ExportLibraryReadable, ImportLibrary, RestoreLibrary, RestoreLibraryReadable, SyncCurrent,
+    ToggleNoteList, ToggleSidebar, TrashSelected,
 };
 use crate::components::QuitApplication;
 use crate::file_url::parse_file_url;
@@ -152,6 +153,8 @@ pub(crate) fn library_menu() -> Menu {
             MenuItem::action("导入 Evernote / Joplin 资料…", ImportLibrary),
             MenuItem::action("备份整个资料库…", BackupLibrary),
             MenuItem::action("恢复到新资料库…", RestoreLibrary),
+            MenuItem::action("导出整个资料库为可读 HTML…", ExportLibraryReadable),
+            MenuItem::action("从可读导出恢复到新资料库…", RestoreLibraryReadable),
             MenuItem::separator(),
             MenuItem::action("退出 Joplin Lite", QuitApplication),
         ],

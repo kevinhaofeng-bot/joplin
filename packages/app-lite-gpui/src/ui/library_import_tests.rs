@@ -180,6 +180,79 @@ async fn mounted_backup_then_restore_creates_a_new_library_and_keeps_the_active_
 }
 
 #[gpui::test]
+async fn mounted_readable_export_then_restore_creates_a_new_library(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    cx.dispatch_action(crate::app::CreateNote);
+    cx.run_until_parked();
+    let before = library_counts(&fixture.base).unwrap();
+    let bundle = fixture.base.parent().unwrap().join("可读导出");
+
+    cx.dispatch_action(crate::app::ExportLibraryReadable);
+    cx.run_until_parked();
+    let target = bundle.clone();
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_library_readable_export_picker_for_test(Ok(Some(target)), shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    let message = notice(&view, cx);
+    assert!(message.contains("可读导出完成"), "{message}");
+    assert!(bundle.join("index.html").is_file());
+    assert!(bundle.join("manifest.json").is_file());
+
+    cx.dispatch_action(crate::app::RestoreLibraryReadable);
+    cx.run_until_parked();
+    let source = bundle.clone();
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_library_readable_restore_picker_for_test(Ok(Some(source)), shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    let message = notice(&view, cx);
+    assert!(message.contains("恢复完成"), "{message}");
+    let restored = view
+        .read_with(cx, |shell, _| shell.imported_library_ready_for_test())
+        .expect("restored library ready to open");
+    assert!(restored.starts_with(fixture.base.parent().unwrap().join("imported-libraries")));
+    assert_eq!(library_counts(&restored).unwrap().notes, before.notes);
+    assert_eq!(library_counts(&fixture.base).unwrap(), before);
+}
+
+#[gpui::test]
+async fn mounted_readable_restore_of_a_non_bundle_leaves_no_new_library(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    let bogus = fixture.base.parent().unwrap().join("不是导出");
+    std::fs::create_dir_all(&bogus).unwrap();
+
+    cx.dispatch_action(crate::app::RestoreLibraryReadable);
+    cx.run_until_parked();
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_library_readable_restore_picker_for_test(Ok(Some(bogus)), shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    let message = notice(&view, cx);
+    assert!(message.contains("恢复未完成"), "{message}");
+    assert!(
+        view.read_with(cx, |shell, _| shell.imported_library_ready_for_test())
+            .is_none()
+    );
+    let imports = fixture.base.parent().unwrap().join("imported-libraries");
+    let leftovers = std::fs::read_dir(&imports)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        leftovers, 0,
+        "a failed restore must not leave an empty library"
+    );
+}
+
+#[gpui::test]
 async fn mounted_copy_note_menu_action_creates_and_selects_a_copy(cx: &mut TestAppContext) {
     let fixture = fixture();
     let (view, cx) = mount(&fixture, cx);

@@ -24,6 +24,8 @@ pub(super) enum LibraryJob {
     Import,
     Backup,
     Restore,
+    ReadableExport,
+    ReadableRestore,
 }
 
 pub(super) struct PendingLibraryImport {

@@ -4,13 +4,17 @@
 //! background. Restore never replaces a library: it verifies the backup and
 //! publishes it under `imported-libraries/`, reusing the "打开导入的资料库"
 //! switch from the import flow.
+//!
+//! The readable export is a second, human-browsable format (HTML pages plus
+//! original resource bytes); its restore follows the same new-library rule.
 
 use super::library_import::{ImportPhase, LibraryJob, PendingLibraryImport};
 use super::*;
-use crate::app::{BackupLibrary, RestoreLibrary};
+use crate::app::{BackupLibrary, ExportLibraryReadable, RestoreLibrary, RestoreLibraryReadable};
 use crate::library_profile::LibraryProfiles;
 use app_lite_core::{
-    BackupError, BackupReport, PublishedLibrary, backup_library, restore_library_backup,
+    BackupError, BackupReport, LibraryReadableReport, PublishedLibrary, ReadableExportError,
+    backup_library, export_library_readable, restore_library_backup, restore_library_readable,
     unique_library_destination,
 };
 use std::sync::atomic::AtomicBool;
@@ -60,7 +64,15 @@ impl LibraryShell {
         cx.notify();
         #[cfg(not(test))]
         if let Some(handle) = window.window_handle().downcast::<LibraryShell>() {
-            cx.defer(move |app| prompt_for_backup_target(handle, token, app));
+            cx.defer(move |app| {
+                prompt_for_new_directory(
+                    handle,
+                    token,
+                    "Joplin-Lite-资料库备份",
+                    LibraryShell::complete_library_backup_picker,
+                    app,
+                )
+            });
         }
         #[cfg(test)]
         let _ = (window, token);
@@ -81,10 +93,208 @@ impl LibraryShell {
         cx.notify();
         #[cfg(not(test))]
         if let Some(handle) = window.window_handle().downcast::<LibraryShell>() {
-            cx.defer(move |app| prompt_for_backup_source(handle, token, app));
+            cx.defer(move |app| {
+                prompt_for_existing_directory(
+                    handle,
+                    token,
+                    LibraryShell::complete_library_restore_picker,
+                    app,
+                )
+            });
         }
         #[cfg(test)]
         let _ = (window, token);
+    }
+
+    pub(super) fn export_library_readable_action(
+        &mut self,
+        _: &ExportLibraryReadable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_library_import.is_some() {
+            return;
+        }
+        if !self.flush_active_session(FlushReason::Export, cx) {
+            self.library_import_notice = Some(ExportNotice::Error(
+                "当前笔记尚未保存完成，暂不能导出；请稍后再试。".into(),
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(token) = self.begin_library_job(LibraryJob::ReadableExport, cx) else {
+            return;
+        };
+        self.library_import_notice = Some(ExportNotice::Status(
+            "请选择一个尚不存在的导出目录。导出为可直接用浏览器阅读的 HTML，含全部笔记（含回收站）、历史版本与附件原文件。"
+                .into(),
+        ));
+        cx.notify();
+        #[cfg(not(test))]
+        if let Some(handle) = window.window_handle().downcast::<LibraryShell>() {
+            cx.defer(move |app| {
+                prompt_for_new_directory(
+                    handle,
+                    token,
+                    "Joplin-Lite-可读导出",
+                    LibraryShell::complete_library_readable_export_picker,
+                    app,
+                )
+            });
+        }
+        #[cfg(test)]
+        let _ = (window, token);
+    }
+
+    pub(super) fn restore_library_readable_action(
+        &mut self,
+        _: &RestoreLibraryReadable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(token) = self.begin_library_job(LibraryJob::ReadableRestore, cx) else {
+            return;
+        };
+        self.library_import_notice = Some(ExportNotice::Status(
+            "请选择一个可读导出目录。它将恢复为新的资料库，当前资料库不变。".into(),
+        ));
+        cx.notify();
+        #[cfg(not(test))]
+        if let Some(handle) = window.window_handle().downcast::<LibraryShell>() {
+            cx.defer(move |app| {
+                prompt_for_existing_directory(
+                    handle,
+                    token,
+                    LibraryShell::complete_library_readable_restore_picker,
+                    app,
+                )
+            });
+        }
+        #[cfg(test)]
+        let _ = (window, token);
+    }
+
+    fn complete_library_readable_export_picker(
+        &mut self,
+        token: u64,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((target, _cancel)) =
+            self.take_picker(token, LibraryJob::ReadableExport, selection, cx)
+        else {
+            return;
+        };
+        // A late edit after the picker opened would make the export refuse
+        // ("unsaved edits must be flushed"); flush again at the real boundary.
+        if !self.flush_active_session(FlushReason::Export, cx) {
+            self.pending_library_import = None;
+            self.library_import_notice = Some(ExportNotice::Error(
+                "当前笔记尚未保存完成，暂不能导出；请稍后再试。".into(),
+            ));
+            cx.notify();
+            return;
+        }
+        let repository = self.model.read(cx).repository();
+        self.library_import_notice = Some(ExportNotice::Status(format!(
+            "正在后台导出整个资料库到 {}…",
+            target.display()
+        )));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let job_target = target.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { export_library_readable(&repository, &job_target) })
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                shell.finish_library_readable_export(token, target, result, shell_cx);
+            });
+        })
+        .detach();
+    }
+
+    fn complete_library_readable_restore_picker(
+        &mut self,
+        token: u64,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((bundle, _cancel)) =
+            self.take_picker(token, LibraryJob::ReadableRestore, selection, cx)
+        else {
+            return;
+        };
+        let Some(imports_dir) = cx
+            .try_global::<LibraryProfiles>()
+            .map(LibraryProfiles::imports_dir)
+        else {
+            self.pending_library_import = None;
+            return;
+        };
+        self.library_import_notice = Some(ExportNotice::Status(
+            "正在后台校验可读导出并恢复为新资料库…".into(),
+        ));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { restore_readable_into_new_library(&imports_dir, &bundle) })
+                .await;
+            let _ = this.update(cx, |shell, shell_cx| {
+                shell.finish_library_readable_restore(token, result, shell_cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_library_readable_export(
+        &mut self,
+        token: u64,
+        target: PathBuf,
+        result: Result<LibraryReadableReport, ReadableExportError>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.finish_pending(token) {
+            return;
+        }
+        self.library_import_notice = Some(match result {
+            Ok(report) => ExportNotice::Status(format!(
+                "可读导出完成：{} 篇笔记、{} 个附件文件，位于 {}。用浏览器打开其中的 index.html 即可阅读。",
+                report.note_count,
+                report.resource_count,
+                target.display()
+            )),
+            Err(error) => ExportNotice::Error(format!("可读导出未完成：{error}。资料库未改动。")),
+        });
+        cx.notify();
+    }
+
+    fn finish_library_readable_restore(
+        &mut self,
+        token: u64,
+        result: Result<(PathBuf, LibraryReadableReport), ReadableExportError>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.finish_pending(token) {
+            return;
+        }
+        self.library_import_notice = Some(match result {
+            Ok((path, report)) => {
+                let message = format!(
+                    "恢复完成：{} 篇笔记、{} 个附件，已保存为新资料库 {}。当前资料库未改动。",
+                    report.note_count,
+                    report.resource_count,
+                    path.display()
+                );
+                self.imported_library_ready = Some(path);
+                ExportNotice::Status(message)
+            }
+            Err(error) => ExportNotice::Error(format!(
+                "恢复未完成：{error}。未创建新资料库，当前资料库未改动。"
+            )),
+        });
+        cx.notify();
     }
 
     /// Returns the cancel flag when `token`/`job` are the pending picker.
@@ -271,6 +481,26 @@ impl LibraryShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn complete_library_readable_export_picker_for_test(
+        &mut self,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let token = self.next_library_import_token;
+        self.complete_library_readable_export_picker(token, selection, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_library_readable_restore_picker_for_test(
+        &mut self,
+        selection: Result<Option<PathBuf>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let token = self.next_library_import_token;
+        self.complete_library_readable_restore_picker(token, selection, cx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn complete_library_backup_picker_for_test(
         &mut self,
         selection: Result<Option<PathBuf>, String>,
@@ -291,12 +521,39 @@ impl LibraryShell {
     }
 }
 
+/// Restores into a fresh directory under `imports_dir`; a failed restore
+/// removes that directory so no empty library is left behind.
+fn restore_readable_into_new_library(
+    imports_dir: &std::path::Path,
+    bundle: &std::path::Path,
+) -> Result<(PathBuf, LibraryReadableReport), ReadableExportError> {
+    std::fs::create_dir_all(imports_dir)?;
+    let destination = unique_library_destination(imports_dir, bundle)?;
+    std::fs::create_dir(&destination)?;
+    match restore_library_readable(bundle, &destination) {
+        Ok(report) => Ok((destination, report)),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&destination);
+            Err(error)
+        }
+    }
+}
+
+type PickerCompletion =
+    fn(&mut LibraryShell, u64, Result<Option<PathBuf>, String>, &mut Context<LibraryShell>);
+
 #[cfg(not(test))]
-fn prompt_for_backup_target(window: WindowHandle<LibraryShell>, token: u64, cx: &mut App) {
+fn prompt_for_new_directory(
+    window: WindowHandle<LibraryShell>,
+    token: u64,
+    suggested_name: &str,
+    complete: PickerCompletion,
+    cx: &mut App,
+) {
     let default_dir = directories::UserDirs::new()
         .and_then(|dirs| dirs.document_dir().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let prompt = cx.prompt_for_new_path(&default_dir, Some("Joplin-Lite-资料库备份"));
+    let prompt = cx.prompt_for_new_path(&default_dir, Some(suggested_name));
     cx.spawn(async move |cx| {
         let selection = match prompt.await {
             Ok(Ok(path)) => Ok(path),
@@ -305,7 +562,7 @@ fn prompt_for_backup_target(window: WindowHandle<LibraryShell>, token: u64, cx: 
         };
         let _ = cx.update(move |app| {
             let _ = window.update(app, |shell, _window, shell_cx| {
-                shell.complete_library_backup_picker(token, selection, shell_cx);
+                complete(shell, token, selection, shell_cx);
             });
         });
     })
@@ -313,7 +570,12 @@ fn prompt_for_backup_target(window: WindowHandle<LibraryShell>, token: u64, cx: 
 }
 
 #[cfg(not(test))]
-fn prompt_for_backup_source(window: WindowHandle<LibraryShell>, token: u64, cx: &mut App) {
+fn prompt_for_existing_directory(
+    window: WindowHandle<LibraryShell>,
+    token: u64,
+    complete: PickerCompletion,
+    cx: &mut App,
+) {
     let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
         files: false,
         directories: true,
@@ -328,7 +590,7 @@ fn prompt_for_backup_source(window: WindowHandle<LibraryShell>, token: u64, cx: 
         };
         let _ = cx.update(move |app| {
             let _ = window.update(app, |shell, _window, shell_cx| {
-                shell.complete_library_restore_picker(token, selection, shell_cx);
+                complete(shell, token, selection, shell_cx);
             });
         });
     })

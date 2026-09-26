@@ -16,6 +16,8 @@ gpui::actions!(
         OpenImportedLibrary,
         BackupLibrary,
         RestoreLibrary,
+        ExportLibraryReadable,
+        RestoreLibraryReadable,
         CopyNote,
     ]
 );
