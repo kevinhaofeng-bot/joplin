@@ -208,10 +208,16 @@ impl<'a> Converter<'a> {
                         );
                     }
                     if dest_url.starts_with(":/") {
-                        return self.blocked(
-                            JexBodyBlockerKind::AmbiguousAttachment,
-                            "Resource attachment must occupy its own paragraph",
-                        );
+                        self.url(&dest_url)?;
+                        let Some(resource) = self.resource(&dest_url).cloned() else {
+                            return self.blocked(
+                                JexBodyBlockerKind::InternalNoteLink,
+                                "Internal link is not a verified attachment resource",
+                            );
+                        };
+                        let label = self.inlines(TagEnd::Link, marks.clone(), true)?;
+                        self.resource_inline(resource, label, &marks, &mut out);
+                        continue;
                     }
                     // An empty or in-note fragment target points nowhere the
                     // product can represent; the link text is the content.
@@ -306,10 +312,24 @@ impl<'a> Converter<'a> {
     }
 
     fn paragraph(&mut self) -> Result<Block> {
-        // A verified PDF link is only representable as a whole-block card.
+        // A paragraph that is exactly `[filename](:/id)` is a whole-block card;
+        // any other resource link stays inline (see resource_inline).
+        let standalone_card = matches!(
+            (
+                self.events.get(self.cursor + 1),
+                self.events.get(self.cursor + 2),
+                self.events.get(self.cursor + 3),
+            ),
+            (Some(Event::Text(label)), Some(Event::End(TagEnd::Link)), Some(Event::End(TagEnd::Paragraph)))
+                if matches!(self.peek(), Some(Event::Start(Tag::Link { dest_url, .. }))
+                    if self.resource(dest_url).is_some_and(|resource| {
+                        !resource.mime.starts_with("image/") && resource.filename == label.as_ref()
+                    }))
+        );
         if let Some(Event::Start(Tag::Link {
             dest_url, title, ..
         })) = self.peek().cloned()
+            && standalone_card
         {
             if dest_url.starts_with(":/") {
                 if !title.is_empty() {
@@ -359,6 +379,48 @@ impl<'a> Converter<'a> {
             style: BlockStyle::default(),
             inlines,
         })
+    }
+
+    /// Joplin resource link inside text. The resource keeps its position; a
+    /// label other than the filename stays visible before it.
+    fn resource_inline(
+        &mut self,
+        resource: JexVerifiedResource,
+        label: Vec<Inline>,
+        context: &Marks,
+        out: &mut Vec<Inline>,
+    ) {
+        let plain: String = label
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        let only_filename = plain == resource.filename
+            && label
+                .iter()
+                .all(|inline| matches!(inline, Inline::Text { marks, .. } if marks == context));
+        if !only_filename {
+            out.extend(label);
+        }
+        self.occurrences.push(resource.destination_id.clone());
+        if matches!(
+            resource.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            out.push(Inline::Image {
+                resource_id: resource.destination_id,
+                alt: resource.filename,
+                display_width: None,
+            });
+        } else {
+            out.push(Inline::Attachment {
+                resource_id: resource.destination_id,
+                filename: resource.filename,
+                media_type: resource.mime,
+            });
+        }
     }
 
     fn list(&mut self, ordered_start: Option<u64>) -> Result<Block> {

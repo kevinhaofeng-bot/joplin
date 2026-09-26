@@ -328,10 +328,6 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
         ),
         ("[相对](../other.md)".into(), JexBodyBlockerKind::UnsafeLink),
         (
-            format!("前[附件.pdf](:/{PDF})后"),
-            JexBodyBlockerKind::AmbiguousAttachment,
-        ),
-        (
             format!("![附件.pdf](:/{PDF})"),
             JexBodyBlockerKind::AmbiguousAttachment,
         ),
@@ -431,4 +427,80 @@ fn html_semantic_blocks_keep_quote_code_and_divider() {
         CanonicalDocument::parse_html(&result.canonical_html).unwrap(),
         result.document
     );
+}
+
+/// Joplin writes resource links anywhere in text (`[label](:/id)`). They keep
+/// their position as inline cards/images; a label that differs from the
+/// verified filename stays visible as text before the resource.
+#[test]
+fn inline_resource_links_keep_position_label_and_resource() {
+    let card = |id: &str, name: &str, mime: &str| {
+        format!(
+            "<a data-joplin-lite-inline-attachment=\"true\" href=\":/{id}\" data-filename=\"{name}\" data-media-type=\"{mime}\">{name}</a>"
+        )
+    };
+    let pdf = card(TARGET_PDF, "附件.pdf", "application/pdf");
+    let cases: Vec<(String, String, Vec<&str>)> = vec![
+        (
+            format!("前[附件.pdf](:/{PDF})后"),
+            format!("<p>前{pdf}后</p>"),
+            vec![TARGET_PDF],
+        ),
+        (
+            format!("见[合同](:/{PDF})。"),
+            format!("<p>见合同{pdf}。</p>"),
+            vec![TARGET_PDF],
+        ),
+        (
+            format!("[**合同**](:/{PDF})"),
+            format!("<p><strong>合同</strong>{pdf}</p>"),
+            vec![TARGET_PDF],
+        ),
+        (
+            format!("**[附件.pdf](:/{PDF})**"),
+            format!("<p>{pdf}</p>"),
+            vec![TARGET_PDF],
+        ),
+        (
+            format!("[附件.pdf](:/{PDF}) 说明"),
+            format!("<p>{pdf} 说明</p>"),
+            vec![TARGET_PDF],
+        ),
+        (
+            format!("- 项[附件.pdf](:/{PDF})\n- 二"),
+            format!("<ul><li>项{pdf}</li><li>二</li></ul>"),
+            vec![TARGET_PDF],
+        ),
+        (
+            format!("## 标题[附件.pdf](:/{PDF})"),
+            format!("<h2>标题{pdf}</h2>"),
+            vec![TARGET_PDF],
+        ),
+        (
+            format!("看[元数据文件名.png](:/{IMAGE})和[证据.txt](:/{TEXT_FILE})"),
+            format!(
+                "<p>看<img src=\":/{TARGET_IMAGE}\" alt=\"元数据文件名.png\">和{}</p>",
+                card(TARGET_TEXT_FILE, "证据.txt", "text/plain")
+            ),
+            vec![TARGET_IMAGE, TARGET_TEXT_FILE],
+        ),
+    ];
+    for (body, html, occurrences) in cases {
+        let converted = convert_jex_note_body(NOTE, "inline.md", 1, &body, &resources())
+            .unwrap_or_else(|error| panic!("body={body}: {error:?}"));
+        assert_eq!(converted.canonical_html, html, "body={body}");
+        assert_eq!(
+            converted.ordered_resource_occurrences,
+            occurrences
+                .into_iter()
+                .map(|id| ResourceId::new(id).unwrap())
+                .collect::<Vec<_>>(),
+            "body={body}"
+        );
+        assert_eq!(
+            CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+            converted.document,
+            "body={body}"
+        );
+    }
 }
