@@ -106,6 +106,8 @@ Codex 已独立核验 `becdff6d6`：core 345 通过；GUI 1362 通过、1 忽略
 说明：第一次运行 `backup_verify` 因工作目录不存在报 `TargetParentMissing`（退出101）；创建目录后重跑通过，属于调用方式问题，不是产品缺陷。原生审计编译时工作树里有另一会话未提交的 `app-lite-gpui/src/native_editor/toolbar.rs`，审计入口与它无关，但仍不是纯净构建。原生审计只比较资源顺序和文字，不代替排版、表格的视觉验收。
 
 | 多段落引用 → 相邻多个引用块（只含段落时）；含列表或标题的引用仍阻断 | `cd9405a04` | 1444 / 222 |
+| 同类嵌套 Markdown 列表 → 列表项 `indent` = 嵌套层级（原生 depth，上限 8，依赖另一会话 `24d5a632c`）；异类嵌套、超 8 层、项内第二个块仍阻断。`[![alt](:/img)](url)` 与 `<a href><img></a>` → 图片 `link`（依赖另一会话 `ef8517cf1`）；链到资源或片段的仍阻断 | `6af36711c` | 1500 / 166 |
+| 非图片资源用图片语法 `![名](:/pdf)` → 原位附件卡片（alt 与文件名不同时保留为文字）；在外链内时仍阻断 | `451f556a8` | 1502 / 164 |
 
 ### 剩余警告的真实分布（HEAD `6bff4936c`，只读探针）
 
@@ -192,3 +194,26 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 
 - Claude 实施状态：阶段2 进行中（core 部分已提交，待验收）
 - Codex 验收状态：未验收
+
+## 与另一会话协作完成的原生支持（A/B）
+
+- A（另一会话 `24d5a632c`）：确认“列表缩进后自动保存失败”属实并修复——codec 双向映射列表项 depth ↔ canonical `ListItem.style.indent`，原生 `MAX_LIST_DEPTH` 64→8 与 `data-indent` 上限一致；段落缩进仍拒绝。
+- B（另一会话 `ef8517cf1`）：canonical `Inline::Image`/`Block::Image` 与原生 `BlockContent::Image` 新增 `link: Option<String>`，序列化 `<a href><img></a>`，经 `valid_link` 过滤；本版不做 Cmd 点击打开链接。该会话在 `jex_body.rs`/`jex_html.rs` 只做了补 `link: None` 的机械修改。
+- 协作过程：B 期间本会话按约定暂停修改 `document.rs`/`jex_body.rs`/`jex_html.rs`；本会话唯一未提交文件 `tests/jex_body_conversion.rs`（嵌套列表 RED 测试）未被纳入对方提交。
+
+本会话 `6af36711c` 的导入映射与测试：
+- `jex_body.rs`：`list_items()` 递归展开同类嵌套列表；紧凑列表项的行内文字在嵌套列表开始处结束。Markdown 图片在外链内时取链接 mark 作为图片 `link`。
+- `jex_html.rs`：`image()` 接收外层链接，写入 `link`。
+- 测试：`same_kind_nested_markdown_list_keeps_levels_as_item_indent`（先失败：旧代码对 `- 一\n  - 二` 报阻断）；`linked_resource_image_keeps_its_external_link`（先失败：`LinkedImage`）。原“嵌套列表必阻断”“外链包图片必阻断”两条旧断言按新能力删除或改为“链到另一资源仍阻断”。core 全套 355 通过，日志 `/tmp/joplin-stage2-claude/core-links-lists.log`。
+
+### `6af36711c` 的新鲜隔离导入与原生审计
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| `import_verify`：JEX 副本 → `/tmp/joplin-stage2-import4.1wdHFf/imports` | 退出0，90.3 s；1666/31/2/64/425/4153/4127；**降级 166**（与只读审计 1500/166 一致）；发布 blob 0 不符，源 blob 缺失 0、多余 0 | `/tmp/joplin-stage2-import4.1wdHFf/verify.log` |
+| `sqlite3 -readonly …/library.sqlite "select count(*) from notes where body_html like '%<a href=%><img%'"` 与 `… like '%<li data-indent=%'` | 含带链接图片的笔记 242 篇；含缩进列表项的笔记 13 篇（说明新结构确实进入了正文） | `/tmp/joplin-stage2-import4.1wdHFf/structure-counts.txt` |
+| 原生加载/回写审计 → `/tmp/joplin-stage2-import4.1wdHFf/imports/all_notebooks-1790460896/library.sqlite` | 退出0；`real-copy notes=1666, failure_categories={}`，上述 242/13 篇均能原生打开并回写 | `/tmp/joplin-stage2-import4.1wdHFf/native-audit.log` |
+
+注意：这次原生审计的构建包含另一会话尚未提交的 C 菜单改动（`app/actions.rs`、`library_menu.rs`、`ui/library_backup.rs`、`ui/library_import.rs`、`ui/library_import_tests.rs`、`ui/mod.rs`，见 `/tmp/joplin-stage2-import4.1wdHFf/gpui-dirty.txt`），不是纯净构建。审计入口不经过菜单，但 Codex 仍需在干净检出上复核。`451f556a8` 这一步（+2 篇）只重跑了只读审计和 core 全套（356 通过，`/tmp/joplin-stage2-claude/core-nonimage.log`），没有另做新鲜导入。
+
+剩余 164 篇降级，已按收益发给负责 `app-lite-gpui` 的会话排期：表格 64、H4–H6 14、有序列表起始号 12、行内数学约 12、外链图片约 11（是否联网抓取涉及隐私，建议保持降级，由用户决定）。
