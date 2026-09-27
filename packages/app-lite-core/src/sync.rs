@@ -13,8 +13,10 @@ use app_lite_protocol::{
 
 use crate::{LibraryError, LibraryRepository, SyncFailure};
 
-/// Stays under the protocol's 4 MiB push body with room for the envelope.
-const MAX_PUSH_BATCH_BYTES: usize = 3 * 1024 * 1024;
+/// One request must finish within the transport's 120 s timeout on a weak
+/// link (1 MiB at ~20 KB/s is ~50 s); a larger batch there would time out
+/// and be resent forever. A single op larger than this still goes alone.
+const MAX_PUSH_BATCH_BYTES: usize = 1024 * 1024;
 /// Attachment transfer unit; the HTTP layer allows 4 MiB.
 const BLOB_CHUNK_BYTES: u64 = 1024 * 1024;
 

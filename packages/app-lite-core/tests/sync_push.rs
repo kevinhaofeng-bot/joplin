@@ -258,3 +258,66 @@ fn an_upload_leaves_the_cursor_at_the_server_head_without_counting_downloads() {
     // The change notification for our own upload then reads as seen.
     assert_eq!(repo.sync_cursor().unwrap(), store.head());
 }
+
+/// Records the largest push body sent.
+struct MeasuresPushes<'a> {
+    inner: &'a ServerStore,
+    largest: Cell<usize>,
+}
+
+impl SyncTransport for MeasuresPushes<'_> {
+    fn push(&self, request: &PushRequest) -> Result<PushResponse, TransportError> {
+        let size = serde_json::to_vec(request).unwrap().len();
+        self.largest.set(self.largest.get().max(size));
+        SyncTransport::push(self.inner, request)
+    }
+    fn pull(&self, request: &PullRequest) -> Result<PullResponse, TransportError> {
+        SyncTransport::pull(self.inner, request)
+    }
+    fn blob_status(&self, sha256: &str) -> Result<BlobStatus, TransportError> {
+        SyncTransport::blob_status(self.inner, sha256)
+    }
+    fn put_chunk(
+        &self,
+        sha256: &str,
+        size: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<BlobStatus, TransportError> {
+        SyncTransport::put_chunk(self.inner, sha256, size, offset, bytes)
+    }
+    fn read_range(&self, sha256: &str, offset: u64, len: u64) -> Result<Vec<u8>, TransportError> {
+        SyncTransport::read_range(self.inner, sha256, offset, len)
+    }
+}
+
+#[test]
+fn uploads_are_split_into_requests_a_weak_link_can_finish() {
+    let server_root = tempdir().unwrap();
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let root = tempdir().unwrap();
+    let repo = open(root.path());
+    for index in 0..12 {
+        repo.create_note(CreateNote {
+            title: format!("长笔记 {index}"),
+            notebook_id: None,
+            document: text(&"a".repeat(200 * 1024)),
+        })
+        .unwrap();
+    }
+    let transport = MeasuresPushes {
+        inner: &store,
+        largest: Cell::new(0),
+    };
+    sync::sync_once(&repo, &transport).unwrap();
+    assert_eq!(
+        repo.sync_pending_count().unwrap(),
+        0,
+        "all sent in one sync"
+    );
+    assert!(
+        transport.largest.get() <= 1024 * 1024 + 64 * 1024,
+        "largest push {} bytes",
+        transport.largest.get()
+    );
+}
