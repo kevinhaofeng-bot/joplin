@@ -387,10 +387,156 @@ fn table_inventory(db: &Connection) -> Result<(), Box<dyn std::error::Error>> {
             notes_with_tables += 1;
         }
     }
+    table_source_checks(db)?;
     println!("tables notes={notes_with_tables} tables={tables}");
     println!("tables columns(capped 12)={columns:?}");
     println!("tables rows={rows:?}");
     println!("tables column_alignments={alignments:?}");
     println!("tables in_cell={in_cell:?}");
     Ok(())
+}
+
+/// Source-level checks the table model depends on: GFM rows wider than the
+/// header (the parser drops extra cells), escaped pipes, HTML entities, cell
+/// image targets, size limits, and raw HTML tables with spans, nesting or
+/// block content. Counts only.
+fn table_source_checks(db: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    use pulldown_cmark::{Event as E, Options, Parser, Tag as T, TagEnd};
+    let mut counts = BTreeMap::<&'static str, usize>::new();
+    let mut add = |key: &'static str, value: usize| *counts.entry(key).or_default() += value;
+    let mut statement = db.prepare("SELECT raw_body_bytes FROM jex_stage_note_audit")?;
+    for bytes in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
+        let bytes = bytes?;
+        let body = std::str::from_utf8(&bytes)?;
+        let mut in_cell = false;
+        let mut rows = 0usize;
+        let mut cells = 0usize;
+        let mut header_cells = 0usize;
+        let mut row = 0..0;
+        let mut html = String::new();
+        for (event, range) in Parser::new_ext(body, Options::all()).into_offset_iter() {
+            match &event {
+                E::Start(T::Table(aligns)) => {
+                    rows = 0;
+                    if aligns.len() > 64 {
+                        add("md_table_over_64_columns", 1);
+                    }
+                    let source = &body[range.clone()];
+                    add("md_escaped_pipes", source.matches("\\|").count());
+                    let entity = |text: &str| {
+                        text.split('&')
+                            .skip(1)
+                            .filter(|rest| {
+                                let name: String = rest
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '#')
+                                    .collect();
+                                !name.is_empty() && rest[name.len()..].starts_with(';')
+                            })
+                            .count()
+                    };
+                    add("md_table_html_entities", entity(source));
+                }
+                E::Start(T::TableHead) | E::Start(T::TableRow) => {
+                    rows += 1;
+                    cells = 0;
+                    row = range.clone();
+                }
+                E::End(TagEnd::TableHead) => header_cells = cells,
+                E::End(TagEnd::TableRow) => {
+                    let lost = nonempty_cells_beyond(&body[row.clone()], header_cells);
+                    if lost > 0 {
+                        add("md_rows_losing_nonempty_cells_beyond_header", 1);
+                    }
+                }
+                E::End(TagEnd::Table) if rows > 1000 => add("md_table_over_1000_rows", 1),
+                E::Start(T::TableCell) => {
+                    in_cell = true;
+                    cells += 1;
+                }
+                E::End(TagEnd::TableCell) => in_cell = false,
+                E::Start(T::Image { dest_url, .. }) if in_cell => {
+                    if dest_url.starts_with(":/") {
+                        add("md_cell_images_resource", 1);
+                    } else {
+                        add("md_cell_images_external", 1);
+                    }
+                }
+                E::Html(text) | E::InlineHtml(text) => html.push_str(text),
+                _ => {}
+            }
+        }
+        let lower = html.to_ascii_lowercase();
+        let html_tables = lower.matches("<table").count();
+        add("html_tables", html_tables);
+        if html_tables > 0 {
+            add("html_table_colspan", lower.matches("colspan").count());
+            add("html_table_rowspan", lower.matches("rowspan").count());
+            let mut depth = 0usize;
+            let mut in_cell_depth = 0usize;
+            let mut rest = lower.as_str();
+            while let Some(start) = rest.find('<') {
+                rest = &rest[start + 1..];
+                let closing = rest.starts_with('/');
+                let name: String = rest
+                    .trim_start_matches('/')
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                match (name.as_str(), closing) {
+                    ("table", false) => {
+                        if depth > 0 {
+                            add("html_nested_tables", 1);
+                        }
+                        depth += 1;
+                    }
+                    ("table", true) => depth = depth.saturating_sub(1),
+                    ("td" | "th", false) => in_cell_depth = depth,
+                    ("td" | "th", true) => in_cell_depth = 0,
+                    (
+                        "p" | "div" | "ul" | "ol" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                        | "blockquote" | "pre",
+                        false,
+                    ) if in_cell_depth > 0 => add("html_cell_block_elements", 1),
+                    _ => {}
+                }
+            }
+        }
+    }
+    for (key, value) in counts {
+        println!("table_check {key}={value}");
+    }
+    Ok(())
+}
+
+/// GFM pads short rows but drops cells beyond the header. Re-parse the row
+/// under an 80-column header and count non-empty cells past `header`.
+fn nonempty_cells_beyond(row: &str, header: usize) -> usize {
+    use pulldown_cmark::{Event as E, Options, Parser, Tag as T, TagEnd};
+    let row = row.trim();
+    let row = row.strip_prefix('|').unwrap_or(row);
+    let row = row.strip_suffix('|').unwrap_or(row);
+    let wide = format!("|{}|\n|{}|\n|{}|\n", "a|".repeat(80), "-|".repeat(80), row);
+    let (mut in_body, mut in_cell, mut index, mut lost) = (false, false, 0usize, 0usize);
+    let mut visible = false;
+    for event in Parser::new_ext(&wide, Options::all()) {
+        match event {
+            E::End(TagEnd::TableHead) => in_body = true,
+            E::Start(T::TableCell) if in_body => {
+                in_cell = true;
+                visible = false;
+            }
+            E::End(TagEnd::TableCell) if in_body => {
+                in_cell = false;
+                index += 1;
+                if index > header && visible {
+                    lost += 1;
+                }
+            }
+            E::Text(text) | E::Code(text) if in_cell => visible |= !text.trim().is_empty(),
+            E::Start(T::Image { .. }) | E::Start(T::Link { .. }) if in_cell => visible = true,
+            _ => {}
+        }
+    }
+    lost
 }
