@@ -291,3 +291,80 @@ fn a_malformed_remote_body_is_a_visible_failure_and_does_not_block_later_changes
         "the skipped change is visible"
     );
 }
+
+#[test]
+fn identical_offline_edits_do_not_create_a_conflict_copy() {
+    let (_server_root, store) = server();
+    let a = client();
+    let note = a
+        .repo
+        .create_note(CreateNote {
+            title: "同改".into(),
+            notebook_id: None,
+            document: text("原文"),
+        })
+        .unwrap();
+    sync(&a, &store);
+    let b = client();
+    sync(&b, &store);
+    save(&a, &note.id, "同改", "两边写了一样的字");
+    save(&b, &note.id, "同改", "两边写了一样的字");
+    sync(&a, &store);
+    sync(&b, &store);
+    sync(&a, &store);
+    for device in [&a, &b] {
+        assert_eq!(titles(device), ["同改"], "no copy when the content agrees");
+    }
+}
+
+#[test]
+fn a_library_restored_from_backup_is_a_new_device_that_keeps_unsynced_edits() {
+    let (_server_root, store) = server();
+    let a = client();
+    let note = a
+        .repo
+        .create_note(CreateNote {
+            title: "备份前".into(),
+            notebook_id: None,
+            document: text("已同步"),
+        })
+        .unwrap();
+    sync(&a, &store);
+    // An edit made after the last sync is in the backup but not on the server.
+    save(&a, &note.id, "备份前", "只在备份里的修改");
+    let work = tempdir().unwrap();
+    let backup = work.path().join("backup");
+    app_lite_core::backup_library(
+        a._root.path(),
+        &backup,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let restored_dir = work.path().join("restored");
+    app_lite_core::restore_library_backup(
+        &backup,
+        &restored_dir,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let restored = LibraryRepository::open(restored_dir.join("library.sqlite")).unwrap();
+    assert_ne!(
+        restored.sync_device_id().unwrap(),
+        a.repo.sync_device_id().unwrap(),
+        "a restored library never reuses the old device identity"
+    );
+    sync::sync_once(&restored, &store).unwrap();
+    let b = client();
+    sync(&b, &store);
+    let kept = b
+        .repo
+        .list_notes(ListQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|n| b.repo.load_note(&n.id).unwrap().unwrap())
+        .any(|n| n.body_text.contains("只在备份里的修改"));
+    assert!(
+        kept,
+        "the unsynced edit reaches the server from the restored library"
+    );
+}

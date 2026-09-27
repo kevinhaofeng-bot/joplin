@@ -403,12 +403,16 @@ impl LibraryRepository {
                 accept_inflight(&transaction, &change.op_id, kind, id, change.revision)?;
                 continue;
             }
+            // Local work the server has not confirmed: queued changes, or an
+            // entity that exists here but was never uploaded (a restored or
+            // re-imported library).
             let pending = inflight_op.is_some()
                 || transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE entity_type=?1 AND entity_id=?2)",
                     params![kind, id],
                     |row| row.get::<_, i64>(0),
-                )? != 0;
+                )? != 0
+                || (known == 0 && local_row_exists(&transaction, kind, id)?);
             if pending {
                 // Remote wins the entity: a local note edit survives as its
                 // conflict copy (made from the note row, not the outbox),
@@ -491,7 +495,11 @@ impl LibraryRepository {
             (true, _) => None,
             (false, None) => return Ok(Err(Skip("note change without payload".into()))),
         };
-        let copied = pending && exists;
+        let copied = pending
+            && exists
+            && !remote
+                .as_ref()
+                .is_some_and(|note| note.matches_local(transaction, &note_id).unwrap_or(false));
         if copied {
             self.conflict_copy(transaction, &note_id, change.revision, now)?;
         }
@@ -809,6 +817,34 @@ impl RemoteNote {
         }))
     }
 
+    /// Same visible content as the local note: nothing to keep as a copy.
+    fn matches_local(
+        &self,
+        transaction: &Transaction<'_>,
+        id: &NoteId,
+    ) -> Result<bool, LibraryError> {
+        let local: Option<(String, String, String, i64)> = transaction
+            .query_row(
+                "SELECT title, body_html, notebook_id, deleted_time FROM notes WHERE id=?1",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((title, body_html, notebook_id, deleted_time)) = local else {
+            return Ok(false);
+        };
+        let tags = column(
+            transaction,
+            "SELECT tag_id FROM note_tags WHERE note_id=?1 ORDER BY position, tag_id",
+            id.as_str(),
+        )?;
+        Ok(title == self.title
+            && body_html == self.body_html
+            && notebook_id == self.notebook_id
+            && (deleted_time != 0) == (self.deleted_time != 0)
+            && tags == self.tag_ids)
+    }
+
     fn write(
         &self,
         transaction: &Transaction<'_>,
@@ -1040,5 +1076,48 @@ impl RemoteResourceRef {
             size: usize::try_from(payload.get("size")?.as_u64()?).ok()?,
             sha256: crate::BlobHash::new(text("sha256")?).ok()?,
         })
+    }
+}
+
+fn local_row_exists(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    id: &str,
+) -> Result<bool, LibraryError> {
+    let table = match kind {
+        "note" => "notes",
+        "notebook" => "notebooks",
+        "stack" => "stacks",
+        "tag" => "tags",
+        _ => "resources",
+    };
+    Ok(transaction.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=?1)"),
+        [id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+impl LibraryRepository {
+    /// A restored library is a new device: it gets a new identity, never
+    /// resends the old device's queued ops, and re-uploads the current state
+    /// of anything that had unconfirmed changes (conflict copies keep them
+    /// if the server moved on meanwhile).
+    pub(crate) fn sync_reset_identity(&self) -> Result<(), LibraryError> {
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "DELETE FROM sync_entities WHERE EXISTS(
+                 SELECT 1 FROM sync_outbox o WHERE o.entity_type=sync_entities.entity_type AND o.entity_id=sync_entities.entity_id
+                 UNION ALL
+                 SELECT 1 FROM sync_inflight i WHERE i.entity_type=sync_entities.entity_type AND i.entity_id=sync_entities.entity_id);
+             DELETE FROM sync_inflight;
+             DELETE FROM sync_failures;
+             DELETE FROM sync_outbox;
+             DELETE FROM sync_cursor;",
+        )?;
+        transaction.execute("DELETE FROM settings WHERE key=?1", [DEVICE_ID_SETTING])?;
+        transaction.commit()?;
+        Ok(())
     }
 }

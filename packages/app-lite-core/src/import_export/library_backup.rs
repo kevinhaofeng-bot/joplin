@@ -401,12 +401,11 @@ fn prepare_restore(
         if referenced != listed {
             return Err(BackupError::DatabaseMismatch);
         }
-        // A restored library is a new client: never replay the old device's
-        // pending operations or resume its pull position.
-        db.execute_batch("DELETE FROM sync_outbox; DELETE FROM sync_cursor;")?;
     }
-    // Opening runs schema migrations for older snapshots.
-    drop(LibraryRepository::open(temp.path().join(DATABASE))?);
+    // Opening runs schema migrations for older snapshots. A restored library
+    // is a new client: new identity, no replay of the old device's queue or
+    // pull position (after migration, so older snapshots have the tables).
+    LibraryRepository::open(temp.path().join(DATABASE))?.sync_reset_identity()?;
     let counts = ManifestCounts::from(library_counts(temp.path())?);
     if counts != manifest.counts {
         return Err(BackupError::CountsMismatch);
