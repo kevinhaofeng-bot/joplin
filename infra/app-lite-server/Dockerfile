@@ -12,5 +12,6 @@ COPY --from=build /src/app-lite-server/target/release/app-lite-server /usr/local
 USER applite
 VOLUME /data
 EXPOSE 8787
-# APP_LITE_SERVER_TOKEN must come from the environment (compose env_file).
+# APP_LITE_SERVER_TOKEN must come from the environment (compose env_file);
+# APP_LITE_TLS_CERT and APP_LITE_TLS_KEY there switch the server to HTTPS.
 ENTRYPOINT ["app-lite-server", "--root", "/data", "--listen", "0.0.0.0:8787"]

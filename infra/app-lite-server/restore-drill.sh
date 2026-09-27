@@ -17,12 +17,14 @@ while read -r name; do
   [ "$(shasum -a 256 "$scratch/data/blobs/$name" | cut -d' ' -f1)" = "$name" ] || { echo "restored blob mismatch: $name" >&2; exit 1; }
 done < "$backup/blobs.txt"
 token=$(head -c 32 /dev/urandom | xxd -p -c 64)
-APP_LITE_SERVER_TOKEN="$token" "$server" --root "$scratch/data" --listen "127.0.0.1:0" 2> "$scratch/server.log" &
+# The drill always runs plain HTTP on loopback, whatever the caller's shell sets.
+env -u APP_LITE_TLS_CERT -u APP_LITE_TLS_KEY APP_LITE_SERVER_TOKEN="$token" \
+  "$server" --root "$scratch/data" --listen "127.0.0.1:0" 2> "$scratch/server.log" &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT
 address=
 for _ in $(seq 100); do
-  address=$(sed -n 's/^app-lite-server listening on //p' "$scratch/server.log")
+  address=$(sed -n 's/^app-lite-server listening on \([^ ]*\).*/\1/p' "$scratch/server.log")
   [ -n "$address" ] && break
   sleep 0.1
 done

@@ -1,6 +1,9 @@
 # A separate service with its own directory, port and container; it does not
 # replace anything already running. Put APP_LITE_SERVER_TOKEN (at least 32
-# random bytes) in app-lite-server.env, which is not committed.
+# random bytes) in app-lite-server.env, which is not committed. For HTTPS put
+# cert.pem and key.pem in ./tls and add to that file:
+#   APP_LITE_TLS_CERT=/tls/cert.pem
+#   APP_LITE_TLS_KEY=/tls/key.pem
 services:
   app-lite-server:
     build:
@@ -9,6 +12,7 @@ services:
     env_file: app-lite-server.env
     volumes:
       - ./data:/data
+      - ./tls:/tls:ro
     ports:
       - "8787:8787"
     restart: unless-stopped
