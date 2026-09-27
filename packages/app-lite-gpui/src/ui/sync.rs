@@ -172,6 +172,9 @@ fn entity_label(entity_type: &str) -> &'static str {
 }
 
 fn failure_reason(failure: &SyncFailure) -> String {
+    if failure.waiting {
+        return "其他设备的这项修改引用的附件还没到，附件到达后会自动补上，无需操作。".into();
+    }
     if !failure.can_retry {
         return format!(
             "服务器上的这条修改无法读取，已跳过；本机内容未受影响（{}）。",
@@ -547,7 +550,9 @@ impl LibraryShell {
             .ok()
             .flatten()
             .map(age);
-        let problems = self.sync_failures(cx).len() + self.sync_conflicts(cx).len();
+        let failures = self.sync_failures(cx);
+        let waiting = failures.iter().filter(|failure| failure.waiting).count();
+        let problems = failures.len() - waiting + self.sync_conflicts(cx).len();
         let link = self.event_link_state();
         let health = if self.auto_sync.paused
             || problems > 0
@@ -555,6 +560,7 @@ impl LibraryShell {
         {
             SyncHealth::Attention
         } else if matches!(link, LinkState::Connecting | LinkState::Waiting)
+            || waiting > 0
             || self.auto_sync.retry_at.is_some()
             || oldest.is_some_and(|age| age > Duration::from_secs(90))
         {

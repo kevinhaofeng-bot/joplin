@@ -917,3 +917,19 @@ async fn the_health_panel_grades_the_link_and_backlog_without_note_content(
         "no note content in health facts: {facts:?}"
     );
 }
+
+#[test]
+fn a_change_waiting_for_its_attachment_says_it_resolves_itself() {
+    let failure = app_lite_core::SyncFailure {
+        op_id: "a".repeat(32),
+        entity_type: "note".into(),
+        entity_id: "b".repeat(32),
+        reason: "waiting for attachment c".into(),
+        title: None,
+        updated_time: 0,
+        can_retry: false,
+        waiting: true,
+    };
+    let text = crate::ui::sync::failure_row_text(&failure);
+    assert!(text.contains("附件到达后会自动补上"), "{text}");
+}
