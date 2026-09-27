@@ -14,7 +14,6 @@
 //! sync until a manual sync succeeds.
 
 use super::*;
-use app_lite_protocol::client::HttpTransport;
 use app_lite_protocol::{SyncEvent, TransportError};
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -74,6 +73,7 @@ pub(crate) struct EventLink {
     task: Option<Task<()>>,
     retry: Option<Task<()>>,
     last_event: Option<Instant>,
+    config: Option<sync::SyncConfig>,
 }
 
 impl Default for EventLink {
@@ -85,6 +85,7 @@ impl Default for EventLink {
             task: None,
             retry: None,
             last_event: None,
+            config: None,
         }
     }
 }
@@ -101,9 +102,15 @@ enum LinkMessage {
 }
 
 impl LibraryShell {
-    pub(super) fn ensure_event_link(&mut self, url: &str, token: &str, cx: &mut Context<Self>) {
+    /// Opens the link when off; a changed configuration replaces it.
+    pub(super) fn ensure_event_link(&mut self, config: &sync::SyncConfig, cx: &mut Context<Self>) {
+        if self.event_link.config.as_ref() != Some(config) {
+            self.stop_event_link();
+            self.event_link.reconnect.reset();
+            self.event_link.config = Some(config.clone());
+        }
         if self.event_link.state == LinkState::Off {
-            self.open_event_link(url.to_owned(), token.to_owned(), cx);
+            self.open_event_link(cx);
         }
     }
 
@@ -124,7 +131,10 @@ impl LibraryShell {
         self.event_link.reconnect.reset();
     }
 
-    fn open_event_link(&mut self, url: String, token: String, cx: &mut Context<Self>) {
+    fn open_event_link(&mut self, cx: &mut Context<Self>) {
+        let Some(config) = self.event_link.config.clone() else {
+            return;
+        };
         let generation = self.event_link.current.fetch_add(1, Ordering::AcqRel) + 1;
         self.event_link.state = LinkState::Connecting;
         self.event_link.retry = None;
@@ -134,10 +144,11 @@ impl LibraryShell {
         }
         let (sender, mut receiver) = mpsc::unbounded();
         let current = Arc::clone(&self.event_link.current);
-        let (thread_url, thread_token) = (url.clone(), token.clone());
         std::thread::spawn(move || {
-            let transport = HttpTransport::new(&thread_url, &thread_token);
-            let mut stream = match transport.open_events() {
+            let stream = config
+                .transport()
+                .and_then(|transport| transport.open_events());
+            let mut stream = match stream {
                 Ok(stream) => stream,
                 Err(error) => {
                     let _ = sender.unbounded_send(LinkMessage::Ended(error));
@@ -177,7 +188,7 @@ impl LibraryShell {
                 let Some(message) = message else { return };
                 let keep = this
                     .update(cx, |shell, shell_cx| {
-                        shell.on_link_message(generation, message, &url, &token, shell_cx)
+                        shell.on_link_message(generation, message, shell_cx)
                     })
                     .unwrap_or(false);
                 if !keep {
@@ -192,8 +203,6 @@ impl LibraryShell {
         &mut self,
         generation: u64,
         message: LinkMessage,
-        url: &str,
-        token: &str,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.event_link.current.load(Ordering::Acquire) != generation {
@@ -217,28 +226,30 @@ impl LibraryShell {
             }
             LinkMessage::Event(SyncEvent::Bye) => {
                 self.event_link.state = LinkState::Off;
-                self.open_event_link(url.to_owned(), token.to_owned(), cx);
+                self.open_event_link(cx);
                 false
             }
+            // Retrying cannot fix credentials or an untrusted certificate.
             LinkMessage::Ended(TransportError::Unauthorized) => {
-                self.stop_event_link();
-                self.auto_sync.paused = true;
-                self.sync_status = sync::ShellSyncStatus::Failed(
+                self.pause_after_link_refusal(
                     "同步失败：服务器拒绝了凭据，请检查同步设置中的 token。".into(),
+                    cx,
                 );
-                cx.notify();
+                false
+            }
+            LinkMessage::Ended(TransportError::Permanent(reason)) => {
+                self.pause_after_link_refusal(sync::refused_reason_message(&reason), cx);
                 false
             }
             LinkMessage::Ended(_) => {
                 self.event_link.current.fetch_add(1, Ordering::AcqRel);
                 self.event_link.state = LinkState::Waiting;
                 let delay = self.event_link.reconnect.next_delay(jitter());
-                let (url, token) = (url.to_owned(), token.to_owned());
                 self.event_link.retry = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(delay).await;
                     let _ = this.update(cx, |shell, shell_cx| {
                         if shell.event_link.state == LinkState::Waiting {
-                            shell.open_event_link(url, token, shell_cx);
+                            shell.open_event_link(shell_cx);
                         }
                     });
                 }));
@@ -251,6 +262,13 @@ impl LibraryShell {
     /// A head below the cursor means a server restored from a backup; the
     /// sync reconciles that too. Our own uploads leave the cursor at the
     /// head, so their notification causes no sync.
+    fn pause_after_link_refusal(&mut self, message: String, cx: &mut Context<Self>) {
+        self.stop_event_link();
+        self.auto_sync.paused = true;
+        self.sync_status = sync::ShellSyncStatus::Failed(message);
+        cx.notify();
+    }
+
     fn note_remote_head(&mut self, head: u64, cx: &mut Context<Self>) {
         self.auto_sync.announced_head = Some(head);
         if self.remote_changes_announced(cx) {

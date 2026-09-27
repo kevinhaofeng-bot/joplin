@@ -2,6 +2,9 @@
 //!
 //!   APP_LITE_SERVER_TOKEN=… sync_drill <profile> <server-url>
 //!
+//! `APP_LITE_SERVER_CA=<pem file>` additionally trusts that certificate
+//! (an HTTPS server with a self-signed certificate).
+//!
 //! Runs sync passes until nothing is left to upload or download, then checks
 //! every attachment's bytes against its SHA-256 and prints entity counts, so
 //! two profiles can be compared. Prints only counts, timings and outcomes.
@@ -20,7 +23,10 @@ fn main() {
     let token = std::env::var("APP_LITE_SERVER_TOKEN").expect("APP_LITE_SERVER_TOKEN");
     std::fs::create_dir_all(&profile).unwrap();
     let repository = LibraryRepository::open(profile.join("library.sqlite")).unwrap();
-    let transport = HttpTransport::new(&url, &token);
+    let certificate = std::env::var_os("APP_LITE_SERVER_CA")
+        .map(|path| std::fs::read_to_string(path).expect("APP_LITE_SERVER_CA readable"));
+    let transport = HttpTransport::with_trusted_certificate(&url, &token, certificate.as_deref())
+        .expect("valid certificate");
     let started = Instant::now();
     let mut total = sync::SyncReport::default();
     for pass in 1.. {

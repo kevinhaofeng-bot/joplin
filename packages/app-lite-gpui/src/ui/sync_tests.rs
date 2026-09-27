@@ -729,3 +729,62 @@ async fn a_server_that_never_says_hello_is_given_up_after_15_seconds(cx: &mut Te
     cx.run_until_parked();
     assert_eq!(opens(&view, cx), 2, "retried after the first backoff step");
 }
+
+#[gpui::test]
+async fn sync_and_notifications_run_over_https_with_a_trusted_self_signed_certificate(
+    cx: &mut TestAppContext,
+) {
+    use crate::ui::sync_events::LinkState;
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate_pem = certified.cert.pem();
+    let tls = app_lite_server::http::tls_config_from_pem(
+        certificate_pem.as_bytes(),
+        certified.key_pair.serialize_pem().as_bytes(),
+    )
+    .unwrap();
+    let fixture = fixture_with(app_lite_server::http::HttpOptions {
+        tls: Some(tls),
+        ..Default::default()
+    });
+    let https = format!("https://localhost:{}", fixture.server.local_addr().port());
+    let write_config = |pem: Option<&str>| {
+        std::fs::write(
+            fixture.profile.join("sync.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "server_url": https,
+                "token": TOKEN,
+                "server_certificate_pem": pem,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    fixture
+        .repository
+        .create_note(CreateNote {
+            title: "经 HTTPS".into(),
+            notebook_id: None,
+            document: text("x"),
+        })
+        .unwrap();
+    write_config(None);
+    let (view, cx) = mount(&fixture, cx);
+    let refused = sync_now(&view, cx);
+    assert!(refused.contains("TLS 证书不受信任"), "{refused}");
+    assert!(refused.contains("待同步"), "{refused}");
+    wait(30, &view, cx);
+    assert_ne!(
+        link_state(&view, cx),
+        LinkState::Connected,
+        "no link to an untrusted server"
+    );
+
+    write_config(Some(&certificate_pem));
+    let synced = sync_now(&view, cx);
+    assert!(
+        synced.starts_with("已同步") && !synced.contains("待同步"),
+        "{synced}"
+    );
+    wait(5, &view, cx);
+    wait_for_link(&view, cx);
+}

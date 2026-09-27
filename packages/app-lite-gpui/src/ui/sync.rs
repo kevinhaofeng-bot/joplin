@@ -62,10 +62,24 @@ pub(crate) enum ShellSyncStatus {
     Failed(String),
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
-struct SyncConfig {
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(super) struct SyncConfig {
     server_url: String,
     token: String,
+    /// PEM certificate to trust besides the public roots, for an HTTPS
+    /// server with a self-signed certificate.
+    #[serde(default)]
+    server_certificate_pem: Option<String>,
+}
+
+impl SyncConfig {
+    pub(super) fn transport(&self) -> Result<HttpTransport, app_lite_protocol::TransportError> {
+        HttpTransport::with_trusted_certificate(
+            &self.server_url,
+            &self.token,
+            self.server_certificate_pem.as_deref(),
+        )
+    }
 }
 
 fn load_config(profile: &Path) -> Result<Option<SyncConfig>, String> {
@@ -98,6 +112,7 @@ fn write_template(profile: &Path) -> std::io::Result<std::path::PathBuf> {
             let template = SyncConfig {
                 server_url: String::new(),
                 token: String::new(),
+                server_certificate_pem: None,
             };
             file.write_all(&serde_json::to_vec_pretty(&template).expect("serializes"))?;
             file.sync_all()?;
@@ -108,10 +123,20 @@ fn write_template(profile: &Path) -> std::io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
+const UNTRUSTED_CERTIFICATE: &str = "同步失败：服务器的 TLS 证书不受信任。若服务器使用自签名证书，请把它的 PEM 文本填入同步设置的 server_certificate_pem。";
+
+pub(super) fn refused_reason_message(reason: &str) -> String {
+    if reason.contains("certificate is not trusted") {
+        UNTRUSTED_CERTIFICATE.into()
+    } else {
+        format!("同步失败：服务器拒绝了请求（{reason}）。")
+    }
+}
+
 fn failure_message(error: &SyncError) -> String {
     match error {
         SyncError::Unauthorized => "同步失败：服务器拒绝了凭据，请检查同步设置中的 token。".into(),
-        SyncError::Rejected(reason) => format!("同步失败：服务器拒绝了请求（{reason}）。"),
+        SyncError::Rejected(reason) => refused_reason_message(reason),
         SyncError::Library(error) => format!("同步失败：本地资料库错误（{error}）。"),
     }
 }
@@ -208,7 +233,9 @@ impl LibraryShell {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let transport = HttpTransport::new(&config.server_url, &config.token);
+                    let transport = config.transport().map_err(|error| {
+                        SyncError::Rejected(format!("同步设置中的证书无效：{error:?}"))
+                    })?;
                     sync_once(&repository, &transport)
                 })
                 .await;
@@ -240,7 +267,7 @@ impl LibraryShell {
             self.stop_event_link();
             return;
         };
-        self.ensure_event_link(&config.server_url, &config.token, cx);
+        self.ensure_event_link(&config, cx);
         if self.sync_status == ShellSyncStatus::Running
             || self.active_session_has_unsaved_changes(cx)
         {

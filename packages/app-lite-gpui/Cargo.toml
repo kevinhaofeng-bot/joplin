@@ -126,6 +126,7 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 tempfile = "3"
 unicode-segmentation = "1.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
+rcgen = "0.13"
 
 # Cargo auto-discovers each *.rs file in benches/ as its own bench binary.
 # Every Criterion bench needs `harness = false` so Cargo doesn't inject the
