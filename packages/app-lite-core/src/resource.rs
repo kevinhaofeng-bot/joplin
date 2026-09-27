@@ -238,6 +238,60 @@ impl ResourceStore {
         Ok(ResourceBlob { sha256, size })
     }
 
+    /// Bytes kept so far of an interrupted download of `sha256`.
+    pub(crate) fn download_part_len(&self, sha256: &BlobHash) -> Result<u64, ResourceError> {
+        Ok(
+            match open_blob(self.blobs_dir.0, &download_part_name(sha256))? {
+                Some(file) => file.metadata()?.len(),
+                None => 0,
+            },
+        )
+    }
+
+    /// Appends bytes received at `offset` to the download of `sha256`; a
+    /// longer part (a repeated range) is cut back to `offset` first.
+    pub(crate) fn append_download_part(
+        &self,
+        sha256: &BlobHash,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), ResourceError> {
+        let name = download_part_name(sha256);
+        let mut file = open_or_create_regular_file(self.blobs_dir.0, std::ffi::OsStr::new(&name))?;
+        let length = file.metadata()?.len();
+        if length < offset {
+            return Err(ResourceError::Io(std::io::Error::other(
+                "download part is shorter than the resume offset",
+            )));
+        }
+        if length > offset {
+            file.set_len(offset)?;
+        }
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Publishes a finished download through the normal hashing path and
+    /// removes the part whatever the outcome: a part whose hash is wrong
+    /// must not be resumed.
+    pub(crate) fn publish_download_part(
+        &self,
+        sha256: &BlobHash,
+        size: usize,
+        title: &str,
+        mime: &str,
+        file_extension: &str,
+    ) -> Result<ResourceBlob, ResourceError> {
+        let name = download_part_name(sha256);
+        let result = match open_blob(self.blobs_dir.0, &name)? {
+            Some(file) => self.put_reader(file, size, title, mime, file_extension),
+            None => Err(ResourceError::Io(std::io::ErrorKind::NotFound.into())),
+        };
+        let _ = unlink_at(self.blobs_dir.0, &name);
+        result
+    }
+
     /// Observes actual blob-byte reads. Projection/list consumers use this
     /// narrow diagnostic seam to prove they never hydrate Task-5 resources.
     #[cfg(any(test, feature = "test-support"))]
@@ -655,6 +709,12 @@ fn persist_blob_from_reader<R: Read>(
     }
     fsync_fd(dir_fd)?;
     Ok(sha256)
+}
+
+/// Hidden, and named by a validated hex digest, so it can never collide
+/// with a published blob.
+fn download_part_name(sha256: &BlobHash) -> String {
+    format!(".download.{}.part", sha256.as_str())
 }
 
 fn verify_existing_blob(dir_fd: RawFd, sha256: &str) -> Result<(), ResourceError> {

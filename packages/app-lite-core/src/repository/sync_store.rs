@@ -723,17 +723,41 @@ impl LibraryRepository {
 
     /// Writes downloaded bytes into the content-addressed store. Metadata
     /// follows only when the page applies, after `verify_staged_blob`.
-    pub(crate) fn sync_store_blob<R: std::io::Read>(
+    pub(crate) fn sync_budget(&self) -> &crate::sync::TransferBudget {
+        &self.sync_budget
+    }
+
+    pub(crate) fn sync_download_part_len(
         &self,
-        reader: R,
-        size: usize,
-        title: &str,
-        mime: &str,
-        extension: &str,
+        sha256: &crate::BlobHash,
+    ) -> Result<u64, LibraryError> {
+        Ok(self.resource_store.download_part_len(sha256)?)
+    }
+
+    pub(crate) fn sync_append_download(
+        &self,
+        sha256: &crate::BlobHash,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), LibraryError> {
+        Ok(self
+            .resource_store
+            .append_download_part(sha256, offset, bytes)?)
+    }
+
+    pub(crate) fn sync_publish_download(
+        &self,
+        resource: &RemoteResourceRef,
     ) -> Result<crate::BlobHash, LibraryError> {
         Ok(self
             .resource_store
-            .put_reader(reader, size, title, mime, extension)?
+            .publish_download_part(
+                &resource.sha256,
+                resource.size,
+                &resource.title,
+                &resource.mime,
+                &resource.file_extension,
+            )?
             .sha256)
     }
 

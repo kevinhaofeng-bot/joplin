@@ -404,6 +404,7 @@ pub struct LibraryRepository {
     /// handle, so a bounded FTS write never also holds its Rust mutex.
     index_connection: Mutex<Option<Connection>>,
     profile_dir: ProfileDir,
+    sync_budget: crate::sync::TransferBudget,
     #[allow(dead_code)]
     database_file: DatabaseFile,
     resource_store: ResourceStore,
@@ -639,6 +640,7 @@ impl LibraryRepository {
             connection: Mutex::new(connection),
             index_connection: Mutex::new(None),
             profile_dir: profile,
+            sync_budget: Default::default(),
             database_file,
             resource_store,
             events: Mutex::new(Vec::new()),

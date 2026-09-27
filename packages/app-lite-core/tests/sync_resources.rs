@@ -173,3 +173,136 @@ fn a_remote_attachment_delete_does_not_remove_one_still_used_here() {
         assert!(device.load_note(&other.id).unwrap().is_some(), "{name}");
     }
 }
+
+/// A link that drops every second attachment range, or any request larger
+/// than `largest` bytes, counting the attachment bytes it delivered.
+struct ShortLivedLink<'a> {
+    inner: &'a ServerStore,
+    largest: usize,
+    drop_every_other_range: bool,
+    ranges: Cell<usize>,
+    delivered: Cell<u64>,
+}
+
+impl ShortLivedLink<'_> {
+    fn new(
+        inner: &ServerStore,
+        largest: usize,
+        drop_every_other_range: bool,
+    ) -> ShortLivedLink<'_> {
+        ShortLivedLink {
+            inner,
+            largest,
+            drop_every_other_range,
+            ranges: Cell::new(0),
+            delivered: Cell::new(0),
+        }
+    }
+}
+
+impl SyncTransport for ShortLivedLink<'_> {
+    fn push(&self, request: &PushRequest) -> Result<PushResponse, TransportError> {
+        if serde_json::to_vec(request).unwrap().len() > self.largest {
+            return Err(TransportError::Retryable("link dropped".into()));
+        }
+        SyncTransport::push(self.inner, request)
+    }
+    fn pull(&self, request: &PullRequest) -> Result<PullResponse, TransportError> {
+        SyncTransport::pull(self.inner, request)
+    }
+    fn blob_status(&self, sha256: &str) -> Result<BlobStatus, TransportError> {
+        SyncTransport::blob_status(self.inner, sha256)
+    }
+    fn put_chunk(
+        &self,
+        sha256: &str,
+        size: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<BlobStatus, TransportError> {
+        if bytes.len() > self.largest {
+            return Err(TransportError::Retryable("link dropped".into()));
+        }
+        SyncTransport::put_chunk(self.inner, sha256, size, offset, bytes)
+    }
+    fn read_range(&self, sha256: &str, offset: u64, len: u64) -> Result<Vec<u8>, TransportError> {
+        self.ranges.set(self.ranges.get() + 1);
+        if len as usize > self.largest
+            || (self.drop_every_other_range && self.ranges.get() % 2 == 0)
+        {
+            return Err(TransportError::Retryable("link dropped".into()));
+        }
+        let bytes = SyncTransport::read_range(self.inner, sha256, offset, len)?;
+        self.delivered
+            .set(self.delivered.get() + bytes.len() as u64);
+        Ok(bytes)
+    }
+}
+
+fn sync_until_idle(repository: &LibraryRepository, transport: &dyn SyncTransport) -> usize {
+    for pass in 1..=200 {
+        let report = sync::sync_once(repository, transport).unwrap();
+        if report.retryable == 0 && repository.sync_pending_count().unwrap() == 0 {
+            return pass;
+        }
+    }
+    panic!("never converged");
+}
+
+#[test]
+fn an_interrupted_download_resumes_where_it_stopped() {
+    let server_root = tempdir().unwrap();
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let (_a_root, a) = client();
+    let bytes = picture();
+    let resource = a
+        .import_resource(&bytes, "照片.png", "image/png", "png")
+        .unwrap();
+    a.create_note(CreateNote {
+        title: "带图".into(),
+        notebook_id: None,
+        document: with_image("看图", resource.clone()),
+    })
+    .unwrap();
+    sync::sync_once(&a, &store).unwrap();
+
+    let (_b_root, b) = client();
+    let link = ShortLivedLink::new(&store, usize::MAX, true);
+    let passes = sync_until_idle(&b, &link);
+    assert!(passes > 1, "the link did drop");
+    assert_eq!(b.read_resource_bytes(&resource).unwrap().unwrap(), bytes);
+    assert_eq!(
+        link.delivered.get(),
+        bytes.len() as u64,
+        "no byte fetched twice"
+    );
+}
+
+#[test]
+fn transfers_shrink_until_a_link_that_cannot_carry_large_requests_gets_everything_through() {
+    let server_root = tempdir().unwrap();
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let (_a_root, a) = client();
+    let bytes = picture();
+    let resource = a
+        .import_resource(&bytes, "照片.png", "image/png", "png")
+        .unwrap();
+    for index in 0..40 {
+        a.create_note(CreateNote {
+            title: format!("笔记 {index}"),
+            notebook_id: None,
+            document: with_image(&"字".repeat(3000), resource.clone()),
+        })
+        .unwrap();
+    }
+    let link = ShortLivedLink::new(&store, 200 * 1024, false);
+    sync_until_idle(&a, &link);
+    let (_b_root, b) = client();
+    sync_until_idle(&b, &link);
+    assert_eq!(b.read_resource_bytes(&resource).unwrap().unwrap(), bytes);
+    assert!(
+        sync::sync_failures(&b).unwrap().is_empty(),
+        "nothing skipped on the receiving side"
+    );
+    assert_eq!(b.list_notes(Default::default()).unwrap().len(), 40);
+}

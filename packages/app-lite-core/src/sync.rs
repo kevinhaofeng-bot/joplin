@@ -4,7 +4,8 @@
 //! (persistent queue, batches, per-item outcome); the protocol and conflict
 //! policy are this project's own design.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use app_lite_protocol::{
     Action, BlobStatus, EntityKind, EntityRef, MAX_PULL_LIMIT, MAX_PUSH_OPS, OpResult, Operation,
@@ -13,12 +14,58 @@ use app_lite_protocol::{
 
 use crate::{LibraryError, LibraryRepository, SyncFailure};
 
-/// One request must finish within the transport's 120 s timeout on a weak
-/// link (1 MiB at ~20 KB/s is ~50 s); a larger batch there would time out
-/// and be resent forever. A single op larger than this still goes alone.
+/// Largest push body and attachment range per request. One request must
+/// finish within the transport's 120 s timeout on a weak link (1 MiB at
+/// ~20 KB/s is ~50 s).
 const MAX_PUSH_BATCH_BYTES: usize = 1024 * 1024;
-/// Attachment transfer unit; the HTTP layer allows 4 MiB.
-const BLOB_CHUNK_BYTES: u64 = 1024 * 1024;
+const MAX_BLOB_CHUNK_BYTES: u64 = 1024 * 1024;
+const MIN_PUSH_BATCH_BYTES: usize = 32 * 1024;
+const MIN_BLOB_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// Request sizes that follow the link: halved after a request lost in
+/// transit, doubled after one that succeeded, within the bounds above. A
+/// link that drops sooner than a full-size request takes (a phone moving
+/// between cells) otherwise resends the same request forever. Kept per
+/// library for the life of the process.
+#[derive(Debug)]
+pub(crate) struct TransferBudget {
+    push_bytes: AtomicUsize,
+    chunk_bytes: AtomicU64,
+}
+
+impl Default for TransferBudget {
+    fn default() -> Self {
+        Self {
+            push_bytes: AtomicUsize::new(MAX_PUSH_BATCH_BYTES),
+            chunk_bytes: AtomicU64::new(MAX_BLOB_CHUNK_BYTES),
+        }
+    }
+}
+
+impl TransferBudget {
+    fn push_bytes(&self) -> usize {
+        self.push_bytes.load(Ordering::Relaxed)
+    }
+    fn chunk_bytes(&self) -> u64 {
+        self.chunk_bytes.load(Ordering::Relaxed)
+    }
+    fn push_lost(&self) {
+        let next = (self.push_bytes() / 2).max(MIN_PUSH_BATCH_BYTES);
+        self.push_bytes.store(next, Ordering::Relaxed);
+    }
+    fn push_delivered(&self) {
+        let next = (self.push_bytes() * 2).min(MAX_PUSH_BATCH_BYTES);
+        self.push_bytes.store(next, Ordering::Relaxed);
+    }
+    fn chunk_lost(&self) {
+        let next = (self.chunk_bytes() / 2).max(MIN_BLOB_CHUNK_BYTES);
+        self.chunk_bytes.store(next, Ordering::Relaxed);
+    }
+    fn chunk_delivered(&self) {
+        let next = (self.chunk_bytes() * 2).min(MAX_BLOB_CHUNK_BYTES);
+        self.chunk_bytes.store(next, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncReport {
@@ -217,7 +264,8 @@ fn push_round(
     if inflight.is_empty() {
         return Ok(false);
     }
-    for batch in batches(&inflight) {
+    let budget = repository.sync_budget();
+    for batch in batches(&inflight, budget.push_bytes()) {
         // An op referencing an incomplete blob is never published; later
         // batches may hold notes that use it, so stop this pass entirely.
         for op in batch {
@@ -240,10 +288,17 @@ fn push_round(
             ops,
         };
         let response = match transport.push(&request) {
-            Ok(response) => response,
+            Ok(response) => {
+                budget.push_delivered();
+                response
+            }
+            // Later batches may hold notes that reference what this one
+            // carried (an attachment, a notebook): sending them first would
+            // publish references the server cannot resolve yet.
             Err(TransportError::Retryable(_)) => {
+                budget.push_lost();
                 report.retryable += batch.len();
-                continue;
+                return Ok(true);
             }
             Err(error) => return Err(fatal(error)),
         };
@@ -283,12 +338,12 @@ pub fn retry_failure(repository: &LibraryRepository, op_id: &str) -> Result<bool
     repository.sync_retry_failure(op_id)
 }
 
-fn batches(ops: &[crate::SyncInflight]) -> Vec<&[crate::SyncInflight]> {
+fn batches(ops: &[crate::SyncInflight], limit: usize) -> Vec<&[crate::SyncInflight]> {
     let mut batches = Vec::new();
     let mut start = 0;
     let mut bytes = 0;
     for (index, op) in ops.iter().enumerate() {
-        if index > start && bytes + op.action_json.len() > MAX_PUSH_BATCH_BYTES {
+        if index > start && bytes + op.action_json.len() > limit {
             batches.push(&ops[start..index]);
             start = index;
             bytes = 0;
@@ -327,76 +382,45 @@ fn downloadable(
 }
 
 /// Streams a blob from the server into the local store, verifying its hash.
+/// Resumes after the bytes an earlier interrupted download kept, fetching
+/// ranges sized by the transfer budget; the finished part is published only
+/// if its hash matches.
 fn download(
     repository: &LibraryRepository,
     transport: &dyn SyncTransport,
     resource: &crate::repository::RemoteResourceRef,
 ) -> Result<(), TransportError> {
-    let mut reader = RangeReader {
-        transport,
-        sha256: resource.sha256.as_str(),
-        size: resource.size as u64,
-        offset: 0,
-        buffer: Vec::new(),
-        position: 0,
-        failure: None,
-    };
-    let stored = repository.sync_store_blob(
-        &mut reader,
-        resource.size,
-        &resource.title,
-        &resource.mime,
-        &resource.file_extension,
-    );
-    if let Some(failure) = reader.failure {
-        return Err(failure);
+    let retryable = |error: LibraryError| TransportError::Retryable(error.to_string());
+    let budget = repository.sync_budget();
+    let size = resource.size as u64;
+    let mut offset = repository
+        .sync_download_part_len(&resource.sha256)
+        .map_err(retryable)?
+        .min(size);
+    while offset < size {
+        let len = budget.chunk_bytes().min(size - offset);
+        match transport.read_range(resource.sha256.as_str(), offset, len) {
+            Ok(bytes) if !bytes.is_empty() && bytes.len() as u64 <= len => {
+                repository
+                    .sync_append_download(&resource.sha256, offset, &bytes)
+                    .map_err(retryable)?;
+                offset += bytes.len() as u64;
+                budget.chunk_delivered();
+            }
+            Ok(_) => return Err(TransportError::Retryable("short attachment read".into())),
+            Err(TransportError::Retryable(reason)) => {
+                budget.chunk_lost();
+                return Err(TransportError::Retryable(reason));
+            }
+            Err(error) => return Err(error),
+        }
     }
-    match stored {
+    match repository.sync_publish_download(resource) {
         Ok(sha) if sha == resource.sha256 => Ok(()),
         Ok(_) => Err(TransportError::Permanent(
             "downloaded attachment does not match its hash".into(),
         )),
-        Err(error) => Err(TransportError::Retryable(error.to_string())),
-    }
-}
-
-struct RangeReader<'a> {
-    transport: &'a dyn SyncTransport,
-    sha256: &'a str,
-    size: u64,
-    offset: u64,
-    buffer: Vec<u8>,
-    position: usize,
-    failure: Option<TransportError>,
-}
-
-impl Read for RangeReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.position == self.buffer.len() {
-            if self.offset >= self.size {
-                return Ok(0);
-            }
-            let len = BLOB_CHUNK_BYTES.min(self.size - self.offset);
-            match self.transport.read_range(self.sha256, self.offset, len) {
-                Ok(bytes) if !bytes.is_empty() && bytes.len() as u64 <= len => {
-                    self.offset += bytes.len() as u64;
-                    self.buffer = bytes;
-                    self.position = 0;
-                }
-                Ok(_) => {
-                    self.failure = Some(TransportError::Retryable("short attachment read".into()));
-                    return Err(io::Error::other("short attachment read"));
-                }
-                Err(error) => {
-                    self.failure = Some(error);
-                    return Err(io::Error::other("attachment download failed"));
-                }
-            }
-        }
-        let count = out.len().min(self.buffer.len() - self.position);
-        out[..count].copy_from_slice(&self.buffer[self.position..self.position + count]);
-        self.position += count;
-        Ok(count)
+        Err(error) => Err(retryable(error)),
     }
 }
 
@@ -430,17 +454,28 @@ fn upload_blob(
         .open_verified_resource_file(&id)
         .map_err(|error| TransportError::Retryable(error.to_string()))?
         .ok_or_else(|| TransportError::Permanent("attachment is no longer stored here".into()))?;
-    let mut chunk = vec![0; BLOB_CHUNK_BYTES as usize];
+    let budget = repository.sync_budget();
+    let mut chunk = vec![0; MAX_BLOB_CHUNK_BYTES as usize];
     while offset < size {
-        let len = BLOB_CHUNK_BYTES.min(size - offset) as usize;
+        let len = budget.chunk_bytes().min(size - offset) as usize;
         file.seek(SeekFrom::Start(offset))
             .and_then(|_| file.read_exact(&mut chunk[..len]))
             .map_err(|error| TransportError::Retryable(error.to_string()))?;
         match transport.put_chunk(resource.sha256.as_str(), size, offset, &chunk[..len]) {
-            Ok(BlobStatus::Complete) => return Ok(()),
-            Ok(BlobStatus::Partial { bytes }) => offset = bytes,
-            Ok(BlobStatus::Missing) => offset = 0,
+            Ok(status) => {
+                budget.chunk_delivered();
+                match status {
+                    BlobStatus::Complete => return Ok(()),
+                    BlobStatus::Partial { bytes } => offset = bytes,
+                    BlobStatus::Missing => offset = 0,
+                }
+            }
             Err(TransportError::OffsetMismatch { expected }) => offset = expected,
+            Err(TransportError::Retryable(reason)) => {
+                // The server keeps what arrived; the next attempt resumes there.
+                budget.chunk_lost();
+                return Err(TransportError::Retryable(reason));
+            }
             Err(error) => return Err(error),
         }
     }

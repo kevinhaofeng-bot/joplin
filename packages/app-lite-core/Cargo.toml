@@ -27,9 +27,11 @@ sha2 = "0.10"
 tar = "0.4"
 thiserror = "2"
 tempfile = "3"
+rcgen = "0.13"
 xml-syntax-reader = { path = "vendor/xml-syntax-reader-0.2.0" }
 
 [dev-dependencies]
 app-lite-protocol = { path = "../app-lite-protocol", features = ["client"] }
 app-lite-server = { path = "../app-lite-server" }
 tempfile = "3"
+rcgen = "0.13"
