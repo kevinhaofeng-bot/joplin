@@ -77,6 +77,22 @@ impl Reconnect {
     }
 }
 
+/// A fixed description: never the server's text or an address.
+fn link_error_category(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::Retryable(reason) if reason.contains("no hello") => "连接后服务器未应答",
+        TransportError::Retryable(reason) if reason.contains("closed") => "连接被中断",
+        TransportError::Retryable(reason)
+            if reason.contains("timed out") || reason.contains("Timed out") =>
+        {
+            "连接静默超时"
+        }
+        TransportError::Retryable(_) => "无法连接服务器",
+        TransportError::Unauthorized => "凭据被拒绝",
+        TransportError::Permanent(_) | TransportError::OffsetMismatch { .. } => "服务器拒绝",
+    }
+}
+
 fn jitter() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -102,6 +118,8 @@ pub(crate) struct EventLink {
     task: Option<Task<()>>,
     retry: Option<Task<()>>,
     last_event: Option<Instant>,
+    last_hello: Option<Instant>,
+    last_error: Option<&'static str>,
     config: Option<sync::SyncConfig>,
     environment: Box<dyn LinkEnvironment>,
     last_wall_clock: Option<std::time::SystemTime>,
@@ -117,6 +135,8 @@ impl Default for EventLink {
             task: None,
             retry: None,
             last_event: None,
+            last_hello: None,
+            last_error: None,
             config: None,
             environment: Box::new(SystemEnvironment),
             last_wall_clock: None,
@@ -275,8 +295,10 @@ impl LibraryShell {
         }
         self.event_link.last_event = Some(Instant::now());
         match message {
+            LinkMessage::Event(SyncEvent::Heartbeat) => true,
             LinkMessage::Event(SyncEvent::Hello { head }) => {
                 self.event_link.state = LinkState::Connected;
+                self.event_link.last_hello = Some(Instant::now());
                 self.event_link.reconnect.reset();
                 // The server answered: an earlier unreachable-server backoff
                 // no longer applies.
@@ -306,7 +328,8 @@ impl LibraryShell {
                 self.pause_after_link_refusal(sync::refused_reason_message(&reason), cx);
                 false
             }
-            LinkMessage::Ended(_) => {
+            LinkMessage::Ended(error) => {
+                self.event_link.last_error = Some(link_error_category(&error));
                 self.event_link.current.fetch_add(1, Ordering::AcqRel);
                 self.event_link.state = LinkState::Waiting;
                 let delay = self.event_link.reconnect.next_delay(jitter());
@@ -339,6 +362,31 @@ impl LibraryShell {
         if self.remote_changes_announced(cx) {
             self.auto_sync_tick(cx);
         }
+    }
+
+    pub(super) fn event_link_state(&self) -> LinkState {
+        self.event_link.state
+    }
+
+    /// Link facts for the health panel.
+    pub(super) fn event_link_facts(&self) -> Vec<String> {
+        let ago = |at: Option<Instant>| {
+            at.map_or_else(
+                || "无".to_owned(),
+                |at| format!("{} 秒前", at.elapsed().as_secs()),
+            )
+        };
+        let mut facts = vec![
+            format!("最近一次连上：{}", ago(self.event_link.last_hello)),
+            format!(
+                "最近一次收到服务器消息（含心跳）：{}",
+                ago(self.event_link.last_event)
+            ),
+        ];
+        if let Some(error) = self.event_link.last_error {
+            facts.push(format!("最近一次连接问题：{error}"));
+        }
+        facts
     }
 
     pub(super) fn event_link_text(&self) -> String {

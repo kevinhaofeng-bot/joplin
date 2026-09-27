@@ -31,6 +31,25 @@ const AUTO_SYNC_PULL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AUTO_SYNC_FIRST_BACKOFF: Duration = Duration::from_secs(30);
 const AUTO_SYNC_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncHealth {
+    Unconfigured,
+    Healthy,
+    Recovering,
+    Attention,
+}
+
+impl SyncHealth {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "状态：未配置同步",
+            Self::Healthy => "状态：正常",
+            Self::Recovering => "状态：恢复中（会自动重试）",
+            Self::Attention => "状态：需要处理",
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct AutoSync {
     task: Option<Task<()>>,
@@ -506,6 +525,65 @@ impl LibraryShell {
         }
     }
 
+    /// Health grade and privacy-safe facts for the panel (after the
+    /// reference clients' `0debug` snapshot).
+    pub(super) fn sync_health(&self, cx: &App) -> (SyncHealth, Vec<String>) {
+        use crate::ui::sync_events::LinkState;
+        let repository = self.model.read_with(cx, |model, _| model.repository());
+        let configured = self
+            .active_profile(cx)
+            .and_then(|profile| load_config(&profile).ok().flatten())
+            .is_some();
+        if !configured {
+            return (SyncHealth::Unconfigured, Vec::new());
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64);
+        let age = |at: i64| Duration::from_millis((now_ms - at).max(0) as u64);
+        let pending = repository.sync_pending_count().unwrap_or(0);
+        let oldest = repository
+            .sync_oldest_pending_time()
+            .ok()
+            .flatten()
+            .map(age);
+        let problems = self.sync_failures(cx).len() + self.sync_conflicts(cx).len();
+        let link = self.event_link_state();
+        let health = if self.auto_sync.paused
+            || problems > 0
+            || oldest.is_some_and(|age| age > Duration::from_secs(10 * 60))
+        {
+            SyncHealth::Attention
+        } else if matches!(link, LinkState::Connecting | LinkState::Waiting)
+            || self.auto_sync.retry_at.is_some()
+            || oldest.is_some_and(|age| age > Duration::from_secs(90))
+        {
+            SyncHealth::Recovering
+        } else {
+            SyncHealth::Healthy
+        };
+        let minutes = |duration: Duration| match duration.as_secs() {
+            seconds if seconds < 60 => format!("{seconds} 秒"),
+            seconds if seconds < 3600 => format!("{} 分钟", seconds / 60),
+            seconds => format!("{} 小时", seconds / 3600),
+        };
+        let mut facts = vec![
+            match repository.sync_last_success_time().ok().flatten() {
+                Some(at) => format!("最近一次成功同步：{}前", minutes(age(at))),
+                None => "最近一次成功同步：尚无".into(),
+            },
+            match oldest {
+                Some(oldest) => format!("待同步 {pending} 项，最久已等 {}", minutes(oldest)),
+                None => "待同步：无".into(),
+            },
+        ];
+        if self.auto_sync.paused {
+            facts.push("自动同步已暂停，修正后点“立即同步”".into());
+        }
+        facts.extend(self.event_link_facts());
+        (health, facts)
+    }
+
     pub(super) fn sync_status_text(&self, cx: &App) -> String {
         let pending = self
             .model
@@ -617,12 +695,33 @@ impl LibraryShell {
                             .child("关闭"),
                     ),
             );
-        panel = panel.child(
-            div()
-                .text_size(px(11.0))
-                .text_color(rgba(0x536f59ff))
-                .child(self.event_link_text()),
-        );
+        let (health, facts) = self.sync_health(cx);
+        panel = panel
+            .child(
+                div()
+                    .id("sync-health")
+                    .debug_selector(|| "sync-health".to_owned())
+                    .text_color(match health {
+                        SyncHealth::Attention => rgba(0xa34838ff),
+                        SyncHealth::Recovering => rgba(0x8d6a27ff),
+                        _ => rgba(0x536f59ff),
+                    })
+                    .child(health.label()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x536f59ff))
+                    .child(self.event_link_text()),
+            );
+        for fact in facts {
+            panel = panel.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x8a978dff))
+                    .child(fact),
+            );
+        }
         let conflicts = self.sync_conflicts(cx);
         if failures.is_empty() && conflicts.is_empty() {
             panel = panel.child(div().text_color(rgba(0x536f59ff)).child("没有同步问题。"));

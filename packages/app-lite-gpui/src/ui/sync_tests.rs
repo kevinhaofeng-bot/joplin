@@ -852,3 +852,68 @@ async fn waking_from_sleep_or_changing_network_reconnects_and_syncs_at_once(
     assert_eq!(opens(&view, cx), first_opens + 2);
     assert_eq!(attempts(&view, cx), first_attempts + 2);
 }
+
+#[gpui::test]
+async fn the_health_panel_grades_the_link_and_backlog_without_note_content(
+    cx: &mut TestAppContext,
+) {
+    use crate::ui::sync::SyncHealth;
+    let fixture = fixture_with(app_lite_server::http::HttpOptions {
+        heartbeat: std::time::Duration::from_millis(200),
+        ..Default::default()
+    });
+    let note = fixture
+        .repository
+        .create_note(CreateNote {
+            title: "机密标题".into(),
+            notebook_id: None,
+            document: text("x"),
+        })
+        .unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    let health = |view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| shell.sync_health(app))
+    };
+    assert_eq!(health(&view, cx).0, SyncHealth::Unconfigured);
+
+    fixture.configure(TOKEN);
+    wait(5, &view, cx);
+    wait_for_link(&view, cx);
+    settle(&view, cx, |view, cx| {
+        view.read_with(cx, |shell, app| shell.sync_health(app))
+            .1
+            .iter()
+            .any(|fact| fact.contains("收到服务器消息（含心跳）：0 秒前"))
+    });
+    let (grade, facts) = health(&view, cx);
+    assert_eq!(grade, SyncHealth::Healthy, "{facts:?}");
+    assert!(
+        facts
+            .iter()
+            .any(|fact| fact.starts_with("最近一次成功同步：") && !fact.contains("尚无"))
+    );
+    assert!(facts.contains(&"待同步：无".to_owned()));
+
+    drop(fixture.server);
+    settle(&view, cx, |view, cx| {
+        view.read_with(cx, |shell, app| shell.sync_health(app)).0 == SyncHealth::Recovering
+    });
+    assert!(
+        health(&view, cx)
+            .1
+            .iter()
+            .any(|fact| fact.starts_with("最近一次连接问题："))
+    );
+
+    let stored = fixture.repository.load_note(&note.id).unwrap().unwrap();
+    fixture
+        .repository
+        .save_overtaken_edit_as_conflict_copy(&note.id, stored.revision, "机密标题", &text("y"))
+        .unwrap();
+    let (grade, facts) = health(&view, cx);
+    assert_eq!(grade, SyncHealth::Attention);
+    assert!(
+        facts.iter().all(|fact| !fact.contains("机密")),
+        "no note content in health facts: {facts:?}"
+    );
+}
