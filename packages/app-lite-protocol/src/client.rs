@@ -1,11 +1,19 @@
 //! Blocking HTTP client for the routes in docs/research/sync-client-design-v1.md §1.
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use crate::{
-    BlobStatus, PullRequest, PullResponse, PushRequest, PushResponse, SyncTransport, TransportError,
+    BlobStatus, EVENTS_HEARTBEAT_SECONDS, PullRequest, PullResponse, PushRequest, PushResponse,
+    SyncEvent, SyncTransport, TransportError,
 };
+
+/// No byte for this long means the event stream is dead: after a network
+/// change a half-open connection reports no error of its own. Two missed
+/// heartbeats plus slack.
+pub const EVENTS_SILENCE_TIMEOUT: Duration = Duration::from_secs(EVENTS_HEARTBEAT_SECONDS * 5 / 2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_EVENT_LINE_BYTES: u64 = 4096;
 
 /// Upper bound on a response body the client will read.
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -22,7 +30,7 @@ impl HttpTransport {
             base_url: base_url.trim_end_matches('/').to_owned(),
             authorization: format!("Bearer {token}"),
             agent: ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
+                .timeout_connect(CONNECT_TIMEOUT)
                 .timeout(Duration::from_secs(120))
                 .build(),
         }
@@ -95,6 +103,72 @@ impl HttpTransport {
             .set("Authorization", &self.authorization)
             .set("Content-Type", "application/json")
             .send_bytes(&bytes)
+    }
+}
+
+impl HttpTransport {
+    /// Opens `GET /v1/events`; see `EVENTS_SILENCE_TIMEOUT`.
+    pub fn open_events(&self) -> Result<EventStream, TransportError> {
+        self.open_events_with(EVENTS_SILENCE_TIMEOUT)
+    }
+
+    pub fn open_events_with(&self, silence: Duration) -> Result<EventStream, TransportError> {
+        // Its own agent: the request timeout of `agent` would cut a healthy
+        // stream, while a per-read timeout is exactly the silence rule.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(silence)
+            .timeout_write(CONNECT_TIMEOUT)
+            .build();
+        let response = Self::checked(
+            agent
+                .get(&self.url("/v1/events"))
+                .set("Authorization", &self.authorization)
+                .set("Accept", "text/event-stream")
+                .set("Connection", "close")
+                .call(),
+        )?;
+        Ok(EventStream {
+            lines: BufReader::new(Box::new(response.into_reader())),
+        })
+    }
+}
+
+pub struct EventStream {
+    lines: BufReader<Box<dyn Read + Send + Sync>>,
+}
+
+impl EventStream {
+    /// Blocks for the next event. Heartbeat comments only keep the stream
+    /// alive. Silence, a closed connection, or an oversized line is
+    /// `Retryable`: reconnect.
+    pub fn next_event(&mut self) -> Result<SyncEvent, TransportError> {
+        let (mut event, mut data) = (String::new(), String::new());
+        loop {
+            let mut line = String::new();
+            let read = (&mut self.lines)
+                .take(MAX_EVENT_LINE_BYTES)
+                .read_line(&mut line)
+                .map_err(|error| TransportError::Retryable(format!("event stream: {error}")))?;
+            if read == 0 {
+                return Err(TransportError::Retryable("event stream closed".into()));
+            }
+            if !line.ends_with('\n') {
+                return Err(TransportError::Retryable("event line too long".into()));
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                if let Some(parsed) = SyncEvent::from_sse(&event, &data) {
+                    return Ok(parsed);
+                }
+                event.clear();
+                data.clear();
+            } else if let Some(value) = line.strip_prefix("event:") {
+                event = value.trim().to_owned();
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data = value.trim().to_owned();
+            }
+        }
     }
 }
 

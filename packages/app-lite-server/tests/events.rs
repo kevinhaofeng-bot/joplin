@@ -218,3 +218,121 @@ fn clients_that_go_silent_mid_request_do_not_hold_the_workers() {
     );
     drop(stalled);
 }
+
+/// Forwards bytes both ways until `blackhole` is set; then keeps both
+/// sockets open and moves nothing, like a link that died without a FIN or
+/// RST (base station handover, expired NAT entry).
+struct FaultProxy {
+    address: std::net::SocketAddr,
+    blackhole: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn fault_proxy(upstream: std::net::SocketAddr) -> FaultProxy {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let hole = Arc::clone(&blackhole);
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { return };
+            let server = TcpStream::connect(upstream).unwrap();
+            for (mut from, mut to) in [
+                (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                (server, client),
+            ] {
+                let hole = Arc::clone(&hole);
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    from.set_read_timeout(Some(Duration::from_millis(20)))
+                        .unwrap();
+                    let mut buffer = [0u8; 8192];
+                    loop {
+                        if hole.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        match from.read(&mut buffer) {
+                            Ok(0) => return,
+                            // Bytes in flight when the link died are lost.
+                            Ok(_) if hole.load(Ordering::Acquire) => {}
+                            Ok(count) => {
+                                if to.write_all(&buffer[..count]).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        }
+    });
+    FaultProxy { address, blackhole }
+}
+
+#[test]
+fn the_client_follows_the_stream_and_calls_a_silent_one_dead() {
+    use app_lite_protocol::SyncEvent;
+    let running = start(fast());
+    let proxy = fault_proxy(running.server.local_addr());
+    let through_proxy = HttpTransport::new(&format!("http://{}", proxy.address), TOKEN);
+    let mut stream = through_proxy
+        .open_events_with(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(stream.next_event().unwrap(), SyncEvent::Hello { head: 0 });
+    push_note(&running.url(), 'a');
+    assert_eq!(stream.next_event().unwrap(), SyncEvent::Changed { head: 1 });
+
+    proxy
+        .blackhole
+        .store(true, std::sync::atomic::Ordering::Release);
+    push_note(&running.url(), 'b');
+    let started = Instant::now();
+    let silent = stream.next_event();
+    assert!(
+        matches!(silent, Err(app_lite_protocol::TransportError::Retryable(_))),
+        "{silent:?} after {:?}",
+        started.elapsed()
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(800) && waited < Duration::from_secs(3),
+        "dead after {waited:?}"
+    );
+
+    // Once the link is back, a new stream reports the head it missed.
+    proxy
+        .blackhole
+        .store(false, std::sync::atomic::Ordering::Release);
+    let mut again = through_proxy
+        .open_events_with(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(again.next_event().unwrap(), SyncEvent::Hello { head: 2 });
+    assert!(matches!(
+        HttpTransport::new(&running.url(), "wrong-token-wrong-token-wrong-token").open_events(),
+        Err(app_lite_protocol::TransportError::Unauthorized)
+    ));
+    assert_eq!(
+        through_proxy
+            .open_events_with(Duration::from_secs(5))
+            .unwrap()
+            .next_event()
+            .unwrap(),
+        SyncEvent::Hello { head: 2 }
+    );
+}
+
+#[test]
+fn a_stream_the_server_ends_on_schedule_says_bye() {
+    use app_lite_protocol::SyncEvent;
+    let running = start(fast());
+    let mut stream = HttpTransport::new(&running.url(), TOKEN)
+        .open_events_with(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(stream.next_event().unwrap(), SyncEvent::Hello { head: 0 });
+    assert_eq!(stream.next_event().unwrap(), SyncEvent::Bye);
+    assert!(stream.next_event().is_err(), "closed after bye");
+}
