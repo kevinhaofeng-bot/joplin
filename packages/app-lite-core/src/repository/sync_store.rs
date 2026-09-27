@@ -409,19 +409,24 @@ impl LibraryRepository {
                     params![kind, id],
                     |row| row.get::<_, i64>(0),
                 )? != 0;
+            if pending {
+                // Remote wins the entity: a local note edit survives as its
+                // conflict copy (made from the note row, not the outbox),
+                // other kinds lose the edit. Cleared first so that applying
+                // may queue new work (an attachment still used here).
+                drop_pending(&transaction, kind, id)?;
+            }
             let outcome = match kind {
                 "note" => self.apply_remote_note(&transaction, id, change, pending, now),
                 "notebook" => apply_remote_notebook(&transaction, id, change, now),
                 "stack" | "tag" => apply_remote_container(&transaction, kind, id, change, now),
-                _ => Ok(Err(Skip(format!("{kind} changes are not applied yet")))),
+                "resource" => self.apply_remote_resource(&transaction, id, change, now),
+                _ => Ok(Err(Skip(format!("{kind} changes are not supported")))),
             };
             match outcome? {
                 Ok(conflict) => {
                     report.applied += 1;
                     if pending {
-                        // Remote wins the entity; a local note edit survives
-                        // as its conflict copy, other kinds lose the edit.
-                        drop_pending(&transaction, kind, id)?;
                         report.conflicts += usize::from(conflict || kind != "note");
                     }
                     if kind == "note" {
@@ -507,6 +512,140 @@ impl LibraryRepository {
             None => {}
         }
         Ok(Ok(copied))
+    }
+
+    pub(crate) fn sync_has_blob(&self, sha256: &str) -> Result<bool, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM resource_blobs WHERE sha256=?1)",
+            [sha256],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    /// Writes downloaded bytes into the content-addressed store. Metadata
+    /// follows only when the page applies, after `verify_staged_blob`.
+    pub(crate) fn sync_store_blob<R: std::io::Read>(
+        &self,
+        reader: R,
+        size: usize,
+        title: &str,
+        mime: &str,
+        extension: &str,
+    ) -> Result<crate::BlobHash, LibraryError> {
+        Ok(self
+            .resource_store
+            .put_reader(reader, size, title, mime, extension)?
+            .sha256)
+    }
+
+    fn apply_remote_resource(
+        &self,
+        transaction: &Transaction<'_>,
+        id: &str,
+        change: &app_lite_protocol::Change,
+        now: i64,
+    ) -> Result<Result<bool, Skip>, LibraryError> {
+        if change.deleted {
+            let used: i64 = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM note_resources WHERE resource_id=?1)
+                     OR EXISTS(SELECT 1 FROM note_revisions WHERE instr(body_html, ':/' || ?1) > 0)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if used != 0 {
+                // Still shown here: keep it and put it back on the server.
+                let resource = crate::ResourceId::new(id).map_err(|_| LibraryError::InvalidId)?;
+                super::enqueue_sync(
+                    transaction,
+                    self.id_source.as_ref(),
+                    &crate::EntityRef::Resource(resource),
+                    1,
+                    "restore",
+                    now,
+                )?;
+                return Ok(Ok(true));
+            }
+            let sha: Option<String> = transaction
+                .query_row("SELECT sha256 FROM resources WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if let Some(sha) = sha {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO tombstones (entity_type, entity_id, final_revision, deleted_time, purged_time)
+                     SELECT 'resource', id, revision + 1, ?2, ?2 FROM resources WHERE id=?1",
+                    params![id, now],
+                )?;
+                transaction.execute("DELETE FROM resources WHERE id=?1", [id])?;
+                let orphan = transaction.execute(
+                    "DELETE FROM resource_blobs WHERE sha256=?1 AND NOT EXISTS(SELECT 1 FROM resources WHERE sha256=?1)",
+                    [&sha],
+                )?;
+                if orphan != 0 {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO resource_gc_queue (sha256, created_time) VALUES (?1, ?2)",
+                        params![sha, now],
+                    )?;
+                }
+            }
+            return Ok(Ok(false));
+        }
+        let Some(resource) = change.payload.as_ref().and_then(RemoteResourceRef::parse) else {
+            return Ok(Err(Skip("attachment payload is incomplete".into())));
+        };
+        let existing: Option<String> = transaction
+            .query_row("SELECT sha256 FROM resources WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if existing.is_some_and(|sha| sha != resource.sha256.as_str()) {
+            return Ok(Err(Skip(
+                "attachment content changed on another device".into(),
+            )));
+        }
+        // The blob was downloaded before this page; inside this writer
+        // transaction GC cannot race the check below.
+        transaction.execute(
+            "DELETE FROM resource_gc_queue WHERE sha256=?1",
+            [resource.sha256.as_str()],
+        )?;
+        self.resource_store
+            .verify_staged_blob(&crate::resource::ResourceBlob {
+                sha256: resource.sha256.clone(),
+                size: resource.size,
+            })?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO resource_blobs (sha256, size, mime, relative_path, created_time, revision) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                resource.sha256.as_str(),
+                resource.size as i64,
+                resource.mime,
+                format!("resources/blobs/{}", resource.sha256.as_str()),
+                now
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM tombstones WHERE entity_type='resource' AND entity_id=?1",
+            [id],
+        )?;
+        transaction.execute(
+            "INSERT INTO resources (id, sha256, title, mime, file_extension, size, created_time, updated_time, deleted_time, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0, 1)
+             ON CONFLICT(id) DO UPDATE SET title=excluded.title, mime=excluded.mime,
+               file_extension=excluded.file_extension, updated_time=excluded.updated_time,
+               deleted_time=0, revision=resources.revision+1",
+            params![
+                id,
+                resource.sha256.as_str(),
+                resource.title,
+                resource.mime,
+                resource.file_extension,
+                resource.size as i64,
+                now
+            ],
+        )?;
+        Ok(Ok(false))
     }
 
     /// The local version becomes a new note (uploaded like any new note) so
@@ -880,4 +1019,26 @@ fn drop_pending(transaction: &Transaction<'_>, kind: &str, id: &str) -> Result<(
         params![kind, id],
     )?;
     Ok(())
+}
+
+/// Validated attachment metadata from a remote payload.
+pub struct RemoteResourceRef {
+    pub(crate) title: String,
+    pub(crate) mime: String,
+    pub(crate) file_extension: String,
+    pub(crate) size: usize,
+    pub(crate) sha256: crate::BlobHash,
+}
+
+impl RemoteResourceRef {
+    pub(crate) fn parse(payload: &Value) -> Option<Self> {
+        let text = |key: &str| payload.get(key)?.as_str().map(str::to_owned);
+        Some(Self {
+            title: text("title")?,
+            mime: text("mime")?,
+            file_extension: text("file_extension")?,
+            size: usize::try_from(payload.get("size")?.as_u64()?).ok()?,
+            sha256: crate::BlobHash::new(text("sha256")?).ok()?,
+        })
+    }
 }
