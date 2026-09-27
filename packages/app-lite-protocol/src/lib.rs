@@ -149,3 +149,35 @@ pub fn valid_sha256(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+
+/// How a sync call failed, as far as the caller needs to decide what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportError {
+    /// Network failure, server busy or 5xx: send the same request again later.
+    Retryable(String),
+    /// The request itself is invalid (4xx): resending it cannot succeed.
+    Permanent(String),
+    /// Missing or wrong credentials; nothing was applied.
+    Unauthorized,
+    /// A chunk was not at the end of the server's partial upload.
+    OffsetMismatch { expected: u64 },
+}
+
+/// One sync server, in-process or over HTTP. Every per-operation outcome is
+/// still in `PushResponse`; an `Ok` push is not by itself a success.
+pub trait SyncTransport {
+    fn push(&self, request: &PushRequest) -> Result<PushResponse, TransportError>;
+    fn pull(&self, request: &PullRequest) -> Result<PullResponse, TransportError>;
+    fn blob_status(&self, sha256: &str) -> Result<BlobStatus, TransportError>;
+    fn put_chunk(
+        &self,
+        sha256: &str,
+        size: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<BlobStatus, TransportError>;
+    fn read_range(&self, sha256: &str, offset: u64, len: u64) -> Result<Vec<u8>, TransportError>;
+}
+
+#[cfg(feature = "client")]
+pub mod client;

@@ -1,6 +1,8 @@
 //! Joplin Lite personal sync server: storage for protocol v1
-//! (docs/research/sync-protocol-v1.md). Transport-free; the HTTP layer and
-//! NAS deployment come after the protocol review gate.
+//! (docs/research/sync-protocol-v1.md). `http` maps it onto HTTP
+//! (docs/research/sync-client-design-v1.md §1).
+
+pub mod http;
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -12,7 +14,7 @@ use std::{
 use app_lite_protocol::{
     Action, BlobStatus, Change, EntityKind, EntityRef, MAX_PAYLOAD_BYTES, MAX_PULL_LIMIT,
     MAX_PUSH_OPS, OpResult, Operation, PROTOCOL_VERSION, PullRequest, PullResponse, PushRequest,
-    PushResponse, valid_id, valid_sha256,
+    PushResponse, SyncTransport, TransportError, valid_id, valid_sha256,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -321,5 +323,45 @@ fn validate(device_id: &str, op: &Operation) -> Result<Option<String>, &'static 
             }
             Ok(Some(text))
         }
+    }
+}
+
+impl From<ServerError> for TransportError {
+    fn from(error: ServerError) -> Self {
+        match error {
+            ServerError::OffsetMismatch { expected } => Self::OffsetMismatch { expected },
+            ServerError::Storage(_) | ServerError::Io(_) => Self::Retryable(error.to_string()),
+            ServerError::Protocol(_)
+            | ServerError::BadRequest(_)
+            | ServerError::HashMismatch
+            | ServerError::NotFound
+            | ServerError::Json(_) => Self::Permanent(error.to_string()),
+        }
+    }
+}
+
+/// In-process transport: the same client engine runs against the store
+/// directly in tests.
+impl SyncTransport for ServerStore {
+    fn push(&self, request: &PushRequest) -> Result<PushResponse, TransportError> {
+        Ok(ServerStore::push(self, request.clone())?)
+    }
+    fn pull(&self, request: &PullRequest) -> Result<PullResponse, TransportError> {
+        Ok(ServerStore::pull(self, request.clone())?)
+    }
+    fn blob_status(&self, sha256: &str) -> Result<BlobStatus, TransportError> {
+        Ok(ServerStore::blob_status(self, sha256)?)
+    }
+    fn put_chunk(
+        &self,
+        sha256: &str,
+        size: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<BlobStatus, TransportError> {
+        Ok(ServerStore::put_chunk(self, sha256, size, offset, bytes)?)
+    }
+    fn read_range(&self, sha256: &str, offset: u64, len: u64) -> Result<Vec<u8>, TransportError> {
+        Ok(ServerStore::read_range(self, sha256, offset, len)?)
     }
 }
