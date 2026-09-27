@@ -108,6 +108,7 @@ Codex 已独立核验 `becdff6d6`：core 345 通过；GUI 1362 通过、1 忽略
 | 多段落引用 → 相邻多个引用块（只含段落时）；含列表或标题的引用仍阻断 | `cd9405a04` | 1444 / 222 |
 | 同类嵌套 Markdown 列表 → 列表项 `indent` = 嵌套层级（原生 depth，上限 8，依赖另一会话 `24d5a632c`）；异类嵌套、超 8 层、项内第二个块仍阻断。`[![alt](:/img)](url)` 与 `<a href><img></a>` → 图片 `link`（依赖另一会话 `ef8517cf1`）；链到资源或片段的仍阻断 | `6af36711c` | 1500 / 166 |
 | 非图片资源用图片语法 `![名](:/pdf)` → 原位附件卡片（alt 与文件名不同时保留为文字）；在外链内时仍阻断 | `451f556a8` | 1502 / 164 |
+| H4–H6（依赖另一会话 `c1275c5ea`）；顶层有序列表起始号写入 `start`（依赖 `27878ea83`，u32 溢出仍阻断）；嵌套子列表从 ≠1 开始仍阻断（展平后只能有一个 start） | `56342c126` | 1522 / 144 |
 
 ### 剩余警告的真实分布（HEAD `6bff4936c`，只读探针）
 
@@ -284,3 +285,38 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 - 表格：方案草案在 `docs/research/table-model-proposal.md`，等迁移侧确认后再实施。
 - Claude 实施状态：以上提交待验收；实机矩阵未完成
 - Codex 验收状态：未验收
+
+## H4–H6 与有序列表起始号的导入映射（`56342c126`）
+
+- 修复一次编译阻断：我在未提交的 `jex_body.rs:565` 写了 `start.and_then(Result::ok)`，这里的 `Result` 解析成了本文件的别名 `Result<T, JexBodyFidelityBlocker>`，而实际需要的是 `TryFromIntError`，于是报 E0631（Codex 复现日志 `/tmp/joplin-codex-review-27878-dirty-core.log`，cargo test 退出 101）。改为 `std::result::Result::ok`。
+- 新增测试 `deep_headings_and_ordered_list_start_convert`。先失败证据：旧代码对 `####` 报 `UnsupportedHeading`。
+- 修正我自己写错的用例：按 CommonMark，从非 1 开始的有序列表不能打断段落，所以 `1. 一\n   5. 五` 的第二行是续行文字，不是子列表。改为 `1. 一\n\n   5. 五` 后，用临时探针确认它按“Ordered list start number is not representable”阻断，临时文件已删除。
+- 按新能力删除旧断言“`####` 必阻断”。
+- core 全套 359 通过，日志 `/tmp/joplin-stage2-claude/core-h4-start.log`。
+
+## 纯净构建回归 + 新鲜隔离导入 + 原生往返（HEAD `56342c126`）
+
+做法：`git worktree add --detach` 单独检出，从零编译到独立 target 目录，检出里没有任何未提交改动（`worktree-dirty.txt` 为空）。日志目录 `/tmp/joplin-stage2-claude/clean-56342c126/`，用后已 `git worktree remove`。
+
+| 命令（在该检出内） | 结果 | 日志 |
+| --- | --- | --- |
+| `import_verify`：只读 JEX 副本 → `/tmp/joplin-stage2-import5.sLTM2B/imports` | 退出0，91.3 s；1666/31/2/64/425/4153/4127；**降级 144**（与只读审计 1522/144 一致）；发布 blob 0 不符，源 blob 缺失 0、多余 0 | `/tmp/joplin-stage2-import5.sLTM2B/verify.log` |
+| `sqlite3 -readonly` 统计正文结构 | 含 `<h4>`–`<h6>` 的笔记 19 篇；含 `<ol start=` 的笔记 14 篇 | `structure-counts.txt` |
+| `cargo test --locked --bin velotype`（`app-lite-gpui`） | 退出0；1370 通过、0 失败、1 忽略 | `gpui.log` |
+| 原生加载/回写审计 → `/tmp/joplin-stage2-import5.sLTM2B/imports/all_notebooks-1790475871/library.sqlite` | 退出0；`real-copy notes=1666, failure_categories={}`（上面 19/14 篇都能原生打开并回写） | `audit.log` |
+| core `--features test-support --tests` | 退出0；359 通过 | `core.log` |
+| server `--offline` | 退出0；10 通过 | `server.log` |
+
+编译警告仍有 150 行，未清零。以上为本会话自测，不是 Codex 验收。
+
+## 表格方案的迁移侧核查（`e06f214d7`，只读探针）
+
+另一会话的方案草案在 `docs/research/table-model-proposal.md`。核查命令：`JOPLIN_LITE_AUDIT_TABLES=1 cargo run -q --release --locked --example migration_fidelity_audit <隔离副本>`，只输出计数。
+
+- GFM 表格 290 张：colspan/rowspan、单元格块级内容、嵌套表格在语法上都不可能出现；超过 1000 行 0 张，超过 64 列 0 张。
+- 内嵌原始 HTML 表格 7 张，全部在同一篇笔记里：rowspan 3 处、嵌套 table 3 处、单元格内块级元素 390 个。按方案这篇会整表降级；它现在本来就因原始 HTML 降级。
+- 单元格里的转义管道 `\|` 26 处，GFM 解析为字面 `|`，canonical 需要保留；HTML 实体 2 处，解析器已解码成文字。
+- 解析器会丢掉超出表头列数的单元格。按解析器重算后，丢失非空单元格的行为 0。我先前按 `|` 粗数得到的 445 是误报，已从探针移除。
+- 单元格内图片 68 个：53 个指向资源，15 个是外链（这些笔记仍会因外链图片降级）。单元格内行内 HTML `<a>` 14 处，导入时仍按原始 HTML 阻断。
+
+已回复另一会话：对方案 B 没有异议；canonical 层落地后，由本会话接 GFM 表格导入映射。
