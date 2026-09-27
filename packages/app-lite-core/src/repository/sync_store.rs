@@ -495,7 +495,8 @@ pub struct SyncApplyReport {
 struct Skip(String);
 
 impl LibraryRepository {
-    pub(crate) fn sync_cursor(&self) -> Result<u64, LibraryError> {
+    /// Highest server cursor this library has applied.
+    pub fn sync_cursor(&self) -> Result<u64, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
         let cursor: Option<String> = connection
             .query_row(

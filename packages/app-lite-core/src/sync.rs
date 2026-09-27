@@ -57,10 +57,16 @@ pub fn sync_once(
     if !pull(repository, transport, &mut report)? {
         return Ok(report);
     }
-    let conflicts = report.conflicts;
+    let (conflicts, accepted) = (report.conflicts, report.accepted);
     push(repository, transport, &device_id, &mut report)?;
-    if report.conflicts > conflicts && pull(repository, transport, &mut report)? {
-        push(repository, transport, &device_id, &mut report)?;
+    if report.conflicts > conflicts {
+        if pull(repository, transport, &mut report)? {
+            push(repository, transport, &device_id, &mut report)?;
+        }
+    } else if report.accepted > accepted {
+        // Moves the cursor past our own uploads (skipped as already known),
+        // so the server's change notification for them reads as seen.
+        pull(repository, transport, &mut report)?;
     }
     Ok(report)
 }

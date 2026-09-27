@@ -239,3 +239,22 @@ fn one_sync_uploads_more_than_one_batch() {
     assert_eq!(repo.sync_pending_count().unwrap(), 0, "{report:?}");
     assert_eq!(repo.outbox_count().unwrap(), 0);
 }
+
+#[test]
+fn an_upload_leaves_the_cursor_at_the_server_head_without_counting_downloads() {
+    let server_root = tempdir().unwrap();
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let root = tempdir().unwrap();
+    let repo = open(root.path());
+    repo.create_note(CreateNote {
+        title: "本机".into(),
+        notebook_id: None,
+        document: text("x"),
+    })
+    .unwrap();
+    let report = sync::sync_once(&repo, &store).unwrap();
+    assert!(report.accepted > 0);
+    assert_eq!(report.pulled, 0, "our own changes are not downloads");
+    // The change notification for our own upload then reads as seen.
+    assert_eq!(repo.sync_cursor().unwrap(), store.head());
+}
