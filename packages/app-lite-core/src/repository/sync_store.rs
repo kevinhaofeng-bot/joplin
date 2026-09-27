@@ -22,6 +22,17 @@ pub struct SyncInflight {
     pub action_json: String,
 }
 
+/// A conflict copy made on this device that the person has not settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflict {
+    pub copy_id: NoteId,
+    pub copy_title: String,
+    pub original_id: String,
+    /// None when the original is no longer here.
+    pub original_title: Option<String>,
+    pub created_time: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncFailure {
     pub op_id: String,
@@ -270,6 +281,50 @@ impl LibraryRepository {
             )?;
         }
         self.load_note(&copy.id)?.ok_or(LibraryError::NotFound)
+    }
+
+    /// Unsettled conflict copies, oldest first. A copy that was trashed is
+    /// settled: the person chose the other version.
+    pub fn sync_conflicts(&self) -> Result<Vec<SyncConflict>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT c.id, copy.title, c.entity_id,
+                    (SELECT title FROM notes WHERE id=c.entity_id AND deleted_time=0), c.created_time
+             FROM sync_conflicts c JOIN notes copy ON copy.id=c.id
+             WHERE c.resolved_time=0 AND copy.deleted_time=0
+             ORDER BY c.created_time, c.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut conflicts = Vec::new();
+        for row in rows {
+            let (copy_id, copy_title, original_id, original_title, created_time) = row?;
+            conflicts.push(SyncConflict {
+                copy_id: NoteId::parse(copy_id).map_err(|_| LibraryError::InvalidId)?,
+                copy_title,
+                original_id,
+                original_title,
+                created_time,
+            });
+        }
+        Ok(conflicts)
+    }
+
+    /// The person has compared the versions; the copy note itself stays.
+    pub fn sync_resolve_conflict(&self, copy_id: &NoteId) -> Result<bool, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE sync_conflicts SET resolved_time=?2 WHERE id=?1 AND resolved_time=0",
+            params![copy_id.as_str(), self.now().max(1)],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Drops a refused upload so the next sync sends the entity's current

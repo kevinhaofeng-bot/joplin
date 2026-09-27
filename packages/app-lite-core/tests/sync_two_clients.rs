@@ -195,6 +195,19 @@ fn concurrent_edits_of_one_note_keep_both_as_a_visible_conflict_copy() {
             .expect("conflict copy is visible on both devices");
         assert!(copy.body_text.contains("B 写的结论"), "no edit is lost");
     }
+    // The device that made the copy lists it until the person settles it.
+    let open = b.repo.sync_conflicts().unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].original_id, note.id.as_str());
+    assert_eq!(open[0].copy_title, "会议（冲突副本）");
+    assert_eq!(open[0].original_title.as_deref(), Some("会议"));
+    assert!(b.repo.sync_resolve_conflict(&open[0].copy_id).unwrap());
+    assert!(b.repo.sync_conflicts().unwrap().is_empty());
+    assert!(
+        b.repo.load_note(&open[0].copy_id).unwrap().is_some(),
+        "settling keeps the copy"
+    );
+    assert!(!b.repo.sync_resolve_conflict(&open[0].copy_id).unwrap());
 }
 
 #[test]
@@ -489,5 +502,11 @@ fn an_unsaved_edit_overtaken_by_a_remote_version_is_kept_as_a_conflict_copy() {
     assert!(
         b.repo.load_note(&copy.id).unwrap().is_some(),
         "the copy syncs"
+    );
+    assert_eq!(a.repo.sync_conflicts().unwrap().len(), 1);
+    a.repo.trash_note(&copy.id).unwrap();
+    assert!(
+        a.repo.sync_conflicts().unwrap().is_empty(),
+        "a trashed copy is settled"
     );
 }
