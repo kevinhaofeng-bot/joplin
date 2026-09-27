@@ -460,3 +460,35 @@ fn a_client_trickling_its_request_head_is_cut_off_at_the_head_deadline() {
             .is_ok()
     );
 }
+
+#[test]
+fn a_chunk_cut_off_mid_upload_keeps_what_arrived() {
+    use app_lite_protocol::BlobStatus;
+    let running = start(fast());
+    let sha = "a".repeat(64);
+    let mut socket = TcpStream::connect(running.server.local_addr()).unwrap();
+    write!(
+        socket,
+        "PUT /v1/blobs/{sha}?size=200000&offset=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 100000\r\n\r\n"
+    )
+    .unwrap();
+    socket.write_all(&[7u8; 40_000]).unwrap();
+    socket.shutdown(std::net::Shutdown::Both).unwrap();
+    let transport = HttpTransport::new(&running.url(), TOKEN);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = transport.blob_status(&sha).unwrap();
+        if status == (BlobStatus::Partial { bytes: 40_000 }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{status:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The client resumes right after the received bytes.
+    assert_eq!(
+        transport
+            .put_chunk(&sha, 200_000, 40_000, &[7u8; 10_000])
+            .unwrap(),
+        BlobStatus::Partial { bytes: 50_000 }
+    );
+}

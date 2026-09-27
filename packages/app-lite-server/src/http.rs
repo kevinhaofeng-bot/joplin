@@ -480,6 +480,28 @@ fn body(reader: &mut impl Read, request: &Request, limit: u64) -> Result<Vec<u8>
     Ok(plain)
 }
 
+/// An attachment chunk as far as it arrived. Blobs are content-addressed
+/// and verified whole on completion, so the bytes received before a link
+/// dropped are kept and the client resumes after them; otherwise a chunk
+/// longer than the link stays up would be resent forever.
+fn chunk_prefix(reader: &mut impl Read, request: &Request) -> Result<Vec<u8>, Reply> {
+    if request.gzip_body {
+        return body(reader, request, MAX_CHUNK_BYTES);
+    }
+    let Some(length) = request.content_length else {
+        return Err(text(411, "Content-Length is required"));
+    };
+    if length > MAX_CHUNK_BYTES {
+        return Err(text(413, "request body too large"));
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    let _ = reader.take(length).read_to_end(&mut bytes);
+    if bytes.is_empty() && length > 0 {
+        return Err(text(400, "unreadable request body"));
+    }
+    Ok(bytes)
+}
+
 fn query(url: &str, name: &str) -> Option<u64> {
     url.split_once('?')?
         .1
@@ -604,7 +626,7 @@ fn route(store: &ServerStore, request: &Request, reader: &mut impl Read) -> Resu
             .unwrap_or_else(error),
         ("PUT", ["v1", "blobs", sha256]) => match (query(url, "size"), query(url, "offset")) {
             (Some(size), Some(offset)) => {
-                let bytes = body(reader, request, MAX_CHUNK_BYTES)?;
+                let bytes = chunk_prefix(reader, request)?;
                 store
                     .put_chunk(sha256, size, offset, &bytes)
                     .map(|status| json(&status))
