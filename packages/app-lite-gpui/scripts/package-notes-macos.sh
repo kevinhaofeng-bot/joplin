@@ -29,7 +29,8 @@ cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" --release --locked --bin 
 # Read Cargo's real target directory (worktrees may share one) instead of
 # assuming ./target, so a stale binary is never packaged.
 TARGET_DIR="$(cargo metadata --manifest-path "$PROJECT_ROOT/Cargo.toml" --no-deps --format-version 1 \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+[[ -n "$TARGET_DIR" ]] || { echo "cannot read cargo target directory" >&2; exit 1; }
 BINARY="$TARGET_DIR/release/velotype"
 [[ -x "$BINARY" ]] || { echo "release binary missing: $BINARY" >&2; exit 1; }
 
