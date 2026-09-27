@@ -7,7 +7,9 @@
 //! mid-request (a phone losing its radio, an expired carrier NAT entry)
 //! frees its thread instead of holding it forever. One request per
 //! connection, `Content-Length` bodies only; `GET /v1/events` streams
-//! Server-Sent Events on the same connection.
+//! Server-Sent Events on the same connection. With `HttpOptions::tls` the
+//! server terminates TLS itself (rustls), so a NAS needs no reverse proxy;
+//! the handshake is bounded by the same socket timeouts.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -28,10 +30,15 @@ const LINGER: Duration = Duration::from_secs(2);
 const MAX_LINGER_BYTES: u64 = 2 * MAX_JSON_BODY_BYTES;
 
 /// Timing and limits that tests shorten; production uses `Default`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HttpOptions {
+    /// Serve HTTPS with this configuration instead of plain HTTP.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
     /// Longest wait for bytes from, or room to send to, one client.
     pub socket_timeout: Duration,
+    /// The TLS handshake and request head together must arrive within this,
+    /// however slowly the bytes trickle in.
+    pub request_head_timeout: Duration,
     pub heartbeat: Duration,
     pub max_stream: Duration,
     /// Event streams each hold a connection for their lifetime.
@@ -43,7 +50,9 @@ pub struct HttpOptions {
 impl Default for HttpOptions {
     fn default() -> Self {
         Self {
+            tls: None,
             socket_timeout: Duration::from_secs(60),
+            request_head_timeout: Duration::from_secs(10),
             heartbeat: Duration::from_secs(EVENTS_HEARTBEAT_SECONDS),
             max_stream: Duration::from_secs(EVENTS_MAX_STREAM_SECONDS),
             max_streams: 32,
@@ -158,7 +167,10 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
         std::thread::spawn(move || {
             let Some(_slot) = Slot::claim(&shared.connections, shared.options.max_connections)
             else {
-                let _ = write_reply(&socket, text(503, "server busy"));
+                // Plain text on a TLS port would only confuse the client.
+                if shared.options.tls.is_none() {
+                    let _ = write_reply(&mut &socket, text(503, "server busy"));
+                }
                 return;
             };
             serve(&shared, socket);
@@ -206,6 +218,74 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// The client socket; while `deadline` is set every read waits at most
+/// until then, so the request head has an overall time limit.
+struct Socket {
+    tcp: TcpStream,
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Socket {
+    fn clear_deadline(&mut self) {
+        self.deadline = None;
+        let _ = self.tcp.set_read_timeout(Some(self.timeout));
+    }
+}
+
+impl Read for Socket {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            self.tcp
+                .set_read_timeout(Some(remaining.min(self.timeout)))?;
+        }
+        self.tcp.read(buffer)
+    }
+}
+
+impl Write for Socket {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.tcp.write(buffer)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+/// A plain or TLS connection over `Socket`.
+trait Channel: Read + Write {
+    fn socket(&mut self) -> &mut Socket;
+    /// False while a TLS handshake is unfinished: nothing can be sent.
+    fn established(&self) -> bool {
+        true
+    }
+    /// Ends a TLS session with `close_notify`; nothing for plain TCP.
+    fn close_notify(&mut self) {}
+}
+
+impl Channel for Socket {
+    fn socket(&mut self) -> &mut Socket {
+        self
+    }
+}
+
+impl Channel for rustls::StreamOwned<rustls::ServerConnection, Socket> {
+    fn socket(&mut self) -> &mut Socket {
+        &mut self.sock
+    }
+    fn established(&self) -> bool {
+        !self.conn.is_handshaking()
+    }
+    fn close_notify(&mut self) {
+        self.conn.send_close_notify();
+        let _ = self.flush();
+    }
+}
+
 /// After a reply the client may still be sending a body the server
 /// refused; closing then would reset the connection before the client reads
 /// the reply. Read and discard for a bounded time and amount first.
@@ -229,12 +309,12 @@ fn linger_close(socket: &TcpStream, options: &HttpOptions) {
 /// attachment bytes are mostly compressed already.
 const GZIP_REPLY_ABOVE_BYTES: usize = 1024;
 
-fn write_reply(socket: &TcpStream, reply: Reply) -> std::io::Result<()> {
+fn write_reply(socket: &mut impl Write, reply: Reply) -> std::io::Result<()> {
     write_reply_encoded(socket, reply, false)
 }
 
 fn write_reply_encoded(
-    mut socket: &TcpStream,
+    socket: &mut impl Write,
     mut reply: Reply,
     accepts_gzip: bool,
 ) -> std::io::Result<()> {
@@ -295,9 +375,9 @@ impl Request {
 }
 
 /// Request line and headers; the body stays in `reader`.
-fn read_head(reader: &mut BufReader<&TcpStream>) -> Result<Request, Reply> {
+fn read_head(reader: &mut impl BufRead) -> Result<Request, Reply> {
     let mut read = 0;
-    let mut line = |reader: &mut BufReader<&TcpStream>| -> Result<String, Reply> {
+    let mut line = |reader: &mut dyn BufRead| -> Result<String, Reply> {
         let mut line = String::new();
         let limit = (MAX_HEADER_BYTES - read) as u64 + 1;
         let count = reader
@@ -374,11 +454,7 @@ fn authorized(request: &Request, token: &str) -> bool {
     })
 }
 
-fn body(
-    reader: &mut BufReader<&TcpStream>,
-    request: &Request,
-    limit: u64,
-) -> Result<Vec<u8>, Reply> {
+fn body(reader: &mut impl Read, request: &Request, limit: u64) -> Result<Vec<u8>, Reply> {
     let Some(length) = request.content_length else {
         return Err(text(411, "Content-Length is required"));
     };
@@ -414,40 +490,65 @@ fn query(url: &str, name: &str) -> Option<u64> {
 }
 
 fn serve(shared: &Shared, socket: TcpStream) {
-    let mut reader = BufReader::new(&socket);
-    let request = match read_head(&mut reader) {
-        Ok(request) => request,
-        Err(reply) => {
-            let _ = write_reply(&socket, reply);
-            linger_close(&socket, &shared.options);
+    let Ok(tcp) = socket.try_clone() else {
+        return;
+    };
+    let channel = Socket {
+        tcp,
+        timeout: shared.options.socket_timeout,
+        deadline: Some(Instant::now() + shared.options.request_head_timeout),
+    };
+    match &shared.options.tls {
+        None => serve_on(shared, &socket, channel),
+        Some(config) => {
+            let Ok(connection) = rustls::ServerConnection::new(Arc::clone(config)) else {
+                return;
+            };
+            serve_on(
+                shared,
+                &socket,
+                rustls::StreamOwned::new(connection, channel),
+            );
+        }
+    }
+}
+
+fn serve_on(shared: &Shared, socket: &TcpStream, channel: impl Channel) {
+    let mut reader = BufReader::new(channel);
+    let reply = match read_head(&mut reader) {
+        // A client that never finished its handshake cannot read a reply.
+        Err(_) if !reader.get_mut().established() => return,
+        Err(reply) => reply,
+        Ok(request) if !authorized(&request, &shared.token) => text(401, "unauthorized"),
+        Ok(request) if request.method == "GET" && request.path() == "/v1/events" => {
+            reader.get_mut().socket().clear_deadline();
+            let Some(_slot) = Slot::claim(&shared.streams, shared.options.max_streams) else {
+                let _ = write_reply(reader.get_mut(), text(503, "too many event streams"));
+                reader.get_mut().close_notify();
+                return;
+            };
+            let _ = stream_events(shared, reader.get_mut());
+            reader.get_mut().close_notify();
+            return;
+        }
+        Ok(request) => {
+            reader.get_mut().socket().clear_deadline();
+            let reply = route(&shared.store, &request, &mut reader).unwrap_or_else(|reply| reply);
+            let _ = write_reply_encoded(reader.get_mut(), reply, request.accepts_gzip);
+            reader.get_mut().close_notify();
+            linger_close(socket, &shared.options);
             return;
         }
     };
-    if !authorized(&request, &shared.token) {
-        let _ = write_reply(&socket, text(401, "unauthorized"));
-        linger_close(&socket, &shared.options);
-        return;
-    }
-    if request.method == "GET" && request.path() == "/v1/events" {
-        match Slot::claim(&shared.streams, shared.options.max_streams) {
-            Some(_slot) => {
-                let _ = stream_events(shared, &socket);
-            }
-            None => {
-                let _ = write_reply(&socket, text(503, "too many event streams"));
-            }
-        }
-        return;
-    }
-    let reply = route(&shared.store, &request, &mut reader).unwrap_or_else(|reply| reply);
-    let _ = write_reply_encoded(&socket, reply, request.accepts_gzip);
-    linger_close(&socket, &shared.options);
+    let _ = write_reply(reader.get_mut(), reply);
+    reader.get_mut().close_notify();
+    linger_close(socket, &shared.options);
 }
 
 /// `hello`, then `changed` whenever the head moves and a comment line when
 /// quiet, until the client goes away, the server stops, or the stream has
 /// run `max_stream` (then `bye`).
-fn stream_events(shared: &Shared, mut socket: &TcpStream) -> std::io::Result<()> {
+fn stream_events(shared: &Shared, socket: &mut impl Write) -> std::io::Result<()> {
     socket.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
           X-Accel-Buffering: no\r\nConnection: close\r\n\r\n",
@@ -477,11 +578,7 @@ fn stream_events(shared: &Shared, mut socket: &TcpStream) -> std::io::Result<()>
     }
 }
 
-fn route(
-    store: &ServerStore,
-    request: &Request,
-    reader: &mut BufReader<&TcpStream>,
-) -> Result<Reply, Reply> {
+fn route(store: &ServerStore, request: &Request, reader: &mut impl Read) -> Result<Reply, Reply> {
     let segments: Vec<&str> = request.path().trim_matches('/').split('/').collect();
     let url = request.url.as_str();
     Ok(match (request.method.as_str(), segments.as_slice()) {
@@ -531,4 +628,25 @@ fn route(
         }
         _ => text(404, "no such route"),
     })
+}
+
+/// TLS settings from a PEM certificate chain and private key, for
+/// `HttpOptions::tls`.
+pub fn tls_config_from_pem(
+    certificate_chain: &[u8],
+    private_key: &[u8],
+) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    let chain = rustls_pemfile::certs(&mut &*certificate_chain).collect::<Result<Vec<_>, _>>()?;
+    if chain.is_empty() {
+        return Err("no certificate in the PEM file".into());
+    }
+    let key =
+        rustls_pemfile::private_key(&mut &*private_key)?.ok_or("no private key in the PEM file")?;
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(chain, key)?;
+    Ok(Arc::new(config))
 }

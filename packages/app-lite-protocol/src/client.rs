@@ -1,6 +1,7 @@
 //! Blocking HTTP client for the routes in docs/research/sync-client-design-v1.md §1.
 
 use std::io::{BufRead, BufReader, Read};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
@@ -26,18 +27,63 @@ pub struct HttpTransport {
     base_url: String,
     authorization: String,
     agent: ureq::Agent,
+    tls: Arc<rustls::ClientConfig>,
+}
+
+/// Trusted roots: the public (Mozilla) roots plus any certificates given,
+/// such as a NAS's self-signed certificate.
+fn tls_config(extra_pem: Option<&str>) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(pem) = extra_pem {
+        let certificates = rustls_pemfile::certs(&mut pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| TransportError::Permanent(format!("server certificate: {error}")))?;
+        if certificates.is_empty() {
+            return Err(TransportError::Permanent(
+                "server certificate: no certificate in the PEM text".into(),
+            ));
+        }
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .map_err(|error| TransportError::Permanent(format!("server certificate: {error}")))?;
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| TransportError::Permanent(error.to_string()))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Arc::new(config))
 }
 
 impl HttpTransport {
     pub fn new(base_url: &str, token: &str) -> Self {
-        Self {
+        Self::with_trusted_certificate(base_url, token, None)
+            .expect("the public roots alone always build")
+    }
+
+    /// Also trusts the certificates in `pem` (for a server with a
+    /// self-signed certificate).
+    pub fn with_trusted_certificate(
+        base_url: &str,
+        token: &str,
+        pem: Option<&str>,
+    ) -> Result<Self, TransportError> {
+        let tls = tls_config(pem)?;
+        Ok(Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
             authorization: format!("Bearer {token}"),
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(CONNECT_TIMEOUT)
                 .timeout(Duration::from_secs(120))
+                .tls_config(Arc::clone(&tls))
                 .build(),
-        }
+            tls,
+        })
     }
 
     fn url(&self, path: &str) -> String {
@@ -92,6 +138,10 @@ impl HttpTransport {
             Err(ureq::Error::Status(status, _)) => {
                 Err(TransportError::Retryable(format!("HTTP {status}")))
             }
+            // Retrying cannot make an untrusted certificate trusted.
+            Err(error) if certificate_rejected(&error) => Err(TransportError::Permanent(format!(
+                "the server's TLS certificate is not trusted: {error}"
+            ))),
             Err(error) => Err(TransportError::Retryable(error.to_string())),
         }
     }
@@ -120,6 +170,27 @@ impl HttpTransport {
     }
 }
 
+/// Whether the error chain holds a rustls certificate rejection.
+fn certificate_rejected(error: &ureq::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        let rustls_error = current.downcast_ref::<rustls::Error>().or_else(|| {
+            current
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        });
+        if matches!(
+            rustls_error,
+            Some(rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented)
+        ) {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
 impl HttpTransport {
     /// Opens `GET /v1/events`; see `EVENTS_SILENCE_TIMEOUT`.
     pub fn open_events(&self) -> Result<EventStream, TransportError> {
@@ -133,6 +204,7 @@ impl HttpTransport {
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout_read(silence)
             .timeout_write(CONNECT_TIMEOUT)
+            .tls_config(Arc::clone(&self.tls))
             .build();
         let response = Self::checked(
             agent

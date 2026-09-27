@@ -42,7 +42,9 @@ fn start(options: HttpOptions) -> Running {
 
 fn fast() -> HttpOptions {
     HttpOptions {
+        tls: None,
         socket_timeout: Duration::from_secs(5),
+        request_head_timeout: Duration::from_secs(5),
         heartbeat: Duration::from_millis(200),
         max_stream: Duration::from_secs(2),
         max_streams: 4,
@@ -403,4 +405,42 @@ fn json_travels_gzip_compressed_both_ways_and_the_limit_counts_decompressed_byte
         &bomb,
     );
     assert!(head.starts_with("HTTP/1.1 413"), "{head}");
+}
+
+#[test]
+fn a_client_trickling_its_request_head_is_cut_off_at_the_head_deadline() {
+    let running = start(HttpOptions {
+        socket_timeout: Duration::from_millis(500),
+        request_head_timeout: Duration::from_secs(1),
+        max_connections: 1,
+        ..fast()
+    });
+    let address = running.server.local_addr();
+    let trickler = std::thread::spawn(move || {
+        let mut socket = TcpStream::connect(address).unwrap();
+        let started = Instant::now();
+        // One byte every 300 ms never trips the per-read timeout.
+        for byte in b"POST /v1/pull HTTP/1.1\r\nHost: xxxxxxxxxxxxxxxxxxxxxxxx"
+            .iter()
+            .cycle()
+        {
+            if socket.write_all(&[*byte]).is_err() || started.elapsed() > Duration::from_secs(10) {
+                return started.elapsed();
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        unreachable!()
+    });
+    let cut_off = trickler.join().unwrap();
+    assert!(cut_off < Duration::from_secs(5), "held for {cut_off:?}");
+    let transport = HttpTransport::new(&running.url(), TOKEN);
+    assert!(
+        transport
+            .pull(&PullRequest {
+                protocol: PROTOCOL_VERSION,
+                cursor: 0,
+                limit: 1,
+            })
+            .is_ok()
+    );
 }

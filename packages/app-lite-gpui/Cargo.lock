@@ -140,9 +140,12 @@ name = "app-lite-protocol"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "ureq",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -152,6 +155,8 @@ dependencies = [
  "app-lite-protocol",
  "flate2",
  "rusqlite",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
