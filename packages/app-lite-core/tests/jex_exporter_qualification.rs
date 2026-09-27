@@ -135,7 +135,7 @@ fn fixture(reverse: bool) -> TempPath {
         ),
         (
             format!("{BAD_BODY}.md"),
-            exporter_note(BAD_BODY, "|A|B|\n|-|-|\n|1|2|", &[]),
+            exporter_note(BAD_BODY, "术语\n: 定义", &[]),
         ),
         (
             format!("{BAD_TIME}.md"),

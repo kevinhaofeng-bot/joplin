@@ -56,8 +56,7 @@ fn markdown_html_block_preserves_rich_text_instead_of_showing_tags() {
 
 #[test]
 fn unsupported_block_does_not_flatten_surrounding_rich_text_and_images() {
-    let body =
-        format!("**前文**\n\n![图](:/{IMAGE})\n\n| A | B |\n|---|---|\n| 甲 | 乙 |\n\n**后文**");
+    let body = format!("**前文**\n\n![图](:/{IMAGE})\n\n术语\n: 定义\n\n**后文**");
     let (result, warning) =
         app_lite_core::convert_jex_note_body_or_degrade(NOTE, "mixed.md", 1, &body, &resources())
             .unwrap();
@@ -75,7 +74,7 @@ fn unsupported_block_does_not_flatten_surrounding_rich_text_and_images() {
             .ends_with("<p><strong>后文</strong></p>")
     );
     let image = result.canonical_html.find("<img ").unwrap();
-    assert!(image < result.canonical_html.find("---").unwrap());
+    assert!(image < result.canonical_html.find("术语").unwrap());
     assert_eq!(
         result.ordered_resource_occurrences,
         vec![ResourceId::new(TARGET_IMAGE).unwrap()]
@@ -267,10 +266,6 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
     // Mutation caught: treating a recognized unsupported construct as plain
     // text, or accepting a syntactically plausible but unverified :/ID.
     let cases: Vec<(String, JexBodyBlockerKind)> = vec![
-        (
-            "| A | B |\n|---|---|\n| 甲 | 乙 |".into(),
-            JexBodyBlockerKind::UnsupportedStructure,
-        ),
         (
             "<script>alert(1)</script>".into(),
             JexBodyBlockerKind::RawHtml,
@@ -870,4 +865,77 @@ fn deep_headings_and_ordered_list_start_convert() {
         );
     }
     assert!(convert_jex_note_body(NOTE, "ol.md", 1, "1. 一\n\n   5. 五", &resources()).is_err());
+}
+
+/// GFM tables become canonical tables (5455bcb25): the first row is the
+/// header, cells keep inline marks, links, `<br>`, escaped pipes and
+/// resource images. An external image in a cell still blocks.
+#[test]
+fn gfm_tables_convert_with_header_inline_content_and_resource_images() {
+    use app_lite_core::document::Block;
+    let cell_text = |inlines: &[Inline]| {
+        inlines
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text { text, .. } => text.clone(),
+                Inline::SoftBreak => "\n".into(),
+                Inline::Image { .. } => "[img]".into(),
+                other => format!("{other:?}"),
+            })
+            .collect::<String>()
+    };
+    let body = format!(
+        "前文\n\n| 甲 | 乙 |\n|---|---|\n| **粗** | 一<br>二 |\n| a \\| b | ![图](:/{IMAGE}) |\n| 只有一格 |\n\n后文"
+    );
+    let converted = convert_jex_note_body(NOTE, "table.md", 1, &body, &resources())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let [
+        Block::Paragraph { .. },
+        Block::Table { rows, header },
+        Block::Paragraph { .. },
+    ] = converted.document.blocks()
+    else {
+        panic!("{:?}", converted.document);
+    };
+    assert!(*header);
+    let grid: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell_text(&cell.inlines))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        grid,
+        [
+            ["甲", "乙"],
+            ["粗", "一\n二"],
+            ["a | b", "[img]"],
+            ["只有一格", ""],
+        ]
+    );
+    assert!(matches!(
+        &rows[1].cells[0].inlines[0],
+        Inline::Text { marks, .. } if marks.bold
+    ));
+    assert_eq!(
+        converted.ordered_resource_occurrences,
+        vec![ResourceId::new(TARGET_IMAGE).unwrap()]
+    );
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        converted.document
+    );
+    assert!(matches!(
+        convert_jex_note_body(
+            NOTE,
+            "table.md",
+            1,
+            "| 外链 |\n|---|\n| ![x](https://example.com/a.png) |",
+            &resources()
+        ),
+        Err(error) if error.kind == JexBodyBlockerKind::UnsupportedImageSource
+    ));
 }

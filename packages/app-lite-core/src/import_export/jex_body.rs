@@ -7,6 +7,7 @@ use pulldown_cmark::{Event, HeadingLevel as MdHeadingLevel, Options, Parser, Tag
 
 use crate::document::{
     Block, BlockStyle, CanonicalDocument, HeadingLevel, Inline, ListItem, ListKind, Marks,
+    TableCell, TableRow,
 };
 use crate::resource::ResourceId;
 
@@ -15,6 +16,9 @@ const MAX_EVENTS: usize = 20_000;
 const MAX_DEPTH: usize = 64;
 const MAX_URL_BYTES: usize = 8 * 1024;
 const MAX_TOTAL_URL_BYTES: usize = 64 * 1024;
+// Same limits as canonical tables; larger ones stay degraded.
+const MAX_TABLE_ROWS: usize = 1000;
+const MAX_TABLE_COLUMNS: usize = 64;
 // Canonical data-indent and editor list depth both stop at 8.
 const MAX_LIST_INDENT: u8 = 8;
 
@@ -426,6 +430,51 @@ impl<'a> Converter<'a> {
         self.events.get(self.cursor + end + 1) == Some(&Event::End(TagEnd::Link))
     }
 
+    /// A GFM table: the first row is its header; cells hold inline content.
+    fn table(&mut self) -> Result<Block> {
+        let mut rows = Vec::new();
+        loop {
+            match self.next() {
+                Some(Event::Start(Tag::TableHead)) => rows.push(self.table_row(TagEnd::TableHead)?),
+                Some(Event::Start(Tag::TableRow)) => rows.push(self.table_row(TagEnd::TableRow)?),
+                Some(Event::End(TagEnd::Table)) => break,
+                _ => {
+                    return self.blocked(
+                        JexBodyBlockerKind::UnsupportedStructure,
+                        "Markdown table structure did not close as expected",
+                    );
+                }
+            }
+        }
+        if rows.len() > MAX_TABLE_ROWS || rows.iter().any(|row| row.cells.len() > MAX_TABLE_COLUMNS)
+        {
+            return self.blocked(
+                JexBodyBlockerKind::UnsupportedStructure,
+                "Table exceeds the canonical size limits",
+            );
+        }
+        Ok(Block::Table { rows, header: true })
+    }
+
+    fn table_row(&mut self, end: TagEnd) -> Result<TableRow> {
+        let mut cells = Vec::new();
+        loop {
+            match self.next() {
+                Some(Event::Start(Tag::TableCell)) => cells.push(TableCell {
+                    inlines: self.inlines(TagEnd::TableCell, Marks::default(), false)?,
+                }),
+                Some(Event::End(found)) if found == end => break,
+                _ => {
+                    return self.blocked(
+                        JexBodyBlockerKind::UnsupportedStructure,
+                        "Markdown table structure did not close as expected",
+                    );
+                }
+            }
+        }
+        Ok(TableRow { cells })
+    }
+
     /// Joplin resource link inside text. The resource keeps its position; a
     /// label other than the filename stays visible before it.
     fn resource_inline(
@@ -647,6 +696,7 @@ impl<'a> Converter<'a> {
                     });
                 }
                 Event::Start(Tag::List(start)) => blocks.push(self.list(start)?),
+                Event::Start(Tag::Table(_)) => blocks.push(self.table()?),
                 Event::Start(Tag::HtmlBlock) => {
                     // Only what the strict HTML converter maps losslessly.
                     let mut fragment = String::new();
@@ -820,11 +870,15 @@ pub fn convert_jex_note_body_or_degrade(
                     occurrences: Vec::new(),
                     url_bytes: 0,
                 };
+                // Markdown table source is not HTML; reading it as HTML would
+                // scatter the cells instead of showing readable source.
+                let is_table =
+                    matches!(converter.events.first(), Some(Event::Start(Tag::Table(_))));
                 match converter.blocks() {
                     Ok(part) => blocks.extend(part),
                     Err(error) => {
                         let fragment = &body[start..range.end];
-                        let html_part = if error.kind == JexBodyBlockerKind::RawHtml {
+                        let html_part = if error.kind == JexBodyBlockerKind::RawHtml && !is_table {
                             super::jex_html::convert_html_locally_degraded(
                                 source_note_id,
                                 source_path,
