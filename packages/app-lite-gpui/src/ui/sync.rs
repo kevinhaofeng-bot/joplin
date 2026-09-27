@@ -20,8 +20,8 @@
 use super::*;
 use crate::app::{OpenSyncSettings, ShowSyncFailures, SyncNow};
 use crate::library_profile::LibraryProfiles;
-use app_lite_core::SyncFailure;
 use app_lite_core::sync::{SyncError, SyncReport, retry_failure, sync_once};
+use app_lite_core::{SyncConflict, SyncFailure};
 use app_lite_protocol::client::HttpTransport;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -417,8 +417,24 @@ impl LibraryShell {
         cx.notify();
     }
 
+    pub(super) fn sync_conflicts(&self, cx: &App) -> Vec<SyncConflict> {
+        self.model
+            .read_with(cx, |model, _| model.repository())
+            .sync_conflicts()
+            .unwrap_or_default()
+    }
+
     pub(super) fn toggle_sync_failures(&mut self, cx: &mut Context<Self>) {
-        self.sync_failures_open = !self.sync_failures_open && !self.sync_failures(cx).is_empty();
+        self.sync_failures_open = !self.sync_failures_open
+            && (!self.sync_failures(cx).is_empty() || !self.sync_conflicts(cx).is_empty());
+        cx.notify();
+    }
+
+    fn settle_conflict(&mut self, copy_id: &app_lite_core::NoteId, cx: &mut Context<Self>) {
+        let repository = self.model.read_with(cx, |model, _| model.repository());
+        if let Err(error) = repository.sync_resolve_conflict(copy_id) {
+            self.sync_status = ShellSyncStatus::Failed(format!("无法标记冲突副本：{error}"));
+        }
         cx.notify();
     }
 
@@ -455,8 +471,15 @@ impl LibraryShell {
         } else {
             String::new()
         };
+        let conflicts = self.sync_conflicts(cx).len();
         if failures > 0 {
-            pending.push_str(&format!("；{failures} 项同步问题，点此查看"));
+            pending.push_str(&format!("；{failures} 项同步问题"));
+        }
+        if conflicts > 0 {
+            pending.push_str(&format!("；{conflicts} 个冲突副本待处理"));
+        }
+        if failures + conflicts > 0 {
+            pending.push_str("，点此查看");
         }
         match &self.sync_status {
             ShellSyncStatus::Unconfigured => format!(
@@ -547,9 +570,77 @@ impl LibraryShell {
                             .child("关闭"),
                     ),
             );
-        if failures.is_empty() {
+        let conflicts = self.sync_conflicts(cx);
+        if failures.is_empty() && conflicts.is_empty() {
             panel = panel.child(div().text_color(rgba(0x536f59ff)).child("没有同步问题。"));
-        } else {
+        }
+        if !conflicts.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x8a978dff))
+                    .child("冲突副本：两个版本都已保留。比较后删除不要的一份，或标记为已处理。"),
+            );
+        }
+        for (index, conflict) in conflicts.into_iter().enumerate() {
+            let original = conflict.original_title.as_deref().map_or_else(
+                || "原笔记已不在本机".to_owned(),
+                |title| format!("原笔记“{title}”"),
+            );
+            let open_id = conflict.copy_id.clone();
+            let settle_id = conflict.copy_id.clone();
+            panel = panel.child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .items_start()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgba(0x8d6a27ff))
+                            .child(format!("“{}”（{original}）", conflict.copy_title)),
+                    )
+                    .child(
+                        div()
+                            .id(("sync-conflict-open", index))
+                            .debug_selector(move || format!("sync-conflict-open-{index}"))
+                            .px(px(10.0))
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .bg(rgba(0xf1f4f1ff))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _event, window, cx| {
+                                    shell.apply_action(
+                                        AppAction::SelectNote(open_id.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child("打开"),
+                    )
+                    .child(
+                        div()
+                            .id(("sync-conflict-settle", index))
+                            .debug_selector(move || format!("sync-conflict-settle-{index}"))
+                            .px(px(10.0))
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .bg(rgba(0xf1f4f1ff))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _event, _window, cx| {
+                                    shell.settle_conflict(&settle_id, cx);
+                                }),
+                            )
+                            .child("已处理"),
+                    ),
+            );
+        }
+        if !failures.is_empty() {
             panel = panel.child(
                 div()
                     .text_size(px(11.0))

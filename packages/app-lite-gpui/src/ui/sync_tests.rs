@@ -368,6 +368,29 @@ async fn an_unsaved_edit_overtaken_by_a_sync_is_kept_as_a_conflict_copy(cx: &mut
             .any(|(title, body)| title == "同一篇（冲突副本）" && body.contains("本机未保存")),
         "{bodies:?}"
     );
+
+    assert!(text.contains("1 个冲突副本待处理，点此查看"), "{text}");
+    click("library-sync-status", cx);
+    click("sync-conflict-open-0", cx);
+    let copy = fixture.repository.sync_conflicts().unwrap()[0]
+        .copy_id
+        .clone();
+    let selected = view.read_with(cx, |shell, app| {
+        shell
+            .model
+            .read(app)
+            .navigation()
+            .selected_note_id()
+            .cloned()
+    });
+    assert_eq!(selected, Some(copy.clone()), "打开 selects the copy");
+    click("sync-conflict-settle-0", cx);
+    assert!(fixture.repository.sync_conflicts().unwrap().is_empty());
+    assert!(!status(&view, cx).contains("冲突副本待处理"));
+    assert!(
+        fixture.repository.load_note(&copy).unwrap().is_some(),
+        "settling keeps the copy"
+    );
 }
 
 #[gpui::test]
