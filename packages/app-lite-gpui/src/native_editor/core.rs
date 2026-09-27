@@ -436,7 +436,7 @@ impl EditorCore {
     }
 
     #[cfg(test)]
-    fn from_document(document: Document, cx: &mut TestAppContext) -> Self {
+    pub(crate) fn from_document(document: Document, cx: &mut TestAppContext) -> Self {
         let selection = document.end_selection();
         let focus = cx.update(|app| app.focus_handle());
         Self::from_parts(document, selection, focus, EditorAccess::Editable)
@@ -812,6 +812,7 @@ impl EditorCore {
             | Transaction::IndentList { .. }
             | Transaction::OutdentList { .. }
             | Transaction::SetImageDisplayWidth { .. }
+            | Transaction::ReplaceTable { .. }
             | Transaction::SetImageNaturalSize { .. }
             | Transaction::RestoreInlineGroups { .. } => None,
         }
@@ -1725,6 +1726,119 @@ impl EditorCore {
         self.apply_resource_anchor_replacement(resource_anchor_mapping);
         self.find.reconcile(&self.document);
         Ok(outcome)
+    }
+
+    /// Replace one table atom through a single undoable transaction.
+    fn edit_table(
+        &mut self,
+        node_id: NodeId,
+        edit: impl FnOnce(&mut Vec<app_lite_core::document::TableRow>) -> bool,
+    ) -> Result<(), DocumentError> {
+        let BlockContent::Table(table) = &self
+            .document
+            .block(node_id)
+            .ok_or(DocumentError::NodeNotFound(node_id))?
+            .content
+        else {
+            return Err(DocumentError::InvalidBlockContent(node_id));
+        };
+        let table = table
+            .edited(edit)
+            .ok_or_else(|| DocumentError::InvalidOperation("表格编辑超出范围".into()))?;
+        let selection = self.selection;
+        self.apply(Transaction::ReplaceTable {
+            node_id,
+            table: std::sync::Arc::new(table),
+        })?;
+        self.selection = selection;
+        Ok(())
+    }
+
+    pub(crate) fn set_table_cell(
+        &mut self,
+        node_id: NodeId,
+        row: usize,
+        column: usize,
+        inlines: Vec<app_lite_core::document::Inline>,
+    ) -> Result<(), DocumentError> {
+        self.edit_table(node_id, |rows| {
+            let Some(cell) = rows.get_mut(row).and_then(|row| row.cells.get_mut(column)) else {
+                return false;
+            };
+            cell.inlines = inlines;
+            true
+        })
+    }
+
+    pub(crate) fn insert_table_row(
+        &mut self,
+        node_id: NodeId,
+        at: usize,
+    ) -> Result<(), DocumentError> {
+        self.edit_table(node_id, |rows| {
+            if at > rows.len() {
+                return false;
+            }
+            let width = rows.iter().map(|row| row.cells.len()).max().unwrap_or(1);
+            rows.insert(
+                at,
+                app_lite_core::document::TableRow {
+                    cells: vec![Default::default(); width],
+                },
+            );
+            true
+        })
+    }
+
+    pub(crate) fn delete_table_row(
+        &mut self,
+        node_id: NodeId,
+        at: usize,
+    ) -> Result<(), DocumentError> {
+        self.edit_table(node_id, |rows| {
+            if at >= rows.len() || rows.len() == 1 {
+                return false;
+            }
+            rows.remove(at);
+            true
+        })
+    }
+
+    pub(crate) fn insert_table_column(
+        &mut self,
+        node_id: NodeId,
+        at: usize,
+    ) -> Result<(), DocumentError> {
+        self.edit_table(node_id, |rows| {
+            let width = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
+            if at > width {
+                return false;
+            }
+            for row in rows.iter_mut() {
+                row.cells.resize_with(width, Default::default);
+                row.cells.insert(at, Default::default());
+            }
+            true
+        })
+    }
+
+    pub(crate) fn delete_table_column(
+        &mut self,
+        node_id: NodeId,
+        at: usize,
+    ) -> Result<(), DocumentError> {
+        self.edit_table(node_id, |rows| {
+            let width = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
+            if at >= width || width == 1 {
+                return false;
+            }
+            for row in rows.iter_mut() {
+                if at < row.cells.len() {
+                    row.cells.remove(at);
+                }
+            }
+            true
+        })
     }
 
     /// Simulates a pause before the next edit (see `TYPING_GROUP_DELAY`).

@@ -85,6 +85,12 @@ pub enum Transaction {
         node_id: NodeId,
         display_width: Option<u32>,
     },
+    /// Replace a table atom's whole content (a cell edit or a row/column
+    /// change). The inverse restores the original block.
+    ReplaceTable {
+        node_id: NodeId,
+        table: std::sync::Arc<super::model::TableContent>,
+    },
     /// Internal presentation repair for a legacy durable image whose old
     /// canonical HTML lacked natural dimensions. `EditorCore` applies this
     /// directly to the model without adding a user-visible history entry.
@@ -122,6 +128,7 @@ impl Transaction {
             Self::MergeBlocks { .. }
             | Self::RemoveNode { .. }
             | Self::SetImageDisplayWidth { .. }
+            | Self::ReplaceTable { .. }
             | Self::SetImageNaturalSize { .. }
             | Self::RestoreBlocks { .. } => None,
             Self::RestoreInlineGroups { .. } => None,
@@ -145,6 +152,14 @@ impl Transaction {
                 .saturating_add(filename.len())
                 .saturating_add(media_type.len()),
             Self::ToggleMark { mark, .. } => base.saturating_add(mark.estimated_bytes()),
+            Self::ReplaceTable { table, .. } => base.saturating_add(
+                table
+                    .rows
+                    .iter()
+                    .flatten()
+                    .map(|cell| cell.len() * 2)
+                    .fold(0usize, usize::saturating_add),
+            ),
             Self::SetBlockKind { kind, .. } => base.saturating_add(kind.estimated_bytes()),
             Self::RestoreBlocks { blocks, .. } => base.saturating_add(
                 blocks

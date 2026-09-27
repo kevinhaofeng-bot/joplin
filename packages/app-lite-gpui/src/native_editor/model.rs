@@ -186,6 +186,65 @@ pub struct TableContent {
 }
 
 impl TableContent {
+    /// Display text per cell plus the canonical block written on save.
+    pub(crate) fn from_canonical(block: app_lite_core::document::Block) -> Option<Self> {
+        let block = app_lite_core::CanonicalDocument::from_blocks(vec![block])
+            .blocks()
+            .first()?
+            .clone();
+        let app_lite_core::document::Block::Table { rows, header } = &block else {
+            return None;
+        };
+        Some(Self {
+            header: *header,
+            rows: rows
+                .iter()
+                .map(|row| {
+                    row.cells
+                        .iter()
+                        .map(|cell| super::codec::table_cell_text(&cell.inlines))
+                        .collect()
+                })
+                .collect(),
+            canonical: block,
+        })
+    }
+
+    fn canonical_rows(&self) -> (Vec<app_lite_core::document::TableRow>, bool) {
+        match &self.canonical {
+            app_lite_core::document::Block::Table { rows, header } => (rows.clone(), *header),
+            _ => (Vec::new(), self.header),
+        }
+    }
+
+    pub(crate) fn cell_inlines(
+        &self,
+        row: usize,
+        column: usize,
+    ) -> Option<&[app_lite_core::document::Inline]> {
+        match &self.canonical {
+            app_lite_core::document::Block::Table { rows, .. } => rows
+                .get(row)?
+                .cells
+                .get(column)
+                .map(|cell| cell.inlines.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// The table after `edit` changes its canonical rows; None when the edit
+    /// refuses (out of range, or it would leave no row or column).
+    pub(crate) fn edited(
+        &self,
+        edit: impl FnOnce(&mut Vec<app_lite_core::document::TableRow>) -> bool,
+    ) -> Option<Self> {
+        let (mut rows, header) = self.canonical_rows();
+        if !edit(&mut rows) || rows.is_empty() || rows.iter().all(|row| row.cells.is_empty()) {
+            return None;
+        }
+        Self::from_canonical(app_lite_core::document::Block::Table { rows, header })
+    }
+
     pub fn column_count(&self) -> usize {
         self.rows.iter().map(Vec::len).max().unwrap_or(0)
     }
@@ -2481,6 +2540,11 @@ impl Document {
                     self.apply_set_image_natural_size(node_id, natural_size)?;
                 (selection, changed_nodes, inverse, None)
             }
+            Transaction::ReplaceTable { node_id, table } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_replace_table(node_id, table)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::RestoreBlocks {
                 index,
                 remove_count,
@@ -3816,6 +3880,36 @@ impl Document {
             ));
         }
         *current = display_width;
+        self.blocks.replace(index, updated);
+        let mut changed_nodes = SmallVec::new();
+        push_unique(&mut changed_nodes, node_id);
+        let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
+            index,
+            remove_count: 1,
+            blocks: vec![original],
+        }]);
+        Ok((self.selection_near_index(index), changed_nodes, inverse))
+    }
+
+    fn apply_replace_table(
+        &mut self,
+        node_id: NodeId,
+        table: Arc<TableContent>,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        let index = self.node_index(node_id)?;
+        let original = self.blocks[index].clone();
+        let mut updated = original.clone();
+        let BlockContent::Table(current) = &mut updated.content else {
+            return Err(DocumentError::InvalidBlockContent(node_id));
+        };
+        if **current == *table {
+            return Ok((
+                self.selection_near_index(index),
+                SmallVec::new(),
+                TransactionBatch::default(),
+            ));
+        }
+        *current = table;
         self.blocks.replace(index, updated);
         let mut changed_nodes = SmallVec::new();
         push_unique(&mut changed_nodes, node_id);

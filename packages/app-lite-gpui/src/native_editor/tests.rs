@@ -8008,3 +8008,74 @@ fn quick_adjacent_typing_and_ime_commits_undo_as_one_step(cx: &mut gpui::TestApp
     editor.insert_text("甲").unwrap();
     assert_eq!(editor.undo_depth(), 2);
 }
+
+/// Tables (step 2): a cell's content, rows and columns change through one
+/// undoable table replacement each and save as canonical table HTML.
+#[gpui::test]
+fn table_cells_rows_and_columns_edit_undo_and_save(cx: &mut gpui::TestAppContext) {
+    use app_lite_core::document::{Inline, Marks};
+    let html = "<p>前</p><table data-joplin-lite-table=\"true\"><tbody><tr><th>名</th><th>值</th></tr><tr><td>甲</td><td>一</td></tr></tbody></table>";
+    let canonical = app_lite_core::CanonicalDocument::parse_html(html).unwrap();
+    let document = crate::native_editor::codec::import_canonical(&canonical).unwrap();
+    let mut editor = EditorCore::from_document(document, cx);
+    let table = editor.document().blocks()[1].id;
+    let saved = |editor: &EditorCore| {
+        crate::native_editor::codec::export_canonical(editor.document())
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned()
+    };
+    editor
+        .set_table_cell(
+            table,
+            1,
+            1,
+            vec![Inline::Text {
+                text: "改".into(),
+                marks: Marks {
+                    bold: true,
+                    ..Marks::default()
+                },
+            }],
+        )
+        .unwrap();
+    assert!(
+        saved(&editor).contains("<td><strong>改</strong></td>"),
+        "{}",
+        saved(&editor)
+    );
+    editor.insert_table_row(table, 2).unwrap();
+    editor.insert_table_column(table, 1).unwrap();
+    let grid = |editor: &EditorCore| match &editor.document().block(table).unwrap().content {
+        BlockContent::Table(content) => content.rows.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        grid(&editor),
+        vec![
+            vec!["名".to_owned(), String::new(), "值".to_owned()],
+            vec!["甲".to_owned(), String::new(), "改".to_owned()],
+            vec![String::new(), String::new(), String::new()],
+        ]
+    );
+    editor.delete_table_row(table, 0).unwrap();
+    assert_eq!(grid(&editor).len(), 2);
+    for _ in 0..4 {
+        editor.undo().unwrap();
+    }
+    assert_eq!(saved(&editor), canonical.to_canonical_html().as_str());
+
+    // A table keeps at least one row and one column.
+    let single = app_lite_core::CanonicalDocument::parse_html(
+        "<table data-joplin-lite-table=\"true\"><tbody><tr><td>仅</td></tr></tbody></table>",
+    )
+    .unwrap();
+    let mut editor = EditorCore::from_document(
+        crate::native_editor::codec::import_canonical(&single).unwrap(),
+        cx,
+    );
+    let table = editor.document().blocks()[0].id;
+    assert!(editor.delete_table_row(table, 0).is_err());
+    assert!(editor.delete_table_column(table, 0).is_err());
+}

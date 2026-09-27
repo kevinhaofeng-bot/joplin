@@ -815,7 +815,7 @@ pub fn export_canonical_with_resources(
 
 /// Display text of a read-only table cell: soft breaks become lines and
 /// images/cards show their label.
-fn table_cell_text(inlines: &[Inline]) -> String {
+pub(crate) fn table_cell_text(inlines: &[Inline]) -> String {
     let mut text = String::new();
     for inline in inlines {
         match inline {
