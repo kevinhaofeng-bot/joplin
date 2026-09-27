@@ -7898,6 +7898,28 @@ fn failed_optimistic_resource_replays_selected_text_and_later_input(cx: &mut gpu
 /// Evernote `list/keymap.ts` handleEnter: Enter on an empty list item
 /// outdents it (a nested item) or leaves the list (a top-level item).
 #[gpui::test]
+fn leaving_a_list_then_typing_saves_no_extra_empty_paragraph(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::default();
+    let mut editor = EditorCore::for_test_paragraphs(["甲"], cx);
+    editor.select_all();
+    catalogue
+        .execute(
+            EditorCommand::OrderedList,
+            CommandArgument::None,
+            &mut editor,
+        )
+        .unwrap();
+    editor.move_end();
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_paragraph_break().unwrap();
+    editor.type_text("乙").unwrap();
+    let html = super::codec::export_canonical(editor.document())
+        .unwrap()
+        .to_canonical_html();
+    assert_eq!(html.as_str(), "<ol><li>甲</li></ol><p>乙</p>");
+}
+
+#[gpui::test]
 fn enter_on_an_empty_list_item_outdents_or_leaves_the_list(cx: &mut gpui::TestAppContext) {
     let catalogue = CommandCatalogue::default();
     let mut editor = EditorCore::for_test_paragraphs(["一"], cx);
