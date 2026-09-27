@@ -253,7 +253,8 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 
 | 提交 | 作用 | 先失败证据 |
 | --- | --- | --- |
-| `d3127d4d3` | 空列表项回车：嵌套项先减少缩进，顶层项变回段落，整个动作一步可撤销（对应 Evernote `list/keymap.ts` handleEnter）；图片缩放后保持选中；Cmd-N 后可直接输入标题 | `enter_on_an_empty_list_item_outdents_or_leaves_the_list`、`typing_right_after_cmd_n_goes_into_the_new_notes_title` |
+| `53e8192da` | Cmd-N 后可直接输入标题 | `typing_right_after_cmd_n_goes_into_the_new_notes_title` |
+| `d3127d4d3` | 空列表项回车：嵌套项先减少缩进，顶层项变回段落，整个动作一步可撤销（对应 Evernote `list/keymap.ts` handleEnter）；图片缩放后保持选中 | `enter_on_an_empty_list_item_outdents_or_leaves_the_list` |
 | `24d5a632c` | 列表项缩进可保存（见上方 A） | `indented_list_items_save_as_canonical_indent_and_reopen_at_their_depth` 等 2 条，失败原因为 `UnsupportedListDepth` |
 | `ef8517cf1` | 图片链接（见上方 B） | 变异核验：把 link 固定为 None，两条往返测试失败 |
 | `dd13ee9fc` | 可读导出/恢复的菜单入口；恢复失败会删除新建的空目录 | 两条挂载测试，未实现时编译即失败 |
