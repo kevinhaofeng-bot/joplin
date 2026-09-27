@@ -46,6 +46,9 @@ pub struct SyncFailure {
     /// An upload the server refused. A skipped download cannot be retried:
     /// the change is already behind the cursor.
     pub can_retry: bool,
+    /// A remote change kept until an attachment it shows arrives; it is
+    /// applied then without any action.
+    pub waiting: bool,
 }
 
 impl LibraryRepository {
@@ -221,7 +224,8 @@ impl LibraryRepository {
                         WHEN 'tag' THEN (SELECT title FROM tags WHERE id=f.entity_id)
                         WHEN 'resource' THEN (SELECT title FROM resources WHERE id=f.entity_id)
                     END,
-                    EXISTS(SELECT 1 FROM sync_inflight i WHERE i.op_id=f.op_id)
+                    EXISTS(SELECT 1 FROM sync_inflight i WHERE i.op_id=f.op_id),
+                    EXISTS(SELECT 1 FROM sync_deferred d WHERE d.op_id=f.op_id)
              FROM sync_failures f ORDER BY f.updated_time, f.op_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -233,6 +237,7 @@ impl LibraryRepository {
                 updated_time: row.get(4)?,
                 title: row.get(5)?,
                 can_retry: row.get(6)?,
+                waiting: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -490,10 +495,38 @@ pub struct SyncApplyReport {
     pub applied: usize,
     pub conflicts: usize,
     pub skipped: usize,
+    /// Kept until the attachments they show arrive.
+    pub deferred: usize,
 }
 
 /// Why one remote change was not applied; recorded as a visible failure.
 struct Skip(String);
+
+/// The first attachment a remote note shows that is not stored here yet.
+fn missing_attachment(
+    transaction: &Transaction<'_>,
+    change: &app_lite_protocol::Change,
+) -> Result<Option<String>, LibraryError> {
+    let Some(ids) = change
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("resource_ids"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(None);
+    };
+    for id in ids.iter().filter_map(Value::as_str) {
+        let present: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM resources WHERE id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            return Ok(Some(id.to_owned()));
+        }
+    }
+    Ok(None)
+}
 
 impl LibraryRepository {
     /// When the oldest local change still waiting for the server was made
@@ -565,83 +598,9 @@ impl LibraryRepository {
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for change in changes {
-            let kind = change.entity.kind.as_str();
-            let id = change.entity.id.as_str();
-            if !app_lite_protocol::valid_id(id) {
-                continue;
-            }
-            let known: i64 = transaction
-                .query_row(
-                    "SELECT server_revision FROM sync_entities WHERE entity_type=?1 AND entity_id=?2",
-                    params![kind, id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .unwrap_or(0);
-            if known >= change.revision as i64 {
-                continue;
-            }
-            let inflight_op: Option<String> = transaction
-                .query_row(
-                    "SELECT op_id FROM sync_inflight WHERE entity_type=?1 AND entity_id=?2",
-                    params![kind, id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if inflight_op.as_deref() == Some(change.op_id.as_str()) {
-                // Our own op whose Accepted response was lost.
-                accept_inflight(&transaction, &change.op_id, kind, id, change.revision)?;
-                continue;
-            }
-            // Local work the server has not confirmed: queued changes, or an
-            // entity that exists here but was never uploaded (a restored or
-            // re-imported library).
-            let pending = inflight_op.is_some()
-                || transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE entity_type=?1 AND entity_id=?2)",
-                    params![kind, id],
-                    |row| row.get::<_, i64>(0),
-                )? != 0
-                || (known == 0 && local_row_exists(&transaction, kind, id)?);
-            if pending {
-                // Remote wins the entity: a local note edit survives as its
-                // conflict copy (made from the note row, not the outbox),
-                // other kinds lose the edit. Cleared first so that applying
-                // may queue new work (an attachment still used here).
-                drop_pending(&transaction, kind, id)?;
-            }
-            let outcome = match kind {
-                "note" => self.apply_remote_note(&transaction, id, change, pending, now),
-                "notebook" => apply_remote_notebook(&transaction, id, change, now),
-                "stack" | "tag" => apply_remote_container(&transaction, kind, id, change, now),
-                "resource" => self.apply_remote_resource(&transaction, id, change, now),
-                _ => Ok(Err(Skip(format!("{kind} changes are not supported")))),
-            };
-            match outcome? {
-                Ok(conflict) => {
-                    report.applied += 1;
-                    if pending {
-                        report.conflicts += usize::from(conflict || kind != "note");
-                    }
-                    if kind == "note" {
-                        touched_notes.push(id.to_owned());
-                    }
-                }
-                Err(Skip(reason)) => {
-                    report.skipped += 1;
-                    transaction.execute(
-                        "INSERT INTO sync_failures(op_id,entity_type,entity_id,reason,updated_time) VALUES(?1,?2,?3,?4,?5)
-                         ON CONFLICT(op_id) DO UPDATE SET reason=excluded.reason, updated_time=excluded.updated_time",
-                        params![change.op_id, kind, id, reason, now],
-                    )?;
-                }
-            }
-            transaction.execute(
-                "INSERT INTO sync_entities(entity_type,entity_id,server_revision) VALUES(?1,?2,?3)
-                 ON CONFLICT(entity_type,entity_id) DO UPDATE SET server_revision=excluded.server_revision",
-                params![kind, id, change.revision as i64],
-            )?;
+            self.apply_change(&transaction, change, now, &mut report, &mut touched_notes)?;
         }
+        self.apply_deferred(&transaction, now, &mut report, &mut touched_notes)?;
         transaction.execute(
             "INSERT INTO sync_cursor(name,cursor,updated_time) VALUES(?1,?2,?3)
              ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor, updated_time=excluded.updated_time",
@@ -660,6 +619,180 @@ impl LibraryRepository {
             self.publish(events);
         }
         Ok(report)
+    }
+
+    /// One remote change: skipped when already known, deferred when it
+    /// needs an attachment that has not arrived, otherwise applied (remote
+    /// wins, a local note edit survives as a conflict copy) or recorded as a
+    /// visible failure.
+    fn apply_change(
+        &self,
+        transaction: &Transaction<'_>,
+        change: &app_lite_protocol::Change,
+        now: i64,
+        report: &mut SyncApplyReport,
+        touched_notes: &mut Vec<String>,
+    ) -> Result<(), LibraryError> {
+        let kind = change.entity.kind.as_str();
+        let id = change.entity.id.as_str();
+        if !app_lite_protocol::valid_id(id) {
+            return Ok(());
+        }
+        let known: i64 = transaction
+            .query_row(
+                "SELECT server_revision FROM sync_entities WHERE entity_type=?1 AND entity_id=?2",
+                params![kind, id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if known >= change.revision as i64 {
+            return Ok(());
+        }
+        let inflight_op: Option<String> = transaction
+            .query_row(
+                "SELECT op_id FROM sync_inflight WHERE entity_type=?1 AND entity_id=?2",
+                params![kind, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if inflight_op.as_deref() == Some(change.op_id.as_str()) {
+            // Our own op whose Accepted response was lost.
+            accept_inflight(transaction, &change.op_id, kind, id, change.revision)?;
+            return Ok(());
+        }
+        // An attachment the note shows has not arrived yet (a device sent
+        // them out of order, or it is still on its way): keep the change and
+        // apply it once the attachment is here. Local work stays pending, and
+        // the revision is not recorded, so nothing is decided early.
+        if kind == "note"
+            && let Some(missing) = missing_attachment(transaction, change)?
+        {
+            // The change it replaces no longer waits.
+            transaction.execute(
+                "DELETE FROM sync_failures WHERE op_id IN
+                     (SELECT op_id FROM sync_deferred WHERE entity_type=?1 AND entity_id=?2)",
+                params![kind, id],
+            )?;
+            transaction.execute(
+                "INSERT INTO sync_deferred(entity_type,entity_id,op_id,revision,change_json,created_time)
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(entity_type,entity_id) DO UPDATE SET op_id=excluded.op_id,
+                     revision=excluded.revision, change_json=excluded.change_json",
+                params![
+                    kind,
+                    id,
+                    change.op_id,
+                    change.revision as i64,
+                    serde_json::to_string(change).map_err(|_| LibraryError::InvalidSnapshot)?,
+                    now
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO sync_failures(op_id,entity_type,entity_id,reason,updated_time) VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(op_id) DO UPDATE SET reason=excluded.reason, updated_time=excluded.updated_time",
+                params![
+                    change.op_id,
+                    kind,
+                    id,
+                    format!("waiting for attachment {missing}"),
+                    now
+                ],
+            )?;
+            report.deferred += 1;
+            return Ok(());
+        }
+        // Local work the server has not confirmed: queued changes, or an
+        // entity that exists here but was never uploaded (a restored or
+        // re-imported library).
+        let pending = inflight_op.is_some()
+            || transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE entity_type=?1 AND entity_id=?2)",
+                params![kind, id],
+                |row| row.get::<_, i64>(0),
+            )? != 0
+            || (known == 0 && local_row_exists(transaction, kind, id)?);
+        if pending {
+            // Remote wins the entity: a local note edit survives as its
+            // conflict copy (made from the note row, not the outbox),
+            // other kinds lose the edit. Cleared first so that applying
+            // may queue new work (an attachment still used here).
+            drop_pending(transaction, kind, id)?;
+        }
+        let outcome = match kind {
+            "note" => self.apply_remote_note(transaction, id, change, pending, now),
+            "notebook" => apply_remote_notebook(transaction, id, change, now),
+            "stack" | "tag" => apply_remote_container(transaction, kind, id, change, now),
+            "resource" => self.apply_remote_resource(transaction, id, change, now),
+            _ => Ok(Err(Skip(format!("{kind} changes are not supported")))),
+        };
+        match outcome? {
+            Ok(conflict) => {
+                // A newer version supersedes any change kept for later.
+                transaction.execute(
+                    "DELETE FROM sync_failures WHERE op_id IN
+                         (SELECT op_id FROM sync_deferred WHERE entity_type=?1 AND entity_id=?2)",
+                    params![kind, id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM sync_deferred WHERE entity_type=?1 AND entity_id=?2",
+                    params![kind, id],
+                )?;
+                report.applied += 1;
+                if pending {
+                    report.conflicts += usize::from(conflict || kind != "note");
+                }
+                if kind == "note" {
+                    touched_notes.push(id.to_owned());
+                }
+            }
+            Err(Skip(reason)) => {
+                report.skipped += 1;
+                transaction.execute(
+                    "INSERT INTO sync_failures(op_id,entity_type,entity_id,reason,updated_time) VALUES(?1,?2,?3,?4,?5)
+                     ON CONFLICT(op_id) DO UPDATE SET reason=excluded.reason, updated_time=excluded.updated_time",
+                    params![change.op_id, kind, id, reason, now],
+                )?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO sync_entities(entity_type,entity_id,server_revision) VALUES(?1,?2,?3)
+             ON CONFLICT(entity_type,entity_id) DO UPDATE SET server_revision=excluded.server_revision",
+            params![kind, id, change.revision as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Applies kept changes whose attachments have arrived since.
+    fn apply_deferred(
+        &self,
+        transaction: &Transaction<'_>,
+        now: i64,
+        report: &mut SyncApplyReport,
+        touched_notes: &mut Vec<String>,
+    ) -> Result<(), LibraryError> {
+        let kept: Vec<(String, String, String)> = {
+            let mut statement = transaction
+                .prepare("SELECT entity_type, entity_id, change_json FROM sync_deferred")?;
+            let rows =
+                statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for (kind, id, change_json) in kept {
+            let Ok(change) = serde_json::from_str::<app_lite_protocol::Change>(&change_json) else {
+                transaction.execute(
+                    "DELETE FROM sync_deferred WHERE entity_type=?1 AND entity_id=?2",
+                    params![kind, id],
+                )?;
+                continue;
+            };
+            if missing_attachment(transaction, &change)?.is_some() {
+                continue;
+            }
+            report.deferred = report.deferred.saturating_sub(1);
+            self.apply_change(transaction, &change, now, report, touched_notes)?;
+        }
+        Ok(())
     }
 
     /// Ok(true) when a local edit was kept as a conflict copy.
@@ -712,17 +845,26 @@ impl LibraryRepository {
         Ok(Ok(copied))
     }
 
+    /// Known to the library, or already downloaded for a page that has not
+    /// applied yet (a page applies only once all its attachments are here;
+    /// without this, a page with several attachments on a weak link would
+    /// download the first ones again on every attempt).
     pub(crate) fn sync_has_blob(&self, sha256: &str) -> Result<bool, LibraryError> {
-        let connection = self.connection.lock().expect("library mutex poisoned");
-        Ok(connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM resource_blobs WHERE sha256=?1)",
-            [sha256],
-            |row| row.get::<_, i64>(0),
-        )? != 0)
+        let known = {
+            let connection = self.connection.lock().expect("library mutex poisoned");
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resource_blobs WHERE sha256=?1)",
+                [sha256],
+                |row| row.get::<_, i64>(0),
+            )? != 0
+        };
+        if known {
+            return Ok(true);
+        }
+        let hash = crate::BlobHash::new(sha256).map_err(|_| LibraryError::InvalidSnapshot)?;
+        Ok(self.resource_store.contains(&hash)?)
     }
 
-    /// Writes downloaded bytes into the content-addressed store. Metadata
-    /// follows only when the page applies, after `verify_staged_blob`.
     pub(crate) fn sync_budget(&self) -> &crate::sync::TransferBudget {
         &self.sync_budget
     }
@@ -1327,6 +1469,7 @@ impl LibraryRepository {
                  SELECT 1 FROM sync_inflight i WHERE i.entity_type=sync_entities.entity_type AND i.entity_id=sync_entities.entity_id);
              DELETE FROM sync_inflight;
              DELETE FROM sync_failures;
+             DELETE FROM sync_deferred;
              DELETE FROM sync_outbox;
              DELETE FROM sync_cursor;",
         )?;
@@ -1357,7 +1500,7 @@ impl LibraryRepository {
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
-            "DELETE FROM sync_entities; DELETE FROM sync_inflight; DELETE FROM sync_failures; DELETE FROM sync_cursor;",
+            "DELETE FROM sync_entities; DELETE FROM sync_inflight; DELETE FROM sync_failures; DELETE FROM sync_deferred; DELETE FROM sync_cursor;",
         )?;
         transaction.commit()?;
         Ok(())

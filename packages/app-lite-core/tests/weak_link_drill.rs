@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, sync};
 use app_lite_protocol::client::HttpTransport;
+use app_lite_protocol::{
+    BlobStatus, PullRequest, PullResponse, PushRequest, PushResponse, SyncTransport, TransportError,
+};
 use app_lite_server::ServerStore;
 use app_lite_server::http::{HttpOptions, HttpServer, tls_config_from_pem};
 use tempfile::tempdir;
@@ -103,11 +106,73 @@ fn noise(seed: u32, length: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Logs every request's size, duration and outcome.
+struct Logged<'a>(&'a HttpTransport);
+
+fn logged<T>(
+    what: String,
+    call: impl FnOnce() -> Result<T, TransportError>,
+) -> Result<T, TransportError> {
+    let started = Instant::now();
+    let result = call();
+    println!(
+        "drill.call {what} {:.1}s {}",
+        started.elapsed().as_secs_f64(),
+        match &result {
+            Ok(_) => "ok".to_owned(),
+            Err(error) => format!("{error:?}").chars().take(120).collect(),
+        }
+    );
+    result
+}
+
+impl SyncTransport for Logged<'_> {
+    fn push(&self, request: &PushRequest) -> Result<PushResponse, TransportError> {
+        logged(format!("push {} ops", request.ops.len()), || {
+            self.0.push(request)
+        })
+    }
+    fn pull(&self, request: &PullRequest) -> Result<PullResponse, TransportError> {
+        logged(format!("pull limit {}", request.limit), || {
+            self.0.pull(request)
+        })
+    }
+    fn blob_status(&self, sha256: &str) -> Result<BlobStatus, TransportError> {
+        logged("blob_status".into(), || self.0.blob_status(sha256))
+    }
+    fn put_chunk(
+        &self,
+        sha256: &str,
+        size: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<BlobStatus, TransportError> {
+        logged(format!("put_chunk @{offset} +{}", bytes.len()), || {
+            self.0.put_chunk(sha256, size, offset, bytes)
+        })
+    }
+    fn read_range(&self, sha256: &str, offset: u64, len: u64) -> Result<Vec<u8>, TransportError> {
+        logged(format!("read_range @{offset} +{len}"), || {
+            self.0.read_range(sha256, offset, len)
+        })
+    }
+}
+
 /// Sync passes until idle; returns (passes, retryable passes).
 fn sync_until_idle(repository: &LibraryRepository, transport: &HttpTransport) -> (usize, usize) {
+    let transport = &Logged(transport);
     let mut retried = 0;
     for pass in 1..=400 {
+        let started = Instant::now();
         let report = sync::sync_once(repository, transport).expect("no permanent failure");
+        println!(
+            "drill.pass {pass}: {:.1}s accepted {} pulled {} retryable {} pending {}",
+            started.elapsed().as_secs_f64(),
+            report.accepted,
+            report.pulled,
+            report.retryable,
+            repository.sync_pending_count().unwrap()
+        );
         retried += usize::from(report.retryable > 0);
         if report.retryable == 0
             && report.accepted == 0

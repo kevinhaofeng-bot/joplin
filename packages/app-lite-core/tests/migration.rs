@@ -35,7 +35,7 @@ impl RepositoryIdSource for FixedIds {
 }
 
 #[test]
-fn open_creates_clean_v11_database_idempotently() {
+fn open_creates_clean_current_database_idempotently() {
     // Catches a fresh profile missing v7 schema/PRAGMAs or a second open changing it.
     let profile = tempdir().unwrap();
     let path = profile.path().join("library.sqlite");
@@ -46,9 +46,14 @@ fn open_creates_clean_v11_database_idempotently() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        SCHEMA_VERSION
     );
-    for table in ["sync_entities", "sync_inflight", "sync_failures"] {
+    for table in [
+        "sync_entities",
+        "sync_inflight",
+        "sync_failures",
+        "sync_deferred",
+    ] {
         assert_eq!(
             connection
                 .query_row(
@@ -1587,9 +1592,9 @@ fn lexical_profile_bind_refuses_a_symlink_swap_before_sqlite_opens() {
     );
 }
 
-/// v10 -> v11 only adds the sync client tables; notes and outbox survive.
+/// v10 -> current only adds the sync client tables; notes and outbox survive.
 #[test]
-fn v10_library_upgrades_to_v11_keeping_notes_and_outbox() {
+fn v10_library_upgrades_keeping_notes_and_outbox() {
     let profile = tempdir().unwrap();
     let path = profile.path().join("library.sqlite");
     let repository = LibraryRepository::open(&path).unwrap();
@@ -1621,6 +1626,57 @@ fn v10_library_upgrades_to_v11_keeping_notes_and_outbox() {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        SCHEMA_VERSION
+    );
+}
+
+/// v11 -> v12 adds only the deferred-change table.
+#[test]
+fn v11_library_upgrades_by_adding_only_the_deferred_table() {
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).unwrap();
+    let note = repository
+        .create_note(app_lite_core::CreateNote {
+            title: "升级前".into(),
+            notebook_id: None,
+            document: app_lite_core::CanonicalDocument::parse_html("<p>正文</p>").unwrap(),
+        })
+        .unwrap();
+    drop(repository);
+    let connection = Connection::open(&path).unwrap();
+    // A v11 library whose default notebook was replaced by an adopted one.
+    connection
+        .execute_batch(
+            "DROP TABLE sync_deferred; UPDATE notebooks SET is_default=0; PRAGMA user_version = 11;",
+        )
+        .unwrap();
+    let count = |connection: &Connection, table: &str| {
+        connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    let notebooks = count(&connection, "notebooks");
+    drop(connection);
+    let repository = LibraryRepository::open(&path).unwrap();
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().title,
+        "升级前"
+    );
+    drop(repository);
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        count(&connection, "notebooks"),
+        notebooks,
+        "no notebook created"
+    );
+    assert_eq!(count(&connection, "sync_deferred"), 0);
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        12
     );
 }

@@ -238,6 +238,12 @@ impl ResourceStore {
         Ok(ResourceBlob { sha256, size })
     }
 
+    /// Whether the blob is stored. Blobs are published under their hash only
+    /// after it was verified, so presence means the right bytes.
+    pub(crate) fn contains(&self, sha256: &BlobHash) -> Result<bool, ResourceError> {
+        Ok(open_blob(self.blobs_dir.0, sha256.as_str())?.is_some())
+    }
+
     /// Bytes kept so far of an interrupted download of `sha256`.
     pub(crate) fn download_part_len(&self, sha256: &BlobHash) -> Result<u64, ResourceError> {
         Ok(

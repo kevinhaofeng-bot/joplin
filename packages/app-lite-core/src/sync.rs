@@ -5,7 +5,7 @@
 //! policy are this project's own design.
 
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use app_lite_protocol::{
     Action, BlobStatus, EntityKind, EntityRef, MAX_PULL_LIMIT, MAX_PUSH_OPS, OpResult, Operation,
@@ -22,48 +22,126 @@ const MAX_BLOB_CHUNK_BYTES: u64 = 1024 * 1024;
 const MIN_PUSH_BATCH_BYTES: usize = 32 * 1024;
 const MIN_BLOB_CHUNK_BYTES: u64 = 64 * 1024;
 
-/// Request sizes that follow the link: halved after a request lost in
-/// transit, doubled after one that succeeded, within the bounds above. A
-/// link that drops sooner than a full-size request takes (a phone moving
-/// between cells) otherwise resends the same request forever. Kept per
-/// library for the life of the process.
+/// One request size that follows the link, like TCP's congestion window:
+/// a request lost in transit halves it and sets the ceiling there; a
+/// delivered one doubles it back up to the ceiling, then raises the
+/// ceiling by an eighth. A link that drops sooner than a full-size request
+/// takes (a phone moving between cells) otherwise resends the same request
+/// forever; without the ceiling the size oscillates between one that fits
+/// and one that does not.
+#[derive(Debug)]
+struct Adaptive {
+    current: AtomicU64,
+    ceiling: AtomicU64,
+    min: u64,
+    max: u64,
+}
+
+impl Adaptive {
+    const fn new(min: u64, max: u64) -> Self {
+        Self {
+            current: AtomicU64::new(max),
+            ceiling: AtomicU64::new(max),
+            min,
+            max,
+        }
+    }
+    fn get(&self) -> u64 {
+        self.current.load(Ordering::Relaxed)
+    }
+    fn lost(&self) {
+        let next = (self.get() / 2).max(self.min);
+        self.ceiling.store(next, Ordering::Relaxed);
+        self.current.store(next, Ordering::Relaxed);
+    }
+    fn delivered(&self) {
+        let ceiling = self.ceiling.load(Ordering::Relaxed);
+        let current = self.get();
+        if current < ceiling {
+            self.current
+                .store((current * 2).min(ceiling), Ordering::Relaxed);
+        } else {
+            let raised = (ceiling + ceiling / 8).clamp(self.min, self.max);
+            self.ceiling.store(raised, Ordering::Relaxed);
+            self.current.store(raised, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Request sizes per library, kept for the life of the process.
 #[derive(Debug)]
 pub(crate) struct TransferBudget {
-    push_bytes: AtomicUsize,
-    chunk_bytes: AtomicU64,
+    push_bytes: Adaptive,
+    chunk_bytes: Adaptive,
+    /// Changes per pull page; one page of large notes can itself outlast
+    /// the link.
+    pull_changes: Adaptive,
 }
 
 impl Default for TransferBudget {
     fn default() -> Self {
         Self {
-            push_bytes: AtomicUsize::new(MAX_PUSH_BATCH_BYTES),
-            chunk_bytes: AtomicU64::new(MAX_BLOB_CHUNK_BYTES),
+            push_bytes: Adaptive::new(MIN_PUSH_BATCH_BYTES as u64, MAX_PUSH_BATCH_BYTES as u64),
+            chunk_bytes: Adaptive::new(MIN_BLOB_CHUNK_BYTES, MAX_BLOB_CHUNK_BYTES),
+            pull_changes: Adaptive::new(1, MAX_PULL_LIMIT as u64),
         }
     }
 }
 
 impl TransferBudget {
     fn push_bytes(&self) -> usize {
-        self.push_bytes.load(Ordering::Relaxed)
+        self.push_bytes.get() as usize
     }
     fn chunk_bytes(&self) -> u64 {
-        self.chunk_bytes.load(Ordering::Relaxed)
+        self.chunk_bytes.get()
+    }
+    fn pull_changes(&self) -> usize {
+        self.pull_changes.get() as usize
     }
     fn push_lost(&self) {
-        let next = (self.push_bytes() / 2).max(MIN_PUSH_BATCH_BYTES);
-        self.push_bytes.store(next, Ordering::Relaxed);
+        self.push_bytes.lost();
     }
     fn push_delivered(&self) {
-        let next = (self.push_bytes() * 2).min(MAX_PUSH_BATCH_BYTES);
-        self.push_bytes.store(next, Ordering::Relaxed);
+        self.push_bytes.delivered();
     }
     fn chunk_lost(&self) {
-        let next = (self.chunk_bytes() / 2).max(MIN_BLOB_CHUNK_BYTES);
-        self.chunk_bytes.store(next, Ordering::Relaxed);
+        self.chunk_bytes.lost();
     }
     fn chunk_delivered(&self) {
-        let next = (self.chunk_bytes() * 2).min(MAX_BLOB_CHUNK_BYTES);
-        self.chunk_bytes.store(next, Ordering::Relaxed);
+        self.chunk_bytes.delivered();
+    }
+    fn pull_lost(&self) {
+        self.pull_changes.lost();
+    }
+    fn pull_delivered(&self) {
+        self.pull_changes.delivered();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Adaptive;
+
+    #[test]
+    fn a_lost_request_sets_a_ceiling_that_growth_then_approaches_slowly() {
+        let size = Adaptive::new(64, 1024);
+        size.lost();
+        assert_eq!(size.get(), 512);
+        size.delivered();
+        assert_eq!(size.get(), 576, "above the ceiling only by an eighth");
+        size.lost();
+        size.lost();
+        assert_eq!(size.get(), 144);
+        size.delivered();
+        assert_eq!(size.get(), 162);
+        for _ in 0..100 {
+            size.delivered();
+        }
+        assert_eq!(size.get(), 1024, "bounded by the maximum");
+        for _ in 0..20 {
+            size.lost();
+        }
+        assert_eq!(size.get(), 64, "bounded by the minimum");
     }
 }
 
@@ -147,11 +225,15 @@ fn pull(
         let request = PullRequest {
             protocol: PROTOCOL_VERSION,
             cursor: repository.sync_cursor()?,
-            limit: MAX_PULL_LIMIT,
+            limit: repository.sync_budget().pull_changes(),
         };
         let response = match transport.pull(&request) {
-            Ok(response) => response,
+            Ok(response) => {
+                repository.sync_budget().pull_delivered();
+                response
+            }
             Err(TransportError::Retryable(_)) => {
+                repository.sync_budget().pull_lost();
                 report.retryable += 1;
                 return Ok(false);
             }

@@ -4,7 +4,10 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
+/// v12: remote note changes waiting for an attachment that has not arrived
+/// yet, kept (instead of skipped) and applied once it has.
+const SYNC_DEFERRED_TABLE: &str = "CREATE TABLE IF NOT EXISTS sync_deferred (entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, op_id TEXT NOT NULL, revision INTEGER NOT NULL, change_json TEXT NOT NULL, created_time INTEGER NOT NULL, PRIMARY KEY(entity_type, entity_id));";
 /// The durable identity of the extractor implementation currently compiled
 /// into the client. A future extractor changes this one value; v10 reopen
 /// reconciles the live associated queue once through the settings sentinel.
@@ -23,7 +26,7 @@ pub(crate) fn migrate_schema(
     // BEGIN IMMEDIATE is deliberately the first migration operation. It keeps
     // the legacy-RTF gate authoritative until the schema publication commits.
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(LibraryError::UnsupportedSchema(version));
     }
@@ -41,6 +44,13 @@ pub(crate) fn migrate_schema(
     // Resource binding is intentionally after the legacy gate but before any
     // schema/data mutation, while this migration-wide lock is still held.
     let mut resource_store = preflight()?;
+    // v11 -> v12 only adds a table; the full path below would also rerun
+    // bootstrap steps (such as the default notebook) that are not needed.
+    if version == 11 {
+        transaction.execute_batch(SYNC_DEFERRED_TABLE)?;
+        transaction.execute_batch("PRAGMA user_version = 12")?;
+        version = SCHEMA_VERSION;
+    }
     if version == SCHEMA_VERSION {
         let stored: Option<String> = transaction
             .query_row(
@@ -183,7 +193,8 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
             params![DERIVED_TEXT_EXTRACTOR_VERSION_SETTING, DERIVED_TEXT_EXTRACTOR_VERSION],
         )?;
     }
-    transaction.execute_batch("PRAGMA user_version = 11")?;
+    transaction.execute_batch(SYNC_DEFERRED_TABLE)?;
+    transaction.execute_batch("PRAGMA user_version = 12")?;
     before_commit();
     // The test hook models the last pathname/descriptor race.  It must run
     // before the final identity check so a swapped profile aborts the still

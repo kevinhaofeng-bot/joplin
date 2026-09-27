@@ -306,3 +306,139 @@ fn transfers_shrink_until_a_link_that_cannot_carry_large_requests_gets_everythin
     );
     assert_eq!(b.list_notes(Default::default()).unwrap().len(), 40);
 }
+
+#[test]
+fn a_note_that_arrives_before_its_attachment_waits_for_it_instead_of_being_lost() {
+    use app_lite_protocol::{Action, Operation, PROTOCOL_VERSION};
+    // A publishes normally to one server...
+    let first_root = tempdir().unwrap();
+    let first = ServerStore::open(first_root.path()).unwrap();
+    let (_a_root, a) = client();
+    let bytes = picture();
+    let resource = a
+        .import_resource(&bytes, "照片.png", "image/png", "png")
+        .unwrap();
+    let note = a
+        .create_note(CreateNote {
+            title: "先到的笔记".into(),
+            notebook_id: None,
+            document: with_image("看图", resource.clone()),
+        })
+        .unwrap();
+    sync::sync_once(&a, &first).unwrap();
+    let changes = first
+        .pull(PullRequest {
+            protocol: PROTOCOL_VERSION,
+            cursor: 0,
+            limit: 100,
+        })
+        .unwrap()
+        .changes;
+
+    // ...and another device replays it to a second server with the note
+    // ahead of its attachment.
+    let second_root = tempdir().unwrap();
+    let second = ServerStore::open(second_root.path()).unwrap();
+    let device = "e".repeat(32);
+    let replay = |kinds: &[&str]| {
+        for (index, change) in changes
+            .iter()
+            .filter(|change| kinds.contains(&change.entity.kind.as_str()))
+            .enumerate()
+        {
+            let op_id = format!("{:032x}", index + 1 + 100 * kinds.len());
+            second
+                .push(PushRequest {
+                    protocol: PROTOCOL_VERSION,
+                    device_id: device.clone(),
+                    ops: vec![Operation {
+                        op_id,
+                        device_id: device.clone(),
+                        entity: change.entity.clone(),
+                        base_revision: 0,
+                        action: Action::Put {
+                            payload: change.payload.clone().unwrap(),
+                        },
+                    }],
+                })
+                .unwrap();
+        }
+    };
+    replay(&["notebook", "note"]);
+    let (_b_root, b) = client();
+    sync::sync_once(&b, &second).unwrap();
+    assert!(b.load_note(&note.id).unwrap().is_none());
+    let waiting = sync::sync_failures(&b).unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert!(waiting[0].waiting && !waiting[0].can_retry, "{waiting:?}");
+
+    let sha = format!("{:x}", Sha256::digest(&bytes));
+    let blob = SyncTransport::read_range(&first, &sha, 0, bytes.len() as u64).unwrap();
+    second
+        .put_chunk(&sha, bytes.len() as u64, 0, &blob)
+        .unwrap();
+    replay(&["resource"]);
+    sync::sync_once(&b, &second).unwrap();
+    let arrived = b
+        .load_note(&note.id)
+        .unwrap()
+        .expect("applied once the attachment is here");
+    assert_eq!(arrived.resource_ids, vec![resource]);
+    assert!(sync::sync_failures(&b).unwrap().is_empty());
+}
+
+fn picture_seeded(seed: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2_621_440);
+    let mut state = seed | 1;
+    while bytes.len() < 2_621_440 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn attachments_finished_on_earlier_attempts_are_not_downloaded_again() {
+    let server_root = tempdir().unwrap();
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let (_a_root, a) = client();
+    let pictures: Vec<(ResourceId, Vec<u8>)> = (0..3)
+        .map(|seed| {
+            let bytes = picture_seeded(2 * seed + 23);
+            let id = a
+                .import_resource(&bytes, &format!("图 {seed}.png"), "image/png", "png")
+                .unwrap();
+            (id, bytes)
+        })
+        .collect();
+    let mut inlines = Vec::new();
+    for (id, _) in &pictures {
+        inlines.push(Inline::Image {
+            resource_id: id.clone(),
+            alt: "图".into(),
+            display_width: None,
+            link: None,
+        });
+    }
+    a.create_note(CreateNote {
+        title: "三张图".into(),
+        notebook_id: None,
+        document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines,
+        }]),
+    })
+    .unwrap();
+    sync::sync_once(&a, &store).unwrap();
+
+    let (_b_root, b) = client();
+    let link = ShortLivedLink::new(&store, usize::MAX, true);
+    sync_until_idle(&b, &link);
+    for (id, bytes) in &pictures {
+        assert_eq!(&b.read_resource_bytes(id).unwrap().unwrap(), bytes);
+    }
+    let total: u64 = pictures.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+    assert_eq!(link.delivered.get(), total, "no byte fetched twice");
+}

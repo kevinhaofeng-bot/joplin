@@ -125,6 +125,7 @@ dependencies = [
  "md-5",
  "pulldown-cmark",
  "quick-xml 0.37.5",
+ "rcgen",
  "rusqlite",
  "serde",
  "serde_json",
