@@ -8079,3 +8079,41 @@ fn table_cells_rows_and_columns_edit_undo_and_save(cx: &mut gpui::TestAppContext
     assert!(editor.delete_table_row(table, 0).is_err());
     assert!(editor.delete_table_column(table, 0).is_err());
 }
+
+#[gpui::test]
+fn inserting_a_table_splits_the_paragraph_saves_and_undoes(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    let table = editor.insert_table(2, 2).unwrap();
+    let html = crate::native_editor::codec::export_canonical(editor.document())
+        .unwrap()
+        .to_canonical_html()
+        .as_str()
+        .to_owned();
+    assert!(
+        html.starts_with("<p>前</p><table data-joplin-lite-table=\"true\">"),
+        "{html}"
+    );
+    assert!(html.ends_with("</table><p>后</p>"), "{html}");
+    assert_eq!(html.matches("<tr>").count(), 2, "{html}");
+    assert!(matches!(
+        editor.document().block(table).unwrap().content,
+        BlockContent::Table(_)
+    ));
+    editor.undo().unwrap();
+    assert_eq!(editor.visible_text(), "前后");
+
+    // Never inside a heading/quote/list parent that holds an image.
+    let grouped = app_lite_core::CanonicalDocument::parse_html(
+        "<h2>标题<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\">尾</h2>",
+    )
+    .unwrap();
+    let mut editor = EditorCore::from_document(
+        crate::native_editor::codec::import_canonical(&grouped).unwrap(),
+        cx,
+    );
+    editor.set_caret_utf8("标".len());
+    let before = editor.document().semantic_snapshot();
+    assert!(editor.insert_table(2, 2).is_err());
+    assert_eq!(editor.document().semantic_snapshot(), before);
+}

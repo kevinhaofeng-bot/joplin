@@ -485,6 +485,7 @@ enum StructuralInsert {
         filename: String,
         media_type: String,
     },
+    Table(Arc<TableContent>),
 }
 
 impl StructuralInsert {
@@ -513,6 +514,13 @@ impl StructuralInsert {
                 if resource_id.is_empty() || filename.trim().is_empty() || media_type.is_empty() {
                     return Err(DocumentError::InvalidOperation(
                         "an attachment requires resource metadata".into(),
+                    ));
+                }
+            }
+            Self::Table(table) => {
+                if table.rows.is_empty() || table.column_count() == 0 {
+                    return Err(DocumentError::InvalidOperation(
+                        "a table needs at least one cell".into(),
                     ));
                 }
             }
@@ -548,6 +556,7 @@ impl StructuralInsert {
                     media_type: media_type.clone(),
                 },
             ),
+            Self::Table(table) => (BlockKind::Table, BlockContent::Table(table.clone())),
         };
         Block {
             id,
@@ -2199,6 +2208,7 @@ impl Document {
             | Transaction::OutdentList { .. }
             | Transaction::InsertImage { .. }
             | Transaction::InsertAttachment { .. }
+            | Transaction::InsertTable { .. }
             | Transaction::EnsureParagraph { .. }
             | Transaction::RemoveNode { .. } => true,
             _ => false,
@@ -2238,6 +2248,11 @@ impl Document {
             .collect();
         if before.is_empty() {
             return self.apply_transaction_raw(transaction);
+        }
+        if matches!(&transaction, Transaction::InsertTable { .. }) {
+            return Err(DocumentError::InvalidOperation(
+                "表格只能插在正文段落之间，不能插在含图的标题、引用或列表里".into(),
+            ));
         }
         let attachment_to_plain_parent =
             matches!(&transaction, Transaction::InsertAttachment { .. })
@@ -2538,6 +2553,11 @@ impl Document {
             } => {
                 let (selection, changed_nodes, inverse) =
                     self.apply_set_image_natural_size(node_id, natural_size)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::InsertTable { selection, table } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_insert_structural(selection, StructuralInsert::Table(table))?;
                 (selection, changed_nodes, inverse, None)
             }
             Transaction::ReplaceTable { node_id, table } => {

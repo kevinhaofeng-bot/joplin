@@ -85,6 +85,11 @@ pub enum Transaction {
         node_id: NodeId,
         display_width: Option<u32>,
     },
+    /// Insert a new table atom at the selection (between paragraphs).
+    InsertTable {
+        selection: Selection,
+        table: std::sync::Arc<super::model::TableContent>,
+    },
     /// Replace a table atom's whole content (a cell edit or a row/column
     /// change). The inverse restores the original block.
     ReplaceTable {
@@ -123,6 +128,7 @@ impl Transaction {
             | Self::OutdentList { selection }
             | Self::InsertImage { selection, .. }
             | Self::InsertAttachment { selection, .. }
+            | Self::InsertTable { selection, .. }
             | Self::EnsureParagraph { selection } => Some(*selection),
             Self::SplitBlock { at } => Some(Selection::caret(*at)),
             Self::MergeBlocks { .. }
@@ -152,14 +158,15 @@ impl Transaction {
                 .saturating_add(filename.len())
                 .saturating_add(media_type.len()),
             Self::ToggleMark { mark, .. } => base.saturating_add(mark.estimated_bytes()),
-            Self::ReplaceTable { table, .. } => base.saturating_add(
-                table
-                    .rows
-                    .iter()
-                    .flatten()
-                    .map(|cell| cell.len() * 2)
-                    .fold(0usize, usize::saturating_add),
-            ),
+            Self::ReplaceTable { table, .. } | Self::InsertTable { table, .. } => base
+                .saturating_add(
+                    table
+                        .rows
+                        .iter()
+                        .flatten()
+                        .map(|cell| cell.len() * 2)
+                        .fold(0usize, usize::saturating_add),
+                ),
             Self::SetBlockKind { kind, .. } => base.saturating_add(kind.estimated_bytes()),
             Self::RestoreBlocks { blocks, .. } => base.saturating_add(
                 blocks

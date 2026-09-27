@@ -38,6 +38,31 @@ pub(crate) const ATTACHMENT_CARD_HEIGHT: f32 = 76.0;
 pub(crate) const TABLE_LINE_HEIGHT: f32 = 22.0;
 pub(crate) const TABLE_ROW_PADDING: f32 = 10.0;
 
+/// The cell under `position`, using the same geometry `paint_table` draws:
+/// equal-width columns, rows as tall as their tallest cell.
+pub(crate) fn table_cell_at(
+    table: &super::model::TableContent,
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> Option<(usize, usize)> {
+    if !contains(bounds, position) {
+        return None;
+    }
+    let columns = table.column_count().max(1);
+    let fraction = f32::from(position.x - bounds.left()) / f32::from(bounds.size.width).max(1.0);
+    let column = ((fraction * columns as f32).floor() as usize).min(columns - 1);
+    let mut top = f32::from(bounds.top());
+    let y = f32::from(position.y);
+    for (row, lines) in table.row_line_counts().enumerate() {
+        let height = lines as f32 * TABLE_LINE_HEIGHT + TABLE_ROW_PADDING;
+        if y < top + height {
+            return Some((row, column));
+        }
+        top += height;
+    }
+    None
+}
+
 pub(crate) fn table_height(table: &super::model::TableContent) -> f32 {
     table
         .row_line_counts()

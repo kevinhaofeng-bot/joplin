@@ -8,8 +8,8 @@
 use crate::app::save_coordinator::FlushReason;
 use crate::app::{
     BackupLibrary, CopyNote, CreateNote, CycleListViewMode, CycleSort, ExportCurrentNote,
-    ExportLibraryReadable, ImportLibrary, OpenSyncSettings, RestoreLibrary, RestoreLibraryReadable,
-    SyncCurrent, SyncNow, ToggleNoteList, ToggleSidebar, TrashSelected,
+    ExportLibraryReadable, ImportLibrary, InsertNoteTable, OpenSyncSettings, RestoreLibrary,
+    RestoreLibraryReadable, SyncCurrent, SyncNow, ToggleNoteList, ToggleSidebar, TrashSelected,
 };
 use crate::components::QuitApplication;
 use crate::file_url::parse_file_url;
@@ -143,6 +143,7 @@ pub(crate) fn library_menu() -> Menu {
             MenuItem::action("新建笔记", CreateNote),
             MenuItem::action("复制笔记", CopyNote),
             MenuItem::action("移至废纸篓", TrashSelected),
+            MenuItem::action("插入表格", InsertNoteTable),
             MenuItem::separator(),
             MenuItem::action("显示/隐藏侧栏", ToggleSidebar),
             MenuItem::action("显示/隐藏笔记列表", ToggleNoteList),

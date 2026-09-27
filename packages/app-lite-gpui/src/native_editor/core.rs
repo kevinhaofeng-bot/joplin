@@ -332,7 +332,14 @@ impl ImageResizeDrag {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AtomicBlockHit {
     Image,
-    Attachment { resource_id: String },
+    Attachment {
+        resource_id: String,
+    },
+    Table {
+        node_id: NodeId,
+        row: usize,
+        column: usize,
+    },
 }
 
 impl EditorCore {
@@ -747,6 +754,7 @@ impl EditorCore {
             | Transaction::DeleteRange { selection }
             | Transaction::InsertImage { selection, .. }
             | Transaction::InsertAttachment { selection, .. }
+            | Transaction::InsertTable { selection, .. }
             | Transaction::EnsureParagraph { selection } => Some(selection_range(*selection)),
             Transaction::SplitBlock { at } => {
                 let offset = self.document.flat_offset_for_point(*at)?;
@@ -1752,6 +1760,39 @@ impl EditorCore {
         })?;
         self.selection = selection;
         Ok(())
+    }
+
+    /// Insert an empty table with a header row at the caret; returns its node.
+    pub(crate) fn insert_table(
+        &mut self,
+        rows: usize,
+        columns: usize,
+    ) -> Result<NodeId, DocumentError> {
+        let block = app_lite_core::document::Block::Table {
+            rows: vec![
+                app_lite_core::document::TableRow {
+                    cells: vec![Default::default(); columns.max(1)],
+                };
+                rows.max(1)
+            ],
+            header: true,
+        };
+        let table = super::model::TableContent::from_canonical(block)
+            .ok_or_else(|| DocumentError::InvalidOperation("无法创建表格".into()))?;
+        let outcome = self.apply_with_selection(Transaction::InsertTable {
+            selection: self.selection,
+            table: std::sync::Arc::new(table),
+        })?;
+        outcome
+            .changed_nodes
+            .iter()
+            .copied()
+            .find(|id| {
+                self.document
+                    .block(*id)
+                    .is_some_and(|block| matches!(block.content, BlockContent::Table(_)))
+            })
+            .ok_or_else(|| DocumentError::InvalidOperation("表格未插入".into()))
     }
 
     pub(crate) fn set_table_cell(
@@ -2765,6 +2806,15 @@ impl EditorCore {
             BlockContent::Attachment { resource_id, .. } => AtomicBlockHit::Attachment {
                 resource_id: resource_id.clone(),
             },
+            BlockContent::Table(table) => {
+                let bounds = self.layout.block_layout(node_id)?.bounds;
+                let (row, column) = super::layout::table_cell_at(table, bounds, position)?;
+                AtomicBlockHit::Table {
+                    node_id,
+                    row,
+                    column,
+                }
+            }
             _ => return None,
         };
         self.selection = self.full_block_selection(index);

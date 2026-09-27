@@ -21,6 +21,7 @@ gpui::actions!(
         CopyNote,
         SyncNow,
         OpenSyncSettings,
+        InsertNoteTable,
     ]
 );
 

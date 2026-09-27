@@ -146,8 +146,16 @@ impl Default for EditorSurfaceHooks {
 /// of the native editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EditorSurfaceEvent {
-    OpenAttachment { resource_id: String },
+    OpenAttachment {
+        resource_id: String,
+    },
     DismissFindInNote,
+    /// Double-click on a table cell: the shell opens its cell editor.
+    EditTableCell {
+        node_id: super::model::NodeId,
+        row: usize,
+        column: usize,
+    },
 }
 
 /// One mounted document canvas. Its editor is the only input-handler owner;
@@ -399,10 +407,24 @@ impl EditorSurface {
         if let Some(hit) = atomic {
             self.pointer_anchor = None;
             focus_editor(&self.editor, window, cx);
-            if event.click_count >= 2
-                && let AtomicBlockHit::Attachment { resource_id } = hit
-            {
-                cx.emit(EditorSurfaceEvent::OpenAttachment { resource_id });
+            if event.click_count >= 2 {
+                match hit {
+                    AtomicBlockHit::Attachment { resource_id } => {
+                        cx.emit(EditorSurfaceEvent::OpenAttachment { resource_id });
+                    }
+                    AtomicBlockHit::Table {
+                        node_id,
+                        row,
+                        column,
+                    } if !self.mode.is_read_only() => {
+                        cx.emit(EditorSurfaceEvent::EditTableCell {
+                            node_id,
+                            row,
+                            column,
+                        });
+                    }
+                    _ => {}
+                }
             }
             cx.stop_propagation();
             return;

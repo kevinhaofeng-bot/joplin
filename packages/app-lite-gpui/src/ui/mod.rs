@@ -8,6 +8,7 @@ pub mod note_list;
 mod readable_export;
 pub mod sidebar;
 mod sync;
+mod table_cell_editor;
 
 use self::card_thumbnail::{
     CARD_THUMBNAIL_CACHE_BUDGET, CARD_THUMBNAIL_PROXY_EDGE, CardThumbnailManager,
@@ -516,6 +517,7 @@ pub struct LibraryShell {
     /// session has already advanced its own fence and must retain history.
     remount_current_surface_after_organization_commit: bool,
     sync_status: sync::ShellSyncStatus,
+    table_cell_editor: Option<table_cell_editor::TableCellEditor>,
     /// Saved before a native panel opens. Completion always uses this point,
     /// never an arbitrary caret that may have moved while the picker owned
     /// focus.
@@ -1053,6 +1055,7 @@ impl LibraryShell {
             surface_note_id: None,
             remount_current_surface_after_organization_commit: false,
             sync_status: sync::ShellSyncStatus::Idle,
+            table_cell_editor: None,
             pending_resource_insert: None,
             #[cfg(test)]
             resource_picker_presentations_for_test: Arc::new(AtomicUsize::new(0)),
@@ -2349,6 +2352,7 @@ impl LibraryShell {
             });
         }
 
+        self.table_cell_editor = None;
         // A switch (including a codec failure) first removes the old mounted
         // entity. It is never possible to show one note under another note's
         // selection/title.
@@ -2518,6 +2522,13 @@ impl LibraryShell {
                         }
                         EditorSurfaceEvent::DismissFindInNote => {
                             shell.close_find_in_note_from_editor(shell_cx);
+                        }
+                        EditorSurfaceEvent::EditTableCell {
+                            node_id,
+                            row,
+                            column,
+                        } => {
+                            shell.open_table_cell_editor(*node_id, *row, *column, shell_cx);
                         }
                     },
                 ));
@@ -6586,6 +6597,7 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::export_library_readable_action))
             .on_action(cx.listener(Self::restore_library_readable_action))
             .on_action(cx.listener(Self::sync_now_action))
+            .on_action(cx.listener(Self::insert_table_action))
             .on_action(cx.listener(Self::open_sync_settings_action))
             .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_find_in_note))
@@ -6618,6 +6630,9 @@ impl Render for LibraryShell {
         }
         for overlay in editor_overlays {
             root = root.child(overlay);
+        }
+        if let Some(cell_editor) = self.render_table_cell_editor(window, cx) {
+            root = root.child(cell_editor);
         }
         let search_palette =
             self.render_search_palette(f32::from(window.viewport_size().width), cx);
@@ -7075,6 +7090,8 @@ mod organization_input_tests;
 mod quit_lifecycle_tests;
 #[cfg(test)]
 mod sync_tests;
+#[cfg(test)]
+mod table_cell_editor_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
