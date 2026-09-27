@@ -14,6 +14,10 @@ use crate::{
 pub const EVENTS_SILENCE_TIMEOUT: Duration = Duration::from_secs(EVENTS_HEARTBEAT_SECONDS * 5 / 2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EVENT_LINE_BYTES: u64 = 4096;
+/// JSON request bodies above this are sent gzip-compressed: uploads are the
+/// costly direction on a weak link. Responses are compressed by the server
+/// when asked (ureq's `gzip` feature asks and decodes).
+const GZIP_REQUEST_ABOVE_BYTES: usize = 1024;
 
 /// Upper bound on a response body the client will read.
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -98,11 +102,21 @@ impl HttpTransport {
         body: &T,
     ) -> Result<ureq::Response, ureq::Error> {
         let bytes = serde_json::to_vec(body).expect("protocol types serialize");
-        self.agent
+        let request = self
+            .agent
             .post(&self.url(path))
             .set("Authorization", &self.authorization)
-            .set("Content-Type", "application/json")
-            .send_bytes(&bytes)
+            .set("Content-Type", "application/json");
+        if bytes.len() <= GZIP_REQUEST_ABOVE_BYTES {
+            return request.send_bytes(&bytes);
+        }
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), Default::default());
+        std::io::Write::write_all(&mut encoder, &bytes).expect("writing to memory");
+        let compressed = encoder.finish().expect("writing to memory");
+        request
+            .set("Content-Encoding", "gzip")
+            .send_bytes(&compressed)
     }
 }
 

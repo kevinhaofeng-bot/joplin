@@ -336,3 +336,71 @@ fn a_stream_the_server_ends_on_schedule_says_bye() {
     assert_eq!(stream.next_event().unwrap(), SyncEvent::Bye);
     assert!(stream.next_event().is_err(), "closed after bye");
 }
+
+/// One raw request; returns the status line, headers and body.
+fn raw_request(running: &Running, head: &str, body: &[u8]) -> (String, Vec<u8>) {
+    use std::io::Read;
+    let mut socket = TcpStream::connect(running.server.local_addr()).unwrap();
+    socket.write_all(head.as_bytes()).unwrap();
+    socket.write_all(body).unwrap();
+    let mut response = Vec::new();
+    socket.read_to_end(&mut response).unwrap();
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    (
+        String::from_utf8_lossy(&response[..split]).into_owned(),
+        response[split + 4..].to_vec(),
+    )
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn json_travels_gzip_compressed_both_ways_and_the_limit_counts_decompressed_bytes() {
+    use std::io::Read;
+    let running = start(fast());
+    for op in 'a'..='f' {
+        push_note(&running.url(), op);
+    }
+    let pull = gzip(br#"{"protocol":1,"cursor":0,"limit":100}"#);
+    let (head, body) = raw_request(
+        &running,
+        &format!(
+            "POST /v1/pull HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Encoding: gzip\r\nAccept-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            pull.len()
+        ),
+        &pull,
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("Content-Encoding: gzip"), "{head}");
+    let mut plain = String::new();
+    flate2::read::GzDecoder::new(body.as_slice())
+        .read_to_string(&mut plain)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&plain).unwrap()["changes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+
+    // 20 MiB of zeros compress to a few KiB: refused by what they expand to.
+    let bomb = gzip(&vec![b' '; 20 * 1024 * 1024]);
+    assert!(bomb.len() < 64 * 1024);
+    let (head, _) = raw_request(
+        &running,
+        &format!(
+            "POST /v1/push HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            bomb.len()
+        ),
+        &bomb,
+    );
+    assert!(head.starts_with("HTTP/1.1 413"), "{head}");
+}

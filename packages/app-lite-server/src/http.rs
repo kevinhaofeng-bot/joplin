@@ -197,6 +197,7 @@ fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         422 => "Unprocessable Entity",
         431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
@@ -224,9 +225,34 @@ fn linger_close(socket: &TcpStream, options: &HttpOptions) {
     }
 }
 
-fn write_reply(mut socket: &TcpStream, reply: Reply) -> std::io::Result<()> {
+/// JSON replies above this go gzip-compressed to clients that accept it;
+/// attachment bytes are mostly compressed already.
+const GZIP_REPLY_ABOVE_BYTES: usize = 1024;
+
+fn write_reply(socket: &TcpStream, reply: Reply) -> std::io::Result<()> {
+    write_reply_encoded(socket, reply, false)
+}
+
+fn write_reply_encoded(
+    mut socket: &TcpStream,
+    mut reply: Reply,
+    accepts_gzip: bool,
+) -> std::io::Result<()> {
+    let mut encoding = "";
+    if accepts_gzip
+        && reply.content_type == "application/json"
+        && reply.body.len() > GZIP_REPLY_ABOVE_BYTES
+    {
+        let mut encoder = flate2::write::GzEncoder::new(
+            Vec::with_capacity(reply.body.len() / 4),
+            flate2::Compression::default(),
+        );
+        encoder.write_all(&reply.body)?;
+        reply.body = encoder.finish()?;
+        encoding = "Content-Encoding: gzip\r\n";
+    }
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{encoding}Content-Length: {}\r\nConnection: close\r\n\r\n",
         reply.status,
         reason(reply.status),
         reply.content_type,
@@ -258,6 +284,8 @@ struct Request {
     url: String,
     authorization: Option<String>,
     content_length: Option<u64>,
+    gzip_body: bool,
+    accepts_gzip: bool,
 }
 
 impl Request {
@@ -299,6 +327,8 @@ fn read_head(reader: &mut BufReader<&TcpStream>) -> Result<Request, Reply> {
         url: url.to_owned(),
         authorization: None,
         content_length: None,
+        gzip_body: false,
+        accepts_gzip: false,
     };
     loop {
         let header = line(reader)?;
@@ -314,6 +344,16 @@ fn read_head(reader: &mut BufReader<&TcpStream>) -> Result<Request, Reply> {
         } else if name.eq_ignore_ascii_case("content-length") {
             request.content_length =
                 Some(value.parse().map_err(|_| text(400, "bad content-length"))?);
+        } else if name.eq_ignore_ascii_case("content-encoding") {
+            match value.to_ascii_lowercase().as_str() {
+                "gzip" => request.gzip_body = true,
+                "identity" => {}
+                _ => return Err(text(415, "only gzip request bodies are accepted")),
+            }
+        } else if name.eq_ignore_ascii_case("accept-encoding") {
+            request.accepts_gzip = value
+                .split(',')
+                .any(|coding| coding.trim().to_ascii_lowercase().starts_with("gzip"));
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(text(501, "only Content-Length bodies are accepted"));
         }
@@ -349,7 +389,19 @@ fn body(
     reader
         .read_exact(&mut bytes)
         .map_err(|_| text(400, "unreadable request body"))?;
-    Ok(bytes)
+    if !request.gzip_body {
+        return Ok(bytes);
+    }
+    // The limit applies to the decompressed size as well.
+    let mut plain = Vec::new();
+    flate2::read::GzDecoder::new(bytes.as_slice())
+        .take(limit + 1)
+        .read_to_end(&mut plain)
+        .map_err(|_| text(400, "malformed gzip body"))?;
+    if plain.len() as u64 > limit {
+        return Err(text(413, "request body too large"));
+    }
+    Ok(plain)
 }
 
 fn query(url: &str, name: &str) -> Option<u64> {
@@ -388,7 +440,7 @@ fn serve(shared: &Shared, socket: TcpStream) {
         return;
     }
     let reply = route(&shared.store, &request, &mut reader).unwrap_or_else(|reply| reply);
-    let _ = write_reply(&socket, reply);
+    let _ = write_reply_encoded(&socket, reply, request.accepts_gzip);
     linger_close(&socket, &shared.options);
 }
 
