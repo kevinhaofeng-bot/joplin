@@ -298,7 +298,10 @@ fn the_client_follows_the_stream_and_calls_a_silent_one_dead() {
         .unwrap();
     assert_eq!(stream.next_event().unwrap(), SyncEvent::Hello { head: 0 });
     push_note(&running.url(), 'a');
-    assert_eq!(next_change(&mut stream).unwrap(), SyncEvent::Changed { head: 1 });
+    assert_eq!(
+        next_change(&mut stream).unwrap(),
+        SyncEvent::Changed { head: 1 }
+    );
 
     proxy
         .blackhole
