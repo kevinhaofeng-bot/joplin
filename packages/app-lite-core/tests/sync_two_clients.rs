@@ -440,3 +440,54 @@ fn a_server_restored_from_an_older_backup_loses_nothing() {
         assert_eq!(titles(device).len(), 3, "no spurious conflict copies");
     }
 }
+
+#[test]
+fn an_unsaved_edit_overtaken_by_a_remote_version_is_kept_as_a_conflict_copy() {
+    let (_server_root, store) = server();
+    let a = client();
+    let note = a
+        .repo
+        .create_note(CreateNote {
+            title: "同一篇".into(),
+            notebook_id: None,
+            document: text("原文"),
+        })
+        .unwrap();
+    let tag = a.repo.create_tag("标签").unwrap();
+    a.repo.set_note_tags(&note.id, &[tag.id.clone()]).unwrap();
+    sync(&a, &store);
+    let b = client();
+    sync(&b, &store);
+    save(&b, &note.id, "同一篇", "另一台设备改的");
+    sync(&b, &store);
+    let opened = a.repo.load_note(&note.id).unwrap().unwrap();
+    sync(&a, &store);
+    // The editor still holds an edit based on `opened`, now overtaken.
+    let copy = a
+        .repo
+        .save_overtaken_edit_as_conflict_copy(
+            &note.id,
+            opened.revision,
+            "同一篇",
+            &text("本机未保存"),
+        )
+        .unwrap();
+    assert_eq!(copy.title, "同一篇（冲突副本）");
+    assert!(copy.body_html.contains("本机未保存"));
+    assert_eq!(copy.notebook_id, opened.notebook_id);
+    assert_eq!(copy.tag_ids, vec![tag.id.clone()]);
+    assert!(
+        a.repo
+            .load_note(&note.id)
+            .unwrap()
+            .unwrap()
+            .body_html
+            .contains("另一台设备改的")
+    );
+    sync(&a, &store);
+    sync(&b, &store);
+    assert!(
+        b.repo.load_note(&copy.id).unwrap().is_some(),
+        "the copy syncs"
+    );
+}

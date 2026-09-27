@@ -226,6 +226,52 @@ impl LibraryRepository {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Keeps an editor's edit that a synced remote version overtook (it was
+    /// based on `based_on_revision`, no longer current) as a conflict copy,
+    /// the same outcome a pull gives an unsynced saved edit: the original
+    /// follows the remote version, the local text lives on beside it.
+    pub fn save_overtaken_edit_as_conflict_copy(
+        &self,
+        original: &NoteId,
+        based_on_revision: i64,
+        title: &str,
+        document: &crate::CanonicalDocument,
+    ) -> Result<crate::Note, LibraryError> {
+        // The remote side may have purged the note: the copy then goes to
+        // the default notebook.
+        let current = self.load_note(original)?;
+        let copy = self.create_note(crate::CreateNote {
+            title: format!("{title}{CONFLICT_SUFFIX}"),
+            notebook_id: current.as_ref().map(|note| note.notebook_id.clone()),
+            document: document.clone(),
+        })?;
+        if let Some(current) = &current {
+            self.set_note_tags(&copy.id, &current.tag_ids)?;
+        }
+        {
+            let connection = self.connection.lock().expect("library mutex poisoned");
+            let remote_revision: i64 = connection
+                .query_row(
+                    "SELECT server_revision FROM sync_entities WHERE entity_type='note' AND entity_id=?1",
+                    [original.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            connection.execute(
+                "INSERT INTO sync_conflicts (id, entity_id, local_revision, remote_revision, created_time) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    copy.id.as_str(),
+                    original.as_str(),
+                    based_on_revision,
+                    remote_revision,
+                    self.now()
+                ],
+            )?;
+        }
+        self.load_note(&copy.id)?.ok_or(LibraryError::NotFound)
+    }
+
     /// Drops a refused upload so the next sync sends the entity's current
     /// state as a new op (the server remembers the refused op id). The
     /// entity's outbox rows stay, so it is still pending. False when the
