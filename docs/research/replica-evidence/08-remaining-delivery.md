@@ -401,6 +401,57 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 
 - **NAS 部署**：等待用户在本会话明确同意；部署前先读 `~/servers.md`，只用独立目录、端口和容器。
 - **实机检查**：本会话没有操作界面的工具。表格显示与编辑、同步菜单与状态、撤销合并、输入法，需要 Codex 或用户用上面的 Release 包在隔离 profile 上实机检查。
-- **同步**：没有自动/定时同步（只有“立即同步”）；没有冲突副本列表界面（冲突副本以“（冲突副本）”标题的普通笔记出现）；永久失败只在日志和 `sync_failures` 表里，没有界面。
+- **同步**：没有自动/定时同步（只有“立即同步”）；没有冲突副本列表界面（冲突副本以“（冲突副本）”标题的普通笔记出现）。永久失败的界面见下节（`2101461fd`、`1863f92f3`）。
 - **迁移**：85 篇降级，其中外链图片是否联网抓取需要用户决定；行内数学在 Evernote 核心里没有对应，保持降级。
 - 表格限制见上节。
+
+## 同步问题列表与手动重试（`2101461fd`、`1863f92f3`）
+
+### Evernote 参照与独立设计
+
+| 文件 | SHA256 | 看到的行为 |
+| --- | --- | --- |
+| `main-readable/src/modules/42665__module-42665.js` 第 215–260 行 | `0a965cac…f7336` | `MutationUpsyncActivity`：`processMutationUpsyncResults` 分出 success/retry/failed。只有 retry 放回队列（`unshiftUnsyncedMutations`）；failed 不再排队，只 `rebuildOptimisticGraph()` 并写日志，也就是本地的乐观修改回到服务端状态 |
+| `renderer-readable/chunks/9435.js` 第 41196–41200 行 | `236728fa…d99e` | 笔记列表只有一个“未同步”小图标（`localChangeTimestamp > 0`，提示文案 `Note.snippet.unsyncIndicator.tooltip.unsynced`）。没找到失败列表 |
+
+采用 Evernote 的做法：失败的操作不自动重发，可重试的错误留在队列里。
+**独立设计（不是复刻）**：Evernote 会丢掉本地修改，这里不丢。被拒的上传挂起，连同原因列出，由用户点“重试”，从当前本地内容新生成一次上传。“同步问题”列表和重试按钮都是本项目自己的界面。
+
+### 修复前的问题（先失败证据）
+
+被服务器永久拒绝的操作留在 `sync_inflight`，之后每次同步都原样重发。同一次同步里如果有别的内容被接受，推送循环会再发一次。服务端按 op_id 缓存结果，所以永远得到同一个拒绝。另外，该实体一直占着 in-flight 位置，之后的本地修改永远不会上传。
+
+新测试在只加接口、不加挂起逻辑时的结果（`/tmp/joplin-final-claude/sync-failures/red.log`）：第一次同步就发送了 2 次（期望 1）；重试后的测试里发送 3 次（期望 2）。
+
+### 实现
+
+- core `2101461fd`：
+  - `sync_prepare_inflight` 跳过已记录失败的 op，这类 op 也不占批次名额。
+  - `SyncFailure` 增加 `title`（本地标题）、`updated_time`、`can_retry`（被拒的上传为 true，跳过的下载为 false）。
+  - `sync::retry_failure(op_id)` 在一个事务里删掉挂起的 op 和它的失败记录，保留 outbox，下次同步用当前本地内容生成新 op，只发一次。对下载侧失败或已不存在的项返回 false，不改动任何东西。
+- GUI `1863f92f3`：
+  - 状态栏常驻显示“N 项同步问题，点此查看”，数字来自持久化的记录，不是本次同步的报告；“仅保存在本机、待同步”仍单独显示。
+  - 点击状态栏或菜单“同步问题…”打开列表。每行显示类型、本地标题、中文原因（超过 4 MiB 上限时提示缩短或拆分）。
+  - 被拒的上传有“重试”按钮：标记后立即同步一次，同步进行中不显示按钮。下载侧失败说明无法重试、本机内容未受影响。
+  - 界面从不自动清除或自动重试。
+
+失败记录只在以下情况消失：重试后被接受；服务端对该实体的新版本到达（本机修改按既有规则成为冲突副本）；服务端从较早备份恢复后的重新对账（被拒的内容会重新上传，仍被拒时会重新列出）。
+
+### 测试
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| core `cargo test --offline --features test-support --test sync_failures --test sync_two_clients --test sync_push --test sync_resources --test sync_http`（工作树内） | 退出0；2 + 8 + 5 + 2 + 3 通过 | `/tmp/joplin-final-claude/sync-failures/green.log` |
+| 纯净检出 `1863f92f3`：core `--features test-support --tests` | 退出0；384 通过 | `/tmp/joplin-final-claude/clean-1863f92f3/core.log` |
+| 纯净检出：`sync_drill` 示例编译 | 退出0 | `drill-build.log` |
+| 纯净检出：server | 退出0；15 通过 | `server.log` |
+| 纯净检出：gpui `--bin velotype` | 退出0；1384 通过、0 失败、1 忽略 | `gpui.log` |
+
+新增或加强的测试：
+
+- `sync_failures.rs::a_rejected_upload_is_listed_parked_and_uploads_current_content_after_a_retry`：真实服务端拒绝超过 4 MiB 的笔记。断言：列出标题；再次同步和本地修改都不会重发；其他笔记照常上传；重试后上传的是修改后的内容，另一台设备收到。
+- `sync_failures.rs::a_retry_that_fails_again_is_listed_again_after_one_attempt`：未修复就重试时只多发 1 次，用新 op_id，再次列出，之后不再发送。
+- `sync_two_clients.rs` 的畸形远端正文用例：下载侧失败 `can_retry=false`，重试返回 false，记录保留。
+- 挂载 UI `ui::sync_tests::a_refused_upload_is_listed_and_retried_only_from_its_button`：本机 HTTP 服务端，真实点击状态栏和“重试”按钮，另一台设备收到修改后的内容。gpui 0.2.2 的 `debug_bounds` 不清除旧帧条目，所以“按钮已消失”用 shell 状态断言，不用 `debug_bounds().is_none()`。
+
+以上都是本会话自测，不是 Codex 验收。没有实机点击，也没有接触 NAS 或生产服务。
