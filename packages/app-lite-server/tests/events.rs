@@ -275,6 +275,18 @@ fn fault_proxy(upstream: std::net::SocketAddr) -> FaultProxy {
     FaultProxy { address, blackhole }
 }
 
+/// The next event that is not a heartbeat.
+fn next_change(
+    stream: &mut app_lite_protocol::client::EventStream,
+) -> Result<app_lite_protocol::SyncEvent, app_lite_protocol::TransportError> {
+    loop {
+        match stream.next_event()? {
+            app_lite_protocol::SyncEvent::Heartbeat => {}
+            event => return Ok(event),
+        }
+    }
+}
+
 #[test]
 fn the_client_follows_the_stream_and_calls_a_silent_one_dead() {
     use app_lite_protocol::SyncEvent;
@@ -286,14 +298,14 @@ fn the_client_follows_the_stream_and_calls_a_silent_one_dead() {
         .unwrap();
     assert_eq!(stream.next_event().unwrap(), SyncEvent::Hello { head: 0 });
     push_note(&running.url(), 'a');
-    assert_eq!(stream.next_event().unwrap(), SyncEvent::Changed { head: 1 });
+    assert_eq!(next_change(&mut stream).unwrap(), SyncEvent::Changed { head: 1 });
 
     proxy
         .blackhole
         .store(true, std::sync::atomic::Ordering::Release);
     push_note(&running.url(), 'b');
     let started = Instant::now();
-    let silent = stream.next_event();
+    let silent = next_change(&mut stream);
     assert!(
         matches!(silent, Err(app_lite_protocol::TransportError::Retryable(_))),
         "{silent:?} after {:?}",
@@ -335,7 +347,8 @@ fn a_stream_the_server_ends_on_schedule_says_bye() {
         .open_events_with(Duration::from_secs(1))
         .unwrap();
     assert_eq!(stream.next_event().unwrap(), SyncEvent::Hello { head: 0 });
-    assert_eq!(stream.next_event().unwrap(), SyncEvent::Bye);
+    assert_eq!(stream.next_event().unwrap(), SyncEvent::Heartbeat);
+    assert_eq!(next_change(&mut stream).unwrap(), SyncEvent::Bye);
     assert!(stream.next_event().is_err(), "closed after bye");
 }
 

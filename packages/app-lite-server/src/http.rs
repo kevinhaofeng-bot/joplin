@@ -572,7 +572,7 @@ fn stream_events(shared: &Shared, socket: &mut impl Write) -> std::io::Result<()
             seen = head;
             socket.write_all(SyncEvent::Changed { head }.to_sse().as_bytes())?;
         } else {
-            socket.write_all(b": ping\n\n")?;
+            socket.write_all(SyncEvent::Heartbeat.to_sse().as_bytes())?;
         }
         socket.flush()?;
     }

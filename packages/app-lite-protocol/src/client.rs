@@ -225,9 +225,9 @@ pub struct EventStream {
 }
 
 impl EventStream {
-    /// Blocks for the next event. Heartbeat comments only keep the stream
-    /// alive. Silence, a closed connection, or an oversized line is
-    /// `Retryable`: reconnect.
+    /// Blocks for the next event; a keep-alive comment is `Heartbeat`.
+    /// Silence, a closed connection, or an oversized line is `Retryable`:
+    /// reconnect.
     pub fn next_event(&mut self) -> Result<SyncEvent, TransportError> {
         let (mut event, mut data) = (String::new(), String::new());
         loop {
@@ -243,6 +243,9 @@ impl EventStream {
                 return Err(TransportError::Retryable("event line too long".into()));
             }
             let line = line.trim_end_matches(['\r', '\n']);
+            if line.starts_with(':') {
+                return Ok(SyncEvent::Heartbeat);
+            }
             if line.is_empty() {
                 if let Some(parsed) = SyncEvent::from_sse(&event, &data) {
                     return Ok(parsed);

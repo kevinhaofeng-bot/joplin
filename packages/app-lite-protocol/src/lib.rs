@@ -36,6 +36,8 @@ pub enum SyncEvent {
     },
     /// The server ended the stream on schedule; reconnect without backoff.
     Bye,
+    /// A keep-alive comment: the link is alive, nothing changed.
+    Heartbeat,
 }
 
 impl SyncEvent {
@@ -45,6 +47,7 @@ impl SyncEvent {
             Self::Hello { head } => format!("event: hello\ndata: {{\"head\":{head}}}\n\n"),
             Self::Changed { head } => format!("event: changed\ndata: {{\"head\":{head}}}\n\n"),
             Self::Bye => "event: bye\ndata: {}\n\n".into(),
+            Self::Heartbeat => ": ping\n\n".into(),
         }
     }
 

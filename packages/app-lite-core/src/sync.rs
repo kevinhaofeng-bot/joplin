@@ -70,6 +70,9 @@ pub fn sync_once(
         // so the server's change notification for them reads as seen.
         pull(repository, transport, &mut report)?;
     }
+    if report.retryable == 0 {
+        repository.sync_record_success()?;
+    }
     Ok(report)
 }
 

@@ -321,3 +321,54 @@ fn uploads_are_split_into_requests_a_weak_link_can_finish() {
         transport.largest.get()
     );
 }
+
+struct Unreachable;
+
+impl SyncTransport for Unreachable {
+    fn push(&self, _: &PushRequest) -> Result<PushResponse, TransportError> {
+        Err(TransportError::Retryable("no route".into()))
+    }
+    fn pull(&self, _: &PullRequest) -> Result<PullResponse, TransportError> {
+        Err(TransportError::Retryable("no route".into()))
+    }
+    fn blob_status(&self, _: &str) -> Result<BlobStatus, TransportError> {
+        Err(TransportError::Retryable("no route".into()))
+    }
+    fn put_chunk(&self, _: &str, _: u64, _: u64, _: &[u8]) -> Result<BlobStatus, TransportError> {
+        Err(TransportError::Retryable("no route".into()))
+    }
+    fn read_range(&self, _: &str, _: u64, _: u64) -> Result<Vec<u8>, TransportError> {
+        Err(TransportError::Retryable("no route".into()))
+    }
+}
+
+#[test]
+fn health_facts_track_the_oldest_waiting_change_and_the_last_successful_sync() {
+    let server_root = tempdir().unwrap();
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let root = tempdir().unwrap();
+    let repo = open(root.path());
+    repo.create_note(CreateNote {
+        title: "等待".into(),
+        notebook_id: None,
+        document: text("x"),
+    })
+    .unwrap();
+    assert!(repo.sync_oldest_pending_time().unwrap().is_some());
+    assert_eq!(repo.sync_last_success_time().unwrap(), None);
+    sync::sync_once(&repo, &Unreachable).unwrap();
+    assert_eq!(
+        repo.sync_last_success_time().unwrap(),
+        None,
+        "an unreachable server is not a success"
+    );
+    sync::sync_once(&repo, &store).unwrap();
+    assert_eq!(repo.sync_oldest_pending_time().unwrap(), None);
+    let succeeded = repo.sync_last_success_time().unwrap().expect("recorded");
+    drop(repo);
+    assert_eq!(
+        open(root.path()).sync_last_success_time().unwrap(),
+        Some(succeeded),
+        "survives a restart"
+    );
+}

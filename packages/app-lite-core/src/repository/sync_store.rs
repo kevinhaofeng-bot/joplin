@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use super::{LibraryError, LibraryRepository, NoteId};
 
 const DEVICE_ID_SETTING: &str = "sync.device_id";
+const LAST_SUCCESS_SETTING: &str = "sync.last_success_time";
 /// Kinds in dependency order: containers before the notes that reference them.
 const KINDS: [&str; 5] = ["stack", "notebook", "tag", "resource", "note"];
 
@@ -495,6 +496,47 @@ pub struct SyncApplyReport {
 struct Skip(String);
 
 impl LibraryRepository {
+    /// When the oldest local change still waiting for the server was made
+    /// (milliseconds); refused uploads, which wait for the person, excluded.
+    pub fn sync_oldest_pending_time(&self) -> Result<Option<i64>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT MIN(created_time) FROM (
+                 SELECT created_time FROM sync_outbox o
+                 WHERE NOT EXISTS (SELECT 1 FROM sync_inflight i JOIN sync_failures f ON f.op_id=i.op_id
+                                   WHERE i.entity_type=o.entity_type AND i.entity_id=o.entity_id)
+                 UNION ALL
+                 SELECT created_time FROM sync_inflight WHERE op_id NOT IN (SELECT op_id FROM sync_failures))",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// When a sync last finished with the server reachable throughout
+    /// (milliseconds); survives restarts.
+    pub fn sync_last_success_time(&self) -> Result<Option<i64>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        Ok(connection
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                [LAST_SUCCESS_SETTING],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse().ok()))
+    }
+
+    pub(crate) fn sync_record_success(&self) -> Result<(), LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let now = self.now();
+        connection.execute(
+            "INSERT INTO settings(key,value,updated_time) VALUES(?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_time=excluded.updated_time",
+            params![LAST_SUCCESS_SETTING, now.to_string(), now],
+        )?;
+        Ok(())
+    }
+
     /// Highest server cursor this library has applied.
     pub fn sync_cursor(&self) -> Result<u64, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
