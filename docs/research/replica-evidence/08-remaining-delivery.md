@@ -350,3 +350,57 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 ### 剩余 85 篇降级（只读探针）
 
 特征组合里单独出现的：外链图片 11、原始 HTML 11、行内数学 11，另有 11 篇没有标记特征（原因分布见 `/tmp/joplin-stage3-claude/fidelity-after-tables.log`）。外链图片是否联网抓取需要用户决定；行内数学在 Evernote 核心里没有对应，保持降级。
+
+## 同步、撤销合并、表格编辑（2026-09-27，`843498bc7`..`30540454f`）
+
+### 同步
+
+引擎、GUI 接线、真实规模本机演练与备份/恢复安全审查的完整证据在 `06-sync.md`（`40f9cca55`）。要点：
+
+- 演练1 `/tmp/joplin-sync-drill.verqL1/drill.log` 的版本边界：HEAD `23e9d048e` 加当时未提交的 `infra/app-lite-server/` 与 `examples/sync_drill.rs`（其后原样提交为 `b55d1d87b`），**不含** `4bc60bdb6` 的修正（当时一次同步只传 100 条，所以跑了 61 轮）。结果：5916 个实体全部被接受；备份 4127 blob；从恢复出来的服务端全新拉取 5916 条；计数相同，4153 个附件重新哈希 0 不符，笔记内容摘要相同。
+- `4bc60bdb6` 之后的演练与服务端回滚测试见 06-sync.md 同节。
+- 所有演练只在本机临时目录进行。**NAS 未部署**：需要用户在本会话明确同意，并先读 `~/servers.md`；没有改动任何生产服务。
+
+### 撤销合并（`917b711ec`）
+
+依据 Evernote 使用的 prosemirror-history `newGroupDelay` 500 ms：500 ms 内相邻的连续输入和输入法提交合为一步撤销；换位置、删除、格式、结构操作都会断开合并。
+
+### 表格编辑（`e3c5de65c`、`228dba2eb`、`30540454f`）
+
+- 双击单元格打开单元格编辑框：Enter/Tab 提交并前进，Esc 取消；增删行列、插入表格（菜单“插入表格”）。每次改动是一个 `ReplaceTable`/`InsertTable` 事务，可撤销，保存回 canonical `Block::Table`。
+- `30540454f`：单元格文字按列宽换行，行高取该行最高单元格；布局、点击命中、绘制共用一份行高估算，绘制裁剪在单元格内。新增测试 `long_table_cells_wrap_into_taller_rows_that_hit_testing_agrees_with`。
+
+表格仍有的限制：
+
+- 单元格编辑框是嵌套的完整编辑器，行内格式、链接、图片都保留；框里的标题、引用、代码块提交时变回普通行内文字（块样式丢失）；列表、表格等其他块级结构拒绝提交并提示。多个段落以换行合并。
+- 网格里的单元格只显示纯文字：行内格式不显示（打开编辑框才看得到），内容仍原样保存。
+- 单元格内图片只显示 alt 文字，不显示图片。
+- 不支持合并单元格、列宽调整、单元格对齐（canonical 本来也不表示这些）。
+- 行高是不经排版的估算（全角 14.5 px、半角 8 px）：极端字体下可能多留空白，或文字被单元格裁掉。
+- 表格显示和编辑都没有实机查看。
+
+## 最终产品验证（HEAD `30540454f`，纯净检出）
+
+做法：`git worktree add --detach /tmp/joplin-final-claude/wt-30540454f 30540454f`，独立 target 目录从零编译；检出里无未提交改动（`worktree-dirty.txt` 为空）。日志 `/tmp/joplin-final-claude/clean-30540454f/`，用后已 `git worktree remove`。
+
+| 命令（在该检出内） | 结果 | 日志 |
+| --- | --- | --- |
+| core `cargo test --offline --locked --features test-support --tests` | 退出0；382 通过、0 失败 | `core.log` |
+| server `cargo test --offline --locked` | 退出0；15 通过 | `server.log` |
+| protocol `cargo test --offline --all-features` | 退出0；0 个测试（该 crate 没有自己的测试，HTTP 客户端由 core 的 `sync_http` 覆盖）。第一次带 `--locked` 失败退出101，因为该 crate 没有自己的 Cargo.lock，属环境问题 | `protocol.log` |
+| gpui `cargo test --offline --locked --bin velotype` | 退出0；1383 通过、0 失败、1 忽略 | `gpui.log` |
+| `import_verify`：只读 JEX 副本（SHA256 `8544080e…74906f500`）→ `/tmp/joplin-final-import.t7CAGW/imports` | 退出0，92.2 s；1666/31/2/64/425/4153/4127；**降级 85**；发布 blob 4127 个重新哈希 0 不符，源 blob 缺失 0、多余 0 | `/tmp/joplin-final-import.t7CAGW/verify.log` |
+| 统计含 `data-joplin-lite-table` 的笔记 | 75 篇 | `tables.txt` |
+| 原生加载/回写审计 | 退出0；`real-copy notes=1666, failure_categories={}` | `audit.log` |
+| `scripts/package-notes-macos.sh /tmp/joplin-final-claude/dist-notes` | 退出0；`/tmp/joplin-final-claude/dist-notes/20260927T075224Z-30540454f/Joplin Lite.app`，0.7.2 (16250)，`worktree_dirty_for_app_sources: no`，binary SHA256 `25665299…f3f0069e` | `package.log` |
+| `scripts/measure-product-memory.sh`，profile 为新鲜导入库的拷贝 `/tmp/joplin-final-claude/mem-profile`（1.2 GB），3 次、每次静置 10 s | 退出0；RSS 79.9 / 70.6 / 69.2 MiB | `memory/summary.txt` |
+
+已安装的 App 和原资料库都没有被写入或替换。GPUI 编译警告 150 行，未清零。以上是本会话自测，**不是 Codex 验收**。
+
+## 仍未完成 / 需要用户或 Codex
+
+- **NAS 部署**：等待用户在本会话明确同意；部署前先读 `~/servers.md`，只用独立目录、端口和容器。
+- **实机检查**：本会话没有操作界面的工具。表格显示与编辑、同步菜单与状态、撤销合并、输入法，需要 Codex 或用户用上面的 Release 包在隔离 profile 上实机检查。
+- **同步**：没有自动/定时同步（只有“立即同步”）；没有冲突副本列表界面（冲突副本以“（冲突副本）”标题的普通笔记出现）；永久失败只在日志和 `sync_failures` 表里，没有界面。
+- **迁移**：85 篇降级，其中外链图片是否联网抓取需要用户决定；行内数学在 Evernote 核心里没有对应，保持降级。
+- 表格限制见上节。
