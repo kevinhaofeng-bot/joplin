@@ -9615,7 +9615,12 @@ async fn mounted_multi_selection_trash_is_refused_while_the_open_note_cannot_sav
                 .id
         })
         .collect();
-    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    // A manual clock: nothing typed below is saved on its own.
+    let (view, cx) = mount_shell_with_save_clock(
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
     redraw(cx);
     cx.update(|window, app| {
         view.update(app, |shell, shell_cx| {
@@ -9628,17 +9633,62 @@ async fn mounted_multi_selection_trash_is_refused_while_the_open_note_cannot_sav
         });
     });
     redraw(cx);
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("open note surface");
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input("未保存的补充");
+    redraw(cx);
+    let body = |view: &Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app))
+    };
+    assert!(
+        body(&view, cx).contains("未保存的补充"),
+        "{}",
+        body(&view, cx)
+    );
+    assert!(
+        !repository
+            .load_note(&notes[0])
+            .unwrap()
+            .unwrap()
+            .body_html
+            .contains("未保存的补充"),
+        "the edit is not saved yet"
+    );
     let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
     session.update(cx, |session, _| {
         session.force_save_failure_for_test("模拟写入失败")
     });
+
     cx.dispatch_action(TrashSelected);
     redraw(cx);
+
     assert!(
         notes.iter().all(|id| !in_trash(&repository, id)),
         "nothing trashed"
     );
     assert!(view.read_with(cx, |shell, _| shell.save_error_for_test().is_some()));
+    let retained = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    assert_eq!(
+        retained.entity_id(),
+        session.entity_id(),
+        "the same editing session is kept"
+    );
+    assert!(
+        body(&view, cx).contains("未保存的补充"),
+        "the unsaved text survives: {}",
+        body(&view, cx)
+    );
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell
+            .model
+            .read(app)
+            .navigation()
+            .selected_note_id()
+            .cloned()),
+        Some(notes[0].clone())
+    );
 }
 
 #[gpui::test]
