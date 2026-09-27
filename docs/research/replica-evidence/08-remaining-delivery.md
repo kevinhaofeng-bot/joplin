@@ -524,3 +524,70 @@ core 新增 `an_unsaved_edit_overtaken_by_a_remote_version_is_kept_as_a_conflict
 以上是本会话自测，不是 Codex 验收。没有实机点击，没有部署 NAS，没有改动生产服务、原资料库或已安装的 App。
 
 仍未完成：下载侧失败无法手动忽略，会一直列着；实机检查；NAS 部署（需要用户在本会话明确同意）；外链图片是否联网抓取（需要用户决定）；GPUI 编译警告约 150 行。
+
+## 变更推送与弱网（`82cd06ec9`..`438083ddc`）
+
+### 参照
+
+| 来源 | 位置 | 采用了什么 |
+| --- | --- | --- |
+| Evernote NSync | `66578__n-sync-event-manager.js`（`310e012c…7336`）`createSyncEventSource`、`handleErrorEvent`；`59030__module-59030.js`（`c76c71df…b0`） | 用 Server-Sent Events 长连接（`/v1/connect`，Bearer）；重连带上次位置，回退 60 s 重放；退避 3/15/15/15/30/60 s 加 ≤1 s 抖动；401/403 走认证错误；暂停 60 s 后断开 |
+| yuchbox | github.com/yuchting/yuchbox `c4e3d7c8`：`fetchMgr.java` 395–482、640–660，`fetchEmail.java` 1099–1122、1663–1712，客户端 `recvMain.java` 280–282 | 客户端发起 TLS 长连接，认证限时 10 s；可配置心跳（1/3/5/10/30 min）；推送后逐条确认，没确认的按 3 min×次数重发，发满 10 次放弃 |
+| 用户的 stego-reader | `custom-protocol-tui` 分支 `572c12d9`：`server/tcp.js`、`docs/superpowers/specs/2026-06-24-matrix-removal-tcp-receipts-design.md`、`plans/2026-07-12-ios-connection-stability.md`、`specs/2026-07-20-delivery-receipt-hms-fallback-design.md`、`specs/2026-07-25-stego-zero-operation-reliability-design.md` | 半开连接检测（客户端 60 s PING、120 s 无 PONG 断开；服务端空闲 180 s 发 PING、300 s 销毁）；连接 10 s 和认证 10–15 s 超时；3→5→10→30→60 s 退避，只在认证成功后重置，认证失败停止重连；用代次防止同时存在两条连接；“连接在不代表送到了”；弱网帧 gzip |
+
+本项目的取舍：推送只发“服务端最新游标变了”的**提示**，不带数据。数据仍走按游标的拉取（重复执行无副作用，服务端确认后才算同步）。所以丢失一条通知只影响延迟，不影响正确性，不需要 yuchbox 的逐条确认重发，也不需要 Evernote 的回退重放。
+
+### 实现
+
+- 协议 `82cd06ec9`：`GET /v1/events`。流程是 `hello{head}`，然后每次有变更发 `changed{head}`；空闲时每 25 s 发一行注释心跳；300 s 后发 `bye` 并关闭。
+- 服务端 `82cd06ec9`：
+  - 对照实验发现 tiny_http 没有单连接超时：4 个工作线程时，6 个在上传中途失联的客户端让服务端 120 s 无响应（`/tmp/joplin-final-claude/push/socket-timeout-red.log` 记录同类结论）。
+  - 实测 macOS 上 accept 出来的连接**不继承**监听 socket 的超时，Linux 行为不同，不能依赖。
+  - 因此改为自己的最小 HTTP/1.1 实现：每个连接读写超时 60 s；最多 64 个连接、32 条推送流；每个连接只处理一个请求；关闭前有上限地读掉剩余请求体，保证超大请求仍能读到 413；只接受带 Content-Length 的请求体。tiny_http 依赖已移除。
+- 客户端推送流 `867bf57c2`：每次读取的超时为 2.5 个心跳（62 s），静默超过就判定为死连接。用“黑洞”代理（不关连接、不再转发任何字节）验证能判定。
+- 游标 `78582275c`：上传有被接受的内容时，末尾再拉取一次，把游标推进到服务端最新位置。自己上传引起的通知因此不再触发多余的同步；自己的变更在拉取时跳过，不计入下载数。
+- 界面连接控制器 `8a665831b`：
+  - 同一时间只有一条连接，靠代次区分，旧的读取线程会自行退出。
+  - `hello` 必须在 15 s 内到达；退避 3/5/10/30/60 s，从第二次起加 ≤1 s 抖动，只在收到 `hello` 后重置；收到 `bye` 立即重连；401 暂停自动同步；手动同步会跳过退避等待。
+  - 只有服务端宣布的游标不等于本地游标时才同步；每 5 分钟的拉取保留作兜底。
+  - 同步面板显示连接状态。
+- 上传批量 `438083ddc`：从 3 MiB 降到 1 MiB。3 MiB 在约 20 KB/s 的弱网上要约 150 s，超过客户端 120 s 超时，这一批会永远重发；1 MiB 约 50 s。
+
+### 测试与对照
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| server `cargo test --offline` | 退出0；20 通过（新增 `tests/events.rs` 5 条，其中 2 条走故障代理） | `/tmp/joplin-final-claude/push/server-green.log` |
+| 对照：socket 超时改为 60 s | 卡住的连接占满名额，新请求得不到服务，测试失败 | `socket-timeout-red.log` |
+| core `--features test-support --tests` | 退出0；387 通过 | — |
+| 对照：批量恢复为 3 MiB | 最大请求 2 462 866 字节，测试失败 | `batch-red.log` |
+| gpui `--bin velotype` | 退出0；1392 通过、1 忽略；同步挂载测试连续 5 次通过 | `gpui.log` |
+
+新增的挂载测试（本机真实服务端，测试时钟快进）：
+
+- 另一台设备的修改靠通知在测试时钟不动的情况下到达；没有变化时 60 s 内不同步；5 分钟定时拉取仍在。
+- 收到 `bye` 后立即重连；服务端消失后在 3 s、5 s（加抖动）时重连。
+- 服务端连上 TCP 但不回 `hello`：14 s 时仍在连接中，15 s 时放弃，再过 3 s 重试。
+- 另有退避序列的单元测试。
+
+### Release 二进制本机演练（`438083ddc`，工作树无未提交改动）
+
+脚本 `/tmp/joplin-final-claude/push/drill.sh`，目录 `/tmp/joplin-push-drill.*`（见 `drill-dir.txt`）。服务端是 Release 版 `app-lite-server`，监听随机本机端口；用 `curl -N` 挂住推送流。
+
+| 步骤 | 结果 |
+| --- | --- |
+| A（新鲜导入库的拷贝）上传 | 4 轮，110.7 s；接受 5916 个实体；附件重新算哈希 4153 个、0 不符 |
+| 推送流 | `hello {"head":0}`，60 条 `changed`，最后一条 `{"head":5916}` |
+| B（全新空库）拉取 | 42.5 s，拉到 5916 个；计数与 A 相同；附件重新算哈希 0 不符；笔记内容摘要相同 `6b9bba86…1cdf` |
+| 不带令牌访问 `/v1/events` | 401 |
+| 服务端重启后空闲 55 s | `hello {"head":5916}`，之后 2 条 `: ping` |
+
+### 仍未做
+
+- 请求和响应的 gzip 压缩。
+- 没有监听 Mac 睡眠唤醒和网络切换来立即重连；目前靠 62 s 静默判定加退避。
+- 反向代理（Caddy 或 NAS 自带）下的实测，需要在 NAS 部署时做；服务端已发 `X-Accel-Buffering: no`。
+- 客户端目前只支持明文 HTTP（ureq 未启用 TLS），公网访问要靠反向代理终止 TLS。
+- 移动端的厂商推送（HMS/APNs）兜底，桌面端不需要。
+
+以上是本会话自测，不是 Codex 验收。没有部署 NAS，没有改动生产服务、原资料库或已安装的 App。
