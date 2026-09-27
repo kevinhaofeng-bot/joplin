@@ -246,3 +246,40 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 | `cargo test --manifest-path packages/app-lite-server/Cargo.toml --offline` | 退出0；10 通过 | `server.log` |
 
 编译警告仍存在（GUI 测试构建输出 150 行 `warning`），未清零。临时检出用后已 `git worktree remove`。这是本会话自测，不代替 Codex 验收。
+
+## GPUI 侧（负责 `app-lite-gpui` 的会话）：实机发现、H4–H6、有序列表起始号
+
+### 提交
+
+| 提交 | 作用 | 先失败证据 |
+| --- | --- | --- |
+| `d3127d4d3` | 空列表项回车：嵌套项先减少缩进，顶层项变回段落，整个动作一步可撤销（对应 Evernote `list/keymap.ts` handleEnter）；图片缩放后保持选中；Cmd-N 后可直接输入标题 | `enter_on_an_empty_list_item_outdents_or_leaves_the_list`、`typing_right_after_cmd_n_goes_into_the_new_notes_title` |
+| `24d5a632c` | 列表项缩进可保存（见上方 A） | `indented_list_items_save_as_canonical_indent_and_reopen_at_their_depth` 等 2 条，失败原因为 `UnsupportedListDepth` |
+| `ef8517cf1` | 图片链接（见上方 B） | 变异核验：把 link 固定为 None，两条往返测试失败 |
+| `dd13ee9fc` | 可读导出/恢复的菜单入口；恢复失败会删除新建的空目录 | 两条挂载测试，未实现时编译即失败 |
+| `c1275c5ea` | canonical `HeadingLevel::{Four,Five,Six}`，原生可保存 4–6 级标题 | `h4_to_h6_round_trip_as_headings`（编译失败）、`h4_to_h6_open_as_native_headings_and_save_unchanged`（`UnsupportedBlockKind Heading(4)`） |
+| `27878ea83` | `Block::List.start`：只在有序列表且 ≠1 时存在，旧正文逐字不变；相邻列表只有后者没有 start 时才合并；原生侧用 Document 侧表（键为首项 NodeId）记录，全量与增量编号共用 `numbering_kind_for`，导出时在该项处新开列表 | codec 测试断言起始号往返失败；core 测试做变异核验 |
+
+测试调整：有两条"保存失败要可见"的测试原本拿"缩进列表"和"4 级标题"当作无法保存的结构。这两者现在都能保存了，所以改为插入一张不属于本笔记的图片（`MissingResource`）来触发失败，被测的失败路径不变。
+
+### 实机检查（Release 包，隔离 profile `/tmp/joplin-lite-accept-0927/profile`）
+
+- 编辑器工具栏"更多"曾经点不开。排查结论：Claude 桌面窗口叠在 Joplin 窗口右侧，点击落到了 Claude 窗口上（computer-use 截图会隐藏 Claude 自身窗口）。把 Joplin 窗口挪开后，"更多"正常弹出；选中图片时列表和对齐项正确置灰。不是产品缺陷，未改代码。
+- 仍未关闭的 GUI 问题：D2 输入撤销按字粒度；D5 退出列表后再输入会多出空段落（出现过，还没有分步复现）；缩放手柄在右边缘被裁掉一半；列表标记在左边缘被裁切。
+- 还没做的实机项：真实拼音 IME 全矩阵、附件卡片与 Quick Look、中文搜索 UI、批量组织、菜单导入/备份/恢复（含新增的可读导出）、重启后复查。
+
+### 偶发测试
+
+- `ui::index_scheduler_tests::mounted_scheduler_close_finishes_only_active_index_transaction`：高负载下全套运行时卡死一次（测试 hook 里的 `recv()` 没有超时），卡了约 9 分钟后手动结束；单独运行 3/3 通过，重跑全套通过。
+- `ui::index_scheduler_tests::mounted_scheduler_advances_a_derived_job_saved_after_open`：全套运行中失败一次（Pending ≠ Failed），单独运行 3/3 通过。
+- 两者都与本节改动无关，未修改，只记录。
+
+### 命令与结果（HEAD `27878ea83`，工作树内，非纯净检出）
+
+- `cargo test --offline --bin velotype`（`packages/app-lite-gpui`）：1370 通过、0 失败、1 忽略。
+- `cargo test --offline --features test-support`（`packages/app-lite-core`）：358 通过、0 失败。
+- 两个 crate 的 `cargo fmt --check` 均通过。
+
+- 表格：方案草案在 `docs/research/table-model-proposal.md`，等迁移侧确认后再实施。
+- Claude 实施状态：以上提交待验收；实机矩阵未完成
+- Codex 验收状态：未验收
