@@ -5,8 +5,8 @@
 //! policy are this project's own design.
 
 use app_lite_protocol::{
-    Action, EntityKind, EntityRef, MAX_PUSH_OPS, OpResult, Operation, PROTOCOL_VERSION,
-    PushRequest, SyncTransport, TransportError,
+    Action, EntityKind, EntityRef, MAX_PULL_LIMIT, MAX_PUSH_OPS, OpResult, Operation,
+    PROTOCOL_VERSION, PullRequest, PushRequest, SyncTransport, TransportError,
 };
 
 use crate::{LibraryError, LibraryRepository, SyncFailure};
@@ -17,6 +17,10 @@ const MAX_PUSH_BATCH_BYTES: usize = 3 * 1024 * 1024;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncReport {
     pub accepted: usize,
+    /// Remote changes applied locally.
+    pub pulled: usize,
+    /// Remote changes skipped as malformed; listed by `sync_failures`.
+    pub skipped: usize,
     pub conflicts: usize,
     /// Operations still waiting because the server or network was unavailable.
     pub retryable: usize,
@@ -33,14 +37,78 @@ pub enum SyncError {
     Rejected(String),
 }
 
-/// One upload pass. Transport failures that may succeed later are counted as
-/// `retryable` and leave every in-flight op to be resent unchanged.
+/// One sync pass: download, then upload. An upload conflict triggers another
+/// download (which turns the local edit into a conflict copy) and an upload
+/// of that copy. Transport failures that may succeed later are counted as
+/// `retryable`; every in-flight op is then resent unchanged next time.
 pub fn sync_once(
     repository: &LibraryRepository,
     transport: &dyn SyncTransport,
 ) -> Result<SyncReport, SyncError> {
     let device_id = repository.sync_device_id()?;
     let mut report = SyncReport::default();
+    if !pull(repository, transport, &mut report)? {
+        return Ok(report);
+    }
+    let conflicts = report.conflicts;
+    push(repository, transport, &device_id, &mut report)?;
+    if report.conflicts > conflicts && pull(repository, transport, &mut report)? {
+        push(repository, transport, &device_id, &mut report)?;
+    }
+    Ok(report)
+}
+
+/// Returns false when the server was unreachable.
+fn pull(
+    repository: &LibraryRepository,
+    transport: &dyn SyncTransport,
+    report: &mut SyncReport,
+) -> Result<bool, SyncError> {
+    loop {
+        let request = PullRequest {
+            protocol: PROTOCOL_VERSION,
+            cursor: repository.sync_cursor()?,
+            limit: MAX_PULL_LIMIT,
+        };
+        let response = match transport.pull(&request) {
+            Ok(response) => response,
+            Err(TransportError::Retryable(_)) => {
+                report.retryable += 1;
+                return Ok(false);
+            }
+            Err(error) => return Err(fatal(error)),
+        };
+        if response.next_cursor < request.cursor {
+            return Err(SyncError::Rejected("server cursor moved backwards".into()));
+        }
+        let applied = repository.sync_apply_page(&response.changes, response.next_cursor)?;
+        report.pulled += applied.applied;
+        report.skipped += applied.skipped;
+        report.conflicts += applied.conflicts;
+        if !response.has_more {
+            return Ok(true);
+        }
+    }
+}
+
+fn fatal(error: TransportError) -> SyncError {
+    match error {
+        TransportError::Unauthorized => SyncError::Unauthorized,
+        TransportError::Permanent(reason) => SyncError::Rejected(reason),
+        TransportError::Retryable(reason) => SyncError::Rejected(reason),
+        TransportError::OffsetMismatch { .. } => {
+            SyncError::Rejected("unexpected upload response".into())
+        }
+    }
+}
+
+fn push(
+    repository: &LibraryRepository,
+    transport: &dyn SyncTransport,
+    device_id: &str,
+    report: &mut SyncReport,
+) -> Result<(), SyncError> {
+    let device_id = device_id.to_owned();
     let inflight = repository.sync_prepare_inflight(MAX_PUSH_OPS)?;
     for batch in batches(&inflight) {
         let ops = batch
@@ -58,11 +126,7 @@ pub fn sync_once(
                 report.retryable += batch.len();
                 continue;
             }
-            Err(TransportError::Unauthorized) => return Err(SyncError::Unauthorized),
-            Err(TransportError::Permanent(reason)) => return Err(SyncError::Rejected(reason)),
-            Err(TransportError::OffsetMismatch { .. }) => {
-                return Err(SyncError::Rejected("unexpected upload response".into()));
-            }
+            Err(error) => return Err(fatal(error)),
         };
         if response.results.len() != batch.len() {
             return Err(SyncError::Rejected("push result count differs".into()));
@@ -75,11 +139,8 @@ pub fn sync_once(
                     repository.sync_record_accepted(&op_id, revision)?;
                     report.accepted += 1;
                 }
-                OpResult::Conflict { op_id, .. } => {
-                    // Resolution arrives with the download half; keep the op.
-                    repository.sync_record_permanent(&op_id, "conflict pending resolution")?;
-                    report.conflicts += 1;
-                }
+                // The next download resolves it (conflict copy, remote wins).
+                OpResult::Conflict { .. } => report.conflicts += 1,
                 OpResult::Retryable { .. } => report.retryable += 1,
                 OpResult::Permanent { op_id, reason } => {
                     repository.sync_record_permanent(&op_id, &reason)?;
@@ -88,7 +149,7 @@ pub fn sync_once(
             }
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 pub fn sync_failures(repository: &LibraryRepository) -> Result<Vec<SyncFailure>, LibraryError> {

@@ -333,3 +333,551 @@ fn column(transaction: &Transaction<'_>, sql: &str, id: &str) -> Result<Vec<Stri
     let rows = statement.query_map([id], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
+
+const CURSOR_NAME: &str = "server";
+const CONFLICT_SUFFIX: &str = "（冲突副本）";
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncApplyReport {
+    pub applied: usize,
+    pub conflicts: usize,
+    pub skipped: usize,
+}
+
+/// Why one remote change was not applied; recorded as a visible failure.
+struct Skip(String);
+
+impl LibraryRepository {
+    pub(crate) fn sync_cursor(&self) -> Result<u64, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let cursor: Option<String> = connection
+            .query_row(
+                "SELECT cursor FROM sync_cursor WHERE name=?1",
+                [CURSOR_NAME],
+                |row| row.get(0),
+            )
+            .optional()?;
+        cursor
+            .map(|value| value.parse().map_err(|_| LibraryError::InvalidSnapshot))
+            .unwrap_or(Ok(0))
+    }
+
+    /// Applies one pulled page and advances the cursor in the same
+    /// transaction. Remote changes never produce outbox rows (no echo).
+    pub(crate) fn sync_apply_page(
+        &self,
+        changes: &[app_lite_protocol::Change],
+        next_cursor: u64,
+    ) -> Result<SyncApplyReport, LibraryError> {
+        let now = self.now();
+        let mut report = SyncApplyReport::default();
+        let mut touched_notes = Vec::new();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for change in changes {
+            let kind = change.entity.kind.as_str();
+            let id = change.entity.id.as_str();
+            if !app_lite_protocol::valid_id(id) {
+                continue;
+            }
+            let known: i64 = transaction
+                .query_row(
+                    "SELECT server_revision FROM sync_entities WHERE entity_type=?1 AND entity_id=?2",
+                    params![kind, id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if known >= change.revision as i64 {
+                continue;
+            }
+            let inflight_op: Option<String> = transaction
+                .query_row(
+                    "SELECT op_id FROM sync_inflight WHERE entity_type=?1 AND entity_id=?2",
+                    params![kind, id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if inflight_op.as_deref() == Some(change.op_id.as_str()) {
+                // Our own op whose Accepted response was lost.
+                accept_inflight(&transaction, &change.op_id, kind, id, change.revision)?;
+                continue;
+            }
+            let pending = inflight_op.is_some()
+                || transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sync_outbox WHERE entity_type=?1 AND entity_id=?2)",
+                    params![kind, id],
+                    |row| row.get::<_, i64>(0),
+                )? != 0;
+            let outcome = match kind {
+                "note" => self.apply_remote_note(&transaction, id, change, pending, now),
+                "notebook" => apply_remote_notebook(&transaction, id, change, now),
+                "stack" | "tag" => apply_remote_container(&transaction, kind, id, change, now),
+                _ => Ok(Err(Skip(format!("{kind} changes are not applied yet")))),
+            };
+            match outcome? {
+                Ok(conflict) => {
+                    report.applied += 1;
+                    if pending {
+                        // Remote wins the entity; a local note edit survives
+                        // as its conflict copy, other kinds lose the edit.
+                        drop_pending(&transaction, kind, id)?;
+                        report.conflicts += usize::from(conflict || kind != "note");
+                    }
+                    if kind == "note" {
+                        touched_notes.push(id.to_owned());
+                    }
+                }
+                Err(Skip(reason)) => {
+                    report.skipped += 1;
+                    transaction.execute(
+                        "INSERT INTO sync_failures(op_id,entity_type,entity_id,reason,updated_time) VALUES(?1,?2,?3,?4,?5)
+                         ON CONFLICT(op_id) DO UPDATE SET reason=excluded.reason, updated_time=excluded.updated_time",
+                        params![change.op_id, kind, id, reason, now],
+                    )?;
+                }
+            }
+            transaction.execute(
+                "INSERT INTO sync_entities(entity_type,entity_id,server_revision) VALUES(?1,?2,?3)
+                 ON CONFLICT(entity_type,entity_id) DO UPDATE SET server_revision=excluded.server_revision",
+                params![kind, id, change.revision as i64],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO sync_cursor(name,cursor,updated_time) VALUES(?1,?2,?3)
+             ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor, updated_time=excluded.updated_time",
+            params![CURSOR_NAME, next_cursor.to_string(), now],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        if report.applied > 0 {
+            let mut events = vec![super::LibraryEvent::OrganizationChanged];
+            for id in touched_notes {
+                if let Ok(id) = NoteId::parse(&id) {
+                    events.push(super::LibraryEvent::NoteProjectionChanged(id.clone()));
+                    events.push(super::LibraryEvent::SearchProjectionQueued(id));
+                }
+            }
+            self.publish(events);
+        }
+        Ok(report)
+    }
+
+    /// Ok(true) when a local edit was kept as a conflict copy.
+    fn apply_remote_note(
+        &self,
+        transaction: &Transaction<'_>,
+        id: &str,
+        change: &app_lite_protocol::Change,
+        pending: bool,
+        now: i64,
+    ) -> Result<Result<bool, Skip>, LibraryError> {
+        let note_id = NoteId::parse(id).map_err(|_| LibraryError::InvalidId)?;
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1)",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        let remote = match (&change.deleted, &change.payload) {
+            (false, Some(payload)) => match RemoteNote::parse(transaction, payload)? {
+                Ok(note) => Some(note),
+                Err(skip) => return Ok(Err(skip)),
+            },
+            (true, _) => None,
+            (false, None) => return Ok(Err(Skip("note change without payload".into()))),
+        };
+        let copied = pending && exists;
+        if copied {
+            self.conflict_copy(transaction, &note_id, change.revision, now)?;
+        }
+        match remote {
+            Some(note) => {
+                note.write(transaction, &note_id, now)?;
+            }
+            None if exists => {
+                transaction.execute(
+                    "INSERT INTO tombstones (entity_type, entity_id, final_revision, deleted_time, purged_time)
+                     SELECT 'note', id, revision + 1, CASE WHEN deleted_time = 0 THEN ?2 ELSE deleted_time END, ?2 FROM notes WHERE id = ?1",
+                    params![id, now],
+                )?;
+                transaction.execute("DELETE FROM note_revisions WHERE note_id=?1", [id])?;
+                transaction.execute("DELETE FROM notes WHERE id=?1", [id])?;
+                super::queue_search(transaction, &note_id, now, "remote-purge")?;
+            }
+            None => {}
+        }
+        Ok(Ok(copied))
+    }
+
+    /// The local version becomes a new note (uploaded like any new note) so
+    /// that adopting the remote version loses nothing.
+    fn conflict_copy(
+        &self,
+        transaction: &Transaction<'_>,
+        original: &NoteId,
+        remote_revision: u64,
+        now: i64,
+    ) -> Result<(), LibraryError> {
+        let copy = NoteId::parse(self.allocate_id(transaction, "notes")?)
+            .map_err(|_| LibraryError::InvalidId)?;
+        let local_revision: i64 = transaction.query_row(
+            "SELECT revision FROM notes WHERE id=?1",
+            [original.as_str()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO notes (id,title,body_html,body_text,snippet,notebook_id,created_time,updated_time,deleted_time,revision)
+             SELECT ?2, title || ?3, body_html, body_text, snippet, notebook_id, ?4, ?4, 0, 1 FROM notes WHERE id=?1",
+            params![original.as_str(), copy.as_str(), CONFLICT_SUFFIX, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO note_tags (note_id, tag_id, position) SELECT ?2, tag_id, position FROM note_tags WHERE note_id=?1",
+            params![original.as_str(), copy.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO note_resources (note_id, position, resource_id, is_associated)
+             SELECT ?2, position, resource_id, 1 FROM note_resources WHERE note_id=?1 AND is_associated=1",
+            params![original.as_str(), copy.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO note_revisions (note_id, revision, title, body_html, body_text, created_time)
+             SELECT id, revision, title, body_html, body_text, updated_time FROM notes WHERE id=?1",
+            [copy.as_str()],
+        )?;
+        super::queue_search(transaction, &copy, now, "conflict-copy")?;
+        super::queue_derived_text_for_note(transaction, &copy, now)?;
+        super::enqueue_sync(
+            transaction,
+            self.id_source.as_ref(),
+            &crate::EntityRef::Note(copy.clone()),
+            1,
+            "create",
+            now,
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_conflicts (id, entity_id, local_revision, remote_revision, created_time) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![copy.as_str(), original.as_str(), local_revision, remote_revision as i64, now],
+        )?;
+        Ok(())
+    }
+}
+
+/// A validated remote note body and its relations.
+struct RemoteNote {
+    title: String,
+    body_html: String,
+    body_text: String,
+    notebook_id: String,
+    tag_ids: Vec<String>,
+    resource_ids: Vec<crate::ResourceId>,
+    created_time: i64,
+    updated_time: i64,
+    deleted_time: i64,
+}
+
+impl RemoteNote {
+    fn parse(
+        transaction: &Transaction<'_>,
+        payload: &Value,
+    ) -> Result<Result<Self, Skip>, LibraryError> {
+        let text = |key: &str| payload.get(key).and_then(Value::as_str);
+        let number = |key: &str| payload.get(key).and_then(Value::as_i64);
+        let ids = |key: &str| -> Option<Vec<String>> {
+            payload
+                .get(key)?
+                .as_array()?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|id| app_lite_protocol::valid_id(id))
+                        .map(str::to_owned)
+                })
+                .collect()
+        };
+        let (Some(title), Some(body_html), Some(notebook_id), Some(tag_ids), Some(resource_ids)) = (
+            text("title"),
+            text("body_html"),
+            text("notebook_id"),
+            ids("tag_ids"),
+            ids("resource_ids"),
+        ) else {
+            return Ok(Err(Skip("note payload is incomplete".into())));
+        };
+        let Ok(document) = crate::CanonicalDocument::parse_html(body_html) else {
+            return Ok(Err(Skip("note body is not valid HTML".into())));
+        };
+        if document.to_canonical_html().as_str() != body_html {
+            return Ok(Err(Skip("note body is not canonical".into())));
+        }
+        let declared_resources = resource_ids;
+        let resource_ids: Vec<crate::ResourceId> = document.resource_ids();
+        if resource_ids
+            .iter()
+            .map(crate::ResourceId::as_str)
+            .ne(declared_resources.iter().map(String::as_str))
+        {
+            return Ok(Err(Skip("note resources differ from its body".into())));
+        }
+        for resource in &resource_ids {
+            let present: i64 = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE id=?1)",
+                [resource.as_str()],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                return Ok(Err(Skip(format!(
+                    "attachment {} is not available",
+                    resource.as_str()
+                ))));
+            }
+        }
+        let notebook_exists: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notebooks WHERE id=?1 AND deleted_time=0)",
+            [notebook_id],
+            |row| row.get(0),
+        )?;
+        let notebook_id = if notebook_exists != 0 {
+            notebook_id.to_owned()
+        } else {
+            transaction.query_row(
+                "SELECT id FROM notebooks WHERE is_default=1 AND deleted_time=0 ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        let mut known_tags = Vec::new();
+        for tag in tag_ids {
+            let present: i64 = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE id=?1 AND deleted_time=0)",
+                [&tag],
+                |row| row.get(0),
+            )?;
+            if present != 0 {
+                known_tags.push(tag);
+            }
+        }
+        Ok(Ok(Self {
+            title: title.chars().take(1024).collect(),
+            body_html: body_html.to_owned(),
+            body_text: document.search_text().as_str().to_owned(),
+            notebook_id,
+            tag_ids: known_tags,
+            resource_ids,
+            created_time: number("created_time").unwrap_or(0),
+            updated_time: number("updated_time").unwrap_or(0),
+            deleted_time: number("deleted_time").unwrap_or(0),
+        }))
+    }
+
+    fn write(
+        &self,
+        transaction: &Transaction<'_>,
+        id: &NoteId,
+        now: i64,
+    ) -> Result<(), LibraryError> {
+        let snippet = super::snippet(&self.body_text);
+        // A remote edit may revive a note purged here (delete versus edit).
+        transaction.execute(
+            "DELETE FROM tombstones WHERE entity_type='note' AND entity_id=?1",
+            [id.as_str()],
+        )?;
+        transaction.execute(
+            "INSERT INTO notes (id,title,body_html,body_text,snippet,notebook_id,created_time,updated_time,deleted_time,revision)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1)
+             ON CONFLICT(id) DO UPDATE SET title=excluded.title, body_html=excluded.body_html,
+               body_text=excluded.body_text, snippet=excluded.snippet, notebook_id=excluded.notebook_id,
+               created_time=excluded.created_time, updated_time=excluded.updated_time,
+               deleted_time=excluded.deleted_time, revision=notes.revision+1",
+            params![
+                id.as_str(),
+                self.title,
+                self.body_html,
+                self.body_text,
+                snippet,
+                self.notebook_id,
+                self.created_time,
+                self.updated_time,
+                self.deleted_time
+            ],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO note_revisions (note_id, revision, title, body_html, body_text, created_time)
+             SELECT id, revision, title, body_html, body_text, ?2 FROM notes WHERE id=?1",
+            params![id.as_str(), now],
+        )?;
+        transaction.execute("DELETE FROM note_tags WHERE note_id=?1", [id.as_str()])?;
+        for (position, tag) in self.tag_ids.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO note_tags (note_id, tag_id, position) VALUES (?1, ?2, ?3)",
+                params![id.as_str(), tag, position as i64],
+            )?;
+        }
+        super::replace_note_resources(transaction, id, &self.resource_ids)?;
+        transaction.execute(
+            "UPDATE notes SET selected_thumbnail_id=NULL WHERE id=?1 AND selected_thumbnail_id IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM note_resources WHERE note_id=?1 AND resource_id=notes.selected_thumbnail_id AND is_associated=1)",
+            [id.as_str()],
+        )?;
+        super::queue_search(transaction, id, now, "remote")?;
+        super::queue_derived_text_for_note(transaction, id, now)?;
+        Ok(())
+    }
+}
+
+fn remote_title(change: &app_lite_protocol::Change) -> Result<String, Skip> {
+    change
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty() && title.chars().count() <= 255)
+        .map(str::to_owned)
+        .ok_or_else(|| Skip("title is missing or invalid".into()))
+}
+
+fn apply_remote_container(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    id: &str,
+    change: &app_lite_protocol::Change,
+    now: i64,
+) -> Result<Result<bool, Skip>, LibraryError> {
+    let table = if kind == "stack" { "stacks" } else { "tags" };
+    if change.deleted {
+        transaction.execute(&format!("DELETE FROM {table} WHERE id=?1"), [id])?;
+        return Ok(Ok(false));
+    }
+    let title = match remote_title(change) {
+        Ok(title) => title,
+        Err(skip) => return Ok(Err(skip)),
+    };
+    transaction.execute(
+        &format!(
+            "INSERT INTO {table} (id,title,revision,created_time,updated_time,deleted_time) VALUES (?1,?2,1,?3,?3,0)
+             ON CONFLICT(id) DO UPDATE SET title=excluded.title, updated_time=excluded.updated_time,
+               deleted_time=0, revision={table}.revision+1"
+        ),
+        params![id, title, now],
+    )?;
+    Ok(Ok(false))
+}
+
+fn apply_remote_notebook(
+    transaction: &Transaction<'_>,
+    id: &str,
+    change: &app_lite_protocol::Change,
+    now: i64,
+) -> Result<Result<bool, Skip>, LibraryError> {
+    let local_default: String = transaction.query_row(
+        "SELECT id FROM notebooks WHERE is_default=1 AND deleted_time=0 ORDER BY id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if change.deleted {
+        if id != local_default {
+            transaction.execute(
+                "UPDATE notes SET notebook_id=?2 WHERE notebook_id=?1",
+                params![id, local_default],
+            )?;
+            transaction.execute("DELETE FROM notebooks WHERE id=?1 AND is_default=0", [id])?;
+        }
+        return Ok(Ok(false));
+    }
+    let title = match remote_title(change) {
+        Ok(title) => title,
+        Err(skip) => return Ok(Err(skip)),
+    };
+    let payload = change
+        .payload
+        .as_ref()
+        .expect("title came from the payload");
+    let stack_id = payload
+        .get("stack_id")
+        .and_then(Value::as_str)
+        .filter(|stack| {
+            transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM stacks WHERE id=?1 AND deleted_time=0)",
+                    [stack],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok_and(|exists| exists != 0)
+        });
+    let remote_default = payload.get("is_default").and_then(Value::as_bool) == Some(true);
+    if remote_default && id != local_default {
+        // A fresh device joining a library: its untouched default notebook
+        // becomes the library's, so both devices share one default.
+        let untouched: i64 = transaction.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM notes WHERE notebook_id=?1)
+                AND NOT EXISTS(SELECT 1 FROM sync_entities WHERE entity_type='notebook' AND entity_id=?1)",
+            [&local_default],
+            |row| row.get(0),
+        )?;
+        if untouched != 0 {
+            transaction.execute(
+                "DELETE FROM sync_inflight WHERE entity_type='notebook' AND entity_id=?1",
+                [&local_default],
+            )?;
+            transaction.execute(
+                "DELETE FROM sync_outbox WHERE entity_type='notebook' AND entity_id=?1",
+                [&local_default],
+            )?;
+            transaction.execute(
+                "UPDATE notebooks SET id=?2, title=?3, stack_id=?4, updated_time=?5 WHERE id=?1",
+                params![local_default, id, title, stack_id, now],
+            )?;
+            return Ok(Ok(false));
+        }
+    }
+    transaction.execute(
+        "INSERT INTO notebooks (id,title,stack_id,is_default,revision,created_time,updated_time,deleted_time)
+         VALUES (?1,?2,?3,0,1,?4,?4,0)
+         ON CONFLICT(id) DO UPDATE SET title=excluded.title, stack_id=excluded.stack_id,
+           updated_time=excluded.updated_time, deleted_time=0, revision=notebooks.revision+1",
+        params![id, title, stack_id, now],
+    )?;
+    Ok(Ok(false))
+}
+
+fn accept_inflight(
+    transaction: &Transaction<'_>,
+    op_id: &str,
+    kind: &str,
+    id: &str,
+    revision: u64,
+) -> Result<(), LibraryError> {
+    let outbox: String = transaction.query_row(
+        "SELECT outbox_ids_json FROM sync_inflight WHERE op_id=?1",
+        [op_id],
+        |row| row.get(0),
+    )?;
+    let outbox: Vec<String> =
+        serde_json::from_str(&outbox).map_err(|_| LibraryError::InvalidSnapshot)?;
+    delete_outbox(transaction, &outbox)?;
+    transaction.execute("DELETE FROM sync_inflight WHERE op_id=?1", [op_id])?;
+    transaction.execute("DELETE FROM sync_failures WHERE op_id=?1", [op_id])?;
+    transaction.execute(
+        "INSERT INTO sync_entities(entity_type,entity_id,server_revision) VALUES(?1,?2,?3)
+         ON CONFLICT(entity_type,entity_id) DO UPDATE SET server_revision=excluded.server_revision",
+        params![kind, id, revision as i64],
+    )?;
+    Ok(())
+}
+
+fn drop_pending(transaction: &Transaction<'_>, kind: &str, id: &str) -> Result<(), LibraryError> {
+    transaction.execute(
+        "DELETE FROM sync_failures WHERE op_id IN (SELECT op_id FROM sync_inflight WHERE entity_type=?1 AND entity_id=?2)",
+        params![kind, id],
+    )?;
+    transaction.execute(
+        "DELETE FROM sync_inflight WHERE entity_type=?1 AND entity_id=?2",
+        params![kind, id],
+    )?;
+    transaction.execute(
+        "DELETE FROM sync_outbox WHERE entity_type=?1 AND entity_id=?2",
+        params![kind, id],
+    )?;
+    Ok(())
+}
