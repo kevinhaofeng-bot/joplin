@@ -22,19 +22,20 @@
 
 ## 2. 客户端引擎（`app-lite-core`，不含网络依赖）
 
-新增 schema v11，只做加法：
+新增 schema v11，只做加法（三张新表，已有表不变）：
 - `sync_entities(entity_type, entity_id, server_revision, PRIMARY KEY(entity_type, entity_id))`：记录每个实体最后一次已知的服务端修订号，作为 `base_revision`。本地的 `revision` 和服务端修订号是两套独立编号，不能混用。
-- `sync_failures(op_id PRIMARY KEY, reason, updated_time)`：记录永久失败的原因，供状态栏显示。
+- `sync_inflight(entity_type, entity_id, op_id, base_revision, action_json, outbox_ids_json, created_time, PRIMARY KEY(entity_type, entity_id))`：每个实体至多一条“在途操作”，在发送之前落盘。响应丢失后原样重发同一个 op_id 和同一份 payload，直到拿到确定结果（Accepted/Conflict/Permanent），然后才基于最新本地状态生成下一条。否则会出现两种错误：同一 op_id 带上新内容，服务端判为 `op_id reused`；或者换新 op_id，却和自己上一次已被接受的写入冲突。
+- `sync_failures(op_id PRIMARY KEY, entity_type, entity_id, reason, updated_time)`：记录永久失败的原因，供状态栏显示。
 - 设备 ID 存在 `settings` 的 `sync.device_id`，首次同步时生成。从备份恢复时清空这一项，新客户端不会冒用旧身份。
 
 一次同步按下面顺序执行：
 1. 上行附件：本地待发的笔记引用了哪些资源，就先确保这些 blob 在服务端完整。用 `blob_status` 查询后从断点续传，只有状态为 `Complete` 的才继续后面的步骤。
-2. push：按实体合并 outbox 行，同一实体只发最新状态，参照 Evernote 的 rollup。实体仍然存在就发 `Put{payload}`，已删除或进了 tombstone 就发 `Delete`。`op_id` 取该实体最早一条 outbox 行的 id，这样重试时 `op_id` 保持不变。每批最多 100 条。发送时不持有 UI 锁，由调用方在后台线程执行。
+2. push：已有在途操作的实体，原样重发。其余实体按 outbox 合并，同一实体只发最新状态，参照 Evernote 的 rollup；生成新的 op_id，与所覆盖的 outbox 行 id 一起写入 `sync_inflight` 后再发送。实体仍然存在就发 `Put{payload}`，笔记进回收站也按 Put 发，带上 `deleted_time`；已彻底删除的发 `Delete`。实体从未上传过、本地又已不存在的，直接丢弃这些 outbox 行，不发送。每批最多 100 条。发送时不持有 UI 锁，由调用方在后台线程执行。
 3. 逐项处理结果：
-   - `Accepted`：在同一个事务里删除该实体本次发出的 outbox 行（按 id 集合删，发送之后新产生的行保留），并更新 `server_revision`。
+   - `Accepted`：在同一个事务里删除在途操作所覆盖的 outbox 行（发送之后新产生的行保留）和在途行本身，并更新 `server_revision`。
    - `Conflict`：本地版本另存为一篇新笔记，标题加“（冲突副本 设备时间）”，然后按服务端版本覆盖原实体并登记 `sync_conflicts`，最后清掉这批 outbox 行。服务端版本是删除时，本地编辑作为新笔记保留，不会静默消失。
-   - `Retryable`：保留 outbox 行，按 `retry_after_ms` 退避。
-   - `Permanent`：保留 outbox 行，写入 `sync_failures`。
+   - `Retryable`，或整个请求的传输失败：保留在途行，下次原样重发。
+   - `Permanent`：保留在途行和 outbox 行，写入 `sync_failures`。不自动重试，由用户看到原因后处理。
 4. pull：从 `sync_cursor` 开始拉取。每一页的变更应用和 cursor 推进放在同一个本地事务里，应用失败就不推进 cursor。应用远端变更时不写 outbox，避免回声。遇到自己设备发出、且修订号不高于已知值的变更，直接跳过。如果本地该实体还有待发的 outbox 行，就按冲突处理（本地另存副本）。拉下来的资源元数据先下载 blob（`read_range`，边下边校验 SHA-256），完整后才写入资源行。
 
 payload 只包含可移植字段：

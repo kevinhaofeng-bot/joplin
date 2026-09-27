@@ -1,3 +1,6 @@
+mod sync_store;
+pub use sync_store::{SyncFailure, SyncInflight};
+
 use crate::resource::{
     DatabaseFile, ProfileDir, ResourceBlob, ResourceError, ResourceInput, ResourceStore,
 };

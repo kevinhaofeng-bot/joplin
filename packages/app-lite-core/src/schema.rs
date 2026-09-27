@@ -4,7 +4,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 /// The durable identity of the extractor implementation currently compiled
 /// into the client. A future extractor changes this one value; v10 reopen
 /// reconciles the live associated queue once through the settings sentinel.
@@ -78,6 +78,9 @@ CREATE TABLE IF NOT EXISTS search_queue (note_id TEXT PRIMARY KEY NOT NULL, upda
 CREATE TABLE IF NOT EXISTS sync_outbox (id TEXT PRIMARY KEY NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, entity_revision INTEGER NOT NULL, operation TEXT NOT NULL, created_time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sync_cursor (name TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL, updated_time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sync_conflicts (id TEXT PRIMARY KEY NOT NULL, entity_id TEXT NOT NULL, local_revision INTEGER NOT NULL, remote_revision INTEGER NOT NULL, created_time INTEGER NOT NULL, resolved_time INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS sync_entities (entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, server_revision INTEGER NOT NULL, PRIMARY KEY(entity_type, entity_id));
+CREATE TABLE IF NOT EXISTS sync_inflight (entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, op_id TEXT NOT NULL UNIQUE, base_revision INTEGER NOT NULL, action_json TEXT NOT NULL, outbox_ids_json TEXT NOT NULL, created_time INTEGER NOT NULL, PRIMARY KEY(entity_type, entity_id));
+CREATE TABLE IF NOT EXISTS sync_failures (op_id TEXT PRIMARY KEY NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, reason TEXT NOT NULL, updated_time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS shortcuts (id TEXT PRIMARY KEY NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, position INTEGER NOT NULL, created_time INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS search_history (query TEXT PRIMARY KEY NOT NULL, last_used_time INTEGER NOT NULL, use_count INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL, updated_time INTEGER NOT NULL);
@@ -180,7 +183,7 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
             params![DERIVED_TEXT_EXTRACTOR_VERSION_SETTING, DERIVED_TEXT_EXTRACTOR_VERSION],
         )?;
     }
-    transaction.execute_batch("PRAGMA user_version = 10")?;
+    transaction.execute_batch("PRAGMA user_version = 11")?;
     before_commit();
     // The test hook models the last pathname/descriptor race.  It must run
     // before the final identity check so a swapped profile aborts the still

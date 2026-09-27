@@ -8,6 +8,7 @@ pub mod resource;
 pub mod revision;
 pub mod schema;
 pub mod search;
+pub mod sync;
 
 pub use document::{CanonicalDocument, CanonicalHtml, DocumentError, SearchText};
 pub use domain::*;

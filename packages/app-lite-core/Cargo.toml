@@ -12,6 +12,7 @@ name = "app_lite_core"
 path = "src/lib.rs"
 
 [dependencies]
+app-lite-protocol = { path = "../app-lite-protocol" }
 base64 = "0.22"
 getrandom = { version = "0.2", features = ["std"] }
 html5ever = "0.38"
@@ -29,4 +30,5 @@ tempfile = "3"
 xml-syntax-reader = { path = "vendor/xml-syntax-reader-0.2.0" }
 
 [dev-dependencies]
+app-lite-server = { path = "../app-lite-server" }
 tempfile = "3"

@@ -35,7 +35,7 @@ impl RepositoryIdSource for FixedIds {
 }
 
 #[test]
-fn open_creates_clean_v10_database_idempotently() {
+fn open_creates_clean_v11_database_idempotently() {
     // Catches a fresh profile missing v7 schema/PRAGMAs or a second open changing it.
     let profile = tempdir().unwrap();
     let path = profile.path().join("library.sqlite");
@@ -46,8 +46,21 @@ fn open_creates_clean_v10_database_idempotently() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
+    for table in ["sync_entities", "sync_inflight", "sync_failures"] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1,
+            "{table}"
+        );
+    }
     assert_eq!(
         connection
             .query_row(
@@ -1571,5 +1584,43 @@ fn lexical_profile_bind_refuses_a_symlink_swap_before_sqlite_opens() {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         3
+    );
+}
+
+/// v10 -> v11 only adds the sync client tables; notes and outbox survive.
+#[test]
+fn v10_library_upgrades_to_v11_keeping_notes_and_outbox() {
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).unwrap();
+    let note = repository
+        .create_note(app_lite_core::CreateNote {
+            title: "升级前".into(),
+            notebook_id: None,
+            document: app_lite_core::CanonicalDocument::parse_html("<p>正文</p>").unwrap(),
+        })
+        .unwrap();
+    let outbox = repository.outbox_count().unwrap();
+    drop(repository);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE sync_entities; DROP TABLE sync_inflight; DROP TABLE sync_failures;
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+    let repository = LibraryRepository::open(&path).unwrap();
+    let reopened = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(reopened.title, "升级前");
+    assert_eq!(reopened.body_html, note.body_html);
+    assert_eq!(repository.outbox_count().unwrap(), outbox);
+    assert!(repository.sync_failures().unwrap().is_empty());
+    drop(repository);
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        11
     );
 }
