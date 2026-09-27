@@ -200,9 +200,17 @@ impl ServerStore {
             .collect::<Result<Vec<_>, ServerError>>()?;
         let has_more = changes.len() > limit;
         changes.truncate(limit);
-        let next_cursor = changes
-            .last()
-            .map_or(request.cursor, |change| change.cursor);
+        // With nothing newer, report the server's own head rather than echo
+        // the client: a head below the client's cursor means the server was
+        // restored from an older backup, which the client must not miss.
+        let next_cursor = match changes.last() {
+            Some(change) => change.cursor,
+            None => {
+                connection.query_row("SELECT IFNULL(MAX(cursor), 0) FROM changes", [], |row| {
+                    row.get::<_, i64>(0)
+                })? as u64
+            }
+        };
         Ok(PullResponse {
             changes,
             next_cursor,

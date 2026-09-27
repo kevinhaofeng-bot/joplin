@@ -220,3 +220,22 @@ fn a_note_created_and_purged_before_any_sync_sends_nothing() {
     );
     assert_eq!(repo.outbox_count().unwrap(), 0);
 }
+
+#[test]
+fn one_sync_uploads_more_than_one_batch() {
+    let root = tempdir().unwrap();
+    let server_root = tempdir().unwrap();
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let repo = open(root.path());
+    for index in 0..250 {
+        repo.create_note(CreateNote {
+            title: format!("第{index}篇"),
+            notebook_id: None,
+            document: text("x"),
+        })
+        .unwrap();
+    }
+    let report = sync::sync_once(&repo, &store).unwrap();
+    assert_eq!(repo.sync_pending_count().unwrap(), 0, "{report:?}");
+    assert_eq!(repo.outbox_count().unwrap(), 0);
+}

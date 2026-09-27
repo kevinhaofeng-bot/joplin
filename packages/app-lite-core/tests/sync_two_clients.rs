@@ -368,3 +368,74 @@ fn a_library_restored_from_backup_is_a_new_device_that_keeps_unsynced_edits() {
         "the unsynced edit reaches the server from the restored library"
     );
 }
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// The server is restored from an older backup. A client whose cursor is
+/// now ahead of the server must notice, re-upload what the server lost and
+/// still receive changes made after the restore.
+#[test]
+fn a_server_restored_from_an_older_backup_loses_nothing() {
+    let server_root = tempdir().unwrap();
+    let backup = tempdir().unwrap();
+    let a = client();
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let first = a
+        .repo
+        .create_note(CreateNote {
+            title: "备份前".into(),
+            notebook_id: None,
+            document: text("一"),
+        })
+        .unwrap();
+    sync(&a, &store);
+    drop(store);
+    copy_dir(server_root.path(), &backup.path().join("server"));
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let lost = a
+        .repo
+        .create_note(CreateNote {
+            title: "备份后才上传".into(),
+            notebook_id: None,
+            document: text("二"),
+        })
+        .unwrap();
+    sync(&a, &store);
+    drop(store);
+
+    // Restore the older backup over the server data.
+    std::fs::remove_dir_all(server_root.path()).unwrap();
+    copy_dir(&backup.path().join("server"), server_root.path());
+    let store = ServerStore::open(server_root.path()).unwrap();
+    let b = client();
+    sync(&b, &store);
+    let later = b
+        .repo
+        .create_note(CreateNote {
+            title: "恢复之后新建".into(),
+            notebook_id: None,
+            document: text("三"),
+        })
+        .unwrap();
+    sync(&b, &store);
+
+    sync(&a, &store);
+    sync(&b, &store);
+    for device in [&a, &b] {
+        for id in [&first.id, &lost.id, &later.id] {
+            assert!(device.repo.load_note(id).unwrap().is_some(), "{id:?}");
+        }
+        assert_eq!(titles(device).len(), 3, "no spurious conflict copies");
+    }
+}

@@ -1134,3 +1134,68 @@ impl LibraryRepository {
         )?)
     }
 }
+
+impl LibraryRepository {
+    /// Forgets everything learned from a server that has since been restored
+    /// from an older backup. Local changes (outbox) and the device identity
+    /// stay; entities are then compared afresh on the next pull.
+    pub(crate) fn sync_forget_server_state(&self) -> Result<(), LibraryError> {
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "DELETE FROM sync_entities; DELETE FROM sync_inflight; DELETE FROM sync_failures; DELETE FROM sync_cursor;",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+const ANCHOR_NAME: &str = "anchor";
+
+impl LibraryRepository {
+    /// The highest server change this client knows of (pulled or its own
+    /// accepted op): used to notice a server restored from an older backup,
+    /// whose cursor numbers are then reused by different changes.
+    pub(crate) fn sync_anchor(&self) -> Result<Option<(u64, String)>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT cursor FROM sync_cursor WHERE name=?1",
+                [ANCHOR_NAME],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let (cursor, op_id) = value.split_once(':').ok_or(LibraryError::InvalidSnapshot)?;
+        Ok(Some((
+            cursor.parse().map_err(|_| LibraryError::InvalidSnapshot)?,
+            op_id.to_owned(),
+        )))
+    }
+
+    pub(crate) fn sync_raise_anchor(&self, cursor: u64, op_id: &str) -> Result<(), LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let current: Option<String> = connection
+            .query_row(
+                "SELECT cursor FROM sync_cursor WHERE name=?1",
+                [ANCHOR_NAME],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current_cursor = current
+            .as_deref()
+            .and_then(|value| value.split_once(':'))
+            .and_then(|(cursor, _)| cursor.parse::<u64>().ok())
+            .unwrap_or(0);
+        if cursor > current_cursor {
+            connection.execute(
+                "INSERT INTO sync_cursor(name,cursor,updated_time) VALUES(?1,?2,?3)
+                 ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor, updated_time=excluded.updated_time",
+                params![ANCHOR_NAME, format!("{cursor}:{op_id}"), self.now()],
+            )?;
+        }
+        Ok(())
+    }
+}

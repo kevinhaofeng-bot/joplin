@@ -196,6 +196,9 @@ impl LibraryShell {
             ShellSyncStatus::Running => "正在同步…".into(),
             ShellSyncStatus::Succeeded { report } => {
                 let mut text = format!("已同步：上传 {}、下载 {}", report.accepted, report.pulled);
+                if report.server_restored {
+                    text.push_str("；服务器曾从较早的备份恢复，已与本机重新对账");
+                }
                 if report.conflicts > 0 {
                     text.push_str(&format!("，{} 处冲突已保存为“冲突副本”", report.conflicts));
                 }

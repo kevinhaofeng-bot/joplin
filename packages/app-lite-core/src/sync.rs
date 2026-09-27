@@ -29,6 +29,9 @@ pub struct SyncReport {
     /// Operations still waiting because the server or network was unavailable.
     pub retryable: usize,
     pub permanent: usize,
+    /// The server had been restored from an older backup; local state was
+    /// reconciled against it from the start.
+    pub server_restored: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +71,20 @@ fn pull(
     transport: &dyn SyncTransport,
     report: &mut SyncReport,
 ) -> Result<bool, SyncError> {
+    let mut forgot_server_state = false;
+    match server_still_has_anchor(repository, transport) {
+        Ok(true) => {}
+        Ok(false) => {
+            repository.sync_forget_server_state()?;
+            forgot_server_state = true;
+            report.server_restored = true;
+        }
+        Err(TransportError::Retryable(_)) => {
+            report.retryable += 1;
+            return Ok(false);
+        }
+        Err(error) => return Err(fatal(error)),
+    }
     loop {
         let request = PullRequest {
             protocol: PROTOCOL_VERSION,
@@ -83,7 +100,17 @@ fn pull(
             Err(error) => return Err(fatal(error)),
         };
         if response.next_cursor < request.cursor {
-            return Err(SyncError::Rejected("server cursor moved backwards".into()));
+            // The server was restored from an older backup. Start over from
+            // its beginning: equal content is adopted, differing local
+            // content becomes a conflict copy, and what the server lost is
+            // uploaded again.
+            if forgot_server_state {
+                return Err(SyncError::Rejected("server cursor moved backwards".into()));
+            }
+            repository.sync_forget_server_state()?;
+            forgot_server_state = true;
+            report.server_restored = true;
+            continue;
         }
         for change in &response.changes {
             let Some(resource) = downloadable(change) else {
@@ -102,6 +129,9 @@ fn pull(
             }
         }
         let applied = repository.sync_apply_page(&response.changes, response.next_cursor)?;
+        if let Some(last) = response.changes.last() {
+            repository.sync_raise_anchor(last.cursor, &last.op_id)?;
+        }
         report.pulled += applied.applied;
         report.skipped += applied.skipped;
         report.conflicts += applied.conflicts;
@@ -109,6 +139,29 @@ fn pull(
             return Ok(true);
         }
     }
+}
+
+/// A server restored from an older backup reuses cursor numbers, so the
+/// change at our highest known cursor must still be the same op.
+fn server_still_has_anchor(
+    repository: &LibraryRepository,
+    transport: &dyn SyncTransport,
+) -> Result<bool, TransportError> {
+    let Some((cursor, op_id)) = repository
+        .sync_anchor()
+        .map_err(|error| TransportError::Permanent(error.to_string()))?
+    else {
+        return Ok(true);
+    };
+    let response = transport.pull(&PullRequest {
+        protocol: PROTOCOL_VERSION,
+        cursor: cursor.saturating_sub(1),
+        limit: 1,
+    })?;
+    Ok(response
+        .changes
+        .first()
+        .is_some_and(|change| change.cursor == cursor && change.op_id == op_id))
 }
 
 fn fatal(error: TransportError) -> SyncError {
@@ -122,14 +175,37 @@ fn fatal(error: TransportError) -> SyncError {
     }
 }
 
+/// Uploads until nothing is left, nothing more is accepted, or the server
+/// becomes unreachable.
 fn push(
     repository: &LibraryRepository,
     transport: &dyn SyncTransport,
     device_id: &str,
     report: &mut SyncReport,
 ) -> Result<(), SyncError> {
+    loop {
+        let (accepted, retryable) = (report.accepted, report.retryable);
+        if !push_round(repository, transport, device_id, report)? {
+            return Ok(());
+        }
+        if report.accepted == accepted || report.retryable > retryable {
+            return Ok(());
+        }
+    }
+}
+
+/// One prepared set of at most `MAX_PUSH_OPS` ops; false when it was empty.
+fn push_round(
+    repository: &LibraryRepository,
+    transport: &dyn SyncTransport,
+    device_id: &str,
+    report: &mut SyncReport,
+) -> Result<bool, SyncError> {
     let device_id = device_id.to_owned();
     let inflight = repository.sync_prepare_inflight(MAX_PUSH_OPS)?;
+    if inflight.is_empty() {
+        return Ok(false);
+    }
     for batch in batches(&inflight) {
         // An op referencing an incomplete blob is never published; later
         // batches may hold notes that use it, so stop this pass entirely.
@@ -138,7 +214,7 @@ fn push(
                 Ok(()) => {}
                 Err(TransportError::Retryable(_)) => {
                     report.retryable += 1;
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(error) => return Err(fatal(error)),
             }
@@ -166,9 +242,12 @@ fn push(
         for result in response.results {
             match result {
                 OpResult::Accepted {
-                    op_id, revision, ..
+                    op_id,
+                    revision,
+                    cursor,
                 } => {
                     repository.sync_record_accepted(&op_id, revision)?;
+                    repository.sync_raise_anchor(cursor, &op_id)?;
                     report.accepted += 1;
                 }
                 // The next download resolves it (conflict copy, remote wins).
@@ -181,7 +260,7 @@ fn push(
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub fn sync_failures(repository: &LibraryRepository) -> Result<Vec<SyncFailure>, LibraryError> {
