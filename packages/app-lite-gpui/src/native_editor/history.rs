@@ -1,6 +1,7 @@
 //! Bounded inverse-operation history for the native document model.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use super::model::{Document, DocumentError, Selection};
 use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
@@ -12,7 +13,13 @@ struct HistoryEntry {
     before_selection: Selection,
     after_selection: Selection,
     bytes: usize,
+    time: Instant,
 }
+
+/// Evernote's editor (prosemirror-history, `newGroupDelay` default 500 ms,
+/// enabled in `apps/peso/plugins.ts:219`) joins a change to the previous undo
+/// group when it follows within this delay at an adjacent position.
+pub const TYPING_GROUP_DELAY: Duration = Duration::from_millis(500);
 
 /// Undo/redo history bounded by both entry count and operation payload bytes.
 /// Entries retain inverse and forward operations only; they never retain a
@@ -100,6 +107,7 @@ impl History {
         entry.forward = TransactionBatch(vec![replacement]);
         entry.before_selection = before_selection;
         entry.after_selection = outcome.selection;
+        entry.time = Instant::now();
         entry.bytes = entry
             .inverse
             .estimated_bytes()
@@ -152,6 +160,7 @@ impl History {
             before_selection,
             after_selection: outcome.selection,
             bytes,
+            time: Instant::now(),
         };
         self.used_bytes = self.used_bytes.saturating_add(bytes);
         self.undo.push_back(entry);
@@ -235,6 +244,49 @@ impl History {
             estimated_bytes,
             inserted_span: None,
         })
+    }
+
+    /// Join the newest entry into the previous one when both only insert
+    /// text, the newest starts where the previous ended, and it followed
+    /// within [`TYPING_GROUP_DELAY`]. Called after plain typing and after an
+    /// input-method commit, never while a composition is still provisional
+    /// (its entry must stay separate for `replace_last_with`).
+    pub fn coalesce_typing(&mut self) {
+        let count = self.undo.len();
+        if count < 2 {
+            return;
+        }
+        let (previous, last) = (&self.undo[count - 2], &self.undo[count - 1]);
+        let only_text = |batch: &TransactionBatch| {
+            batch
+                .0
+                .iter()
+                .all(|transaction| matches!(transaction, Transaction::InsertText { .. }))
+        };
+        if !only_text(&previous.forward)
+            || !only_text(&last.forward)
+            || previous.after_selection != last.before_selection
+            || last.time.saturating_duration_since(previous.time) > TYPING_GROUP_DELAY
+        {
+            return;
+        }
+        let last = self.undo.pop_back().expect("counted two entries");
+        let previous = self.undo.back_mut().expect("counted two entries");
+        // Undo applies the newest inverse first, then the older one.
+        let mut inverse = last.inverse.0;
+        inverse.extend(previous.inverse.0.drain(..));
+        previous.inverse = TransactionBatch(inverse);
+        previous.forward.0.extend(last.forward.0);
+        previous.after_selection = last.after_selection;
+        previous.bytes = previous.bytes.saturating_add(last.bytes);
+        previous.time = last.time;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_last_entry_for_test(&mut self, by: Duration) {
+        if let Some(entry) = self.undo.back_mut() {
+            entry.time = entry.time.checked_sub(by).unwrap_or(entry.time);
+        }
     }
 
     pub fn undo_depth(&self) -> usize {

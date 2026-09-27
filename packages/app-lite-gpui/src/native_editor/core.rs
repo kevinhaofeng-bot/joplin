@@ -1292,6 +1292,7 @@ impl EditorCore {
         })?;
         self.selection = outcome.selection;
         self.clear_composition();
+        self.history.coalesce_typing();
         Ok(())
     }
 
@@ -1726,6 +1727,12 @@ impl EditorCore {
         Ok(outcome)
     }
 
+    /// Simulates a pause before the next edit (see `TYPING_GROUP_DELAY`).
+    #[cfg(test)]
+    pub(crate) fn age_last_history_entry_for_test(&mut self, by: std::time::Duration) {
+        self.history.age_last_entry_for_test(by);
+    }
+
     pub fn undo(&mut self) -> Result<(), DocumentError> {
         self.ensure_editable()?;
         let resource_anchor_mapping = self
@@ -2004,6 +2011,8 @@ impl EditorCore {
             &outcome.numbering_ranges,
         );
         self.clear_composition();
+        // The composition is final now; it may join the preceding input.
+        self.history.coalesce_typing();
         Ok(())
     }
 

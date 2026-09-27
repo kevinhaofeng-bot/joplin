@@ -7973,3 +7973,38 @@ fn enter_on_an_empty_list_item_outdents_or_leaves_the_list(cx: &mut gpui::TestAp
         ]
     );
 }
+
+/// D2: Evernote joins adjacent edits made within 500 ms into one undo step
+/// (prosemirror-history `newGroupDelay`); consecutive input-method commits
+/// and typed characters are undone together, a pause or a caret move starts
+/// a new step.
+#[gpui::test]
+fn quick_adjacent_typing_and_ime_commits_undo_as_one_step(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    for word in ["一", "二"] {
+        editor
+            .replace_and_mark_utf16(None, "yi", Some(2..2))
+            .unwrap();
+        editor.commit_marked_text(word).unwrap();
+    }
+    editor.insert_text("三").unwrap();
+    assert_eq!(editor.visible_text(), "前一二三后");
+    assert_eq!(editor.undo_depth(), 1, "one undo step for continuous input");
+    editor.undo().unwrap();
+    assert_eq!(editor.visible_text(), "前后");
+    editor.redo().unwrap();
+    assert_eq!(editor.visible_text(), "前一二三后");
+
+    // A pause longer than the group delay starts a new step.
+    editor.age_last_history_entry_for_test(std::time::Duration::from_millis(600));
+    editor.insert_text("四").unwrap();
+    assert_eq!(editor.undo_depth(), 2);
+    editor.undo().unwrap();
+    assert_eq!(editor.visible_text(), "前一二三后");
+
+    // Typing somewhere else is not adjacent: its own step.
+    editor.set_caret_utf8(0);
+    editor.insert_text("甲").unwrap();
+    assert_eq!(editor.undo_depth(), 2);
+}
