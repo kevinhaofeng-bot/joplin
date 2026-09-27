@@ -26,7 +26,11 @@ pub(crate) enum ShellSyncStatus {
     Unconfigured,
     Idle,
     Running,
-    Succeeded { report: SyncReport },
+    Succeeded {
+        report: SyncReport,
+        /// Title of the conflict copy that kept the open note's unsaved edit.
+        kept_edit: Option<String>,
+    },
     Failed(String),
 }
 
@@ -172,14 +176,34 @@ impl LibraryShell {
         .detach();
     }
 
-    fn finish_sync(&mut self, result: Result<SyncReport, SyncError>, cx: &mut Context<Self>) {
+    pub(super) fn finish_sync(
+        &mut self,
+        result: Result<SyncReport, SyncError>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut kept_edit = None;
+        match self.open_note_overtaken_by_sync(cx) {
+            Overtaken::No => {}
+            Overtaken::Yes => {
+                // Reread the open note and remount the editor at the
+                // revision the sync installed.
+                self.remount_current_surface_after_organization_commit = true;
+            }
+            Overtaken::KeptAs(title) => {
+                self.remount_current_surface_after_organization_commit = true;
+                kept_edit = Some(title);
+            }
+            Overtaken::Unkept(message) => {
+                // Never replace an editor whose text could not be kept.
+                self.sync_status = ShellSyncStatus::Failed(message);
+                cx.notify();
+                return;
+            }
+        }
         self.sync_status = match result {
-            Ok(report) => ShellSyncStatus::Succeeded { report },
+            Ok(report) => ShellSyncStatus::Succeeded { report, kept_edit },
             Err(error) => ShellSyncStatus::Failed(failure_message(&error)),
         };
-        // Remote changes may have replaced the open note's revision: reread
-        // it and remount the editor at that revision.
-        self.remount_current_surface_after_organization_commit = true;
         let reload = self.model.update(cx, |model, model_cx| {
             let result = model.reload_after_sync();
             model_cx.notify();
@@ -190,6 +214,49 @@ impl LibraryShell {
         }
         self.sync_editor_surface(cx);
         cx.notify();
+    }
+
+    /// Whether the sync replaced the revision the open editor is based on.
+    /// An unsaved edit on top of it is kept as a conflict copy first, the
+    /// same outcome a saved but unsynced edit gets from the pull.
+    fn open_note_overtaken_by_sync(&mut self, cx: &mut Context<Self>) -> Overtaken {
+        let Some(session) = self.note_session.clone() else {
+            return Overtaken::No;
+        };
+        let (repository, note_id) = self.model.read_with(cx, |model, _| {
+            (model.repository(), model.active_session_note_id().cloned())
+        });
+        let Some(note_id) = self.surface_note_id.clone().or(note_id) else {
+            return Overtaken::No;
+        };
+        let based_on = session.read(cx).expected_revision();
+        let stored = match repository.load_note(&note_id) {
+            Ok(stored) => stored,
+            Err(error) => return Overtaken::Unkept(format!("同步后无法读取当前笔记：{error}")),
+        };
+        if stored
+            .as_ref()
+            .is_some_and(|note| note.revision == based_on && note.deleted_time.is_none())
+        {
+            return Overtaken::No;
+        }
+        let edit = match session.update(cx, |session, session_cx| session.unsaved_edit(session_cx))
+        {
+            Ok(Some(edit)) => edit,
+            Ok(None) => return Overtaken::Yes,
+            Err(error) => {
+                return Overtaken::Unkept(format!(
+                    "当前笔记已被其他设备修改，但无法读取你未保存的编辑（{error}）；编辑器内容保留，请先复制再同步。"
+                ));
+            }
+        };
+        match repository.save_overtaken_edit_as_conflict_copy(&note_id, based_on, &edit.0, &edit.1)
+        {
+            Ok(copy) => Overtaken::KeptAs(copy.title),
+            Err(error) => Overtaken::Unkept(format!(
+                "当前笔记已被其他设备修改，未能把你未保存的编辑另存为冲突副本（{error}）；编辑器内容保留，请先复制再同步。"
+            )),
+        }
     }
 
     pub(super) fn open_sync_settings_action(
@@ -285,13 +352,18 @@ impl LibraryShell {
             ),
             ShellSyncStatus::Idle => format!("尚未同步{pending}"),
             ShellSyncStatus::Running => "正在同步…".into(),
-            ShellSyncStatus::Succeeded { report } => {
+            ShellSyncStatus::Succeeded { report, kept_edit } => {
                 let mut text = format!("已同步：上传 {}、下载 {}", report.accepted, report.pulled);
                 if report.server_restored {
                     text.push_str("；服务器曾从较早的备份恢复，已与本机重新对账");
                 }
                 if report.conflicts > 0 {
                     text.push_str(&format!("，{} 处冲突已保存为“冲突副本”", report.conflicts));
+                }
+                if let Some(copy) = kept_edit {
+                    text.push_str(&format!(
+                        "；当前笔记已被其他设备修改，你未保存的编辑另存为“{copy}”"
+                    ));
                 }
                 if report.retryable > 0 {
                     text.push_str("，部分内容因网络中断未完成，下次同步继续");
@@ -393,4 +465,11 @@ impl LibraryShell {
         }
         Some(panel.into_any_element())
     }
+}
+
+enum Overtaken {
+    No,
+    Yes,
+    KeptAs(String),
+    Unkept(String),
 }

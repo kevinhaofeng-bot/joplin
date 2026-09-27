@@ -1603,6 +1603,21 @@ impl NoteSession {
         self.save.generation()
     }
 
+    /// Title and body not yet saved at `expected_revision`, for keeping them
+    /// when a sync has replaced that revision; None when all is saved.
+    /// Uncommitted IME candidate text is not an edit yet and is not included.
+    pub(crate) fn unsaved_edit(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<(String, app_lite_core::CanonicalDocument)>, SaveError> {
+        self.observe_current_entities(cx);
+        if matches!(self.save.state(), SaveState::Clean) && self.pending_flush.is_none() {
+            return Ok(None);
+        }
+        let snapshot = Self::encode_snapshot(self.snapshot(), "保留未保存的编辑")?;
+        Ok(Some((snapshot.title, snapshot.document)))
+    }
+
     pub(crate) fn expected_revision(&self) -> i64 {
         self.expected_revision
     }

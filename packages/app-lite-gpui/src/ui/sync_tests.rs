@@ -285,3 +285,123 @@ async fn a_refused_upload_is_listed_and_retried_only_from_its_button(cx: &mut Te
             .contains("改短了")
     );
 }
+
+/// Opens `note`, types `typed` without letting it save, then applies a
+/// sync pass run the way the background executor runs it.
+fn type_then_finish_a_sync<'a>(
+    fixture: &Fixture,
+    note: &app_lite_core::NoteId,
+    typed: &str,
+    cx: &'a mut TestAppContext,
+) -> (gpui::Entity<LibraryShell>, &'a mut VisualTestContext) {
+    let (view, cx) = mount(fixture, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.clone()), window, shell_cx);
+        })
+    });
+    redraw(cx);
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input(typed);
+    let transport = HttpTransport::new(&fixture.url(), TOKEN);
+    let report = app_lite_core::sync::sync_once(&fixture.repository, &transport);
+    view.update(cx, |shell, shell_cx| shell.finish_sync(report, shell_cx));
+    redraw(cx);
+    (view, cx)
+}
+
+/// Syncs `note` to the server and a second device, and returns that device.
+fn second_device(fixture: &Fixture) -> (tempfile::TempDir, LibraryRepository) {
+    let transport = HttpTransport::new(&fixture.url(), TOKEN);
+    app_lite_core::sync::sync_once(&fixture.repository, &transport).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let other = LibraryRepository::open(root.path().join("library.sqlite")).unwrap();
+    app_lite_core::sync::sync_once(&other, &transport).unwrap();
+    (root, other)
+}
+
+#[gpui::test]
+async fn an_unsaved_edit_overtaken_by_a_sync_is_kept_as_a_conflict_copy(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    fixture.configure(TOKEN);
+    let note = fixture
+        .repository
+        .create_note(CreateNote {
+            title: "同一篇".into(),
+            notebook_id: None,
+            document: text("原文"),
+        })
+        .unwrap();
+    let (_other_root, other) = second_device(&fixture);
+    let remote = other.load_note(&note.id).unwrap().unwrap();
+    other
+        .save_note(SaveNote {
+            id: note.id.clone(),
+            expected_revision: remote.revision,
+            title: "同一篇".into(),
+            document: text("另一台设备改的"),
+            resource_ids: vec![],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    app_lite_core::sync::sync_once(&other, &HttpTransport::new(&fixture.url(), TOKEN)).unwrap();
+
+    let (view, cx) = type_then_finish_a_sync(&fixture, &note.id, "本机未保存", cx);
+    let text = status(&view, cx);
+    assert!(text.contains("另存为“同一篇（冲突副本）”"), "{text}");
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert!(body.contains("另一台设备改的"), "{body}");
+    let bodies: Vec<(String, String)> = fixture
+        .repository
+        .list_notes(Default::default())
+        .unwrap()
+        .into_iter()
+        .map(|summary| {
+            let note = fixture.repository.load_note(&summary.id).unwrap().unwrap();
+            (note.title, note.body_html)
+        })
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .any(|(title, body)| title == "同一篇（冲突副本）" && body.contains("本机未保存")),
+        "{bodies:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_sync_that_leaves_the_open_note_alone_keeps_its_unsaved_edit(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    fixture.configure(TOKEN);
+    let note = fixture
+        .repository
+        .create_note(CreateNote {
+            title: "正在写".into(),
+            notebook_id: None,
+            document: text("原文"),
+        })
+        .unwrap();
+    let (_other_root, other) = second_device(&fixture);
+    other
+        .create_note(CreateNote {
+            title: "别的笔记".into(),
+            notebook_id: None,
+            document: text("x"),
+        })
+        .unwrap();
+    app_lite_core::sync::sync_once(&other, &HttpTransport::new(&fixture.url(), TOKEN)).unwrap();
+
+    let (view, cx) = type_then_finish_a_sync(&fixture, &note.id, "继续写", cx);
+    let text = status(&view, cx);
+    assert!(
+        text.contains("下载 1") && !text.contains("冲突副本"),
+        "{text}"
+    );
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert!(body.contains("继续写"), "the editor keeps the edit: {body}");
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let stored = fixture.repository.load_note(&note.id).unwrap().unwrap();
+    assert!(stored.body_html.contains("继续写"), "{}", stored.body_html);
+}
