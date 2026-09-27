@@ -30,11 +30,80 @@ pub struct HttpTransport {
     tls: Arc<rustls::ClientConfig>,
 }
 
-/// Trusted roots: the public (Mozilla) roots plus any certificates given,
-/// such as a NAS's self-signed certificate.
+/// Accepts a server certificate identical to one the person trusted (a
+/// self-signed one, often marked as a CA, which chain validation refuses as
+/// `CaUsedAsEndEntity`); anything else must chain to a trusted root. The
+/// handshake signature is verified either way.
+#[derive(Debug)]
+struct PinnedOrChained {
+    pinned: Vec<rustls::pki_types::CertificateDer<'static>>,
+    chained: Arc<rustls::client::WebPkiServerVerifier>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedOrChained {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self
+            .pinned
+            .iter()
+            .any(|pinned| pinned.as_ref() == end_entity.as_ref())
+        {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        self.chained
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Trusted: the public (Mozilla) roots, plus the certificates given: each
+/// accepted as the server's exact certificate or as a root it chains to
+/// (a private CA).
 fn tls_config(extra_pem: Option<&str>) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut pinned = Vec::new();
     if let Some(pem) = extra_pem {
         let certificates = rustls_pemfile::certs(&mut pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
@@ -45,18 +114,28 @@ fn tls_config(extra_pem: Option<&str>) -> Result<Arc<rustls::ClientConfig>, Tran
             ));
         }
         for certificate in certificates {
-            roots
-                .add(certificate)
-                .map_err(|error| TransportError::Permanent(format!("server certificate: {error}")))?;
+            // A certificate unusable as a root can still be pinned.
+            let _ = roots.add(certificate.clone());
+            pinned.push(certificate);
         }
     }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|error| TransportError::Permanent(error.to_string()))?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let chained = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::clone(&provider),
+    )
+    .build()
+    .map_err(|error| TransportError::Permanent(format!("server certificate: {error}")))?;
+    let verifier = Arc::new(PinnedOrChained {
+        pinned,
+        chained,
+        provider: Arc::clone(&provider),
+    });
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| TransportError::Permanent(error.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
     Ok(Arc::new(config))
 }
 

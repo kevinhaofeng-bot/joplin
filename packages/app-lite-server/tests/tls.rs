@@ -31,12 +31,15 @@ impl Running {
 
 fn start(options: HttpOptions) -> Running {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    let certificate_pem = certified.cert.pem();
-    let tls = tls_config_from_pem(
-        certificate_pem.as_bytes(),
-        certified.key_pair.serialize_pem().as_bytes(),
+    serve(
+        certified.cert.pem(),
+        certified.key_pair.serialize_pem(),
+        options,
     )
-    .unwrap();
+}
+
+fn serve(certificate_pem: String, key_pem: String, options: HttpOptions) -> Running {
+    let tls = tls_config_from_pem(certificate_pem.as_bytes(), key_pem.as_bytes()).unwrap();
     let root = tempdir().unwrap();
     let store = Arc::new(ServerStore::open(root.path()).unwrap());
     let server = HttpServer::bind_with(
@@ -54,6 +57,16 @@ fn start(options: HttpOptions) -> Running {
         server,
         certificate_pem,
     }
+}
+
+/// A self-signed certificate marked as a CA, as `openssl req -x509` and
+/// many NAS systems make them.
+fn self_signed_ca_style() -> (String, String) {
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let key = rcgen::KeyPair::generate().unwrap();
+    let certificate = params.self_signed(&key).unwrap();
+    (certificate.pem(), key.serialize_pem())
 }
 
 fn pull(transport: &HttpTransport) -> Result<usize, TransportError> {
@@ -129,4 +142,48 @@ fn plain_http_or_a_stalled_handshake_does_not_disturb_the_tls_listener() {
     assert_eq!(pull(&transport).unwrap(), 0);
     assert!(started.elapsed() < Duration::from_secs(3));
     drop(stalled);
+}
+
+#[test]
+fn a_trusted_self_signed_certificate_marked_as_a_ca_is_accepted_by_exact_match() {
+    let (certificate, key) = self_signed_ca_style();
+    let running = serve(certificate, key, HttpOptions::default());
+    let transport = HttpTransport::with_trusted_certificate(
+        &running.url(),
+        TOKEN,
+        Some(&running.certificate_pem),
+    )
+    .unwrap();
+    assert_eq!(pull(&transport).unwrap(), 0);
+
+    // Trusting one such certificate does not trust another for the same name.
+    let (other, _) = self_signed_ca_style();
+    let wrong =
+        HttpTransport::with_trusted_certificate(&running.url(), TOKEN, Some(&other)).unwrap();
+    assert!(matches!(pull(&wrong), Err(TransportError::Permanent(_))));
+}
+
+#[test]
+fn a_certificate_issued_by_a_trusted_private_ca_is_accepted() {
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let server_key = rcgen::KeyPair::generate().unwrap();
+    let server_certificate = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .unwrap()
+        .signed_by(&server_key, &ca, &ca_key)
+        .unwrap();
+    let running = serve(
+        server_certificate.pem(),
+        server_key.serialize_pem(),
+        HttpOptions::default(),
+    );
+    let transport =
+        HttpTransport::with_trusted_certificate(&running.url(), TOKEN, Some(&ca.pem())).unwrap();
+    assert_eq!(pull(&transport).unwrap(), 0);
 }
