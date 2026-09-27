@@ -714,3 +714,50 @@ fn reopening_requeues_transient_derived_text_failures_up_to_three_attempts() {
         ));
     }
 }
+
+#[test]
+fn trashing_several_notes_is_one_transaction() {
+    let profile = tempdir().unwrap();
+    let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let create = |title: &str| {
+        repository
+            .create_note(CreateNote {
+                title: title.into(),
+                notebook_id: None,
+                document: document(title),
+            })
+            .unwrap()
+            .id
+    };
+    let (first, second, third) = (create("一"), create("二"), create("三"));
+    let outbox = repository.outbox_count().unwrap();
+
+    repository
+        .trash_notes(&[first.clone(), third.clone()])
+        .unwrap();
+    let in_trash = |id: &NoteId| {
+        repository
+            .load_note(id)
+            .unwrap()
+            .unwrap()
+            .deleted_time
+            .is_some()
+    };
+    assert!(in_trash(&first) && in_trash(&third) && !in_trash(&second));
+    assert_eq!(
+        repository.outbox_count().unwrap(),
+        outbox + 2,
+        "each is queued for sync"
+    );
+
+    // One target already in Trash: nothing moves, nothing is queued.
+    let outbox = repository.outbox_count().unwrap();
+    assert!(
+        repository
+            .trash_notes(&[second.clone(), first.clone()])
+            .is_err()
+    );
+    assert!(!in_trash(&second), "rolled back");
+    assert_eq!(repository.outbox_count().unwrap(), outbox);
+    assert!(repository.trash_notes(&[]).is_err());
+}

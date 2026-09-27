@@ -9584,3 +9584,121 @@ async fn typing_right_after_cmd_n_goes_into_the_new_notes_title(cx: &mut TestApp
     });
     assert_eq!(title, "新标题");
 }
+
+fn in_trash(repository: &LibraryRepository, id: &NoteId) -> bool {
+    repository
+        .load_note(id)
+        .unwrap()
+        .unwrap()
+        .deleted_time
+        .is_some()
+}
+
+/// The multi-selection path goes through the same pre-delete flush as a
+/// single note: a dirty open note that cannot be saved stops the whole
+/// delete instead of trashing the others or losing its text.
+#[gpui::test]
+async fn mounted_multi_selection_trash_is_refused_while_the_open_note_cannot_save(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let notes: Vec<NoteId> = ["甲", "乙", "丙"]
+        .into_iter()
+        .map(|title| {
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: None,
+                    document: rich_document(title),
+                })
+                .unwrap()
+                .id
+        })
+        .collect();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(notes[0].clone()), window, shell_cx);
+            shell.apply_action(
+                AppAction::ToggleNoteInSelection(notes[2].clone()),
+                window,
+                shell_cx,
+            );
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    session.update(cx, |session, _| {
+        session.force_save_failure_for_test("模拟写入失败")
+    });
+    cx.dispatch_action(TrashSelected);
+    redraw(cx);
+    assert!(
+        notes.iter().all(|id| !in_trash(&repository, id)),
+        "nothing trashed"
+    );
+    assert!(view.read_with(cx, |shell, _| shell.save_error_for_test().is_some()));
+}
+
+#[gpui::test]
+async fn mounted_multi_selection_trash_moves_every_selected_note_and_keeps_a_valid_selection(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let notes: Vec<NoteId> = ["甲", "乙", "丙", "丁"]
+        .into_iter()
+        .map(|title| {
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: None,
+                    document: rich_document(title),
+                })
+                .unwrap()
+                .id
+        })
+        .collect();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(notes[0].clone()), window, shell_cx);
+            shell.apply_action(
+                AppAction::ToggleNoteInSelection(notes[2].clone()),
+                window,
+                shell_cx,
+            );
+        });
+    });
+    redraw(cx);
+    cx.dispatch_action(TrashSelected);
+    redraw(cx);
+    assert!(in_trash(&repository, &notes[0]) && in_trash(&repository, &notes[2]));
+    assert!(!in_trash(&repository, &notes[1]) && !in_trash(&repository, &notes[3]));
+    let (selected, listed, editing) = view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        (
+            model.navigation().selected_note_id().cloned(),
+            model
+                .projections()
+                .iter()
+                .map(|note| note.id.clone())
+                .collect::<Vec<_>>(),
+            model.active_session_note_id().cloned(),
+        )
+    });
+    let selected = selected.expect("a successor is selected");
+    assert!(listed.contains(&selected) && !in_trash(&repository, &selected));
+    assert_eq!(editing, Some(selected));
+    assert_eq!(listed.len(), 2);
+
+    // A single selection still trashes just that note.
+    cx.dispatch_action(TrashSelected);
+    redraw(cx);
+    let remaining: Vec<&NoteId> = [&notes[1], &notes[3]]
+        .into_iter()
+        .filter(|id| !in_trash(&repository, id))
+        .collect();
+    assert_eq!(remaining.len(), 1);
+}

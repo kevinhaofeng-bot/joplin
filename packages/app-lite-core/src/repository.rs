@@ -1576,10 +1576,18 @@ impl LibraryRepository {
     }
 
     pub fn trash_note(&self, id: &NoteId) -> Result<(), LibraryError> {
-        self.set_deleted(id, true)
+        self.set_deleted(std::slice::from_ref(id), true)
     }
+
+    /// Moves every note to Trash in one transaction: if any of them is
+    /// missing or already in Trash, none is moved and `NotFound` is
+    /// returned. Attachments are untouched, as for one note.
+    pub fn trash_notes(&self, ids: &[NoteId]) -> Result<(), LibraryError> {
+        self.set_deleted(ids, true)
+    }
+
     pub fn restore_note(&self, id: &NoteId) -> Result<(), LibraryError> {
-        self.set_deleted(id, false)
+        self.set_deleted(std::slice::from_ref(id), false)
     }
 
     pub fn purge_note(&self, id: &NoteId) -> Result<(), LibraryError> {
@@ -3532,59 +3540,75 @@ impl LibraryRepository {
         result
     }
 
-    fn set_deleted(&self, id: &NoteId, deleted: bool) -> Result<(), LibraryError> {
+    fn set_deleted(&self, ids: &[NoteId], deleted: bool) -> Result<(), LibraryError> {
+        if ids.is_empty() {
+            return Err(LibraryError::NotFound);
+        }
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction()?;
-        let revision: i64 = transaction
-            .query_row(
-                "SELECT revision FROM notes WHERE id = ?1",
-                [id.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .ok_or(LibraryError::NotFound)?
-            + 1;
-        let updated = next_note_time(&transaction, id, now)?;
-        let count = if deleted {
-            transaction.execute("UPDATE notes SET deleted_time = ?2, updated_time = ?3, revision = ?4 WHERE id = ?1 AND deleted_time = 0", params![id.as_str(), now, updated, revision])?
-        } else {
-            let active_notebook: i64 = transaction.query_row("SELECT EXISTS(SELECT 1 FROM notes n JOIN notebooks b ON b.id=n.notebook_id WHERE n.id=?1 AND b.deleted_time=0)", [id.as_str()], |row| row.get(0))?;
-            let notebook = if active_notebook == 1 {
-                None
+        for (index, id) in ids.iter().enumerate() {
+            if ids[..index].contains(id) {
+                continue;
+            }
+            let revision: i64 = transaction
+                .query_row(
+                    "SELECT revision FROM notes WHERE id = ?1",
+                    [id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or(LibraryError::NotFound)?
+                + 1;
+            let updated = next_note_time(&transaction, id, now)?;
+            let count = if deleted {
+                transaction.execute("UPDATE notes SET deleted_time = ?2, updated_time = ?3, revision = ?4 WHERE id = ?1 AND deleted_time = 0", params![id.as_str(), now, updated, revision])?
             } else {
-                Some(default_notebook_id(&transaction)?)
+                let active_notebook: i64 = transaction.query_row("SELECT EXISTS(SELECT 1 FROM notes n JOIN notebooks b ON b.id=n.notebook_id WHERE n.id=?1 AND b.deleted_time=0)", [id.as_str()], |row| row.get(0))?;
+                let notebook = if active_notebook == 1 {
+                    None
+                } else {
+                    Some(default_notebook_id(&transaction)?)
+                };
+                transaction.execute("UPDATE notes SET deleted_time = 0, notebook_id = COALESCE(?2, notebook_id), updated_time = ?3, revision = ?4 WHERE id = ?1 AND deleted_time <> 0", params![id.as_str(), notebook.as_ref().map(NotebookId::as_str), updated, revision])?
             };
-            transaction.execute("UPDATE notes SET deleted_time = 0, notebook_id = COALESCE(?2, notebook_id), updated_time = ?3, revision = ?4 WHERE id = ?1 AND deleted_time <> 0", params![id.as_str(), notebook.as_ref().map(NotebookId::as_str), updated, revision])?
-        };
-        if count != 1 {
-            return Err(LibraryError::NotFound);
+            // Dropping the transaction rolls back notes already changed.
+            if count != 1 {
+                return Err(LibraryError::NotFound);
+            }
+            enqueue_sync(
+                &transaction,
+                self.id_source.as_ref(),
+                &EntityRef::Note(id.clone()),
+                revision,
+                if deleted { "trash" } else { "restore" },
+                updated,
+            )?;
+            queue_search(
+                &transaction,
+                id,
+                updated,
+                if deleted { "trash" } else { "restore" },
+            )?;
         }
-        enqueue_sync(
-            &transaction,
-            self.id_source.as_ref(),
-            &EntityRef::Note(id.clone()),
-            revision,
-            if deleted { "trash" } else { "restore" },
-            updated,
-        )?;
-        queue_search(
-            &transaction,
-            id,
-            updated,
-            if deleted { "trash" } else { "restore" },
-        )?;
         transaction.commit()?;
-        self.publish(vec![
-            if deleted {
-                LibraryEvent::NoteTrashed(id.clone())
-            } else {
-                LibraryEvent::NoteRestored(id.clone())
-            },
-            LibraryEvent::NoteProjectionChanged(id.clone()),
-            LibraryEvent::SearchProjectionQueued(id.clone()),
-            LibraryEvent::SyncQueued(EntityRef::Note(id.clone())),
-        ]);
+        let mut events = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            if ids[..index].contains(id) {
+                continue;
+            }
+            events.extend([
+                if deleted {
+                    LibraryEvent::NoteTrashed(id.clone())
+                } else {
+                    LibraryEvent::NoteRestored(id.clone())
+                },
+                LibraryEvent::NoteProjectionChanged(id.clone()),
+                LibraryEvent::SearchProjectionQueued(id.clone()),
+                LibraryEvent::SyncQueued(EntityRef::Note(id.clone())),
+            ]);
+        }
+        self.publish(events);
         Ok(())
     }
 

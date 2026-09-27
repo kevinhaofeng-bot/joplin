@@ -354,13 +354,14 @@ impl AppModel {
             } => self.navigate_to(route, selected_note_id),
             AppAction::NavigateBack => self.navigate_history(false),
             AppAction::NavigateForward => self.navigate_history(true),
-            AppAction::TrashNote(id) => self.trash_note(id),
-            AppAction::TrashSelected => self
-                .navigation
-                .selected_note_id()
-                .cloned()
-                .ok_or(LibraryError::NotFound)
-                .and_then(|id| self.trash_note(id)),
+            AppAction::TrashNote(id) => self.trash_notes(vec![id]),
+            // Every selected note, as Evernote's multi-select DELETE; one
+            // transaction, so a target that can no longer be trashed leaves
+            // all of them in place.
+            AppAction::TrashSelected => match self.selected_note_ids() {
+                ids if ids.is_empty() => Err(LibraryError::NotFound),
+                ids => self.trash_notes(ids),
+            },
             AppAction::RestoreNote(id) => self
                 .apply_organization_mutation("笔记已恢复", move |repository| {
                     repository.restore_note(&id)
@@ -525,8 +526,8 @@ impl AppModel {
         self.persist_shell_state()
     }
 
-    fn trash_note(&mut self, id: NoteId) -> Result<(), LibraryError> {
-        self.repository.trash_note(&id)?;
+    fn trash_notes(&mut self, ids: Vec<NoteId>) -> Result<(), LibraryError> {
+        self.repository.trash_notes(&ids)?;
         // The SQLite mutation has already committed, but its successor
         // selection, target Note hydration and persisted shell selection are
         // each fallible. Build them in the same candidate packet used for

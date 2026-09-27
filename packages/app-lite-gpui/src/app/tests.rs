@@ -2508,3 +2508,138 @@ fn copy_selected_note_selects_a_new_note_with_the_same_content() {
     assert!(model.projections().iter().any(|p| p.id == copy));
     assert!(model.projections().iter().any(|p| p.id == source));
 }
+
+/// Evernote's multi-select DELETE (renderer 9435.js, allMultiSelectHandlers
+/// `[As.DELETE]` dispatching every multi-selected note) moves all of them
+/// to Trash, not only the one whose editor is open.
+#[test]
+fn trashing_a_non_contiguous_multi_selection_trashes_every_selected_note_only() {
+    let (_profile, repository) = repository();
+    let resource = repository
+        .import_resource(b"picture bytes", "pic.png", "image/png", "png")
+        .unwrap();
+    let ids: Vec<NoteId> = (0..5)
+        .map(|index| {
+            let document = if index == 2 {
+                CanonicalDocument::from_blocks(vec![Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Image {
+                        resource_id: resource.clone(),
+                        alt: "图".into(),
+                        display_width: None,
+                        link: None,
+                    }],
+                }])
+            } else {
+                CanonicalDocument::default()
+            };
+            repository
+                .create_note(CreateNote {
+                    title: format!("笔记 {index}"),
+                    notebook_id: None,
+                    document,
+                })
+                .unwrap()
+                .id
+        })
+        .collect();
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    model
+        .dispatch(AppAction::SelectNote(ids[0].clone()))
+        .unwrap();
+    model
+        .dispatch(AppAction::ToggleNoteInSelection(ids[2].clone()))
+        .unwrap();
+    model
+        .dispatch(AppAction::ToggleNoteInSelection(ids[4].clone()))
+        .unwrap();
+    assert_eq!(
+        model.selected_note_ids(),
+        vec![ids[0].clone(), ids[2].clone(), ids[4].clone()]
+    );
+
+    model.dispatch(AppAction::TrashSelected).unwrap();
+
+    let trashed = |id: &NoteId| {
+        repository
+            .load_note(id)
+            .unwrap()
+            .unwrap()
+            .deleted_time
+            .is_some()
+    };
+    for index in [0, 2, 4] {
+        assert!(trashed(&ids[index]), "selected note {index} is in Trash");
+    }
+    for index in [1, 3] {
+        assert!(
+            !trashed(&ids[index]),
+            "unselected note {index} is untouched"
+        );
+    }
+    assert_eq!(
+        repository
+            .read_resource_bytes(&resource)
+            .unwrap()
+            .as_deref(),
+        Some(&b"picture bytes"[..]),
+        "a trashed note's attachment is kept"
+    );
+    // The successor selection is a live, listed note with its own session.
+    let selected = model.navigation().selected_note_id().cloned().unwrap();
+    assert!(selected == ids[1] || selected == ids[3], "{selected:?}");
+    assert_eq!(model.active_session_note_id(), Some(&selected));
+    assert_eq!(model.selected_note_ids(), vec![selected]);
+    assert!(model.projections().iter().all(|note| !trashed(&note.id)));
+
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Trash,
+            selected_note_id: None,
+        })
+        .unwrap();
+    let mut in_trash: Vec<NoteId> = model
+        .projections()
+        .iter()
+        .map(|note| note.id.clone())
+        .collect();
+    in_trash.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut expected = vec![ids[0].clone(), ids[2].clone(), ids[4].clone()];
+    expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(in_trash, expected);
+    model
+        .dispatch(AppAction::RestoreNote(ids[2].clone()))
+        .unwrap();
+    assert!(!trashed(&ids[2]), "restorable from Trash");
+    assert!(trashed(&ids[0]) && trashed(&ids[4]));
+}
+
+/// One transaction: when any selected note can no longer be trashed,
+/// nothing is, and the failure is reported instead of trashing the rest
+/// silently.
+#[test]
+fn a_multi_selection_trash_that_cannot_complete_trashes_nothing_and_says_so() {
+    let (_profile, repository) = repository();
+    let kept = create(&repository, "留下");
+    let gone = create(&repository, "已被别处删除");
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    model.dispatch(AppAction::SelectNote(kept.clone())).unwrap();
+    model
+        .dispatch(AppAction::ToggleNoteInSelection(gone.clone()))
+        .unwrap();
+    repository.trash_note(&gone).unwrap();
+
+    assert!(model.dispatch(AppAction::TrashSelected).is_err());
+    assert!(
+        repository
+            .load_note(&kept)
+            .unwrap()
+            .unwrap()
+            .deleted_time
+            .is_none(),
+        "not trashed on its own"
+    );
+    assert!(matches!(model.status(), AppStatus::Error(_)));
+    assert_eq!(model.navigation().selected_note_id(), Some(&kept));
+    assert_eq!(model.active_session_note_id(), Some(&kept));
+}
