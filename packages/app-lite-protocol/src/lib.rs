@@ -8,6 +8,62 @@ pub const MAX_PUSH_OPS: usize = 100;
 pub const MAX_PULL_LIMIT: usize = 500;
 pub const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
+/// Change notifications (`GET /v1/events`): a hint that the server head
+/// moved, never data; the client still pulls from its own cursor, so a lost
+/// event costs latency, not correctness.
+///
+/// The server sends `hello` at once, a comment line at least every
+/// `EVENTS_HEARTBEAT_SECONDS` (so carrier NAT and proxies keep the
+/// connection, and the client can call a silent one dead), and closes the
+/// stream after `EVENTS_MAX_STREAM_SECONDS` with `bye` so a connection the
+/// server cannot tell is dead does not live forever.
+pub const EVENTS_HEARTBEAT_SECONDS: u64 = 25;
+pub const EVENTS_MAX_STREAM_SECONDS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventHead {
+    pub head: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncEvent {
+    /// First event of every stream: the server's current head.
+    Hello {
+        head: u64,
+    },
+    Changed {
+        head: u64,
+    },
+    /// The server ended the stream on schedule; reconnect without backoff.
+    Bye,
+}
+
+impl SyncEvent {
+    /// One Server-Sent Events record.
+    pub fn to_sse(self) -> String {
+        match self {
+            Self::Hello { head } => format!("event: hello\ndata: {{\"head\":{head}}}\n\n"),
+            Self::Changed { head } => format!("event: changed\ndata: {{\"head\":{head}}}\n\n"),
+            Self::Bye => "event: bye\ndata: {}\n\n".into(),
+        }
+    }
+
+    /// Parses one record's `event` name and `data`; unknown names are None
+    /// so a newer server can add events.
+    pub fn from_sse(event: &str, data: &str) -> Option<Self> {
+        match event {
+            "hello" => serde_json::from_str::<EventHead>(data)
+                .ok()
+                .map(|EventHead { head }| Self::Hello { head }),
+            "changed" => serde_json::from_str::<EventHead>(data)
+                .ok()
+                .map(|EventHead { head }| Self::Changed { head }),
+            "bye" => Some(Self::Bye),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {

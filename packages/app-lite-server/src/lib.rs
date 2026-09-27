@@ -8,7 +8,8 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 use app_lite_protocol::{
@@ -46,6 +47,17 @@ pub struct ServerStore {
     connection: Mutex<Connection>,
     blobs: PathBuf,
     uploads: PathBuf,
+    /// Highest change cursor, for event streams waiting on it.
+    head: Mutex<u64>,
+    head_moved: Condvar,
+}
+
+fn query_head(connection: &Connection) -> Result<u64, rusqlite::Error> {
+    connection
+        .query_row("SELECT IFNULL(MAX(cursor), 0) FROM changes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|head| head as u64)
 }
 
 impl ServerStore {
@@ -62,10 +74,13 @@ impl ServerStore {
              CREATE TABLE IF NOT EXISTS entities (kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, deleted INTEGER NOT NULL, payload TEXT, PRIMARY KEY(kind, id));
              CREATE TABLE IF NOT EXISTS changes (cursor INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, deleted INTEGER NOT NULL, payload TEXT, op_id TEXT NOT NULL, device_id TEXT NOT NULL);",
         )?;
+        let head = query_head(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             blobs,
             uploads,
+            head: Mutex::new(head),
+            head_moved: Condvar::new(),
         })
     }
 
@@ -77,10 +92,46 @@ impl ServerStore {
             return Err(ServerError::BadRequest("too many ops or invalid device id"));
         }
         let mut results = Vec::with_capacity(request.ops.len());
-        for op in &request.ops {
-            results.push(self.apply(&request.device_id, op)?);
-        }
+        let outcome = request.ops.iter().try_for_each(|op| {
+            self.apply(&request.device_id, op)
+                .map(|result| results.push(result))
+        });
+        // Ops applied before a failure are committed: announce them too.
+        self.publish_head()?;
+        outcome?;
         Ok(PushResponse { results })
+    }
+
+    fn publish_head(&self) -> Result<(), ServerError> {
+        let head = query_head(&self.connection.lock().expect("server mutex poisoned"))?;
+        let mut current = self.head.lock().expect("head mutex poisoned");
+        if head != *current {
+            *current = head;
+            self.head_moved.notify_all();
+        }
+        Ok(())
+    }
+
+    pub fn head(&self) -> u64 {
+        *self.head.lock().expect("head mutex poisoned")
+    }
+
+    /// The head once it differs from `seen`, or after `timeout`.
+    pub fn wait_for_head(&self, seen: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        let mut head = self.head.lock().expect("head mutex poisoned");
+        while *head == seen {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            head = self
+                .head_moved
+                .wait_timeout(head, deadline - now)
+                .expect("head mutex poisoned")
+                .0;
+        }
+        *head
     }
 
     fn apply(&self, device_id: &str, op: &Operation) -> Result<OpResult, ServerError> {

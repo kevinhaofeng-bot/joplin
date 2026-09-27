@@ -11,7 +11,6 @@ serde = "1"
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tiny_http = "0.12"
 
 [dev-dependencies]
 app-lite-protocol = { path = "../app-lite-protocol", features = ["client"] }
