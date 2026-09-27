@@ -32,13 +32,17 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(app_lite_server::http::HttpOptions::default())
+}
+
+fn fixture_with(options: app_lite_server::http::HttpOptions) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("library");
     std::fs::create_dir(&profile).unwrap();
     let repository = Arc::new(LibraryRepository::open(profile.join("library.sqlite")).unwrap());
     let server_root = tempfile::tempdir().unwrap();
     let store = Arc::new(ServerStore::open(server_root.path()).unwrap());
-    let server = HttpServer::bind("127.0.0.1:0", store, TOKEN.into()).unwrap();
+    let server = HttpServer::bind_with("127.0.0.1:0", store, TOKEN.into(), options).unwrap();
     Fixture {
         _root: root,
         profile,
@@ -445,9 +449,7 @@ fn wait(seconds: u64, view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestCont
 }
 
 #[gpui::test]
-async fn sync_runs_on_its_own_after_local_changes_and_periodically_for_remote_ones(
-    cx: &mut TestAppContext,
-) {
+async fn sync_runs_on_its_own_and_remote_edits_arrive_by_notification(cx: &mut TestAppContext) {
     let fixture = fixture();
     fixture.configure(TOKEN);
     fixture
@@ -466,7 +468,16 @@ async fn sync_runs_on_its_own_after_local_changes_and_periodically_for_remote_on
         "{line}"
     );
     assert_eq!(attempts(&view, cx), 1);
+    wait_for_link(&view, cx);
+    wait(60, &view, cx);
+    assert_eq!(
+        attempts(&view, cx),
+        1,
+        "no sync without a cause, not even for our own upload's notification"
+    );
 
+    // Another device's edit arrives by notification, long before the
+    // periodic pull (the test clock does not move meanwhile).
     let (_other_root, other) = second_device(&fixture);
     let remote = other
         .create_note(CreateNote {
@@ -476,11 +487,35 @@ async fn sync_runs_on_its_own_after_local_changes_and_periodically_for_remote_on
         })
         .unwrap();
     app_lite_core::sync::sync_once(&other, &HttpTransport::new(&fixture.url(), TOKEN)).unwrap();
-    wait(60, &view, cx);
-    assert_eq!(attempts(&view, cx), 1, "nothing to send: no sync yet");
+    let arrived = (0..300).any(|_| {
+        cx.run_until_parked();
+        wait_for_sync(&view, cx);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fixture.repository.load_note(&remote.id).unwrap().is_some()
+    });
+    assert!(arrived, "{}", status(&view, cx));
+    assert_eq!(attempts(&view, cx), 2);
+
     wait(5 * 60, &view, cx);
-    assert_eq!(attempts(&view, cx), 2, "the periodic pull");
-    assert!(fixture.repository.load_note(&remote.id).unwrap().is_some());
+    assert_eq!(
+        attempts(&view, cx),
+        3,
+        "the periodic pull stays as a fallback"
+    );
+}
+
+/// Waits (real time) for the notification link's `hello`.
+fn wait_for_link(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) {
+    for _ in 0..300 {
+        cx.run_until_parked();
+        if view.read_with(cx, |shell, _| shell.event_link_state_for_test())
+            == crate::ui::sync_events::LinkState::Connected
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the notification link did not connect");
 }
 
 #[gpui::test]
@@ -570,4 +605,127 @@ async fn an_unreachable_server_backs_off_and_bad_credentials_pause_until_a_manua
         .unwrap();
     wait(5, &view, cx);
     assert_eq!(attempts(&view, cx), paused + 1, "resumed");
+}
+
+fn opens(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) -> usize {
+    view.read_with(cx, |shell, _| shell.event_link_opens_for_test())
+}
+
+fn link_state(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+) -> crate::ui::sync_events::LinkState {
+    view.read_with(cx, |shell, _| shell.event_link_state_for_test())
+}
+
+/// Runs the foreground until `done` holds, in real time (link threads).
+fn settle(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+    done: impl Fn(&gpui::Entity<LibraryShell>, &mut VisualTestContext) -> bool,
+) {
+    for _ in 0..500 {
+        cx.run_until_parked();
+        if done(view, cx) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("condition not reached: {:?}", link_state(view, cx));
+}
+
+#[gpui::test]
+async fn the_link_reconnects_at_once_after_bye_and_backs_off_after_losing_the_server(
+    cx: &mut TestAppContext,
+) {
+    use crate::ui::sync_events::LinkState;
+    let fixture = fixture_with(app_lite_server::http::HttpOptions {
+        heartbeat: std::time::Duration::from_millis(200),
+        max_stream: std::time::Duration::from_secs(1),
+        ..Default::default()
+    });
+    fixture.configure(TOKEN);
+    let (view, cx) = mount(&fixture, cx);
+    wait(5, &view, cx);
+    wait_for_link(&view, cx);
+    assert_eq!(opens(&view, cx), 1);
+    // The server's scheduled `bye`: a new stream at once, no clock needed.
+    settle(&view, cx, |view, cx| opens(view, cx) == 2);
+    wait_for_link(&view, cx);
+
+    drop(fixture.server);
+    settle(&view, cx, |view, cx| {
+        link_state(view, cx) == LinkState::Waiting
+    });
+    let lost = opens(&view, cx);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(2900));
+    cx.run_until_parked();
+    assert_eq!(opens(&view, cx), lost, "first retry after 3 s");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    settle(&view, cx, |view, cx| {
+        opens(view, cx) == lost + 1 && link_state(view, cx) == LinkState::Waiting
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(4900));
+    cx.run_until_parked();
+    assert_eq!(
+        opens(&view, cx),
+        lost + 1,
+        "then 5 s and up to 1 s of jitter"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(1200));
+    settle(&view, cx, |view, cx| opens(view, cx) == lost + 2);
+}
+
+#[gpui::test]
+async fn a_server_that_never_says_hello_is_given_up_after_15_seconds(cx: &mut TestAppContext) {
+    use crate::ui::sync_events::LinkState;
+    // Accepts connections and holds `/v1/events` without a byte; anything
+    // else gets 503 so ordinary syncs fail fast.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = silent.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for socket in silent.incoming() {
+            let Ok(mut socket) = socket else { return };
+            let mut head = [0u8; 1024];
+            let read = std::io::Read::read(&mut socket, &mut head).unwrap_or(0);
+            if String::from_utf8_lossy(&head[..read]).contains("/v1/events") {
+                held.push(socket);
+            } else {
+                let _ = std::io::Write::write_all(
+                    &mut socket,
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    let fixture = fixture();
+    std::fs::write(
+        fixture.profile.join("sync.json"),
+        serde_json::to_vec(
+            &serde_json::json!({ "server_url": format!("http://{address}"), "token": TOKEN }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    wait(5, &view, cx);
+    assert_eq!(opens(&view, cx), 1);
+    assert_eq!(link_state(&view, cx), LinkState::Connecting);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(14));
+    cx.run_until_parked();
+    assert_eq!(link_state(&view, cx), LinkState::Connecting);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(link_state(&view, cx), LinkState::Waiting);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.run_until_parked();
+    assert_eq!(opens(&view, cx), 2, "retried after the first backoff step");
 }

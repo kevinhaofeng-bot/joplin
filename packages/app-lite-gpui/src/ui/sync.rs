@@ -36,10 +36,13 @@ pub(crate) struct AutoSync {
     task: Option<Task<()>>,
     running_automatic: bool,
     last_finished: Option<Instant>,
-    retry_at: Option<Instant>,
-    backoff: Option<Duration>,
+    pub(super) retry_at: Option<Instant>,
+    pub(super) backoff: Option<Duration>,
     /// Set by a credential or protocol error; cleared by a manual sync.
-    paused: bool,
+    pub(super) paused: bool,
+    /// Latest head the server announced; a sync is due while it differs
+    /// from the local cursor.
+    pub(super) announced_head: Option<u64>,
     #[cfg(test)]
     attempts: usize,
 }
@@ -188,6 +191,7 @@ impl LibraryShell {
         self.auto_sync.paused = false;
         self.auto_sync.retry_at = None;
         self.auto_sync.backoff = None;
+        self.reconnect_event_link_now();
         self.start_sync(config, false, cx);
     }
 
@@ -227,9 +231,17 @@ impl LibraryShell {
         }));
     }
 
-    fn auto_sync_tick(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn auto_sync_tick(&mut self, cx: &mut Context<Self>) {
+        let config = (!self.auto_sync.paused)
+            .then(|| self.active_profile(cx))
+            .flatten()
+            .and_then(|profile| load_config(&profile).ok().flatten());
+        let Some(config) = config else {
+            self.stop_event_link();
+            return;
+        };
+        self.ensure_event_link(&config.server_url, &config.token, cx);
         if self.sync_status == ShellSyncStatus::Running
-            || self.auto_sync.paused
             || self.active_session_has_unsaved_changes(cx)
         {
             return;
@@ -238,25 +250,29 @@ impl LibraryShell {
         if self.auto_sync.retry_at.is_some_and(|at| now < at) {
             return;
         }
-        let Some(config) = self
-            .active_profile(cx)
-            .and_then(|profile| load_config(&profile).ok().flatten())
-        else {
-            return;
-        };
         let repository = self.model.read_with(cx, |model, _| model.repository());
         let parked = repository
             .sync_failures()
             .map(|failures| failures.iter().filter(|failure| failure.can_retry).count())
             .unwrap_or(0) as i64;
         let sendable = repository.sync_pending_count().unwrap_or(0) - parked;
+        let remote_due = self.remote_changes_announced(cx);
         let pull_due = self
             .auto_sync
             .last_finished
             .is_none_or(|at| now.duration_since(at) >= AUTO_SYNC_PULL_INTERVAL);
-        if sendable > 0 || pull_due {
+        if sendable > 0 || pull_due || remote_due {
             self.start_sync(config, true, cx);
         }
+    }
+
+    pub(super) fn remote_changes_announced(&self, cx: &App) -> bool {
+        self.auto_sync.announced_head.is_some_and(|head| {
+            self.model
+                .read_with(cx, |model, _| model.repository())
+                .sync_cursor()
+                .is_ok_and(|cursor| cursor != head)
+        })
     }
 
     /// Schedules the next automatic attempt from how this one ended.
@@ -325,6 +341,10 @@ impl LibraryShell {
             self.sync_status = ShellSyncStatus::Failed(format!("同步后刷新失败：{error}"));
         }
         self.sync_editor_surface(cx);
+        // Changes announced while this sync ran.
+        if self.remote_changes_announced(cx) {
+            self.auto_sync_tick(cx);
+        }
         cx.notify();
     }
 
@@ -425,8 +445,7 @@ impl LibraryShell {
     }
 
     pub(super) fn toggle_sync_failures(&mut self, cx: &mut Context<Self>) {
-        self.sync_failures_open = !self.sync_failures_open
-            && (!self.sync_failures(cx).is_empty() || !self.sync_conflicts(cx).is_empty());
+        self.sync_failures_open = !self.sync_failures_open;
         cx.notify();
     }
 
@@ -553,7 +572,7 @@ impl LibraryShell {
                 div()
                     .flex()
                     .justify_between()
-                    .child(div().text_color(rgba(0x25342bff)).child("同步问题"))
+                    .child(div().text_color(rgba(0x25342bff)).child("同步状态"))
                     .child(
                         div()
                             .id("sync-failures-close")
@@ -570,6 +589,12 @@ impl LibraryShell {
                             .child("关闭"),
                     ),
             );
+        panel = panel.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgba(0x536f59ff))
+                .child(self.event_link_text()),
+        );
         let conflicts = self.sync_conflicts(cx);
         if failures.is_empty() && conflicts.is_empty() {
             panel = panel.child(div().text_color(rgba(0x536f59ff)).child("没有同步问题。"));
