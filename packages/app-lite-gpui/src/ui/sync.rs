@@ -35,7 +35,7 @@ const AUTO_SYNC_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 pub(crate) struct AutoSync {
     task: Option<Task<()>>,
     running_automatic: bool,
-    last_finished: Option<Instant>,
+    pub(super) last_finished: Option<Instant>,
     pub(super) retry_at: Option<Instant>,
     pub(super) backoff: Option<Duration>,
     /// Set by a credential or protocol error; cleared by a manual sync.
@@ -267,6 +267,7 @@ impl LibraryShell {
             self.stop_event_link();
             return;
         };
+        self.check_link_environment();
         self.ensure_event_link(&config, cx);
         if self.sync_status == ShellSyncStatus::Running
             || self.active_session_has_unsaved_changes(cx)

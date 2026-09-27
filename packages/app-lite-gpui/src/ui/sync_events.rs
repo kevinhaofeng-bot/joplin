@@ -11,7 +11,10 @@
 //! `EVENTS_SILENCE_TIMEOUT` without a byte; reconnects back off 3, 5, 10,
 //! 30, 60 s plus up to 1 s jitter, and reset only on `hello`; the server's
 //! scheduled `bye` reconnects at once; refused credentials pause automatic
-//! sync until a manual sync succeeds.
+//! sync until a manual sync succeeds. Like the reference clients' resume
+//! from background, waking from sleep or a change of network (the local
+//! address of the default route) reconnects at once and syncs, instead of
+//! waiting for the silence timeout.
 
 use super::*;
 use app_lite_protocol::{SyncEvent, TransportError};
@@ -21,6 +24,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// More wall-clock time than this between two 5 s checks means the Mac
+/// slept.
+const WAKE_GAP: Duration = Duration::from_secs(30);
+
+/// What the link watches besides the stream; replaced in tests.
+pub(crate) trait LinkEnvironment {
+    fn wall_clock(&self) -> std::time::SystemTime;
+    /// Changes when the machine moves to another network; None offline.
+    fn network(&self) -> Option<std::net::IpAddr>;
+}
+
+pub(crate) struct SystemEnvironment;
+
+impl LinkEnvironment for SystemEnvironment {
+    fn wall_clock(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+
+    /// The source address the default route would use. A UDP connect
+    /// only selects the route; nothing is sent.
+    fn network(&self) -> Option<std::net::IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("192.0.2.1:9").ok()?;
+        socket.local_addr().ok().map(|address| address.ip())
+    }
+}
 const RECONNECT_STEPS_SECONDS: [u64; 5] = [3, 5, 10, 30, 60];
 
 /// Reconnect delays: the fixed steps, the last repeated, with up to 1 s of
@@ -74,6 +103,9 @@ pub(crate) struct EventLink {
     retry: Option<Task<()>>,
     last_event: Option<Instant>,
     config: Option<sync::SyncConfig>,
+    environment: Box<dyn LinkEnvironment>,
+    last_wall_clock: Option<std::time::SystemTime>,
+    last_network: Option<Option<std::net::IpAddr>>,
 }
 
 impl Default for EventLink {
@@ -86,6 +118,9 @@ impl Default for EventLink {
             retry: None,
             last_event: None,
             config: None,
+            environment: Box::new(SystemEnvironment),
+            last_wall_clock: None,
+            last_network: None,
         }
     }
 }
@@ -120,6 +155,36 @@ impl LibraryShell {
             self.event_link.state = LinkState::Off;
             self.event_link.task = None;
             self.event_link.retry = None;
+        }
+    }
+
+    /// Reconnects and syncs at once after sleep or a network change. Called
+    /// from the 5 s automatic-sync check.
+    pub(super) fn check_link_environment(&mut self) {
+        let wall = self.event_link.environment.wall_clock();
+        let network = self.event_link.environment.network();
+        let woke = self
+            .event_link
+            .last_wall_clock
+            .and_then(|previous| wall.duration_since(previous).ok())
+            .is_some_and(|gap| gap > WAKE_GAP);
+        let moved = self
+            .event_link
+            .last_network
+            .is_some_and(|previous| previous != network);
+        self.event_link.last_wall_clock = Some(wall);
+        self.event_link.last_network = Some(network);
+        if woke || moved {
+            self.stop_event_link();
+            self.event_link.reconnect.reset();
+            self.auto_sync.retry_at = None;
+            self.auto_sync.backoff = None;
+            // Makes the periodic pull due now.
+            self.auto_sync.last_finished = None;
+            #[cfg(test)]
+            {
+                self.event_link_recoveries += 1;
+            }
         }
     }
 
@@ -297,6 +362,16 @@ impl LibraryShell {
 
     pub(super) fn event_link_opens_for_test(&self) -> usize {
         self.event_link_opens
+    }
+
+    pub(super) fn event_link_recoveries_for_test(&self) -> usize {
+        self.event_link_recoveries
+    }
+
+    pub(super) fn set_link_environment_for_test(&mut self, environment: Box<dyn LinkEnvironment>) {
+        self.event_link.environment = environment;
+        self.event_link.last_wall_clock = None;
+        self.event_link.last_network = None;
     }
 }
 

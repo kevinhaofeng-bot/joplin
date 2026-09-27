@@ -523,6 +523,8 @@ pub struct LibraryShell {
     event_link: sync_events::EventLink,
     #[cfg(test)]
     event_link_opens: usize,
+    #[cfg(test)]
+    event_link_recoveries: usize,
     table_cell_editor: Option<table_cell_editor::TableCellEditor>,
     /// Saved before a native panel opens. Completion always uses this point,
     /// never an arbitrary caret that may have moved while the picker owned
@@ -1066,6 +1068,8 @@ impl LibraryShell {
             event_link: sync_events::EventLink::default(),
             #[cfg(test)]
             event_link_opens: 0,
+            #[cfg(test)]
+            event_link_recoveries: 0,
             table_cell_editor: None,
             pending_resource_insert: None,
             #[cfg(test)]

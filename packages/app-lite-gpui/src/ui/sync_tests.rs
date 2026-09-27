@@ -788,3 +788,67 @@ async fn sync_and_notifications_run_over_https_with_a_trusted_self_signed_certif
     wait(5, &view, cx);
     wait_for_link(&view, cx);
 }
+
+#[derive(Clone)]
+struct FakeEnvironment {
+    wall: std::rc::Rc<std::cell::Cell<std::time::SystemTime>>,
+    network: std::rc::Rc<std::cell::Cell<Option<std::net::IpAddr>>>,
+}
+
+impl crate::ui::sync_events::LinkEnvironment for FakeEnvironment {
+    fn wall_clock(&self) -> std::time::SystemTime {
+        self.wall.get()
+    }
+    fn network(&self) -> Option<std::net::IpAddr> {
+        self.network.get()
+    }
+}
+
+#[gpui::test]
+async fn waking_from_sleep_or_changing_network_reconnects_and_syncs_at_once(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    fixture.configure(TOKEN);
+    let (view, cx) = mount(&fixture, cx);
+    let environment = FakeEnvironment {
+        wall: std::rc::Rc::new(std::cell::Cell::new(std::time::SystemTime::now())),
+        network: std::rc::Rc::new(std::cell::Cell::new(Some("192.168.5.151".parse().unwrap()))),
+    };
+    view.update(cx, |shell, _| {
+        shell.set_link_environment_for_test(Box::new(environment.clone()))
+    });
+    let recoveries = |view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, _| shell.event_link_recoveries_for_test())
+    };
+    wait(5, &view, cx);
+    wait_for_link(&view, cx);
+    let (first_opens, first_attempts) = (opens(&view, cx), attempts(&view, cx));
+    // Ordinary time passing is not a wake-up.
+    for _ in 0..12 {
+        environment
+            .wall
+            .set(environment.wall.get() + std::time::Duration::from_secs(5));
+        wait(5, &view, cx);
+    }
+    assert_eq!(recoveries(&view, cx), 0);
+    assert_eq!(opens(&view, cx), first_opens);
+
+    environment
+        .wall
+        .set(environment.wall.get() + std::time::Duration::from_secs(10 * 60));
+    wait(5, &view, cx);
+    assert_eq!(recoveries(&view, cx), 1, "woke from sleep");
+    wait_for_link(&view, cx);
+    assert_eq!(opens(&view, cx), first_opens + 1);
+    assert_eq!(attempts(&view, cx), first_attempts + 1, "and pulled");
+
+    environment
+        .network
+        .set(Some("172.20.10.2".parse().unwrap()));
+    wait(5, &view, cx);
+    assert_eq!(recoveries(&view, cx), 2, "moved to another network");
+    wait_for_link(&view, cx);
+    assert_eq!(opens(&view, cx), first_opens + 2);
+    assert_eq!(attempts(&view, cx), first_attempts + 2);
+}
