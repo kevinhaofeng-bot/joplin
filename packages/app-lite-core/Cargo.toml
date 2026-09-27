@@ -30,5 +30,6 @@ tempfile = "3"
 xml-syntax-reader = { path = "vendor/xml-syntax-reader-0.2.0" }
 
 [dev-dependencies]
+app-lite-protocol = { path = "../app-lite-protocol", features = ["client"] }
 app-lite-server = { path = "../app-lite-server" }
 tempfile = "3"
