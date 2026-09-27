@@ -8080,6 +8080,44 @@ fn table_cells_rows_and_columns_edit_undo_and_save(cx: &mut gpui::TestAppContext
     assert!(editor.delete_table_column(table, 0).is_err());
 }
 
+#[test]
+fn long_table_cells_wrap_into_taller_rows_that_hit_testing_agrees_with() {
+    use super::layout::{TABLE_LINE_HEIGHT, table_cell_at, table_height, table_row_heights};
+    let table = super::model::TableContent {
+        header: true,
+        rows: vec![
+            vec!["项目".into(), "说明".into()],
+            vec!["短".into(), "很长的说明文字".repeat(8)],
+            vec!["末行".into(), "b".into()],
+        ],
+        canonical: app_lite_core::document::Block::Table {
+            header: true,
+            rows: Vec::new(),
+        },
+    };
+    let heights = table_row_heights(&table, 400.0);
+    assert_eq!(heights[0], heights[2]);
+    assert!(
+        heights[1] >= heights[0] + 2.0 * TABLE_LINE_HEIGHT,
+        "{heights:?}"
+    );
+    let narrow: f32 = table_row_heights(&table, 200.0).iter().sum();
+    assert!(narrow > table_height(&table, 400.0));
+    let bounds = Bounds::new(
+        point(px(0.0), px(0.0)),
+        gpui::size(px(400.0), px(heights.iter().sum())),
+    );
+    let last_row_top = heights[0] + heights[1];
+    assert_eq!(
+        table_cell_at(&table, bounds, point(px(10.0), px(last_row_top - 1.0))),
+        Some((1, 0))
+    );
+    assert_eq!(
+        table_cell_at(&table, bounds, point(px(390.0), px(last_row_top + 1.0))),
+        Some((2, 1))
+    );
+}
+
 #[gpui::test]
 fn inserting_a_table_splits_the_paragraph_saves_and_undoes(cx: &mut gpui::TestAppContext) {
     let mut editor = EditorCore::for_test("前后", cx);

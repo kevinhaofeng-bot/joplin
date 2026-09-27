@@ -677,22 +677,33 @@ fn paint_snapshot(
     Ok(())
 }
 
-/// Paints a read-only table atom: equal-width columns, one fixed line
-/// height per displayed line, text clipped to its cell.
+/// Paints a table atom: equal-width columns, cell text wrapped to its
+/// column and clipped to its cell. Row heights come from the same estimate
+/// layout and hit-testing use.
 fn paint_table(
     table: &super::model::TableContent,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Result<()> {
-    use super::layout::{TABLE_LINE_HEIGHT, TABLE_ROW_PADDING};
+    use super::layout::{
+        TABLE_CELL_PADDING_X, TABLE_LINE_HEIGHT, TABLE_ROW_PADDING, table_cell_text_width,
+        table_row_heights,
+    };
+    let width = f32::from(bounds.size.width);
     let columns = table.column_count().max(1);
     let column_width = bounds.size.width / columns as f32;
+    let text_width = px(table_cell_text_width(table, width));
     let border = rgba(0xc9d3ccff);
     let style = window.text_style();
     let mut top = bounds.top();
-    for (row_index, (row, lines)) in table.rows.iter().zip(table.row_line_counts()).enumerate() {
-        let row_height = px(lines as f32 * TABLE_LINE_HEIGHT + TABLE_ROW_PADDING);
+    for (row_index, (row, height)) in table
+        .rows
+        .iter()
+        .zip(table_row_heights(table, width))
+        .enumerate()
+    {
+        let row_height = px(height);
         let is_header = table.header && row_index == 0;
         if is_header {
             window.paint_quad(fill(
@@ -717,9 +728,10 @@ fn paint_table(
                 font.weight = FontWeight::SEMIBOLD;
             }
             window.with_content_mask(Some(gpui::ContentMask { bounds: cell }), |window| {
-                for (line_index, line) in text.lines().enumerate() {
+                let mut y = cell.top() + px(TABLE_ROW_PADDING / 2.0);
+                for line in text.split('\n') {
                     let line: SharedString = line.to_owned().into();
-                    let shaped = window.text_system().shape_line(
+                    let wrapped = window.text_system().shape_text(
                         line.clone(),
                         px(14.0),
                         &[TextRun {
@@ -730,20 +742,23 @@ fn paint_table(
                             underline: None,
                             strikethrough: None,
                         }],
+                        Some(text_width),
                         None,
-                    );
-                    shaped.paint(
-                        point(
-                            cell.left() + px(8.0),
-                            cell.top()
-                                + px(
-                                    TABLE_ROW_PADDING / 2.0 + line_index as f32 * TABLE_LINE_HEIGHT
-                                ),
-                        ),
-                        px(TABLE_LINE_HEIGHT),
-                        window,
-                        cx,
                     )?;
+                    for wrapped_line in wrapped {
+                        wrapped_line.paint(
+                            point(cell.left() + px(TABLE_CELL_PADDING_X), y),
+                            px(TABLE_LINE_HEIGHT),
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )?;
+                        y += wrapped_line.size(px(TABLE_LINE_HEIGHT)).height;
+                    }
+                    if line.is_empty() {
+                        y += px(TABLE_LINE_HEIGHT);
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             })?;

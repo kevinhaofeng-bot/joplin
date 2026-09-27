@@ -248,16 +248,6 @@ impl TableContent {
     pub fn column_count(&self) -> usize {
         self.rows.iter().map(Vec::len).max().unwrap_or(0)
     }
-
-    /// Display lines of the tallest cell in each row.
-    pub fn row_line_counts(&self) -> impl Iterator<Item = usize> + '_ {
-        self.rows.iter().map(|row| {
-            row.iter()
-                .map(|cell| cell.lines().count().max(1))
-                .max()
-                .unwrap_or(1)
-        })
-    }
 }
 
 impl BlockContent {

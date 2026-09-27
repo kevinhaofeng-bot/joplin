@@ -34,12 +34,48 @@ const DEFAULT_TEXT_HEIGHT: f32 = 24.0;
 /// chrome; the layout registry owns this stable document-coordinate height.
 pub(crate) const ATTACHMENT_CARD_HEIGHT: f32 = 76.0;
 /// Read-only table atom geometry: one fixed line height per displayed line,
-/// with vertical padding per row. Cell text is not wrapped (step 1).
+/// with vertical padding per row; cell text wraps to the column width.
 pub(crate) const TABLE_LINE_HEIGHT: f32 = 22.0;
 pub(crate) const TABLE_ROW_PADDING: f32 = 10.0;
 
+/// Horizontal padding inside a table cell.
+pub(crate) const TABLE_CELL_PADDING_X: f32 = 8.0;
+
+/// Width available to the text of one cell in a table `width` wide.
+pub(crate) fn table_cell_text_width(table: &super::model::TableContent, width: f32) -> f32 {
+    (width / table.column_count().max(1) as f32 - 2.0 * TABLE_CELL_PADDING_X).max(8.0)
+}
+
+/// Row heights for a table laid out `width` wide. Wrapped lines are
+/// estimated without shaping (full-width CJK, half-width ASCII), generous
+/// enough that painted text normally fits; paint clips to the cell anyway.
+pub(crate) fn table_row_heights(table: &super::model::TableContent, width: f32) -> Vec<f32> {
+    let text_width = table_cell_text_width(table, width);
+    table
+        .rows
+        .iter()
+        .map(|row| {
+            let lines = row
+                .iter()
+                .map(|cell| {
+                    cell.split('\n')
+                        .map(|line| {
+                            let estimated: f32 = line
+                                .chars()
+                                .map(|c| if c.is_ascii() { 8.0 } else { 14.5 })
+                                .sum();
+                            (estimated / text_width).ceil().max(1.0)
+                        })
+                        .sum::<f32>()
+                })
+                .fold(1.0, f32::max);
+            lines * TABLE_LINE_HEIGHT + TABLE_ROW_PADDING
+        })
+        .collect()
+}
+
 /// The cell under `position`, using the same geometry `paint_table` draws:
-/// equal-width columns, rows as tall as their tallest cell.
+/// equal-width columns, rows as tall as their tallest (wrapped) cell.
 pub(crate) fn table_cell_at(
     table: &super::model::TableContent,
     bounds: Bounds<Pixels>,
@@ -53,8 +89,10 @@ pub(crate) fn table_cell_at(
     let column = ((fraction * columns as f32).floor() as usize).min(columns - 1);
     let mut top = f32::from(bounds.top());
     let y = f32::from(position.y);
-    for (row, lines) in table.row_line_counts().enumerate() {
-        let height = lines as f32 * TABLE_LINE_HEIGHT + TABLE_ROW_PADDING;
+    for (row, height) in table_row_heights(table, f32::from(bounds.size.width))
+        .into_iter()
+        .enumerate()
+    {
         if y < top + height {
             return Some((row, column));
         }
@@ -63,10 +101,9 @@ pub(crate) fn table_cell_at(
     None
 }
 
-pub(crate) fn table_height(table: &super::model::TableContent) -> f32 {
-    table
-        .row_line_counts()
-        .map(|lines| lines as f32 * TABLE_LINE_HEIGHT + TABLE_ROW_PADDING)
+pub(crate) fn table_height(table: &super::model::TableContent, width: f32) -> f32 {
+    table_row_heights(table, width)
+        .into_iter()
         .sum::<f32>()
         .max(TABLE_LINE_HEIGHT + TABLE_ROW_PADDING)
 }
@@ -157,7 +194,7 @@ fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
             ..
         } => image_layout_size(available_width, *natural_size, *display_width),
         BlockContent::Attachment { .. } => (available_width, ATTACHMENT_CARD_HEIGHT),
-        BlockContent::Table(table) => (available_width, table_height(table)),
+        BlockContent::Table(table) => (available_width, table_height(table, available_width)),
         _ => (available_width, DEFAULT_TEXT_HEIGHT),
     };
     Bounds::new(
@@ -2112,7 +2149,7 @@ impl LayoutRegistry {
                     .1
                 }
                 BlockContent::Attachment { .. } => ATTACHMENT_CARD_HEIGHT,
-                BlockContent::Table(table) => table_height(table),
+                BlockContent::Table(table) => table_height(table, width),
                 _ => DEFAULT_TEXT_HEIGHT,
             };
             this.estimated_heights.insert(block.id, height.max(1.0));
