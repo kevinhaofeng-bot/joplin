@@ -401,7 +401,7 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 
 - **NAS 部署**：等待用户在本会话明确同意；部署前先读 `~/servers.md`，只用独立目录、端口和容器。
 - **实机检查**：本会话没有操作界面的工具。表格显示与编辑、同步菜单与状态、撤销合并、输入法，需要 Codex 或用户用上面的 Release 包在隔离 profile 上实机检查。
-- **同步**：没有自动/定时同步（只有“立即同步”）；没有冲突副本列表界面（冲突副本以“（冲突副本）”标题的普通笔记出现）。永久失败的界面见下节（`2101461fd`、`1863f92f3`）。
+- **同步**：自动同步、冲突副本列表、永久失败界面都已补上，见文末两节。
 - **迁移**：85 篇降级，其中外链图片是否联网抓取需要用户决定；行内数学在 Evernote 核心里没有对应，保持降级。
 - 表格限制见上节。
 
@@ -455,3 +455,72 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 - 挂载 UI `ui::sync_tests::a_refused_upload_is_listed_and_retried_only_from_its_button`：本机 HTTP 服务端，真实点击状态栏和“重试”按钮，另一台设备收到修改后的内容。gpui 0.2.2 的 `debug_bounds` 不清除旧帧条目，所以“按钮已消失”用 shell 状态断言，不用 `debug_bounds().is_none()`。
 
 以上都是本会话自测，不是 Codex 验收。没有实机点击，也没有接触 NAS 或生产服务。
+
+## 同步收尾：未保存编辑不再丢失、自动同步、冲突副本列表（`2002ba400`..`8166eedd1`）
+
+### 修复：同步结束时丢弃当前笔记的未保存编辑（`2002ba400`、`ad09c5636`）
+
+同步结束后，编辑器总是从存储重新挂载。在同步进行中输入、还没来得及保存的文字会被静默丢弃。**即使这次同步根本没改动当前笔记**也会丢。手动同步会先保存，所以丢失发生在同步进行中的输入；自动同步会让这种情况变得常见，因此先修这个。
+
+先失败证据：临时把 `finish_sync` 恢复为旧行为（无条件重新挂载）后跑新测试，两条都失败（`/tmp/joplin-final-claude/sync-failures/overtaken-red.log`）：
+
+- 远端改了当前笔记：没有冲突副本，本机输入丢失。
+- 远端只新增了别的笔记：编辑器里只剩“原文”，输入丢失。
+
+修复：
+
+- 只有当同步替换了编辑器所基于的版本时，才重新挂载编辑器。
+- 此时如果有未保存的编辑，先用新增的核心方法 `save_overtaken_edit_as_conflict_copy` 另存为“标题（冲突副本）”：放在同一笔记本，复制标签；原笔记已被彻底删除时放进默认笔记本。这与拉取时“已保存但未同步的编辑”的处理一致：远端版本占用原 id，本机内容成为冲突副本。
+- 如果另存失败，不替换编辑器，状态栏说明情况并请用户先复制。
+- 正在输入、尚未确认的输入法候选文字不算编辑，不会被保存。
+
+### 自动同步（`39bce21c6`）
+
+| 参照 | 文件 / SHA256 | 内容 |
+| --- | --- | --- |
+| Evernote | `68232__sync-manager.js` `2870d3e0…9d7a`，`getNextActivity` | 有未同步修改且队列空闲时，安排一次 5 s 后的后台上传（`runAfter: now + MILLIS_IN_ONE_SECOND * 5`）；调度器最多等 10 s 再检查 |
+| Evernote | `21551__module-21551.js` `a1d08fd6…811d` | `SHORT_RETRY_TIME` 30 s，`ACTIVITY_RECURRENCY_TIME` 5 min（常量出处；它们在 Evernote 里用于别的活动，这里只借用数值） |
+
+实现：配置了同步后，每 5 s 检查一次：
+
+- 有可发送的本地修改（待同步数减去挂起的被拒项）时同步。
+- 距上次同步满 5 分钟时同步一次，拉取远端修改。**这是独立设计**：Evernote 下载靠服务端推送，我们的服务端没有推送。
+- 当前笔记有未保存输入时不同步。
+- 服务器不可达时退避：30 s，之后翻倍，最长 5 min。
+- 凭据或协议错误后暂停自动同步，状态栏写明，直到用户手动“立即同步”。
+
+同时修正状态文案：服务器不可达时以前显示“已同步：上传 0、下载 0…”，现在显示“未能连接同步服务器，稍后自动重试”，并保留“待同步”计数。
+
+### 冲突副本列表（`4c1ddab43`、`8166eedd1`）
+
+Evernote 参照 `32150__localization-catalog.js`（`5fff17c5…70b4`）：`Home.widgetDesc.scratchPad.conflicts`“{N} conflicting versions — Select the items you want to keep”，`Home.content.conflict.label`“Conflict - {NOTE_LABEL}”。
+
+实现：
+
+- core 的 `sync_conflicts()` 列出本机产生、尚未处理且副本仍在的冲突副本；`sync_resolve_conflict` 写 `resolved_time`（表中原有该列，无需迁移）。副本移入废纸篓也视为已处理。标记已处理不会删除副本笔记。
+- 状态栏显示“N 个冲突副本待处理，点此查看”。同步问题面板里每条冲突副本有“打开”（选中副本）和“已处理”两个按钮。
+- 限制：冲突记录只在产生副本的设备上有；其他设备收到的副本是普通笔记，不进这个列表。
+
+### 测试
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| 纯净检出 `8166eedd1`：core `--features test-support --tests` | 退出0；385 通过 | `/tmp/joplin-final-claude/clean-8166eedd1/core.log` |
+| 纯净检出：server | 退出0；15 通过 | `server.log` |
+| 纯净检出：gpui `--bin velotype` | 退出0；1389 通过、0 失败、1 忽略 | `gpui.log` |
+| 纯净检出：`package-notes-macos.sh /tmp/joplin-final-claude/dist-notes` | 退出0；`20260927T101320Z-8166eedd1/Joplin Lite.app`，0.7.2 (16259)，`worktree_dirty_for_app_sources: no`，binary SHA256 `e800ae4f…e89443f` | `package.log` |
+| 上面的包在导入库拷贝 `/tmp/joplin-final-claude/mem-profile` 上空闲内存，3 次各静置 10 s | 退出0；RSS 69.2 / 70.0 / 71.5 MiB（该拷贝未配置同步，自动同步不运行） | `memory/summary.txt` |
+
+新增的挂载测试（本机真实 HTTP 服务端，测试时钟快进）：
+
+- `an_unsaved_edit_overtaken_by_a_sync_is_kept_as_a_conflict_copy`：未保存编辑成为冲突副本，编辑器显示远端版本；状态栏计数；点“打开”选中副本；点“已处理”后从列表消失，副本仍在。
+- `a_sync_that_leaves_the_open_note_alone_keeps_its_unsaved_edit`：同步没有改动当前笔记时，编辑器保留输入，之后正常保存。
+- `sync_runs_on_its_own_after_local_changes_and_periodically_for_remote_ones`：5 s 内上传；没有待发内容时 60 s 内不同步；5 分钟后拉到远端新笔记。
+- `automatic_sync_waits_for_unsaved_input`：有未保存输入时，30 s 内 0 次自动同步。
+- `an_unreachable_server_backs_off_and_bad_credentials_pause_until_a_manual_sync`：退避间隔 30 s、60 s；token 错误后 10 分钟内 0 次尝试，状态栏写明已暂停；手动同步成功后恢复。
+
+core 新增 `an_unsaved_edit_overtaken_by_a_remote_version_is_kept_as_a_conflict_copy`，并在并发编辑用例中覆盖列表与“已处理”。
+
+以上是本会话自测，不是 Codex 验收。没有实机点击，没有部署 NAS，没有改动生产服务、原资料库或已安装的 App。
+
+仍未完成：下载侧失败无法手动忽略，会一直列着；实机检查；NAS 部署（需要用户在本会话明确同意）；外链图片是否联网抓取（需要用户决定）；GPUI 编译警告约 150 行。
