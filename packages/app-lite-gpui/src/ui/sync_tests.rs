@@ -405,3 +405,146 @@ async fn a_sync_that_leaves_the_open_note_alone_keeps_its_unsaved_edit(cx: &mut 
     let stored = fixture.repository.load_note(&note.id).unwrap().unwrap();
     assert!(stored.body_html.contains("继续写"), "{}", stored.body_html);
 }
+
+fn attempts(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) -> usize {
+    view.read_with(cx, |shell, _| shell.auto_sync_attempts_for_test())
+}
+
+/// Lets `seconds` pass on the test clock and any sync it starts finish.
+fn wait(seconds: u64, view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) -> String {
+    for _ in 0..seconds {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        wait_for_sync(view, cx);
+    }
+    status(view, cx)
+}
+
+#[gpui::test]
+async fn sync_runs_on_its_own_after_local_changes_and_periodically_for_remote_ones(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    fixture.configure(TOKEN);
+    fixture
+        .repository
+        .create_note(CreateNote {
+            title: "本机写的".into(),
+            notebook_id: None,
+            document: text("x"),
+        })
+        .unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    assert!(status(&view, cx).contains("待同步"));
+    let line = wait(5, &view, cx);
+    assert!(
+        line.starts_with("已同步") && !line.contains("待同步"),
+        "{line}"
+    );
+    assert_eq!(attempts(&view, cx), 1);
+
+    let (_other_root, other) = second_device(&fixture);
+    let remote = other
+        .create_note(CreateNote {
+            title: "另一台设备的".into(),
+            notebook_id: None,
+            document: text("y"),
+        })
+        .unwrap();
+    app_lite_core::sync::sync_once(&other, &HttpTransport::new(&fixture.url(), TOKEN)).unwrap();
+    wait(60, &view, cx);
+    assert_eq!(attempts(&view, cx), 1, "nothing to send: no sync yet");
+    wait(5 * 60, &view, cx);
+    assert_eq!(attempts(&view, cx), 2, "the periodic pull");
+    assert!(fixture.repository.load_note(&remote.id).unwrap().is_some());
+}
+
+#[gpui::test]
+async fn automatic_sync_waits_for_unsaved_input(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    fixture.configure(TOKEN);
+    let note = fixture
+        .repository
+        .create_note(CreateNote {
+            title: "正在写".into(),
+            notebook_id: None,
+            document: text("原文"),
+        })
+        .unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        })
+    });
+    redraw(cx);
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input("还没保存");
+    wait(30, &view, cx);
+    assert_eq!(attempts(&view, cx), 0);
+}
+
+#[gpui::test]
+async fn an_unreachable_server_backs_off_and_bad_credentials_pause_until_a_manual_sync(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_url = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    std::fs::write(
+        fixture.profile.join("sync.json"),
+        serde_json::to_vec(&serde_json::json!({ "server_url": closed_url, "token": TOKEN }))
+            .unwrap(),
+    )
+    .unwrap();
+    fixture
+        .repository
+        .create_note(CreateNote {
+            title: "等网络".into(),
+            notebook_id: None,
+            document: text("x"),
+        })
+        .unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    let line = wait(5, &view, cx);
+    assert_eq!(attempts(&view, cx), 1);
+    assert!(
+        line.starts_with("未能连接同步服务器，稍后自动重试") && line.contains("待同步"),
+        "{line}"
+    );
+    wait(25, &view, cx);
+    assert_eq!(attempts(&view, cx), 1, "backing off 30 s");
+    wait(10, &view, cx);
+    assert_eq!(attempts(&view, cx), 2);
+    wait(50, &view, cx);
+    assert_eq!(attempts(&view, cx), 2, "then 60 s");
+    wait(15, &view, cx);
+    assert_eq!(attempts(&view, cx), 3);
+
+    fixture.configure("not-the-right-token");
+    wait(5 * 60, &view, cx);
+    let paused = attempts(&view, cx);
+    let line = wait(10 * 60, &view, cx);
+    assert!(line.contains("自动同步已暂停"), "{line}");
+    assert_eq!(attempts(&view, cx), paused, "no attempts while paused");
+
+    fixture.configure(TOKEN);
+    let line = sync_now(&view, cx);
+    assert!(
+        line.starts_with("已同步") && !line.contains("待同步"),
+        "{line}"
+    );
+    fixture
+        .repository
+        .create_note(CreateNote {
+            title: "之后的".into(),
+            notebook_id: None,
+            document: text("z"),
+        })
+        .unwrap();
+    wait(5, &view, cx);
+    assert_eq!(attempts(&view, cx), paused + 1, "resumed");
+}

@@ -6,6 +6,12 @@
 //! editor never keeps a revision the sync replaced. The status line always
 //! says whether work is only saved locally or confirmed by the server.
 //!
+//! Once configured, sync also runs on its own (`AutoSync`): 5 s after local
+//! changes are saved (Evernote schedules its background upsync 5 s out), and
+//! every 5 minutes to pick up remote changes. It never runs while the open
+//! note has unsaved input, backs off while the server is unreachable, and
+//! pauses after a credential or protocol error until "立即同步" succeeds.
+//!
 //! Changes the server refused, or remote changes that could not be read,
 //! stay listed under "同步问题…" until they resolve. A refused upload is
 //! retried only when the person presses "重试": that sends the item's
@@ -18,6 +24,25 @@ use app_lite_core::SyncFailure;
 use app_lite_core::sync::{SyncError, SyncReport, retry_failure, sync_once};
 use app_lite_protocol::client::HttpTransport;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+const AUTO_SYNC_TICK: Duration = Duration::from_secs(5);
+const AUTO_SYNC_PULL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const AUTO_SYNC_FIRST_BACKOFF: Duration = Duration::from_secs(30);
+const AUTO_SYNC_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+pub(crate) struct AutoSync {
+    task: Option<Task<()>>,
+    running_automatic: bool,
+    last_finished: Option<Instant>,
+    retry_at: Option<Instant>,
+    backoff: Option<Duration>,
+    /// Set by a credential or protocol error; cleared by a manual sync.
+    paused: bool,
+    #[cfg(test)]
+    attempts: usize,
+}
 
 pub(super) const SYNC_CONFIG_FILE: &str = "sync.json";
 
@@ -160,7 +185,19 @@ impl LibraryShell {
             cx.notify();
             return;
         }
+        self.auto_sync.paused = false;
+        self.auto_sync.retry_at = None;
+        self.auto_sync.backoff = None;
+        self.start_sync(config, false, cx);
+    }
+
+    fn start_sync(&mut self, config: SyncConfig, automatic: bool, cx: &mut Context<Self>) {
         self.sync_status = ShellSyncStatus::Running;
+        self.auto_sync.running_automatic = automatic;
+        #[cfg(test)]
+        {
+            self.auto_sync.attempts += usize::from(automatic);
+        }
         cx.notify();
         let repository = self.model.read_with(cx, |model, _| model.repository());
         cx.spawn(async move |this, cx| {
@@ -176,11 +213,86 @@ impl LibraryShell {
         .detach();
     }
 
+    pub(super) fn start_auto_sync(&mut self, cx: &mut Context<Self>) {
+        self.auto_sync.task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTO_SYNC_TICK).await;
+                if this
+                    .update(cx, |shell, shell_cx| shell.auto_sync_tick(shell_cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn auto_sync_tick(&mut self, cx: &mut Context<Self>) {
+        if self.sync_status == ShellSyncStatus::Running
+            || self.auto_sync.paused
+            || self.active_session_has_unsaved_changes(cx)
+        {
+            return;
+        }
+        let now = cx.background_executor().now();
+        if self.auto_sync.retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+        let Some(config) = self
+            .active_profile(cx)
+            .and_then(|profile| load_config(&profile).ok().flatten())
+        else {
+            return;
+        };
+        let repository = self.model.read_with(cx, |model, _| model.repository());
+        let parked = repository
+            .sync_failures()
+            .map(|failures| failures.iter().filter(|failure| failure.can_retry).count())
+            .unwrap_or(0) as i64;
+        let sendable = repository.sync_pending_count().unwrap_or(0) - parked;
+        let pull_due = self
+            .auto_sync
+            .last_finished
+            .is_none_or(|at| now.duration_since(at) >= AUTO_SYNC_PULL_INTERVAL);
+        if sendable > 0 || pull_due {
+            self.start_sync(config, true, cx);
+        }
+    }
+
+    /// Schedules the next automatic attempt from how this one ended.
+    fn note_auto_sync_outcome(&mut self, result: &Result<SyncReport, SyncError>, cx: &App) {
+        let now = cx.background_executor().now();
+        self.auto_sync.last_finished = Some(now);
+        let unreachable = match result {
+            Ok(report) => report.retryable > 0,
+            Err(_) => {
+                if self.auto_sync.running_automatic {
+                    self.auto_sync.paused = true;
+                }
+                false
+            }
+        };
+        if unreachable {
+            let backoff = self
+                .auto_sync
+                .backoff
+                .map_or(AUTO_SYNC_FIRST_BACKOFF, |previous| {
+                    (previous * 2).min(AUTO_SYNC_MAX_BACKOFF)
+                });
+            self.auto_sync.backoff = Some(backoff);
+            self.auto_sync.retry_at = Some(now + backoff);
+        } else {
+            self.auto_sync.backoff = None;
+            self.auto_sync.retry_at = None;
+        }
+    }
+
     pub(super) fn finish_sync(
         &mut self,
         result: Result<SyncReport, SyncError>,
         cx: &mut Context<Self>,
     ) {
+        self.note_auto_sync_outcome(&result, cx);
         let mut kept_edit = None;
         match self.open_note_overtaken_by_sync(cx) {
             Overtaken::No => {}
@@ -352,6 +464,16 @@ impl LibraryShell {
             ),
             ShellSyncStatus::Idle => format!("尚未同步{pending}"),
             ShellSyncStatus::Running => "正在同步…".into(),
+            ShellSyncStatus::Succeeded { report, .. }
+                if report.retryable > 0 && report.accepted == 0 && report.pulled == 0 =>
+            {
+                let retry = if self.auto_sync.retry_at.is_some() {
+                    "，稍后自动重试"
+                } else {
+                    ""
+                };
+                format!("未能连接同步服务器{retry}{pending}")
+            }
             ShellSyncStatus::Succeeded { report, kept_edit } => {
                 let mut text = format!("已同步：上传 {}、下载 {}", report.accepted, report.pulled);
                 if report.server_restored {
@@ -369,6 +491,9 @@ impl LibraryShell {
                     text.push_str("，部分内容因网络中断未完成，下次同步继续");
                 }
                 text + &pending
+            }
+            ShellSyncStatus::Failed(message) if self.auto_sync.paused => {
+                format!("{message}自动同步已暂停，修正后点“立即同步”{pending}")
             }
             ShellSyncStatus::Failed(message) => format!("{message}{pending}"),
         }
@@ -472,4 +597,11 @@ enum Overtaken {
     Yes,
     KeptAs(String),
     Unkept(String),
+}
+
+#[cfg(test)]
+impl LibraryShell {
+    pub(super) fn auto_sync_attempts_for_test(&self) -> usize {
+        self.auto_sync.attempts
+    }
 }

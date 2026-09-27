@@ -518,6 +518,7 @@ pub struct LibraryShell {
     remount_current_surface_after_organization_commit: bool,
     sync_status: sync::ShellSyncStatus,
     sync_failures_open: bool,
+    auto_sync: sync::AutoSync,
     table_cell_editor: Option<table_cell_editor::TableCellEditor>,
     /// Saved before a native panel opens. Completion always uses this point,
     /// never an arbitrary caret that may have moved while the picker owned
@@ -1057,6 +1058,7 @@ impl LibraryShell {
             remount_current_surface_after_organization_commit: false,
             sync_status: sync::ShellSyncStatus::Idle,
             sync_failures_open: false,
+            auto_sync: sync::AutoSync::default(),
             table_cell_editor: None,
             pending_resource_insert: None,
             #[cfg(test)]
@@ -1136,6 +1138,7 @@ impl LibraryShell {
             library_surface_paint_hooks_for_test: Arc::new(LibrarySurfacePaintHooks::default()),
         };
         shell.sync_editor_surface(cx);
+        shell.start_auto_sync(cx);
         // UniformListScrollHandle retains this request until its first
         // `track_scroll` mount, so a restored selection can reach a distant
         // card before the window has drawn for the first time.
