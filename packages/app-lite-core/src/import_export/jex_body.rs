@@ -477,7 +477,8 @@ impl<'a> Converter<'a> {
         depth: u8,
         items: &mut Vec<ListItem>,
     ) -> Result<()> {
-        if ordered_start.is_some_and(|start| start != 1) {
+        // Nesting flattens into one canonical list, which has one start.
+        if depth > 0 && ordered_start.is_some_and(|start| start != 1) {
             return self.blocked(
                 JexBodyBlockerKind::UnsupportedStructure,
                 "Ordered list start number is not representable",
@@ -554,11 +555,16 @@ impl<'a> Converter<'a> {
                 );
             }
         };
-        Ok(Block::List {
-            kind,
-            items,
-            start: None,
-        })
+        let start = match ordered_start.map(u32::try_from) {
+            Some(Err(_)) => {
+                return self.blocked(
+                    JexBodyBlockerKind::UnsupportedStructure,
+                    "Ordered list start number is not representable",
+                );
+            }
+            start => start.and_then(std::result::Result::ok),
+        };
+        Ok(Block::List { kind, items, start })
     }
 
     fn blocks(&mut self) -> Result<Vec<Block>> {
@@ -618,12 +624,9 @@ impl<'a> Converter<'a> {
                         MdHeadingLevel::H1 => HeadingLevel::One,
                         MdHeadingLevel::H2 => HeadingLevel::Two,
                         MdHeadingLevel::H3 => HeadingLevel::Three,
-                        _ => {
-                            return self.blocked(
-                                JexBodyBlockerKind::UnsupportedHeading,
-                                "Heading level exceeds canonical support",
-                            );
-                        }
+                        MdHeadingLevel::H4 => HeadingLevel::Four,
+                        MdHeadingLevel::H5 => HeadingLevel::Five,
+                        MdHeadingLevel::H6 => HeadingLevel::Six,
                     };
                     let inlines = self.inlines(
                         TagEnd::Heading(match level {

@@ -276,10 +276,6 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
             JexBodyBlockerKind::RawHtml,
         ),
         (
-            "# 好\n\n四级\n----\n\n#### 不能".into(),
-            JexBodyBlockerKind::UnsupportedHeading,
-        ),
-        (
             "- 普通\n- [x] 混排".into(),
             JexBodyBlockerKind::UnsupportedStructure,
         ),
@@ -831,4 +827,47 @@ fn non_image_resource_in_image_syntax_becomes_an_inline_card() {
             vec![ResourceId::new(TARGET_PDF).unwrap()]
         );
     }
+}
+
+/// H4–H6 and an ordered list's start number are canonical now (c1275c5ea,
+/// 27878ea83). A nested sub-list that restarts at another number still
+/// blocks: nesting flattens into one list with one start.
+#[test]
+fn deep_headings_and_ordered_list_start_convert() {
+    use app_lite_core::document::{Block, HeadingLevel};
+    let converted = convert_jex_note_body(
+        NOTE,
+        "h.md",
+        1,
+        "#### 四\n\n##### 五\n\n###### 六",
+        &resources(),
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    let levels: Vec<_> = converted
+        .document
+        .blocks()
+        .iter()
+        .map(|block| match block {
+            Block::Heading { level, .. } => *level,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        levels,
+        [HeadingLevel::Four, HeadingLevel::Five, HeadingLevel::Six]
+    );
+    for (body, expected) in [("3. 三\n4. 四", Some(3)), ("1. 一\n2. 二", None)] {
+        let converted = convert_jex_note_body(NOTE, "ol.md", 1, body, &resources())
+            .unwrap_or_else(|error| panic!("body={body}: {error:?}"));
+        let [Block::List { start, items, .. }] = converted.document.blocks() else {
+            panic!("body={body}: {:?}", converted.document);
+        };
+        assert_eq!((*start, items.len()), (expected, 2), "body={body}");
+        assert_eq!(
+            CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+            converted.document,
+            "body={body}"
+        );
+    }
+    assert!(convert_jex_note_body(NOTE, "ol.md", 1, "1. 一\n\n   5. 五", &resources()).is_err());
 }
