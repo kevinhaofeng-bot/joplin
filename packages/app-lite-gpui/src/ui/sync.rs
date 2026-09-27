@@ -5,11 +5,17 @@
 //! one pass on the background executor, then rereads the open note so the
 //! editor never keeps a revision the sync replaced. The status line always
 //! says whether work is only saved locally or confirmed by the server.
+//!
+//! Changes the server refused, or remote changes that could not be read,
+//! stay listed under "同步问题…" until they resolve. A refused upload is
+//! retried only when the person presses "重试": that sends the item's
+//! current local state once.
 
 use super::*;
-use crate::app::{OpenSyncSettings, SyncNow};
+use crate::app::{OpenSyncSettings, ShowSyncFailures, SyncNow};
 use crate::library_profile::LibraryProfiles;
-use app_lite_core::sync::{SyncError, SyncReport, sync_once};
+use app_lite_core::SyncFailure;
+use app_lite_core::sync::{SyncError, SyncReport, retry_failure, sync_once};
 use app_lite_protocol::client::HttpTransport;
 use std::path::Path;
 
@@ -76,6 +82,44 @@ fn failure_message(error: &SyncError) -> String {
         SyncError::Rejected(reason) => format!("同步失败：服务器拒绝了请求（{reason}）。"),
         SyncError::Library(error) => format!("同步失败：本地资料库错误（{error}）。"),
     }
+}
+
+fn entity_label(entity_type: &str) -> &'static str {
+    match entity_type {
+        "note" => "笔记",
+        "notebook" => "笔记本",
+        "stack" => "笔记本组",
+        "tag" => "标签",
+        "resource" => "附件",
+        _ => "项目",
+    }
+}
+
+fn failure_reason(failure: &SyncFailure) -> String {
+    if !failure.can_retry {
+        return format!(
+            "服务器上的这条修改无法读取，已跳过；本机内容未受影响（{}）。",
+            failure.reason
+        );
+    }
+    if failure.reason.contains("payload too large") {
+        return "内容超过服务器单项上限（4 MiB）。缩短或拆分后点“重试”。".into();
+    }
+    format!("服务器拒绝了这项修改（{}）。", failure.reason)
+}
+
+/// One row of the "同步问题" list, as shown.
+pub(crate) fn failure_row_text(failure: &SyncFailure) -> String {
+    let name = failure
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .map_or_else(|| "（已不在本机）".to_owned(), |title| format!("“{title}”"));
+    format!(
+        "{}{name}：{}",
+        entity_label(&failure.entity_type),
+        failure_reason(failure)
+    )
 }
 
 impl LibraryShell {
@@ -177,17 +221,64 @@ impl LibraryShell {
         cx.notify();
     }
 
+    pub(super) fn sync_failures(&self, cx: &App) -> Vec<SyncFailure> {
+        self.model
+            .read_with(cx, |model, _| model.repository())
+            .sync_failures()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn show_sync_failures_action(
+        &mut self,
+        _: &ShowSyncFailures,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_failures_open = true;
+        cx.notify();
+    }
+
+    pub(super) fn toggle_sync_failures(&mut self, cx: &mut Context<Self>) {
+        self.sync_failures_open = !self.sync_failures_open && !self.sync_failures(cx).is_empty();
+        cx.notify();
+    }
+
+    /// Marks one refused upload for a single new attempt, then syncs.
+    pub(super) fn retry_sync_failure(
+        &mut self,
+        op_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sync_status == ShellSyncStatus::Running {
+            return;
+        }
+        let repository = self.model.read_with(cx, |model, _| model.repository());
+        match retry_failure(&repository, op_id) {
+            Ok(true) => self.sync_now_action(&SyncNow, window, cx),
+            Ok(false) => cx.notify(),
+            Err(error) => {
+                self.sync_status = ShellSyncStatus::Failed(format!("无法重试：{error}"));
+                cx.notify();
+            }
+        }
+    }
+
     pub(super) fn sync_status_text(&self, cx: &App) -> String {
         let pending = self
             .model
             .read_with(cx, |model, _| model.repository())
             .sync_pending_count()
             .unwrap_or(0);
-        let pending = if pending > 0 {
+        let failures = self.sync_failures(cx).len();
+        let mut pending = if pending > 0 {
             format!("，{pending} 项仅保存在本机、待同步")
         } else {
             String::new()
         };
+        if failures > 0 {
+            pending.push_str(&format!("；{failures} 项同步问题，点此查看"));
+        }
         match &self.sync_status {
             ShellSyncStatus::Unconfigured => format!(
                 "未配置同步：在“同步设置…”生成的 {SYNC_CONFIG_FILE} 中填写服务器地址与 token{pending}"
@@ -205,15 +296,101 @@ impl LibraryShell {
                 if report.retryable > 0 {
                     text.push_str("，部分内容因网络中断未完成，下次同步继续");
                 }
-                if report.permanent + report.skipped > 0 {
-                    text.push_str(&format!(
-                        "，{} 项未能同步",
-                        report.permanent + report.skipped
-                    ));
-                }
                 text + &pending
             }
             ShellSyncStatus::Failed(message) => format!("{message}{pending}"),
         }
+    }
+}
+
+impl LibraryShell {
+    pub(super) fn render_sync_failures(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.sync_failures_open {
+            return None;
+        }
+        let failures = self.sync_failures(cx);
+        let running = self.sync_status == ShellSyncStatus::Running;
+        let mut panel = div()
+            .id("sync-failures")
+            .debug_selector(|| "sync-failures".to_owned())
+            .absolute()
+            .bottom(px(130.0))
+            .right(px(14.0))
+            .w(px(460.0))
+            .max_h(px(360.0))
+            .overflow_y_scroll()
+            .p(px(12.0))
+            .rounded(px(8.0))
+            .bg(rgba(0xffffffff))
+            .border_1()
+            .border_color(rgba(0xc9d3ccff))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .text_size(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(div().text_color(rgba(0x25342bff)).child("同步问题"))
+                    .child(
+                        div()
+                            .id("sync-failures-close")
+                            .debug_selector(|| "sync-failures-close".to_owned())
+                            .cursor_pointer()
+                            .text_color(rgba(0x536f59ff))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event, _window, cx| {
+                                    shell.sync_failures_open = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("关闭"),
+                    ),
+            );
+        if failures.is_empty() {
+            panel = panel.child(div().text_color(rgba(0x536f59ff)).child("没有同步问题。"));
+        } else {
+            panel = panel.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x8a978dff))
+                    .child("下列内容都已保存在本机，只是没有同步到服务器。"),
+            );
+        }
+        for (index, failure) in failures.into_iter().enumerate() {
+            let op_id = failure.op_id.clone();
+            let row = div().flex().gap(px(8.0)).items_start().child(
+                div()
+                    .flex_1()
+                    .text_color(rgba(0xa34838ff))
+                    .child(failure_row_text(&failure)),
+            );
+            let row = if failure.can_retry && !running {
+                row.child(
+                    div()
+                        .id(("sync-failure-retry", index))
+                        .debug_selector(move || format!("sync-failure-retry-{index}"))
+                        .px(px(10.0))
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0xf1f4f1ff))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _event, window, cx| {
+                                shell.retry_sync_failure(&op_id, window, cx);
+                            }),
+                        )
+                        .child("重试"),
+                )
+            } else {
+                row
+            };
+            panel = panel.child(row);
+        }
+        Some(panel.into_any_element())
     }
 }

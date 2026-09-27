@@ -517,6 +517,7 @@ pub struct LibraryShell {
     /// session has already advanced its own fence and must retain history.
     remount_current_surface_after_organization_commit: bool,
     sync_status: sync::ShellSyncStatus,
+    sync_failures_open: bool,
     table_cell_editor: Option<table_cell_editor::TableCellEditor>,
     /// Saved before a native panel opens. Completion always uses this point,
     /// never an arbitrary caret that may have moved while the picker owned
@@ -1055,6 +1056,7 @@ impl LibraryShell {
             surface_note_id: None,
             remount_current_surface_after_organization_commit: false,
             sync_status: sync::ShellSyncStatus::Idle,
+            sync_failures_open: false,
             table_cell_editor: None,
             pending_resource_insert: None,
             #[cfg(test)]
@@ -6599,6 +6601,7 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::sync_now_action))
             .on_action(cx.listener(Self::insert_table_action))
             .on_action(cx.listener(Self::open_sync_settings_action))
+            .on_action(cx.listener(Self::show_sync_failures_action))
             .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_find_in_note))
             .on_action(cx.listener(Self::find_next_in_note))
@@ -6633,6 +6636,9 @@ impl Render for LibraryShell {
         }
         if let Some(cell_editor) = self.render_table_cell_editor(window, cx) {
             root = root.child(cell_editor);
+        }
+        if let Some(failures) = self.render_sync_failures(cx) {
+            root = root.child(failures);
         }
         let search_palette =
             self.render_search_palette(f32::from(window.viewport_size().width), cx);
@@ -6705,6 +6711,11 @@ impl Render for LibraryShell {
                     } else {
                         rgba(0x536f59ff)
                     },
+                )
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|shell, _event, _window, cx| shell.toggle_sync_failures(cx)),
                 )
                 .child(self.sync_status_text(cx)),
         )
