@@ -28,6 +28,12 @@ pub struct SyncFailure {
     pub entity_type: String,
     pub entity_id: String,
     pub reason: String,
+    /// The entity's local title, when it still exists here.
+    pub title: Option<String>,
+    pub updated_time: i64,
+    /// An upload the server refused. A skipped download cannot be retried:
+    /// the change is already behind the cursor.
+    pub can_retry: bool,
 }
 
 impl LibraryRepository {
@@ -67,8 +73,14 @@ impl LibraryRepository {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: i64 =
-            transaction.query_row("SELECT count(*) FROM sync_inflight", [], |row| row.get(0))?;
+        // A refused op stays parked (and keeps its entity out of the
+        // candidates) until the person retries it: resending it unchanged
+        // would only be refused again.
+        let existing: i64 = transaction.query_row(
+            "SELECT count(*) FROM sync_inflight WHERE op_id NOT IN (SELECT op_id FROM sync_failures)",
+            [],
+            |row| row.get(0),
+        )?;
         let mut room = limit.saturating_sub(existing as usize);
         for kind in KINDS {
             if room == 0 {
@@ -115,6 +127,7 @@ impl LibraryRepository {
         transaction.commit()?;
         let mut statement = connection.prepare(
             "SELECT entity_type,entity_id,op_id,base_revision,action_json FROM sync_inflight
+             WHERE op_id NOT IN (SELECT op_id FROM sync_failures)
              ORDER BY created_time, CASE entity_type WHEN 'stack' THEN 0 WHEN 'notebook' THEN 1
              WHEN 'tag' THEN 2 WHEN 'resource' THEN 3 ELSE 4 END, entity_id LIMIT ?1",
         )?;
@@ -168,7 +181,8 @@ impl LibraryRepository {
         Ok(())
     }
 
-    /// Keeps the op and its outbox rows; the reason is shown to the person.
+    /// Parks the op with its outbox rows; the reason is shown to the person,
+    /// who can retry it (`sync_retry_failure`).
     pub(crate) fn sync_record_permanent(
         &self,
         op_id: &str,
@@ -187,7 +201,16 @@ impl LibraryRepository {
     pub fn sync_failures(&self) -> Result<Vec<SyncFailure>, LibraryError> {
         let connection = self.connection.lock().expect("library mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT op_id,entity_type,entity_id,reason FROM sync_failures ORDER BY updated_time, op_id",
+            "SELECT f.op_id,f.entity_type,f.entity_id,f.reason,f.updated_time,
+                    CASE f.entity_type
+                        WHEN 'note' THEN (SELECT title FROM notes WHERE id=f.entity_id)
+                        WHEN 'notebook' THEN (SELECT title FROM notebooks WHERE id=f.entity_id)
+                        WHEN 'stack' THEN (SELECT title FROM stacks WHERE id=f.entity_id)
+                        WHEN 'tag' THEN (SELECT title FROM tags WHERE id=f.entity_id)
+                        WHEN 'resource' THEN (SELECT title FROM resources WHERE id=f.entity_id)
+                    END,
+                    EXISTS(SELECT 1 FROM sync_inflight i WHERE i.op_id=f.op_id)
+             FROM sync_failures f ORDER BY f.updated_time, f.op_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(SyncFailure {
@@ -195,9 +218,32 @@ impl LibraryRepository {
                 entity_type: row.get(1)?,
                 entity_id: row.get(2)?,
                 reason: row.get(3)?,
+                updated_time: row.get(4)?,
+                title: row.get(5)?,
+                can_retry: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Drops a refused upload so the next sync sends the entity's current
+    /// state as a new op (the server remembers the refused op id). The
+    /// entity's outbox rows stay, so it is still pending. False when the
+    /// failure is not a refused upload (or is already gone).
+    pub fn sync_retry_failure(&self, op_id: &str) -> Result<bool, LibraryError> {
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let parked = transaction.execute(
+            "DELETE FROM sync_inflight WHERE op_id=?1
+             AND EXISTS(SELECT 1 FROM sync_failures WHERE op_id=?1)",
+            [op_id],
+        )?;
+        if parked == 0 {
+            return Ok(false);
+        }
+        transaction.execute("DELETE FROM sync_failures WHERE op_id=?1", [op_id])?;
+        transaction.commit()?;
+        Ok(true)
     }
 }
 

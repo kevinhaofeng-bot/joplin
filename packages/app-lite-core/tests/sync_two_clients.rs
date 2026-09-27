@@ -283,13 +283,14 @@ fn a_malformed_remote_body_is_a_visible_failure_and_does_not_block_later_changes
         b.repo.load_note(&a2.id).unwrap().is_some(),
         "later changes still apply"
     );
-    assert!(
-        sync::sync_failures(&b.repo)
-            .unwrap()
-            .iter()
-            .any(|failure| failure.entity_id == bad),
-        "the skipped change is visible"
-    );
+    let failures = sync::sync_failures(&b.repo).unwrap();
+    let skipped = failures
+        .iter()
+        .find(|failure| failure.entity_id == bad)
+        .expect("the skipped change is visible");
+    assert!(!skipped.can_retry, "a download cannot be retried from here");
+    assert!(!sync::retry_failure(&b.repo, &skipped.op_id).unwrap());
+    assert_eq!(sync::sync_failures(&b.repo).unwrap(), failures, "kept");
 }
 
 #[test]

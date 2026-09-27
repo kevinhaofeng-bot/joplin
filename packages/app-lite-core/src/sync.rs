@@ -267,6 +267,11 @@ pub fn sync_failures(repository: &LibraryRepository) -> Result<Vec<SyncFailure>,
     repository.sync_failures()
 }
 
+/// Person-triggered: the next sync sends the entity's current state once.
+pub fn retry_failure(repository: &LibraryRepository, op_id: &str) -> Result<bool, LibraryError> {
+    repository.sync_retry_failure(op_id)
+}
+
 fn batches(ops: &[crate::SyncInflight]) -> Vec<&[crate::SyncInflight]> {
     let mut batches = Vec::new();
     let mut start = 0;
