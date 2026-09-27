@@ -8155,3 +8155,76 @@ fn inserting_a_table_splits_the_paragraph_saves_and_undoes(cx: &mut gpui::TestAp
     assert!(editor.insert_table(2, 2).is_err());
     assert_eq!(editor.document().semantic_snapshot(), before);
 }
+
+#[gpui::test]
+fn a_copied_image_and_attachment_paste_back_as_themselves_in_one_undo_step(
+    cx: &mut gpui::TestAppContext,
+) {
+    use super::images::FragmentSegment;
+    let mut source = EditorCore::for_test("前后", cx);
+    source.set_caret_utf8("前".len());
+    source.insert_fixture_image("img", (40, 30)).unwrap();
+    source
+        .apply(super::transaction::Transaction::InsertAttachment {
+            selection: source.selection(),
+            resource_id: "doc".into(),
+            filename: "说明.pdf".into(),
+            media_type: "application/pdf".into(),
+        })
+        .unwrap();
+    source.select_all();
+    let fragment = source.copy_fragment().expect("resources make a fragment");
+    let kinds: Vec<&str> = fragment
+        .segments
+        .iter()
+        .map(|segment| match segment {
+            FragmentSegment::Text { .. } => "text",
+            FragmentSegment::Break => "break",
+            FragmentSegment::Image { .. } => "image",
+            FragmentSegment::Attachment { .. } => "attachment",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "text",
+            "break",
+            "image",
+            "break",
+            "attachment",
+            "break",
+            "text"
+        ]
+    );
+    assert_eq!(fragment.plain_text(), "前\n\n\n后");
+
+    let mut plain = EditorCore::for_test("纯文本", cx);
+    plain.select_all();
+    assert!(plain.copy_fragment().is_none(), "text alone stays plain");
+
+    let mut target = EditorCore::for_test("甲乙", cx);
+    target.set_caret_utf8("甲".len());
+    let depth = target.undo_depth();
+    let images = target.paste_fragment(&fragment).unwrap();
+    assert_eq!(images.len(), 1);
+    let shape = |editor: &EditorCore| {
+        editor
+            .document()
+            .blocks()
+            .iter()
+            .map(|block| match &block.content {
+                BlockContent::Text { text, .. } => format!("text:{text}"),
+                BlockContent::Image { resource_id, .. } => format!("image:{resource_id}"),
+                BlockContent::Attachment { resource_id, .. } => format!("attachment:{resource_id}"),
+                _ => "other".into(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let pasted = vec!["text:甲前", "image:img", "attachment:doc", "text:后乙"];
+    assert_eq!(shape(&target), pasted);
+    assert_eq!(target.undo_depth(), depth + 1, "one undo step");
+    target.undo().unwrap();
+    assert_eq!(shape(&target), vec!["text:甲乙"]);
+    target.redo().unwrap();
+    assert_eq!(shape(&target), pasted);
+}

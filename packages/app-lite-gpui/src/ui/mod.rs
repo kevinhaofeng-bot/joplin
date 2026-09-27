@@ -3154,6 +3154,20 @@ impl LibraryShell {
                 focus_editor(&editor, window, cx);
                 Ok(())
             }
+            PasteIntent::Fragment { fragment } => {
+                let Some(session) = self.note_session.clone() else {
+                    return Err("笔记已关闭，未粘贴".to_owned());
+                };
+                Self::discard_resource_insert_intent(&session, saved_intent, cx);
+                session
+                    .update(cx, |session, session_cx| {
+                        session.paste_fragment(&fragment, session_cx)
+                    })
+                    .map_err(|error| error.to_string())?;
+                let editor = session.read_with(cx, |session, _| session.editor().clone());
+                focus_editor(&editor, window, cx);
+                Ok(())
+            }
             PasteIntent::Unsupported => {
                 if let Some(session) = self.note_session.as_ref() {
                     Self::discard_resource_insert_intent(session, saved_intent, cx);

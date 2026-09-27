@@ -282,6 +282,24 @@ impl History {
         previous.time = last.time;
     }
 
+    /// Joins every entry recorded after `depth` into one, so a user action
+    /// made of several transactions (a structured paste) undoes and redoes
+    /// as one step. Redo replays the same transactions in the same order.
+    pub fn merge_since(&mut self, depth: usize) {
+        while self.undo.len() > depth + 1 {
+            let last = self.undo.pop_back().expect("more than one entry");
+            let previous = self.undo.back_mut().expect("more than one entry");
+            // Undo applies the newest inverse first, then the older one.
+            let mut inverse = last.inverse.0;
+            inverse.extend(previous.inverse.0.drain(..));
+            previous.inverse = TransactionBatch(inverse);
+            previous.forward.0.extend(last.forward.0);
+            previous.after_selection = last.after_selection;
+            previous.bytes = previous.bytes.saturating_add(last.bytes);
+            previous.time = last.time;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn age_last_entry_for_test(&mut self, by: Duration) {
         if let Some(entry) = self.undo.back_mut() {

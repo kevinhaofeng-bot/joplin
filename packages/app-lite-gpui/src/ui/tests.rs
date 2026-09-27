@@ -9752,3 +9752,176 @@ async fn mounted_multi_selection_trash_moves_every_selected_note_and_keeps_a_val
         .collect();
     assert_eq!(remaining.len(), 1);
 }
+
+/// Codex acceptance blocker: a selected image copied with Cmd-C and pasted
+/// into another note arrived as U+FFFC text with no resource. Evernote
+/// serializes a resource node to the clipboard with its hash and maps it
+/// back to the stored resource on paste (common-editor resource/schema.ts
+/// `resourceNodeToClipboard`, resource/resource.ts
+/// `setResourcesOnClipboardParser`).
+#[gpui::test]
+async fn mounted_copied_image_pastes_into_another_note_as_the_same_attachment(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let png = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .unwrap();
+    let image = repository
+        .import_resource(&png.bytes, "photo.png", "image/png", "png")
+        .unwrap();
+    let source = repository
+        .create_note(CreateNote {
+            title: "Acceptance Two".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Image {
+                resource_id: image.clone(),
+                alt: "photo".into(),
+                presentation: Default::default(),
+                link: None,
+            }]),
+        })
+        .unwrap();
+    let target = repository
+        .create_note(CreateNote {
+            title: "Clipboard test".into(),
+            notebook_id: None,
+            document: rich_document("目标"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    let open = |id: &NoteId, view: &Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        let id = id.clone();
+        // A background save of the previous note (its image geometry
+        // repair) may still be running; the switch waits for it, as a
+        // second click would in the app.
+        for _ in 0..50 {
+            let switched = cx.update(|window, app| {
+                view.update(app, |shell, shell_cx| {
+                    shell.apply_action_with_result(
+                        AppAction::SelectNote(id.clone()),
+                        window,
+                        shell_cx,
+                    )
+                })
+            });
+            if switched {
+                break;
+            }
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            view.read_with(cx, |shell, app| shell
+                .model
+                .read(app)
+                .navigation()
+                .selected_note_id()
+                .cloned()),
+            Some(id)
+        );
+        redraw(cx);
+        let surface = cx.debug_bounds("native-editor-surface").unwrap();
+        cx.simulate_click(surface.center(), Modifiers::default());
+        redraw(cx);
+    };
+    open(&source.id, &view, cx);
+    cx.dispatch_action(SelectAll);
+    cx.dispatch_action(Copy);
+
+    open(&target.id, &view, cx);
+    cx.simulate_keystrokes("cmd-end");
+    cx.dispatch_action(Paste);
+    redraw(cx);
+
+    let editor_state = |view: &Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| {
+            let editor = shell.note_session.as_ref().unwrap().read(app).editor().read(app);
+            let images: Vec<String> = editor
+                .document()
+                .blocks()
+                .iter()
+                .filter_map(|block| match &block.content {
+                    BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let placeholder_text = editor.document().blocks().iter().any(|block| {
+                matches!(&block.content, BlockContent::Text { text, .. } if text.contains('\u{fffc}'))
+            });
+            (images, placeholder_text)
+        })
+    };
+    let (images, placeholder_text) = editor_state(&view, cx);
+    assert_eq!(
+        images,
+        vec![image.as_str().to_owned()],
+        "the image itself arrives"
+    );
+    assert!(!placeholder_text, "no U+FFFC text in its place");
+    // Visible at once: the stored bytes load into the target editor
+    // without reopening the note.
+    redraw(cx);
+    redraw(cx);
+    assert!(
+        view.read_with(cx, |shell, app| {
+            shell
+                .note_session
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .editor()
+                .read(app)
+                .image_source_path(image.as_str())
+                .is_some_and(|path| path.is_file())
+        }),
+        "the pasted image loads in the target note"
+    );
+
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let stored = repository.load_note(&target.id).unwrap().unwrap();
+    assert_eq!(
+        stored.resource_ids,
+        vec![image.clone()],
+        "{}",
+        stored.body_html
+    );
+    assert!(
+        !stored.body_html.contains('\u{fffc}'),
+        "{}",
+        stored.body_html
+    );
+    assert!(stored.body_html.contains(image.as_str()));
+    assert!(
+        repository
+            .load_note(&source.id)
+            .unwrap()
+            .unwrap()
+            .resource_ids
+            == vec![image.clone()],
+        "the source keeps its image"
+    );
+
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert!(
+        editor_state(&view, cx).0.is_empty(),
+        "one Undo removes the paste"
+    );
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    assert_eq!(
+        editor_state(&view, cx).0,
+        vec![image.as_str().to_owned()],
+        "Redo restores it"
+    );
+
+    // Reopened from storage, the note still shows the image.
+    open(&source.id, &view, cx);
+    open(&target.id, &view, cx);
+    assert_eq!(editor_state(&view, cx).0, vec![image.as_str().to_owned()]);
+}

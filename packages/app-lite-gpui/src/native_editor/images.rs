@@ -540,6 +540,10 @@ const MAX_HTML_IMAGE_DESCRIPTOR_BYTES: usize = MAX_DATA_URI_ENCODED_BYTES + 4096
 /// before image UTTypes on that platform.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClipboardPayload {
+    /// Structure copied from this app's editor (images and attachments by
+    /// resource id), carried as GPUI clipboard metadata next to the plain
+    /// text; GPUI drops it when another app replaces the text.
+    pub fragment: Option<ClipboardFragment>,
     pub images: Vec<ImagePayload>,
     pub file_urls: Vec<PathBuf>,
     pub temporary_files: Vec<PathBuf>,
@@ -568,7 +572,12 @@ impl ClipboardPayload {
                 ClipboardEntry::Image(image) => {
                     payload.images.push(ImagePayload::from_image(image))
                 }
-                ClipboardEntry::String(string) => payload.text = Some(string.text().to_owned()),
+                ClipboardEntry::String(string) => {
+                    payload.fragment = string
+                        .metadata_json::<ClipboardFragment>()
+                        .filter(|fragment| fragment.version == CLIPBOARD_FRAGMENT_VERSION);
+                    payload.text = Some(string.text().to_owned());
+                }
             }
         }
         payload.images = bounded_image_candidates(std::mem::take(&mut payload.images));
@@ -590,8 +599,73 @@ impl ClipboardPayload {
     }
 }
 
+pub const CLIPBOARD_FRAGMENT_VERSION: u32 = 1;
+
+/// An editor selection that holds images or attachments, in document
+/// order. Evernote copies a resource node as `<img data-hash data-type>`
+/// and maps the hash back to the stored resource on paste (common-editor
+/// `resource/schema.ts` `resourceNodeToClipboard`, `resource/resource.ts`
+/// `setResourcesOnClipboardParser`); here the resource id plays the hash's
+/// part, so a paste references the same stored resource.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClipboardFragment {
+    pub version: u32,
+    pub segments: Vec<FragmentSegment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FragmentSegment {
+    Text {
+        text: String,
+    },
+    /// A paragraph boundary between copied blocks.
+    Break,
+    Image {
+        resource_id: String,
+        natural_size: (u32, u32),
+        natural_size_known: bool,
+        display_width: Option<u32>,
+    },
+    Attachment {
+        resource_id: String,
+        filename: String,
+        media_type: String,
+    },
+}
+
+impl ClipboardFragment {
+    /// The text alone, one line per copied block.
+    pub fn plain_text(&self) -> String {
+        let mut text = String::new();
+        for segment in &self.segments {
+            match segment {
+                FragmentSegment::Text { text: part } => text.push_str(part),
+                FragmentSegment::Break => text.push('\n'),
+                FragmentSegment::Image { .. } | FragmentSegment::Attachment { .. } => {}
+            }
+        }
+        text
+    }
+}
+
+impl FragmentSegment {
+    pub fn resource_id(&self) -> Option<&str> {
+        match self {
+            Self::Image { resource_id, .. } | Self::Attachment { resource_id, .. } => {
+                Some(resource_id)
+            }
+            Self::Text { .. } | Self::Break => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PasteIntent {
+    /// Copied from this app's editor with images or attachments.
+    Fragment {
+        fragment: ClipboardFragment,
+    },
     Image {
         payload: ImagePayload,
     },
@@ -619,6 +693,7 @@ pub enum PasteIntent {
 /// payloads before text and never insert an image placeholder string.
 pub fn classify_clipboard(payload: ClipboardPayload) -> PasteIntent {
     let ClipboardPayload {
+        fragment,
         images,
         file_urls,
         temporary_files,
@@ -629,6 +704,9 @@ pub fn classify_clipboard(payload: ClipboardPayload) -> PasteIntent {
     } = payload;
     if native_image_rejected {
         return PasteIntent::Unsupported;
+    }
+    if let Some(fragment) = fragment {
+        return PasteIntent::Fragment { fragment };
     }
     if !images.is_empty() {
         let candidates = bounded_image_candidates(images);
@@ -733,6 +811,9 @@ pub fn resolve_clipboard_payload(
     // image-first policy is preserved instead of letting native plain text
     // suppress the image returned by GPUI.
     Some(ClipboardPayload {
+        // Only GPUI reads its own metadata type; it is valid only while the
+        // plain text is still the one it was written with.
+        fragment: gpui.fragment,
         // Prefer the AppKit-owned byte copy over GPUI's duplicate image
         // representation; Finder file URLs still retain their own source.
         images: if !native.file_urls.is_empty() {

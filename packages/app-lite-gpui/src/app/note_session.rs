@@ -11,8 +11,8 @@ use crate::native_editor::codec::{
 };
 use crate::native_editor::core::{EditorCore, ResourceInsertAnchor};
 use crate::native_editor::images::{
-    EncodedImagePayload, ImagePayload, ResourceImport, ResourceKind, ResourceSource,
-    inspect_persisted_image,
+    ClipboardFragment, EncodedImagePayload, FragmentSegment, ImagePayload, ResourceImport,
+    ResourceKind, ResourceSource, inspect_persisted_image,
 };
 use crate::native_editor::model::{BlockContent, Document, NodeId, Selection};
 use crate::native_editor::transaction::Transaction;
@@ -2683,6 +2683,123 @@ impl NoteSession {
             selected_thumbnail_id,
             presentation_warning,
         })
+    }
+
+    /// A structured paste from this app's editor (Evernote maps a pasted
+    /// resource's hash back to the stored resource; here the resource id).
+    /// Every image and attachment it names must still be stored in this
+    /// library; each joins this note's allowed resources, the fragment is
+    /// inserted as one undo step, images load through the same hydration as
+    /// on open, and a durable save is requested at once: a crash journal can
+    /// only vouch for resources already in this note's saved history.
+    pub(crate) fn paste_fragment(
+        &mut self,
+        fragment: &ClipboardFragment,
+        cx: &mut Context<Self>,
+    ) -> Result<(), SaveError> {
+        if self.is_read_only() {
+            return Err(SaveError::new("笔记为只读，无法粘贴"));
+        }
+        if self.title.read(cx).marked_range().is_some()
+            || self.editor.read(cx).marked_text().is_some()
+        {
+            return Err(SaveError::new("输入法组合文本尚未确认，无法粘贴"));
+        }
+        if let SaveState::Failed(error) = self.save.state() {
+            return Err(SaveError::new(format!("当前笔记保存失败：{error}")));
+        }
+        let missing = || SaveError::new("剪贴板里的图片或附件已不在本资料库中，未粘贴");
+        let mut fragment = fragment.clone();
+        let mut resource_ids = Vec::new();
+        let mut attachments = Vec::new();
+        let mut unmeasured = Vec::new();
+        for segment in &mut fragment.segments {
+            let Some(raw) = segment.resource_id().map(str::to_owned) else {
+                continue;
+            };
+            let id = ResourceId::new(&raw).map_err(|_| missing())?;
+            let stored = self
+                .repository
+                .resource_metadata(&id)?
+                .ok_or_else(missing)?;
+            let (_, file) = self
+                .repository
+                .open_verified_resource_file(&id)?
+                .ok_or_else(missing)?;
+            match segment {
+                FragmentSegment::Image {
+                    natural_size,
+                    natural_size_known,
+                    ..
+                } => {
+                    if !*natural_size_known {
+                        // The source had not measured it yet: measure the
+                        // stored bytes as hydration would, and let hydration
+                        // repeat it for orientation.
+                        let (_, measured) =
+                            inspect_persisted_image(file, &stored.mime).map_err(|_| missing())?;
+                        *natural_size = measured;
+                        unmeasured.push(raw.clone());
+                    }
+                }
+                FragmentSegment::Attachment { .. } => attachments.push((raw.clone(), stored.size)),
+                FragmentSegment::Text { .. } | FragmentSegment::Break => {}
+            }
+            resource_ids.push(id);
+        }
+        // Published before the editor changes, so the journal written for
+        // this edit already allows these resources.
+        extend_resource_allowlist(&mut self.resource_ids, &resource_ids);
+        let editor = self.editor.clone();
+        let images = editor
+            .update(cx, |editor, editor_cx| {
+                let result = editor.paste_fragment(&fragment);
+                if result.is_ok() {
+                    for (resource_id, size) in &attachments {
+                        let _ = editor.register_attachment(resource_id, *size as u64);
+                    }
+                }
+                editor_cx.notify();
+                result
+            })
+            .map_err(|error| SaveError::new(error.to_string()))?;
+        let pasted_images: Vec<String> = images.iter().map(|(_, id)| id.clone()).collect();
+        for (node_id, resource_id) in images {
+            let Some(FragmentSegment::Image { natural_size, .. }) = fragment
+                .segments
+                .iter()
+                .find(|segment| segment.resource_id() == Some(resource_id.as_str()))
+            else {
+                continue;
+            };
+            let Ok(id) = ResourceId::new(&resource_id) else {
+                continue;
+            };
+            let entry = self
+                .persisted_image_hydration
+                .entry(resource_id.clone())
+                .or_insert_with(|| PersistedImageHydration {
+                    resource_id: id,
+                    natural_size: *natural_size,
+                    legacy_node_ids: Vec::new(),
+                    inline_node_ids: Vec::new(),
+                });
+            if unmeasured.contains(&resource_id) {
+                entry.legacy_node_ids.push(node_id);
+            }
+        }
+        // Start loading the pasted image now. Waiting for the renderer's
+        // residency request is not enough: its notification during paint
+        // does not reach this session unless something else changes too.
+        editor.update(cx, |editor, _| {
+            editor.request_image_hydration(pasted_images)
+        });
+        self.drain_image_hydration_requests(&editor, cx);
+        self.observe_current_entities(cx);
+        // "Still saving" is the expected answer here, not a failure.
+        let _ = self.flush(FlushReason::ManualSync, cx);
+        cx.notify();
+        Ok(())
     }
 
     /// Drain the renderer's viewport-resident image IDs into this retained

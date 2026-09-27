@@ -654,9 +654,19 @@ impl Render for EditorSurface {
         });
         let copy_editor = editor.clone();
         surface = surface.on_action(move |_action: &Copy, _window, cx| {
-            let text = copy_editor.read(cx).copy_plain_text();
-            if !text.is_empty() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            let editor = copy_editor.read(cx);
+            let text = editor.copy_plain_text();
+            // Images and attachments ride along as metadata so a paste in
+            // this app references the same stored resource; other apps read
+            // the plain text.
+            match editor.copy_fragment() {
+                Some(fragment) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                        text, fragment,
+                    ));
+                }
+                None if !text.is_empty() => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+                None => {}
             }
         });
         let surface = surface.child(editor_canvas(
