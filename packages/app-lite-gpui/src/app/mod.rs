@@ -1168,6 +1168,26 @@ impl AppModel {
     pub fn active_session_note_id(&self) -> Option<&NoteId> {
         self.active_session.as_ref().map(|session| &session.note.id)
     }
+    /// After a sync applied remote changes: reread the open note's body (so
+    /// the editor remounts at the new revision), the index and the list. A
+    /// note deleted elsewhere is deselected rather than kept stale.
+    pub fn reload_after_sync(&mut self) -> Result<(), LibraryError> {
+        self.navigation_index = self.repository.list_navigation_index()?;
+        if let Some(active) = self.active_session.as_ref() {
+            match self.repository.load_note(&active.note.id)? {
+                Some(note) if note.deleted_time.is_none() => {
+                    self.active_session = Some(ActiveSession { note });
+                }
+                _ => {
+                    self.navigation.select(None);
+                    self.active_session = None;
+                    self.persist_shell_state()?;
+                }
+            }
+        }
+        self.refresh_list()
+    }
+
     pub fn active_note(&self) -> Option<&Note> {
         self.active_session.as_ref().map(|session| &session.note)
     }

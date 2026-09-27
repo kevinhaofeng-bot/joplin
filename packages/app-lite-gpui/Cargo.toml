@@ -55,6 +55,7 @@ code-highlight-config = [
 
 [dependencies]
 app-lite-core = { path = "../app-lite-core" }
+app-lite-protocol = { path = "../app-lite-protocol", features = ["client"] }
 anyhow = "1"
 base64 = "0.23"
 uuid = "1.23"
@@ -119,6 +120,7 @@ objc2-image-io = { version = "0.3.2", default-features = false, features = ["std
 
 [dev-dependencies]
 app-lite-core = { path = "../app-lite-core", features = ["test-support"] }
+app-lite-server = { path = "../app-lite-server" }
 gpui = { version = "0.2", features = ["test-support"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "html_reports"] }
 tempfile = "3"

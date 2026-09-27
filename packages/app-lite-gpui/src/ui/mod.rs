@@ -7,6 +7,7 @@ pub mod note_card;
 pub mod note_list;
 mod readable_export;
 pub mod sidebar;
+mod sync;
 
 use self::card_thumbnail::{
     CARD_THUMBNAIL_CACHE_BUDGET, CARD_THUMBNAIL_PROXY_EDGE, CardThumbnailManager,
@@ -514,6 +515,7 @@ pub struct LibraryShell {
     /// Normal editor saves deliberately do not set this flag: their live
     /// session has already advanced its own fence and must retain history.
     remount_current_surface_after_organization_commit: bool,
+    sync_status: sync::ShellSyncStatus,
     /// Saved before a native panel opens. Completion always uses this point,
     /// never an arbitrary caret that may have moved while the picker owned
     /// focus.
@@ -1050,6 +1052,7 @@ impl LibraryShell {
             _card_thumbnail_task: None,
             surface_note_id: None,
             remount_current_surface_after_organization_commit: false,
+            sync_status: sync::ShellSyncStatus::Idle,
             pending_resource_insert: None,
             #[cfg(test)]
             resource_picker_presentations_for_test: Arc::new(AtomicUsize::new(0)),
@@ -6582,6 +6585,8 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::restore_library_action))
             .on_action(cx.listener(Self::export_library_readable_action))
             .on_action(cx.listener(Self::restore_library_readable_action))
+            .on_action(cx.listener(Self::sync_now_action))
+            .on_action(cx.listener(Self::open_sync_settings_action))
             .on_action(cx.listener(Self::toggle_search_palette))
             .on_action(cx.listener(Self::toggle_find_in_note))
             .on_action(cx.listener(Self::find_next_in_note))
@@ -6668,6 +6673,26 @@ impl Render for LibraryShell {
             ),
             IndexingStatus::Idle => None,
         })
+        .child(
+            // Always visible: local saving and server confirmation are
+            // different states and are never shown as one.
+            div()
+                .id("library-sync-status")
+                .debug_selector(|| "library-sync-status".to_owned())
+                .absolute()
+                .bottom(px(106.0))
+                .right(px(14.0))
+                .max_w(px(560.0))
+                .text_size(px(11.0))
+                .text_color(
+                    if matches!(self.sync_status, sync::ShellSyncStatus::Failed(_)) {
+                        rgba(0xa34838ff)
+                    } else {
+                        rgba(0x536f59ff)
+                    },
+                )
+                .child(self.sync_status_text(cx)),
+        )
         .children(self.resource_notice.as_ref().map(|notice| {
             div()
                 .id("library-resource-notice")
@@ -7048,6 +7073,8 @@ mod note_card_tests;
 mod organization_input_tests;
 #[cfg(test)]
 mod quit_lifecycle_tests;
+#[cfg(test)]
+mod sync_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

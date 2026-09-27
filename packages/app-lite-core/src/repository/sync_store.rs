@@ -1121,3 +1121,16 @@ impl LibraryRepository {
         Ok(())
     }
 }
+
+impl LibraryRepository {
+    /// Entities with changes the server has not confirmed yet.
+    pub fn sync_pending_count(&self) -> Result<i64, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT count(*) FROM (SELECT entity_type, entity_id FROM sync_outbox
+                                   UNION SELECT entity_type, entity_id FROM sync_inflight)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+}

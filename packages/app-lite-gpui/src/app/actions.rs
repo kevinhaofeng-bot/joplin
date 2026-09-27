@@ -19,6 +19,8 @@ gpui::actions!(
         ExportLibraryReadable,
         RestoreLibraryReadable,
         CopyNote,
+        SyncNow,
+        OpenSyncSettings,
     ]
 );
 
