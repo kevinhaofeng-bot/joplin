@@ -109,6 +109,7 @@ Codex 已独立核验 `becdff6d6`：core 345 通过；GUI 1362 通过、1 忽略
 | 同类嵌套 Markdown 列表 → 列表项 `indent` = 嵌套层级（原生 depth，上限 8，依赖另一会话 `24d5a632c`）；异类嵌套、超 8 层、项内第二个块仍阻断。`[![alt](:/img)](url)` 与 `<a href><img></a>` → 图片 `link`（依赖另一会话 `ef8517cf1`）；链到资源或片段的仍阻断 | `6af36711c` | 1500 / 166 |
 | 非图片资源用图片语法 `![名](:/pdf)` → 原位附件卡片（alt 与文件名不同时保留为文字）；在外链内时仍阻断 | `451f556a8` | 1502 / 164 |
 | H4–H6（依赖另一会话 `c1275c5ea`）；顶层有序列表起始号写入 `start`（依赖 `27878ea83`，u32 溢出仍阻断）；嵌套子列表从 ≠1 开始仍阻断（展平后只能有一个 start） | `56342c126` | 1522 / 144 |
+| GFM 表格 → canonical 表格（依赖另一会话 `5455bcb25`）：首行为表头；单元格保留标记、链接、`<br>`、转义管道、资源图片；超 1000 行/64 列或单元格含外链图片仍阻断；降级路径里失败的表格显示可读源码而不被当 HTML 拆散 | `22c9c233a` | 1581 / 85 |
 
 ### 剩余警告的真实分布（HEAD `6bff4936c`，只读探针）
 
@@ -320,3 +321,32 @@ core 全套 351 通过，日志 `/tmp/joplin-stage2-claude/core-enex.log`。
 - 单元格内图片 68 个：53 个指向资源，15 个是外链（这些笔记仍会因外链图片降级）。单元格内行内 HTML `<a>` 14 处，导入时仍按原始 HTML 阻断。
 
 已回复另一会话：对方案 B 没有异议；canonical 层落地后，由本会话接 GFM 表格导入映射。
+
+## 接手 GPUI 与表格导入（2026-09-27）
+
+另一会话按用户指示停手，交底 `docs/superpowers/plans/2026-09-27-claude-gpui-session-handoff.md`（`24ec79d05`）；此后 `app-lite-gpui` 也由本会话负责。
+
+### 集成回归（HEAD `c19db6275`，工作树无未提交改动）
+
+`cargo test --offline --features test-support --tests`（core）退出0，367 通过；`cargo test --offline --bin velotype`（gpui）退出0，1372 通过、0 失败、1 忽略。日志 `/tmp/joplin-stage3-claude/integ-c19db6275/`。schema v11 对 GUI 无影响。
+
+### GFM 表格导入（`22c9c233a`）
+
+- 新增 `gfm_tables_convert_with_header_inline_content_and_resource_images`。先失败证据：旧代码报“Markdown block construct has no lossless canonical mapping”。
+- 两条旧测试原来拿表格当“不支持”的夹具，改用定义列表；它们断言的行为（只降级失败块、阻断种类为 UnsupportedStructure）不变。
+- 发现并修复一处降级质量回退：单元格含行内 HTML 的表格在降级路径被当作 HTML 解析，单元格被拆散。现在表格片段显示可读源码。
+- core 全套 368 通过，日志 `/tmp/joplin-stage3-claude/core-tables.log`。
+
+真实副本新鲜隔离导入与原生往返（HEAD `888a71c17`，含 `22c9c233a`；工作树无未提交改动）：
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| `import_verify`：只读 JEX 副本 → `/tmp/joplin-stage3-import6.qGst4B/imports` | 退出0，92.6 s；1666/31/2/64/425/4153/4127；**降级 85**；发布 blob 0 不符，源 blob 缺失 0、多余 0 | `/tmp/joplin-stage3-import6.qGst4B/verify.log` |
+| 统计含 `data-joplin-lite-table` 的笔记 | 75 篇 | `/tmp/joplin-stage3-claude/fresh-22c9c233a/tables.txt` |
+| 原生加载/回写审计 | 退出0；`real-copy notes=1666, failure_categories={}`，75 篇含表格的笔记都能原生打开并原样回写 | `/tmp/joplin-stage3-claude/fresh-22c9c233a/audit.log` |
+
+原生侧表格目前是只读原子块（另一会话方案第 1 步）：单元格不能编辑、文字不换行、单元格内图片只显示 alt。表格显示没有实机查看。
+
+### 剩余 85 篇降级（只读探针）
+
+特征组合里单独出现的：外链图片 11、原始 HTML 11、行内数学 11，另有 11 篇没有标记特征（原因分布见 `/tmp/joplin-stage3-claude/fidelity-after-tables.log`）。外链图片是否联网抓取需要用户决定；行内数学在 Evernote 核心里没有对应，保持降级。

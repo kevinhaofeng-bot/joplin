@@ -10,5 +10,6 @@
 | 3 完整备份与恢复 | [03-backup-restore.md](replica-evidence/03-backup-restore.md) | `3d4f209e7` | 往返与真实规模通过；实机未做 | 未独立验收 |
 | 4 生命周期/组织/浏览 | [04-lifecycle-organization.md](replica-evidence/04-lifecycle-organization.md) | `0b436b4d8`、`308546e3a` | 修复永久删除两处数据缺陷；复制/多选/批量已交；实机未做 | 未独立验收 |
 | 5 多模态与搜索 | [05-multimodal-search.md](replica-evidence/05-multimodal-search.md) | `a89acda94`、`224840804` | 修复 SQLite 锁丢失致写入丢失；OCR/PDF 端到端通过；界面实机未做 | 未独立验收 |
-| 6 NAS 同步 | [06-sync.md](replica-evidence/06-sync.md) | `e6a73c019` | 仅第一步：协议+契约 8/8；网络/客户端/部署待协议审核与用户同意 | 未独立验收 |
+| 6 NAS 同步 | [06-sync.md](replica-evidence/06-sync.md) | `e6a73c019`、`93f6271f4`..`9405cb11d` | HTTP 传输、客户端同步引擎（上行/下行/冲突副本/附件断点/恢复身份）与两客户端 HTTP 矩阵已交；GUI 接线、容器与 NAS 部署未做（部署需用户同意） | 未独立验收 |
+| 8 剩余交付（迁移/可读导出/表格） | [08-remaining-delivery.md](replica-evidence/08-remaining-delivery.md) | `56c48d6aa`..`22c9c233a` | 迁移严格通过 1386→1581/1666；全库可读导出与恢复；新鲜导入与原生往返已验；实机未做 | 未独立验收 |
 | 7 安装与最终验收 | — | — | 未开始 | 未独立验收 |
