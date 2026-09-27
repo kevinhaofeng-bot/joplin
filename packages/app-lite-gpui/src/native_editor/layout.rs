@@ -33,6 +33,18 @@ const DEFAULT_TEXT_HEIGHT: f32 = 24.0;
 /// than borrowing an empty paragraph's extent. The renderer owns the visual
 /// chrome; the layout registry owns this stable document-coordinate height.
 pub(crate) const ATTACHMENT_CARD_HEIGHT: f32 = 76.0;
+/// Read-only table atom geometry: one fixed line height per displayed line,
+/// with vertical padding per row. Cell text is not wrapped (step 1).
+pub(crate) const TABLE_LINE_HEIGHT: f32 = 22.0;
+pub(crate) const TABLE_ROW_PADDING: f32 = 10.0;
+
+pub(crate) fn table_height(table: &super::model::TableContent) -> f32 {
+    table
+        .row_line_counts()
+        .map(|lines| lines as f32 * TABLE_LINE_HEIGHT + TABLE_ROW_PADDING)
+        .sum::<f32>()
+        .max(TABLE_LINE_HEIGHT + TABLE_ROW_PADDING)
+}
 const PREFETCH_VIEWPORTS: f32 = 1.0;
 const FALLBACK_GLYPH_WIDTH: f32 = 8.0;
 const CARET_WIDTH: f32 = 1.0;
@@ -120,6 +132,7 @@ fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
             ..
         } => image_layout_size(available_width, *natural_size, *display_width),
         BlockContent::Attachment { .. } => (available_width, ATTACHMENT_CARD_HEIGHT),
+        BlockContent::Table(table) => (available_width, table_height(table)),
         _ => (available_width, DEFAULT_TEXT_HEIGHT),
     };
     Bounds::new(
@@ -983,7 +996,10 @@ impl LayoutRegistry {
             let y = self.height_prefix(index);
             let height = self.height_prefix(index + 1) - y;
             let (before, after, is_image) = block_points(block);
-            let is_atomic = matches!(block.kind, BlockKind::Image | BlockKind::Attachment);
+            let is_atomic = matches!(
+                block.kind,
+                BlockKind::Image | BlockKind::Attachment | BlockKind::Table
+            );
             let mut bounds = block_bounds(width, block);
             if let Some(depth) = document.inline_group_list_depth(block.id) {
                 if let BlockContent::Image {
@@ -2071,6 +2087,7 @@ impl LayoutRegistry {
                     .1
                 }
                 BlockContent::Attachment { .. } => ATTACHMENT_CARD_HEIGHT,
+                BlockContent::Table(table) => table_height(table),
                 _ => DEFAULT_TEXT_HEIGHT,
             };
             this.estimated_heights.insert(block.id, height.max(1.0));

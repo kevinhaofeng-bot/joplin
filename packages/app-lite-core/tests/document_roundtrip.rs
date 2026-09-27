@@ -304,3 +304,72 @@ fn ordered_list_start_round_trips_and_keeps_adjacent_lists_apart() {
         assert_eq!(document.to_canonical_html().as_str(), expected, "{input}");
     }
 }
+
+/// GFM-style tables: rows of inline-only cells, first row optionally a
+/// header. Spans, block content and nested tables stay on the generic path.
+#[test]
+fn simple_tables_round_trip_with_header_links_images_and_breaks() {
+    use app_lite_core::document::TableCell;
+    let html = format!(
+        "<table data-joplin-lite-table=\"true\"><tbody><tr><th>名称</th><th>说明</th></tr><tr><td><strong>甲</strong>|乙</td><td>一行<br>二行</td></tr><tr><td><a href=\"https://example.com/\">链接</a></td><td><img src=\":/{FIRST_RESOURCE}\" alt=\"图\"></td></tr></tbody></table>"
+    );
+    let document = CanonicalDocument::parse_html(&html).unwrap();
+    let [Block::Table { rows, header: true }] = document.blocks() else {
+        panic!("{:?}", document.blocks());
+    };
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.cells.len() == 2));
+    assert!(matches!(
+        rows[2].cells[1],
+        TableCell { ref inlines } if matches!(inlines.as_slice(), [Inline::Image { .. }])
+    ));
+    assert_eq!(document.to_canonical_html().as_str(), html);
+    assert_eq!(
+        document.search_text().as_str(),
+        "名称\t说明\n甲|乙\t一行\n二行\n链接\t图"
+    );
+    assert_eq!(
+        document.resource_ids(),
+        vec![ResourceId::new(FIRST_RESOURCE).unwrap()]
+    );
+}
+
+#[test]
+fn plain_html_tables_are_normalized_and_ragged_rows_padded() {
+    let document = CanonicalDocument::parse_html(
+        "<table><thead><tr><td>a</td><td>b</td></tr></thead><tr><td>c</td></tr></table>",
+    )
+    .unwrap();
+    assert_eq!(
+        document.to_canonical_html().as_str(),
+        "<table data-joplin-lite-table=\"true\"><tbody><tr><td>a</td><td>b</td></tr><tr><td>c</td><td></td></tr></tbody></table>"
+    );
+}
+
+#[test]
+fn tables_with_spans_or_block_cells_keep_the_generic_path() {
+    for html in [
+        "<table><tr><td colspan=\"2\">a</td></tr></table>",
+        "<table><tr><td><ul><li>a</li></ul></td></tr></table>",
+    ] {
+        let document = CanonicalDocument::parse_html(html).unwrap();
+        assert!(
+            !document
+                .blocks()
+                .iter()
+                .any(|block| matches!(block, Block::Table { .. })),
+            "{html}"
+        );
+        assert!(document.search_text().as_str().contains('a'), "{html}");
+    }
+    // The outer table falls back; the inner simple table keeps its grid.
+    let nested = CanonicalDocument::parse_html(
+        "<table><tr><td>外<table><tr><td>内</td></tr></table></td></tr></table>",
+    )
+    .unwrap();
+    assert_eq!(nested.search_text().as_str(), "外\n内");
+    assert!(matches!(
+        nested.blocks(),
+        [Block::Paragraph { .. }, Block::Table { rows, .. }] if rows.len() == 1
+    ));
+}

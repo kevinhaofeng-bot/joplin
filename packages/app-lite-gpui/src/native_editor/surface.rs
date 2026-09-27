@@ -790,7 +790,10 @@ fn move_editor_vertically_and_reveal(
                 .document()
                 .block(editor.selection().head.node_id)
                 .is_some_and(|block| {
-                    matches!(block.kind, BlockKind::Image | BlockKind::Attachment)
+                    matches!(
+                        block.kind,
+                        BlockKind::Image | BlockKind::Attachment | BlockKind::Table
+                    )
                 });
         editor_cx.notify();
         (moved, caret, stopped_at_resource_atom)

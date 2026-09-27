@@ -11,7 +11,7 @@ use std::fmt;
 
 use super::model::{
     Block, BlockContent, BlockKind, Document, DocumentError, InlineGroup, MAX_LIST_DEPTH, Mark,
-    NodeId, StyledRun, TextAlignment,
+    NodeId, StyledRun, TableContent, TextAlignment,
 };
 
 /// The library shell deliberately imports only the canonical subset that can
@@ -392,6 +392,32 @@ pub fn import_canonical_with_resources(
                     revision: 0,
                 });
             }
+            CanonicalBlock::Table { rows, header } => {
+                for resource_id in
+                    CanonicalDocument::from_blocks(vec![block.clone()]).resource_ids()
+                {
+                    ensure_resource(&resource_id, available_resources, block_index)?;
+                }
+                native.push(Block {
+                    id: next_node_id(&mut next_id),
+                    kind: BlockKind::Table,
+                    content: BlockContent::Table(std::sync::Arc::new(TableContent {
+                        header: *header,
+                        rows: rows
+                            .iter()
+                            .map(|row| {
+                                row.cells
+                                    .iter()
+                                    .map(|cell| table_cell_text(&cell.inlines))
+                                    .collect()
+                            })
+                            .collect(),
+                        canonical: block.clone(),
+                    })),
+                    alignment: TextAlignment::Left,
+                    revision: 0,
+                });
+            }
             CanonicalBlock::Divider => native.push(Block {
                 id: next_node_id(&mut next_id),
                 kind: BlockKind::Divider,
@@ -767,6 +793,17 @@ pub fn export_canonical_with_resources(
                 }
                 output.push(CanonicalBlock::Divider);
             }
+            BlockKind::Table => {
+                let BlockContent::Table(table) = &block.content else {
+                    return Err(CanonicalExportError::InvalidTextContent { block_index });
+                };
+                for resource_id in
+                    CanonicalDocument::from_blocks(vec![table.canonical.clone()]).resource_ids()
+                {
+                    parse_allowed_resource(resource_id.as_str(), available_resources, block_index)?;
+                }
+                output.push(table.canonical.clone());
+            }
             BlockKind::BulletItem { .. }
             | BlockKind::OrderedItem { .. }
             | BlockKind::CheckItem { .. } => unreachable!("handled as a list item above"),
@@ -774,6 +811,23 @@ pub fn export_canonical_with_resources(
     }
     flush_list(&mut output, &mut pending_list);
     Ok(CanonicalDocument::from_blocks(output))
+}
+
+/// Display text of a read-only table cell: soft breaks become lines and
+/// images/cards show their label.
+fn table_cell_text(inlines: &[Inline]) -> String {
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text { text: run, .. } => text.push_str(run),
+            Inline::SoftBreak => text.push('\n'),
+            Inline::Image { alt, .. } => {
+                text.push_str(if alt.is_empty() { "[图片]" } else { alt })
+            }
+            Inline::Attachment { filename, .. } => text.push_str(filename),
+        }
+    }
+    text
 }
 
 fn ensure_resource(
@@ -1442,6 +1496,52 @@ mod tests {
             });
         assert_eq!(width, Some(Some(320)));
         assert_eq!(super::export_canonical(&reopened).unwrap(), exported);
+    }
+
+    #[test]
+    fn tables_open_as_read_only_atoms_and_save_unchanged() {
+        let html = "<p>前</p><table data-joplin-lite-table=\"true\"><tbody><tr><th>名称</th><th>说明</th></tr><tr><td><strong>甲</strong></td><td>一行<br>二行</td></tr><tr><td><a href=\"https://example.com/\">链接</a></td><td><img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"图\"></td></tr></tbody></table><p>后</p>";
+        let canonical = CanonicalDocument::parse_html(html).unwrap();
+        let resources = canonical.resource_ids();
+        let document = import_canonical_with_resources(&canonical, &resources).unwrap();
+        let table = &document.blocks()[1];
+        assert_eq!(table.kind, BlockKind::Table);
+        let BlockContent::Table(content) = &table.content else {
+            panic!("{:?}", table.content);
+        };
+        assert!(content.header);
+        assert_eq!(
+            content.rows,
+            vec![
+                vec!["名称".to_owned(), "说明".to_owned()],
+                vec!["甲".to_owned(), "一行\n二行".to_owned()],
+                vec!["链接".to_owned(), "图".to_owned()],
+            ]
+        );
+        assert_eq!(
+            export_canonical_with_resources(&document, Some(&resources)).unwrap(),
+            canonical
+        );
+        assert!(matches!(
+            export_canonical_with_resources(&document, Some(&[])),
+            Err(CanonicalExportError::MissingResource { .. })
+        ));
+        assert!(matches!(
+            import_canonical_with_resources(&canonical, &[]),
+            Err(CanonicalImportError::MissingResource { .. })
+        ));
+        let mut layout = crate::native_editor::layout::LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 1_000.0, 680.0);
+        let bounds = layout
+            .visible()
+            .iter()
+            .find(|block| block.node_id == table.id)
+            .unwrap()
+            .bounds;
+        // Rows of 1, 2 and 1 display lines.
+        let expected = 4.0 * crate::native_editor::layout::TABLE_LINE_HEIGHT
+            + 3.0 * crate::native_editor::layout::TABLE_ROW_PADDING;
+        assert!((f32::from(bounds.size.height) - expected).abs() < 0.5);
     }
 
     #[test]

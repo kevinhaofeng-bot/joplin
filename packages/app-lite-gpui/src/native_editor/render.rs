@@ -38,6 +38,7 @@ struct RenderBlock {
     image_resource_id: Option<String>,
     image_natural_max_edge: Option<u32>,
     attachment: Option<AttachmentRenderInfo>,
+    table: Option<std::sync::Arc<super::model::TableContent>>,
 }
 
 /// The card contains presentation metadata only. Resource bytes stay in the
@@ -278,6 +279,10 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 }
                 _ => None,
             });
+            let table = model_block.and_then(|block| match &block.content {
+                super::model::BlockContent::Table(table) => Some(table.clone()),
+                _ => None,
+            });
             let shaped_background_run_count = layout
                 .cache
                 .get(&block.node_id)
@@ -304,6 +309,7 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 image_resource_id,
                 image_natural_max_edge,
                 attachment,
+                table,
             }
         })
         .collect();
@@ -564,6 +570,10 @@ fn paint_snapshot(
             }
             continue;
         }
+        if let Some(table) = block.table.as_ref() {
+            paint_table(table, block.layout.bounds, window, cx)?;
+            continue;
+        }
         if let Some(attachment) = block.attachment.as_ref() {
             paint_attachment_card(attachment, block.layout.bounds, window, cx)?;
             #[cfg(test)]
@@ -663,6 +673,82 @@ fn paint_snapshot(
         quad.border_color = rgba(0x2167dfff).into();
         quad.corner_radii = Corners::all(px(2.0));
         window.paint_quad(quad);
+    }
+    Ok(())
+}
+
+/// Paints a read-only table atom: equal-width columns, one fixed line
+/// height per displayed line, text clipped to its cell.
+fn paint_table(
+    table: &super::model::TableContent,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Result<()> {
+    use super::layout::{TABLE_LINE_HEIGHT, TABLE_ROW_PADDING};
+    let columns = table.column_count().max(1);
+    let column_width = bounds.size.width / columns as f32;
+    let border = rgba(0xc9d3ccff);
+    let style = window.text_style();
+    let mut top = bounds.top();
+    for (row_index, (row, lines)) in table.rows.iter().zip(table.row_line_counts()).enumerate() {
+        let row_height = px(lines as f32 * TABLE_LINE_HEIGHT + TABLE_ROW_PADDING);
+        let is_header = table.header && row_index == 0;
+        if is_header {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(bounds.left(), top),
+                    gpui::size(bounds.size.width, row_height),
+                ),
+                rgba(0xf1f5f2ff),
+            ));
+        }
+        for column in 0..columns {
+            let cell = Bounds::new(
+                point(bounds.left() + column_width * column as f32, top),
+                gpui::size(column_width, row_height),
+            );
+            window.paint_quad(outline(cell, border, BorderStyle::default()));
+            let Some(text) = row.get(column) else {
+                continue;
+            };
+            let mut font = style.font();
+            if is_header {
+                font.weight = FontWeight::SEMIBOLD;
+            }
+            window.with_content_mask(Some(gpui::ContentMask { bounds: cell }), |window| {
+                for (line_index, line) in text.lines().enumerate() {
+                    let line: SharedString = line.to_owned().into();
+                    let shaped = window.text_system().shape_line(
+                        line.clone(),
+                        px(14.0),
+                        &[TextRun {
+                            len: line.len(),
+                            font: font.clone(),
+                            color: rgba(0x25342bff).into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    shaped.paint(
+                        point(
+                            cell.left() + px(8.0),
+                            cell.top()
+                                + px(
+                                    TABLE_ROW_PADDING / 2.0 + line_index as f32 * TABLE_LINE_HEIGHT
+                                ),
+                        ),
+                        px(TABLE_LINE_HEIGHT),
+                        window,
+                        cx,
+                    )?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+        top += row_height;
     }
     Ok(())
 }
@@ -941,6 +1027,7 @@ mod tests {
             image_resource_id: None,
             image_natural_max_edge: None,
             attachment: None,
+            table: None,
         }
     }
 

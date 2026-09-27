@@ -3012,6 +3012,7 @@ impl EditorCore {
                 BlockContent::Text { text, .. } => result.push_str(text),
                 BlockContent::Image { .. }
                 | BlockContent::Attachment { .. }
+                | BlockContent::Table(_)
                 | BlockContent::Empty => result.push('\u{fffc}'),
             }
         }
@@ -3529,7 +3530,10 @@ impl EntityInputHandler for EditorCore {
 /// this predicate at the editor boundary prevents a rendered attachment card
 /// from accidentally becoming a text-like, uneditable dead zone.
 fn is_atomic_block_kind(kind: &BlockKind) -> bool {
-    matches!(kind, BlockKind::Image | BlockKind::Attachment)
+    matches!(
+        kind,
+        BlockKind::Image | BlockKind::Attachment | BlockKind::Table
+    )
 }
 
 fn block_points(block: &Block) -> (DocPoint, DocPoint) {

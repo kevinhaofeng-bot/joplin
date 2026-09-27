@@ -57,15 +57,27 @@ impl NodeId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     Paragraph,
-    Heading { level: u8 },
-    BulletItem { depth: u8 },
-    OrderedItem { depth: u8 },
-    CheckItem { depth: u8, checked: bool },
+    Heading {
+        level: u8,
+    },
+    BulletItem {
+        depth: u8,
+    },
+    OrderedItem {
+        depth: u8,
+    },
+    CheckItem {
+        depth: u8,
+        checked: bool,
+    },
     Quote,
     Code,
     Image,
     Attachment,
     Divider,
+    /// A canonical table kept as one read-only atom (first native step:
+    /// display and lossless save; cell editing is not implemented yet).
+    Table,
 }
 
 impl BlockKind {
@@ -160,7 +172,33 @@ pub enum BlockContent {
         filename: String,
         media_type: String,
     },
+    Table(Arc<TableContent>),
     Empty,
+}
+
+/// A table atom: plain display text per cell, plus the canonical block that
+/// is written back unchanged on save.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TableContent {
+    pub header: bool,
+    pub rows: Vec<Vec<String>>,
+    pub canonical: app_lite_core::document::Block,
+}
+
+impl TableContent {
+    pub fn column_count(&self) -> usize {
+        self.rows.iter().map(Vec::len).max().unwrap_or(0)
+    }
+
+    /// Display lines of the tallest cell in each row.
+    pub fn row_line_counts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.rows.iter().map(|row| {
+            row.iter()
+                .map(|cell| cell.lines().count().max(1))
+                .max()
+                .unwrap_or(1)
+        })
+    }
 }
 
 impl BlockContent {
@@ -237,6 +275,13 @@ impl Block {
                 filename,
                 media_type,
             } => resource_id.len() + filename.len() + media_type.len(),
+            BlockContent::Table(table) => table
+                .rows
+                .iter()
+                .flatten()
+                .map(String::len)
+                .sum::<usize>()
+                .saturating_mul(2),
             BlockContent::Empty => 0,
         };
         std::mem::size_of::<Self>() + content_bytes
@@ -3939,7 +3984,10 @@ fn is_text_block(block: &Block) -> bool {
 
 fn is_navigation_block(block: &Block) -> bool {
     block.content.as_text().is_some()
-        || matches!(block.kind, BlockKind::Image | BlockKind::Attachment)
+        || matches!(
+            block.kind,
+            BlockKind::Image | BlockKind::Attachment | BlockKind::Table
+        )
 }
 
 fn block_flat_lengths(block: &Block) -> (usize, usize) {
@@ -3955,6 +4003,7 @@ fn is_structural_block(block: &Block) -> bool {
         (BlockKind::Image, BlockContent::Image { .. })
             | (BlockKind::Attachment, BlockContent::Attachment { .. })
             | (BlockKind::Divider, BlockContent::Empty)
+            | (BlockKind::Table, BlockContent::Table(_))
     )
 }
 
@@ -3963,7 +4012,8 @@ fn validate_block_invariants(block: &Block) -> Result<(), DocumentError> {
     match (&block.kind, &block.content) {
         (BlockKind::Image, BlockContent::Image { .. })
         | (BlockKind::Attachment, BlockContent::Attachment { .. })
-        | (BlockKind::Divider, BlockContent::Empty) => Ok(()),
+        | (BlockKind::Divider, BlockContent::Empty)
+        | (BlockKind::Table, BlockContent::Table(_)) => Ok(()),
         (
             BlockKind::Paragraph
             | BlockKind::Heading { .. }
@@ -4006,7 +4056,8 @@ fn validate_block_slice(blocks: &[Block]) -> Result<(), DocumentError> {
         match (&block.kind, &block.content) {
             (BlockKind::Image, BlockContent::Image { .. })
             | (BlockKind::Attachment, BlockContent::Attachment { .. })
-            | (BlockKind::Divider, BlockContent::Empty) => {}
+            | (BlockKind::Divider, BlockContent::Empty)
+            | (BlockKind::Table, BlockContent::Table(_)) => {}
             (kind, BlockContent::Text { text, styles }) if is_text_kind(kind) => {
                 validate_styles(block.id, text, styles)?;
             }

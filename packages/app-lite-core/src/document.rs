@@ -134,7 +134,25 @@ pub enum Block {
     },
     /// A semantic horizontal divider.
     Divider,
+    /// A simple grid of inline-only cells (GFM-table shape). `header` marks
+    /// the first row as header cells. Row lengths are equal after
+    /// normalization.
+    Table { rows: Vec<TableRow>, header: bool },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRow {
+    pub cells: Vec<TableCell>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableCell {
+    pub inlines: Vec<Inline>,
+}
+
+/// Larger tables stay on the generic flattening path.
+const MAX_TABLE_ROWS: usize = 1000;
+const MAX_TABLE_COLUMNS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadingLevel {
@@ -374,6 +392,28 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                 output.push_str("</a>");
             }
             Block::Divider => output.push_str("<hr data-joplin-lite-block-divider=\"true\">"),
+            Block::Table { rows, header } => {
+                output.push_str("<table data-joplin-lite-table=\"true\"><tbody>");
+                for (row_index, row) in rows.iter().enumerate() {
+                    let tag = if *header && row_index == 0 {
+                        "th"
+                    } else {
+                        "td"
+                    };
+                    output.push_str("<tr>");
+                    for cell in &row.cells {
+                        output.push('<');
+                        output.push_str(tag);
+                        output.push('>');
+                        serialize_inlines(&cell.inlines, &mut output);
+                        output.push_str("</");
+                        output.push_str(tag);
+                        output.push('>');
+                    }
+                    output.push_str("</tr>");
+                }
+                output.push_str("</tbody></table>");
+            }
         }
     }
     output
@@ -459,6 +499,19 @@ fn search_text(document: &CanonicalDocument) -> String {
             Block::Image { alt, .. } => output.push_str(alt),
             Block::Attachment { filename, .. } => output.push_str(filename),
             Block::Divider => {}
+            Block::Table { rows, .. } => {
+                for (row_index, row) in rows.iter().enumerate() {
+                    if row_index > 0 {
+                        output.push('\n');
+                    }
+                    for (cell_index, cell) in row.cells.iter().enumerate() {
+                        if cell_index > 0 {
+                            output.push('\t');
+                        }
+                        append_search_inlines(&cell.inlines, &mut output);
+                    }
+                }
+            }
         }
     }
     output
@@ -506,6 +559,17 @@ fn resource_ids(document: &CanonicalDocument) -> Vec<ResourceId> {
                 vec![resource_id.clone()]
             }
             Block::Divider => Vec::new(),
+            Block::Table { rows, .. } => {
+                rows.iter()
+                    .flat_map(|row| row.cells.iter())
+                    .flat_map(|cell| cell.inlines.iter())
+                    .filter_map(|inline| match inline {
+                        Inline::Image { resource_id, .. }
+                        | Inline::Attachment { resource_id, .. } => Some(resource_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            }
         })
         .collect()
 }
@@ -529,7 +593,8 @@ fn block_is_empty(block: &Block) -> bool {
         | Block::Code { .. }
         | Block::Image { .. }
         | Block::Attachment { .. }
-        | Block::Divider => false,
+        | Block::Divider
+        | Block::Table { .. } => false,
     }
 }
 
@@ -595,6 +660,7 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 media_type,
             },
             Block::Divider => Block::Divider,
+            Block::Table { rows, header } => normalize_table(rows, header),
         })
         .fold(Vec::new(), |mut normalized, block| {
             if let (
@@ -622,6 +688,25 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
 fn normalize_style(mut style: BlockStyle) -> BlockStyle {
     style.indent = style.indent.min(8);
     style
+}
+
+fn normalize_table(rows: Vec<TableRow>, header: bool) -> Block {
+    let width = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            let mut cells: Vec<TableCell> = row
+                .cells
+                .into_iter()
+                .map(|cell| TableCell {
+                    inlines: normalize_inlines(cell.inlines),
+                })
+                .collect();
+            cells.resize_with(width, TableCell::default);
+            TableRow { cells }
+        })
+        .collect();
+    Block::Table { rows, header }
 }
 
 fn normalize_list_start(kind: ListKind, start: Option<u32>) -> Option<u32> {
@@ -1274,6 +1359,88 @@ fn drain_dom(root: DomHandle) {
     }
 }
 
+fn element_name(node: &DomHandle) -> Option<String> {
+    match &node.data {
+        DomData::Element { name, .. } => Some(name.local.to_string().to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+fn is_ignorable_table_child(node: &DomHandle) -> bool {
+    match &node.data {
+        DomData::Text(text) => text.borrow().trim().is_empty(),
+        DomData::Comment(_) => true,
+        _ => false,
+    }
+}
+
+/// Projects a simple table (rows of th/td holding only inline content).
+/// Spans, captions, block content, nested tables or an oversize grid return
+/// None so the caller keeps the generic flattening and loses no text.
+fn project_table(table: &DomHandle) -> Option<Block> {
+    let mut row_nodes = Vec::new();
+    for child in table.children.borrow().iter() {
+        match element_name(child).as_deref() {
+            Some("thead" | "tbody" | "tfoot") => {
+                for row in child.children.borrow().iter() {
+                    match element_name(row).as_deref() {
+                        Some("tr") => row_nodes.push(row.clone()),
+                        None if is_ignorable_table_child(row) => {}
+                        _ => return None,
+                    }
+                }
+            }
+            Some("tr") => row_nodes.push(child.clone()),
+            Some("colgroup") => {}
+            None if is_ignorable_table_child(child) => {}
+            _ => return None,
+        }
+    }
+    if row_nodes.is_empty() || row_nodes.len() > MAX_TABLE_ROWS {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(row_nodes.len());
+    let mut header = false;
+    for (row_index, row) in row_nodes.iter().enumerate() {
+        let mut cells = Vec::new();
+        let mut all_header = true;
+        for cell in row.children.borrow().iter() {
+            let name = element_name(cell);
+            match name.as_deref() {
+                Some("td" | "th") => {}
+                None if is_ignorable_table_child(cell) => continue,
+                _ => return None,
+            }
+            all_header &= name.as_deref() == Some("th");
+            let DomData::Element { attrs, .. } = &cell.data else {
+                return None;
+            };
+            for span in ["colspan", "rowspan"] {
+                if attribute(&attrs.borrow(), span)
+                    .is_some_and(|value| value.trim().parse::<u32>().ok() != Some(1))
+                {
+                    return None;
+                }
+            }
+            let projected = project_dom(cell);
+            let inlines = match projected.blocks.as_slice() {
+                [] => Vec::new(),
+                [Block::Paragraph { inlines, .. }] => inlines.clone(),
+                _ => return None,
+            };
+            cells.push(TableCell { inlines });
+        }
+        if cells.len() > MAX_TABLE_COLUMNS {
+            return None;
+        }
+        if row_index == 0 {
+            header = all_header && !cells.is_empty();
+        }
+        rows.push(TableRow { cells });
+    }
+    Some(Block::Table { rows, header })
+}
+
 fn project_dom(root: &DomHandle) -> CanonicalDocument {
     let mut projection = Projection::default();
     let mut pending = vec![ProjectionFrame::Visit {
@@ -1395,6 +1562,13 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                     // canonical model can preserve, so it remains ordinary
                     // visible inline content rather than being silently
                     // hoisted across list boundaries.
+                    if projection.list_contexts.is_empty()
+                        && tag == "table"
+                        && let Some(table) = project_table(&node)
+                    {
+                        projection.structural_block(table);
+                        continue;
+                    }
                     if projection.list_contexts.is_empty()
                         && tag == "img"
                         && attribute(&attrs.borrow(), "data-joplin-lite-block-image").as_deref()
@@ -1992,6 +2166,14 @@ impl Projection {
         });
         self.flow_has_visible = true;
         self.current_item_has_content = true;
+    }
+
+    fn structural_block(&mut self, block: Block) {
+        self.flush();
+        self.document.blocks.push(block);
+        self.pending_space = false;
+        self.pending_marks = None;
+        self.flow_has_visible = false;
     }
 
     fn block_image(&mut self, attrs: &[Attribute], marks: &ProjectionMarks) {
@@ -3169,7 +3351,8 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
     #[test]
     fn table_foster_parenting_keeps_stray_text_before_table_cells() {
         let document = parse_html("<table>before<tr><td>cell</td></tr>after</table>").unwrap();
-        assert_eq!(search_text(&document), "beforeaftercell");
+        // The simple table is its own block after the foster-parented text.
+        assert_eq!(search_text(&document), "beforeafter\ncell");
     }
 
     #[test]
