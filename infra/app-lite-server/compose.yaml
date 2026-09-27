@@ -1,0 +1,14 @@
+# A separate service with its own directory, port and container; it does not
+# replace anything already running. Put APP_LITE_SERVER_TOKEN (at least 32
+# random bytes) in app-lite-server.env, which is not committed.
+services:
+  app-lite-server:
+    build:
+      context: ../../packages
+      dockerfile: ../infra/app-lite-server/Dockerfile
+    env_file: app-lite-server.env
+    volumes:
+      - ./data:/data
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
