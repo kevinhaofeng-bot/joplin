@@ -2216,6 +2216,14 @@ impl LibraryShell {
         self.apply_action(AppAction::CreateNote, window, cx);
     }
 
+    /// Names how many notes Restore acts on, since it restores them all.
+    fn restore_selected_label(&self, cx: &App) -> String {
+        match self.model.read(cx).selected_note_ids().len() {
+            count if count > 1 => format!("恢复 {count} 篇笔记"),
+            _ => "恢复当前笔记".to_owned(),
+        }
+    }
+
     fn trash_selected(&mut self, _: &TrashSelected, window: &mut Window, cx: &mut Context<Self>) {
         self.apply_action(AppAction::TrashSelected, window, cx);
     }
@@ -5196,7 +5204,7 @@ impl LibraryShell {
                     .gap(px(6.0))
                     .child(library_action_button(
                         "library-organization-restore-selected",
-                        "恢复当前笔记".to_owned(),
+                        self.restore_selected_label(cx),
                         AppAction::RestoreSelected,
                         cx,
                     ))

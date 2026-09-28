@@ -2440,6 +2440,101 @@ fn trash_route_restore_and_purge_are_typed_and_do_not_revive_a_wrong_session() {
     assert_eq!(model.active_session_note_id(), None);
 }
 
+/// Evernote's Trash action menu restores every selected guid (renderer
+/// 9435.js `[As.RESTORE]: () => e(us.eA({ guids: s }))`), all or none.
+#[test]
+fn restore_selected_restores_every_selected_trash_note_or_none() {
+    let (_profile, repository) = repository();
+    let ids: Vec<_> = ["一", "二", "三", "四"]
+        .into_iter()
+        .map(|title| create(&repository, title))
+        .collect();
+    repository.trash_notes(&ids).expect("trash fixtures");
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Trash,
+            selected_note_id: Some(ids[1].clone()),
+        })
+        .expect("navigate trash");
+    let listed: Vec<_> = model
+        .projections()
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    let (primary, extra) = (listed[1].clone(), listed[2].clone());
+    model
+        .dispatch(AppAction::SelectNote(primary.clone()))
+        .expect("select");
+    model
+        .dispatch(AppAction::ToggleNoteInSelection(extra.clone()))
+        .expect("cmd-click");
+    let in_trash = |id: &NoteId| {
+        repository
+            .load_note(id)
+            .expect("load")
+            .expect("exists")
+            .deleted_time
+            .is_some()
+    };
+
+    // Restored elsewhere meanwhile: nothing is restored, the selection stays.
+    repository.restore_note(&extra).expect("restore elsewhere");
+    assert!(model.dispatch(AppAction::RestoreSelected).is_err());
+    assert!(in_trash(&primary), "all or none");
+    assert_eq!(model.navigation().selected_note_id(), Some(&primary));
+    assert!(matches!(model.status(), AppStatus::Error(_)));
+    repository.trash_note(&extra).expect("back to trash");
+    model.refresh_list().expect("refresh");
+    model
+        .dispatch(AppAction::SelectNote(primary.clone()))
+        .expect("select again");
+    model
+        .dispatch(AppAction::ToggleNoteInSelection(extra.clone()))
+        .expect("cmd-click again");
+    assert_eq!(
+        model.selected_note_ids(),
+        vec![primary.clone(), extra.clone()]
+    );
+
+    model
+        .dispatch(AppAction::RestoreSelected)
+        .expect("restore selected");
+    assert!(!in_trash(&primary) && !in_trash(&extra), "both restored");
+    let remaining: Vec<_> = listed
+        .iter()
+        .filter(|id| **id != primary && **id != extra)
+        .cloned()
+        .collect();
+    assert!(remaining.iter().all(in_trash), "the others stay in Trash");
+    assert_eq!(model.navigation().route(), &LibraryRoute::Trash);
+    assert_eq!(
+        model
+            .projections()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>(),
+        remaining
+    );
+    let selected = model.navigation().selected_note_id().cloned();
+    assert!(
+        selected.as_ref().is_some_and(|id| remaining.contains(id)),
+        "a remaining Trash note is selected: {selected:?}"
+    );
+    assert_eq!(model.selected_note_ids().len(), 1, "multi-selection ends");
+    assert_eq!(model.status(), &AppStatus::Ready);
+
+    // One selected note keeps the single-note path's result.
+    let only = remaining[0].clone();
+    model
+        .dispatch(AppAction::SelectNote(only.clone()))
+        .expect("select one");
+    model
+        .dispatch(AppAction::RestoreSelected)
+        .expect("restore one");
+    assert!(!in_trash(&only));
+}
+
 #[test]
 fn cmd_click_multi_selection_moves_and_tags_every_selected_note_through_the_same_actions() {
     let (profile, repository) = repository();

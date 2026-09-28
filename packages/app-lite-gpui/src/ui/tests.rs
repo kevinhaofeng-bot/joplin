@@ -9691,6 +9691,168 @@ async fn mounted_multi_selection_trash_is_refused_while_the_open_note_cannot_sav
     );
 }
 
+/// Cmd-click in Trash, then Restore: every selected note comes back to its
+/// own notebook with its attachment, one note stays in Trash and becomes
+/// the selection, and a fresh open of the library agrees.
+#[gpui::test]
+async fn mounted_restore_selected_restores_every_selected_note(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let work = repository.create_notebook("工作", None).unwrap();
+    let image = repository
+        .import_resource(&png_fixture(), "photo.png", "image/png", "png")
+        .unwrap();
+    let notes: Vec<NoteId> = ["甲", "乙", "丙"]
+        .into_iter()
+        .map(|title| {
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: Some(work.id.clone()),
+                    document: CanonicalDocument::from_blocks(vec![Block::Image {
+                        resource_id: image.clone(),
+                        alt: title.into(),
+                        presentation: ImagePresentation {
+                            natural_size: Some((1, 1)),
+                            ..Default::default()
+                        },
+                        link: None,
+                    }]),
+                })
+                .unwrap()
+                .id
+        })
+        .collect();
+    repository.trash_notes(&notes).unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::NavigateTo {
+                    route: LibraryRoute::Trash,
+                    selected_note_id: None,
+                },
+                window,
+                shell_cx,
+            )
+        });
+    });
+    redraw(cx);
+    let listed: Vec<NoteId> = view.read_with(cx, |shell, app| {
+        shell
+            .model
+            .read(app)
+            .projections()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect()
+    });
+    assert_eq!(listed.len(), 3);
+    let card = |index: usize, cx: &mut VisualTestContext| {
+        cx.debug_bounds(Box::leak(
+            format!("library-note-card-{index}").into_boxed_str(),
+        ))
+        .unwrap_or_else(|| panic!("card {index}"))
+    };
+    let first = card(0, cx);
+    cx.simulate_click(first.center(), Modifiers::default());
+    redraw(cx);
+    let third = card(2, cx);
+    cx.simulate_click(
+        third.center(),
+        Modifiers {
+            platform: true,
+            ..Default::default()
+        },
+    );
+    redraw(cx);
+    let selected = view.read_with(cx, |shell, app| shell.model.read(app).selected_note_ids());
+    assert_eq!(selected, vec![listed[0].clone(), listed[2].clone()]);
+    let toggle = cx
+        .debug_bounds("library-toggle-organization")
+        .expect("organization trigger in Trash");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell.restore_selected_label(app)),
+        "恢复 2 篇笔记"
+    );
+    let restore = cx
+        .debug_bounds("library-organization-restore-selected")
+        .expect("restore control");
+    cx.simulate_click(restore.center(), Modifiers::default());
+    redraw(cx);
+
+    let in_trash = |id: &NoteId| {
+        repository
+            .load_note(id)
+            .unwrap()
+            .unwrap()
+            .deleted_time
+            .is_some()
+    };
+    assert!(
+        !in_trash(&listed[0]) && !in_trash(&listed[2]),
+        "both restored"
+    );
+    assert!(in_trash(&listed[1]), "the unselected note stays in Trash");
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(model.selected_note_ids(), vec![listed[1].clone()]);
+        assert_eq!(
+            model
+                .projections()
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec![listed[1].clone()]
+        );
+        assert!(shell.resource_notice.is_none());
+    });
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell.restore_selected_label(app)),
+        "恢复当前笔记"
+    );
+
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    for id in [&listed[0], &listed[2]] {
+        let note = reopened.load_note(id).unwrap().unwrap();
+        assert_eq!(note.deleted_time, None);
+        assert_eq!(note.notebook_id, work.id, "back in its own notebook");
+        assert_eq!(
+            note.resource_ids,
+            vec![image.clone()],
+            "with its attachment"
+        );
+    }
+    assert_eq!(
+        reopened.read_resource_bytes(&image).unwrap().unwrap(),
+        png_fixture()
+    );
+    let mut reopened_model = AppModel::open(Arc::new(reopened)).unwrap();
+    let ids = |model: &AppModel| {
+        model
+            .projections()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let all_notes = ids(&reopened_model);
+    assert!(
+        all_notes.contains(&listed[0]) && all_notes.contains(&listed[2]),
+        "restored notes are listed again after reopening"
+    );
+    assert!(!all_notes.contains(&listed[1]));
+    reopened_model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Trash,
+            selected_note_id: None,
+        })
+        .unwrap();
+    assert_eq!(ids(&reopened_model), vec![listed[1].clone()]);
+}
+
 #[gpui::test]
 async fn mounted_multi_selection_trash_moves_every_selected_note_and_keeps_a_valid_selection(
     cx: &mut TestAppContext,

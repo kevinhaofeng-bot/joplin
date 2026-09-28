@@ -366,11 +366,14 @@ impl AppModel {
                 .apply_organization_mutation("笔记已恢复", move |repository| {
                     repository.restore_note(&id)
                 }),
-            AppAction::RestoreSelected => self.selected_note_for_organization().and_then(|id| {
-                self.apply_organization_mutation("笔记已恢复", move |repository| {
-                    repository.restore_note(&id)
-                })
-            }),
+            // Every selected note, as Evernote's multi-select RESTORE of all
+            // guids; one transaction, all or none.
+            AppAction::RestoreSelected => match self.selected_note_ids() {
+                ids if ids.is_empty() => Err(LibraryError::NotFound),
+                ids => self.apply_organization_mutation("笔记已恢复", move |repository| {
+                    repository.restore_notes(&ids)
+                }),
+            },
             AppAction::PurgeNote(id) => self
                 .apply_organization_mutation("笔记已永久删除", move |repository| {
                     repository.purge_note(&id)

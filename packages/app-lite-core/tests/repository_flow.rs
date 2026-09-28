@@ -716,6 +716,105 @@ fn reopening_requeues_transient_derived_text_failures_up_to_three_attempts() {
 }
 
 #[test]
+fn restoring_several_notes_is_one_transaction() {
+    let profile = tempdir().unwrap();
+    let database = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&database).unwrap();
+    let work = repository.create_notebook("工作", None).unwrap();
+    let gone = repository.create_notebook("已删", None).unwrap();
+    let image = repository
+        .import_resource(b"not decoded here", "receipt.png", "image/png", "png")
+        .unwrap();
+    let create = |title: &str, notebook: &app_lite_core::NotebookId| {
+        repository
+            .create_note(CreateNote {
+                title: title.into(),
+                notebook_id: Some(notebook.clone()),
+                document: document(title),
+            })
+            .unwrap()
+            .id
+    };
+    let (first, second, third) = (
+        create("一", &work.id),
+        create("二", &gone.id),
+        create("三", &work.id),
+    );
+    let with_image = repository.load_note(&first).unwrap().unwrap();
+    repository
+        .save_note(SaveNote {
+            id: first.clone(),
+            expected_revision: with_image.revision,
+            title: "一".into(),
+            document: CanonicalDocument::from_blocks(vec![Block::Image {
+                resource_id: image.clone(),
+                alt: "receipt".into(),
+                presentation: Default::default(),
+                link: None,
+            }]),
+            resource_ids: vec![image.clone()],
+            selected_thumbnail_id: Some(image.clone()),
+        })
+        .unwrap();
+    repository
+        .trash_notes(&[first.clone(), second.clone(), third.clone()])
+        .unwrap();
+    // A notebook deleted by another device while the note sat in Trash.
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE notebooks SET deleted_time = 1 WHERE id = ?1",
+            [gone.id.as_str()],
+        )
+        .unwrap();
+    let in_trash = |id: &NoteId| {
+        repository
+            .load_note(id)
+            .unwrap()
+            .unwrap()
+            .deleted_time
+            .is_some()
+    };
+
+    // One target is no longer in Trash: nothing is restored or queued.
+    repository.restore_note(&third).unwrap();
+    let outbox = repository.outbox_count().unwrap();
+    assert!(
+        repository
+            .restore_notes(&[first.clone(), third.clone(), second.clone()])
+            .is_err()
+    );
+    assert!(in_trash(&first) && in_trash(&second), "rolled back");
+    assert_eq!(repository.outbox_count().unwrap(), outbox);
+    assert!(repository.restore_notes(&[]).is_err());
+
+    repository
+        .restore_notes(&[first.clone(), second.clone(), first.clone()])
+        .unwrap();
+    assert!(!in_trash(&first) && !in_trash(&second));
+    assert_eq!(
+        repository.outbox_count().unwrap(),
+        outbox + 2,
+        "each is queued for sync once"
+    );
+    drop(repository);
+    let reopened = LibraryRepository::open(&database).unwrap();
+    let first = reopened.load_note(&first).unwrap().unwrap();
+    assert_eq!(first.notebook_id, work.id, "back in its own notebook");
+    assert_eq!(first.resource_ids, vec![image.clone()]);
+    assert_eq!(
+        reopened.read_resource_bytes(&image).unwrap().unwrap(),
+        b"not decoded here",
+        "its attachment is intact"
+    );
+    assert_eq!(
+        reopened.load_note(&second).unwrap().unwrap().notebook_id,
+        reopened.default_notebook().unwrap().id,
+        "a note whose notebook is gone returns to the default notebook"
+    );
+}
+
+#[test]
 fn trashing_several_notes_is_one_transaction() {
     let profile = tempdir().unwrap();
     let repository = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();

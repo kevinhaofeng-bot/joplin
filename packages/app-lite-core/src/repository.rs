@@ -1590,6 +1590,14 @@ impl LibraryRepository {
         self.set_deleted(std::slice::from_ref(id), false)
     }
 
+    /// Restores every note in one transaction, as Evernote restores all
+    /// selected guids: if any is missing or no longer in Trash, none is
+    /// restored and `NotFound` is returned. Each note returns to its own
+    /// notebook, or to the default one if that notebook is gone.
+    pub fn restore_notes(&self, ids: &[NoteId]) -> Result<(), LibraryError> {
+        self.set_deleted(ids, false)
+    }
+
     pub fn purge_note(&self, id: &NoteId) -> Result<(), LibraryError> {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
