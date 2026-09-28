@@ -103,6 +103,87 @@ impl LibraryShell {
         })
     }
 
+    pub(super) fn table_cell_has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.table_cell_editor
+            .as_ref()
+            .is_some_and(|cell| cell.editor.read(cx).focus_handle().is_focused(window))
+    }
+
+    /// Paste into the focused cell. A cell holds text, marks and links; an
+    /// image or file here is refused instead of landing in the note body.
+    pub(super) fn paste_into_table_cell(
+        &mut self,
+        intent: PasteIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.table_cell_editor.as_ref().map(|cell| cell.editor.clone()) else {
+            return;
+        };
+        let (formatted, plain) = match intent {
+            PasteIntent::Text { text } => (None, Some(text)),
+            PasteIntent::Fragment { fragment } if fragment.resources.is_empty() => (
+                CanonicalDocument::parse_html(&fragment.html).ok(),
+                Some(fragment.plain),
+            ),
+            PasteIntent::Html { html, text } => {
+                match CanonicalDocument::parse_pasted_html(&html) {
+                    Ok(pasted) if pasted.images.is_empty() => (Some(pasted.document), text),
+                    Ok(_) => (None, None),
+                    Err(_) => (None, text),
+                }
+            }
+            PasteIntent::File { path, cleanup } => {
+                if cleanup {
+                    let _ = std::fs::remove_file(path);
+                }
+                (None, None)
+            }
+            PasteIntent::FileCandidates { cleanup_paths, .. } => {
+                for path in cleanup_paths {
+                    let _ = std::fs::remove_file(path);
+                }
+                (None, None)
+            }
+            _ => (None, None),
+        };
+        let blocks = formatted
+            .and_then(|document| cell_inlines(&document).ok())
+            .map(|inlines| {
+                CanonicalDocument::from_blocks(vec![CanonicalBlock::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines,
+                }])
+            })
+            .and_then(|document| import_canonical_with_resources(&document, &[]).ok())
+            .map(|document| document.blocks().iter().cloned().collect::<Vec<_>>());
+        if blocks.is_none() && plain.is_none() {
+            self.resource_notice = Some("单元格只能粘贴文字和链接；图片或文件请粘贴到正文".into());
+            cx.notify();
+            return;
+        }
+        let result = editor.update(cx, |editor, editor_cx| {
+            let result = match (blocks, plain) {
+                (Some(blocks), _) => editor
+                    .paste_blocks(&crate::native_editor::core::CopiedBlocks {
+                        blocks,
+                        open_start: true,
+                        open_end: true,
+                    })
+                    .map(|_| ()),
+                (None, Some(text)) => editor.paste_plain_text(&text),
+                (None, None) => unreachable!("checked above"),
+            };
+            editor_cx.notify();
+            result
+        });
+        if let Err(error) = result {
+            self.resource_notice = Some(format!("粘贴未完成：{error}"));
+            cx.notify();
+        }
+        crate::native_editor::surface::focus_editor(&editor, window, cx);
+    }
+
     pub(super) fn open_table_cell_editor(
         &mut self,
         node_id: crate::native_editor::model::NodeId,

@@ -3154,6 +3154,10 @@ impl LibraryShell {
         let Some(payload) = payload else {
             return;
         };
+        if self.table_cell_has_focus(window, cx) {
+            self.paste_into_table_cell(classify_clipboard(payload), window, cx);
+            return;
+        }
         let Some(session) = self.note_session.clone() else {
             self.resource_notice = Some("请先选择一篇笔记再粘贴资源".to_owned());
             cx.notify();

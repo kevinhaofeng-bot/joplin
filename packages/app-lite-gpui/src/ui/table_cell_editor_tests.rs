@@ -431,3 +431,73 @@ async fn insert_table_from_the_menu_opens_its_first_cell(cx: &mut TestAppContext
     assert_eq!(body.matches("data-joplin-lite-table").count(), 2, "{body}");
     assert!(body.contains("<th>新表头</th>"), "{body}");
 }
+
+#[gpui::test]
+async fn cmd_v_in_a_clicked_cell_pastes_into_that_cell_not_the_body(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let (_, bounds) = table_node(&view, cx);
+    let target = point(
+        bounds.left() + bounds.size.width * 0.75,
+        bounds.bottom() - px(4.0),
+    );
+    for count in [1, 2] {
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: target,
+            modifiers: Modifiers::default(),
+            click_count: count,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: target,
+            modifiers: Modifiers::default(),
+            click_count: count,
+        });
+    }
+    cx.run_until_parked();
+    cx.update(|window, app| window.draw(app).clear());
+    assert_eq!(open_cell(&view, cx), Some((1, 1)));
+
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("粘贴丙".to_owned()));
+    cx.simulate_keystrokes("cmd-v");
+    cx.run_until_parked();
+    let fragment = crate::native_editor::images::ClipboardFragment {
+        version: crate::native_editor::images::CLIPBOARD_FRAGMENT_VERSION,
+        html: "<p><strong>粗</strong></p>".into(),
+        plain: "粗".into(),
+        resources: Vec::new(),
+        open_start: true,
+        open_end: true,
+    };
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string_with_json_metadata(
+        "粗".into(),
+        fragment,
+    ));
+    cx.simulate_keystrokes("cmd-v");
+    cx.run_until_parked();
+    let png = crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .unwrap();
+    cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        png.bytes,
+    )));
+    cx.simulate_keystrokes("cmd-v");
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |shell, _| shell.queued_resource_inserts.is_empty()
+            && shell.resource_notice.is_some()),
+        "an image pasted into a cell is refused visibly, never queued for the body"
+    );
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(open_cell(&view, cx), Some((2, 0)), "Tab still moves on after a paste");
+
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(body.contains("<td>甲</td><td>一粘贴丙<strong>粗</strong></td>"), "{body}");
+    assert!(body.starts_with("<p>前</p>"), "the body before the table is untouched: {body}");
+    assert!(!body.contains("<img"), "{body}");
+}
