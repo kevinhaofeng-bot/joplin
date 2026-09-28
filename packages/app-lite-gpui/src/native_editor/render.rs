@@ -421,6 +421,16 @@ pub fn paint(editor: &EditorCore, window: &mut Window, cx: &mut App) -> gpui::Re
     paint_snapshot(&snapshot, content_mask, None, None, window, cx)
 }
 
+/// GPUI turns a notification sent while a window is drawing into a view
+/// invalidation only (`WindowInvalidator::invalidate_view` returns without
+/// an `Effect::Notify` outside `DrawPhase::None`), so observers such as the
+/// retained note session never hear of it and no redraw is scheduled. A
+/// paint-time state change is therefore announced once the frame is done.
+fn notify_after_paint(editor: &Entity<EditorCore>, cx: &mut App) {
+    let editor = editor.clone();
+    cx.defer(move |cx| editor.update(cx, |_, editor_cx| editor_cx.notify()));
+}
+
 fn paint_snapshot(
     snapshot: &RenderSnapshot,
     content_mask: Bounds<Pixels>,
@@ -443,11 +453,10 @@ fn paint_snapshot(
             .into_iter()
             .filter_map(|index| snapshot.blocks[index].image_resource_id.clone())
             .collect::<Vec<_>>();
-        let _ = editor.update(cx, |editor, editor_cx| {
-            if editor.request_image_hydration(resident_ids) {
-                editor_cx.notify();
-            }
-        });
+        let requested = editor.update(cx, |editor, _| editor.request_image_hydration(resident_ids));
+        if requested {
+            notify_after_paint(editor, cx);
+        }
     }
     if let Some(cache) = image_cache.as_ref() {
         let resident_indices = residency.resident_indices();
@@ -545,11 +554,9 @@ fn paint_snapshot(
                 if let (Some(editor), Some(resource_id)) =
                     (editor.as_ref(), block.image_resource_id.as_deref())
                 {
-                    let _ = editor.update(cx, |editor, editor_cx| {
-                        if editor.mark_image_loaded(resource_id) {
-                            editor_cx.notify();
-                        }
-                    });
+                    if editor.update(cx, |editor, _| editor.mark_image_loaded(resource_id)) {
+                        notify_after_paint(editor, cx);
+                    }
                 }
                 window.paint_image(block.layout.bounds, Corners::all(px(6.0)), image, 0, false)?;
             } else {
@@ -558,11 +565,9 @@ fn paint_snapshot(
                     block.image_resource_id.as_deref(),
                     image.as_ref(),
                 ) {
-                    let _ = editor.update(cx, |editor, editor_cx| {
-                        if editor.mark_image_failed(resource_id) {
-                            editor_cx.notify();
-                        }
-                    });
+                    if editor.update(cx, |editor, _| editor.mark_image_failed(resource_id)) {
+                        notify_after_paint(editor, cx);
+                    }
                 }
                 let mut quad = fill(block.layout.bounds, rgba(0x9aa4b233));
                 quad.corner_radii = Corners::all(px(6.0));

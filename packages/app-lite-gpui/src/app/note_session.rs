@@ -2763,7 +2763,6 @@ impl NoteSession {
                 result
             })
             .map_err(|error| SaveError::new(error.to_string()))?;
-        let pasted_images: Vec<String> = images.iter().map(|(_, id)| id.clone()).collect();
         for (node_id, resource_id) in images {
             let Some(FragmentSegment::Image { natural_size, .. }) = fragment
                 .segments
@@ -2788,13 +2787,6 @@ impl NoteSession {
                 entry.legacy_node_ids.push(node_id);
             }
         }
-        // Start loading the pasted image now. Waiting for the renderer's
-        // residency request is not enough: its notification during paint
-        // does not reach this session unless something else changes too.
-        editor.update(cx, |editor, _| {
-            editor.request_image_hydration(pasted_images)
-        });
-        self.drain_image_hydration_requests(&editor, cx);
         self.observe_current_entities(cx);
         // "Still saving" is the expected answer here, not a failure.
         let _ = self.flush(FlushReason::ManualSync, cx);
