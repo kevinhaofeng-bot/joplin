@@ -492,6 +492,12 @@ pub struct LibraryShell {
     next_pasted_image_fetch: u64,
     #[cfg(test)]
     pasted_image_results_for_test: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    /// Set: the next note session opened holds its first image load, and
+    /// the release lands here.
+    #[cfg(test)]
+    stall_images_in_next_session_for_test: bool,
+    #[cfg(test)]
+    image_load_release_for_test: Option<futures::channel::oneshot::Sender<()>>,
     _note_session_observation: Option<Subscription>,
     editor_surface: Option<Entity<EditorSurface>>,
     /// The one shared formatting owner for the active session's existing
@@ -1064,6 +1070,10 @@ impl LibraryShell {
             next_pasted_image_fetch: 0,
             #[cfg(test)]
             pasted_image_results_for_test: Default::default(),
+            #[cfg(test)]
+            stall_images_in_next_session_for_test: false,
+            #[cfg(test)]
+            image_load_release_for_test: None,
             editor_surface: None,
             command_chrome: None,
             _command_chrome_event_subscription: None,
@@ -2160,6 +2170,14 @@ impl LibraryShell {
     }
 
     fn flush_active_session(&mut self, reason: FlushReason, cx: &mut Context<Self>) -> bool {
+        if let Err(error) = self.persist_table_cell_draft(cx) {
+            self.save_pending = false;
+            self.save_error = Some(ShellSaveError::Lifecycle {
+                message: format!("无法在 {reason:?} 前保存单元格：{error}"),
+            });
+            cx.notify();
+            return false;
+        }
         let Some(session) = self.note_session.clone() else {
             return true;
         };
@@ -2446,6 +2464,12 @@ impl LibraryShell {
                 }) {
                     self.resource_notice = Some(warning);
                 }
+                #[cfg(test)]
+                if std::mem::take(&mut self.stall_images_in_next_session_for_test) {
+                    self.image_load_release_for_test = Some(session.update(cx, |session, _| {
+                        session.stall_next_image_hydration_for_test()
+                    }));
+                }
                 // A web image left loading when this note was last open (or
                 // before the app quit) is fetched again.
                 self.resume_pasted_image_jobs(Some(&opened_note_id), cx);
@@ -2587,6 +2611,14 @@ impl LibraryShell {
                 self._editor_surface_event_subscription = Some(cx.subscribe(
                     &surface,
                     |shell, _surface, event, shell_cx| match event {
+                        EditorSurfaceEvent::OpenLink { url } => {
+                            // Only ordinary external links may launch a system handler.
+                            if let Ok(target) = url::Url::parse(url) {
+                                if matches!(target.scheme(), "https" | "http" | "mailto") {
+                                    shell_cx.open_url(target.as_str());
+                                }
+                            }
+                        }
                         EditorSurfaceEvent::OpenAttachment { resource_id } => {
                             shell.open_attachment_resource(resource_id.clone(), shell_cx);
                         }
@@ -7229,6 +7261,8 @@ mod quit_lifecycle_tests;
 mod sync_tests;
 #[cfg(test)]
 mod table_cell_editor_tests;
+#[cfg(test)]
+mod table_render_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

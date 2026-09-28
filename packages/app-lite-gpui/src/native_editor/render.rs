@@ -10,6 +10,7 @@ use gpui::{
 };
 #[cfg(test)]
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use super::core::EditorCore;
 use super::images::{BudgetedImageCache, proxy_max_edge_for_viewport};
@@ -39,6 +40,10 @@ struct RenderBlock {
     image_natural_max_edge: Option<u32>,
     attachment: Option<AttachmentRenderInfo>,
     table: Option<std::sync::Arc<super::model::TableContent>>,
+    table_layout: Option<std::sync::Arc<super::table_layout::TableLayout>>,
+    /// Each image in the table: its resource id and, once loaded, its file.
+    table_images: Vec<(String, Option<Resource>)>,
+    table_scroll_offset: f32,
 }
 
 /// The card contains presentation metadata only. Resource bytes stay in the
@@ -110,6 +115,48 @@ struct TestRenderObservations {
     paint_entity_calls: usize,
     attachment_card_paints: usize,
     image_residency: Option<TestImageResidencyObservation>,
+    table_cells: Vec<TestTableCellPaint>,
+}
+
+/// What one frame painted in one table cell, in window coordinates.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TestTableCellPaint {
+    pub(crate) row: usize,
+    pub(crate) column: usize,
+    pub(crate) cell: Bounds<Pixels>,
+    pub(crate) runs: Vec<TestTableRun>,
+    /// Resource id, where it was painted, and whether its pixels were drawn
+    /// (false: the loading placeholder).
+    pub(crate) images: Vec<(String, Bounds<Pixels>, bool)>,
+    pub(crate) attachments: Vec<(String, Bounds<Pixels>)>,
+    /// Top of each painted text line, and its height.
+    pub(crate) lines: Vec<(Pixels, Pixels)>,
+    /// Lowest painted pixel of the cell's content.
+    pub(crate) content_bottom: Pixels,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestTableRun {
+    pub(crate) text: String,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) underline: bool,
+    pub(crate) strikethrough: bool,
+    pub(crate) highlight: bool,
+    pub(crate) link: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_table_cell_paints() -> Vec<TestTableCellPaint> {
+    TEST_RENDER_OBSERVATIONS
+        .with(|observations| std::mem::take(&mut observations.borrow_mut().table_cells))
+}
+
+#[cfg(test)]
+fn observe_table_cell_paint(paint: TestTableCellPaint) {
+    TEST_RENDER_OBSERVATIONS.with(|observations| observations.borrow_mut().table_cells.push(paint));
 }
 
 #[cfg(test)]
@@ -236,7 +283,15 @@ const fn text_paint_passes() -> [TextPaintPass; 2] {
     [TextPaintPass::Background, TextPaintPass::Glyphs]
 }
 
+#[cfg(test)]
 fn snapshot(editor: &EditorCore) -> RenderSnapshot {
+    snapshot_with_image_viewport(editor, None)
+}
+
+fn snapshot_with_image_viewport(
+    editor: &EditorCore,
+    image_viewport: Option<Bounds<Pixels>>,
+) -> RenderSnapshot {
     let layout = editor.layout();
     let blocks = layout
         .visible()
@@ -283,6 +338,43 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 super::model::BlockContent::Table(table) => Some(table.clone()),
                 _ => None,
             });
+            let table_layout = table
+                .as_ref()
+                .and_then(|_| layout.table_layout(block.node_id));
+            let table_images = table_layout
+                .as_ref()
+                .map(|table_layout| {
+                    let mut ids: Vec<String> = Vec::new();
+                    for (resource_id, relative) in table_layout.images() {
+                        if let Some(viewport) = image_viewport {
+                            let mut image_bounds = relative;
+                            image_bounds.origin += block.bounds.origin;
+                            image_bounds.origin.x -= px(layout.table_scroll_offset(block.node_id));
+                            // Table residency is per image, not per table. Both
+                            // the horizontal table clip and vertical note clip
+                            // must expose pixels before the original is read.
+                            let visible = block.bounds.intersect(&viewport);
+                            if visible.size.width <= px(0.0)
+                                || visible.size.height <= px(0.0)
+                                || !bounds_intersect(image_bounds, visible)
+                            {
+                                continue;
+                            }
+                        }
+                        if !ids.iter().any(|known| known == resource_id) {
+                            ids.push(resource_id.to_owned());
+                        }
+                    }
+                    ids.into_iter()
+                        .map(|resource_id| {
+                            let resource = editor
+                                .image_source_path(&resource_id)
+                                .map(|path| Resource::from(path.to_path_buf()));
+                            (resource_id, resource)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let shaped_background_run_count = layout
                 .cache
                 .get(&block.node_id)
@@ -310,6 +402,9 @@ fn snapshot(editor: &EditorCore) -> RenderSnapshot {
                 image_natural_max_edge,
                 attachment,
                 table,
+                table_layout,
+                table_images,
+                table_scroll_offset: layout.table_scroll_offset(block.node_id),
             }
         })
         .collect();
@@ -379,7 +474,8 @@ fn classify_image_residency(
     let mut following_image = None;
 
     for (index, block) in blocks.iter().enumerate() {
-        if !block.is_image {
+        // A table with images in its cells loads them like image blocks.
+        if !block.is_image && block.table_images.is_empty() {
             continue;
         }
         if bounds_intersect(block.layout.bounds, content_mask) {
@@ -416,8 +512,8 @@ fn image_request_edge(block: &RenderBlock, scale_factor: f32, is_visible: bool) 
 }
 
 pub fn paint(editor: &EditorCore, window: &mut Window, cx: &mut App) -> gpui::Result<()> {
-    let snapshot = snapshot(editor);
     let content_mask = window.content_mask().bounds;
+    let snapshot = snapshot_with_image_viewport(editor, Some(content_mask));
     paint_snapshot(&snapshot, content_mask, None, None, window, cx)
 }
 
@@ -451,7 +547,14 @@ fn paint_snapshot(
         let resident_ids = residency
             .resident_indices()
             .into_iter()
-            .filter_map(|index| snapshot.blocks[index].image_resource_id.clone())
+            .flat_map(|index| {
+                let block = &snapshot.blocks[index];
+                block
+                    .image_resource_id
+                    .clone()
+                    .into_iter()
+                    .chain(block.table_images.iter().map(|(id, _)| id.clone()))
+            })
             .collect::<Vec<_>>();
         let requested = editor.update(cx, |editor, _| editor.request_image_hydration(resident_ids));
         if requested {
@@ -462,12 +565,33 @@ fn paint_snapshot(
         let resident_indices = residency.resident_indices();
         let resident_resources = resident_indices
             .iter()
-            .filter_map(|index| snapshot.blocks[*index].image_resource.as_ref())
+            .flat_map(|index| {
+                let block = &snapshot.blocks[*index];
+                block.image_resource.iter().chain(
+                    block
+                        .table_images
+                        .iter()
+                        .filter_map(|(_, resource)| resource.as_ref()),
+                )
+            })
             .collect::<Vec<_>>();
         cache.update(cx, |cache, cache_cx| {
             cache.set_visible_resources(resident_resources.iter().copied());
             for index in resident_indices.iter().copied() {
                 let block = &snapshot.blocks[index];
+                if let Some(table_layout) = block.table_layout.as_ref() {
+                    // A cell image is drawn at most its cell's width.
+                    let edge = image_proxy_max_edge_for_bounds(
+                        table_layout.column_width,
+                        table_layout.column_width,
+                        window.scale_factor(),
+                    );
+                    for (_, resource) in &block.table_images {
+                        if let Some(resource) = resource {
+                            cache.request_edge_with_natural_max(resource, edge, None);
+                        }
+                    }
+                }
                 if !block.is_image {
                     continue;
                 }
@@ -576,7 +700,57 @@ fn paint_snapshot(
             continue;
         }
         if let Some(table) = block.table.as_ref() {
-            paint_table(table, block.layout.bounds, window, cx)?;
+            match block.table_layout.as_ref() {
+                Some(table_layout) => {
+                    let mut loaded = HashMap::new();
+                    for (resource_id, resource) in &block.table_images {
+                        let image = residency
+                            .is_resident(index)
+                            .then_some(resource.as_ref())
+                            .flatten()
+                            .and_then(|resource| {
+                                image_cache.as_ref().and_then(|cache| {
+                                    cache.update(cx, |cache, cx| cache.load(resource, window, cx))
+                                })
+                            });
+                        match image {
+                            Some(Ok(image)) => {
+                                if let Some(editor) = editor.as_ref() {
+                                    if editor.update(cx, |editor, _| {
+                                        editor.mark_image_loaded(resource_id)
+                                    }) {
+                                        notify_after_paint(editor, cx);
+                                    }
+                                }
+                                loaded.insert(resource_id.clone(), image);
+                            }
+                            Some(Err(_)) => {
+                                if let Some(editor) = editor.as_ref() {
+                                    if editor.update(cx, |editor, _| {
+                                        editor.mark_image_failed(resource_id)
+                                    }) {
+                                        notify_after_paint(editor, cx);
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    let viewport = block.layout.bounds;
+                    let mut content_bounds = viewport;
+                    content_bounds.origin.x -= px(block.table_scroll_offset);
+                    content_bounds.size.width = px(table_layout.column_width * table.column_count().max(1) as f32);
+                    window.with_content_mask(Some(gpui::ContentMask { bounds: viewport }), |window| paint_table_layout(
+                        table,
+                        table_layout,
+                        content_bounds,
+                        &loaded,
+                        window,
+                        cx,
+                    ))?;
+                }
+                None => paint_table(table, block.layout.bounds, window, cx)?,
+            }
             continue;
         }
         if let Some(attachment) = block.attachment.as_ref() {
@@ -682,6 +856,176 @@ fn paint_snapshot(
     Ok(())
 }
 
+/// Paints a table from its measured layout (`table_layout`): the same row
+/// heights and cell content positions that sizing and hit-testing use.
+fn paint_table_layout(
+    table: &super::model::TableContent,
+    table_layout: &super::table_layout::TableLayout,
+    bounds: Bounds<Pixels>,
+    loaded: &HashMap<String, std::sync::Arc<gpui::RenderImage>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Result<()> {
+    use super::layout::TABLE_LINE_HEIGHT;
+    use super::table_layout::CellPiece;
+    let border = rgba(0xc9d3ccff);
+    let column_width = px(table_layout.column_width);
+    let line_height = px(TABLE_LINE_HEIGHT);
+    let mut top = bounds.top();
+    for (row_index, (cells, height)) in table_layout
+        .cells
+        .iter()
+        .zip(&table_layout.row_heights)
+        .enumerate()
+    {
+        let row_height = px(*height);
+        if table.header && row_index == 0 {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(bounds.left(), top),
+                    gpui::size(bounds.size.width, row_height),
+                ),
+                rgba(0xf1f5f2ff),
+            ));
+        }
+        for (column, cell_layout) in cells.iter().enumerate() {
+            let cell = Bounds::new(
+                point(bounds.left() + column_width * column as f32, top),
+                gpui::size(column_width, row_height),
+            );
+            window.paint_quad(outline(cell, border, BorderStyle::default()));
+            let (left, content_top) = table_layout.content_origin(row_index, column);
+            let origin_x = bounds.left() + px(left);
+            let origin_y = bounds.top() + px(content_top);
+            #[cfg(test)]
+            let mut observed = TestTableCellPaint {
+                row: row_index,
+                column,
+                cell,
+                content_bottom: origin_y + px(cell_layout.height),
+                ..Default::default()
+            };
+            window.with_content_mask(Some(gpui::ContentMask { bounds: cell }), |window| {
+                for piece in &cell_layout.pieces {
+                    match piece {
+                        CellPiece::Text { top, lines, runs, .. } => {
+                            #[cfg(test)]
+                            observed
+                                .runs
+                                .extend(runs.iter().map(|(text, marks)| TestTableRun {
+                                    text: text.clone(),
+                                    bold: marks.bold,
+                                    italic: marks.italic,
+                                    underline: marks.underline,
+                                    strikethrough: marks.strikethrough,
+                                    highlight: marks.highlight,
+                                    link: marks.link,
+                                }));
+                            let _ = runs;
+                            let mut y = origin_y + px(*top);
+                            for line in lines {
+                                let origin = point(origin_x, y);
+                                line.paint_background(
+                                    origin,
+                                    line_height,
+                                    gpui::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )?;
+                                line.paint(
+                                    origin,
+                                    line_height,
+                                    gpui::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )?;
+                                let line_bottom = y + line.size(line_height).height;
+                                #[cfg(test)]
+                                {
+                                    let mut row_top = y;
+                                    while row_top < line_bottom {
+                                        observed.lines.push((row_top, line_height));
+                                        row_top += line_height;
+                                    }
+                                }
+                                y = line_bottom;
+                            }
+                        }
+                        CellPiece::Image {
+                            top,
+                            width,
+                            height,
+                            resource_id,
+                        } => {
+                            let image_bounds = Bounds::new(
+                                point(origin_x, origin_y + px(*top)),
+                                gpui::size(px(*width), px(*height)),
+                            );
+                            match loaded.get(resource_id) {
+                                Some(image) => window.paint_image(
+                                    image_bounds,
+                                    Corners::all(px(4.0)),
+                                    image.clone(),
+                                    0,
+                                    false,
+                                )?,
+                                None => {
+                                    let mut quad = fill(image_bounds, rgba(0x9aa4b233));
+                                    quad.corner_radii = Corners::all(px(4.0));
+                                    window.paint_quad(quad);
+                                }
+                            }
+                            #[cfg(test)]
+                            observed.images.push((
+                                resource_id.clone(),
+                                image_bounds,
+                                loaded.contains_key(resource_id),
+                            ));
+                        }
+                        CellPiece::Attachment {
+                            top,
+                            width,
+                            height,
+                            resource_id,
+                            lines,
+                        } => {
+                            let label = Bounds::new(
+                                point(origin_x, origin_y + px(*top)),
+                                gpui::size(px(*width), px(*height)),
+                            );
+                            let mut quad = fill(label, rgba(0xf1f7f3ff));
+                            quad.corner_radii = Corners::all(px(5.0));
+                            window.paint_quad(quad);
+                            let mut y = label.top();
+                            for line in lines {
+                                line.paint(
+                                    point(label.left() + px(6.0), y),
+                                    line_height,
+                                    gpui::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )?;
+                                y += line.size(line_height).height;
+                            }
+                            #[cfg(test)]
+                            observed.attachments.push((resource_id.clone(), label));
+                            let _ = resource_id;
+                        }
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            #[cfg(test)]
+            observe_table_cell_paint(observed);
+        }
+        top += row_height;
+    }
+    Ok(())
+}
+
 /// Paints a table atom: equal-width columns, cell text wrapped to its
 /// column and clipped to its cell. Row heights come from the same estimate
 /// layout and hit-testing use.
@@ -732,9 +1076,22 @@ fn paint_table(
             if is_header {
                 font.weight = FontWeight::SEMIBOLD;
             }
+            #[cfg(test)]
+            let mut observed = TestTableCellPaint {
+                row: row_index,
+                column,
+                cell,
+                ..Default::default()
+            };
             window.with_content_mask(Some(gpui::ContentMask { bounds: cell }), |window| {
                 let mut y = cell.top() + px(TABLE_ROW_PADDING / 2.0);
                 for line in text.split('\n') {
+                    #[cfg(test)]
+                    observed.runs.push(TestTableRun {
+                        text: line.to_owned(),
+                        bold: is_header,
+                        ..Default::default()
+                    });
                     let line: SharedString = line.to_owned().into();
                     let wrapped = window.text_system().shape_text(
                         line.clone(),
@@ -759,14 +1116,29 @@ fn paint_table(
                             window,
                             cx,
                         )?;
-                        y += wrapped_line.size(px(TABLE_LINE_HEIGHT)).height;
+                        let height = wrapped_line.size(px(TABLE_LINE_HEIGHT)).height;
+                        #[cfg(test)]
+                        {
+                            let mut top = y;
+                            while top < y + height {
+                                observed.lines.push((top, px(TABLE_LINE_HEIGHT)));
+                                top += px(TABLE_LINE_HEIGHT);
+                            }
+                        }
+                        y += height;
                     }
                     if line.is_empty() {
                         y += px(TABLE_LINE_HEIGHT);
                     }
                 }
+                #[cfg(test)]
+                {
+                    observed.content_bottom = y;
+                }
                 Ok::<(), anyhow::Error>(())
             })?;
+            #[cfg(test)]
+            observe_table_cell_paint(observed);
         }
         top += row_height;
     }
@@ -894,8 +1266,10 @@ pub fn paint_entity(
             cx,
         );
     }
-    let snapshot = entity.read_with(cx, |editor, _cx| snapshot(editor));
     let content_mask = window.content_mask().bounds;
+    let snapshot = entity.read_with(cx, |editor, _cx| {
+        snapshot_with_image_viewport(editor, Some(content_mask))
+    });
     paint_snapshot(
         &snapshot,
         content_mask,
@@ -1048,6 +1422,9 @@ mod tests {
             image_natural_max_edge: None,
             attachment: None,
             table: None,
+            table_layout: None,
+            table_images: Vec::new(),
+            table_scroll_offset: 0.0,
         }
     }
 

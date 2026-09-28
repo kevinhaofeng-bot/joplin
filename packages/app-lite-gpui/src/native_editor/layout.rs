@@ -696,6 +696,12 @@ pub struct LayoutRegistry {
     height_index_work: usize,
     shape_count: usize,
     layout_scan_count: usize,
+    /// Measured layouts of the tables in the viewport only.
+    table_layouts: HashMap<NodeId, std::sync::Arc<super::table_layout::TableLayout>>,
+    /// Natural sizes of loaded images, for laying out table cells.
+    table_image_sizes: HashMap<String, (u32, u32)>,
+    table_image_generation: u64,
+    table_scroll_offsets: HashMap<NodeId, f32>,
     #[cfg(test)]
     find_viewport_line_work: Cell<usize>,
     #[cfg(test)]
@@ -744,6 +750,10 @@ impl LayoutRegistry {
             height_document_revision: None,
             height_index_work: 0,
             shape_count: 0,
+            table_layouts: HashMap::new(),
+            table_image_sizes: HashMap::new(),
+            table_image_generation: 0,
+            table_scroll_offsets: HashMap::new(),
             layout_scan_count: 0,
             #[cfg(test)]
             find_viewport_line_work: Cell::new(0),
@@ -1166,6 +1176,44 @@ impl LayoutRegistry {
                     continue;
                 };
                 let visual = block_visual_style(block, &style, window.rem_size());
+                if let BlockContent::Table(table) = &block.content {
+                    let key = super::table_layout::TableLayoutKey {
+                        revision: block.revision,
+                        width: f32::from(block_bounds(width, block).size.width),
+                        image_generation: self.table_image_generation,
+                        font: visual.font.clone(),
+                    };
+                    if self
+                        .table_layouts
+                        .get(&node_id)
+                        .is_none_or(|layout| layout.key != key)
+                    {
+                        let sizes = &self.table_image_sizes;
+                        let measured = super::table_layout::measure_table(
+                            table,
+                            key,
+                            window.text_system(),
+                            &|resource_id| sizes.get(resource_id).copied(),
+                        );
+                        let measured_height = measured.height();
+                        self.table_layouts
+                            .insert(node_id, std::sync::Arc::new(measured));
+                        if self
+                            .estimated_heights
+                            .get(&node_id)
+                            .is_none_or(|height| (*height - measured_height).abs() > 0.01)
+                        {
+                            self.estimated_heights.insert(node_id, measured_height);
+                            self.update_height_index(
+                                document,
+                                node_id,
+                                measured_height,
+                                block.revision,
+                            );
+                            estimates_changed = true;
+                        }
+                    }
+                }
                 let Some(text) = block.content.as_text() else {
                     self.update_cache_metadata(
                         node_id,
@@ -1257,7 +1305,87 @@ impl LayoutRegistry {
             }
             self.rebuild_visible_window(document, viewport_top, viewport_height, width);
         }
+        // Only tables in the viewport keep their measured layout.
+        let visible = &self.visible;
+        self.table_layouts
+            .retain(|node_id, _| visible.iter().any(|layout| layout.node_id == *node_id));
         self.enforce_budget();
+    }
+
+    /// The measured layout of a table in the viewport.
+    pub(crate) fn table_layout(
+        &self,
+        node_id: NodeId,
+    ) -> Option<std::sync::Arc<super::table_layout::TableLayout>> {
+        self.table_layouts.get(&node_id).cloned()
+    }
+
+    /// Where `position` falls in a table: by its measured layout when it
+    /// has one (always, once painted), else by the estimate.
+    pub(crate) fn table_hit(
+        &self,
+        node_id: NodeId,
+        table: &super::model::TableContent,
+        bounds: Bounds<Pixels>,
+        position: Point<Pixels>,
+    ) -> Option<super::table_layout::TableHit> {
+        match self.table_layouts.get(&node_id) {
+            Some(layout) => {
+                if !bounds.contains(&position) {
+                    return None;
+                }
+                let mut content = bounds;
+                content.size.width = px(layout.column_width * table.column_count().max(1) as f32);
+                layout.hit(content, point(position.x + px(self.table_scroll_offset(node_id)), position.y))
+            }
+            None => table_cell_at(table, bounds, position).map(|(row, column)| {
+                super::table_layout::TableHit {
+                    row,
+                    column,
+                    attachment: None,
+                }
+            }),
+        }
+    }
+
+    pub(crate) fn table_scroll_offset(&self, node_id: NodeId) -> f32 {
+        let Some(layout) = self.table_layouts.get(&node_id) else { return 0.0; };
+        let width = layout.column_width * layout.cells.first().map_or(0, Vec::len) as f32;
+        self.table_scroll_offsets.get(&node_id).copied().unwrap_or(0.0)
+            .clamp(0.0, (width - layout.key.width).max(0.0))
+    }
+
+    pub(crate) fn table_link_at(&self, position: Point<Pixels>) -> Option<String> {
+        let node_id = self.atomic_block_at(position)?;
+        let bounds = self.visible.iter().find(|block| block.node_id == node_id)?.bounds;
+        if !bounds.contains(&position) { return None; }
+        let layout = self.table_layouts.get(&node_id)?;
+        let mut content = bounds;
+        content.size.width = px(layout.column_width * layout.cells.first()?.len() as f32);
+        layout.link_at(content, point(position.x + px(self.table_scroll_offset(node_id)), position.y))
+    }
+
+    /// View-only horizontal motion; the document and undo history stay unchanged.
+    pub(crate) fn scroll_table_at(&mut self, position: Point<Pixels>, delta: f32) -> bool {
+        let Some(node_id) = self.atomic_block_at(position) else { return false; };
+        let Some(layout) = self.table_layouts.get(&node_id) else { return false; };
+        let width = layout.column_width * layout.cells.first().map_or(0, Vec::len) as f32;
+        let max = (width - layout.key.width).max(0.0);
+        if max <= 0.0 || delta == 0.0 { return false; }
+        let next = (self.table_scroll_offset(node_id) - delta).clamp(0.0, max);
+        self.table_scroll_offsets.insert(node_id, next);
+        // Consume at edges too, so horizontal gestures do not escape the table.
+        true
+    }
+
+    /// An image's natural size became known: tables showing it are laid
+    /// out again on their next pass.
+    pub(crate) fn set_table_image_size(&mut self, resource_id: &str, natural_size: (u32, u32)) {
+        if self.table_image_sizes.get(resource_id) != Some(&natural_size) {
+            self.table_image_sizes
+                .insert(resource_id.to_owned(), natural_size);
+            self.table_image_generation = self.table_image_generation.wrapping_add(1);
+        }
     }
 
     /// Register a measured block as the single exact-layout source. If the
@@ -1299,6 +1427,7 @@ impl LayoutRegistry {
 
     pub(crate) fn clear_exact_cache(&mut self) {
         self.visible.clear();
+        self.table_layouts.clear();
         self.find_highlight_viewport = None;
         self.cache.clear();
         self.lru.clear();

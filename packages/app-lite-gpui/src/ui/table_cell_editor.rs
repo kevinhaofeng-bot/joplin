@@ -67,6 +67,34 @@ fn cell_inlines(document: &CanonicalDocument) -> Result<Vec<Inline>, String> {
 }
 
 impl LibraryShell {
+    /// Include an open cell draft in the note's existing durable save barrier
+    /// without closing the cell or stealing its keyboard focus.
+    pub(super) fn persist_table_cell_draft(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let Some(cell) = self.table_cell_editor.as_ref() else { return Ok(()); };
+        let inlines = cell.editor.read_with(cx, |editor, _| {
+            if editor.marked_text().is_some() {
+                return Err("单元格中仍有未确认的输入法组合文本，请先确认或取消输入".into());
+            }
+            export_canonical_with_resources(editor.document(), Some(&cell.resources))
+                .map_err(|error| error.to_string())
+                .and_then(|document| cell_inlines(&document))
+        })?;
+        let (node_id, row, column) = (cell.node_id, cell.row, cell.column);
+        let session = self.note_session.as_ref().ok_or("单元格所属笔记已经关闭")?;
+        let main = session.read(cx).editor().clone();
+        main.update(cx, |editor, editor_cx| {
+            let current = editor.document().block(node_id).and_then(|block| match &block.content {
+                BlockContent::Table(table) => table.cell_inlines(row, column),
+                _ => None,
+            });
+            if current == Some(inlines.as_slice()) { return Ok(()); }
+            editor.set_table_cell(node_id, row, column, inlines)
+                .map_err(|error| error.to_string())?;
+            editor_cx.notify();
+            Ok(())
+        })
+    }
+
     pub(super) fn open_table_cell_editor(
         &mut self,
         node_id: crate::native_editor::model::NodeId,

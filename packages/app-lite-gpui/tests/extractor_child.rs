@@ -60,18 +60,25 @@ fn child_rejects_unknown_mime_without_waiting_for_stdin_eof() {
         .spawn()
         .expect("start child with an open stdin pipe");
     let _stdin = process.stdin.take().expect("hold stdin open");
-    let deadline = Instant::now() + Duration::from_secs(1);
+    // Match the production runner's 15-second process budget. A debug
+    // executable can take >1s to start alongside Vision/PDF workers; keep
+    // stdin open to test EOF independence, not dynamic-loader throughput.
+    let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         if let Some(status) = process.try_wait().expect("poll child") {
             break status;
         }
-        assert!(
-            Instant::now() < deadline,
-            "unsupported MIME child waited for stdin EOF"
-        );
+        if Instant::now() >= deadline {
+            let _ = process.kill();
+            let _ = process.wait();
+            panic!("unsupported MIME child did not exit with stdin open within the process budget");
+        }
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(!status.success());
+    let output = process.wait_with_output().unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported-mime"),
+        "the child must reject MIME, not fail for an unrelated startup error");
 }
 
 #[test]

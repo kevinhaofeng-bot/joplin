@@ -1155,7 +1155,8 @@ async fn mounted_resource_commit_failure_rolls_back_only_the_optimistic_atom_and
     assert!(
         view.read_with(cx, |shell, _| shell.resource_notice_for_test())
             .is_some_and(|notice| notice.contains("强制资源提交失败")),
-        "the failed staged transaction must remain visibly recoverable"
+        "the failed staged transaction must remain visibly recoverable; notice={:?}",
+        view.read_with(cx, |shell, _| shell.resource_notice_for_test())
     );
     let before_retry = repository
         .load_note(&note_id)

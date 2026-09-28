@@ -347,6 +347,8 @@ pub(crate) enum AtomicBlockHit {
         node_id: NodeId,
         row: usize,
         column: usize,
+        /// The attachment label under the pointer, if any.
+        attachment: Option<String>,
     },
 }
 
@@ -894,13 +896,7 @@ impl EditorCore {
         // after one quick scroll. The active request is allowed to finish,
         // while this slot always represents the newest resident/preload set.
         let next = resource_ids.into_iter().find(|resource_id| {
-            let still_present = self.document.blocks().iter().any(|block| {
-                matches!(
-                    &block.content,
-                    BlockContent::Image { resource_id: candidate, .. }
-                        if candidate == resource_id
-                )
-            });
+            let still_present = self.shows_image(resource_id);
             still_present
                 && !self.materialized_image_ids.contains(resource_id)
                 && !self.active_image_hydration.contains(resource_id)
@@ -921,14 +917,9 @@ impl EditorCore {
         let Some(resource_id) = self.pending_image_hydration.drain().next() else {
             return Vec::new();
         };
-        let still_present = self.document.blocks().iter().any(|block| {
-            matches!(
-                &block.content,
-                BlockContent::Image { resource_id: candidate, .. }
-                    if candidate == &resource_id
-            )
-        });
-        if !still_present {
+        // The same test `request_image_hydration` queued it with: a request
+        // it accepted but this refused would be asked for again every frame.
+        if !self.shows_image(&resource_id) {
             return Vec::new();
         }
         self.active_image_hydration.insert(resource_id.clone());
@@ -1564,7 +1555,26 @@ impl EditorCore {
         self.active_image_hydration.remove(resource_id);
         self.failed_image_hydration.remove(resource_id);
         self.materialized_image_ids.insert(resource_id.to_owned());
+        // Table cells lay their images out at this size from now on.
+        self.layout.set_table_image_size(resource_id, natural_size);
         Ok(())
+    }
+
+    /// Whether an image of the note shows `resource_id`: an image block or
+    /// an image in a table cell.
+    pub(crate) fn shows_image(&self, resource_id: &str) -> bool {
+        self.document
+            .blocks()
+            .iter()
+            .any(|block| match &block.content {
+                BlockContent::Image {
+                    resource_id: candidate,
+                    ..
+                } => candidate == resource_id,
+                BlockContent::Table(table) => super::table_layout::table_image_ids(table)
+                    .any(|candidate| candidate == resource_id),
+                _ => false,
+            })
     }
 
     /// Repair first-frame geometry for legacy image HTML only. This bypasses
@@ -2896,11 +2906,12 @@ impl EditorCore {
             },
             BlockContent::Table(table) => {
                 let bounds = self.layout.block_layout(node_id)?.bounds;
-                let (row, column) = super::layout::table_cell_at(table, bounds, position)?;
+                let hit = self.layout.table_hit(node_id, table, bounds, position)?;
                 AtomicBlockHit::Table {
                     node_id,
-                    row,
-                    column,
+                    row: hit.row,
+                    column: hit.column,
+                    attachment: hit.attachment,
                 }
             }
             _ => return None,
@@ -2909,6 +2920,10 @@ impl EditorCore {
         self.preferred_x = None;
         self.clear_composition();
         Some(hit)
+    }
+
+    pub(crate) fn scroll_table_at(&mut self, position: Point<Pixels>, delta: f32) -> bool {
+        self.layout.scroll_table_at(position, delta)
     }
 
     /// Revert a resource atom whose optimistic cross-store commit failed

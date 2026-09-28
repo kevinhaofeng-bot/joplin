@@ -3078,10 +3078,22 @@ impl NoteSession {
             .map_err(|_| SaveError::new("附件标识无效，无法安全打开"))?;
         let exists_in_live_document = self.editor.read(cx).document().blocks().iter().any(
             |block| {
-                matches!(
-                    &block.content,
-                    BlockContent::Attachment { resource_id: id, .. } if id == resource_id.as_str()
-                )
+                match &block.content {
+                    BlockContent::Attachment { resource_id: id, .. } => {
+                        id == resource_id.as_str()
+                    }
+                    BlockContent::Table(table) => match &table.canonical {
+                        app_lite_core::document::Block::Table { rows, .. } => rows
+                            .iter()
+                            .flat_map(|row| &row.cells)
+                            .flat_map(|cell| &cell.inlines)
+                            .any(|inline| matches!(inline,
+                                app_lite_core::document::Inline::Attachment { resource_id: id, .. }
+                                    if id == &resource_id)),
+                        _ => false,
+                    },
+                    _ => false,
+                }
             },
         );
         if !exists_in_live_document {
@@ -3993,6 +4005,32 @@ impl NoteSession {
                 // the retained session between paint notifications.
                 self.pending_image_hydration.clear();
                 self.pending_image_hydration.push_back(resource_id);
+            } else if let Some(id) = ResourceId::new(&resource_id)
+                .ok()
+                .filter(|id| self.resource_ids.contains(id))
+                .filter(|id| {
+                    // Only tables need descriptor discovery here. A normal
+                    // image may still be an optimistic, uncommitted import;
+                    // reading it as persisted would overwrite its retry error.
+                    editor.read(cx).document().blocks().iter().any(|block| {
+                        matches!(&block.content, BlockContent::Table(table)
+                            if crate::native_editor::table_layout::table_image_ids(table)
+                                .any(|candidate| candidate == id.as_str()))
+                    })
+                })
+            {
+                // A table cell's image: its size is measured as it loads.
+                self.persisted_image_hydration.insert(
+                    resource_id.clone(),
+                    PersistedImageHydration {
+                        resource_id: id,
+                        natural_size: (0, 0),
+                        legacy_node_ids: Vec::new(),
+                        inline_node_ids: Vec::new(),
+                    },
+                );
+                self.pending_image_hydration.clear();
+                self.pending_image_hydration.push_back(resource_id);
             } else if ResourceId::new(&resource_id).is_ok_and(|id| {
                 self.pasted_images
                     .get(&id)
@@ -4086,11 +4124,13 @@ impl NoteSession {
             let (_, materialize_file) = repository
                 .open_verified_resource_file(&hydration.resource_id)?
                 .ok_or_else(|| SaveError::new("资源记录或字节不存在"))?;
-            let cache_natural_size = if hydration.legacy_node_ids.is_empty() {
-                hydration.natural_size
-            } else {
-                measured_natural_size
-            };
+            // (0, 0): no size was recorded (a table cell's image).
+            let cache_natural_size =
+                if hydration.legacy_node_ids.is_empty() && hydration.natural_size.0 > 0 {
+                    hydration.natural_size
+                } else {
+                    measured_natural_size
+                };
             let source = crate::native_editor::images::ImageStore::materialize_durable_reader_at(
                 &staging.root,
                 &crate::native_editor::images::ImageMetadata::new(
@@ -4133,17 +4173,7 @@ impl NoteSession {
     }
 
     fn document_contains_image_resource(&self, resource_id: &str, cx: &mut Context<Self>) -> bool {
-        self.editor
-            .read(cx)
-            .document()
-            .blocks()
-            .iter()
-            .any(|block| {
-                matches!(
-                    &block.content,
-                    BlockContent::Image { resource_id: candidate, .. } if candidate == resource_id
-                )
-            })
+        self.editor.read(cx).shows_image(resource_id)
     }
 
     fn finish_image_hydration(&mut self, result: ImageHydrationCompletion, cx: &mut Context<Self>) {

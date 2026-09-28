@@ -14,6 +14,85 @@ use std::sync::Arc;
 
 const TABLE: &str = "<p>前</p><table data-joplin-lite-table=\"true\"><tbody><tr><th>名</th><th>值</th></tr><tr><td>甲</td><td>一</td></tr></tbody></table>";
 
+#[gpui::test]
+async fn saving_open_cell_includes_keyboard_input_and_keeps_editor_open(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let (_, bounds) = table_node(&view, cx);
+    let position = point(bounds.left() + bounds.size.width * 0.75, bounds.bottom() - px(4.0));
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left, position, modifiers: Default::default(),
+        click_count: 2, first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left, position, modifiers: Default::default(), click_count: 2,
+    });
+    cx.run_until_parked();
+    cx.update(|window, app| window.draw(app).clear());
+    assert_eq!(open_cell(&view, cx), Some((1, 1)));
+    cx.simulate_input("单元格新增");
+    cx.run_until_parked();
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(body.contains("单元格新增"), "manual save lost the open cell's input: {body}");
+    assert_eq!(open_cell(&view, cx), Some((1, 1)), "save should not dismiss the editing context");
+    // A later save must include later input, not just the first cell snapshot.
+    cx.simulate_input("继续");
+    cx.run_until_parked();
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(body.contains("单元格新增继续"), "{body}");
+    let revision = repository.load_note(&note).unwrap().unwrap().revision;
+    let unchanged = saved_body(&view, cx, &repository, &note);
+    assert_eq!(unchanged, body);
+    assert_eq!(repository.load_note(&note).unwrap().unwrap().revision, revision,
+        "saving an unchanged cell must not create another durable revision");
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    let undone = saved_body(&view, cx, &repository, &note);
+    assert!(!undone.contains("继续"), "keyboard undo must affect the focused cell: {undone}");
+    assert!(undone.contains("一"), "undo must preserve the pre-existing cell content");
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.run_until_parked();
+    assert_eq!(saved_body(&view, cx, &repository, &note), body, "redo restores the saved cell content");
+    // Leave and reopen through the shell, then read the durable document again.
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::CreateNote, window, shell_cx);
+    }));
+    cx.run_until_parked();
+    assert_eq!(open_cell(&view, cx), None);
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::SelectNote(note.clone()), window, shell_cx);
+    }));
+    cx.run_until_parked();
+    assert_eq!(repository.load_note(&note).unwrap().unwrap().body_html, body);
+    assert!(view.read_with(cx, |shell, app| {
+        shell.note_session.as_ref().unwrap().read(app).editor().read(app).document().blocks()
+            .iter().any(|block| matches!(&block.content, BlockContent::Table(table)
+                if table.rows.iter().flatten().any(|text| text.contains("单元格新增继续"))))
+    }));
+}
+
+#[gpui::test]
+async fn open_cell_composition_blocks_lifecycle_save(cx: &mut TestAppContext) {
+    use crate::app::save_coordinator::FlushReason;
+    use gpui::EntityInputHandler;
+    let (_root, repository, note, view, cx) = mount(cx);
+    let (node, _) = table_node(&view, cx);
+    cx.update(|_, app| view.update(app, |shell, shell_cx| {
+        shell.open_table_cell_editor(node, 1, 1, shell_cx);
+    }));
+    cx.run_until_parked();
+    let editor = view.read_with(cx, |shell, _| shell.table_cell_editor.as_ref().unwrap().editor.clone());
+    cx.update(|window, app| editor.update(app, |editor, editor_cx| {
+        EntityInputHandler::replace_and_mark_text_in_range(editor, Some(0..0), "候选", Some(2..2), window, editor_cx);
+    }));
+    let allowed = cx.update(|_, app| view.update(app, |shell, shell_cx| {
+        shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx)
+    }));
+    assert!(!allowed, "unconfirmed cell composition must keep the window alive");
+    cx.run_until_parked();
+    assert_eq!(open_cell(&view, cx), Some((1, 1)));
+    assert!(!repository.load_note(&note).unwrap().unwrap().body_html.contains("候选"));
+}
+
 fn mount<'a>(
     cx: &'a mut TestAppContext,
 ) -> (

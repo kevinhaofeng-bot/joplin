@@ -13,6 +13,7 @@ pub mod layout;
 pub mod model;
 pub mod render;
 pub mod surface;
+pub(crate) mod table_layout;
 pub mod toolbar;
 pub mod transaction;
 

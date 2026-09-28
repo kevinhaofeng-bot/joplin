@@ -8369,3 +8369,37 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
         ]
     );
 }
+
+/// An image in a table cell is asked for, handed to the loader once, and
+/// not asked for again while it loads: the dequeue uses the same test as the
+/// request (a mismatch re-requested it on every frame, forever).
+#[gpui::test]
+fn a_table_cell_image_is_requested_once_and_handed_to_the_loader(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("", cx);
+    let table = editor.insert_table(1, 1).unwrap();
+    let image = "0123456789abcdef0123456789abcdef";
+    editor
+        .set_table_cell(
+            table,
+            0,
+            0,
+            vec![app_lite_core::document::Inline::Image {
+                resource_id: app_lite_core::ResourceId::new(image).unwrap(),
+                alt: "图".into(),
+                display_width: None,
+                link: None,
+            }],
+        )
+        .unwrap();
+    assert!(editor.shows_image(image));
+    assert!(editor.request_image_hydration([image.to_owned()]));
+    assert_eq!(
+        editor.take_pending_image_hydration_requests(),
+        vec![image.to_owned()]
+    );
+    assert!(
+        !editor.request_image_hydration([image.to_owned()]),
+        "while it loads, the next frame does not ask again"
+    );
+    assert!(editor.take_pending_image_hydration_requests().is_empty());
+}

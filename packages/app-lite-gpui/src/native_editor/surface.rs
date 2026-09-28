@@ -146,6 +146,7 @@ impl Default for EditorSurfaceHooks {
 /// of the native editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EditorSurfaceEvent {
+    OpenLink { url: String },
     OpenAttachment {
         resource_id: String,
     },
@@ -387,6 +388,15 @@ impl EditorSurface {
                 return;
             }
         }
+        // Evernote table/plugin.ts lets Cmd/Ctrl-click links bypass cell selection.
+        if event.modifiers.platform || event.modifiers.control {
+            if let Some(url) = self.editor.read(cx).layout().table_link_at(event.position) {
+                self.pointer_anchor = None;
+                cx.emit(EditorSurfaceEvent::OpenLink { url });
+                cx.stop_propagation();
+                return;
+            }
+        }
         // Images and attachment cards are structural atoms in editing mode.
         // A click must produce a full NodeSelection-style range, not an
         // ambiguous before/after caret. The attachment's double-click is
@@ -426,9 +436,16 @@ impl EditorSurface {
                         cx.emit(EditorSurfaceEvent::OpenAttachment { resource_id });
                     }
                     AtomicBlockHit::Table {
+                        attachment: Some(resource_id),
+                        ..
+                    } => {
+                        cx.emit(EditorSurfaceEvent::OpenAttachment { resource_id });
+                    }
+                    AtomicBlockHit::Table {
                         node_id,
                         row,
                         column,
+                        attachment: None,
                     } if !self.mode.is_read_only() => {
                         cx.emit(EditorSurfaceEvent::EditTableCell {
                             node_id,
@@ -610,6 +627,16 @@ impl Render for EditorSurface {
             surface = surface
                 .on_key_down(cx.listener(Self::on_key_down))
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                    let delta = event.delta.pixel_delta(px(24.0));
+                    if delta.x.abs() <= delta.y.abs() { return; }
+                    let handled = this.editor.update(cx, |editor, editor_cx| {
+                        let handled = editor.scroll_table_at(event.position, f32::from(delta.x));
+                        if handled { editor_cx.notify(); }
+                        handled
+                    });
+                    if handled { cx.stop_propagation(); }
+                }))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .capture_any_mouse_down(cx.listener(Self::on_mouse_down));
