@@ -129,7 +129,7 @@ fn decode_data_uri(data: &str) -> Result<Vec<u8>, String> {
         return Err("图片太大".to_owned());
     }
     if !header.to_ascii_lowercase().ends_with(";base64") {
-        return Ok(percent_decode(payload).into_bytes());
+        return Ok(percent_decode_bytes(payload));
     }
     let compact: String = payload
         .chars()
@@ -144,11 +144,36 @@ fn decode_data_uri(data: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// RFC 3986 percent-decoding to raw bytes: `+` stays `+`, and a `%` not
+/// followed by two hex digits stays as written.
+fn percent_decode_bytes(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = |offset: usize| {
+            bytes
+                .get(index + offset)
+                .and_then(|byte| (*byte as char).to_digit(16))
+        };
+        match (bytes[index], hex(1), hex(2)) {
+            (b'%', Some(high), Some(low)) => {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+            }
+            (byte, ..) => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    decoded
+}
+
+/// A URL path segment as a file name: percent-decoded, lossy where the
+/// bytes are not UTF-8.
 fn percent_decode(value: &str) -> String {
-    url::form_urlencoded::parse(format!("x={}", value.replace('+', "%2B")).as_bytes())
-        .next()
-        .map(|(_, value)| value.into_owned())
-        .unwrap_or_default()
+    String::from_utf8_lossy(&percent_decode_bytes(value)).into_owned()
 }
 
 fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -245,5 +270,43 @@ mod tests {
                 .iter()
                 .all(|result| result.as_ref().unwrap().is_image())
         );
+    }
+}
+
+#[cfg(test)]
+mod data_uri_tests {
+    use super::*;
+
+    /// A data URI without `;base64` carries bytes percent-encoded, not text:
+    /// a PNG's 0x89 signature and other non-UTF-8 bytes must survive.
+    #[test]
+    fn a_percent_encoded_data_uri_keeps_the_image_bytes() {
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(5, 4)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&png).is_err(),
+            "fixture has non-UTF-8 bytes"
+        );
+        let encoded: String = png
+            .iter()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'+' => {
+                    (*byte as char).to_string()
+                }
+                _ => format!("%{byte:02X}"),
+            })
+            .collect();
+        assert_eq!(
+            decode_data_uri(&format!("image/png,{encoded}")).unwrap(),
+            png
+        );
+        let import = fetch_pasted_images(&[(format!("data:image/png,{encoded}"), "图".into())])
+            .pop()
+            .unwrap()
+            .expect("a valid image");
+        assert!(import.is_image());
+        assert_eq!(decode_data_uri("text/plain,a+b%2").unwrap(), b"a+b%2");
     }
 }
