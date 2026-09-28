@@ -10081,6 +10081,104 @@ async fn mounted_cut_and_paste_keep_headings_marks_and_images(cx: &mut TestAppCo
     assert!(!stored.body_html.contains('\u{fffc}'));
 }
 
+/// Formatted content from a browser, Word or Pages keeps its structure and
+/// marks, and its images become this note's resources; one that cannot be
+/// fetched stays as a link to it (Evernote `clipboard/clipboardparser.ts`).
+#[gpui::test]
+async fn mounted_paste_from_another_app_keeps_formatting_and_stores_its_images(
+    cx: &mut TestAppContext,
+) {
+    use base64::Engine as _;
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let target = repository
+        .create_note(CreateNote {
+            title: "目标".into(),
+            notebook_id: None,
+            document: rich_document("前"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    open_note_body(&view, &target.id, cx);
+    cx.simulate_keystrokes("cmd-end enter");
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("本地.png");
+    std::fs::write(&file, png_fixture()).unwrap();
+    let html = format!(
+        concat!(
+            "<meta charset='utf-8'><h2>标题</h2>",
+            "<p>普通<span style=\"font-weight:700\">粗体</span><a href=\"https://example.com/\">链接</a></p>",
+            "<ul><li>一</li><li>二</li></ul>",
+            "<img src=\"data:image/png;base64,{}\" alt=\"数据图\"><img src=\"{}\">",
+            "<p><img src=\"http://127.0.0.1:9/missing.png\" alt=\"远程图\"></p><p>尾</p>"
+        ),
+        base64::engine::general_purpose::STANDARD.encode(png_fixture()),
+        url::Url::from_file_path(&file).unwrap(),
+    );
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .complete_clipboard_payload_for_test(
+                    crate::native_editor::images::ClipboardPayload {
+                        html: Some(html),
+                        images: crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+                            .images,
+                        text: Some("标题 普通粗体链接".into()),
+                        ..Default::default()
+                    },
+                    window,
+                    shell_cx,
+                )
+                .unwrap();
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let notice = view.read_with(cx, |shell, _| shell.resource_notice.clone());
+    assert!(
+        notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("1 张图片未能获取")),
+        "{notice:?}"
+    );
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let stored = repository.load_note(&target.id).unwrap().unwrap();
+    for expected in [
+        "<p>前</p><h2>标题</h2>",
+        "<p>普通<strong>粗体</strong><a href=\"https://example.com/\">链接</a></p>",
+        "<ul><li>一</li><li>二</li></ul>",
+        "<a href=\"http://127.0.0.1:9/missing.png\">远程图</a>",
+        "<p>尾</p>",
+    ] {
+        assert!(
+            stored.body_html.contains(expected),
+            "{expected}\n{}",
+            stored.body_html
+        );
+    }
+    assert_eq!(stored.resource_ids.len(), 2, "{}", stored.body_html);
+    assert!(!stored.body_html.contains('\u{fffc}'));
+    let titles: Vec<_> = stored
+        .resource_ids
+        .iter()
+        .map(|id| repository.resource_metadata(id).unwrap().unwrap().title)
+        .collect();
+    assert!(
+        titles.contains(&"数据图.png".to_owned()) || titles.contains(&"数据图".to_owned()),
+        "{titles:?}"
+    );
+    assert!(titles.contains(&"本地.png".to_owned()), "{titles:?}");
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert!(
+        !body.contains("标题") && !body.contains("尾"),
+        "one Undo removes the paste: {body}"
+    );
+}
+
 /// A copy from another library still pastes its image: the library that
 /// lacks it imports the copy's exported file after checking its SHA-256,
 /// as Evernote hands the copied `resources` to a paste.

@@ -1,5 +1,6 @@
 //! HTTP client integration used by remote image loading.
 
+pub(crate) mod pasted_images;
 pub(crate) mod update;
 
 use std::io;

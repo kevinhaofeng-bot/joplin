@@ -669,6 +669,11 @@ pub enum PasteIntent {
     Text {
         text: String,
     },
+    /// Formatted content from another app (browser, Pages, Word, TextEdit).
+    Html {
+        html: String,
+        text: Option<String>,
+    },
     Unsupported,
 }
 
@@ -690,6 +695,16 @@ pub fn classify_clipboard(payload: ClipboardPayload) -> PasteIntent {
     }
     if let Some(fragment) = fragment {
         return PasteIntent::Fragment { fragment };
+    }
+    // Word, Excel and Pages also offer a picture of the copied text; like
+    // Evernote, keep the text and its formatting instead.
+    if let Some(html) = html.as_deref()
+        && html_carries_content(html)
+    {
+        return PasteIntent::Html {
+            html: html.to_owned(),
+            text,
+        };
     }
     if !images.is_empty() {
         let candidates = bounded_image_candidates(images);
@@ -736,6 +751,13 @@ pub fn classify_clipboard(payload: ClipboardPayload) -> PasteIntent {
             // unsafe-sized/malformed encoded source must not become visible
             // markup or a fake PNG node.
             HtmlImageDescriptor::Rejected => return PasteIntent::Unsupported,
+            // A lone web or file image: fetched and stored like any other.
+            HtmlImageDescriptor::External => {
+                return PasteIntent::Html {
+                    html: html.to_owned(),
+                    text,
+                };
+            }
             HtmlImageDescriptor::NoImage => {}
         }
     }
@@ -845,7 +867,37 @@ pub fn classify_drop(paths: &[PathBuf]) -> PasteIntent {
 enum HtmlImageDescriptor {
     NoImage,
     DataUri(EncodedImagePayload),
+    External,
     Rejected,
+}
+
+/// Pasted HTML over this size is inserted as its plain text.
+const MAX_STRUCTURED_PASTE_HTML_BYTES: usize = 32 * 1024 * 1024;
+
+/// Text, a list, a table or several images: more than one lone picture,
+/// which the image path pastes from its own bytes.
+fn html_carries_content(html: &str) -> bool {
+    use app_lite_core::document::Block;
+    if html.len() > MAX_STRUCTURED_PASTE_HTML_BYTES {
+        return false;
+    }
+    let Ok(pasted) = app_lite_core::CanonicalDocument::parse_pasted_html(html) else {
+        return false;
+    };
+    let has_text = |inlines: &[app_lite_core::document::Inline]| {
+        inlines.iter().any(|inline| {
+            matches!(inline, app_lite_core::document::Inline::Text { text, .. } if !text.trim().is_empty())
+        })
+    };
+    pasted.images.len() > 1
+        || pasted.document.blocks().iter().any(|block| match block {
+            Block::Paragraph { inlines, .. }
+            | Block::Heading { inlines, .. }
+            | Block::Quote { inlines, .. }
+            | Block::Code { inlines, .. } => has_text(inlines),
+            Block::Image { .. } => false,
+            _ => true,
+        })
 }
 
 /// Locate one `<img>` data URI without creating a lowercase copy of the
@@ -865,7 +917,7 @@ fn parse_html_image_descriptor(html: &str) -> HtmlImageDescriptor {
         .map_or(bytes.len(), |offset| tag_start + offset);
     let tag = &bytes[tag_start..tag_end];
     let Some(data_start) = find_ascii_case_insensitive(tag, b"data:image/") else {
-        return HtmlImageDescriptor::Rejected;
+        return HtmlImageDescriptor::External;
     };
     let kind_start = data_start + b"data:image/".len();
     let Some(kind_end_relative) = tag[kind_start..].iter().position(|byte| *byte == b';') else {
@@ -2986,8 +3038,12 @@ fn native_payload_from_snapshot(snapshot: NativePasteboardSnapshot) -> Option<Cl
         file_urls,
     } = snapshot;
     if !images.is_empty() {
+        // The HTML decides between the picture and formatted text; plain
+        // text alone never displaces an image (screenshot placeholders).
         return Some(ClipboardPayload {
             images: bounded_image_candidates(images),
+            text: html.as_ref().and(text),
+            html,
             ..Default::default()
         });
     }
@@ -3103,33 +3159,59 @@ unsafe fn native_string_value(value: cocoa::base::id) -> Option<String> {
     std::str::from_utf8(bytes).map(str::to_owned).ok()
 }
 
+/// Plain text and HTML of an RTF or RTFD pasteboard item (TextEdit, Notes,
+/// Pages), through AppKit's own RTF reader and HTML writer.
 #[cfg(target_os = "macos")]
-unsafe fn native_rtf_string_value(data: cocoa::base::id) -> Option<String> {
-    use cocoa::base::nil;
+unsafe fn native_rich_text_values(
+    data: cocoa::base::id,
+    rtfd: bool,
+) -> (Option<String>, Option<String>) {
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSAutoreleasePool, NSRange, NSString};
     use objc::{class, msg_send, sel, sel_impl};
     if data == nil {
-        return None;
+        return (None, None);
     }
-    let allocated: cocoa::base::id = msg_send![class!(NSAttributedString), alloc];
+    let allocated: id = msg_send![class!(NSAttributedString), alloc];
     if allocated == nil {
-        return None;
+        return (None, None);
     }
-    let nil_id: cocoa::base::id = nil;
-    let attributed: cocoa::base::id = msg_send![
-        allocated,
-        initWithRTF: data
-        documentAttributes: nil_id
-    ];
+    let nil_id: id = nil;
+    // `initWith…:documentAttributes:` consumes the receiver even when
+    // Foundation rejects malformed bytes; releasing it again would be a
+    // double release under MRC.
+    let attributed: id = if rtfd {
+        msg_send![allocated, initWithRTFD: data documentAttributes: nil_id]
+    } else {
+        msg_send![allocated, initWithRTF: data documentAttributes: nil_id]
+    };
     if attributed == nil {
-        // `initWithRTF:documentAttributes:` consumes the alloc/init receiver
-        // even when Foundation rejects malformed bytes. Releasing it again
-        // here is a double-release and can abort the paste action under MRC.
-        return None;
+        return (None, None);
     }
-    let string: cocoa::base::id = msg_send![attributed, string];
-    let result = unsafe { native_string_value(string) };
+    let string: id = msg_send![attributed, string];
+    let text = unsafe { native_string_value(string) };
+    let length: u64 = msg_send![attributed, length];
+    let key = unsafe { NSString::alloc(nil).init_str("DocumentType").autorelease() };
+    let value = unsafe { NSString::alloc(nil).init_str("NSHTML").autorelease() };
+    let attributes: id = msg_send![class!(NSDictionary), dictionaryWithObject: value forKey: key];
+    let mut error: id = nil;
+    let html_data: id = msg_send![
+        attributed,
+        dataFromRange: NSRange::new(0, length)
+        documentAttributes: attributes
+        error: &mut error
+    ];
+    let html = if html_data == nil {
+        None
+    } else {
+        let size: usize = msg_send![html_data, length];
+        let bytes: *const u8 = msg_send![html_data, bytes];
+        (!bytes.is_null() && size <= MAX_STRUCTURED_PASTE_HTML_BYTES).then(|| {
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(bytes, size) }).into_owned()
+        })
+    };
     let _: () = msg_send![attributed, release];
-    result
+    (text, html)
 }
 
 #[cfg(target_os = "macos")]
@@ -3162,7 +3244,7 @@ unsafe fn native_image_payload(
 pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     // Narrow AppKit bridge: only pasteboard extraction happens here. The
     // editor model, layout, and rendering remain GPUI/native-editor owned.
-    use cocoa::appkit::{NSFilenamesPboardType, NSPasteboard, NSPasteboardTypeString};
+    use cocoa::appkit::{NSFilenamesPboardType, NSPasteboard};
     use cocoa::base::nil;
     use cocoa::foundation::{NSArray, NSAutoreleasePool, NSString};
 
@@ -3189,8 +3271,11 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
             native_image_payload(pasteboard.dataForType(ty), format, remaining_budget)
         }) {
             NativeImageRead::Payloads(images) => {
+                let (html, _, text) = native_textual_forms(pasteboard);
                 return native_payload_from_snapshot(NativePasteboardSnapshot {
                     images,
+                    html,
+                    text,
                     ..Default::default()
                 });
             }
@@ -3220,14 +3305,36 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
         // Textual forms are deliberately read only after every image UTI and
         // file representation has been ruled out, so screenshot placeholder
         // text can never suppress an actual image payload.
-        let html_type = NSString::alloc(nil).init_str("public.html").autorelease();
-        let rtf_type = NSString::alloc(nil).init_str("public.rtf").autorelease();
+        let (html, rich_text, text) = native_textual_forms(pasteboard);
         native_payload_from_snapshot(NativePasteboardSnapshot {
-            html: native_string_value(pasteboard.stringForType(html_type)),
-            rich_text: native_rtf_string_value(pasteboard.dataForType(rtf_type)),
-            text: native_string_value(pasteboard.stringForType(NSPasteboardTypeString)),
+            html,
+            rich_text,
+            text,
             ..Default::default()
         })
+    }
+}
+
+/// HTML (or RTF/RTFD converted to HTML), the rich text's plain string, and
+/// the plain text.
+#[cfg(all(target_os = "macos", not(test)))]
+unsafe fn native_textual_forms(
+    pasteboard: cocoa::base::id,
+) -> (Option<String>, Option<String>, Option<String>) {
+    use cocoa::appkit::{NSPasteboard, NSPasteboardTypeString};
+    use cocoa::base::nil;
+    use cocoa::foundation::{NSAutoreleasePool, NSString};
+    unsafe {
+        let ty = |name: &str| NSString::alloc(nil).init_str(name).autorelease();
+        let html = native_string_value(pasteboard.stringForType(ty("public.html")));
+        let (mut rich_text, mut rich_html) =
+            native_rich_text_values(pasteboard.dataForType(ty("public.rtf")), false);
+        if rich_text.is_none() {
+            (rich_text, rich_html) =
+                native_rich_text_values(pasteboard.dataForType(ty("com.apple.flat-rtfd")), true);
+        }
+        let text = native_string_value(pasteboard.stringForType(NSPasteboardTypeString));
+        (html.or(rich_html), rich_text, text)
     }
 }
 
@@ -4559,7 +4666,7 @@ mod tests {
         use cocoa::foundation::NSAutoreleasePool;
         use objc::{class, msg_send, sel, sel_impl};
 
-        let rtf = br"{\rtf1\ansi\deff0 {\fonttbl {\f0 Helvetica;}} Hello}";
+        let rtf = br"{\rtf1\ansi\deff0 {\fonttbl {\f0 Helvetica;}} Hello {\b bold} {\i ital} {\ul under} {\strike gone}}";
         unsafe {
             let _pool = NSAutoreleasePool::new(nil);
             let data: id = msg_send![
@@ -4567,8 +4674,18 @@ mod tests {
                 dataWithBytes: rtf.as_ptr()
                 length: rtf.len()
             ];
-            let rich_text = native_rtf_string_value(data).expect("Foundation should import RTF");
-            assert_eq!(rich_text.trim(), "Hello");
+            let (rich_text, rich_html) = native_rich_text_values(data, false);
+            let rich_text = rich_text.expect("Foundation should import RTF");
+            assert_eq!(rich_text.trim(), "Hello bold ital under gone");
+            // TextEdit and Notes offer only RTF: its formatting survives.
+            let converted = app_lite_core::CanonicalDocument::parse_pasted_html(
+                &rich_html.expect("AppKit writes RTF as HTML"),
+            )
+            .unwrap();
+            assert_eq!(
+                converted.document.to_canonical_html().as_str(),
+                "<p>&nbsp;Hello <strong>bold</strong> <em>ital</em> <u>under</u> <s>gone</s></p>"
+            );
 
             let native = native_payload_from_snapshot(NativePasteboardSnapshot {
                 html: Some("<img src=\"file:///tmp/photo.png\">".into()),
@@ -4613,7 +4730,7 @@ mod tests {
                 length: malformed.len()
             ];
             assert!(
-                native_rtf_string_value(data).is_none(),
+                native_rich_text_values(data, false) == (None, None),
                 "Foundation should reject malformed RTF without an MRC double-release"
             );
 

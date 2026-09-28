@@ -10,7 +10,9 @@ pub mod schema;
 pub mod search;
 pub mod sync;
 
-pub use document::{CanonicalDocument, CanonicalHtml, DocumentError, SearchText};
+pub use document::{
+    CanonicalDocument, CanonicalHtml, DocumentError, PastedHtml, PastedImage, SearchText,
+};
 pub use domain::*;
 pub use import_export::*;
 pub use journal::{

@@ -16,6 +16,7 @@ use crate::native_editor::images::{
 };
 use crate::native_editor::model::{BlockContent, Document, NodeId, Selection};
 use crate::native_editor::transaction::Transaction;
+use app_lite_core::document::Inline;
 use app_lite_core::{
     CanonicalDocument, EditJournalEntry, JournalOwnership, LegacyJournalPayload, LibraryError,
     LibraryRepository, Note, NoteId, ResourceId, SaveNote, SavedRevision, StagedResource,
@@ -1052,6 +1053,144 @@ pub(crate) fn plain_text_for_blocks(blocks: &[crate::native_editor::model::Block
         }
     }
     lines.join("\n")
+}
+
+/// Swap a pasted image's placeholder for its stored resource, or, when it
+/// could not be stored, for a link to where it came from (or its alt text).
+fn resolve_pasted_block(
+    block: app_lite_core::document::Block,
+    imported: &HashMap<ResourceId, (ResourceId, Option<(u32, u32)>)>,
+    failed: &HashMap<ResourceId, app_lite_core::PastedImage>,
+) -> Vec<app_lite_core::document::Block> {
+    use app_lite_core::document::{Block, BlockStyle, ImagePresentation};
+    let inlines = |inlines: Vec<Inline>| resolve_pasted_inlines(inlines, imported, failed);
+    match block {
+        Block::Image {
+            resource_id,
+            alt,
+            presentation,
+            link,
+        } => {
+            if let Some((id, natural_size)) = imported.get(&resource_id) {
+                return vec![Block::Image {
+                    resource_id: id.clone(),
+                    alt,
+                    presentation: ImagePresentation {
+                        natural_size: natural_size.or(presentation.natural_size),
+                        ..presentation
+                    },
+                    link,
+                }];
+            }
+            let fallback = inlines(vec![Inline::Image {
+                resource_id,
+                alt,
+                display_width: None,
+                link,
+            }]);
+            if fallback.is_empty() {
+                Vec::new()
+            } else {
+                vec![Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: fallback,
+                }]
+            }
+        }
+        Block::Paragraph {
+            style,
+            inlines: content,
+        } => vec![Block::Paragraph {
+            style,
+            inlines: inlines(content),
+        }],
+        Block::Heading {
+            level,
+            style,
+            inlines: content,
+        } => vec![Block::Heading {
+            level,
+            style,
+            inlines: inlines(content),
+        }],
+        Block::Quote {
+            style,
+            inlines: content,
+        } => vec![Block::Quote {
+            style,
+            inlines: inlines(content),
+        }],
+        Block::Code {
+            style,
+            inlines: content,
+        } => vec![Block::Code {
+            style,
+            inlines: inlines(content),
+        }],
+        Block::List { kind, items, start } => vec![Block::List {
+            kind,
+            items: items
+                .into_iter()
+                .map(|mut item| {
+                    item.inlines = inlines(std::mem::take(&mut item.inlines));
+                    item
+                })
+                .collect(),
+            start,
+        }],
+        Block::Table { mut rows, header } => {
+            for cell in rows.iter_mut().flat_map(|row| row.cells.iter_mut()) {
+                cell.inlines = inlines(std::mem::take(&mut cell.inlines));
+            }
+            vec![Block::Table { rows, header }]
+        }
+        other => vec![other],
+    }
+}
+
+fn resolve_pasted_inlines(
+    inlines: Vec<Inline>,
+    imported: &HashMap<ResourceId, (ResourceId, Option<(u32, u32)>)>,
+    failed: &HashMap<ResourceId, app_lite_core::PastedImage>,
+) -> Vec<Inline> {
+    inlines
+        .into_iter()
+        .filter_map(|inline| match inline {
+            Inline::Image {
+                resource_id,
+                alt,
+                display_width,
+                link,
+            } => {
+                if let Some((id, _)) = imported.get(&resource_id) {
+                    return Some(Inline::Image {
+                        resource_id: id.clone(),
+                        alt,
+                        display_width,
+                        link,
+                    });
+                }
+                let source = failed.get(&resource_id).map(|image| image.source.as_str());
+                let web = source.filter(|source| {
+                    source.starts_with("http://") || source.starts_with("https://")
+                });
+                let link = link.or_else(|| web.map(str::to_owned));
+                let text = match (alt.trim(), &link) {
+                    ("", Some(_)) => "[图片]".to_owned(),
+                    ("", None) => return None,
+                    (alt, _) => alt.to_owned(),
+                };
+                Some(Inline::Text {
+                    text,
+                    marks: app_lite_core::document::Marks {
+                        link,
+                        ..Default::default()
+                    },
+                })
+            }
+            other => Some(other),
+        })
+        .collect()
 }
 
 fn extend_resource_allowlist(allowlist: &mut Vec<ResourceId>, resource_ids: &[ResourceId]) {
@@ -2918,11 +3057,7 @@ impl NoteSession {
     /// step, images load as on open, and a durable save is requested at
     /// once: a crash journal can only vouch for resources already in this
     /// note's saved history.
-    pub(crate) fn paste_fragment(
-        &mut self,
-        fragment: &ClipboardFragment,
-        cx: &mut Context<Self>,
-    ) -> Result<PasteOutcome, SaveError> {
+    fn ensure_pasteable(&self, cx: &Context<Self>) -> Result<(), SaveError> {
         if self.is_read_only() {
             return Err(SaveError::new("笔记为只读，无法粘贴"));
         }
@@ -2934,6 +3069,15 @@ impl NoteSession {
         if let SaveState::Failed(error) = self.save.state() {
             return Err(SaveError::new(format!("当前笔记保存失败：{error}")));
         }
+        Ok(())
+    }
+
+    pub(crate) fn paste_fragment(
+        &mut self,
+        fragment: &ClipboardFragment,
+        cx: &mut Context<Self>,
+    ) -> Result<PasteOutcome, SaveError> {
+        self.ensure_pasteable(cx)?;
         let mut html = fragment.html.clone();
         let mut available = Vec::new();
         let mut unavailable = Vec::new();
@@ -2962,7 +3106,92 @@ impl NoteSession {
                 None => unavailable.push(id),
             }
         }
-        let canonical = CanonicalDocument::parse_html(&html)
+        self.paste_canonical_html(
+            &html,
+            available,
+            unavailable,
+            (fragment.open_start, fragment.open_end),
+            cx,
+        )
+    }
+
+    /// HTML from another app, with its images already fetched off the main
+    /// thread (`fetched[i]` belongs to `pasted.images[i]`). An image that
+    /// could not be fetched stays as a link to its source, or its alt text.
+    pub(crate) fn paste_external_html(
+        &mut self,
+        pasted: app_lite_core::PastedHtml,
+        fetched: Vec<Result<crate::native_editor::images::ResourceImport, String>>,
+        cx: &mut Context<Self>,
+    ) -> Result<PasteOutcome, SaveError> {
+        self.ensure_pasteable(cx)?;
+        let mut imported = HashMap::new();
+        let mut failed = HashMap::new();
+        let mut available = Vec::new();
+        for (image, fetched) in pasted.images.iter().zip(
+            fetched
+                .into_iter()
+                .map(Some)
+                .chain(std::iter::repeat_with(|| None)),
+        ) {
+            let stored = fetched
+                .unwrap_or_else(|| Err(String::new()))
+                .and_then(|import| {
+                    let natural_size = match import.kind {
+                        ResourceKind::Image { natural_size, .. } => Some(natural_size),
+                        ResourceKind::Attachment => None,
+                    };
+                    let (source, title, mime, extension, _) = import.into_parts();
+                    let ResourceSource::Bytes(bytes) = source else {
+                        return Err(String::new());
+                    };
+                    self.repository
+                        .import_resource_reader(
+                            std::io::Cursor::new(&bytes),
+                            bytes.len(),
+                            &title,
+                            &mime,
+                            &extension,
+                        )
+                        .map(|id| (id, natural_size))
+                        .map_err(|error| error.to_string())
+                });
+            match stored {
+                Ok((id, natural_size)) => {
+                    available.push(id.clone());
+                    imported.insert(image.placeholder.clone(), (id, natural_size));
+                }
+                Err(_) => {
+                    failed.insert(image.placeholder.clone(), image.clone());
+                }
+            }
+        }
+        let blocks = pasted
+            .document
+            .blocks()
+            .iter()
+            .cloned()
+            .flat_map(|block| resolve_pasted_block(block, &imported, &failed))
+            .collect();
+        let html = CanonicalDocument::from_blocks(blocks)
+            .to_canonical_html()
+            .as_str()
+            .to_owned();
+        let mut outcome =
+            self.paste_canonical_html(&html, available, Vec::new(), (true, true), cx)?;
+        outcome.unavailable = failed.len();
+        Ok(outcome)
+    }
+
+    fn paste_canonical_html(
+        &mut self,
+        html: &str,
+        available: Vec<ResourceId>,
+        unavailable: Vec<ResourceId>,
+        (open_start, open_end): (bool, bool),
+        cx: &mut Context<Self>,
+    ) -> Result<PasteOutcome, SaveError> {
+        let canonical = CanonicalDocument::parse_html(html)
             .map_err(|error| SaveError::new(format!("剪贴板内容无法读取：{error}")))?;
         let mut known = available.clone();
         known.extend(unavailable.iter().cloned());
@@ -3028,8 +3257,8 @@ impl NoteSession {
             .update(cx, |editor, editor_cx| {
                 let result = editor.paste_blocks(&crate::native_editor::core::CopiedBlocks {
                     blocks: blocks.clone(),
-                    open_start: fragment.open_start,
-                    open_end: fragment.open_end,
+                    open_start,
+                    open_end,
                 });
                 if result.is_ok() {
                     for (resource_id, size) in &attachments {

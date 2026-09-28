@@ -15,6 +15,8 @@ pub enum DocumentError {
     DepthLimit { limit: usize },
     #[error("HTML document exceeds the maximum DOM node count of {limit}")]
     NodeLimit { limit: usize },
+    #[error("random source unavailable")]
+    Entropy,
 }
 
 // These limits protect the projection and destruction paths without imposing a
@@ -70,6 +72,27 @@ impl CanonicalDocument {
 
     pub fn parse_html(input: &str) -> Result<Self, DocumentError> {
         parse_html(input)
+    }
+
+    /// HTML written by another app (browser, Pages, Word, Google Docs):
+    /// inline CSS becomes marks, `blockquote`/`pre`/`hr` become their blocks,
+    /// and each image with a non-resource source gets a placeholder id the
+    /// caller replaces once it has the image bytes.
+    pub fn parse_pasted_html(input: &str) -> Result<PastedHtml, DocumentError> {
+        let mut prefix = [0_u8; 12];
+        getrandom::getrandom(&mut prefix).map_err(|_| DocumentError::Entropy)?;
+        let root = parse_dom(input)?;
+        let mut pasted = Some(PastedState {
+            prefix,
+            images: Vec::new(),
+            rules: collect_style_sheets(&root),
+        });
+        let document = project_dom(&root, &mut pasted);
+        drain_dom(root);
+        Ok(PastedHtml {
+            document,
+            images: pasted.map(|state| state.images).unwrap_or_default(),
+        })
     }
 
     pub fn to_canonical_html(&self) -> CanonicalHtml {
@@ -245,7 +268,72 @@ pub enum Inline {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedHtml {
+    pub document: CanonicalDocument,
+    pub images: Vec<PastedImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedImage {
+    pub placeholder: ResourceId,
+    pub source: String,
+    pub alt: String,
+}
+
+struct PastedState {
+    prefix: [u8; 12],
+    images: Vec<PastedImage>,
+    rules: Vec<StyleRule>,
+}
+
+impl PastedState {
+    /// Matching style-sheet rules in source order, then the inline style.
+    fn declarations(&self, tag: &str, attrs: &[Attribute]) -> Vec<(String, String)> {
+        let classes = attribute(attrs, "class")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut declarations = Vec::new();
+        for rule in &self.rules {
+            let tag_matches = rule.tag.as_deref().is_none_or(|rule_tag| rule_tag == tag);
+            let class_matches = rule
+                .class
+                .as_deref()
+                .is_none_or(|class| classes.split_whitespace().any(|own| own == class));
+            if tag_matches && class_matches {
+                declarations.extend(rule.declarations.iter().cloned());
+            }
+        }
+        if let Some(style) = attribute(attrs, "style") {
+            declarations.extend(parse_declarations(&style));
+        }
+        declarations
+    }
+
+    fn placeholder(&mut self, source: String, alt: String) -> ResourceId {
+        let mut id = String::with_capacity(32);
+        for byte in self.prefix {
+            id.push_str(&format!("{byte:02x}"));
+        }
+        id.push_str(&format!("{:08x}", self.images.len() as u32));
+        let placeholder = ResourceId::new(id).expect("32 lowercase hex digits");
+        self.images.push(PastedImage {
+            placeholder: placeholder.clone(),
+            source,
+            alt,
+        });
+        placeholder
+    }
+}
+
 fn parse_html(input: &str) -> Result<CanonicalDocument, DocumentError> {
+    let root = parse_dom(input)?;
+    let document = project_dom(&root, &mut None);
+    drain_dom(root);
+    Ok(document)
+}
+
+fn parse_dom(input: &str) -> Result<DomHandle, DocumentError> {
     let sink = DomSink::default();
     let root = parse_fragment(
         sink,
@@ -261,10 +349,7 @@ fn parse_html(input: &str) -> Result<CanonicalDocument, DocumentError> {
         drain_dom(root);
         return Err(error);
     }
-
-    let document = project_dom(&root);
-    drain_dom(root);
-    Ok(document)
+    Ok(root)
 }
 
 fn serialize_html(document: &CanonicalDocument) -> String {
@@ -1377,7 +1462,7 @@ fn is_ignorable_table_child(node: &DomHandle) -> bool {
 /// Projects a simple table (rows of th/td holding only inline content).
 /// Spans, captions, block content, nested tables or an oversize grid return
 /// None so the caller keeps the generic flattening and loses no text.
-fn project_table(table: &DomHandle) -> Option<Block> {
+fn project_table(table: &DomHandle, pasted: &mut Option<PastedState>) -> Option<Block> {
     let mut row_nodes = Vec::new();
     for child in table.children.borrow().iter() {
         match element_name(child).as_deref() {
@@ -1422,7 +1507,7 @@ fn project_table(table: &DomHandle) -> Option<Block> {
                     return None;
                 }
             }
-            let projected = project_dom(cell);
+            let projected = project_dom(cell, pasted);
             let inlines = match projected.blocks.as_slice() {
                 [] => Vec::new(),
                 [Block::Paragraph { inlines, .. }] => inlines.clone(),
@@ -1441,8 +1526,11 @@ fn project_table(table: &DomHandle) -> Option<Block> {
     Some(Block::Table { rows, header })
 }
 
-fn project_dom(root: &DomHandle) -> CanonicalDocument {
-    let mut projection = Projection::default();
+fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalDocument {
+    let mut projection = Projection {
+        pasted: pasted.take(),
+        ..Projection::default()
+    };
     let mut pending = vec![ProjectionFrame::Visit {
         node: root.clone(),
         marks: ProjectionMarks::default(),
@@ -1455,7 +1543,12 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                 blocks_before,
                 kind,
                 style,
-            } => projection.finish_block(blocks_before, kind, style),
+            } => {
+                if matches!(kind, BlockKind::Quote | BlockKind::Code) {
+                    projection.text_block_depth = projection.text_block_depth.saturating_sub(1);
+                }
+                projection.finish_block(blocks_before, kind, style)
+            }
             ProjectionFrame::FinishList => projection.finish_list(),
             ProjectionFrame::FinishListItem => projection.finish_list_item(),
             ProjectionFrame::FinishListBlock { preserve_empty } => {
@@ -1474,6 +1567,20 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                     if matches!(tag.as_str(), "script" | "style" | "head" | "title") {
                         continue;
                     }
+                    let pasted = projection.pasted.is_some();
+                    let declarations = projection
+                        .pasted
+                        .as_ref()
+                        .map(|state| state.declarations(&tag, &attrs.borrow()))
+                        .unwrap_or_default();
+                    let marks = if pasted {
+                        if pasted_element_is_hidden(&tag, &declarations) {
+                            continue;
+                        }
+                        pasted_marks(&declarations, marks)
+                    } else {
+                        marks
+                    };
                     let children = node.children.borrow().clone();
                     if tag == "ul" || tag == "ol" {
                         let kind = if tag == "ol" {
@@ -1540,7 +1647,11 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                             continue;
                         }
                         let blocks_before = projection.document.blocks.len();
-                        let style = block_style(&attrs.borrow(), 0);
+                        let style = if pasted {
+                            pasted_block_style(&attrs.borrow(), &declarations, 0)
+                        } else {
+                            block_style(&attrs.borrow(), 0)
+                        };
                         projection.begin_block(BlockKind::Heading(level), style);
                         pending.push(ProjectionFrame::FinishBlock {
                             blocks_before,
@@ -1562,11 +1673,44 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                     // canonical model can preserve, so it remains ordinary
                     // visible inline content rather than being silently
                     // hoisted across list boundaries.
-                    if projection.list_contexts.is_empty()
-                        && tag == "table"
-                        && let Some(table) = project_table(&node)
+                    if projection.list_contexts.is_empty() && tag == "table" {
+                        let mut pasted_state = projection.pasted.take();
+                        let table = project_table(&node, &mut pasted_state);
+                        projection.pasted = pasted_state;
+                        if let Some(table) = table {
+                            projection.structural_block(table);
+                            continue;
+                        }
+                    }
+                    if pasted && projection.list_contexts.is_empty() && tag == "hr" {
+                        projection.block_divider();
+                        continue;
+                    }
+                    if pasted && tag == "img" {
+                        projection.pasted_image(&attrs.borrow(), &marks);
+                        continue;
+                    }
+                    if pasted
+                        && projection.text_block_depth > 0
+                        && (is_block_element(&tag)
+                            || matches!(
+                                tag.as_str(),
+                                "div" | "section" | "article" | "header" | "footer"
+                            ))
                     {
-                        projection.structural_block(table);
+                        // A quote or code block keeps its paragraphs as lines.
+                        if projection.flow_has_visible {
+                            projection.ensure_current().push(Inline::SoftBreak);
+                            projection.flow_has_visible = false;
+                            projection.pending_space = false;
+                        }
+                        for child in children.into_iter().rev() {
+                            pending.push(ProjectionFrame::Visit {
+                                node: child,
+                                marks: marks.clone(),
+                                preformatted: preformatted || tag == "pre",
+                            });
+                        }
                         continue;
                     }
                     if projection.list_contexts.is_empty()
@@ -1600,16 +1744,22 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                         || (tag == "pre"
                             && attribute(&attrs.borrow(), "data-joplin-lite-block-code")
                                 .as_deref()
-                                == Some("true"));
+                                == Some("true"))
+                        || (pasted && matches!(tag.as_str(), "blockquote" | "pre"));
                     if projection.list_contexts.is_empty() && native_structural_text {
                         let blocks_before = projection.document.blocks.len();
-                        let style = block_style(&attrs.borrow(), 0);
+                        let style = if pasted {
+                            pasted_block_style(&attrs.borrow(), &declarations, 0)
+                        } else {
+                            block_style(&attrs.borrow(), 0)
+                        };
                         let kind = if tag == "blockquote" {
                             BlockKind::Quote
                         } else {
                             BlockKind::Code
                         };
                         projection.begin_block(kind, style);
+                        projection.text_block_depth += 1;
                         pending.push(ProjectionFrame::FinishBlock {
                             blocks_before,
                             kind,
@@ -1651,8 +1801,12 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                             continue;
                         }
                         let blocks_before = projection.document.blocks.len();
-                        let style =
-                            block_style(&attrs.borrow(), if tag == "blockquote" { 1 } else { 0 });
+                        let default_indent = if tag == "blockquote" { 1 } else { 0 };
+                        let style = if pasted {
+                            pasted_block_style(&attrs.borrow(), &declarations, default_indent)
+                        } else {
+                            block_style(&attrs.borrow(), default_indent)
+                        };
                         projection.begin_block(BlockKind::Paragraph, style);
                         pending.push(ProjectionFrame::FinishBlock {
                             blocks_before,
@@ -1716,6 +1870,12 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
                             None
                         },
                     };
+                    // Inline CSS outranks the tag, as it does in a browser.
+                    let next_marks = if pasted {
+                        pasted_marks(&declarations, next_marks)
+                    } else {
+                        next_marks
+                    };
                     for child in children.into_iter().rev() {
                         pending.push(ProjectionFrame::Visit {
                             node: child,
@@ -1741,6 +1901,7 @@ fn project_dom(root: &DomHandle) -> CanonicalDocument {
         }
     }
 
+    *pasted = projection.pasted.take();
     projection.finish()
 }
 
@@ -1816,6 +1977,8 @@ struct Projection {
     pending_space: bool,
     pending_marks: Option<ProjectionMarks>,
     flow_has_visible: bool,
+    pasted: Option<PastedState>,
+    text_block_depth: usize,
 }
 
 impl Projection {
@@ -2253,6 +2416,44 @@ impl Projection {
         self.flow_has_visible = false;
     }
 
+    fn pasted_image(&mut self, attrs: &[Attribute], marks: &ProjectionMarks) {
+        let source = attribute(attrs, "src").map(|source| source.trim().to_owned());
+        let alt = attribute(attrs, "alt").unwrap_or_default();
+        // Another app cannot hand over this library's resources by id.
+        let Some(source) = source.filter(|source| !source.is_empty() && !source.starts_with(":/"))
+        else {
+            self.text(&alt, marks, true);
+            return;
+        };
+        let Some(state) = self.pasted.as_mut() else {
+            return;
+        };
+        let resource_id = state.placeholder(source, alt.clone());
+        let link = self.materialize_marks(marks).link;
+        if self.list_contexts.is_empty() && self.text_block_depth == 0 {
+            self.flush();
+            self.document.blocks.push(Block::Image {
+                resource_id,
+                alt,
+                presentation: ImagePresentation::default(),
+                link,
+            });
+            self.pending_space = false;
+            self.pending_marks = None;
+            self.flow_has_visible = false;
+            return;
+        }
+        self.flush_pending_space();
+        self.ensure_current().push(Inline::Image {
+            resource_id,
+            alt,
+            display_width: None,
+            link,
+        });
+        self.flow_has_visible = true;
+        self.current_item_has_content = true;
+    }
+
     fn block_divider(&mut self) {
         self.flush();
         self.document.blocks.push(Block::Divider);
@@ -2395,6 +2596,196 @@ fn block_style(attrs: &[Attribute], default_indent: u8) -> BlockStyle {
         .unwrap_or(default_indent)
         .min(8);
     BlockStyle { alignment, indent }
+}
+
+fn parse_declarations(style: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    style.split(';').filter_map(|declaration| {
+        let (name, value) = declaration.split_once(':')?;
+        let value = value.trim().to_ascii_lowercase();
+        let value = value.trim_end_matches("!important").trim().to_owned();
+        Some((name.trim().to_ascii_lowercase(), value))
+    })
+}
+
+/// `tag`, `.class` and `tag.class` rules from the pasted HTML's own style
+/// sheets: macOS's RTF→HTML writer and Word put marks there, not inline.
+fn parse_style_sheet(css: &str) -> Vec<StyleRule> {
+    let mut rules = Vec::new();
+    let mut rest = css;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else {
+            break;
+        };
+        let body = &rest[open + 1..open + close];
+        let declarations: Vec<_> = parse_declarations(body).collect();
+        for selector in rest[..open].split(',') {
+            let selector = selector
+                .rsplit("*/")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let (tag, class) = match selector.split_once('.') {
+                Some((tag, class)) => (tag, Some(class)),
+                None => (selector.as_str(), None),
+            };
+            let simple = |part: &str| {
+                part.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            };
+            if selector.is_empty()
+                || !simple(tag)
+                || class.is_some_and(|class| class.is_empty() || !simple(class))
+            {
+                continue;
+            }
+            rules.push(StyleRule {
+                tag: (!tag.is_empty()).then(|| tag.to_owned()),
+                class: class.map(str::to_owned),
+                declarations: declarations.clone(),
+            });
+        }
+        rest = &rest[open + close + 1..];
+    }
+    rules
+}
+
+struct StyleRule {
+    tag: Option<String>,
+    class: Option<String>,
+    declarations: Vec<(String, String)>,
+}
+
+fn collect_style_sheets(root: &DomHandle) -> Vec<StyleRule> {
+    let mut rules = Vec::new();
+    let mut pending = vec![root.clone()];
+    while let Some(node) = pending.pop() {
+        if element_name(&node).as_deref() == Some("style") {
+            let css: String = node
+                .children
+                .borrow()
+                .iter()
+                .filter_map(|child| match &child.data {
+                    DomData::Text(text) => Some(text.borrow().to_string()),
+                    _ => None,
+                })
+                .collect();
+            rules.extend(parse_style_sheet(
+                &css.replace("<!--", "").replace("-->", ""),
+            ));
+            continue;
+        }
+        pending.extend(node.children.borrow().iter().rev().cloned());
+    }
+    rules
+}
+
+fn pasted_element_is_hidden(tag: &str, declarations: &[(String, String)]) -> bool {
+    if matches!(
+        tag,
+        "meta"
+            | "link"
+            | "noscript"
+            | "template"
+            | "iframe"
+            | "object"
+            | "embed"
+            | "button"
+            | "input"
+            | "select"
+            | "textarea"
+            | "svg"
+            | "canvas"
+            | "video"
+            | "audio"
+    ) {
+        return true;
+    }
+    declarations.iter().any(|(name, value)| {
+        (name == "display" && value == "none")
+            // Word's list bullets and numbers, repeated as visible text.
+            || (name == "mso-list" && value == "ignore")
+    })
+}
+
+fn pasted_marks(declarations: &[(String, String)], mut marks: ProjectionMarks) -> ProjectionMarks {
+    for (name, value) in declarations {
+        match name.as_str() {
+            "font-weight" => {
+                let weight = match value.as_str() {
+                    "bold" | "bolder" => Some(700),
+                    "normal" | "lighter" => Some(400),
+                    number => number.parse::<u32>().ok(),
+                };
+                if let Some(weight) = weight {
+                    // Google Docs wraps a whole copy in <b style="font-weight:normal">.
+                    marks.bold = weight >= 600;
+                }
+            }
+            "font-style" => marks.italic = value == "italic" || value == "oblique",
+            "font" => {
+                let words: Vec<_> = value.split_whitespace().collect();
+                marks.bold = words
+                    .iter()
+                    .any(|word| matches!(*word, "bold" | "bolder" | "600" | "700" | "800" | "900"));
+                marks.italic = words
+                    .iter()
+                    .any(|word| matches!(*word, "italic" | "oblique"));
+            }
+            "text-decoration" | "text-decoration-line" => {
+                marks.underline |= value.contains("underline");
+                marks.strikethrough |= value.contains("line-through");
+            }
+            "background-color" | "background" => {
+                marks.highlight |= highlighting_background(value);
+            }
+            _ => {}
+        }
+    }
+    marks
+}
+
+fn highlighting_background(value: &str) -> bool {
+    let compact = value.replace(' ', "");
+    let color = compact.split(['!', ')']).next().unwrap_or_default();
+    !(compact.is_empty()
+        || compact.starts_with("url(")
+        || matches!(
+            color,
+            "transparent"
+                | "initial"
+                | "inherit"
+                | "unset"
+                | "none"
+                | "white"
+                | "#fff"
+                | "#ffff"
+                | "#ffffff"
+                | "#ffffffff"
+                | "rgb(255,255,255"
+                | "rgba(255,255,255,1"
+        )
+        || (compact.starts_with("rgba(") && compact.ends_with(",0)")))
+}
+
+fn pasted_block_style(
+    attrs: &[Attribute],
+    declarations: &[(String, String)],
+    default_indent: u8,
+) -> BlockStyle {
+    let mut style = block_style(attrs, default_indent);
+    let align = declarations
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "text-align")
+        .map(|(_, value)| value.clone())
+        .or_else(|| attribute(attrs, "align").map(|value| value.to_ascii_lowercase()));
+    style.alignment = match align.as_deref() {
+        Some("center") => Alignment::Center,
+        Some("right" | "end") => Alignment::Right,
+        _ => style.alignment,
+    };
+    style
 }
 
 fn heading_level(tag: &str) -> Option<HeadingLevel> {
@@ -3429,5 +3820,78 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
         let children = parent.children.borrow();
         assert!(Rc::ptr_eq(&children[0], &moved));
         assert!(Rc::ptr_eq(&children[1], &sibling));
+    }
+
+    #[test]
+    fn pasted_html_from_other_apps_keeps_its_formatting_and_images() {
+        let pasted = CanonicalDocument::parse_pasted_html(concat!(
+            "<meta charset='utf-8'><b style=\"font-weight:normal;\" id=\"docs-internal-guid-1\">",
+            "<h2 style=\"text-align:center\">Title <span style=\"font-weight:700\">bold</span></h2>",
+            "<p>Plain <span style=\"font-style:italic;text-decoration:underline line-through\">styled</span> ",
+            "<span style=\"background-color:rgb(255, 255, 0)\">marked</span> ",
+            "<span style=\"background-color:transparent\">clear</span> <a href=\"https://example.com/x\">link</a></p>",
+            "<ul><li>one<li>two <img src=\"https://example.com/in-list.png\" alt=\"small\"></ul>",
+            "<p>before<img src=\"data:image/png;base64,AAAA\" alt=\"pic\">after</p>",
+            "<blockquote><p>quoted</p><p>second</p></blockquote><pre>code  x\n  y</pre><hr>",
+            "<p class=MsoListParagraph><span style='mso-list:Ignore'>·<span>&nbsp;</span></span>word item</p>",
+            "<button>Buy</button><img src=\":/0123456789abcdef0123456789abcdef\"></b>"
+        ))
+        .unwrap();
+        let sources: Vec<_> = pasted
+            .images
+            .iter()
+            .map(|image| (image.source.as_str(), image.alt.as_str()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                ("https://example.com/in-list.png", "small"),
+                ("data:image/png;base64,AAAA", "pic"),
+            ]
+        );
+        let mut html = pasted.document.to_canonical_html().as_str().to_owned();
+        for (index, image) in pasted.images.iter().enumerate() {
+            html = html.replace(image.placeholder.as_str(), &format!("image{index}"));
+        }
+        assert_eq!(
+            html,
+            concat!(
+                "<h2 data-align=\"center\">Title <strong>bold</strong></h2>",
+                "<p>Plain <s><em><u>styled</u></em></s> <mark>marked</mark> clear <a href=\"https://example.com/x\">link</a></p>",
+                "<ul><li>one</li><li>two <img src=\":/image0\" alt=\"small\"></li></ul>",
+                "<p>before</p><img data-joplin-lite-block-image=\"true\" src=\":/image1\" alt=\"pic\"><p>after</p>",
+                "<blockquote data-joplin-lite-block-quote=\"true\">quoted<br>second</blockquote>",
+                "<pre data-joplin-lite-block-code=\"true\">code&nbsp;&nbsp;x<br>&nbsp;&nbsp;y</pre>",
+                "<hr data-joplin-lite-block-divider=\"true\">",
+                "<p>word item</p>"
+            )
+        );
+        // macOS's RTF→HTML writer (TextEdit, Notes) and Word use class rules.
+        let styled = CanonicalDocument::parse_pasted_html(concat!(
+            "<html><head><style type=\"text/css\"><!--\n/* Style Definitions */\n",
+            "p.p1 {margin: 0.0px; font: 24.0px 'Helvetica Neue'; text-align: center}\n",
+            "span.s1 {font: 12.0px 'Helvetica Neue'}\nspan.s2 {text-decoration: underline}\n",
+            "span.s3 {text-decoration: line-through}\n.s4 {background-color: #ffff0b}\n",
+            "@media print { p { display: none } }\n--></style></head><body>",
+            "<p class=\"p1\"><b>Head</b></p><p>plain <span class=\"s1\"><b>bold</b></span> ",
+            "<span class=\"s1\"><i>ital</i></span> <span class=\"s2\">under</span> ",
+            "<span class=\"s3 other\">strike</span> <span class=\"s4\">mark</span></p></body></html>"
+        ))
+        .unwrap();
+        assert_eq!(
+            styled.document.to_canonical_html().as_str(),
+            concat!(
+                "<p data-align=\"center\"><strong>Head</strong></p>",
+                "<p>plain <strong>bold</strong> <em>ital</em> <u>under</u> <s>strike</s> <mark>mark</mark></p>"
+            )
+        );
+        let canonical = CanonicalDocument::parse_html(
+            "<p><b style=\"font-weight:normal\">b</b></p><blockquote>q</blockquote>",
+        )
+        .unwrap();
+        assert_eq!(
+            canonical.to_canonical_html().as_str(),
+            "<p><strong>b</strong></p><p data-indent=\"1\">q</p>"
+        );
     }
 }

@@ -3181,6 +3181,16 @@ impl LibraryShell {
                 focus_editor(&editor, window, cx);
                 Ok(())
             }
+            PasteIntent::Html { html, text } => {
+                let Some(session) = self.note_session.clone() else {
+                    return Err("笔记已关闭，未粘贴".to_owned());
+                };
+                Self::discard_resource_insert_intent(&session, saved_intent, cx);
+                self.paste_external_html(&html, text.as_deref(), session.clone(), cx)?;
+                let editor = session.read_with(cx, |session, _| session.editor().clone());
+                focus_editor(&editor, window, cx);
+                Ok(())
+            }
             PasteIntent::Unsupported => {
                 if let Some(session) = self.note_session.as_ref() {
                     Self::discard_resource_insert_intent(session, saved_intent, cx);

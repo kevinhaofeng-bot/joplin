@@ -1540,6 +1540,9 @@ fn apply_paste_intent_at(
             }))
         }
         PasteIntent::Text { text } => editor.paste_plain_text(&text),
+        PasteIntent::Html { text, .. } => {
+            editor.paste_plain_text(text.as_deref().unwrap_or_default())
+        }
         // The spike has no resource store: keep the fragment's text.
         PasteIntent::Fragment { fragment } => editor.paste_plain_text(&fragment.plain_text()),
         PasteIntent::Unsupported => Ok(()),
