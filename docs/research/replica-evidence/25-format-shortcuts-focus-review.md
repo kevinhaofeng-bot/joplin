@@ -37,3 +37,10 @@
 - 只读SQLite确认笔记5、资源5、sync_outbox为0、sync_failures为0。
 - Ruby调用SQLite读取所有笔记id/title/body_html，与 `/tmp/joplin-nas-acceptance.utBFH6/source/library.sqlite` 完整比较一致；按resource_blobs.relative_path重新计算5个文件SHA256，0不匹配，命令退出0。
 - 因而当前签名包已完成“界面配置—原生证书选择—保存—真实NAS TLS拉取—内容与附件校验”的测试数据闭环。仍不是常驻NAS部署、真实全库迁移、自动重试时序或整款软件交付通过。
+
+## 新包真实快捷键验收
+
+- 同一隔离应用点击“新建”，粘贴标题“新版编辑验收”，Return转正文，粘贴两行合成中英文。实际Cmd+A、Cmd+B/I/U、Cmd+S后，界面三项格式亮起，正文显示相应格式；SQLite保存标题正确，正文为strong/em/u嵌套（两行以br分隔）。截图 `editor-formatted.png`。
+- 实际Cmd+Z、Cmd+S后，SQLite正文仅去掉u，strong/em仍保留；实际Cmd+Shift+Z、Cmd+S恢复u。第一次辅助Swift脚本因语法错误未运行，修正后执行成功，不把失败调用计为验证。
+- 点击另一笔记再返回，格式仍显示且存储一致，截图 `editor-reopened.png`。这是新包对原Cmd+B/I/U缺口的真实按键复验，不仅挂载测试。
+- 文字通过剪贴板粘贴，因此不能替代中文IME组合输入验收。图片前后编辑、图片粘贴、列表和完整工具栏仍需各自验证。
