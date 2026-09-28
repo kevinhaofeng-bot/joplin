@@ -10,13 +10,41 @@ scratch=${2:?scratch dir}
 server=${3:?app-lite-server binary}
 drill=${4:?sync_drill binary}
 [ ! -e "$scratch" ] || { echo "scratch exists: $scratch" >&2; exit 1; }
+# Validate the entire backup before creating anything that resembles a restored
+# service. Treat filenames from the manifest as untrusted, never as paths.
+fail() { echo "invalid backup: $*" >&2; exit 1; }
+for file in sync.sqlite blobs.txt manifest.txt; do
+  [ -f "$backup/$file" ] && [ ! -L "$backup/$file" ] || fail "missing or symlinked $file"
+done
+[ -d "$backup/blobs" ] && [ ! -L "$backup/blobs" ] || fail 'invalid blobs directory'
+awk 'NF != 2 || $2 !~ /^[0-9]+$/ { exit 1 }
+     $1 != "blobs" && $1 != "changes" && $1 != "entities" { exit 1 }
+     seen[$1]++ { exit 1 }
+     END { if (NR != 3) exit 1 }' "$backup/manifest.txt" || fail 'invalid counts manifest'
+[ "$(sqlite3 -readonly "$backup/sync.sqlite" 'PRAGMA integrity_check')" = ok ] || fail 'database integrity'
+for table in changes entities; do
+  expected=$(awk -v key="$table" '$1 == key { print $2 }' "$backup/manifest.txt")
+  actual=$(sqlite3 -readonly "$backup/sync.sqlite" "SELECT count(*) FROM $table")
+  [ "$actual" = "$expected" ] || fail "$table count mismatch"
+done
+count=0
+while IFS= read -r name || [ -n "$name" ]; do
+  [[ "$name" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid blob name'
+  [ -f "$backup/blobs/$name" ] && [ ! -L "$backup/blobs/$name" ] || fail "missing or symlinked blob $name"
+  [ "$(shasum -a 256 "$backup/blobs/$name" | cut -d' ' -f1)" = "$name" ] || fail "blob hash mismatch $name"
+  count=$((count + 1))
+done < "$backup/blobs.txt"
+[ -z "$(sort "$backup/blobs.txt" | uniq -d)" ] || fail 'duplicate blob name'
+expected=$(awk '$1 == "blobs" { print $2 }' "$backup/manifest.txt")
+[ "$count" = "$expected" ] || fail 'blob count mismatch'
 mkdir -p "$scratch/data/blobs" "$scratch/data/uploads"
 cp "$backup/sync.sqlite" "$scratch/data/sync.sqlite"
-while read -r name; do
+while IFS= read -r name || [ -n "$name" ]; do
   cp "$backup/blobs/$name" "$scratch/data/blobs/$name"
   [ "$(shasum -a 256 "$scratch/data/blobs/$name" | cut -d' ' -f1)" = "$name" ] || { echo "restored blob mismatch: $name" >&2; exit 1; }
 done < "$backup/blobs.txt"
-token=$(head -c 32 /dev/urandom | xxd -p -c 64)
+token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+[[ "$token" =~ ^[0-9a-f]{64}$ ]] || { echo 'could not generate restore token' >&2; exit 1; }
 # The drill always runs plain HTTP on loopback, whatever the caller's shell sets.
 env -u APP_LITE_TLS_CERT -u APP_LITE_TLS_KEY APP_LITE_SERVER_TOKEN="$token" \
   "$server" --root "$scratch/data" --listen "127.0.0.1:0" 2> "$scratch/server.log" &

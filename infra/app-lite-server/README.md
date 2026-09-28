@@ -10,4 +10,6 @@
 - 构建与启动：`docker compose -f infra/app-lite-server/compose.yaml up -d --build`（在仓库根目录执行）。
 - 备份：`infra/app-lite-server/backup.sh <data 目录> <新备份目录>`。服务运行中也可以执行；需要宿主机有 `sqlite3` 和 `shasum`。数据库经在线备份 API 复制，blob 逐个复核哈希，未完成的分片不备份。失败时不会留下半成品目录。
 - 恢复演练：`infra/app-lite-server/restore-drill.sh <备份目录> <新临时目录> <app-lite-server 可执行文件> <sync_drill 可执行文件>`。它把备份恢复到临时目录，在本机随机端口启动第二个服务，让一个全新客户端完整拉取并重新哈希全部附件。
+- 恢复前检查：数据库完整性、changes/entities计数、附件清单计数、唯一SHA256文件名和实际哈希；拒绝清单/数据库/附件符号链接。在这些检查完成前不创建恢复目录。依赖 Bash、sqlite3、shasum、od 及标准文本工具，不依赖 xxd；仅用于受信任备份的完整性核查，不是备份来源认证。
+- 脚本回归：`bash infra/app-lite-server/test-restore-validation.sh [<app-lite-server 可执行文件> <sync_drill 可执行文件>]`。不提供参数只做坏备份拒绝测试；提供两个程序则在临时目录运行真实本机服务及恢复，保留日志和测试数据，不触碰既有服务。
 - 实际恢复：按演练脚本前半段，把 `sync.sqlite` 与 `blobs/` 复制到新的 data 目录，再启动服务。客户端不需要改动：如果恢复点早于某个客户端最后一次同步，客户端在下次同步前核对锚点（它已知的最高游标及其 op_id）时会发现，然后从头重新对账。内容相同的直接采用；本机不同的内容保存为冲突副本；服务端丢失的内容重新上传。状态行会提示这一点。
