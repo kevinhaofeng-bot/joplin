@@ -4,15 +4,17 @@
 //! below.  The library owns this `EditorSurface` entity, while the spike keeps
 //! its measurement callbacks around the same canvas helper.
 
+use super::commands::{CommandArgument, CommandCatalogue, EditorCommand};
 use super::core::{AtomicBlockHit, EditorCore};
 use super::find::FindMatch;
 use super::images::BudgetedImageCache;
 use super::model::{BlockKind, DocPoint};
 use super::render;
 use crate::components::{
-    BlockDown, BlockUp, Copy, Cut, Delete, DeleteBack, End, FocusNext, FocusPrev, Home, MoveLeft,
-    MoveRight, Newline, PageDown, PageUp, Redo, SelectAll, SelectEnd, SelectHome, SelectLeft,
-    SelectRight, Undo, WordSelectLeft, WordSelectRight,
+    BlockDown, BlockUp, BoldSelection, Copy, Cut, Delete, DeleteBack, End, FocusNext, FocusPrev,
+    Home, ItalicSelection, MoveLeft, MoveRight, Newline, PageDown, PageUp, Redo, SelectAll,
+    SelectEnd, SelectHome, SelectLeft, SelectRight, UnderlineSelection, Undo, WordSelectLeft,
+    WordSelectRight,
 };
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
@@ -85,6 +87,21 @@ macro_rules! bind_result_action {
         $surface = $surface.on_action(move |_action: &$action, window, cx| {
             let _ = action_editor.update(cx, |editor, editor_cx| {
                 let result = editor.$method();
+                editor_cx.notify();
+                result
+            });
+            focus_editor(&action_editor, window, cx);
+        });
+    }};
+}
+
+macro_rules! bind_format_action {
+    ($surface:ident, $editor:expr, $action:ty, $command:expr) => {{
+        let action_editor = $editor.clone();
+        $surface = $surface.on_action(move |_action: &$action, window, cx| {
+            let _ = action_editor.update(cx, |editor, editor_cx| {
+                let result =
+                    CommandCatalogue::new().execute($command, CommandArgument::None, editor);
                 editor_cx.notify();
                 result
             });
@@ -640,6 +657,17 @@ impl Render for EditorSurface {
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .capture_any_mouse_down(cx.listener(Self::on_mouse_down));
+            // The library body shares the donor's BlockEditor shortcut
+            // context but does not use the spike's parent action handlers.
+            // Route formatting through the same catalogue as toolbar clicks.
+            bind_format_action!(surface, editor, BoldSelection, EditorCommand::Bold);
+            bind_format_action!(surface, editor, ItalicSelection, EditorCommand::Italic);
+            bind_format_action!(
+                surface,
+                editor,
+                UnderlineSelection,
+                EditorCommand::Underline
+            );
         }
         // Preserve the donor's standard key context on the one shared
         // document entity. Mutation permissions are deliberately enforced in

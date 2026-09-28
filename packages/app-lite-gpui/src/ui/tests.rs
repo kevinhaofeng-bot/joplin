@@ -4956,6 +4956,209 @@ async fn mounted_library_shared_chrome_clicks_bold_and_list_with_one_history_ent
 }
 
 #[gpui::test]
+async fn mounted_body_cmd_b_i_u_use_command_history_and_persist_canonical_marks(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "格式快捷键".into(),
+            notebook_id: None,
+            document: rich_document("键盘格式"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    editor.update(cx, |editor, editor_cx| {
+        let block = &editor.document().blocks()[0];
+        editor.set_selection_for_test(Selection::new(
+            DocPoint::with_affinity(block.id, 0, Affinity::Before),
+            DocPoint::with_affinity(block.id, "键盘格式".len(), Affinity::After),
+        ));
+        editor_cx.notify();
+    });
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    let before = editor.read_with(cx, |editor, _| editor.undo_depth());
+    for (shortcut, mark, count) in [
+        ("cmd-b", Mark::Bold, 1),
+        ("cmd-i", Mark::Italic, 2),
+        ("cmd-u", Mark::Underline, 3),
+    ] {
+        cx.simulate_keystrokes(shortcut);
+        redraw(cx);
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(
+                editor.undo_depth(),
+                before + count,
+                "{shortcut} must make one transaction"
+            );
+            assert!(
+                editor.document().blocks()[0]
+                    .content
+                    .styles()
+                    .unwrap()
+                    .iter()
+                    .any(|run| run.marks.contains(&mark)),
+                "{shortcut} must format selected body text"
+            );
+        });
+    }
+    let save = cx.debug_bounds("library-sync-current").unwrap();
+    cx.simulate_click(save.center(), Modifiers::default());
+    redraw(cx);
+    let persisted = repository.load_note(&note.id).unwrap().unwrap();
+    let document = CanonicalDocument::parse_html(&persisted.body_html).unwrap();
+    let Block::Paragraph { inlines, .. } = &document.blocks()[0] else {
+        panic!("paragraph")
+    };
+    let Inline::Text { marks, .. } = &inlines[0] else {
+        panic!("text")
+    };
+    assert!(
+        marks.bold && marks.italic && marks.underline,
+        "{}",
+        persisted.body_html
+    );
+}
+
+#[gpui::test]
+async fn formatting_shortcuts_do_not_mutate_body_when_title_search_or_sync_input_has_focus(
+    cx: &mut TestAppContext,
+) {
+    let (profile, repository) = repository();
+    cx.update(|app| {
+        crate::components::init(app);
+        app.set_global(crate::library_profile::LibraryProfiles {
+            base: profile.path().to_path_buf(),
+            active: profile.path().to_path_buf(),
+        });
+    });
+    let note = repository
+        .create_note(CreateNote {
+            title: "输入焦点".into(),
+            notebook_id: None,
+            document: rich_document("正文不变"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    editor.update(cx, |editor, editor_cx| {
+        let block = &editor.document().blocks()[0];
+        editor.set_selection_for_test(Selection::new(
+            DocPoint::with_affinity(block.id, 0, Affinity::Before),
+            DocPoint::with_affinity(block.id, "正文不变".len(), Affinity::After),
+        ));
+        editor_cx.notify();
+    });
+    let title = cx.debug_bounds("library-note-title").unwrap();
+    cx.simulate_click(title.center(), Modifiers::default());
+    cx.simulate_input("甲");
+    cx.simulate_keystrokes("cmd-b");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.undo_depth()),
+        0,
+        "title focus"
+    );
+    cx.dispatch_action(ToggleSearchPalette);
+    redraw(cx);
+    assert!(cx.debug_bounds("library-search-palette").is_some());
+    cx.simulate_input("乙");
+    cx.simulate_keystrokes("cmd-i");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.undo_depth()),
+        0,
+        "search focus"
+    );
+    cx.dispatch_action(ToggleSearchPalette);
+    redraw(cx);
+    assert!(!view.read_with(cx, |shell, _| shell.search_palette_open));
+    cx.dispatch_action(crate::app::OpenSyncSettings);
+    redraw(cx);
+    let token = cx.debug_bounds("sync-settings-token").unwrap();
+    cx.simulate_click(token.center(), Modifiers::default());
+    cx.update(|window, app| {
+        view.read_with(app, |shell, app| {
+            assert!(
+                shell
+                    .sync_settings
+                    .as_ref()
+                    .unwrap()
+                    .token
+                    .read(app)
+                    .focus_handle()
+                    .is_focused(window),
+                "token input must own focus before Cmd-U"
+            );
+        });
+    });
+    cx.simulate_input("丙");
+    cx.simulate_keystrokes("cmd-u");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.undo_depth()),
+        0,
+        "settings focus"
+    );
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.undo_depth(), 0);
+        assert!(
+            editor.document().blocks()[0]
+                .content
+                .styles()
+                .unwrap()
+                .iter()
+                .all(|run| run.marks.is_empty())
+        );
+    });
+    assert!(view.read_with(cx, |shell, app| {
+        shell.search_input.read(app).text().contains("乙")
+    }));
+    assert!(view.read_with(cx, |shell, app| {
+        shell
+            .sync_settings
+            .as_ref()
+            .unwrap()
+            .token
+            .read(app)
+            .text()
+            .contains("丙")
+    }));
+}
+
+#[gpui::test]
 async fn mounted_library_chrome_format_manual_sync_switch_and_reopen_round_trips_canonical_html(
     cx: &mut TestAppContext,
 ) {

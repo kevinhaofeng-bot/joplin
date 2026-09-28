@@ -1011,6 +1011,7 @@ impl LibraryShell {
             .bg(rgba(0xffffffff))
             .border_1()
             .border_color(rgba(0xcbd5e1ff))
+            .key_context("SyncSettingsInput")
             .track_focus(input.read(cx).focus_handle())
             .on_mouse_down(
                 MouseButton::Left,
@@ -1170,6 +1171,7 @@ impl LibraryShell {
             .top(px(60.0))
             .right(px(24.0))
             .w(px(470.0))
+            .occlude()
             .p(px(16.0))
             .rounded(px(9.0))
             .bg(rgba(0xffffffff))
