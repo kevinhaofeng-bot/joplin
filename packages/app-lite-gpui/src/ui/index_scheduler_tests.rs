@@ -101,6 +101,8 @@ async fn mounted_scheduler_advances_a_derived_job_saved_after_open(cx: &mut Test
         "a stand-alone resource is not associated yet"
     );
 
+    // Reproduce a second window occupying the shared extractor slot.
+    let occupied = DERIVED_TEXT_WORKER_LOCK.lock().unwrap();
     repository
         .save_note(SaveNote {
             id: note.id,
@@ -117,6 +119,14 @@ async fn mounted_scheduler_advances_a_derived_job_saved_after_open(cx: &mut Test
         .expect("ordinary save associates fixture");
     cx.executor()
         .advance_clock(std::time::Duration::from_millis(50));
+    redraw(cx);
+    assert_eq!(repository.derived_text_status(&resource).unwrap(),
+        Some(DerivedTextStatus::Pending { attempts: 0 }),
+        "a busy extractor must keep durable work pending, not drop or consume it");
+    drop(occupied);
+    // Production backs off 250ms on contention, then yields through its 50ms
+    // event loop. No new save/event may be needed after the slot is released.
+    cx.executor().advance_clock(std::time::Duration::from_millis(300));
     redraw(cx);
 
     assert_eq!(
