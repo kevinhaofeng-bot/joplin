@@ -1416,6 +1416,9 @@ impl LibraryShell {
         derived_text_cancelled: Arc<AtomicBool>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        // Resolved here, on the mounting thread, so a test's scheduler keeps
+        // that test's slot whichever thread runs its worker.
+        let worker_lock = derived_text_worker_lock();
         cx.spawn(async move |this, cx| {
             let _derived_text_task_lifetime = derived_text_task_lifetime;
             let mut scheduled = true;
@@ -1431,7 +1434,7 @@ impl LibraryShell {
                     let result = cx
                         .background_executor()
                         .spawn(async move {
-                            let Ok(_single_child) = derived_text_worker_lock().try_lock() else {
+                            let Ok(_single_child) = worker_lock.try_lock() else {
                                 return None;
                             };
                             let kind =
