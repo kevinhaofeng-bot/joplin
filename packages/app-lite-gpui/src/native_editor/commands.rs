@@ -8,7 +8,10 @@
 use std::fmt;
 
 use super::core::EditorCore;
-use super::model::{BlockKind, DocPoint, DocumentError, Mark, Selection, TextAlignment};
+use super::model::{
+    Affinity, Block, BlockContent, BlockKind, DocPoint, Document, DocumentError, InlineGroup, Mark,
+    NodeId, Selection, TextAlignment,
+};
 use super::transaction::{Transaction, TransactionBatch};
 
 /// Commands visible in the native Evernote-order editor strip.
@@ -325,19 +328,10 @@ impl CommandCatalogue {
             | EditorCommand::Link => {
                 let mark = mark_for_command(command);
                 let (any, all) = editor.selection_mark_state(&mark);
-                let text_ranges = editor.selected_text_ranges();
-                let text_only_selection = editor
-                    .selected_block_indices()
-                    .map(|(start, end)| {
-                        editor
-                            .document()
-                            .blocks()
-                            .iter_range(start..end.saturating_add(1))
-                            .all(|block| block.content.as_text().is_some())
-                    })
-                    .unwrap_or(false);
+                // Evernote marks the text of a mixed selection and leaves its
+                // resources alone (ProseMirror `addMark` skips atoms).
                 return CommandState {
-                    enabled: text_only_selection && !text_ranges.is_empty(),
+                    enabled: !editor.selected_text_ranges().is_empty(),
                     toggle: toggle_state(any, all),
                 };
             }
@@ -354,36 +348,42 @@ impl CommandCatalogue {
                 if start > end {
                     return disabled();
                 }
-                let (count, text_only, type_matching, exact_matching) = editor
-                    .document()
-                    .blocks()
-                    .iter_range(start..end.saturating_add(1))
-                    .fold(
-                        (0usize, true, 0usize, 0usize),
-                        |(count, text_only, type_matching, exact_matching), block| {
-                            (
-                                count.saturating_add(1),
-                                text_only && block.content.as_text().is_some(),
-                                type_matching.saturating_add(usize::from(
-                                    block_kind_matches_command(&block.kind, command),
-                                )),
-                                exact_matching.saturating_add(usize::from(
-                                    block.kind == block_kind_for_command(command),
-                                )),
-                            )
-                        },
-                    );
-                if count == 0 || !text_only {
-                    return disabled();
-                }
-                // A list command is never a no-op: it converts, or toggles
-                // an all-matching list back to paragraphs.
                 let is_list = matches!(
                     command,
                     EditorCommand::BulletList
                         | EditorCommand::OrderedList
                         | EditorCommand::CheckList
                 );
+                // Only a list takes in a standalone resource; a paragraph or
+                // heading style skips it, as ProseMirror `setBlockType` does.
+                let (count, type_matching, exact_matching) =
+                    selected_items(editor.document(), start, end)
+                        .iter()
+                        .filter_map(|item| match item {
+                            SelectedItem::Text { kind, .. } | SelectedItem::Grouped { kind } => {
+                                Some(Some(kind))
+                            }
+                            SelectedItem::Standalone { .. } => is_list.then_some(None),
+                        })
+                        .fold(
+                            (0usize, 0usize, 0usize),
+                            |(count, type_matching, exact_matching), kind| {
+                                (
+                                    count.saturating_add(1),
+                                    type_matching.saturating_add(usize::from(kind.is_some_and(
+                                        |kind| block_kind_matches_command(kind, command),
+                                    ))),
+                                    exact_matching.saturating_add(usize::from(kind.is_some_and(
+                                        |kind| *kind == block_kind_for_command(command),
+                                    ))),
+                                )
+                            },
+                        );
+                if count == 0 {
+                    return disabled();
+                }
+                // A list command is never a no-op: it converts, or toggles
+                // an all-matching list back to paragraphs.
                 return CommandState {
                     enabled: is_list || exact_matching != count,
                     toggle: toggle_state(type_matching > 0, type_matching == count),
@@ -637,52 +637,204 @@ fn alignment_for_command(command: EditorCommand) -> TextAlignment {
 /// is already this list type the list is removed (`removeList`); otherwise
 /// each block converts, and existing list items keep their nesting
 /// (`insertOrToggleList` uses `setNodeMarkup`). One undo entry.
+///
+/// `insertOrToggleList` also wraps a selected resource in its own list item
+/// (`applyIndent(tr, pos, listType, checked, false)`). Here that item is the
+/// shape a saved `<li><img></li>` opens as: an empty list row grouped with the
+/// resource. Removing the list unwraps such an item back to the resource.
 fn apply_list_command(command: EditorCommand, editor: &mut EditorCore) -> Result<(), CommandError> {
     let Some((start, end)) = editor.selected_block_indices() else {
         return Ok(());
     };
-    let blocks: Vec<_> = editor
-        .document()
-        .blocks()
-        .iter_range(start..end.saturating_add(1))
-        .map(|block| {
-            let len = block.content.as_text().map_or(0, str::len);
-            (block.id, block.kind.clone(), len)
-        })
-        .collect();
-    let remove = !blocks.is_empty()
-        && blocks
+    let document = editor.document();
+    let items = selected_items(document, start, end);
+    let remove = !items.is_empty()
+        && items.iter().all(|item| match item {
+            SelectedItem::Text { kind, .. } | SelectedItem::Grouped { kind } => {
+                block_kind_matches_command(kind, command)
+            }
+            SelectedItem::Standalone { .. } => false,
+        });
+    let unwrapped: Vec<_> = if remove {
+        document
+            .inline_groups()
             .iter()
-            .all(|(_, kind, _)| block_kind_matches_command(kind, command));
-    let transactions: Vec<_> = blocks
-        .into_iter()
-        .filter_map(|(id, kind, len)| {
+            .filter(|group| {
+                let mut members = group.members.iter().filter_map(|id| document.block(*id));
+                group.members.iter().any(|id| {
+                    document
+                        .node_index(*id)
+                        .is_ok_and(|index| (start..=end).contains(&index))
+                }) && members.all(|block| block.content.as_text().is_none_or(str::is_empty))
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut transactions: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let SelectedItem::Text { id, kind, len } = item else {
+                return None;
+            };
+            if unwrapped.iter().any(|group| group.members.contains(id)) {
+                return None;
+            }
             let target = if remove {
                 BlockKind::Paragraph
             } else {
-                let depth = list_depth(&kind).unwrap_or(0);
-                match command {
-                    EditorCommand::BulletList => BlockKind::BulletItem { depth },
-                    EditorCommand::OrderedList => BlockKind::OrderedItem { depth },
-                    _ => BlockKind::CheckItem {
-                        depth,
-                        checked: match kind {
-                            BlockKind::CheckItem { checked, .. } => checked,
-                            _ => false,
-                        },
-                    },
-                }
+                list_target(command, kind)
             };
-            (target != kind).then(|| Transaction::SetBlockKind {
-                selection: Selection::new(DocPoint::new(id, 0), DocPoint::new(id, len)),
+            (target != *kind).then(|| Transaction::SetBlockKind {
+                selection: Selection::new(DocPoint::new(*id, 0), DocPoint::new(*id, *len)),
                 kind: target,
             })
         })
         .collect();
+    let mut after = editor.selection();
+    if remove {
+        let mut removed_rows = Vec::new();
+        for group in &unwrapped {
+            let Some(resource) = group.members.iter().copied().find(|id| {
+                document
+                    .block(*id)
+                    .is_some_and(|block| block.content.as_text().is_none())
+            }) else {
+                continue;
+            };
+            transactions.push(Transaction::RestoreInlineGroups {
+                remove: group.members.first().copied().into_iter().collect(),
+                groups: Vec::new(),
+            });
+            for id in &group.members {
+                if document
+                    .block(*id)
+                    .is_some_and(|block| block.content.as_text().is_some())
+                {
+                    removed_rows.push((document.node_index(*id)?, *id, resource));
+                }
+            }
+        }
+        removed_rows.sort_by(|left, right| right.0.cmp(&left.0));
+        for (index, id, resource) in removed_rows {
+            transactions.push(Transaction::RestoreBlocks {
+                index,
+                remove_count: 1,
+                blocks: Vec::new(),
+            });
+            for point in [&mut after.anchor, &mut after.head] {
+                if point.node_id == id {
+                    *point = DocPoint::with_affinity(resource, 0, Affinity::Before);
+                }
+            }
+        }
+    } else {
+        let standalone: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                SelectedItem::Standalone { id, index } => Some((*index, *id)),
+                _ => None,
+            })
+            .collect();
+        let rows = document.unused_node_ids(standalone.len())?;
+        let kind = list_target(command, &BlockKind::Paragraph);
+        for ((index, resource), row) in standalone.into_iter().zip(rows).rev() {
+            transactions.push(Transaction::RestoreBlocks {
+                index,
+                remove_count: 0,
+                blocks: vec![Block {
+                    id: row,
+                    kind: kind.clone(),
+                    content: BlockContent::text(""),
+                    alignment: TextAlignment::Left,
+                    revision: 0,
+                }],
+            });
+            transactions.push(Transaction::RestoreInlineGroups {
+                remove: Vec::new(),
+                groups: vec![InlineGroup {
+                    kind: kind.clone(),
+                    members: vec![row, resource],
+                }],
+            });
+        }
+    }
     if !transactions.is_empty() {
-        editor.apply_batch_keeping_selection(TransactionBatch(transactions))?;
+        editor.apply_batch_then_select(TransactionBatch(transactions), after)?;
     }
     Ok(())
+}
+
+fn list_target(command: EditorCommand, kind: &BlockKind) -> BlockKind {
+    let depth = list_depth(kind).unwrap_or(0);
+    match command {
+        EditorCommand::BulletList => BlockKind::BulletItem { depth },
+        EditorCommand::OrderedList => BlockKind::OrderedItem { depth },
+        _ => BlockKind::CheckItem {
+            depth,
+            checked: match kind {
+                BlockKind::CheckItem { checked, .. } => *checked,
+                _ => false,
+            },
+        },
+    }
+}
+
+/// What a block/list command sees in the selected block range. A grouped
+/// resource takes its item's style; a table is neither text nor a resource
+/// Evernote lists wrap here.
+enum SelectedItem {
+    Text {
+        id: NodeId,
+        kind: BlockKind,
+        len: usize,
+    },
+    Grouped {
+        kind: BlockKind,
+    },
+    Standalone {
+        id: NodeId,
+        index: usize,
+    },
+}
+
+fn selected_items(document: &Document, start: usize, end: usize) -> Vec<SelectedItem> {
+    document
+        .blocks()
+        .iter_range(start..end.saturating_add(1))
+        .enumerate()
+        .filter_map(|(offset, block)| {
+            if let Some(text) = block.content.as_text() {
+                return Some(SelectedItem::Text {
+                    id: block.id,
+                    kind: block.kind.clone(),
+                    len: text.len(),
+                });
+            }
+            if !matches!(
+                block.content,
+                BlockContent::Image { .. } | BlockContent::Attachment { .. }
+            ) {
+                return None;
+            }
+            Some(
+                match document
+                    .inline_groups()
+                    .iter()
+                    .find(|group| group.members.contains(&block.id))
+                {
+                    Some(group) => SelectedItem::Grouped {
+                        kind: group.kind.clone(),
+                    },
+                    None => SelectedItem::Standalone {
+                        id: block.id,
+                        index: start + offset,
+                    },
+                },
+            )
+        })
+        .collect()
 }
 
 fn list_depth(kind: &BlockKind) -> Option<u8> {
@@ -852,5 +1004,158 @@ mod tests {
             baseline
         );
         let _ = std::fs::remove_file(unsupported);
+    }
+
+    const IMAGE: &str = r#"<img src=":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" alt="图">"#;
+    const ATTACHMENT: &str = r#"<a data-joplin-lite-inline-attachment="true" href=":/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" data-filename="报告.pdf" data-media-type="application/pdf">报告.pdf</a>"#;
+
+    fn canonical(html: &str) -> String {
+        app_lite_core::document::CanonicalDocument::parse_html(html)
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned()
+    }
+
+    fn saved(editor: &EditorCore) -> String {
+        crate::native_editor::codec::export_canonical(editor.document())
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned()
+    }
+
+    fn opened(html: &str, cx: &mut gpui::TestAppContext) -> EditorCore {
+        let document = app_lite_core::document::CanonicalDocument::parse_html(html).unwrap();
+        EditorCore::from_document(
+            crate::native_editor::codec::import_canonical(&document).unwrap(),
+            cx,
+        )
+    }
+
+    #[gpui::test]
+    fn a_list_takes_in_selected_resources_saves_reopens_undoes_and_toggles_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Evernote `list.ts::insertOrToggleList` wraps a selected resource in
+        // its own list item (`applyIndent(..., false)`) beside the paragraphs.
+        let source = format!("<p>甲</p><p>{IMAGE}</p><p>{ATTACHMENT}</p><p>乙</p>");
+        for (command, list) in [
+            (EditorCommand::BulletList, "ul"),
+            (EditorCommand::OrderedList, "ol"),
+        ] {
+            let mut editor = opened(&source, cx);
+            let original = editor.document().semantic_snapshot();
+            editor.select_all();
+            let catalogue = CommandCatalogue::new();
+            assert!(catalogue.state(command, &editor).enabled);
+            catalogue
+                .execute(command, CommandArgument::None, &mut editor)
+                .unwrap();
+            let expected = canonical(&format!(
+                "<{list}><li>甲</li><li>{IMAGE}</li><li>{ATTACHMENT}</li><li>乙</li></{list}>"
+            ));
+            assert_eq!(saved(&editor), expected);
+            assert_eq!(editor.undo_depth(), 1, "one command is one undo step");
+            if command == EditorCommand::OrderedList {
+                let numbers =
+                    crate::native_editor::layout::ordered_number_summary(editor.document());
+                let mut shown: Vec<_> = numbers.values().copied().collect();
+                shown.sort();
+                assert_eq!(shown, vec![1, 2, 3, 4], "each resource item takes a number");
+            }
+            let wrapped = editor.document().semantic_snapshot();
+
+            let mut reopened = opened(&expected, cx);
+            assert_eq!(
+                saved(&reopened),
+                expected,
+                "a reopened list saves unchanged"
+            );
+            reopened.select_all();
+            assert_eq!(
+                catalogue.state(command, &reopened).toggle,
+                super::ToggleState::On
+            );
+            catalogue
+                .execute(command, CommandArgument::None, &mut reopened)
+                .unwrap();
+            assert_eq!(saved(&reopened), saved(&opened(&source, cx)));
+
+            editor.undo().unwrap();
+            assert_eq!(editor.document().semantic_snapshot(), original);
+            editor.redo().unwrap();
+            assert_eq!(editor.document().semantic_snapshot(), wrapped);
+            editor.select_all();
+            catalogue
+                .execute(command, CommandArgument::None, &mut editor)
+                .unwrap();
+            assert_eq!(editor.document().semantic_snapshot(), original);
+            assert!(
+                editor
+                    .document()
+                    .block(editor.selection().head.node_id)
+                    .is_some()
+            );
+            editor.undo().unwrap();
+            assert_eq!(editor.document().semantic_snapshot(), wrapped);
+        }
+    }
+
+    #[gpui::test]
+    fn text_styles_over_a_mixed_selection_change_only_its_text(cx: &mut gpui::TestAppContext) {
+        // ProseMirror `addMark` and `setBlockType`, which Evernote's editor
+        // commands use, apply to text and skip resource nodes.
+        let source = format!("<p>甲</p><p>{IMAGE}</p><p>乙</p>");
+        for (command, expected) in [
+            (
+                EditorCommand::Bold,
+                format!("<p><strong>甲</strong></p><p>{IMAGE}</p><p><strong>乙</strong></p>"),
+            ),
+            (
+                EditorCommand::Heading1,
+                format!("<h1>甲</h1><p>{IMAGE}</p><h1>乙</h1>"),
+            ),
+        ] {
+            let mut editor = opened(&source, cx);
+            let original = editor.document().semantic_snapshot();
+            editor.select_all();
+            let catalogue = CommandCatalogue::new();
+            assert!(catalogue.state(command, &editor).enabled, "{command:?}");
+            catalogue
+                .execute(command, CommandArgument::None, &mut editor)
+                .unwrap();
+            assert_eq!(saved(&editor), saved(&opened(&expected, cx)), "{command:?}");
+            editor.undo().unwrap();
+            assert_eq!(
+                editor.document().semantic_snapshot(),
+                original,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_resource_alone_takes_a_list_but_no_text_style(cx: &mut gpui::TestAppContext) {
+        let mut editor = opened(&format!("<p>{IMAGE}</p>"), cx);
+        editor.select_all();
+        let catalogue = CommandCatalogue::new();
+        for command in [
+            EditorCommand::Bold,
+            EditorCommand::Heading1,
+            EditorCommand::Paragraph,
+        ] {
+            assert!(!catalogue.state(command, &editor).enabled, "{command:?}");
+        }
+        catalogue
+            .execute(EditorCommand::CheckList, CommandArgument::None, &mut editor)
+            .unwrap();
+        let saved_list = saved(&editor);
+        assert_eq!(saved(&opened(&saved_list, cx)), saved_list);
+        assert!(saved_list.contains("<img "));
+        assert_eq!(
+            catalogue.state(EditorCommand::CheckList, &editor).toggle,
+            super::ToggleState::On
+        );
     }
 }

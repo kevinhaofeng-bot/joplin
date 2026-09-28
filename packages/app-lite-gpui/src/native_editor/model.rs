@@ -2141,6 +2141,26 @@ impl Document {
         Ok(id)
     }
 
+    /// Ids a caller-built `RestoreBlocks` may introduce; applying it advances
+    /// the allocator past them.
+    pub(crate) fn unused_node_ids(&self, count: usize) -> Result<Vec<NodeId>, DocumentError> {
+        let mut raw = self.next_id.max(1);
+        let mut ids = Vec::with_capacity(count);
+        while ids.len() < count {
+            if raw == u64::MAX {
+                return Err(DocumentError::InvalidOperation(
+                    "node id allocator exhausted".into(),
+                ));
+            }
+            let id = NodeId::new_internal(raw);
+            if !self.blocks.contains_node(id) {
+                ids.push(id);
+            }
+            raw += 1;
+        }
+        Ok(ids)
+    }
+
     fn advance_next_id_for_blocks(&mut self, blocks: &[Block]) {
         if let Some(max_id) = blocks.iter().map(|block| block.id.raw()).max() {
             self.next_id = self.next_id.max(max_id.checked_add(1).unwrap_or(u64::MAX));
@@ -2993,22 +3013,6 @@ impl Document {
         }
     }
 
-    fn ensure_text_blocks(
-        &self,
-        start_index: usize,
-        end_index: usize,
-    ) -> Result<(), DocumentError> {
-        for block in self
-            .blocks
-            .iter_range(start_index..end_index.saturating_add(1))
-        {
-            if !matches!(block.content, BlockContent::Text { .. }) {
-                return Err(DocumentError::InvalidBlockContent(block.id));
-            }
-        }
-        Ok(())
-    }
-
     fn ensure_editable_range(
         &self,
         start_index: usize,
@@ -3525,19 +3529,6 @@ impl Document {
         }
         let (start_index, _, end_index, _) = self.selection_bounds(selection)?;
         let (start_index, end_index) = self.semantic_parent_range(start_index, end_index);
-        for block in self
-            .blocks
-            .iter_range(start_index..end_index.saturating_add(1))
-        {
-            if !is_text_block(block)
-                && !self
-                    .inline_groups
-                    .iter()
-                    .any(|group| group.members.contains(&block.id))
-            {
-                self.ensure_text_blocks(start_index, end_index)?;
-            }
-        }
         let originals = self
             .blocks
             .collect_range(start_index..end_index.saturating_add(1));
@@ -3570,7 +3561,6 @@ impl Document {
         self.validate_selection(selection)?;
         let (start_index, start_offset, end_index, end_offset) =
             self.selection_bounds(selection)?;
-        self.ensure_text_blocks(start_index, end_index)?;
         if start_index == end_index && start_offset == end_offset {
             return Ok((selection, SmallVec::new(), TransactionBatch::default()));
         }
@@ -3586,6 +3576,9 @@ impl Document {
             else {
                 continue;
             };
+            if !is_text_block(block) {
+                continue;
+            }
             if range_start == range_end {
                 continue;
             }
@@ -3620,7 +3613,6 @@ impl Document {
         self.validate_selection(selection)?;
         let (start_index, start_offset, end_index, end_offset) =
             self.selection_bounds(selection)?;
-        self.ensure_text_blocks(start_index, end_index)?;
         if start_index == end_index && start_offset == end_offset {
             return Ok((selection, SmallVec::new(), TransactionBatch::default()));
         }
@@ -3636,6 +3628,9 @@ impl Document {
             else {
                 continue;
             };
+            if !is_text_block(block) {
+                continue;
+            }
             if range_start == range_end {
                 continue;
             }

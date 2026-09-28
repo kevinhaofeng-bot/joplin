@@ -8447,6 +8447,90 @@ async fn mounted_corrected_generation_clears_only_its_automatic_save_error(
 }
 
 #[gpui::test]
+async fn mounted_list_command_over_text_and_an_image_saves_and_undoes_durably(
+    cx: &mut TestAppContext,
+) {
+    // Evernote `list.ts::insertOrToggleList` lists a selected resource with
+    // its paragraphs; the saved body, its undo and redo must all persist.
+    use crate::native_editor::commands::{CommandArgument, CommandCatalogue, EditorCommand};
+
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let resource = repository
+        .import_resource(&structural_png(16, 12), "图.png", "image/png", "png")
+        .expect("import image");
+    let note = repository
+        .create_note(CreateNote {
+            title: "图文列表".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html(&format!(
+                "<p>甲</p><p><img src=\":/{}\" alt=\"图\"></p><p>乙</p>",
+                resource.as_str()
+            ))
+            .unwrap(),
+        })
+        .expect("create note");
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("mounted session")
+            .clone()
+    });
+    session.update(cx, |session, _| session.enable_deadline_tasks_for_test());
+    let editor = session.read_with(cx, |session, _| session.editor().clone());
+    let save = |edit: &dyn Fn(&mut crate::native_editor::core::EditorCore),
+                cx: &mut VisualTestContext| {
+        editor.update(cx, |editor, editor_cx| {
+            edit(editor);
+            editor_cx.notify();
+        });
+        for step in [100, 400] {
+            clock.advance(Duration::from_millis(step));
+            cx.executor().advance_clock(Duration::from_millis(step));
+            cx.run_until_parked();
+        }
+        redraw(cx);
+        repository
+            .load_note(&note.id)
+            .unwrap()
+            .expect("saved note")
+            .body_html
+    };
+    let listed = save(
+        &|editor| {
+            editor.select_all();
+            CommandCatalogue::new()
+                .execute(EditorCommand::OrderedList, CommandArgument::None, editor)
+                .expect("list over text and an image");
+        },
+        cx,
+    );
+    let image = format!("<img src=\":/{}\" alt=\"图\">", resource.as_str());
+    assert!(
+        listed.contains(&format!("<ol><li>甲</li><li>{image}</li><li>乙</li></ol>")),
+        "{listed}"
+    );
+    let undone = save(&|editor| editor.undo().expect("undo the list"), cx);
+    assert!(
+        !undone.contains("<ol>") && undone.contains(resource.as_str()),
+        "{undone}"
+    );
+    let redone = save(&|editor| editor.redo().expect("redo the list"), cx);
+    assert_eq!(redone, listed);
+    assert!(view.read_with(cx, |shell, _| shell.save_error.is_none()));
+}
+
+#[gpui::test]
 async fn stale_delayed_session_save_cannot_overwrite_the_newly_selected_note(
     cx: &mut TestAppContext,
 ) {

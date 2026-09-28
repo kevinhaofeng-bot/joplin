@@ -1716,13 +1716,22 @@ impl EditorCore {
         &mut self,
         batch: TransactionBatch,
     ) -> Result<ApplyOutcome, DocumentError> {
+        self.apply_batch_then_select(batch, self.selection)
+    }
+
+    /// `after` must name nodes that survive `batch`.
+    pub(crate) fn apply_batch_then_select(
+        &mut self,
+        batch: TransactionBatch,
+        after: Selection,
+    ) -> Result<ApplyOutcome, DocumentError> {
         #[cfg(test)]
         if let Some(error) = self.next_apply_error_for_test.take() {
             return Err(error);
         }
         let selection = self.selection;
         let outcome = self.apply_batch_with_selection(selection, batch)?;
-        self.selection = selection;
+        self.selection = after;
         self.preferred_x = None;
         self.clear_composition();
         self.layout.invalidate_nodes_with_delta(
