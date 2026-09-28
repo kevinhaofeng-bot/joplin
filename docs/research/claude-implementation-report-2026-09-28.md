@@ -13,6 +13,11 @@
 | 第二批（二）：取消输入法组合后的撤销记录 | 本项目自有缺陷修复。规则是 macOS NSTextInputClient 的约定：取消组合（Escape 发出空的 setMarkedText）不改动文档，因此也不应留下撤销步骤 | 未读取 Evernote 源码 |
 | 输入跟踪 | 本项目自有的诊断工具，只供测试资料使用 | 无 |
 | 第三批：混合资源的列表与格式 | 按 Evernote 源码实现，见第三批的对照表 | `common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/list/list.ts` 的 `insertOrToggleList`（62–101 行）与 `getListTypeAtRange`；段落/标题和行内格式依据的是 ProseMirror `setBlockType`/`addMark` 的通用语义，本批没有另读 Evernote 的格式命令文件 |
+| 第三批补充：已分组资源单独切换列表类型 | 按 Evernote 源码实现 | 同上 `list.ts` `insertOrToggleList`：对已有 listItems 用 `setNodeMarkup` 改类型（Codex evidence32 复核同一文件） |
+| 第四批：表格单元格内 Cmd+V | 本项目自有缺陷修复（粘贴目标跟随焦点）。聚焦上下文的依据由 Codex 在 evidence38 读取：`clipboard/commands/paste.ts` 98–191 行；我本人未另读该文件 | 单元格拒绝图片/文件**没有** Evernote 依据，是表格保真缺口，不是等价实现 |
+| 第五批：批量移除/清空标签与数量文案 | 按 Evernote 行为实现 | 本人实际读取的只有本地化字符串：`main-readable/src/modules/64482__localization-catalog.js` 的 `Boron.notesMultiSelectionContext.title`（"已选择 {N} 条笔记"）、`...editTags`，以及 886/905 行 `AiCopilot.organizationPlan.op.addTagToNotes/removeTagFromNotes.title`（"向/从 {N} 笔记…标签"）。执行路径由 Codex 在 evidence38 读取：renderer `9435.js` 13155–13252 行（EDIT_TAGS 作用于整个选区） |
+| 第六批：OCR 期间的图形内存 | 本项目自有性能缺陷修复 | 无 |
+| 测试隔离：索引/OCR 测试闸门 | 本项目自有测试基础设施修复 | 无 |
 
 ## 第一批：正文文档首尾跳转（`aae2684c1`）
 
@@ -121,4 +126,111 @@ Codex 源码对照审计指出：Evernote 的 `insertOrToggleList` 会把选中�
 - 文字加资源的列表项（例如 `<li>文字<img></li>`）移除列表后，会成为含图的段落组。保存结果正确，但重新打开时会拆成独立的文字块和图片块。
 - 缩进和反缩进仍要求选区内每个块都是列表项。选区包含资源块时（即使资源已在列表项中），命令状态为禁用，因为资源块本身的类型不是列表。只选中该项的空列表行时可以缩进，但没有专门测试。这是尚存的差异。
 - 带资源列表项的实机渲染（列表标记、编号、图片位置）、工具栏点击，以及复选框列表中资源项的勾选，都没有做视觉验证，留给 Codex 实机复核。
+
+### 第三批补充：只选中列表项里的资源时切换列表类型（`2b415da9c`）
+
+问题来自 Codex evidence32：在已有的无序列表中只选中某一项的图片或附件，再点有序列表或清单，命令显示为可用，实际却不起作用。原因是列表项的类型记录在该项的文字行上，而选区只覆盖了资源块。修复后，命令通过该项的文字行改变类型，与 `insertOrToggleList` 用 `setNodeMarkup` 改已有列表项的行为一致。
+
+- 测试 `native_editor::commands::tests::a_selected_list_resource_alone_changes_its_own_item_type`：对图片和附件各跑一遍 UL → OL → 清单。检查保存结果（被选中的那一项单独成为新类型的列表，其他项不变）、保存后重新打开结果不变、每次命令只产生一个撤销步骤，两次撤销后回到原文。
+- RED（修复前）：撤销步数为 0，即空操作。日志 `/tmp/joplin-claude-grouped-list-red.log`。
+- 全量 `cargo test --bin velotype`：退出 0，1465 通过、0 失败、2 忽略。日志 `/tmp/joplin-claude-grouped-list-full.log`。
+
+## 第四批：表格单元格内 Cmd+V（`5e170c03e`）
+
+问题来自 Codex evidence33：单元格编辑器已打开并被点击聚焦时，按 Cmd+V，文字被写进了表格前的正文段落。原因是 `ui/mod.rs::paste_resource_or_text` 总是写入主笔记会话。修复后，只要单元格编辑器持有焦点，粘贴就进入单元格：
+
+- 纯文字按文字粘贴；
+- 本应用复制的片段和外部 HTML，按单元格支持的行内格式（粗体等）粘贴；
+- 图片和文件被拒绝，并显示提示“单元格只能粘贴文字和链接；图片或文件请粘贴到正文”，不会进入正文；由粘贴产生的临时文件会被删除。
+
+测试 `ui::table_cell_editor_tests::cmd_v_in_a_clicked_cell_pastes_into_that_cell_not_the_body` 走真实路径：双击单元格，模拟 `cmd-v` 按键，依次粘贴文字、带粗体的片段和图片，再按 Tab 前进，最后保存到数据库。它检查：单元格内容为 `一粘贴丙<strong>粗</strong>`，表格前的 `<p>前</p>` 没有改动，没有图片被加入，也没有资源进入插入队列。
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| 对照：去掉路由判断 | 失败：图片被当作正文资源排队 | `/tmp/joplin-claude-cell-paste-red.log` |
+| 全量（提交前） | 退出 0；1461 通过、0 失败、2 忽略 | `/tmp/joplin-claude-cell-paste-full.log` |
+
+Codex 已在签名候选包 0fbec38e3 上实机验证原缺陷已修复（evidence38）：点击第 2 行第 2 列，通过真实剪贴板粘贴中文，Tab 后保存到正确的 `td`。
+
+仍然存在的差距：单元格不能粘贴图片或文件，而 Evernote 表格单元格可以包含块级内容和资源。这是表格保真缺口，不能据此关闭表格或多媒体验收门。
+
+## 第五批：批量移除、清空标签与数量文案（`0fbec38e3`）
+
+问题来自 Codex evidence35：`MoveSelectedNote` 和 `AddTagToSelectedNote` 作用于整个选区，而 `SetSelectedNoteTags`（清空标签）和 `RemoveTagFromSelectedNote` 只处理当前一篇；多选时面板仍显示“移动当前笔记”。
+
+修复内容：
+- 仓储层新增三个方法：`remove_tag_from_notes`、`set_tags_for_notes`（都在一个事务中完成，某篇失败则整批回滚）和 `tag_counts_for_notes`。
+- 两个动作改为作用于 `selected_note_ids()`。
+- 多选时文案写明作用范围：“移动 N 篇笔记”“清空 N 篇笔记的标签”“为 N 篇添加 #T”“从 N 篇移除 #T”。只有部分笔记带有的标签，同时提供两个按钮：“为其余 K 篇添加”和“从 M 篇移除”。
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `organization_stage_c::batch_tag_removal_and_clearing_cover_every_selected_note_or_none` | 交集/并集计数；部分笔记带标签；某篇已在废纸篓时整批回滚；未选中的笔记不受影响；清空后标签过滤不再列出这些笔记 |
+| `ui::tests::mounted_tag_buttons_act_on_every_selected_note` | 挂载面板，用鼠标依次点击：部分移除、全部移除、全部添加、清空。每次操作后多选保持为 2 篇，未选中的笔记保留标签 |
+| `ui::tests::organization_tag_labels_name_the_selection_they_change` | 单选与多选下的全部文案 |
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| 对照：两个动作只作用于选区第一篇 | 挂载测试失败 | `/tmp/joplin-claude-batch-tags-red.log` |
+| gpui 全量 | 退出 0；1463 通过 | `/tmp/joplin-claude-batch-tags-full.log` |
+| core 全量 | 退出 0；348 通过 | `/tmp/joplin-claude-batch-tags-core.log` |
+
+Codex 已在签名候选包上实机验证批量添加、清空、移除，重启后数据库中的结果保留（evidence38）。
+
+尚未验证的性能风险：多选时 `selected_note_tag_counts` 在渲染组织面板的过程中同步执行 SQL，每篇笔记一次查询。大量选中时的耗时还没有测量，不能据此称为流畅。
+
+## 第六批：OCR 积压期间的图形内存（`e049fdd60`）
+
+问题来自 Codex evidence36：真实 1666 篇的库副本中，物理占用约 630 MB，其中 IOAccelerator（图形）约 526 MB。
+
+### 测量方法
+
+以下全部使用合成资料库，没有打开任何由用户笔记派生的副本。
+
+- 生成器：`/tmp/joplin-claude-memory-evidence/memfixture-main.rs`，命令为 `memfixture <profile> <笔记数> <每几篇配一张图> <宽> <高>`，另可用环境变量 `TOP_IMAGES=K` 让最新的 K 篇带图。
+- 被测二进制：
+  - 修复前：0fbec38e3 的 release 构建，sha256 `74cd4d7ed93a8321afd506dfd6d34b71a04a4fa89feca035adbbdfb8ac49a27c`；
+  - 修复后：去掉每任务重绘后的 release 构建，sha256 `82bfa684027c72f6c9d67ca4d0ce37e4ffff019d6a00612e1c97b64ce08dfbc0`。
+- 两份二进制和原始 footprint/vmmap 输出都保存在 `/tmp/joplin-claude-memory-evidence/`。
+- 窗口大小为默认的 1160×789。
+
+### 观察到的事实
+
+1. 空库、1666 篇纯文字库、带图库都有 16 个 32 MiB 的 IOAccelerator（graphics）区域。区别只在于它们是否算作 dirty：空库和纯文字库中，dirty 为 7.6 MB，另有 514 MB 计为可回收。
+2. 同一带图夹具（1666 篇，每 4 篇一张 2400×1600 的 PNG，共 417 张），做 OCR 前后的受控对照，3 轮结果一致：
+   - OCR 待处理时，dirty 为 530 MB，可回收为 0；
+   - OCR 全部完成后重新打开，dirty 为 7.6 MB，可回收为 514 MB。
+3. 修复前的时间线（`timeline-before-0fbec38e3.txt`）：从 10 s 到 210 s，待处理任务从 407 降到 1，这期间 dirty 一直是 530 MB；队列清空后 10 秒内降到 16 MB，约 370 s 时 514 MB 重新计为可回收。
+4. 用注入库记录 Metal 分配（仅用于诊断，不属于产品）：待处理期间与完成之后，主进程显式创建的纹理和缓冲区完全相同，都是两个 2 MiB instance buffer、两张 1024² 图集和窗口 drawable。因此 dirty 的 512 MiB 不是应用显式创建的纹理。注入库本身会改变结果，所以带队列 hook 的那组数据已作废，不作为证据。
+5. ImageIO 缩略图（同样的参数）在独立 Swift 进程中不产生任何 IOAccelerator 占用，因此排除了它。
+6. 缩放逻辑：派生文本调度器在每个任务完成后都对整个窗口 `notify()`，积压期间约每秒两次重绘；而界面上没有任何内容对应单个任务。
+7. 修复后的时间线（`timeline-after-fix.txt`）：同一夹具、同一台机器，从 407 个待处理到 0，dirty 始终为 12 MB，514 MB 一直计为可回收。
+
+### 结论与边界
+
+去掉每任务一次的重绘后，积压期间的 530 MB 图形 dirty 不再出现，这一点已在同一夹具上受控复现。驱动为什么在持续重绘时把这 512 MiB 保持为不可清除，没有做驱动层面的验证；报告和代码注释只陈述测量结果。
+
+仍需 Codex 完成：
+- 在 1666 篇真实库的隔离副本上复测；
+- 在真实 UI 中、不强制重绘的情况下，证明搜索结果仍能自动刷新（现有测试调用了 `redraw(cx)`，只能证明事件路由，不能证明自发重绘）。
+
+回归测试 `ui::index_scheduler_tests::a_finished_derived_job_does_not_redraw_the_library`：统计挂载后 shell 收到的通知次数，派生任务完成后应为 0。对照中恢复每任务 notify 后，次数为 1，测试失败（`/tmp/joplin-claude-derived-redraw-red.log`）。
+
+### 测试隔离（`38a79bee0`，`3b9496844`）
+
+Codex 的独立运行发现 index_scheduler 测试间歇失败或挂起。我把 e049 之前的代码放回去做基线对照，结果同样失败，并在 `mounted_scheduler_close_finishes_only_active_index_transaction` 挂起。挂起时的堆栈（`/tmp/joplin-claude-baseline-hang-sample.txt`）与 Codex 捕获到的一致，说明这是既有的测试竞争，不是 e049 引入的。
+
+原因：索引 worker 闸门、它的“在独立线程运行”标志，以及 OCR 槽位都是进程全局变量。测试并行运行时，一个测试挂载窗口可能拿走另一个测试的闸门，或者占住另一个测试的 OCR 槽位。
+
+修复：在测试中把这三者改为按线程保存，并在调度器构造时就解析出该线程的 OCR 槽位。正式应用中仍然只有一个进程级 OCR 槽位，没有改动。
+
+修复后结果：
+- `ui::index_scheduler_tests` 连续 12 次并行运行，12/12 通过、无挂起；
+- 全量运行 4 次，均为 1465 通过、0 失败，最后一次日志为 `/tmp/joplin-claude-lock-capture-full.log`。
+
+另有一个未解释的现象：修复前的某一次全量运行中，`uniform_list_constructs_only_requested_ranges_and_reaches_1662_tail` 失败过一次，失败日志被随后的运行覆盖，之后单独运行 5 次、全量运行多次均通过。原因未查明，这里如实记录。
+
+### 可供独立打包的源码检查点
+
+`3b9496844`。此前的提交依次为 5e170c03e、0fbec38e3、e049fdd60、2b415da9c、38a79bee0。
 
