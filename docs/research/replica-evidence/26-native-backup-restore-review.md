@@ -24,3 +24,9 @@
 验收要求：长中文恢复/导入成功消息下，打开与取消等操作不能被挤出边界；在窄编辑区及一/二/三栏可操作。实际点击打开恢复库、再次编辑保存和重开后再补充通过证据。不得仅通过程序派发 OpenImportedLibrary 绕过按钮可用性验收。
 
 结论：本样本备份/恢复的数据完整性已核验；恢复后的打开和继续使用尚未通过，整款产品不放行。
+
+## 修复后独立自动化复验
+
+Claude 提交 `acc64fbe8`：状态消息换行、操作单独一行，并通过 occlude 避免下层正文抢走按钮点击。主代理在其施工中间态曾独立复现“可见但点击后未切换”；提交后的同名测试独立重跑通过。
+
+命令 `cargo test --bin velotype mounted_restore_status_keeps_its_open_button_on_screen_and_clickable -- --nocapture`，退出 0，1 通过、0 失败。日志 `/tmp/joplin-restore-ui-committed-independent.log`。覆盖三/二/一栏、窄窗边界和点击打开后活动库改变，但属于挂载测试，不是签名包实机。新候选构建中，实机门仍未关闭。
