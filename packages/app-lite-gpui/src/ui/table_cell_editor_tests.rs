@@ -84,6 +84,8 @@ async fn open_cell_composition_blocks_lifecycle_save(cx: &mut TestAppContext) {
     cx.update(|window, app| editor.update(app, |editor, editor_cx| {
         EntityInputHandler::replace_and_mark_text_in_range(editor, Some(0..0), "候选", Some(2..2), window, editor_cx);
     }));
+    assert!(view.read_with(cx, |shell, app| shell.active_session_has_unsaved_changes(app)),
+        "sync must treat the open cell's unconfirmed input as pending local work");
     let allowed = cx.update(|_, app| view.update(app, |shell, shell_cx| {
         shell.flush_for_lifecycle(FlushReason::WindowClose, shell_cx)
     }));
@@ -91,10 +93,37 @@ async fn open_cell_composition_blocks_lifecycle_save(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(open_cell(&view, cx), Some((1, 1)));
     assert!(!repository.load_note(&note).unwrap().unwrap().body_html.contains("候选"));
+    // Neither toolbar completion nor Tab may serialize provisional IME text.
+    cx.update(|_, app| view.update(app, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx);
+    }));
+    assert_eq!(open_cell(&view, cx), Some((1, 1)), "Done must retain composing cell");
+    cx.update(|window, app| window.draw(app).clear());
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(open_cell(&view, cx), Some((1, 1)), "Tab must not advance during composition");
+    assert!(view.read_with(cx, |shell, app| {
+        shell.note_session.as_ref().unwrap().read(app).editor().read(app).document().blocks()
+            .iter().all(|block| !matches!(&block.content, BlockContent::Table(table)
+                if table.rows.iter().flatten().any(|text| text.contains("候选"))))
+    }), "provisional input must never enter the main note");
 }
 
 fn mount<'a>(
     cx: &'a mut TestAppContext,
+) -> (
+    tempfile::TempDir,
+    Arc<LibraryRepository>,
+    app_lite_core::NoteId,
+    gpui::Entity<LibraryShell>,
+    &'a mut VisualTestContext,
+) {
+    mount_with_clock(cx, Arc::new(ManualSaveClock::default()))
+}
+
+fn mount_with_clock<'a>(
+    cx: &'a mut TestAppContext,
+    clock: Arc<ManualSaveClock>,
 ) -> (
     tempfile::TempDir,
     Arc<LibraryRepository>,
@@ -124,7 +153,6 @@ fn mount<'a>(
         .unwrap();
     let model_repository = Arc::clone(&repository);
     let model = cx.new(move |_| AppModel::open(model_repository).unwrap());
-    let clock = Arc::new(ManualSaveClock::default());
     let (view, vcx) = cx.add_window_view(move |window, cx| {
         LibraryShell::new_with_save_clock(model.clone(), None, clock, window, cx)
     });
@@ -138,6 +166,43 @@ fn mount<'a>(
     vcx.update(|window, app| window.draw(app).clear());
     vcx.run_until_parked();
     (root, repository, note.id, view, vcx)
+}
+
+#[gpui::test]
+async fn open_cell_uses_automatic_journal_and_snapshot_then_cancel_restores_original(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    let clock = Arc::new(ManualSaveClock::default());
+    let (_root, repository, note, view, cx) = mount_with_clock(cx, clock.clone());
+    let (node, _) = table_node(&view, cx);
+    cx.update(|_, app| view.update(app, |shell, shell_cx| {
+        shell.note_session.as_ref().unwrap().update(shell_cx, |session, _| session.enable_deadline_tasks_for_test());
+        shell.open_table_cell_editor(node, 1, 1, shell_cx);
+    }));
+    cx.run_until_parked();
+    cx.update(|window, app| window.draw(app).clear());
+    cx.simulate_input("自动保存的单元格");
+    cx.run_until_parked();
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    let journal = repository.latest_edit_journal(&note).unwrap().expect("open cell input needs the same crash journal as ordinary text");
+    assert!(journal.delta_utf8.contains("自动保存的单元格"));
+    assert!(!repository.load_note(&note).unwrap().unwrap().body_html.contains("自动保存的单元格"), "this must test the journal before snapshot compaction");
+    assert!(crate::app::note_session::NoteSession::prepare(repository.load_note(&note).unwrap().unwrap(), &repository).is_ok());
+    clock.advance(Duration::from_millis(400));
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    assert!(repository.load_note(&note).unwrap().unwrap().body_html.contains("自动保存的单元格"));
+    assert_eq!(open_cell(&view, cx), Some((1, 1)));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(open_cell(&view, cx), None);
+    clock.advance(Duration::from_millis(500));
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    let body = repository.load_note(&note).unwrap().unwrap().body_html;
+    assert!(!body.contains("自动保存的单元格"), "cancel must durably restore the original cell: {body}");
+    assert!(body.contains("<td>一</td>"));
 }
 
 fn table_node(
@@ -166,6 +231,43 @@ fn table_node(
             editor.layout().block_layout(block.id).unwrap().bounds,
         )
     })
+}
+
+#[gpui::test]
+async fn open_cell_journal_recovers_after_owner_destruction_without_flush(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    let clock = Arc::new(ManualSaveClock::default());
+    let (root, repository, note, view, cx) = mount_with_clock(cx, clock.clone());
+    let (node, _) = table_node(&view, cx);
+    let old_session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().downgrade());
+    cx.update(|_, app| view.update(app, |shell, shell_cx| {
+        shell.note_session.as_ref().unwrap().update(shell_cx, |session, _| session.enable_deadline_tasks_for_test());
+        shell.open_table_cell_editor(node, 1, 1, shell_cx);
+    }));
+    cx.run_until_parked();
+    cx.update(|window, app| window.draw(app).clear());
+    cx.simulate_input("崩溃前的表格输入");
+    cx.run_until_parked();
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    assert!(repository.latest_edit_journal(&note).unwrap().is_some());
+    assert!(!repository.load_note(&note).unwrap().unwrap().body_html.contains("崩溃前的表格输入"));
+    // Destroy the mounted owners without dispatching close/save/cancel.
+    cx.update(|window, _| window.remove_window());
+    drop(view);
+    cx.cx.update(|_| {}); // release zero-count GPUI owners at an app effect boundary
+    cx.run_until_parked();
+    assert!(old_session.upgrade().is_none(), "recovery must not read a surviving in-memory owner");
+    drop(repository);
+    let repository = Arc::new(LibraryRepository::open(root.path().join("library.sqlite")).unwrap());
+    let base = repository.load_note(&note).unwrap().unwrap();
+    assert!(!base.body_html.contains("崩溃前的表格输入"));
+    let restart = cx.cx.add_empty_window();
+    let recovered = restart.new(|cx| crate::app::note_session::NoteSession::open(base, repository.clone(), clock, cx).unwrap());
+    assert!(recovered.read_with(restart, |session, app| session.editor().read(app).document().blocks()
+        .iter().any(|block| matches!(&block.content, BlockContent::Table(table)
+            if table.rows.iter().flatten().any(|text| text.contains("崩溃前的表格输入"))))));
 }
 
 fn open_cell(

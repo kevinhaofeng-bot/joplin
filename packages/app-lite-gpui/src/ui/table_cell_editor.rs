@@ -31,6 +31,8 @@ pub(crate) struct TableCellEditor {
     pub(crate) editor: Entity<EditorCore>,
     surface: Entity<EditorSurface>,
     resources: Vec<app_lite_core::ResourceId>,
+    original_inlines: Vec<Inline>,
+    _observation: Subscription,
     needs_focus: bool,
     error: Option<String>,
 }
@@ -67,6 +69,12 @@ fn cell_inlines(document: &CanonicalDocument) -> Result<Vec<Inline>, String> {
 }
 
 impl LibraryShell {
+    pub(super) fn table_cell_has_pending_input(&self, cx: &App) -> bool {
+        self.table_cell_editor.as_ref().is_some_and(|cell| {
+            cell.editor.read(cx).marked_text().is_some() || cell.error.is_some()
+        })
+    }
+
     /// Include an open cell draft in the note's existing durable save barrier
     /// without closing the cell or stealing its keyboard focus.
     pub(super) fn persist_table_cell_draft(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
@@ -117,6 +125,7 @@ impl LibraryShell {
         let Some(inlines) = inlines else {
             return;
         };
+        let original_inlines = inlines.clone();
         let canonical = CanonicalDocument::from_blocks(vec![CanonicalBlock::Paragraph {
             style: BlockStyle::default(),
             inlines,
@@ -131,6 +140,21 @@ impl LibraryShell {
             }
         };
         let editor = cx.new(|cx| EditorCore::new(document, cx));
+        let observation = cx.observe(&editor, |shell, changed, shell_cx| {
+            let current = shell.table_cell_editor.as_ref().is_some_and(|cell| {
+                cell.editor.entity_id() == changed.entity_id()
+            });
+            if !current || changed.read(shell_cx).marked_text().is_some() {
+                return;
+            }
+            let error = shell.persist_table_cell_draft(shell_cx).err();
+            if let Some(cell) = shell.table_cell_editor.as_mut() {
+                if cell.error != error {
+                    cell.error = error;
+                    shell_cx.notify();
+                }
+            }
+        });
         let image_cache = self.image_cache.clone();
         let surface_editor = editor.clone();
         let surface = cx.new(move |cx| {
@@ -148,6 +172,8 @@ impl LibraryShell {
             editor,
             surface,
             resources,
+            original_inlines,
+            _observation: observation,
             needs_focus: true,
             error: None,
         });
@@ -159,32 +185,22 @@ impl LibraryShell {
         let Some(cell) = self.table_cell_editor.as_ref() else {
             return;
         };
-        let exported = cell.editor.read_with(cx, |editor, _| {
-            export_canonical_with_resources(editor.document(), Some(&cell.resources))
-        });
-        let inlines = match exported
-            .map_err(|error| error.to_string())
-            .and_then(|document| cell_inlines(&document))
-        {
-            Ok(inlines) => inlines,
-            Err(message) => {
-                if let Some(cell) = self.table_cell_editor.as_mut() {
-                    cell.error = Some(message);
-                }
-                cx.notify();
-                return;
-            }
-        };
         let (node_id, row, column) = (cell.node_id, cell.row, cell.column);
+        if let Err(message) = self.persist_table_cell_draft(cx) {
+            if let Some(cell) = self.table_cell_editor.as_mut() {
+                cell.error = Some(message);
+            }
+            cx.notify();
+            return;
+        }
         let Some(session) = self.note_session.as_ref() else {
             self.table_cell_editor = None;
             cx.notify();
             return;
         };
         let main = session.read(cx).editor().clone();
-        let next = main.update(cx, |editor, editor_cx| {
-            let result = editor.set_table_cell(node_id, row, column, inlines);
-            if result.is_ok() && advance {
+        let next: Result<_, crate::native_editor::model::DocumentError> = main.update(cx, |editor, editor_cx| {
+            if advance {
                 let (rows, columns) = match &editor.document().block(node_id).map(|b| &b.content) {
                     Some(BlockContent::Table(table)) => (table.rows.len(), table.column_count()),
                     _ => (0, 0),
@@ -194,16 +210,14 @@ impl LibraryShell {
                 } else if row + 1 < rows {
                     Some((row + 1, 0))
                 } else {
-                    editor
-                        .insert_table_row(node_id, rows)
-                        .ok()
-                        .map(|()| (rows, 0))
+                    editor.insert_table_row(node_id, rows)?;
+                    Some((rows, 0))
                 };
                 editor_cx.notify();
-                return result.map(|()| next);
+                return Ok(next);
             }
             editor_cx.notify();
-            result.map(|()| None)
+            Ok(None)
         });
         match next {
             Ok(next) => {
@@ -295,6 +309,33 @@ impl LibraryShell {
     }
 
     pub(super) fn cancel_table_cell_editor(&mut self, cx: &mut Context<Self>) {
+        // Autosave protects the draft while the popup is open. Explicit
+        // cancellation restores the opening snapshot through the same save
+        // coordinator, rather than leaving the protected draft as final text.
+        if let Some(cell) = self.table_cell_editor.as_ref() {
+            let (node, row, column) = (cell.node_id, cell.row, cell.column);
+            let original = cell.original_inlines.clone();
+            if let Some(session) = self.note_session.as_ref() {
+                let main = session.read(cx).editor().clone();
+                let result = main.update(cx, |editor, editor_cx| {
+                    let current = editor.document().block(node).and_then(|block| match &block.content {
+                        BlockContent::Table(table) => table.cell_inlines(row, column),
+                        _ => None,
+                    });
+                    if current == Some(original.as_slice()) { return Ok(()); }
+                    let result = editor.set_table_cell(node, row, column, original);
+                    if result.is_ok() { editor_cx.notify(); }
+                    result
+                });
+                if let Err(error) = result {
+                    if let Some(cell) = self.table_cell_editor.as_mut() {
+                        cell.error = Some(format!("无法取消单元格编辑：{error}"));
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         if self.table_cell_editor.take().is_some() {
             cx.notify();
         }

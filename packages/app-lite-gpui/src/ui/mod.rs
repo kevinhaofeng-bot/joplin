@@ -2211,7 +2211,7 @@ impl LibraryShell {
     }
 
     fn active_session_has_unsaved_changes(&self, cx: &App) -> bool {
-        self.note_session
+        self.table_cell_has_pending_input(cx) || self.note_session
             .as_ref()
             .is_some_and(|session| !matches!(session.read(cx).save_state(), SaveState::Clean))
     }
