@@ -5038,6 +5038,291 @@ async fn mounted_body_cmd_b_i_u_use_command_history_and_persist_canonical_marks(
 }
 
 #[gpui::test]
+async fn document_jump_shortcuts_move_body_caret_before_editing(cx: &mut TestAppContext) {
+    let (profile, repository) = repository();
+    cx.update(|app| {
+        crate::components::init(app);
+        app.set_global(crate::library_profile::LibraryProfiles {
+            base: profile.path().to_path_buf(),
+            active: profile.path().to_path_buf(),
+        });
+    });
+    let paragraph = |text: &str| Block::Paragraph {
+        style: BlockStyle::default(),
+        inlines: vec![Inline::Text {
+            text: text.into(),
+            marks: Default::default(),
+        }],
+    };
+    let note = repository
+        .create_note(CreateNote {
+            title: "文档跳转".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                paragraph("第一段"),
+                paragraph("中间段"),
+                paragraph("末段"),
+            ]),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    let (first_id, middle_id, last_id, last_len) = editor.read_with(cx, |editor, _| {
+        let blocks = editor.document().blocks();
+        (
+            blocks[0].id,
+            blocks[1].id,
+            blocks[2].id,
+            blocks[2].content.as_text().unwrap().len(),
+        )
+    });
+    editor.update(cx, |editor, editor_cx| {
+        editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+            middle_id,
+            "中".len(),
+            Affinity::After,
+        )));
+        editor_cx.notify();
+    });
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    cx.simulate_keystrokes("cmd-down");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().head.node_id, last_id);
+        assert_eq!(editor.selection().head.utf8_offset, last_len);
+        assert_eq!(editor.undo_depth(), 0, "navigation must not edit");
+    });
+    cx.simulate_keystrokes("enter");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        let blocks = editor.document().blocks();
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[1].content.as_text(), Some("中间段"));
+        assert_eq!(blocks[2].content.as_text(), Some("末段"));
+    });
+    cx.simulate_keystrokes("cmd-up");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().head.node_id, first_id);
+        assert_eq!(editor.selection().head.utf8_offset, 0);
+    });
+    cx.simulate_keystrokes("ctrl-end");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(
+            editor.selection().head.node_id,
+            editor.document().blocks()[3].id
+        );
+        assert_eq!(editor.selection().head.utf8_offset, 0);
+    });
+    cx.simulate_keystrokes("ctrl-home");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().head.node_id, first_id);
+        assert_eq!(editor.selection().head.utf8_offset, 0);
+    });
+}
+
+/// In a note longer than the window, a jump brings the caret into view at
+/// the top or the very end, and jumping around changes nothing that is
+/// saved.
+#[gpui::test]
+async fn document_jumps_reveal_the_caret_in_a_long_note_and_save_nothing(cx: &mut TestAppContext) {
+    let (profile, repository) = repository();
+    cx.update(|app| {
+        crate::components::init(app);
+        app.set_global(crate::library_profile::LibraryProfiles {
+            base: profile.path().to_path_buf(),
+            active: profile.path().to_path_buf(),
+        });
+    });
+    let blocks: Vec<_> = (0..80)
+        .map(|index| Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: format!("第 {index} 段：足够长的正文，让这篇笔记远远超出一屏。"),
+                marks: Default::default(),
+            }],
+        })
+        .collect();
+    let note = repository
+        .create_note(CreateNote {
+            title: "长文".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(blocks),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    let saved_before = repository.load_note(&note.id).unwrap().unwrap();
+    editor.update(cx, |editor, editor_cx| {
+        let id = editor.document().blocks()[40].id;
+        editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+            id,
+            0,
+            Affinity::After,
+        )));
+        editor_cx.notify();
+    });
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    let caret_in_view = |cx: &mut VisualTestContext| {
+        let viewport = view.read_with(cx, |shell, app| {
+            shell
+                .editor_surface
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .scroll_viewport_for_test()
+        });
+        let caret = editor.read_with(cx, |editor, _| {
+            editor
+                .layout()
+                .caret_bounds_for_point(editor.selection().head)
+                .expect("the caret has a laid-out position")
+        });
+        assert!(
+            caret.top() >= viewport.top() - px(0.5)
+                && caret.bottom() <= viewport.bottom() + px(0.5),
+            "caret {caret:?} outside the note viewport {viewport:?}"
+        );
+    };
+    cx.simulate_keystrokes("cmd-down");
+    // The jump follows the caret for up to three frames while blocks newly
+    // in view are measured.
+    for _ in 0..4 {
+        redraw(cx);
+    }
+    let (head, last) = editor.read_with(cx, |editor, _| {
+        let last = editor.document().blocks().last().unwrap();
+        (
+            editor.selection().head,
+            (last.id, last.content.as_text().unwrap().len()),
+        )
+    });
+    assert_eq!((head.node_id, head.utf8_offset), last);
+    caret_in_view(cx);
+    cx.simulate_keystrokes("cmd-up");
+    redraw(cx);
+    let head = editor.read_with(cx, |editor, _| editor.selection().head);
+    let first = editor.read_with(cx, |editor, _| editor.document().blocks()[0].id);
+    assert_eq!((head.node_id, head.utf8_offset), (first, 0));
+    caret_in_view(cx);
+
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let saved_after = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(saved_after.body_html, saved_before.body_html);
+    assert_eq!(
+        saved_after.revision, saved_before.revision,
+        "nothing was saved"
+    );
+}
+
+#[gpui::test]
+async fn document_jumps_do_not_steal_title_search_or_settings_focus(cx: &mut TestAppContext) {
+    let (profile, repository) = repository();
+    cx.update(|app| {
+        crate::components::init(app);
+        app.set_global(crate::library_profile::LibraryProfiles {
+            base: profile.path().to_path_buf(),
+            active: profile.path().to_path_buf(),
+        });
+    });
+    let note = repository
+        .create_note(CreateNote {
+            title: "焦点隔离".into(),
+            notebook_id: None,
+            document: rich_document("正文保持原位"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    editor.update(cx, |editor, editor_cx| {
+        let id = editor.document().blocks()[0].id;
+        editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+            id,
+            "正文".len(),
+            Affinity::After,
+        )));
+        editor_cx.notify();
+    });
+    let original = editor.read_with(cx, |editor, _| editor.selection());
+    let title = cx.debug_bounds("library-note-title").unwrap();
+    cx.simulate_click(title.center(), Modifiers::default());
+    cx.simulate_keystrokes("cmd-down");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.selection()),
+        original
+    );
+    cx.dispatch_action(ToggleSearchPalette);
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-up");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.selection()),
+        original
+    );
+    cx.dispatch_action(ToggleSearchPalette);
+    redraw(cx);
+    cx.dispatch_action(crate::app::OpenSyncSettings);
+    redraw(cx);
+    let token = cx.debug_bounds("sync-settings-token").unwrap();
+    cx.simulate_click(token.center(), Modifiers::default());
+    cx.simulate_keystrokes("ctrl-end");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.selection()),
+        original
+    );
+}
+
+#[gpui::test]
 async fn formatting_shortcuts_do_not_mutate_body_when_title_search_or_sync_input_has_focus(
     cx: &mut TestAppContext,
 ) {

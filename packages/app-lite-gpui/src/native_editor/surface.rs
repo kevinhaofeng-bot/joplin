@@ -12,9 +12,9 @@ use super::model::{BlockKind, DocPoint};
 use super::render;
 use crate::components::{
     BlockDown, BlockUp, BoldSelection, Copy, Cut, Delete, DeleteBack, End, FocusNext, FocusPrev,
-    Home, ItalicSelection, MoveLeft, MoveRight, Newline, PageDown, PageUp, Redo, SelectAll,
-    SelectEnd, SelectHome, SelectLeft, SelectRight, UnderlineSelection, Undo, WordSelectLeft,
-    WordSelectRight,
+    Home, ItalicSelection, JumpToBottom, JumpToTop, MoveLeft, MoveRight, Newline, PageDown, PageUp,
+    Redo, SelectAll, SelectEnd, SelectHome, SelectLeft, SelectRight, UnderlineSelection, Undo,
+    WordSelectLeft, WordSelectRight,
 };
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
@@ -203,6 +203,9 @@ pub struct EditorSurface {
     // pass shapes that viewport, then uses the exact text range to correct
     // wrapped paragraphs before the result is considered revealed.
     pending_find_reveal: Option<FindMatch>,
+    /// Frames left in which to bring the caret into view after a document
+    /// jump, as blocks newly in view are measured.
+    pending_caret_reveal: u8,
     _editor_subscription: Subscription,
     #[cfg(test)]
     light_surface_paint_for_test: EditorSurfaceLightContract,
@@ -253,6 +256,7 @@ impl EditorSurface {
             clipboard_to_owner: false,
             accepts_pointer_input,
             pending_find_reveal: None,
+            pending_caret_reveal: 0,
             _editor_subscription: subscription,
             #[cfg(test)]
             light_surface_paint_for_test: EditorSurfaceLightContract {
@@ -265,6 +269,12 @@ impl EditorSurface {
 
     pub fn editor(&self) -> &Entity<EditorCore> {
         &self.editor
+    }
+
+    /// The window area the note scrolls in.
+    #[cfg(test)]
+    pub(crate) fn scroll_viewport_for_test(&self) -> gpui::Bounds<Pixels> {
+        self.scroll_handle.bounds()
     }
 
     pub fn mode(&self) -> EditorSurfaceMode {
@@ -578,7 +588,8 @@ impl Render for EditorSurface {
         let (content_width, content_height, embedded) = self
             .embedded_frame
             .map(|(width, height)| (width, height, true))
-            .unwrap_or((1.0, measured_height, false));
+            // The library surface's 1px border sits outside its content.
+            .unwrap_or((1.0, measured_height + 2.0, false));
         let readonly_notice = match self.mode {
             EditorSurfaceMode::Editable => None,
             EditorSurfaceMode::ReadOnly => Some(
@@ -615,6 +626,10 @@ impl Render for EditorSurface {
         let before_shape = self.hooks.clone();
         let after_paint = self.hooks.clone();
         let pending_find_reveal = self.pending_find_reveal.take();
+        let pending_caret_reveal = std::mem::take(&mut self.pending_caret_reveal);
+        let caret_reveal_editor = editor.clone();
+        let caret_reveal_scroll_handle = self.scroll_handle.clone();
+        let caret_reveal_surface = cx.entity().downgrade();
         let find_reveal_editor = editor.clone();
         let find_reveal_scroll_handle = self.scroll_handle.clone();
         let find_reveal_surface = cx.entity().downgrade();
@@ -691,6 +706,30 @@ impl Render for EditorSurface {
         bind_selection_action!(surface, editor, SelectEnd, select_end);
         bind_selection_action!(surface, editor, BlockUp, move_up);
         bind_selection_action!(surface, editor, BlockDown, move_down);
+        // The shared shortcut catalogue maps Cmd-Up/Down and Ctrl-Home/End
+        // to document jumps. A viewport-only jump leaves the insertion point
+        // behind, so a subsequent Return or paste edits the wrong paragraph.
+        // An embedded surface (the measurement spike) does not scroll
+        // itself; it leaves these actions to its host as before.
+        if self.embedded_frame.is_none() {
+            for to_end in [false, true] {
+                let jump_editor = editor.clone();
+                let jump_handle = self.scroll_handle.clone();
+                let jump_surface = cx.entity().downgrade();
+                let jump = move |window: &mut Window, cx: &mut App| {
+                    jump_editor_to_document_edge(&jump_editor, &jump_handle, to_end, window, cx);
+                    let _ = jump_surface.update(cx, |surface, surface_cx| {
+                        surface.pending_caret_reveal = 3;
+                        surface_cx.notify();
+                    });
+                };
+                surface = if to_end {
+                    surface.on_action(move |_action: &JumpToBottom, window, cx| jump(window, cx))
+                } else {
+                    surface.on_action(move |_action: &JumpToTop, window, cx| jump(window, cx))
+                };
+            }
+        }
         let focus_prev_editor = editor.clone();
         let focus_prev_handle = self.scroll_handle.clone();
         surface = surface.on_action(move |_action: &FocusPrev, window, cx| {
@@ -761,6 +800,25 @@ impl Render for EditorSurface {
             content_height,
             move |window, cx| (before_shape.before_shape)(window, cx),
             move |_window, cx| {
+                // After a document jump: blocks newly in view were just
+                // measured and may differ from their estimate, so the canvas
+                // may only reach the caret next frame. Follow until it shows.
+                if pending_caret_reveal > 0 {
+                    let editor = caret_reveal_editor.read(cx);
+                    if let Some(caret) = editor
+                        .layout()
+                        .caret_bounds_for_point(editor.selection().head)
+                    {
+                        reveal_scroll_bounds(&caret_reveal_scroll_handle, caret);
+                        let viewport = caret_reveal_scroll_handle.bounds();
+                        if caret.top() < viewport.top() || caret.bottom() > viewport.bottom() {
+                            let _ = caret_reveal_surface.update(cx, |surface, surface_cx| {
+                                surface.pending_caret_reveal = pending_caret_reveal - 1;
+                                surface_cx.notify();
+                            });
+                        }
+                    }
+                }
                 let Some(found) = pending_find_reveal.clone() else {
                     return;
                 };
@@ -864,6 +922,29 @@ pub fn surface_viewport(
 pub fn focus_editor(editor: &Entity<EditorCore>, window: &mut Window, cx: &mut App) {
     let focus_handle = editor.read(cx).focus_handle().clone();
     focus_handle.focus(window);
+}
+
+fn jump_editor_to_document_edge(
+    editor: &Entity<EditorCore>,
+    scroll_handle: &ScrollHandle,
+    to_end: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    editor.update(cx, |editor, editor_cx| {
+        let offset = if to_end { editor.document_len() } else { 0 };
+        editor.select_document_range(offset, offset);
+        editor_cx.notify();
+    });
+    let mut scroll_offset = scroll_handle.offset();
+    scroll_offset.y = if to_end {
+        -scroll_handle.max_offset().height.max(px(0.0))
+    } else {
+        px(0.0)
+    };
+    scroll_handle.set_offset(scroll_offset);
+    focus_editor(editor, window, cx);
+    window.refresh();
 }
 
 /// Move the retained nested editor viewport by exactly one current page.

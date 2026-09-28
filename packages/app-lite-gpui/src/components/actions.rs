@@ -297,9 +297,9 @@ const SHORTCUT_DEFINITIONS: &[ShortcutDefinition] = &[
         default_keys: &["ctrl-down", "alt-down"],
         context: BLOCK_CONTEXT,
     },
-    // Page scroll and document jumps operate on the editor viewport rather than
-    // a single block, so they use global bindings (no context) and stay active
-    // in both Rendered and Source mode.
+    // Page scroll and document jumps are document-wide rather than block-local,
+    // so they use global bindings (no context). Each focused editor surface
+    // handles the jump with its own caret/viewport policy.
     ShortcutDefinition {
         command: ShortcutCommand::PageUp,
         id: "page_up",
