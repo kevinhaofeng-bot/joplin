@@ -31,3 +31,11 @@ footprint 类别：IOAccelerator(graphics)526MB、IOSurface42MB、其他 IOAccel
 同一二进制、新建 `/tmp/joplin-empty-memory.xm40cs/library`（0篇、0资源），PID88142。CGWindowList 确认窗口1160×789；启动约26秒 RSS57136KiB，footprint84MB。完整输出在该目录 `footprint.txt`、`vmmap.txt`。
 
 空库：IOSurface42MB、IOAccelerator16MB，与真实库相近；graphics dirty7648KiB、reclaimable160MB。真实库 graphics dirty526MB、reclaimable0。因此不能将真实库约630MB说成固定的空窗口启动开销；加载内容后图形资源驻留/可回收状态差异是下一步排查重点。尚未锁定具体纹理、驱动账目或缓存行为，不能直接断言是缩略图泄漏。对照进程已正常退出。
+
+## 逐区域映射与长静置补验
+
+第五次隔离进程 PID88475 在启动4分11秒后 RSS92720KiB，完整 `vmmap-detail.txt` 显示16个独立32MiB的 IOAccelerator(graphics) 区域，合计512MiB，均为 `PURGE=V`，resident/dirty 均为32MiB。graphics 汇总 resident/dirty525.7MiB、volatile512MiB。其余可辨认的窗口表面为3个2320×1522 BGRA、各13.8MiB的 CAMetalLayer drawable。
+
+随后 `footprint-late.txt` 仍报告物理占用620MB、峰值631MB，graphics526MB且reclaimable0。两个工具对purgeable与计费账目的表述不同；不能将512MiB直接从physical footprint扣除，也不能据此断言实际不可回收或确定泄漏。至少可排除“仅启动瞬时峰值，稍候自然回落至低内存”的解释。
+
+下一步实现方应对这16个32MiB区域追踪Metal/驱动分配来源，并比较内容路径和空库；当前没有证据把它们直接归因于某个atlas、缩略图或instance buffer。原始输出保存在 `/tmp/joplin-current-memory.tPavET/`。进程经其自身原生退出菜单正常退出；未修改实现代码或原资料库。
