@@ -102,7 +102,7 @@ async fn mounted_scheduler_advances_a_derived_job_saved_after_open(cx: &mut Test
     );
 
     // Reproduce a second window occupying the shared extractor slot.
-    let occupied = DERIVED_TEXT_WORKER_LOCK.lock().unwrap();
+    let occupied = super::derived_text_worker_lock().lock().unwrap();
     repository
         .save_note(SaveNote {
             id: note.id,
@@ -179,7 +179,7 @@ async fn mounted_derived_text_publish_refreshes_an_active_search_route(cx: &mut 
     // Hold the process-wide child gate until the synthetic D3a publish has
     // emitted. Otherwise the startup worker can consume this intentionally
     // pending image job before the mounted event path observes it.
-    let derived_worker_guard = super::DERIVED_TEXT_WORKER_LOCK
+    let derived_worker_guard = super::derived_text_worker_lock()
         .lock()
         .expect("derived worker gate");
     let (view, cx) = cx.add_window_view(move |window, cx| {
@@ -729,19 +729,6 @@ async fn a_finished_derived_job_does_not_redraw_the_library(cx: &mut TestAppCont
     cx.executor()
         .advance_clock(DERIVED_IMAGE_STARTUP_DELAY + std::time::Duration::from_millis(400));
     cx.run_until_parked();
-    // Parallel tests share the one extractor slot; wait (bounded) for ours.
-    for _ in 0..200 {
-        if matches!(
-            repository.derived_text_status(&resource).unwrap(),
-            Some(DerivedTextStatus::Failed { .. })
-        ) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        cx.executor()
-            .advance_clock(std::time::Duration::from_millis(300));
-        cx.run_until_parked();
-    }
     assert!(matches!(
         repository.derived_text_status(&resource).unwrap(),
         Some(DerivedTextStatus::Failed { attempts: 1, .. })

@@ -112,7 +112,22 @@ pub(crate) enum IndexingStatus {
 // The child itself is process-wide; separate library windows must not launch
 // competing PDFKit/Vision helpers. A busy window leaves its durable job pending and
 // retries on a later bounded scheduler turn.
+#[cfg(not(test))]
 static DERIVED_TEXT_WORKER_LOCK: Mutex<()> = Mutex::new(());
+
+// Tests run in parallel threads; each needs its own slot, or one test's
+// worker holds another's.
+#[cfg(test)]
+thread_local! {
+    static DERIVED_TEXT_WORKER_LOCK: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+}
+
+fn derived_text_worker_lock() -> &'static Mutex<()> {
+    #[cfg(test)]
+    return DERIVED_TEXT_WORKER_LOCK.with(|lock| *lock);
+    #[cfg(not(test))]
+    &DERIVED_TEXT_WORKER_LOCK
+}
 
 // Initial Cards/list construction must not compete with a historical image
 // OCR backlog for verified descriptors. PDFs stay interactive-startup work;
@@ -138,26 +153,27 @@ struct SearchCompletionGate {
     release: futures::channel::oneshot::Receiver<()>,
 }
 
+// Per test thread: a parallel test's mount must not take this test's gate.
 #[cfg(test)]
-static INDEXING_WORKER_GATE: Mutex<Option<IndexingWorkerGate>> = Mutex::new(None);
+thread_local! {
+    static INDEXING_WORKER_GATE: std::cell::RefCell<Option<IndexingWorkerGate>> =
+        const { std::cell::RefCell::new(None) };
+    static INDEXING_WORKER_THREAD_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// The GPUI test executor is deterministic rather than a real thread pool.
 /// This narrow seam runs the *same shell scheduler worker call* on an OS
 /// thread when a transaction-level test must hold SQLite open while the test
 /// drives the mounted foreground window.
 #[cfg(test)]
-static INDEXING_WORKER_THREAD_FOR_TEST: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
 pub(crate) fn install_indexing_worker_gate_for_test(gate: IndexingWorkerGate) {
-    *INDEXING_WORKER_GATE
-        .lock()
-        .expect("indexing worker gate mutex poisoned") = Some(gate);
+    INDEXING_WORKER_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
 }
 
 #[cfg(test)]
 pub(crate) fn run_indexing_worker_on_thread_for_test() {
-    INDEXING_WORKER_THREAD_FOR_TEST.store(true, Ordering::Release);
+    INDEXING_WORKER_THREAD_FOR_TEST.with(|flag| flag.set(true));
 }
 
 /// A bounded coalescing buffer between the repository's unbounded sender and
@@ -1257,12 +1273,9 @@ impl LibraryShell {
         cx: &mut Context<Self>,
     ) -> Task<()> {
         #[cfg(test)]
-        let mut worker_gate = INDEXING_WORKER_GATE
-            .lock()
-            .expect("indexing worker gate mutex poisoned")
-            .take();
+        let mut worker_gate = INDEXING_WORKER_GATE.with(|slot| slot.borrow_mut().take());
         #[cfg(test)]
-        let worker_on_thread = INDEXING_WORKER_THREAD_FOR_TEST.swap(false, Ordering::AcqRel);
+        let worker_on_thread = INDEXING_WORKER_THREAD_FOR_TEST.with(|flag| flag.replace(false));
         cx.spawn(async move |this, cx| {
             let _indexing_task_lifetime = indexing_task_lifetime;
             // An open profile may already have durable work from a prior run.
@@ -1418,7 +1431,7 @@ impl LibraryShell {
                     let result = cx
                         .background_executor()
                         .spawn(async move {
-                            let Ok(_single_child) = DERIVED_TEXT_WORKER_LOCK.try_lock() else {
+                            let Ok(_single_child) = derived_text_worker_lock().try_lock() else {
                                 return None;
                             };
                             let kind =
