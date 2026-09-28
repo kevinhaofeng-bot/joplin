@@ -239,6 +239,14 @@ async fn mounted_readable_restore_of_a_non_bundle_leaves_no_new_library(cx: &mut
     let message = notice(&view, cx);
     assert!(message.contains("恢复未完成"), "{message}");
     assert!(
+        message.contains("不是可读导出包") && message.contains("manifest.json"),
+        "says why in plain words: {message}"
+    );
+    assert!(
+        message.contains("详情："),
+        "keeps the diagnostic: {message}"
+    );
+    assert!(
         view.read_with(cx, |shell, _| shell.imported_library_ready_for_test())
             .is_none()
     );
@@ -250,6 +258,60 @@ async fn mounted_readable_restore_of_a_non_bundle_leaves_no_new_library(cx: &mut
         leftovers, 0,
         "a failed restore must not leave an empty library"
     );
+}
+
+#[gpui::test]
+async fn mounted_readable_restore_of_a_damaged_bundle_says_what_is_wrong(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    cx.dispatch_action(crate::app::CreateNote);
+    cx.run_until_parked();
+    let parent = fixture.base.parent().unwrap().to_path_buf();
+    for (name, damage, expected) in [
+        (
+            "清单损坏",
+            (|bundle: &std::path::Path| std::fs::write(bundle.join("manifest.json"), b"{").unwrap())
+                as fn(&std::path::Path),
+            "manifest.json 无法读取",
+        ),
+        (
+            "缺少目录",
+            |bundle: &std::path::Path| std::fs::remove_dir_all(bundle.join("notes")).unwrap(),
+            "导出包不完整",
+        ),
+    ] {
+        let bundle = parent.join(name);
+        cx.dispatch_action(crate::app::ExportLibraryReadable);
+        cx.run_until_parked();
+        let target = bundle.clone();
+        cx.update(|_, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.complete_library_readable_export_picker_for_test(Ok(Some(target)), shell_cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(notice(&view, cx).contains("可读导出完成"));
+        damage(&bundle);
+        cx.dispatch_action(crate::app::RestoreLibraryReadable);
+        cx.run_until_parked();
+        let source = bundle.clone();
+        cx.update(|_, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.complete_library_readable_restore_picker_for_test(Ok(Some(source)), shell_cx);
+            })
+        });
+        cx.run_until_parked();
+        let message = notice(&view, cx);
+        assert!(message.contains(expected), "{name}: {message}");
+        assert!(
+            message.contains("未创建新资料库") && message.contains("详情："),
+            "{message}"
+        );
+        assert!(
+            view.read_with(cx, |shell, _| shell.imported_library_ready_for_test())
+                .is_none()
+        );
+    }
 }
 
 #[gpui::test]

@@ -239,7 +239,11 @@ impl LibraryShell {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { restore_readable_into_new_library(&imports_dir, &bundle) })
+                .spawn(async move {
+                    let result = restore_readable_into_new_library(&imports_dir, &bundle);
+                    let has_manifest = result.is_err() && bundle.join("manifest.json").is_file();
+                    (result, has_manifest)
+                })
                 .await;
             let _ = this.update(cx, |shell, shell_cx| {
                 shell.finish_library_readable_restore(token, result, shell_cx);
@@ -273,7 +277,10 @@ impl LibraryShell {
     fn finish_library_readable_restore(
         &mut self,
         token: u64,
-        result: Result<(PathBuf, LibraryReadableReport), ReadableExportError>,
+        (result, has_manifest): (
+            Result<(PathBuf, LibraryReadableReport), ReadableExportError>,
+            bool,
+        ),
         cx: &mut Context<Self>,
     ) {
         if !self.finish_pending(token) {
@@ -290,9 +297,7 @@ impl LibraryShell {
                 self.imported_library_ready = Some(path);
                 ExportNotice::Status(message)
             }
-            Err(error) => ExportNotice::Error(format!(
-                "恢复未完成：{error}。未创建新资料库，当前资料库未改动。"
-            )),
+            Err(error) => ExportNotice::Error(readable_restore_error_message(&error, has_manifest)),
         });
         cx.notify();
     }
@@ -523,6 +528,28 @@ impl LibraryShell {
 
 /// Restores into a fresh directory under `imports_dir`; a failed restore
 /// removes that directory so no empty library is left behind.
+/// Says in plain words why a folder could not be restored; the underlying
+/// error stays at the end for diagnosis.
+fn readable_restore_error_message(error: &ReadableExportError, has_manifest: bool) -> String {
+    let reason = match error {
+        ReadableExportError::Io(io)
+            if io.kind() == std::io::ErrorKind::NotFound && !has_manifest =>
+        {
+            "所选文件夹不是可读导出包（缺少 manifest.json）。请选择用“导出整个资料库为可读 HTML…”生成的文件夹"
+        }
+        ReadableExportError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            "导出包不完整：缺少所需的文件或文件夹，可能已被移动或删改"
+        }
+        ReadableExportError::Json(_) => "导出包的 manifest.json 无法读取，可能已损坏",
+        ReadableExportError::InvalidManifest(_) => "导出包的格式或版本不受支持",
+        ReadableExportError::ResourceVerification(_) => {
+            "导出包中的附件与清单记录不一致，可能已被修改"
+        }
+        _ => "恢复过程出错",
+    };
+    format!("恢复未完成：{reason}。未创建新资料库，当前资料库未改动。（详情：{error}）")
+}
+
 fn restore_readable_into_new_library(
     imports_dir: &std::path::Path,
     bundle: &std::path::Path,
