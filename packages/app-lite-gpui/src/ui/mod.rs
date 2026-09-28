@@ -537,6 +537,8 @@ pub struct LibraryShell {
     remount_current_surface_after_organization_commit: bool,
     sync_status: sync::ShellSyncStatus,
     sync_failures_open: bool,
+    sync_settings: Option<sync::SyncSettings>,
+    next_sync_settings_generation: u64,
     auto_sync: sync::AutoSync,
     event_link: sync_events::EventLink,
     #[cfg(test)]
@@ -1090,6 +1092,8 @@ impl LibraryShell {
             remount_current_surface_after_organization_commit: false,
             sync_status: sync::ShellSyncStatus::Idle,
             sync_failures_open: false,
+            sync_settings: None,
+            next_sync_settings_generation: 1,
             auto_sync: sync::AutoSync::default(),
             event_link: sync_events::EventLink::default(),
             #[cfg(test)]
@@ -6797,6 +6801,9 @@ impl Render for LibraryShell {
         }
         if let Some(failures) = self.render_sync_failures(cx) {
             root = root.child(failures);
+        }
+        if let Some(settings) = self.render_sync_settings(cx) {
+            root = root.child(settings);
         }
         let search_palette =
             self.render_search_palette(f32::from(window.viewport_size().width), cx);

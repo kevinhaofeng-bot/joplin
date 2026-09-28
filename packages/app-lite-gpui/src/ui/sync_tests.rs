@@ -8,7 +8,7 @@ use app_lite_core::document::{Block, BlockStyle, Inline};
 use app_lite_core::{CanonicalDocument, CreateNote, LibraryRepository, SaveNote};
 use app_lite_protocol::client::HttpTransport;
 use app_lite_server::{ServerStore, http::HttpServer};
-use gpui::{AppContext, Modifiers, TestAppContext, VisualTestContext};
+use gpui::{AppContext, EntityInputHandler, Modifiers, TestAppContext, VisualTestContext};
 use std::sync::Arc;
 
 const TOKEN: &str = "gpui-sync-test-token-0123456789abcdef";
@@ -108,16 +108,282 @@ fn wait_for_sync(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) 
 }
 
 #[gpui::test]
-async fn unconfigured_sync_explains_how_and_settings_file_is_private(cx: &mut TestAppContext) {
+async fn opening_sync_settings_does_not_create_config_before_save(cx: &mut TestAppContext) {
     let fixture = fixture();
     let (view, cx) = mount(&fixture, cx);
     let text = sync_now(&view, cx);
     assert!(text.contains("未配置同步"), "{text}");
     cx.dispatch_action(OpenSyncSettings);
     cx.run_until_parked();
+    assert!(!fixture.profile.join("sync.json").exists());
+    assert!(view.read_with(cx, |shell, _| shell.sync_settings.is_some()));
+}
+
+fn set_settings_field(
+    input: gpui::Entity<crate::native_editor::chrome::TitleInput>,
+    value: &str,
+    cx: &mut VisualTestContext,
+) {
+    cx.update(|window, app| {
+        input.update(app, |field, field_cx| {
+            field.select_all();
+            <crate::native_editor::chrome::TitleInput as EntityInputHandler>::replace_text_in_range(
+                field, None, value, window, field_cx,
+            );
+        });
+    });
+}
+
+fn open_settings(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+) -> (
+    gpui::Entity<crate::native_editor::chrome::TitleInput>,
+    gpui::Entity<crate::native_editor::chrome::TitleInput>,
+) {
+    cx.dispatch_action(OpenSyncSettings);
+    view.read_with(cx, |shell, _| {
+        let settings = shell.sync_settings.as_ref().unwrap();
+        (settings.server_url.clone(), settings.token.clone())
+    })
+}
+
+#[gpui::test]
+async fn cancelling_sync_settings_keeps_existing_config_byte_for_byte(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    fixture.configure(TOKEN);
+    let path = fixture.profile.join("sync.json");
+    let before = std::fs::read(&path).unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    let (url, token) = open_settings(&view, cx);
+    assert_eq!(
+        cx.update(|_, app| url.read(app).text().to_owned()),
+        fixture.url()
+    );
+    assert_eq!(cx.update(|_, app| token.read(app).text().to_owned()), TOKEN);
+    set_settings_field(url, "https://different.example", cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.cancel_sync_settings(window, shell_cx)
+        })
+    });
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert!(view.read_with(cx, |shell, _| shell.sync_settings.is_none()));
+}
+
+#[gpui::test]
+async fn saving_sync_settings_is_private_preserves_unknown_fields_and_updates_sync(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    let note = fixture
+        .repository
+        .create_note(CreateNote {
+            title: "新配置同步".into(),
+            notebook_id: None,
+            document: text("待上传"),
+        })
+        .unwrap();
+    std::fs::write(
+        fixture.profile.join("sync.json"),
+        br#"{"server_url":"https://old.example","token":"old","future_option":{"enabled":true}}"#,
+    )
+    .unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    let (url, token) = open_settings(&view, cx);
+    set_settings_field(url, &fixture.url(), cx);
+    set_settings_field(token, TOKEN, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.save_sync_settings(window, shell_cx)
+        })
+    });
+    assert!(view.read_with(cx, |shell, _| shell.sync_settings.is_none()));
+    let path = fixture.profile.join("sync.json");
     use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::metadata(fixture.profile.join("sync.json")).unwrap();
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(saved["future_option"]["enabled"], true);
+    assert_eq!(saved["server_url"], fixture.url());
+    assert_eq!(saved["token"], TOKEN);
+    assert!(status(&view, cx).contains("尚未同步"));
+    let result = sync_now(&view, cx);
+    assert!(result.contains("已同步"), "{result}");
+    let other_root = tempfile::tempdir().unwrap();
+    let other = LibraryRepository::open(other_root.path().join("other.sqlite")).unwrap();
+    app_lite_core::sync::sync_once(&other, &HttpTransport::new(&fixture.url(), TOKEN)).unwrap();
+    assert!(other.load_note(&note.id).unwrap().is_some());
+}
+
+#[gpui::test]
+async fn saving_new_settings_waits_for_an_in_flight_sync(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    let (url, token) = open_settings(&view, cx);
+    set_settings_field(url, &fixture.url(), cx);
+    set_settings_field(token, TOKEN, cx);
+    view.update(cx, |shell, _| {
+        shell.sync_status = super::sync::ShellSyncStatus::Running
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.save_sync_settings(window, shell_cx)
+        })
+    });
+    assert!(!fixture.profile.join("sync.json").exists());
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .sync_settings
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("正在同步")
+    }));
+}
+
+#[gpui::test]
+async fn invalid_certificate_and_remote_http_keep_sync_settings_open_without_writing(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    let (url, token) = open_settings(&view, cx);
+    set_settings_field(url.clone(), "http://remote.example", cx);
+    set_settings_field(token, TOKEN, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.save_sync_settings(window, shell_cx)
+        })
+    });
+    assert!(!fixture.profile.join("sync.json").exists());
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .sync_settings
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("HTTPS")
+    }));
+    set_settings_field(url, "https://remote.example", cx);
+    view.update(cx, |shell, _| {
+        shell.sync_settings.as_mut().unwrap().certificate_pem = Some("not a PEM".into())
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.save_sync_settings(window, shell_cx)
+        })
+    });
+    assert!(!fixture.profile.join("sync.json").exists());
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .sync_settings
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("证书")
+    }));
+}
+
+#[gpui::test]
+async fn mounted_sync_settings_fields_and_save_button_accept_real_input(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    cx.dispatch_action(OpenSyncSettings);
+    redraw(cx);
+    let server = cx
+        .debug_bounds("sync-settings-server-url")
+        .expect("server field rendered");
+    cx.simulate_click(server.center(), Modifiers::default());
+    cx.simulate_input(&fixture.url());
+    redraw(cx);
+    assert!(cx.debug_bounds("sync-settings-token").is_some());
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input(TOKEN);
+    redraw(cx);
+    let save = cx
+        .debug_bounds("sync-settings-save")
+        .expect("save button rendered");
+    cx.simulate_click(save.center(), Modifiers::default());
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, _| shell.sync_settings.is_none()));
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.profile.join("sync.json")).unwrap()).unwrap();
+    assert_eq!(saved["server_url"], fixture.url());
+    assert_eq!(saved["token"], TOKEN);
+}
+
+#[test]
+fn token_painter_never_receives_saved_secret_and_certificate_import_checks_pem() {
+    assert_eq!(super::sync::masked_sync_token("ab令牌"), "********");
+    assert!(!super::sync::masked_sync_token(TOKEN).contains(TOKEN));
+    let root = tempfile::tempdir().unwrap();
+    let bad = root.path().join("bad.pem");
+    std::fs::write(&bad, "not a certificate").unwrap();
+    assert!(super::sync::read_certificate_file(&bad).is_err());
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let good = root.path().join("good.pem");
+    std::fs::write(&good, certified.cert.pem()).unwrap();
+    assert_eq!(
+        super::sync::read_certificate_file(&good).unwrap(),
+        certified.cert.pem()
+    );
+}
+
+#[gpui::test]
+async fn mounted_clear_certificate_and_cancel_buttons_do_not_write_until_save(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    std::fs::write(fixture.profile.join("sync.json"), serde_json::to_vec(&serde_json::json!({
+        "server_url": fixture.url(), "token": TOKEN, "server_certificate_pem": "bad old certificate"
+    })).unwrap()).unwrap();
+    let before = std::fs::read(fixture.profile.join("sync.json")).unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    cx.dispatch_action(OpenSyncSettings);
+    redraw(cx);
+    let clear = cx.debug_bounds("sync-settings-clear-certificate").unwrap();
+    cx.simulate_click(clear.center(), Modifiers::default());
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .sync_settings
+            .as_ref()
+            .unwrap()
+            .certificate_pem
+            .is_none()
+    }));
+    assert_eq!(
+        std::fs::read(fixture.profile.join("sync.json")).unwrap(),
+        before
+    );
+    let cancel = cx.debug_bounds("sync-settings-cancel").unwrap();
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, _| shell.sync_settings.is_none()));
+    assert_eq!(
+        std::fs::read(fixture.profile.join("sync.json")).unwrap(),
+        before
+    );
+    cx.dispatch_action(OpenSyncSettings);
+    redraw(cx);
+    let clear = cx.debug_bounds("sync-settings-clear-certificate").unwrap();
+    cx.simulate_click(clear.center(), Modifiers::default());
+    redraw(cx);
+    let save = cx.debug_bounds("sync-settings-save").unwrap();
+    cx.simulate_click(save.center(), Modifiers::default());
+    redraw(cx);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.profile.join("sync.json")).unwrap()).unwrap();
+    assert!(saved["server_certificate_pem"].is_null());
 }
 
 #[gpui::test]

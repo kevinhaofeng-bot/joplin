@@ -1,7 +1,7 @@
 //! Sync with a personal server (docs/research/sync-client-design-v1.md).
 //!
 //! The server address and token live in `sync.json` next to the library
-//! (mode 0600), written by "同步设置…". "立即同步" saves the open note, runs
+//! (mode 0600), written by the sync settings panel. "立即同步" saves the open note, runs
 //! one pass on the background executor, then rereads the open note so the
 //! editor never keeps a revision the sync replaced. The status line always
 //! says whether work is only saved locally or confirmed by the server.
@@ -23,6 +23,9 @@ use crate::library_profile::LibraryProfiles;
 use app_lite_core::sync::{SyncError, SyncReport, retry_failure, sync_once};
 use app_lite_core::{SyncConflict, SyncFailure};
 use app_lite_protocol::client::HttpTransport;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -59,6 +62,7 @@ pub(crate) struct AutoSync {
     pub(super) backoff: Option<Duration>,
     /// Set by a credential or protocol error; cleared by a manual sync.
     pub(super) paused: bool,
+    pub(super) config_unverified: bool,
     /// Latest head the server announced; a sync is due while it differs
     /// from the local cursor.
     pub(super) announced_head: Option<u64>,
@@ -89,6 +93,18 @@ pub(super) struct SyncConfig {
     /// server with a self-signed certificate.
     #[serde(default)]
     server_certificate_pem: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+pub(super) struct SyncSettings {
+    profile: std::path::PathBuf,
+    pub(super) server_url: Entity<TitleInput>,
+    pub(super) token: Entity<TitleInput>,
+    pub(super) certificate_pem: Option<String>,
+    certificate_label: Option<String>,
+    pub(super) error: Option<String>,
+    picker_generation: u64,
 }
 
 impl SyncConfig {
@@ -101,7 +117,7 @@ impl SyncConfig {
     }
 }
 
-fn load_config(profile: &Path) -> Result<Option<SyncConfig>, String> {
+fn read_config_file(profile: &Path) -> Result<Option<SyncConfig>, String> {
     let path = profile.join(SYNC_CONFIG_FILE);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -110,39 +126,101 @@ fn load_config(profile: &Path) -> Result<Option<SyncConfig>, String> {
     };
     let config: SyncConfig =
         serde_json::from_slice(&bytes).map_err(|error| format!("同步设置格式有误：{error}"))?;
-    if config.server_url.trim().is_empty() || config.token.trim().is_empty() {
-        return Ok(None);
-    }
     Ok(Some(config))
 }
 
-/// Creates a template the person fills in; never overwrites an existing file.
-fn write_template(profile: &Path) -> std::io::Result<std::path::PathBuf> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = profile.join(SYNC_CONFIG_FILE);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            let template = SyncConfig {
-                server_url: String::new(),
-                token: String::new(),
-                server_certificate_pem: None,
-            };
-            file.write_all(&serde_json::to_vec_pretty(&template).expect("serializes"))?;
-            file.sync_all()?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    Ok(path)
+fn load_config(profile: &Path) -> Result<Option<SyncConfig>, String> {
+    Ok(read_config_file(profile)?
+        .filter(|config| !config.server_url.trim().is_empty() && !config.token.trim().is_empty()))
 }
 
-const UNTRUSTED_CERTIFICATE: &str = "同步失败：服务器的 TLS 证书不受信任。若服务器使用自签名证书，请把它的 PEM 文本填入同步设置的 server_certificate_pem。";
+fn save_config(profile: &Path, config: &SyncConfig) -> Result<(), String> {
+    let mut temporary = tempfile::NamedTempFile::new_in(profile)
+        .map_err(|error| format!("无法创建同步设置临时文件：{error}"))?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("无法设置同步设置权限：{error}"))?;
+    serde_json::to_writer_pretty(&mut temporary, config)
+        .map_err(|error| format!("无法编码同步设置：{error}"))?;
+    temporary
+        .write_all(b"\n")
+        .map_err(|error| format!("无法写入同步设置：{error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("无法同步同步设置：{error}"))?;
+    temporary
+        .persist(profile.join(SYNC_CONFIG_FILE))
+        .map_err(|error| format!("无法保存同步设置：{}", error.error))?;
+    std::fs::File::open(profile)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| format!("无法同步资料库目录：{error}"))?;
+    Ok(())
+}
+
+const UNTRUSTED_CERTIFICATE: &str =
+    "同步失败：服务器的 TLS 证书不受信任。若使用自签名证书，请在“同步设置…”中导入服务器 PEM 证书。";
+
+fn validate_sync_config(config: &SyncConfig) -> Result<(), String> {
+    let url = url::Url::parse(&config.server_url)
+        .map_err(|_| "服务器地址必须是完整的 HTTPS 地址。".to_owned())?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err("服务器地址必须使用 HTTPS；仅本机测试地址可使用 HTTP。".into());
+    }
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err("服务器地址无效，请不要在地址中填写账号或密码。".into());
+    }
+    if config.token.trim().is_empty() {
+        return Err("请输入访问令牌。".into());
+    }
+    config
+        .transport()
+        .map_err(|error| format!("证书文件无效：{error:?}"))?;
+    Ok(())
+}
+
+pub(super) fn read_certificate_file(path: &Path) -> Result<String, String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("无法读取证书文件：{error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("无法检查证书文件：{error}"))?;
+    if !metadata.is_file() {
+        return Err("请选择普通的 PEM 证书文件。".into());
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err("证书文件超过 1 MiB。".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("无法读取证书文件：{error}"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("证书文件超过 1 MiB。".into());
+    }
+    let pem = String::from_utf8(bytes).map_err(|_| "证书文件必须是 UTF-8 PEM 文本。".to_owned())?;
+    HttpTransport::with_trusted_certificate("https://localhost", "test", Some(&pem))
+        .map_err(|error| format!("证书文件无效：{error:?}"))?;
+    Ok(pem)
+}
+
+pub(super) fn masked_sync_token(token: &str) -> String {
+    // One ASCII glyph per UTF-8 byte keeps TitleInput's byte offsets aligned
+    // with the rendered line without ever handing the token to the painter.
+    "*".repeat(token.len())
+}
 
 pub(super) fn refused_reason_message(reason: &str) -> String {
     if reason.contains("certificate is not trusted") {
@@ -378,6 +456,9 @@ impl LibraryShell {
                 return;
             }
         }
+        if matches!(&result, Ok(report) if report.retryable == 0) {
+            self.auto_sync.config_unverified = false;
+        }
         self.sync_status = match result {
             Ok(report) => ShellSyncStatus::Succeeded { report, kept_edit },
             Err(error) => ShellSyncStatus::Failed(failure_message(&error)),
@@ -444,30 +525,180 @@ impl LibraryShell {
     pub(super) fn open_sync_settings_action(
         &mut self,
         _: &OpenSyncSettings,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(profile) = self.active_profile(cx) else {
             return;
         };
-        match write_template(&profile) {
-            Ok(path) => {
-                self.sync_status = ShellSyncStatus::Unconfigured;
-                #[cfg(not(test))]
-                {
-                    let _ = std::process::Command::new("open")
-                        .arg("-R")
-                        .arg(&path)
-                        .spawn();
-                }
-                #[cfg(test)]
-                let _ = path;
-            }
+        let (config, error) = match read_config_file(&profile) {
+            Ok(config) => (config, None),
+            Err(error) => (None, Some(error)),
+        };
+        let server_url = cx.new(|input_cx| {
+            TitleInput::new(
+                config
+                    .as_ref()
+                    .map_or(String::new(), |config| config.server_url.clone()),
+                input_cx,
+            )
+        });
+        let token = cx.new(|input_cx| {
+            TitleInput::new(
+                config
+                    .as_ref()
+                    .map_or(String::new(), |config| config.token.clone()),
+                input_cx,
+            )
+        });
+        server_url.read(cx).focus_handle().focus(window);
+        self.sync_settings = Some(SyncSettings {
+            profile,
+            server_url,
+            token,
+            certificate_pem: config
+                .as_ref()
+                .and_then(|config| config.server_certificate_pem.clone()),
+            certificate_label: config.as_ref().and_then(|config| {
+                config
+                    .server_certificate_pem
+                    .as_ref()
+                    .map(|_| "已保存的证书".to_owned())
+            }),
+            error,
+            picker_generation: self.next_sync_settings_generation,
+        });
+        self.next_sync_settings_generation += 1;
+        cx.notify();
+    }
+
+    pub(super) fn cancel_sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_settings = None;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    pub(super) fn save_sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(settings) = self.sync_settings.as_mut() else {
+            return;
+        };
+        if self.sync_status == ShellSyncStatus::Running {
+            settings.error = Some("正在同步，请等待本轮完成后再保存新设置。".into());
+            cx.notify();
+            return;
+        }
+        let mut config = match read_config_file(&settings.profile) {
+            Ok(Some(config)) => config,
+            Ok(None) => SyncConfig {
+                server_url: String::new(),
+                token: String::new(),
+                server_certificate_pem: None,
+                extra: Default::default(),
+            },
             Err(error) => {
-                self.sync_status = ShellSyncStatus::Failed(format!("无法创建同步设置：{error}"));
+                settings.error = Some(error);
+                cx.notify();
+                return;
             }
+        };
+        config.server_url = settings
+            .server_url
+            .read(cx)
+            .text()
+            .trim()
+            .trim_end_matches('/')
+            .to_owned();
+        config.token = settings.token.read(cx).text().trim().to_owned();
+        config.server_certificate_pem = settings.certificate_pem.clone();
+        let result =
+            validate_sync_config(&config).and_then(|()| save_config(&settings.profile, &config));
+        match result {
+            Ok(()) => {
+                self.sync_settings = None;
+                self.auto_sync.paused = false;
+                self.auto_sync.retry_at = None;
+                self.auto_sync.backoff = None;
+                self.auto_sync.last_finished = None;
+                self.auto_sync.announced_head = None;
+                self.auto_sync.config_unverified = true;
+                self.sync_status = ShellSyncStatus::Idle;
+                self.stop_event_link();
+                self.focus_handle.focus(window);
+            }
+            Err(error) => settings.error = Some(error),
         }
         cx.notify();
+    }
+
+    fn clear_sync_certificate(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(settings) = self.sync_settings.as_mut() {
+            settings.picker_generation += 1;
+            settings.certificate_pem = None;
+            settings.certificate_label = None;
+            settings.error = None;
+            cx.notify();
+        }
+    }
+
+    fn import_sync_certificate(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(settings) = self.sync_settings.as_mut() else {
+            return;
+        };
+        settings.picker_generation += 1;
+        let generation = settings.picker_generation;
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择 PEM 服务器证书".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = match prompt.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next().map(|path| {
+                    let pem = read_certificate_file(&path)?;
+                    Ok((
+                        pem,
+                        path.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ))
+                }),
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => Some(Err(format!("无法选择证书：{error}"))),
+                Err(error) => Some(Err(format!("无法选择证书：{error}"))),
+            };
+            if let Some(result) = result {
+                let _ = this.update(cx, |shell, shell_cx| {
+                    if let Some(settings) = shell
+                        .sync_settings
+                        .as_mut()
+                        .filter(|settings| settings.picker_generation == generation)
+                    {
+                        match result {
+                            Ok((pem, label)) => {
+                                settings.certificate_pem = Some(pem);
+                                settings.certificate_label = Some(label);
+                                settings.error = None;
+                            }
+                            Err(error) => settings.error = Some(error),
+                        }
+                        shell_cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     pub(super) fn sync_failures(&self, cx: &App) -> Vec<SyncFailure> {
@@ -559,7 +790,8 @@ impl LibraryShell {
             || oldest.is_some_and(|age| age > Duration::from_secs(10 * 60))
         {
             SyncHealth::Attention
-        } else if matches!(link, LinkState::Connecting | LinkState::Waiting)
+        } else if self.auto_sync.config_unverified
+            || matches!(link, LinkState::Connecting | LinkState::Waiting)
             || waiting > 0
             || self.auto_sync.retry_at.is_some()
             || oldest.is_some_and(|age| age > Duration::from_secs(90))
@@ -574,9 +806,13 @@ impl LibraryShell {
             seconds => format!("{} 小时", seconds / 3600),
         };
         let mut facts = vec![
-            match repository.sync_last_success_time().ok().flatten() {
-                Some(at) => format!("最近一次成功同步：{}前", minutes(age(at))),
-                None => "最近一次成功同步：尚无".into(),
+            if self.auto_sync.config_unverified {
+                "新同步设置尚未确认连接；最近一次成功记录属于旧设置".into()
+            } else {
+                match repository.sync_last_success_time().ok().flatten() {
+                    Some(at) => format!("最近一次成功同步：{}前", minutes(age(at))),
+                    None => "最近一次成功同步：尚无".into(),
+                }
             },
             match oldest {
                 Some(oldest) => format!("待同步 {pending} 项，最久已等 {}", minutes(oldest)),
@@ -613,9 +849,9 @@ impl LibraryShell {
             pending.push_str("，点此查看");
         }
         match &self.sync_status {
-            ShellSyncStatus::Unconfigured => format!(
-                "未配置同步：在“同步设置…”生成的 {SYNC_CONFIG_FILE} 中填写服务器地址与 token{pending}"
-            ),
+            ShellSyncStatus::Unconfigured => {
+                format!("未配置同步：打开“同步设置…”填写服务器地址与访问令牌{pending}")
+            }
             ShellSyncStatus::Idle => format!("尚未同步{pending}"),
             ShellSyncStatus::Running => "正在同步…".into(),
             ShellSyncStatus::Succeeded { report, .. }
@@ -655,6 +891,375 @@ impl LibraryShell {
 }
 
 impl LibraryShell {
+    fn render_sync_input(
+        &self,
+        id: &'static str,
+        input: Entity<TitleInput>,
+        secret: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let layout_input = input.clone();
+        let paint_input = input.clone();
+        let canvas = canvas(
+            move |bounds, _window, cx| {
+                let _ = layout_input.update(cx, |input, _| input.record_bounds(bounds));
+                layout_input.clone()
+            },
+            move |bounds, entity, window, cx| {
+                let (display, selection, focus) = entity.read_with(cx, |input, _| {
+                    let display = if secret {
+                        masked_sync_token(input.text())
+                    } else {
+                        input.text().to_owned()
+                    };
+                    (
+                        display,
+                        input.selection().clone(),
+                        input.focus_handle().clone(),
+                    )
+                });
+                let len = display.len();
+                let line = window.text_system().shape_line(
+                    SharedString::from(display),
+                    px(14.0),
+                    &[TextRun {
+                        len,
+                        font: window.text_style().font(),
+                        color: rgba(0x172033ff).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+                let scroll_x =
+                    (line.x_for_index(selection.end) - bounds.size.width + px(4.0)).max(px(0.0));
+                let layout_bounds =
+                    Bounds::new(point(bounds.left() - scroll_x, bounds.top()), bounds.size);
+                entity.update(cx, |input, _| {
+                    input.record_layout(layout_bounds, line.clone())
+                });
+                if focus.is_focused(window) && !selection.is_empty() {
+                    window.paint_quad(gpui::fill(
+                        Bounds::from_corners(
+                            point(
+                                layout_bounds.left() + line.x_for_index(selection.start),
+                                bounds.top(),
+                            ),
+                            point(
+                                layout_bounds.left() + line.x_for_index(selection.end),
+                                bounds.bottom(),
+                            ),
+                        ),
+                        rgba(0x00a82d33),
+                    ));
+                }
+                line.paint(layout_bounds.origin, bounds.size.height, window, cx)
+                    .ok();
+                if focus.is_focused(window) && selection.is_empty() {
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(
+                            point(
+                                layout_bounds.left() + line.x_for_index(selection.start),
+                                bounds.top(),
+                            ),
+                            size(px(1.0), bounds.size.height),
+                        ),
+                        rgba(EVERNOTE_GREEN),
+                    ));
+                }
+                if focus.is_focused(window) {
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(bounds, paint_input.clone()),
+                        cx,
+                    );
+                }
+            },
+        )
+        .w_full()
+        .h(px(28.0));
+        let pointer_input = input.clone();
+        let moving_input = input.clone();
+        let up_input = input.clone();
+        let key_input = input.clone();
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .w_full()
+            .h(px(32.0))
+            .px(px(8.0))
+            .overflow_hidden()
+            .rounded(px(5.0))
+            .bg(rgba(0xffffffff))
+            .border_1()
+            .border_color(rgba(0xcbd5e1ff))
+            .track_focus(input.read(cx).focus_handle())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_shell, event: &MouseDownEvent, window, cx| {
+                    pointer_input.update(cx, |input, input_cx| {
+                        input.begin_pointer_selection(event.position, event.modifiers.shift);
+                        input.focus_handle().focus(window);
+                        input_cx.notify();
+                    });
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |_shell, event: &MouseMoveEvent, _window, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        moving_input.update(cx, |input, input_cx| {
+                            if input.extend_pointer_selection(event.position).is_some() {
+                                input_cx.notify();
+                            }
+                        });
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |_shell, _event, _window, cx| {
+                    up_input.update(cx, |input, _| input.end_pointer_selection());
+                    cx.stop_propagation();
+                }),
+            )
+            .on_key_down(cx.listener(move |shell, event: &KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                let shift = event.keystroke.modifiers.shift;
+                let secondary = event.keystroke.modifiers.secondary();
+                let handled = match key {
+                    "escape" => {
+                        shell.cancel_sync_settings(window, cx);
+                        true
+                    }
+                    "enter" => {
+                        shell.save_sync_settings(window, cx);
+                        true
+                    }
+                    "tab" => {
+                        if let Some(settings) = shell.sync_settings.as_ref() {
+                            let next = if secret {
+                                &settings.server_url
+                            } else {
+                                &settings.token
+                            };
+                            next.read(cx).focus_handle().focus(window);
+                            cx.notify();
+                        }
+                        true
+                    }
+                    "backspace" => {
+                        key_input.update(cx, |input, input_cx| {
+                            input.delete_backward();
+                            input_cx.notify();
+                        });
+                        true
+                    }
+                    "delete" => {
+                        key_input.update(cx, |input, input_cx| {
+                            input.delete_forward();
+                            input_cx.notify();
+                        });
+                        true
+                    }
+                    "left" => {
+                        key_input.update(cx, |input, input_cx| {
+                            input.move_horizontal(false, shift);
+                            input_cx.notify();
+                        });
+                        true
+                    }
+                    "right" => {
+                        key_input.update(cx, |input, input_cx| {
+                            input.move_horizontal(true, shift);
+                            input_cx.notify();
+                        });
+                        true
+                    }
+                    "home" => {
+                        key_input.update(cx, |input, input_cx| {
+                            input.move_to_edge(false, shift);
+                            input_cx.notify();
+                        });
+                        true
+                    }
+                    "end" => {
+                        key_input.update(cx, |input, input_cx| {
+                            input.move_to_edge(true, shift);
+                            input_cx.notify();
+                        });
+                        true
+                    }
+                    "a" if secondary => {
+                        key_input.update(cx, |input, input_cx| {
+                            input.select_all();
+                            input_cx.notify();
+                        });
+                        true
+                    }
+                    "v" if secondary => {
+                        key_input
+                            .update(cx, |input, input_cx| input.paste_from_clipboard(input_cx));
+                        true
+                    }
+                    "c" if secondary && !secret => {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            key_input.read(cx).selected_text().to_owned(),
+                        ));
+                        true
+                    }
+                    "x" if secondary && !secret => {
+                        let selected = key_input.read(cx).selected_text().to_owned();
+                        if !selected.is_empty() {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
+                            key_input.update(cx, |input, input_cx| {
+                                input.delete_forward();
+                                input_cx.notify();
+                            });
+                        }
+                        true
+                    }
+                    "c" | "x" if secondary => true,
+                    _ => false,
+                };
+                if handled {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(canvas)
+            .into_any_element()
+    }
+
+    pub(super) fn render_sync_settings(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let settings = self.sync_settings.as_ref()?;
+        let server_input = self.render_sync_input(
+            "sync-settings-server-url",
+            settings.server_url.clone(),
+            false,
+            cx,
+        );
+        let token_input =
+            self.render_sync_input("sync-settings-token", settings.token.clone(), true, cx);
+        let cert_label = settings
+            .certificate_label
+            .clone()
+            .unwrap_or_else(|| "未导入；公开可信证书无需导入".into());
+        let mut panel = div()
+            .id("sync-settings")
+            .debug_selector(|| "sync-settings".to_owned())
+            .absolute()
+            .top(px(60.0))
+            .right(px(24.0))
+            .w(px(470.0))
+            .p(px(16.0))
+            .rounded(px(9.0))
+            .bg(rgba(0xffffffff))
+            .border_1()
+            .border_color(rgba(0xc9d3ccff))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(9.0))
+            .text_size(px(12.0))
+            .child(
+                div()
+                    .text_size(px(17.0))
+                    .text_color(rgba(0x25342bff))
+                    .child("同步设置"),
+            )
+            .child(div().child("服务器地址（HTTPS）"))
+            .child(server_input)
+            .child(div().child("访问令牌"))
+            .child(token_input)
+            .child(
+                div()
+                    .text_color(rgba(0x536f59ff))
+                    .child("令牌已遮蔽。设置仅保存在当前资料库。"),
+            )
+            .child(div().child("自签名服务器证书（可选）"))
+            .child(div().text_color(rgba(0x536f59ff)).child(cert_label))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("sync-settings-import-certificate")
+                            .debug_selector(|| "sync-settings-import-certificate".to_owned())
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::import_sync_certificate),
+                            )
+                            .child("导入 PEM 文件…"),
+                    )
+                    .child(
+                        div()
+                            .id("sync-settings-clear-certificate")
+                            .debug_selector(|| "sync-settings-clear-certificate".to_owned())
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::clear_sync_certificate),
+                            )
+                            .child("清除证书"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_color(rgba(0x536f59ff))
+                    .child("保存只更新本机设置；连接与同步结果请看“立即同步”的状态。"),
+            );
+        if let Some(error) = &settings.error {
+            panel = panel.child(
+                div()
+                    .id("sync-settings-error")
+                    .debug_selector(|| "sync-settings-error".to_owned())
+                    .text_color(rgba(0xa34838ff))
+                    .child(error.clone()),
+            );
+        }
+        Some(
+            panel
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(16.0))
+                        .child(
+                            div()
+                                .id("sync-settings-cancel")
+                                .debug_selector(|| "sync-settings-cancel".to_owned())
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|shell, _, window, cx| {
+                                        shell.cancel_sync_settings(window, cx)
+                                    }),
+                                )
+                                .child("取消"),
+                        )
+                        .child(
+                            div()
+                                .id("sync-settings-save")
+                                .debug_selector(|| "sync-settings-save".to_owned())
+                                .cursor_pointer()
+                                .text_color(rgba(EVERNOTE_GREEN))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|shell, _, window, cx| {
+                                        shell.save_sync_settings(window, cx)
+                                    }),
+                                )
+                                .child("保存"),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn render_sync_failures(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.sync_failures_open {
             return None;
