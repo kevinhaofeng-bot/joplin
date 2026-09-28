@@ -367,10 +367,6 @@ impl History {
             .collect()
     }
 
-    /// Drop exactly the redo entry that represents a failed optimistic
-    /// resource insertion.  It deliberately has no document effect: the
-    /// caller has already applied its inverse and must prevent a future Redo
-    /// from resurrecting a resource that never committed to SQLite.
     /// Drop the newest undo entry without applying it. Only for an entry
     /// the caller knows left the document as it was (a cancelled input
     /// method composition), so Undo is not spent on a step that does nothing.
@@ -380,6 +376,10 @@ impl History {
         Ok(())
     }
 
+    /// Drop exactly the redo entry that represents a failed optimistic
+    /// resource insertion.  It deliberately has no document effect: the
+    /// caller has already applied its inverse and must prevent a future Redo
+    /// from resurrecting a resource that never committed to SQLite.
     pub(crate) fn discard_next_redo(&mut self) -> Result<(), DocumentError> {
         let entry = self.redo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
         self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);

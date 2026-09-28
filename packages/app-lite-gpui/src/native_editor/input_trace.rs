@@ -2,8 +2,9 @@
 //! machine. With `JOPLIN_LITE_INPUT_TRACE=/path/to/file` set when the app
 //! starts, every input-method call on the note body and title, and every key
 //! that reaches the body's own key handling, is appended to that file as one
-//! JSON line. Off (and free) otherwise. It records the typed text, so use it
-//! only with test content.
+//! JSON line. Off (and free) otherwise; nothing turns it on for a regular
+//! profile. It records the typed text, so it is for test content only, and a
+//! new trace file is readable by its owner only.
 
 use std::io::Write as _;
 use std::sync::{Mutex, OnceLock};
@@ -13,14 +14,23 @@ fn sink() -> Option<&'static Mutex<std::fs::File>> {
     static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     SINK.get_or_init(|| {
         let path = std::env::var_os("JOPLIN_LITE_INPUT_TRACE")?;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+        open_private(std::path::Path::new(&path))
             .ok()
             .map(Mutex::new)
     })
     .as_ref()
+}
+
+/// The trace holds typed text: a new file is readable by its owner only.
+fn open_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -76,6 +86,20 @@ pub(crate) fn record(target: &str, event: &str, detail: impl FnOnce() -> serde_j
         && let Ok(mut file) = sink.lock()
     {
         let _ = writeln!(file, "{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_new_trace_file_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input-trace.jsonl");
+        drop(super::open_private(&path).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
 
