@@ -29,6 +29,7 @@ fn main() {
         .expect("valid certificate");
     let started = Instant::now();
     let mut total = sync::SyncReport::default();
+    let mut converged = false;
     for pass in 1.. {
         let report = sync::sync_once(&repository, &transport).expect("sync pass");
         println!(
@@ -46,6 +47,7 @@ fn main() {
         total.permanent += report.permanent;
         total.skipped += report.skipped;
         let idle = report.accepted == 0 && report.pulled == 0 && report.retryable == 0;
+        converged = idle;
         if idle || pass >= 200 {
             break;
         }
@@ -55,8 +57,10 @@ fn main() {
         "sync.total accepted {} pulled {} conflicts {} permanent {} skipped {}",
         total.accepted, total.pulled, total.conflicts, total.permanent, total.skipped
     );
-    println!("sync.pending {}", repository.sync_pending_count().unwrap());
-    for failure in repository.sync_failures().unwrap() {
+    let pending = repository.sync_pending_count().unwrap();
+    let failures = repository.sync_failures().unwrap();
+    println!("sync.pending {pending}");
+    for failure in &failures {
         println!(
             "sync.failure {} {} {}",
             failure.entity_type, failure.entity_id, failure.reason
@@ -106,4 +110,8 @@ fn main() {
         }
     }
     println!("notes.content_digest {:x}", digest.finalize());
+    if !converged || pending != 0 || !failures.is_empty() || mismatched != 0 {
+        eprintln!("sync verification failed: converged={converged} pending={pending} failures={} mismatched={mismatched}", failures.len());
+        std::process::exit(1);
+    }
 }
