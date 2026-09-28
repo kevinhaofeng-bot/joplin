@@ -6,6 +6,7 @@ mod library_import;
 mod library_import_tests;
 pub mod note_card;
 pub mod note_list;
+mod pasted_image_fetches;
 mod readable_export;
 pub mod sidebar;
 mod sync;
@@ -487,6 +488,10 @@ impl ShellSaveError {
 pub struct LibraryShell {
     model: Entity<AppModel>,
     note_session: Option<Entity<NoteSession>>,
+    pasted_image_fetches: Vec<pasted_image_fetches::PastedImageFetch>,
+    next_pasted_image_fetch: u64,
+    #[cfg(test)]
+    pasted_image_results_for_test: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
     _note_session_observation: Option<Subscription>,
     editor_surface: Option<Entity<EditorSurface>>,
     /// The one shared formatting owner for the active session's existing
@@ -1055,6 +1060,10 @@ impl LibraryShell {
             model,
             note_session: None,
             _note_session_observation: None,
+            pasted_image_fetches: Vec::new(),
+            next_pasted_image_fetch: 0,
+            #[cfg(test)]
+            pasted_image_results_for_test: Default::default(),
             editor_surface: None,
             command_chrome: None,
             _command_chrome_event_subscription: None,
@@ -1156,6 +1165,8 @@ impl LibraryShell {
             library_surface_paint_hooks_for_test: Arc::new(LibrarySurfacePaintHooks::default()),
         };
         shell.sync_editor_surface(cx);
+        // Web images pasted before the last quit and not fetched yet.
+        shell.resume_pasted_image_jobs(None, cx);
         shell.start_auto_sync(cx);
         // UniformListScrollHandle retains this request until its first
         // `track_scroll` mount, so a restored selection can reach a distant
@@ -2416,6 +2427,7 @@ impl LibraryShell {
             return;
         };
         let repository = self.model.read_with(cx, |model, _| model.repository());
+        let opened_note_id = note.id.clone();
         match NoteSession::prepare(note, repository.as_ref())
             .and_then(|prepared| prepared.claim_recovery_ownership(repository.as_ref()))
         {
@@ -2434,6 +2446,9 @@ impl LibraryShell {
                 }) {
                     self.resource_notice = Some(warning);
                 }
+                // A web image left loading when this note was last open (or
+                // before the app quit) is fetched again.
+                self.resume_pasted_image_jobs(Some(&opened_note_id), cx);
                 if reconciliation_pending {
                     let _ = session.update(cx, |session, session_cx| {
                         session.set_reconciliation_locked(true, session_cx);
@@ -2479,6 +2494,17 @@ impl LibraryShell {
                         shell.consume_saved_note_outcome(&session, cx);
                         shell.consume_resource_import_outcome(&session, cx);
                         shell.consume_attachment_open_outcome(&session, cx);
+                        let jobs =
+                            session.update(cx, |session, _| session.take_new_pasted_image_jobs());
+                        if !jobs.is_empty() {
+                            shell.fetch_pasted_images(jobs, cx);
+                        }
+                        if let Some(notice) =
+                            session.update(cx, |session, _| session.take_pasted_image_notice())
+                        {
+                            shell.resource_notice = Some(notice);
+                            cx.notify();
+                        }
                         // Persisted-image hydration is intentionally driven
                         // after the first surface paint. Its per-node failure
                         // therefore arrives on this retained-session

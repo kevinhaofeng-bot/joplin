@@ -10528,13 +10528,13 @@ async fn mounted_paste_from_another_app_keeps_formatting_and_stores_its_images(
                 .unwrap();
         });
     });
-    cx.run_until_parked();
+    wait_for_pasted_images(&view, cx);
     redraw(cx);
     let notice = view.read_with(cx, |shell, _| shell.resource_notice.clone());
     assert!(
         notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("1 张图片未能获取")),
+            .is_some_and(|notice| notice.contains("1 张图片暂时未能获取")),
         "{notice:?}"
     );
     cx.dispatch_action(crate::app::SyncCurrent);
@@ -10544,7 +10544,8 @@ async fn mounted_paste_from_another_app_keeps_formatting_and_stores_its_images(
         "<p>前</p><h2>标题</h2>",
         "<p>普通<strong>粗体</strong><a href=\"https://example.com/\">链接</a></p>",
         "<ul><li>一</li><li>二</li></ul>",
-        "<a href=\"http://127.0.0.1:9/missing.png\">远程图</a>",
+        // Kept as a link that marks the image for the retry.
+        "<a href=\"http://127.0.0.1:9/missing.png#joplin-lite-pasted-image-",
         "<p>尾</p>",
     ] {
         assert!(
@@ -10554,6 +10555,9 @@ async fn mounted_paste_from_another_app_keeps_formatting_and_stores_its_images(
         );
     }
     assert_eq!(stored.resource_ids.len(), 2, "{}", stored.body_html);
+    let jobs = repository.pasted_image_jobs(Some(&target.id)).unwrap();
+    assert_eq!(jobs.len(), 1, "the refused image is fetched again later");
+    assert_eq!(jobs[0].attempts, 1);
     assert!(!stored.body_html.contains('\u{fffc}'));
     let titles: Vec<_> = stored
         .resource_ids
@@ -10572,6 +10576,651 @@ async fn mounted_paste_from_another_app_keeps_formatting_and_stores_its_images(
         !body.contains("标题") && !body.contains("尾"),
         "one Undo removes the paste: {body}"
     );
+}
+
+/// A local image server: each request is answered only when the test
+/// releases one answer, so a request left unreleased stays silent.
+fn serve_image_when_released(body: Vec<u8>) -> (String, mpsc::Sender<()>) {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release, released) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            if released.recv().is_err() {
+                // Keep unanswered connections open until the test ends.
+                held.push(stream);
+                continue;
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+        }
+    });
+    (format!("http://{address}/picture.png"), release)
+}
+
+/// Let every pasted-image fetch deliver its results and the results land.
+fn wait_for_pasted_images(view: &Entity<LibraryShell>, cx: &mut VisualTestContext) {
+    view.read_with(cx, |shell, _| {
+        shell.wait_for_pasted_image_downloads_for_test()
+    });
+    cx.run_until_parked();
+    redraw(cx);
+}
+
+/// Evernote inserts pasted content at once and turns an external image into
+/// a resource behind the scenes, as an attribute update outside the undo
+/// history (`resource/schema.ts` 562–571, `resource/resource.ts` 548–594).
+/// Moving the caret and typing while an image downloads must neither move
+/// the paste nor overwrite what was typed.
+#[gpui::test]
+async fn mounted_external_paste_stays_where_it_was_pasted_while_images_download(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let target = repository
+        .create_note(CreateNote {
+            title: "目标".into(),
+            notebook_id: None,
+            document: rich_document("开头"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    open_note_body(&view, &target.id, cx);
+    cx.simulate_keystrokes("cmd-end");
+    let (url, release) = serve_image_when_released(png_fixture());
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .complete_clipboard_payload_for_test(
+                    crate::native_editor::images::ClipboardPayload {
+                        html: Some(format!("<p>粘贴文字</p><img src=\"{url}\" alt=\"远程\">")),
+                        ..Default::default()
+                    },
+                    window,
+                    shell_cx,
+                )
+                .unwrap();
+        });
+    });
+    // While the image is still downloading: caret to the start, type.
+    cx.update(|_, app| {
+        editor.update(app, |editor, editor_cx| {
+            let first = editor.document().blocks().iter().next().unwrap().id;
+            editor.set_selection_for_test(crate::native_editor::model::Selection::caret(
+                DocPoint::new(first, 0),
+            ));
+            editor.type_text("插入").unwrap();
+            editor_cx.notify();
+        });
+    });
+    release.send(()).unwrap();
+    wait_for_pasted_images(&view, cx);
+
+    // The paste's open start joins its first paragraph to the one at the
+    // caret, as any paste does; what matters is where, not after the typing.
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert!(
+        body.starts_with("插入开头粘贴文字"),
+        "typing stays where it was typed and the paste where it was pasted: {body:?}"
+    );
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let stored = repository.load_note(&target.id).unwrap().unwrap();
+    assert_eq!(stored.resource_ids.len(), 1, "{}", stored.body_html);
+    assert!(
+        stored.body_html.starts_with("<p>插入开头粘贴文字</p><img"),
+        "{}",
+        stored.body_html
+    );
+    assert_eq!(
+        repository
+            .read_resource_bytes(&stored.resource_ids[0])
+            .unwrap()
+            .unwrap(),
+        png_fixture()
+    );
+    // Typing and the paste stay separate undo steps.
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert!(body.starts_with("开头粘贴文字"), "{body:?}");
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert_eq!(body, "开头");
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let stored = repository.load_note(&target.id).unwrap().unwrap();
+    assert_eq!(
+        stored.resource_ids.len(),
+        1,
+        "redo brings the stored image back: {}",
+        stored.body_html
+    );
+}
+
+fn paste_html_for_test(view: &Entity<LibraryShell>, html: String, cx: &mut VisualTestContext) {
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .complete_clipboard_payload_for_test(
+                    crate::native_editor::images::ClipboardPayload {
+                        html: Some(html),
+                        ..Default::default()
+                    },
+                    window,
+                    shell_cx,
+                )
+                .unwrap();
+        });
+    });
+}
+
+fn other_png_fixture() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::DynamicImage::new_rgb8(3, 2)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
+/// The stored images of a note, in body order, as their bytes.
+fn stored_image_bytes(repository: &LibraryRepository, note: &NoteId) -> Vec<Vec<u8>> {
+    repository
+        .load_note(note)
+        .unwrap()
+        .unwrap()
+        .resource_ids
+        .iter()
+        .map(|id| repository.read_resource_bytes(id).unwrap().unwrap())
+        .collect()
+}
+
+/// A web image still downloading when its note is closed, or closed and
+/// opened again, still becomes an image where it was pasted; an image from
+/// a data URI is stored at once, so closing the note loses nothing.
+#[gpui::test]
+async fn mounted_pasted_images_survive_switching_notes_before_they_arrive(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    for scenario in ["switch away", "switch away and back"] {
+        let (_profile, repository) = repository();
+        let create = |title: &str, text: &str| {
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: None,
+                    document: rich_document(text),
+                })
+                .unwrap()
+                .id
+        };
+        let (target, other) = (create("目标", "开头"), create("别的", "别的正文"));
+        let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+        redraw(cx);
+        open_note_body(&view, &target, cx);
+        cx.simulate_keystrokes("cmd-end enter");
+        let (url, release) = serve_image_when_released(png_fixture());
+        let local = format!(
+            "data:image/png;base64,{}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                other_png_fixture()
+            )
+        );
+        paste_html_for_test(
+            &view,
+            format!(
+                "<p>网页图：</p><img src=\"{url}\" alt=\"远程\"><img src=\"{local}\" alt=\"本地\">"
+            ),
+            cx,
+        );
+        redraw(cx);
+        open_note_body(&view, &other, cx);
+        let saved = repository.load_note(&target).unwrap().unwrap();
+        assert_eq!(
+            stored_image_bytes(&repository, &target),
+            vec![other_png_fixture()],
+            "{scenario}: the data URI image is stored at once: {}",
+            saved.body_html
+        );
+        assert!(
+            saved.body_html.contains("#joplin-lite-pasted-image-"),
+            "{scenario}: the web image is saved as its marked link meanwhile: {}",
+            saved.body_html
+        );
+        if scenario == "switch away and back" {
+            open_note_body(&view, &target, cx);
+            let shown = view.read_with(cx, |shell, app| {
+                let session = shell.note_session.as_ref().unwrap().read(app);
+                session
+                    .editor()
+                    .read(app)
+                    .document()
+                    .blocks()
+                    .iter()
+                    .filter(|block| {
+                        matches!(
+                            block.content,
+                            crate::native_editor::model::BlockContent::Image { .. }
+                        )
+                    })
+                    .count()
+            });
+            assert_eq!(
+                shown, 2,
+                "reopened, the loading image shows again as an image"
+            );
+        }
+        release.send(()).unwrap();
+        wait_for_pasted_images(&view, cx);
+        cx.dispatch_action(crate::app::SyncCurrent);
+        redraw(cx);
+        let saved = repository.load_note(&target).unwrap().unwrap();
+        assert_eq!(
+            stored_image_bytes(&repository, &target),
+            vec![png_fixture(), other_png_fixture()],
+            "{scenario}: the web image lands where it was pasted: {}",
+            saved.body_html
+        );
+        assert!(
+            !saved.body_html.contains("joplin-lite-pasted-image"),
+            "{}",
+            saved.body_html
+        );
+        assert!(repository.pasted_image_jobs(None).unwrap().is_empty());
+        assert_eq!(
+            repository.load_note(&other).unwrap().unwrap().resource_ids,
+            Vec::<ResourceId>::new()
+        );
+    }
+}
+
+/// Quitting before a web image arrives keeps it recoverable: the note holds
+/// its marked link and the library its job, and the next launch fetches it
+/// into the same place.
+#[gpui::test]
+async fn mounted_pasted_web_image_arrives_after_a_restart(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let database = profile.path().join("library.sqlite");
+    let create = |title: &str, text: &str| {
+        repository
+            .create_note(CreateNote {
+                title: title.into(),
+                notebook_id: None,
+                document: rich_document(text),
+            })
+            .unwrap()
+            .id
+    };
+    let (target, other) = (create("目标", "开头"), create("别的", "别的正文"));
+    let (url, release) = serve_image_when_released(png_fixture());
+    {
+        let model = cx.new(|_| AppModel::open(Arc::clone(&repository)).unwrap());
+        let (view, window) =
+            cx.add_window_view(move |window, app| LibraryShell::new(model, None, window, app));
+        redraw(window);
+        open_note_body(&view, &target, window);
+        window.simulate_keystrokes("cmd-end enter");
+        paste_html_for_test(&view, format!("<img src=\"{url}\" alt=\"远程\">"), window);
+        // Leave the note, so the next launch does not open it.
+        open_note_body(&view, &other, window);
+        // Quit: the window goes, and with it the unfinished fetch.
+        window.update(|window, _| window.remove_window());
+        drop(view);
+        cx.run_until_parked();
+    }
+    let saved = repository.load_note(&target).unwrap().unwrap();
+    assert!(
+        saved.body_html.contains("#joplin-lite-pasted-image-"),
+        "{}",
+        saved.body_html
+    );
+    assert_eq!(
+        repository.pasted_image_jobs(Some(&target)).unwrap().len(),
+        1
+    );
+    // The closed window's entities are released at the end of the next
+    // update; after that nothing holds the library any more.
+    cx.update(|_| {});
+    cx.run_until_parked();
+    assert_eq!(
+        Arc::strong_count(&repository),
+        1,
+        "the quit released the library"
+    );
+    drop(repository);
+
+    // The next launch opens the library afresh from its profile; the note
+    // stays closed.
+    let repository = Arc::new(LibraryRepository::open(&database).unwrap());
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell
+            .model
+            .read(app)
+            .active_session_note_id()
+            .cloned()),
+        Some(other.clone())
+    );
+    // The server answers in order: first the request the quit abandoned,
+    // then the one made after the restart.
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    wait_for_pasted_images(&view, cx);
+    let saved = repository.load_note(&target).unwrap().unwrap();
+    assert_eq!(
+        stored_image_bytes(&repository, &target),
+        vec![png_fixture()],
+        "{}",
+        saved.body_html
+    );
+    assert!(
+        saved.body_html.starts_with("<p>开头</p><img"),
+        "{}",
+        saved.body_html
+    );
+    assert!(repository.pasted_image_jobs(None).unwrap().is_empty());
+}
+
+/// A downloaded image whose note then fails to save keeps its job: the
+/// note still holds the marked link, and reopening finds and stores the
+/// image, leaving no marker behind.
+#[gpui::test]
+async fn mounted_pasted_image_job_outlives_a_failed_save(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let database = profile.path().join("library.sqlite");
+    let target = repository
+        .create_note(CreateNote {
+            title: "目标".into(),
+            notebook_id: None,
+            document: rich_document("开头"),
+        })
+        .unwrap()
+        .id;
+    let (url, release) = serve_image_when_released(png_fixture());
+    {
+        let model = cx.new(|_| AppModel::open(Arc::clone(&repository)).unwrap());
+        let (view, window) =
+            cx.add_window_view(move |window, app| LibraryShell::new(model, None, window, app));
+        redraw(window);
+        open_note_body(&view, &target, window);
+        window.simulate_keystrokes("cmd-end enter");
+        paste_html_for_test(&view, format!("<img src=\"{url}\" alt=\"远程\">"), window);
+        window.dispatch_action(crate::app::SyncCurrent);
+        redraw(window);
+        // From here every note save fails in the database itself.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_note_save BEFORE UPDATE ON notes
+                 BEGIN SELECT RAISE(ABORT, 'injected note save failure'); END;",
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        view.read_with(window, |shell, _| {
+            shell.wait_for_pasted_image_results_for_test(1)
+        });
+        window.run_until_parked();
+        redraw(window);
+        window.dispatch_action(crate::app::SyncCurrent);
+        redraw(window);
+        let saved = repository.load_note(&target).unwrap().unwrap();
+        assert!(
+            saved.body_html.contains("#joplin-lite-pasted-image-"),
+            "the failed save left the marked link: {}",
+            saved.body_html
+        );
+        assert_eq!(
+            repository.pasted_image_jobs(Some(&target)).unwrap().len(),
+            1,
+            "so the job stays"
+        );
+        window.update(|window, _| window.remove_window());
+        drop(view);
+        cx.run_until_parked();
+    }
+    cx.update(|_| {});
+    cx.run_until_parked();
+    assert_eq!(
+        Arc::strong_count(&repository),
+        1,
+        "the quit released the library"
+    );
+    drop(repository);
+    Connection::open(&database)
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_note_save;")
+        .unwrap();
+
+    let repository = Arc::new(LibraryRepository::open(&database).unwrap());
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    release.send(()).unwrap();
+    wait_for_pasted_images(&view, cx);
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let saved = repository.load_note(&target).unwrap().unwrap();
+    assert!(
+        !saved.body_html.contains("joplin-lite-pasted-image"),
+        "{}",
+        saved.body_html
+    );
+    assert_eq!(
+        stored_image_bytes(&repository, &target),
+        vec![png_fixture()],
+        "{}",
+        saved.body_html
+    );
+    assert!(repository.pasted_image_jobs(None).unwrap().is_empty());
+}
+
+/// Child half of `pasted_web_image_survives_the_app_process_dying`: pastes
+/// a web image whose fetch cannot finish, then ends the process abruptly.
+#[gpui::test]
+#[ignore = "run as a child process by pasted_web_image_survives_the_app_process_dying"]
+async fn paste_then_die_child_process(cx: &mut TestAppContext) {
+    let (Ok(database), Ok(url), Ok(note)) = (
+        std::env::var("JOPLIN_LITE_CHILD_LIBRARY"),
+        std::env::var("JOPLIN_LITE_CHILD_IMAGE_URL"),
+        std::env::var("JOPLIN_LITE_CHILD_NOTE"),
+    ) else {
+        return;
+    };
+    cx.update(|app| crate::components::init(app));
+    let repository = Arc::new(LibraryRepository::open(&database).unwrap());
+    let note = NoteId::parse(note).unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    open_note_body(&view, &note, cx);
+    cx.simulate_keystrokes("cmd-end enter");
+    paste_html_for_test(&view, format!("<img src=\"{url}\" alt=\"远程\">"), cx);
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    // Die mid-fetch: no destructors, no cleanup, as a crash or force quit.
+    std::process::exit(0);
+}
+
+/// The app process dies while a pasted web image is still downloading. The
+/// next process finds the note's marked link and the library's job, fetches
+/// the image and puts it where it was pasted.
+#[gpui::test]
+async fn pasted_web_image_survives_the_app_process_dying(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let database = profile.path().join("library.sqlite");
+    let target = repository
+        .create_note(CreateNote {
+            title: "目标".into(),
+            notebook_id: None,
+            document: rich_document("开头"),
+        })
+        .unwrap()
+        .id;
+    drop(repository);
+    let (url, release) = serve_image_when_released(png_fixture());
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "ui::tests::paste_then_die_child_process",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("JOPLIN_LITE_CHILD_LIBRARY", &database)
+        .env("JOPLIN_LITE_CHILD_IMAGE_URL", &url)
+        .env("JOPLIN_LITE_CHILD_NOTE", target.as_str())
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "child: {}\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let repository = Arc::new(LibraryRepository::open(&database).unwrap());
+    let saved = repository.load_note(&target).unwrap().unwrap();
+    assert!(
+        saved.body_html.contains("#joplin-lite-pasted-image-"),
+        "the dead process left the marked link: {}",
+        saved.body_html
+    );
+    assert_eq!(
+        repository.pasted_image_jobs(Some(&target)).unwrap().len(),
+        1
+    );
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    // First the dead process's request, then this one's.
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    wait_for_pasted_images(&view, cx);
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let saved = repository.load_note(&target).unwrap().unwrap();
+    assert!(
+        saved.body_html.starts_with("<p>开头</p><img"),
+        "{}",
+        saved.body_html
+    );
+    assert_eq!(
+        stored_image_bytes(&repository, &target),
+        vec![png_fixture()]
+    );
+    assert!(repository.pasted_image_jobs(None).unwrap().is_empty());
+}
+
+/// A pasted image is found again only by its own marker: an identical
+/// ordinary link already in the note stays a link, and two images with the
+/// same text finishing in reverse order each land in their own place.
+#[gpui::test]
+async fn mounted_pasted_images_land_by_identity_not_by_matching_text(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    for reopen in [false, true] {
+        let (_profile, repository) = repository();
+        let (first_url, first_release) = serve_image_when_released(png_fixture());
+        let (second_url, second_release) = serve_image_when_released(other_png_fixture());
+        let target = repository
+            .create_note(CreateNote {
+                title: "目标".into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "远程".into(),
+                        marks: Marks {
+                            link: Some(first_url.clone()),
+                            ..Marks::default()
+                        },
+                    }],
+                }]),
+            })
+            .unwrap()
+            .id;
+        let other = repository
+            .create_note(CreateNote {
+                title: "别的".into(),
+                notebook_id: None,
+                document: rich_document("别的正文"),
+            })
+            .unwrap()
+            .id;
+        let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+        redraw(cx);
+        open_note_body(&view, &target, cx);
+        cx.simulate_keystrokes("cmd-end enter");
+        paste_html_for_test(
+            &view,
+            format!(
+                "<img src=\"{first_url}\" alt=\"远程\"><p>中间</p><img src=\"{second_url}\" alt=\"远程\">"
+            ),
+            cx,
+        );
+        redraw(cx);
+        open_note_body(&view, &other, cx);
+        if reopen {
+            open_note_body(&view, &target, cx);
+        }
+        // The second image arrives first.
+        second_release.send(()).unwrap();
+        view.read_with(cx, |shell, _| {
+            shell.wait_for_pasted_image_results_for_test(1)
+        });
+        cx.run_until_parked();
+        first_release.send(()).unwrap();
+        wait_for_pasted_images(&view, cx);
+        cx.dispatch_action(crate::app::SyncCurrent);
+        redraw(cx);
+        let saved = repository.load_note(&target).unwrap().unwrap();
+        assert!(
+            saved
+                .body_html
+                .starts_with(&format!("<p><a href=\"{first_url}\">远程</a></p><img")),
+            "reopen = {reopen}: the ordinary link stays: {}",
+            saved.body_html
+        );
+        assert_eq!(
+            stored_image_bytes(&repository, &target),
+            vec![png_fixture(), other_png_fixture()],
+            "reopen = {reopen}: each image in its own place: {}",
+            saved.body_html
+        );
+        assert!(
+            saved.body_html.contains("<p>中间</p>"),
+            "{}",
+            saved.body_html
+        );
+    }
 }
 
 /// Evernote's `computeSliceDepths`: pasted HTML that starts with a heading,

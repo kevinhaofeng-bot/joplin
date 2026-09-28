@@ -48,8 +48,8 @@ impl LibraryShell {
 }
 
 impl LibraryShell {
-    /// Formatted content from another app. Its images are fetched off the
-    /// main thread, then everything lands in one undo step at the caret.
+    /// Formatted content from another app lands at the caret at once; its
+    /// images load behind it and a failure is reported when it happens.
     pub(super) fn paste_external_html(
         &mut self,
         html: &str,
@@ -67,60 +67,16 @@ impl LibraryShell {
                 })
                 .map_err(|error| error.to_string());
         };
-        if pasted.images.is_empty() {
-            return self.finish_external_html_paste(&session, pasted, Vec::new(), cx);
-        }
-        let sources: Vec<_> = pasted
-            .images
-            .iter()
-            .map(|image| (image.source.clone(), image.alt.clone()))
-            .collect();
-        let progress = format!("正在获取 {} 张图片…", sources.len());
-        self.resource_notice = Some(progress.clone());
-        cx.notify();
-        let fetch = cx
-            .background_executor()
-            .spawn(async move { crate::net::pasted_images::fetch_pasted_images(&sources) });
-        cx.spawn(async move |this, cx| {
-            let fetched = fetch.await;
-            let _ = this.update(cx, |shell, cx| {
-                if shell.resource_notice.as_deref() == Some(progress.as_str()) {
-                    shell.resource_notice = None;
-                }
-                let same_note = shell
-                    .note_session
-                    .as_ref()
-                    .is_some_and(|open| open.entity_id() == session.entity_id());
-                let result = if same_note {
-                    shell.finish_external_html_paste(&session, pasted, fetched, cx)
-                } else {
-                    Err("笔记已切换".to_owned())
-                };
-                if let Err(error) = result {
-                    shell.resource_notice = Some(format!("粘贴未完成：{error}"));
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        Ok(())
-    }
-
-    fn finish_external_html_paste(
-        &mut self,
-        session: &Entity<NoteSession>,
-        pasted: app_lite_core::PastedHtml,
-        fetched: Vec<Result<crate::native_editor::images::ResourceImport, String>>,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
         let outcome = session
             .update(cx, |session, session_cx| {
-                session.paste_external_html(pasted, fetched, session_cx)
+                session.paste_external_html(pasted, session_cx)
             })
             .map_err(|error| error.to_string())?;
+        let jobs = session.update(cx, |session, _| session.take_new_pasted_image_jobs());
+        self.fetch_pasted_images(jobs, cx);
         if outcome.unavailable > 0 {
             self.resource_notice = Some(format!(
-                "{} 张图片未能获取，已保留为指向原图的链接或说明文字",
+                "{} 张图片未能获取，已保留为说明文字",
                 outcome.unavailable
             ));
             cx.notify();

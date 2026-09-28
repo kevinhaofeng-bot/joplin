@@ -84,6 +84,78 @@ struct NativeSessionSnapshot {
     /// `document`, otherwise a normal Backspace/Delete of an atom can never
     /// persist.
     allowed_resource_ids: Vec<ResourceId>,
+    /// Images pasted from another app, still referenced by their placeholder
+    /// ids in `document`; see `export_with_pasted_images`.
+    pasted_images: Arc<HashMap<ResourceId, PastedPlaceholder>>,
+}
+
+/// An image pasted from another app. Its node keeps the placeholder id for
+/// the life of the session, as Evernote keeps one image node whose resource
+/// is filled in behind the scenes (`resource/schema.ts` 562–571); undo and
+/// redo therefore never meet a changed node.
+#[derive(Clone, Debug)]
+struct PastedPlaceholder {
+    image: app_lite_core::PastedImage,
+    state: PastedImageState,
+}
+
+#[derive(Clone, Debug)]
+enum PastedImageState {
+    Downloading,
+    Stored(ResourceId),
+    Failed,
+}
+
+/// Canonical form of a session document: a pasted image is written as its
+/// stored resource once it has one, and until then (or if it never does) as
+/// a link to where it came from, or its alt text. What is saved, journaled
+/// or copied is therefore always a valid note.
+fn export_with_pasted_images(
+    document: &Document,
+    allowed: &[ResourceId],
+    pasted: &HashMap<ResourceId, PastedPlaceholder>,
+) -> Result<CanonicalDocument, crate::native_editor::codec::CanonicalExportError> {
+    if pasted.is_empty() {
+        return export_canonical_with_resources(document, Some(allowed));
+    }
+    let mut allowed = allowed.to_vec();
+    allowed.extend(pasted.keys().cloned());
+    let exported = export_canonical_with_resources(document, Some(&allowed))?;
+    let mut stored = HashMap::new();
+    let mut unresolved = HashMap::new();
+    for (placeholder, entry) in pasted {
+        match &entry.state {
+            PastedImageState::Stored(id) => {
+                stored.insert(placeholder.clone(), (id.clone(), None));
+            }
+            PastedImageState::Downloading => {
+                unresolved.insert(
+                    placeholder.clone(),
+                    PastedFallback {
+                        image: entry.image.clone(),
+                        pending: true,
+                    },
+                );
+            }
+            PastedImageState::Failed => {
+                unresolved.insert(
+                    placeholder.clone(),
+                    PastedFallback {
+                        image: entry.image.clone(),
+                        pending: false,
+                    },
+                );
+            }
+        }
+    }
+    Ok(CanonicalDocument::from_blocks(
+        exported
+            .blocks()
+            .iter()
+            .cloned()
+            .flat_map(|block| resolve_pasted_block(block, &stored, &unresolved))
+            .collect(),
+    ))
 }
 
 /// Metadata for one persisted image. The resource stream never lives here:
@@ -772,6 +844,8 @@ pub(crate) struct PreparedNoteSession {
     native_document: crate::native_editor::model::Document,
     image_sources: Vec<PreparedImageSource>,
     image_load_notices: Vec<String>,
+    /// Web images still being fetched, shown as their placeholders.
+    pending_pasted_images: Vec<app_lite_core::PastedImageJob>,
     attachment_sources: Vec<PreparedAttachmentSource>,
     attachment_load_notices: Vec<String>,
     recovered_generation: Option<i64>,
@@ -1105,12 +1179,245 @@ pub(crate) fn plain_text_for_blocks(blocks: &[crate::native_editor::model::Block
     lines.join("\n")
 }
 
+/// Stores a fetched web image into its note when no editor shows it: the
+/// resource and the note body (its link becomes the image again) commit in
+/// one transaction. A note or link no longer there ends the job quietly.
+pub(crate) fn store_pasted_image_outside_session(
+    repository: &LibraryRepository,
+    job: &app_lite_core::PastedImageJob,
+    import: crate::native_editor::images::ResourceImport,
+) -> Result<(), String> {
+    let saving = |error: &dyn fmt::Display| format!("保存图片到笔记失败：{error}");
+    let Some(note) = repository.load_note(&job.note_id).map_err(|e| saving(&e))? else {
+        let _ = repository.remove_pasted_image_job(&job.id);
+        return Ok(());
+    };
+    let canonical = CanonicalDocument::parse_html(&note.body_html).map_err(|e| saving(&e))?;
+    let ResourceKind::Image { natural_size, .. } = import.kind else {
+        return Err("不是可识别的图片".to_owned());
+    };
+    let (source, title, mime, extension, _) = import.into_parts();
+    let staged = match source {
+        ResourceSource::Bytes(bytes) => repository.stage_resource_reader(
+            std::io::Cursor::new(&bytes),
+            bytes.len(),
+            &title,
+            &mime,
+            &extension,
+        ),
+        ResourceSource::File { file, size } => {
+            repository.stage_resource_reader(file, size, &title, &mime, &extension)
+        }
+    }
+    .map_err(|e| saving(&e))?;
+    let Some(document) = replace_pasted_image_fallback(
+        &canonical,
+        job,
+        Some(staged.resource_id()),
+        Some(natural_size),
+    ) else {
+        let _ = repository.remove_pasted_image_job(&job.id);
+        return Ok(());
+    };
+    repository
+        .commit_staged_resource_snapshot(
+            SaveNote {
+                id: note.id.clone(),
+                expected_revision: note.revision,
+                title: note.title.clone(),
+                resource_ids: document.resource_ids(),
+                document,
+                selected_thumbnail_id: None,
+            },
+            None,
+            &staged,
+        )
+        .map_err(|e| saving(&e))?;
+    let _ = repository.remove_pasted_image_job(&job.id);
+    Ok(())
+}
+
+/// When a fetch is given up while its note is closed: the link loses its
+/// placeholder marker and becomes a plain link to the image's source.
+pub(crate) fn unmark_pasted_image_outside_session(
+    repository: &LibraryRepository,
+    job: &app_lite_core::PastedImageJob,
+) -> Result<(), String> {
+    let Some(note) = repository
+        .load_note(&job.note_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let canonical = CanonicalDocument::parse_html(&note.body_html).map_err(|e| e.to_string())?;
+    let Some(document) = replace_pasted_image_fallback(&canonical, job, None, None) else {
+        return Ok(());
+    };
+    repository
+        .save_note(SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title.clone(),
+            resource_ids: document.resource_ids(),
+            document,
+            selected_thumbnail_id: None,
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Unfinished attempts after which a pasted web image stays a link.
+const MAX_PASTED_IMAGE_ATTEMPTS: u32 = 3;
+
+/// Records a failed fetch; true when the job is dropped for good (the image
+/// stays a link to its source): a lasting failure such as an HTTP 404 or a
+/// file that is not an image, or too many unfinished attempts.
+pub(crate) fn pasted_image_job_given_up(
+    repository: &LibraryRepository,
+    job: &app_lite_core::PastedImageJob,
+    error: &str,
+) -> bool {
+    let give_up = !crate::net::pasted_images::is_retryable(error)
+        || repository
+            .record_pasted_image_attempt(&job.id)
+            .ok()
+            .flatten()
+            .is_none_or(|attempts| attempts >= MAX_PASTED_IMAGE_ATTEMPTS);
+    if give_up {
+        let _ = repository.remove_pasted_image_job(&job.id);
+    }
+    give_up
+}
+
+/// The `<a href>` around a pasted image, if any.
+fn pasted_image_link(document: &CanonicalDocument, placeholder: &ResourceId) -> Option<String> {
+    use app_lite_core::document::Block;
+    let in_inlines = |inlines: &[Inline]| {
+        inlines.iter().find_map(|inline| match inline {
+            Inline::Image {
+                resource_id, link, ..
+            } if resource_id == placeholder => Some(link.clone()),
+            _ => None,
+        })
+    };
+    document
+        .blocks()
+        .iter()
+        .find_map(|block| match block {
+            Block::Image {
+                resource_id, link, ..
+            } if resource_id == placeholder => Some(link.clone()),
+            Block::Paragraph { inlines, .. }
+            | Block::Heading { inlines, .. }
+            | Block::Quote { inlines, .. }
+            | Block::Code { inlines, .. } => in_inlines(inlines),
+            Block::List { items, .. } => items.iter().find_map(|item| in_inlines(&item.inlines)),
+            Block::Table { rows, .. } => rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .find_map(|cell| in_inlines(&cell.inlines)),
+            _ => None,
+        })
+        .flatten()
+}
+
+/// Rewrites the link `job`'s image was saved as while being fetched,
+/// found by its marker (`pasted_image_marker`) and nothing else: into the
+/// image, with `resource_id`, or (`resource_id` None) into a plain link to
+/// the image's source once the fetch is given up. None when the note no
+/// longer has that link.
+pub(crate) fn replace_pasted_image_fallback(
+    document: &CanonicalDocument,
+    job: &app_lite_core::PastedImageJob,
+    resource_id: Option<&ResourceId>,
+    natural_size: Option<(u32, u32)>,
+) -> Option<CanonicalDocument> {
+    use app_lite_core::document::{Block, ImagePresentation, Marks};
+    let marker = pasted_image_marker(&job.url, &job.id);
+    let is_marked = |inline: &Inline| matches!(inline, Inline::Text { marks, .. } if marks.link.as_deref() == Some(marker.as_str()));
+    let replacement = |inline: &Inline| match (resource_id, inline) {
+        (Some(resource_id), _) => Inline::Image {
+            resource_id: resource_id.clone(),
+            alt: job.alt.clone(),
+            display_width: None,
+            link: job.link.clone(),
+        },
+        (None, Inline::Text { text, marks }) => Inline::Text {
+            text: text.clone(),
+            marks: Marks {
+                link: Some(job.link.clone().unwrap_or_else(|| job.url.clone())),
+                ..marks.clone()
+            },
+        },
+        (None, other) => other.clone(),
+    };
+    let mut blocks = document.blocks().to_vec();
+    let replace_inline = |inlines: &mut Vec<Inline>| {
+        inlines
+            .iter()
+            .position(|inline| is_marked(inline))
+            .map(|index| inlines[index] = replacement(&inlines[index]))
+            .is_some()
+    };
+    for block in &mut blocks {
+        let replaced = match block {
+            Block::Paragraph { inlines, .. }
+                if resource_id.is_some() && inlines.len() == 1 && is_marked(&inlines[0]) =>
+            {
+                *block = Block::Image {
+                    resource_id: resource_id.expect("checked").clone(),
+                    alt: job.alt.clone(),
+                    presentation: ImagePresentation {
+                        natural_size,
+                        display_width: None,
+                    },
+                    link: job.link.clone(),
+                };
+                true
+            }
+            Block::Paragraph { inlines, .. }
+            | Block::Heading { inlines, .. }
+            | Block::Quote { inlines, .. }
+            | Block::Code { inlines, .. } => replace_inline(inlines),
+            Block::List { items, .. } => items
+                .iter_mut()
+                .any(|item| replace_inline(&mut item.inlines)),
+            Block::Table { rows, .. } => rows
+                .iter_mut()
+                .flat_map(|row| row.cells.iter_mut())
+                .any(|cell| replace_inline(&mut cell.inlines)),
+            _ => false,
+        };
+        if replaced {
+            return Some(CanonicalDocument::from_blocks(blocks));
+        }
+    }
+    None
+}
+
 /// Swap a pasted image's placeholder for its stored resource, or, when it
 /// could not be stored, for a link to where it came from (or its alt text).
+/// How an image that is not stored is written: `pending` web images carry
+/// their placeholder in the link target so the image can be put back there
+/// exactly (`pasted_image_marker`).
+#[derive(Clone, Debug)]
+struct PastedFallback {
+    image: app_lite_core::PastedImage,
+    pending: bool,
+}
+
+/// The link a pasted web image is saved as while it is being fetched: its
+/// source, plus a fragment naming its placeholder. It opens the image like
+/// the plain source does, and no other link in the note can be taken for it.
+pub(crate) fn pasted_image_marker(url: &str, placeholder: &ResourceId) -> String {
+    let base = url.split('#').next().unwrap_or(url);
+    format!("{base}#joplin-lite-pasted-image-{}", placeholder.as_str())
+}
+
 fn resolve_pasted_block(
     block: app_lite_core::document::Block,
     imported: &HashMap<ResourceId, (ResourceId, Option<(u32, u32)>)>,
-    failed: &HashMap<ResourceId, app_lite_core::PastedImage>,
+    failed: &HashMap<ResourceId, PastedFallback>,
 ) -> Vec<app_lite_core::document::Block> {
     use app_lite_core::document::{Block, BlockStyle, ImagePresentation};
     let inlines = |inlines: Vec<Inline>| resolve_pasted_inlines(inlines, imported, failed);
@@ -1129,6 +1436,14 @@ fn resolve_pasted_block(
                         natural_size: natural_size.or(presentation.natural_size),
                         ..presentation
                     },
+                    link,
+                }];
+            }
+            if !failed.contains_key(&resource_id) {
+                return vec![Block::Image {
+                    resource_id,
+                    alt,
+                    presentation,
                     link,
                 }];
             }
@@ -1201,7 +1516,7 @@ fn resolve_pasted_block(
 fn resolve_pasted_inlines(
     inlines: Vec<Inline>,
     imported: &HashMap<ResourceId, (ResourceId, Option<(u32, u32)>)>,
-    failed: &HashMap<ResourceId, app_lite_core::PastedImage>,
+    failed: &HashMap<ResourceId, PastedFallback>,
 ) -> Vec<Inline> {
     inlines
         .into_iter()
@@ -1220,11 +1535,21 @@ fn resolve_pasted_inlines(
                         link,
                     });
                 }
-                let source = failed.get(&resource_id).map(|image| image.source.as_str());
-                let web = source.filter(|source| {
-                    source.starts_with("http://") || source.starts_with("https://")
-                });
-                let link = link.or_else(|| web.map(str::to_owned));
+                let Some(fallback) = failed.get(&resource_id) else {
+                    return Some(Inline::Image {
+                        resource_id,
+                        alt,
+                        display_width,
+                        link,
+                    });
+                };
+                let source = fallback.image.source.as_str();
+                let web = (source.starts_with("http://") || source.starts_with("https://"))
+                    .then_some(source);
+                let link = match web {
+                    Some(url) if fallback.pending => Some(pasted_image_marker(url, &resource_id)),
+                    _ => link.or_else(|| web.map(str::to_owned)),
+                };
                 let text = match (alt.trim(), &link) {
                     ("", Some(_)) => "[图片]".to_owned(),
                     ("", None) => return None,
@@ -1505,6 +1830,14 @@ pub(crate) struct NoteSession {
     _image_hydration_task: Option<Task<()>>,
     persisted_image_hydration: HashMap<String, PersistedImageHydration>,
     pending_image_hydration: VecDeque<String>,
+    pasted_images: Arc<HashMap<ResourceId, PastedPlaceholder>>,
+    /// Web images just pasted, for the shell to fetch; the fetch outlives
+    /// this session and is recorded in the library until it finishes.
+    new_pasted_image_jobs: Vec<app_lite_core::PastedImageJob>,
+    /// Pasted images the renderer asked for while still downloading.
+    awaiting_pasted_images: std::collections::HashSet<String>,
+    pasted_image_failures: usize,
+    pasted_image_retries: usize,
     pending_legacy_image_repairs: VecDeque<LegacyImageGeometryRepair>,
     /// An attachment platform handoff must outlive a session switch until the
     /// opener returns. The detached worker owns its lease; this flag is only
@@ -1622,11 +1955,29 @@ impl NoteSession {
                 sequence: entry.sequence,
             });
         }
-        let native_document =
-            import_canonical_with_resources(&snapshot.document, &snapshot.resource_ids)
-                .map_err(|error| SaveError::new(format!("无法转换正文: {error}")))?;
-        let (native_document, image_sources) =
-            prepare_persisted_image_hydration(native_document, &snapshot.document)?;
+        // A web image pasted here and still being fetched was saved as a
+        // link; the editor shows it again as the image it will become.
+        let mut displayed = snapshot.document.clone();
+        let mut pending_pasted_images = Vec::new();
+        for job in repository.pasted_image_jobs(Some(&note.id))? {
+            if let Some(restored) =
+                replace_pasted_image_fallback(&displayed, &job, Some(&job.id), None)
+            {
+                displayed = restored;
+                pending_pasted_images.push(job);
+            }
+        }
+        let mut known = snapshot.resource_ids.clone();
+        known.extend(pending_pasted_images.iter().map(|job| job.id.clone()));
+        let native_document = import_canonical_with_resources(&displayed, &known)
+            .map_err(|error| SaveError::new(format!("无法转换正文: {error}")))?;
+        let (native_document, mut image_sources) =
+            prepare_persisted_image_hydration(native_document, &displayed)?;
+        image_sources.retain(|source| {
+            !pending_pasted_images
+                .iter()
+                .any(|job| job.id == source.resource_id)
+        });
         let (attachment_sources, attachment_load_notices) =
             hydrate_persisted_attachments(&native_document, repository);
         Ok(PreparedNoteSession {
@@ -1636,6 +1987,7 @@ impl NoteSession {
             native_document,
             image_sources,
             image_load_notices: Vec::new(),
+            pending_pasted_images,
             attachment_sources,
             attachment_load_notices,
             recovered_generation,
@@ -1658,6 +2010,7 @@ impl NoteSession {
             native_document: document,
             image_sources,
             image_load_notices,
+            pending_pasted_images,
             attachment_sources,
             attachment_load_notices,
             recovered_generation,
@@ -1665,11 +2018,30 @@ impl NoteSession {
             journal_ownership,
             recovery_ownership: _,
         } = prepared.0;
+        let pasted_images: Arc<HashMap<ResourceId, PastedPlaceholder>> = Arc::new(
+            pending_pasted_images
+                .into_iter()
+                .map(|job| {
+                    (
+                        job.id.clone(),
+                        PastedPlaceholder {
+                            image: app_lite_core::PastedImage {
+                                placeholder: job.id,
+                                source: job.url,
+                                alt: job.alt,
+                            },
+                            state: PastedImageState::Downloading,
+                        },
+                    )
+                })
+                .collect(),
+        );
         let read_only = note.deleted_time.is_some();
         let committed_snapshot = NativeSessionSnapshot {
             title: snapshot.title.clone(),
             document: document.clone(),
             allowed_resource_ids: snapshot.resource_ids.clone(),
+            pasted_images: Arc::clone(&pasted_images),
         };
         let title_text = snapshot.title.clone();
         let title = cx.new(move |cx| {
@@ -1778,6 +2150,11 @@ impl NoteSession {
             _image_hydration_task: None,
             persisted_image_hydration,
             pending_image_hydration: VecDeque::new(),
+            pasted_images,
+            new_pasted_image_jobs: Vec::new(),
+            awaiting_pasted_images: Default::default(),
+            pasted_image_failures: 0,
+            pasted_image_retries: 0,
             pending_legacy_image_repairs: VecDeque::new(),
             attachment_open_in_flight: false,
             _opened_attachment_sources: Vec::new(),
@@ -2238,6 +2615,7 @@ impl NoteSession {
             title: self.title.read(cx).text().to_owned(),
             document: prepared_editor_commit.document().clone(),
             allowed_resource_ids: resource_ids.clone(),
+            pasted_images: Arc::clone(&self.pasted_images),
         };
         let image_materialization_root = matches!(staged.kind, ResourceKind::Image { .. })
             .then(|| self.editor.read(cx).image_materialization_root());
@@ -2972,6 +3350,7 @@ impl NoteSession {
             title: self.observed_title.clone(),
             document: editor.read(cx).document().clone(),
             allowed_resource_ids: self.resource_ids.clone(),
+            pasted_images: Arc::clone(&self.pasted_images),
         };
         if matches!(self.save.state(), SaveState::Dirty) {
             self.save.snapshotted(self.save.generation());
@@ -3016,8 +3395,9 @@ impl NoteSession {
             });
         let document = Document::from_blocks(blocks)
             .map_err(|error| SaveError::new(format!("无法复制所选内容：{error}")))?;
-        let canonical = export_canonical_with_resources(&document, Some(&self.resource_ids))
-            .map_err(|error| SaveError::new(format!("无法复制所选内容：{error}")))?;
+        let canonical =
+            export_with_pasted_images(&document, &self.resource_ids, &self.pasted_images)
+                .map_err(|error| SaveError::new(format!("无法复制所选内容：{error}")))?;
         let html = canonical.to_canonical_html().as_str().to_owned();
         let directory = fresh_clipboard_directory()
             .map_err(|error| SaveError::new(format!("无法准备剪贴板文件：{error}")))?;
@@ -3160,59 +3540,57 @@ impl NoteSession {
             &html,
             available,
             unavailable,
+            &[],
             (fragment.open_start, fragment.open_end),
             cx,
         )
     }
 
-    /// HTML from another app, with its images already fetched off the main
-    /// thread (`fetched[i]` belongs to `pasted.images[i]`). An image that
-    /// could not be fetched stays as a link to its source, or its alt text.
+    /// HTML from another app lands at the caret now, in one undo step.
+    /// Images from data URIs and local files are stored first (their bytes
+    /// are at hand and may not be later); web images show as loading and
+    /// are fetched by the shell, off the main thread and beyond this
+    /// session, each becoming a stored resource where it then is however the
+    /// note was edited meanwhile (Evernote updates the node's resource
+    /// outside the undo history, `resource/resource.ts` 548–594). Until then
+    /// the note is saved with a link to the image's source.
     pub(crate) fn paste_external_html(
         &mut self,
         pasted: app_lite_core::PastedHtml,
-        fetched: Vec<Result<crate::native_editor::images::ResourceImport, String>>,
         cx: &mut Context<Self>,
     ) -> Result<PasteOutcome, SaveError> {
         self.ensure_pasteable(cx)?;
-        let mut imported = HashMap::new();
-        let mut failed = HashMap::new();
+        let (local, web): (Vec<_>, Vec<_>) = pasted.images.into_iter().partition(|image| {
+            ["data:", "file:"].iter().any(|scheme| {
+                image
+                    .source
+                    .get(..scheme.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+            })
+        });
+        let mut stored = HashMap::new();
+        let mut unobtainable = HashMap::new();
         let mut available = Vec::new();
-        for (image, fetched) in pasted.images.iter().zip(
-            fetched
-                .into_iter()
-                .map(Some)
-                .chain(std::iter::repeat_with(|| None)),
-        ) {
-            let stored = fetched
-                .unwrap_or_else(|| Err(String::new()))
-                .and_then(|import| {
-                    let natural_size = match import.kind {
-                        ResourceKind::Image { natural_size, .. } => Some(natural_size),
-                        ResourceKind::Attachment => None,
-                    };
-                    let (source, title, mime, extension, _) = import.into_parts();
-                    let ResourceSource::Bytes(bytes) = source else {
-                        return Err(String::new());
-                    };
-                    self.repository
-                        .import_resource_reader(
-                            std::io::Cursor::new(&bytes),
-                            bytes.len(),
-                            &title,
-                            &mime,
-                            &extension,
-                        )
-                        .map(|id| (id, natural_size))
-                        .map_err(|error| error.to_string())
-                });
-            match stored {
-                Ok((id, natural_size)) => {
-                    available.push(id.clone());
-                    imported.insert(image.placeholder.clone(), (id, natural_size));
+        let fetched = crate::net::pasted_images::fetch_pasted_images(
+            &local
+                .iter()
+                .map(|image| (image.source.clone(), image.alt.clone()))
+                .collect::<Vec<_>>(),
+        );
+        for (image, result) in local.into_iter().zip(fetched) {
+            match result.and_then(|import| self.import_pasted_image(import)) {
+                Ok((resource_id, natural_size)) => {
+                    available.push(resource_id.clone());
+                    stored.insert(image.placeholder.clone(), (resource_id, Some(natural_size)));
                 }
                 Err(_) => {
-                    failed.insert(image.placeholder.clone(), image.clone());
+                    unobtainable.insert(
+                        image.placeholder.clone(),
+                        PastedFallback {
+                            image,
+                            pending: false,
+                        },
+                    );
                 }
             }
         }
@@ -3221,7 +3599,7 @@ impl NoteSession {
             .blocks()
             .iter()
             .cloned()
-            .flat_map(|block| resolve_pasted_block(block, &imported, &failed))
+            .flat_map(|block| resolve_pasted_block(block, &stored, &unobtainable))
             .collect();
         // Evernote `clipboardparser.ts` `computeSliceDepths`/`shouldPreserve`:
         // a leading heading, list, table or code block keeps its own block
@@ -3241,10 +3619,226 @@ impl NoteSession {
             .to_canonical_html()
             .as_str()
             .to_owned();
-        let mut outcome =
-            self.paste_canonical_html(&html, available, Vec::new(), (open_start, open_end), cx)?;
-        outcome.unavailable = failed.len();
-        Ok(outcome)
+        let placeholders: Vec<ResourceId> =
+            web.iter().map(|image| image.placeholder.clone()).collect();
+        let jobs: Vec<_> = web
+            .iter()
+            .map(|image| app_lite_core::PastedImageJob {
+                id: image.placeholder.clone(),
+                note_id: self.note_id.clone(),
+                url: image.source.clone(),
+                alt: image.alt.clone(),
+                link: pasted_image_link(&pasted.document, &image.placeholder),
+                attempts: 0,
+            })
+            .collect();
+        // Recorded and registered before the editor changes: the snapshot
+        // taken for this edit must already know how to write these images.
+        self.repository
+            .add_pasted_image_jobs(&self.note_id, &jobs)?;
+        let pasted_images = Arc::make_mut(&mut self.pasted_images);
+        for image in web {
+            pasted_images.insert(
+                image.placeholder.clone(),
+                PastedPlaceholder {
+                    image,
+                    state: PastedImageState::Downloading,
+                },
+            );
+        }
+        let outcome = self.paste_canonical_html(
+            &html,
+            available,
+            Vec::new(),
+            &placeholders,
+            (open_start, open_end),
+            cx,
+        );
+        match outcome {
+            Ok(mut outcome) => {
+                self.new_pasted_image_jobs.extend(jobs);
+                outcome.unavailable = unobtainable.len();
+                Ok(outcome)
+            }
+            Err(error) => {
+                let pasted_images = Arc::make_mut(&mut self.pasted_images);
+                for placeholder in &placeholders {
+                    pasted_images.remove(placeholder);
+                    let _ = self.repository.remove_pasted_image_job(placeholder);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn import_pasted_image(
+        &self,
+        import: crate::native_editor::images::ResourceImport,
+    ) -> Result<(ResourceId, (u32, u32)), String> {
+        let ResourceKind::Image { natural_size, .. } = import.kind else {
+            return Err("不是图片".to_owned());
+        };
+        let (source, title, mime, extension, _) = import.into_parts();
+        match source {
+            ResourceSource::Bytes(bytes) => self.repository.import_resource_reader(
+                std::io::Cursor::new(&bytes),
+                bytes.len(),
+                &title,
+                &mime,
+                &extension,
+            ),
+            ResourceSource::File { file, size } => self
+                .repository
+                .import_resource_reader(file, size, &title, &mime, &extension),
+        }
+        .map(|id| (id, natural_size))
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn take_new_pasted_image_jobs(&mut self) -> Vec<app_lite_core::PastedImageJob> {
+        std::mem::take(&mut self.new_pasted_image_jobs)
+    }
+
+    /// Whether this session shows `job`'s image and should store it itself.
+    pub(crate) fn shows_pasted_image(&self, job: &app_lite_core::PastedImageJob) -> bool {
+        job.note_id == self.note_id && self.pasted_images.contains_key(&job.id)
+    }
+
+    /// A fetch finished for an image this session shows. Returns whether
+    /// the job is done (stored, or given up on).
+    pub(crate) fn store_pasted_image(
+        &mut self,
+        job: &app_lite_core::PastedImageJob,
+        result: Result<crate::native_editor::images::ResourceImport, String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let placeholder = &job.id;
+        if !self.pasted_images.contains_key(placeholder) {
+            return false;
+        }
+        let key = placeholder.as_str().to_owned();
+        match result.and_then(|import| self.import_pasted_image(import)) {
+            Ok((resource_id, natural_size)) => {
+                extend_resource_allowlist(
+                    &mut self.resource_ids,
+                    std::slice::from_ref(&resource_id),
+                );
+                if let Some(entry) = Arc::make_mut(&mut self.pasted_images).get_mut(placeholder) {
+                    entry.state = PastedImageState::Stored(resource_id.clone());
+                }
+                let document = self.editor.read(cx).document();
+                let in_groups = |node_id: NodeId| {
+                    document
+                        .inline_groups()
+                        .iter()
+                        .any(|group| group.members.contains(&node_id))
+                };
+                let (inline_node_ids, block_node_ids): (Vec<NodeId>, Vec<NodeId>) = document
+                    .blocks()
+                    .iter()
+                    .filter(|block| {
+                        matches!(&block.content, BlockContent::Image { resource_id, .. } if *resource_id == key)
+                    })
+                    .map(|block| block.id)
+                    .partition(|node_id| in_groups(*node_id));
+                self.persisted_image_hydration.insert(
+                    key.clone(),
+                    PersistedImageHydration {
+                        resource_id,
+                        natural_size,
+                        legacy_node_ids: Vec::new(),
+                        inline_node_ids,
+                    },
+                );
+                // Its size is now known: a presentation repair outside the
+                // undo history, which also saves the stored image.
+                let _ = self.editor.update(cx, |editor, editor_cx| {
+                    let changed = editor.repair_legacy_image_natural_sizes(
+                        &key,
+                        &block_node_ids,
+                        natural_size,
+                    );
+                    editor_cx.notify();
+                    changed
+                });
+                if self.awaiting_pasted_images.remove(&key) {
+                    self.pending_image_hydration.push_back(key);
+                    self.start_next_image_hydration(cx);
+                }
+                self.observe_current_entities(cx);
+                // The job is retired only once a snapshot without the image's
+                // link is saved (`retire_saved_pasted_image_jobs`): until
+                // then a failed save must still find it again on reopening.
+                let _ = self.flush(FlushReason::ManualSync, cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                if let Some(entry) = Arc::make_mut(&mut self.pasted_images).get_mut(placeholder) {
+                    entry.state = PastedImageState::Failed;
+                }
+                if self.awaiting_pasted_images.remove(&key) {
+                    let _ = self.editor.update(cx, |editor, editor_cx| {
+                        editor.finish_image_hydration_request(&key, false);
+                        editor_cx.notify();
+                    });
+                }
+                let done = pasted_image_job_given_up(&self.repository, job, &error);
+                if done {
+                    self.pasted_image_failures += 1;
+                } else {
+                    self.pasted_image_retries += 1;
+                }
+                cx.notify();
+                done
+            }
+        }
+    }
+
+    /// A stored pasted image's job ends once a saved body no longer holds
+    /// its marked link; a failed save leaves it for the next open.
+    fn retire_saved_pasted_image_jobs(&mut self, saved_body: &str) {
+        let stored: Vec<_> = self
+            .pasted_images
+            .iter()
+            .filter(|(_, entry)| matches!(entry.state, PastedImageState::Stored(_)))
+            .map(|(placeholder, entry)| (placeholder.clone(), entry.image.clone()))
+            .collect();
+        if stored.is_empty() {
+            return;
+        }
+        let Ok(saved) = CanonicalDocument::parse_html(saved_body) else {
+            return;
+        };
+        for (placeholder, image) in stored {
+            let job = app_lite_core::PastedImageJob {
+                id: placeholder.clone(),
+                note_id: self.note_id.clone(),
+                url: image.source,
+                alt: image.alt,
+                link: None,
+                attempts: 0,
+            };
+            if replace_pasted_image_fallback(&saved, &job, Some(&placeholder), None).is_none() {
+                let _ = self.repository.remove_pasted_image_job(&placeholder);
+            }
+        }
+    }
+
+    /// What became of failed image fetches since the last call.
+    pub(crate) fn take_pasted_image_notice(&mut self) -> Option<String> {
+        let failed = std::mem::take(&mut self.pasted_image_failures);
+        let retried = std::mem::take(&mut self.pasted_image_retries);
+        match (failed, retried) {
+            (0, 0) => None,
+            (failed, 0) => Some(format!("{failed} 张图片未能获取，已保留为指向原图的链接")),
+            (0, retried) => Some(format!(
+                "{retried} 张图片暂时未能获取，先保留为指向原图的链接；再次打开这篇笔记或重新启动时会重试"
+            )),
+            (failed, retried) => Some(format!(
+                "{failed} 张图片未能获取，{retried} 张暂时未能获取，均先保留为指向原图的链接"
+            )),
+        }
     }
 
     fn paste_canonical_html(
@@ -3252,6 +3846,7 @@ impl NoteSession {
         html: &str,
         available: Vec<ResourceId>,
         unavailable: Vec<ResourceId>,
+        placeholders: &[ResourceId],
         (open_start, open_end): (bool, bool),
         cx: &mut Context<Self>,
     ) -> Result<PasteOutcome, SaveError> {
@@ -3259,6 +3854,9 @@ impl NoteSession {
             .map_err(|error| SaveError::new(format!("剪贴板内容无法读取：{error}")))?;
         let mut known = available.clone();
         known.extend(unavailable.iter().cloned());
+        known.extend(placeholders.iter().cloned());
+        let is_placeholder =
+            |resource_id: &str| placeholders.iter().any(|id| id.as_str() == resource_id);
         let document = import_canonical_with_resources(&canonical, &known)
             .map_err(|error| SaveError::new(format!("剪贴板内容无法读取：{error}")))?;
         let mut unmeasured = Vec::new();
@@ -3276,7 +3874,7 @@ impl NoteSession {
                     if unavailable.iter().any(|id| id.as_str() == resource_id) {
                         continue;
                     }
-                    if !*natural_size_known {
+                    if !*natural_size_known && !is_placeholder(resource_id) {
                         let id = ResourceId::new(resource_id.as_str())
                             .map_err(|_| SaveError::new("剪贴板里的图片无效"))?;
                         let stored = self
@@ -3334,6 +3932,9 @@ impl NoteSession {
             })
             .map_err(|error| SaveError::new(error.to_string()))?;
         for (node_id, resource_id) in images {
+            if is_placeholder(&resource_id) {
+                continue;
+            }
             let Some(natural_size) =
                 editor
                     .read(cx)
@@ -3392,6 +3993,13 @@ impl NoteSession {
                 // the retained session between paint notifications.
                 self.pending_image_hydration.clear();
                 self.pending_image_hydration.push_back(resource_id);
+            } else if ResourceId::new(&resource_id).is_ok_and(|id| {
+                self.pasted_images
+                    .get(&id)
+                    .is_some_and(|entry| matches!(entry.state, PastedImageState::Downloading))
+            }) {
+                // Stays "loading" until its download lands.
+                self.awaiting_pasted_images.insert(resource_id);
             } else {
                 // The renderer may race a note refresh that removed the
                 // descriptor metadata. Release the core active marker so a
@@ -3764,6 +4372,7 @@ impl NoteSession {
             title,
             document: editor.read(cx).document().clone(),
             allowed_resource_ids: self.resource_ids.clone(),
+            pasted_images: Arc::clone(&self.pasted_images),
         }
     }
 
@@ -3790,9 +4399,10 @@ impl NoteSession {
         snapshot: NativeSessionSnapshot,
         stage: &str,
     ) -> Result<SessionSnapshot, SaveError> {
-        let document = export_canonical_with_resources(
+        let document = export_with_pasted_images(
             &snapshot.document,
-            Some(&snapshot.allowed_resource_ids),
+            &snapshot.allowed_resource_ids,
+            &snapshot.pasted_images,
         )
         .map_err(|error| SaveError::new(format!("无法{stage}: {error}")))?;
         let resource_ids = document.resource_ids();
@@ -3898,6 +4508,7 @@ impl NoteSession {
                 });
                 self.expected_revision = saved.revision;
                 self.last_saved = saved.clone();
+                self.retire_saved_pasted_image_jobs(&note.body_html);
                 self.saved_note_outcome = Some(note);
                 self.journal_base = snapshot;
                 self.journal_ownership = None;
