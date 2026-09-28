@@ -59,6 +59,7 @@ app-lite-protocol = { path = "../app-lite-protocol", features = ["client"] }
 anyhow = "1"
 base64 = "0.23"
 uuid = "1.23"
+sha2 = "0.10"
 gpui = "0.2"
 sum_tree = { package = "gpui_sum_tree", version = "0.2.2" }
 loro_fractional_index = "1.13.0"

@@ -1400,6 +1400,200 @@ impl Document {
         Ok(document)
     }
 
+    /// The blocks within a flat UTF-8 range (the `copy_plain_text` layout:
+    /// text bytes, U+FFFC for an atom, one byte between blocks). Boundary
+    /// text blocks are cut with their styles; atoms are whole. For copying.
+    pub fn slice_flat(&self, start: usize, end: usize) -> Vec<Block> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        for (index, block) in self.blocks.iter().enumerate() {
+            if index > 0 {
+                cursor += 1;
+            }
+            if cursor >= end && !(start == end && cursor == start) {
+                break;
+            }
+            let length = match &block.content {
+                BlockContent::Text { text, .. } => text.len(),
+                _ => '\u{fffc}'.len_utf8(),
+            };
+            let (from, to) = (start.max(cursor), end.min(cursor + length));
+            if from < to || (from == to && length == 0 && (start..end).contains(&cursor)) {
+                match &block.content {
+                    BlockContent::Text { text, styles } => {
+                        let (from, to) = (from - cursor, to - cursor);
+                        if let Some(slice) = text.get(from..to) {
+                            out.push(Block {
+                                content: BlockContent::Text {
+                                    text: slice.to_owned(),
+                                    styles: clip_styles(styles, from, to, -(from as isize)),
+                                },
+                                ..block.clone()
+                            });
+                        }
+                    }
+                    _ => out.push(block.clone()),
+                }
+            }
+            cursor += length;
+        }
+        out
+    }
+
+    /// Plans pasting `blocks` at `at` as one `RestoreBlocks` over the target
+    /// block, with node ids fixed now so redo replays the same nodes.
+    /// ProseMirror slice rules (Evernote's editor; the openness travels in
+    /// its clipboard HTML as `data-pm-slice`): an open start lets the first
+    /// text block join the text before the caret (taking its own kind only
+    /// when that text is empty), an open end lets the text after the caret
+    /// join the last text block; closed ends and atoms stand as their own
+    /// blocks. Returns the transaction and the caret after the pasted
+    /// content.
+    pub fn plan_paste_blocks(
+        &self,
+        at: DocPoint,
+        blocks: &[Block],
+        open_start: bool,
+        open_end: bool,
+    ) -> Result<(Transaction, DocPoint), DocumentError> {
+        if blocks.is_empty() {
+            return Err(DocumentError::InvalidOperation("nothing to paste".into()));
+        }
+        let index = self.validate_point(at)?;
+        let target = &self.blocks[index];
+        let mut next_raw = self.next_id.max(1);
+        let mut allocate = || -> Result<NodeId, DocumentError> {
+            loop {
+                if next_raw == u64::MAX {
+                    return Err(DocumentError::InvalidOperation(
+                        "node id allocator exhausted".into(),
+                    ));
+                }
+                let id = NodeId::new_internal(next_raw);
+                next_raw += 1;
+                if !self.blocks.contains_node(id) {
+                    return Ok(id);
+                }
+            }
+        };
+        let is_text = |block: &Block| matches!(block.content, BlockContent::Text { .. });
+        let Ok((text, styles)) = text_parts(&target.content) else {
+            // The caret sits before or after an atom: insert beside it.
+            let insert_at = if at.affinity == Affinity::After {
+                index + 1
+            } else {
+                index
+            };
+            let mut out = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                out.push(Block {
+                    id: allocate()?,
+                    ..block.clone()
+                });
+            }
+            let last = out.last().expect("non-empty");
+            let caret = match &last.content {
+                BlockContent::Text { text, .. } => DocPoint::new(last.id, text.len()),
+                _ => DocPoint::with_affinity(last.id, 0, Affinity::After),
+            };
+            return Ok((
+                Transaction::RestoreBlocks {
+                    index: insert_at,
+                    remove_count: 0,
+                    blocks: out,
+                },
+                caret,
+            ));
+        };
+        let (left_text, left_styles, right_text, right_styles) =
+            split_text(text, styles, at.utf8_offset);
+        let mut out: Vec<Block> = Vec::with_capacity(blocks.len() + 2);
+        for (position, block) in blocks.iter().enumerate() {
+            if position == 0 && open_start && is_text(block) {
+                let (first_text, first_styles) = text_parts(&block.content)?;
+                let (kind, alignment) = if left_text.is_empty() {
+                    (block.kind.clone(), block.alignment)
+                } else {
+                    (target.kind.clone(), target.alignment)
+                };
+                let mut merged_styles = left_styles.clone();
+                merged_styles.extend(clip_styles(
+                    first_styles,
+                    0,
+                    first_text.len(),
+                    left_text.len() as isize,
+                ));
+                normalize_styles(&mut merged_styles);
+                out.push(Block {
+                    id: target.id,
+                    kind,
+                    content: BlockContent::Text {
+                        text: format!("{left_text}{first_text}"),
+                        styles: merged_styles,
+                    },
+                    alignment,
+                    revision: target.revision,
+                });
+                continue;
+            }
+            if position == 0 && !left_text.is_empty() {
+                out.push(Block {
+                    id: target.id,
+                    kind: target.kind.clone(),
+                    content: BlockContent::Text {
+                        text: left_text.clone(),
+                        styles: left_styles.clone(),
+                    },
+                    alignment: target.alignment,
+                    revision: target.revision,
+                });
+            }
+            out.push(Block {
+                id: allocate()?,
+                ..block.clone()
+            });
+        }
+        let last = out.last_mut().expect("non-empty");
+        let merges_tail = open_end && is_text(last);
+        let caret = if merges_tail {
+            let BlockContent::Text { text, styles } = &mut last.content else {
+                unreachable!("checked above");
+            };
+            let caret = DocPoint::new(last.id, text.len());
+            let shifted = clip_styles(&right_styles, 0, right_text.len(), text.len() as isize);
+            text.push_str(&right_text);
+            styles.extend(shifted);
+            normalize_styles(styles);
+            caret
+        } else if right_text.is_empty() {
+            match &last.content {
+                BlockContent::Text { text, .. } => DocPoint::new(last.id, text.len()),
+                _ => DocPoint::with_affinity(last.id, 0, Affinity::After),
+            }
+        } else {
+            let id = allocate()?;
+            out.push(Block {
+                id,
+                kind: target.kind.clone(),
+                content: BlockContent::Text {
+                    text: right_text,
+                    styles: right_styles,
+                },
+                alignment: target.alignment,
+                revision: target.revision,
+            });
+            DocPoint::with_affinity(id, 0, Affinity::Before)
+        };
+        Ok((
+            Transaction::RestoreBlocks {
+                index,
+                remove_count: 1,
+                blocks: out,
+            },
+            caret,
+        ))
+    }
+
     pub fn blocks(&self) -> &BlockSequence {
         &self.blocks
     }

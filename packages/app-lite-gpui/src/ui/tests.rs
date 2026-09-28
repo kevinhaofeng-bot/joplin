@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::AppAction;
 use crate::app::save_coordinator::ManualSaveClock;
-use crate::components::{Copy, Paste, SelectAll};
+use crate::components::{Copy, Cut, Paste, SelectAll};
 use crate::native_editor::model::{Affinity, BlockKind, DocPoint, Mark};
 use app_lite_core::document::{Block, BlockStyle, ImagePresentation, Inline, Marks};
 use app_lite_core::{
@@ -9831,6 +9831,19 @@ async fn mounted_copied_image_pastes_into_another_note_as_the_same_attachment(
     open(&source.id, &view, cx);
     cx.dispatch_action(SelectAll);
     cx.dispatch_action(Copy);
+    // What other apps get, as Evernote's resource-only copy: the image as a
+    // real file, HTML referencing it, and plain text with no placeholder.
+    let export = crate::ui::clipboard::last_clipboard_export_for_test().expect("copied");
+    assert!(export.resource_only);
+    assert_eq!(export.files.len(), 1);
+    assert_eq!(std::fs::read(&export.files[0]).unwrap(), png.bytes);
+    assert!(!export.plain.contains('\u{fffc}'), "{:?}", export.plain);
+    assert!(export.html.contains("file://"), "{}", export.html);
+    assert!(
+        !export.html.contains(&format!(":/{}", image.as_str())),
+        "{}",
+        export.html
+    );
 
     open(&target.id, &view, cx);
     cx.simulate_keystrokes("cmd-end");
@@ -9924,4 +9937,283 @@ async fn mounted_copied_image_pastes_into_another_note_as_the_same_attachment(
     open(&source.id, &view, cx);
     open(&target.id, &view, cx);
     assert_eq!(editor_state(&view, cx).0, vec![image.as_str().to_owned()]);
+}
+
+/// Opens a note in the mounted shell and focuses its body, waiting out a
+/// background save of the previous note as a second click would.
+fn open_note_body(view: &Entity<LibraryShell>, id: &NoteId, cx: &mut VisualTestContext) {
+    for _ in 0..50 {
+        let switched = cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action_with_result(AppAction::SelectNote(id.clone()), window, shell_cx)
+            })
+        });
+        if switched {
+            break;
+        }
+        cx.run_until_parked();
+    }
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell
+            .model
+            .read(app)
+            .navigation()
+            .selected_note_id()
+            .cloned()),
+        Some(id.clone())
+    );
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    redraw(cx);
+}
+
+fn png_fixture() -> Vec<u8> {
+    crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .unwrap()
+        .bytes
+}
+
+/// Evernote copies and cuts the selection's full HTML (marks, headings,
+/// resources) and reparses it on paste; cut deletes the selection after
+/// copying (common-editor `clipboard/commands/copy.ts`).
+#[gpui::test]
+async fn mounted_cut_and_paste_keep_headings_marks_and_images(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_resource(&png_fixture(), "photo.png", "image/png", "png")
+        .unwrap();
+    let source = repository
+        .create_note(CreateNote {
+            title: "来源".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Heading {
+                    level: app_lite_core::document::HeadingLevel::Two,
+                    style: BlockStyle::default(),
+                    inlines: vec![Inline::Text {
+                        text: "重点".into(),
+                        marks: Marks::default(),
+                    }],
+                },
+                Block::Paragraph {
+                    style: BlockStyle::default(),
+                    inlines: vec![
+                        Inline::Text {
+                            text: "普通".into(),
+                            marks: Marks::default(),
+                        },
+                        Inline::Text {
+                            text: "粗体".into(),
+                            marks: Marks {
+                                bold: true,
+                                ..Marks::default()
+                            },
+                        },
+                    ],
+                },
+                Block::Image {
+                    resource_id: image.clone(),
+                    alt: "photo".into(),
+                    presentation: ImagePresentation {
+                        natural_size: Some((1, 1)),
+                        ..Default::default()
+                    },
+                    link: None,
+                },
+            ]),
+        })
+        .unwrap();
+    let target = repository
+        .create_note(CreateNote {
+            title: "目标".into(),
+            notebook_id: None,
+            document: rich_document("前"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    open_note_body(&view, &source.id, cx);
+    cx.dispatch_action(SelectAll);
+    cx.dispatch_action(Cut);
+    redraw(cx);
+    let body = |view: &Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app))
+    };
+    assert!(
+        !body(&view, cx).contains("重点"),
+        "cut removes the selection"
+    );
+    let export = crate::ui::clipboard::last_clipboard_export_for_test().expect("cut copies");
+    assert!(!export.resource_only, "text and image together");
+    assert!(export.files.is_empty() || export.files.len() == 1);
+    assert_eq!(export.plain, "重点\n普通粗体");
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert!(body(&view, cx).contains("重点"), "one Undo brings it back");
+    cx.dispatch_action(SelectAll);
+    cx.dispatch_action(Cut);
+    redraw(cx);
+
+    open_note_body(&view, &target.id, cx);
+    cx.simulate_keystrokes("cmd-end");
+    cx.dispatch_action(Paste);
+    redraw(cx);
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let stored = repository.load_note(&target.id).unwrap().unwrap();
+    assert!(stored.body_html.contains("<h2>"), "{}", stored.body_html);
+    assert!(
+        stored.body_html.contains("<strong>粗体</strong>"),
+        "{}",
+        stored.body_html
+    );
+    assert_eq!(
+        stored.resource_ids,
+        vec![image.clone()],
+        "{}",
+        stored.body_html
+    );
+    assert!(!stored.body_html.contains('\u{fffc}'));
+}
+
+/// A copy from another library still pastes its image: the library that
+/// lacks it imports the copy's exported file after checking its SHA-256,
+/// as Evernote hands the copied `resources` to a paste.
+#[gpui::test]
+async fn mounted_paste_into_another_library_imports_the_copied_image(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_first_profile, first) = repository();
+    let (_second_profile, second) = repository();
+    let bytes = png_fixture();
+    let image = first
+        .import_resource(&bytes, "photo.png", "image/png", "png")
+        .unwrap();
+    let source = first
+        .create_note(CreateNote {
+            title: "资料库甲".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Image {
+                resource_id: image.clone(),
+                alt: "photo".into(),
+                presentation: Default::default(),
+                link: None,
+            }]),
+        })
+        .unwrap();
+    let target = second
+        .create_note(CreateNote {
+            title: "资料库乙".into(),
+            notebook_id: None,
+            document: rich_document("乙"),
+        })
+        .unwrap();
+    let first_model = cx.new(|_| AppModel::open(Arc::clone(&first)).unwrap());
+    let (first_view, mut first_window) =
+        cx.add_window_view(move |window, app| LibraryShell::new(first_model, None, window, app));
+    redraw(&mut first_window);
+    open_note_body(&first_view, &source.id, &mut first_window);
+    first_window.dispatch_action(SelectAll);
+    first_window.dispatch_action(Copy);
+
+    let second_model = first_window
+        .cx
+        .new(|_| AppModel::open(Arc::clone(&second)).unwrap());
+    let mut second_context = first_window.cx.clone();
+    let (second_view, mut second_window) = second_context
+        .add_window_view(move |window, app| LibraryShell::new(second_model, None, window, app));
+    redraw(&mut second_window);
+    open_note_body(&second_view, &target.id, &mut second_window);
+    second_window.simulate_keystrokes("cmd-end");
+    second_window.dispatch_action(Paste);
+    redraw(&mut second_window);
+    redraw(&mut second_window);
+    second_window.dispatch_action(crate::app::SyncCurrent);
+    redraw(&mut second_window);
+
+    let stored = second.load_note(&target.id).unwrap().unwrap();
+    assert_eq!(stored.resource_ids.len(), 1, "{}", stored.body_html);
+    let imported = &stored.resource_ids[0];
+    assert_eq!(
+        second.read_resource_bytes(imported).unwrap().unwrap(),
+        bytes,
+        "the same image, now stored in this library"
+    );
+    assert!(
+        second_view.read_with(&second_window.cx.clone(), |shell, app| {
+            shell
+                .note_session
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .editor()
+                .read(app)
+                .image_source_path(imported.as_str())
+                .is_some_and(|path| path.is_file())
+        }),
+        "and it shows"
+    );
+    assert!(
+        second_view.read_with(&second_window.cx.clone(), |shell, _| {
+            shell.resource_notice.is_none()
+        })
+    );
+}
+
+/// A resource that is neither here nor importable is left out with a
+/// notice; the rest still pastes, and no placeholder takes its place.
+#[gpui::test]
+async fn mounted_paste_leaves_out_an_unobtainable_image_and_says_so(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let target = repository
+        .create_note(CreateNote {
+            title: "目标".into(),
+            notebook_id: None,
+            document: rich_document("前"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    open_note_body(&view, &target.id, cx);
+    let missing = "f".repeat(32);
+    let fragment = crate::native_editor::images::ClipboardFragment {
+        version: crate::native_editor::images::CLIPBOARD_FRAGMENT_VERSION,
+        html: format!(
+            "<p>文字</p><img data-joplin-lite-block-image=\"true\" src=\":/{missing}\" alt=\"x\">"
+        ),
+        plain: "文字".into(),
+        resources: vec![crate::native_editor::images::FragmentResource {
+            id: missing.clone(),
+            sha256: "0".repeat(64),
+            title: "gone.png".into(),
+            mime: "image/png".into(),
+            file_extension: "png".into(),
+            size: 10,
+            file: None,
+        }],
+        open_start: true,
+        open_end: true,
+    };
+    cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+        "文字".into(),
+        fragment,
+    ));
+    cx.simulate_keystrokes("cmd-end");
+    cx.dispatch_action(Paste);
+    redraw(cx);
+    let notice = view.read_with(cx, |shell, _| shell.resource_notice.clone());
+    assert!(
+        notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("1 个图片或附件未粘贴")),
+        "{notice:?}"
+    );
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert!(body.contains("文字"), "{body}");
+    assert!(!body.contains('\u{fffc}'), "{body:?}");
 }

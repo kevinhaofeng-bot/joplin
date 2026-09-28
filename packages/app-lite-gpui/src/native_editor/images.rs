@@ -599,64 +599,47 @@ impl ClipboardPayload {
     }
 }
 
-pub const CLIPBOARD_FRAGMENT_VERSION: u32 = 1;
+pub const CLIPBOARD_FRAGMENT_VERSION: u32 = 2;
+/// This app's own pasteboard type for a copied fragment; another app's copy
+/// clears it.
+pub const FRAGMENT_PASTEBOARD_TYPE: &str = "com.arielkevin.joplinlite.fragment";
 
-/// An editor selection that holds images or attachments, in document
-/// order. Evernote copies a resource node as `<img data-hash data-type>`
-/// and maps the hash back to the stored resource on paste (common-editor
-/// `resource/schema.ts` `resourceNodeToClipboard`, `resource/resource.ts`
-/// `setResourcesOnClipboardParser`); here the resource id plays the hash's
-/// part, so a paste references the same stored resource.
+/// A selection copied from this app's editor, as Evernote's copy response
+/// (common-editor `clipboard/commands/copy.ts`: `html`, `plain`,
+/// `resources`): the selection's canonical HTML with every block, mark,
+/// link and table, its plain text, and each image or attachment it shows.
+/// Resource nodes keep their identity as Evernote's `<img data-hash>` does
+/// (`resource/schema.ts` `resourceNodeToClipboard`), and a paste maps them
+/// back to stored resources (`resource/resource.ts`
+/// `setResourcesOnClipboardParser`); `file` carries the bytes for a library
+/// that does not have them, like Evernote handing `resources` to paste.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClipboardFragment {
     pub version: u32,
-    pub segments: Vec<FragmentSegment>,
+    pub html: String,
+    pub plain: String,
+    pub resources: Vec<FragmentResource>,
+    /// ProseMirror's `openStart`/`openEnd`, which Evernote's clipboard HTML
+    /// carries as `data-pm-slice`: whether each end joins the text around
+    /// the paste.
+    pub open_start: bool,
+    pub open_end: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum FragmentSegment {
-    Text {
-        text: String,
-    },
-    /// A paragraph boundary between copied blocks.
-    Break,
-    Image {
-        resource_id: String,
-        natural_size: (u32, u32),
-        natural_size_known: bool,
-        display_width: Option<u32>,
-    },
-    Attachment {
-        resource_id: String,
-        filename: String,
-        media_type: String,
-    },
+pub struct FragmentResource {
+    pub id: String,
+    pub sha256: String,
+    pub title: String,
+    pub mime: String,
+    pub file_extension: String,
+    pub size: u64,
+    pub file: Option<PathBuf>,
 }
 
 impl ClipboardFragment {
-    /// The text alone, one line per copied block.
     pub fn plain_text(&self) -> String {
-        let mut text = String::new();
-        for segment in &self.segments {
-            match segment {
-                FragmentSegment::Text { text: part } => text.push_str(part),
-                FragmentSegment::Break => text.push('\n'),
-                FragmentSegment::Image { .. } | FragmentSegment::Attachment { .. } => {}
-            }
-        }
-        text
-    }
-}
-
-impl FragmentSegment {
-    pub fn resource_id(&self) -> Option<&str> {
-        match self {
-            Self::Image { resource_id, .. } | Self::Attachment { resource_id, .. } => {
-                Some(resource_id)
-            }
-            Self::Text { .. } | Self::Break => None,
-        }
+        self.plain.clone()
     }
 }
 
@@ -3186,6 +3169,21 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     unsafe {
         let _pool = NSAutoreleasePool::new(nil);
         let pasteboard = NSPasteboard::generalPasteboard(nil);
+        // A copy from this app's editor first: it also offers plain text,
+        // HTML and, for resources only, files, which would otherwise win.
+        let fragment_type = NSString::alloc(nil)
+            .init_str(FRAGMENT_PASTEBOARD_TYPE)
+            .autorelease();
+        if let Some(fragment) = native_string_value(pasteboard.stringForType(fragment_type))
+            .and_then(|json| serde_json::from_str::<ClipboardFragment>(&json).ok())
+            .filter(|fragment| fragment.version == CLIPBOARD_FRAGMENT_VERSION)
+        {
+            return Some(ClipboardPayload {
+                text: Some(fragment.plain.clone()),
+                fragment: Some(fragment),
+                ..ClipboardPayload::default()
+            });
+        }
         match native_image_candidates_from(|format, uti, remaining_budget| {
             let ty = NSString::alloc(nil).init_str(uti).autorelease();
             native_image_payload(pasteboard.dataForType(ty), format, remaining_budget)

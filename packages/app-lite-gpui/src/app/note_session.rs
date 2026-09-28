@@ -11,8 +11,8 @@ use crate::native_editor::codec::{
 };
 use crate::native_editor::core::{EditorCore, ResourceInsertAnchor};
 use crate::native_editor::images::{
-    ClipboardFragment, EncodedImagePayload, FragmentSegment, ImagePayload, ResourceImport,
-    ResourceKind, ResourceSource, inspect_persisted_image,
+    CLIPBOARD_FRAGMENT_VERSION, ClipboardFragment, EncodedImagePayload, FragmentResource,
+    ImagePayload, ResourceImport, ResourceKind, ResourceSource, inspect_persisted_image,
 };
 use crate::native_editor::model::{BlockContent, Document, NodeId, Selection};
 use crate::native_editor::transaction::Transaction;
@@ -939,6 +939,121 @@ fn resource_ids_are_occurrence_bounded(
 /// snapshots. A resource remains a valid local reference after its relation
 /// is deleted so Cmd-Z can restore the same durable blob; the next snapshot
 /// still derives the visible `note_resources` order from the document.
+/// What a copy of the editor selection puts on the clipboard.
+pub(crate) struct ClipboardExport {
+    pub plain: String,
+    /// For other apps: the canonical HTML with each exported resource
+    /// referenced by its file URL.
+    pub html: String,
+    pub fragment: ClipboardFragment,
+    /// Exported resource files; offered to other apps as files when the
+    /// selection holds only resources (Evernote `resourceCopy`).
+    pub files: Vec<PathBuf>,
+    pub resource_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PasteOutcome {
+    /// Images or attachments left out: neither stored here nor importable.
+    pub unavailable: usize,
+}
+
+/// Resource bytes exported per copy, at most; larger ones stay references.
+const MAX_CLIPBOARD_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A new private directory for one copy's resource files. Older ones are
+/// removed: the clipboard holds only the latest copy.
+fn fresh_clipboard_directory() -> std::io::Result<PathBuf> {
+    let root = std::env::temp_dir().join("joplin-lite-clipboard");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)?;
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    let directory = root.join(uuid::Uuid::new_v4().simple().to_string());
+    std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    Ok(directory)
+}
+
+/// The resource's own file name, made safe; numbered only on a clash.
+fn clipboard_file_name(stored: &app_lite_core::StoredResource, index: usize) -> String {
+    let mut stem: String = stored
+        .title
+        .chars()
+        .map(|c| {
+            if c == '/' || c == ':' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if stem.trim().is_empty() || stem.starts_with('.') {
+        stem = format!("附件{}", index + 1);
+    }
+    let extension = stored.file_extension.trim_start_matches('.');
+    let has_extension = !extension.is_empty()
+        && stem
+            .rsplit_once('.')
+            .is_some_and(|(_, existing)| existing.eq_ignore_ascii_case(extension));
+    let name = if has_extension || extension.is_empty() {
+        stem
+    } else {
+        format!("{stem}.{extension}")
+    };
+    if index == 0 {
+        name
+    } else {
+        format!("{index}-{name}")
+    }
+}
+
+/// Imports a copied resource from its exported file when the bytes still
+/// hash to the recorded SHA-256; None otherwise.
+fn import_clipboard_resource(
+    repository: &LibraryRepository,
+    resource: &FragmentResource,
+) -> Option<ResourceId> {
+    use sha2::{Digest, Sha256};
+    let path = resource.file.as_ref()?;
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() as u64 != resource.size
+        || format!("{:x}", Sha256::digest(&bytes)) != resource.sha256
+    {
+        return None;
+    }
+    repository
+        .import_resource_reader(
+            std::io::Cursor::new(bytes),
+            resource.size as usize,
+            &resource.title,
+            &resource.mime,
+            &resource.file_extension,
+        )
+        .ok()
+}
+
+/// Plain text of copied blocks, as Evernote's clipboard text: an image adds
+/// nothing, an attachment its file name, a table its cells.
+pub(crate) fn plain_text_for_blocks(blocks: &[crate::native_editor::model::Block]) -> String {
+    let mut lines = Vec::new();
+    for block in blocks {
+        match &block.content {
+            BlockContent::Text { text, .. } => lines.push(text.clone()),
+            BlockContent::Attachment { filename, .. } => lines.push(filename.clone()),
+            BlockContent::Table(table) => {
+                lines.extend(table.rows.iter().map(|row| row.join("\t")));
+            }
+            BlockContent::Image { .. } | BlockContent::Empty => {}
+        }
+    }
+    lines.join("\n")
+}
+
 fn extend_resource_allowlist(allowlist: &mut Vec<ResourceId>, resource_ids: &[ResourceId]) {
     for resource_id in resource_ids {
         if !allowlist.iter().any(|known| known == resource_id) {
@@ -2685,18 +2800,129 @@ impl NoteSession {
         })
     }
 
-    /// A structured paste from this app's editor (Evernote maps a pasted
-    /// resource's hash back to the stored resource; here the resource id).
-    /// Every image and attachment it names must still be stored in this
-    /// library; each joins this note's allowed resources, the fragment is
-    /// inserted as one undo step, images load through the same hydration as
-    /// on open, and a durable save is requested at once: a crash journal can
-    /// only vouch for resources already in this note's saved history.
+    /// What copying the editor selection puts on the clipboard, as
+    /// Evernote's copy response (`clipboard/commands/copy.ts`): canonical
+    /// HTML with every block and mark, plain text, and the resources shown.
+    /// Each resource is also exported to a private temporary file, like
+    /// Evernote's `setNativeFilesForCopy`, so other apps get the real file
+    /// and another library can import it. None for a caret.
+    pub(crate) fn copy_selection(
+        &self,
+        cx: &gpui::App,
+    ) -> Result<Option<ClipboardExport>, SaveError> {
+        let copied = self.editor.read(cx).copy_blocks();
+        let (blocks, open_start, open_end) = (copied.blocks, copied.open_start, copied.open_end);
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+        let plain = plain_text_for_blocks(&blocks);
+        let resource_only = blocks
+            .iter()
+            .filter(|block| !matches!(&block.content, BlockContent::Text { text, .. } if text.is_empty()))
+            .all(|block| {
+                matches!(
+                    block.content,
+                    BlockContent::Image { .. } | BlockContent::Attachment { .. }
+                )
+            });
+        let document = Document::from_blocks(blocks)
+            .map_err(|error| SaveError::new(format!("无法复制所选内容：{error}")))?;
+        let canonical = export_canonical_with_resources(&document, Some(&self.resource_ids))
+            .map_err(|error| SaveError::new(format!("无法复制所选内容：{error}")))?;
+        let html = canonical.to_canonical_html().as_str().to_owned();
+        let directory = fresh_clipboard_directory()
+            .map_err(|error| SaveError::new(format!("无法准备剪贴板文件：{error}")))?;
+        let mut budget = MAX_CLIPBOARD_EXPORT_BYTES;
+        let mut resources = Vec::new();
+        let mut files = Vec::new();
+        let mut external_html = html.clone();
+        for id in canonical.resource_ids() {
+            if resources
+                .iter()
+                .any(|resource: &FragmentResource| resource.id == id.as_str())
+            {
+                continue;
+            }
+            let stored = self
+                .repository
+                .resource_metadata(&id)?
+                .ok_or_else(|| SaveError::new("所选内容里的附件已不在资料库中"))?;
+            let size = stored.size.max(0) as u64;
+            let file = if size <= budget {
+                match self.repository.open_verified_resource_file(&id)? {
+                    Some((_, mut source)) => {
+                        let path = directory.join(clipboard_file_name(&stored, files.len()));
+                        let mut target = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&path)
+                            .and_then(|mut target| {
+                                std::io::copy(&mut source, &mut target)?;
+                                target.sync_all()?;
+                                Ok(target)
+                            });
+                        match target.as_mut() {
+                            Ok(_) => {
+                                budget -= size;
+                                if let Ok(url) = url::Url::from_file_path(&path) {
+                                    external_html = external_html.replace(
+                                        &format!("\":/{}\"", id.as_str()),
+                                        &format!("\"{url}\""),
+                                    );
+                                }
+                                files.push(path.clone());
+                                Some(path)
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            resources.push(FragmentResource {
+                id: id.as_str().to_owned(),
+                sha256: stored.sha256.as_str().to_owned(),
+                title: stored.title,
+                mime: stored.mime,
+                file_extension: stored.file_extension,
+                size,
+                file,
+            });
+        }
+        Ok(Some(ClipboardExport {
+            fragment: ClipboardFragment {
+                version: CLIPBOARD_FRAGMENT_VERSION,
+                html,
+                plain: plain.clone(),
+                resources,
+                open_start,
+                open_end,
+            },
+            plain,
+            html: format!("<meta charset=\"utf-8\">{external_html}"),
+            files,
+            resource_only,
+        }))
+    }
+
+    /// Pastes a selection copied in this app with its full structure, as
+    /// Evernote reparses its clipboard HTML and maps each resource hash back
+    /// to a stored resource (`resource/resource.ts`
+    /// `setResourcesOnClipboardParser`). A resource this library lacks is
+    /// imported from the copy's file when its SHA-256 matches, as Evernote
+    /// takes `resources` with a paste; one that cannot be had is left out
+    /// and counted, never replaced by a placeholder. The paste is one undo
+    /// step, images load as on open, and a durable save is requested at
+    /// once: a crash journal can only vouch for resources already in this
+    /// note's saved history.
     pub(crate) fn paste_fragment(
         &mut self,
         fragment: &ClipboardFragment,
         cx: &mut Context<Self>,
-    ) -> Result<(), SaveError> {
+    ) -> Result<PasteOutcome, SaveError> {
         if self.is_read_only() {
             return Err(SaveError::new("笔记为只读，无法粘贴"));
         }
@@ -2708,55 +2934,106 @@ impl NoteSession {
         if let SaveState::Failed(error) = self.save.state() {
             return Err(SaveError::new(format!("当前笔记保存失败：{error}")));
         }
-        let missing = || SaveError::new("剪贴板里的图片或附件已不在本资料库中，未粘贴");
-        let mut fragment = fragment.clone();
-        let mut resource_ids = Vec::new();
-        let mut attachments = Vec::new();
-        let mut unmeasured = Vec::new();
-        for segment in &mut fragment.segments {
-            let Some(raw) = segment.resource_id().map(str::to_owned) else {
+        let mut html = fragment.html.clone();
+        let mut available = Vec::new();
+        let mut unavailable = Vec::new();
+        for resource in &fragment.resources {
+            let Ok(id) = ResourceId::new(&resource.id) else {
                 continue;
             };
-            let id = ResourceId::new(&raw).map_err(|_| missing())?;
-            let stored = self
+            let here = self
                 .repository
                 .resource_metadata(&id)?
-                .ok_or_else(missing)?;
-            let (_, file) = self
-                .repository
-                .open_verified_resource_file(&id)?
-                .ok_or_else(missing)?;
-            match segment {
-                FragmentSegment::Image {
+                .filter(|stored| stored.sha256.as_str() == resource.sha256)
+                .is_some()
+                && self.repository.open_verified_resource_file(&id)?.is_some();
+            if here {
+                available.push(id);
+                continue;
+            }
+            match import_clipboard_resource(&self.repository, resource) {
+                Some(imported) => {
+                    html = html.replace(
+                        &format!(":/{}", resource.id),
+                        &format!(":/{}", imported.as_str()),
+                    );
+                    available.push(imported);
+                }
+                None => unavailable.push(id),
+            }
+        }
+        let canonical = CanonicalDocument::parse_html(&html)
+            .map_err(|error| SaveError::new(format!("剪贴板内容无法读取：{error}")))?;
+        let mut known = available.clone();
+        known.extend(unavailable.iter().cloned());
+        let document = import_canonical_with_resources(&canonical, &known)
+            .map_err(|error| SaveError::new(format!("剪贴板内容无法读取：{error}")))?;
+        let mut unmeasured = Vec::new();
+        let mut attachments = Vec::new();
+        let mut blocks = Vec::new();
+        for block in document.blocks().iter() {
+            let mut block = block.clone();
+            match &mut block.content {
+                BlockContent::Image {
+                    resource_id,
                     natural_size,
                     natural_size_known,
                     ..
                 } => {
+                    if unavailable.iter().any(|id| id.as_str() == resource_id) {
+                        continue;
+                    }
                     if !*natural_size_known {
-                        // The source had not measured it yet: measure the
-                        // stored bytes as hydration would, and let hydration
-                        // repeat it for orientation.
-                        let (_, measured) =
-                            inspect_persisted_image(file, &stored.mime).map_err(|_| missing())?;
-                        *natural_size = measured;
-                        unmeasured.push(raw.clone());
+                        let id = ResourceId::new(resource_id.as_str())
+                            .map_err(|_| SaveError::new("剪贴板里的图片无效"))?;
+                        let stored = self
+                            .repository
+                            .resource_metadata(&id)?
+                            .ok_or_else(|| SaveError::new("剪贴板里的图片已不在资料库中"))?;
+                        if let Some((_, file)) = self.repository.open_verified_resource_file(&id)? {
+                            if let Ok((_, measured)) = inspect_persisted_image(file, &stored.mime) {
+                                *natural_size = measured;
+                                *natural_size_known = true;
+                            }
+                        }
+                        if !*natural_size_known {
+                            unmeasured.push(resource_id.clone());
+                        }
                     }
                 }
-                FragmentSegment::Attachment { .. } => attachments.push((raw.clone(), stored.size)),
-                FragmentSegment::Text { .. } | FragmentSegment::Break => {}
+                BlockContent::Attachment { resource_id, .. } => {
+                    if unavailable.iter().any(|id| id.as_str() == resource_id) {
+                        continue;
+                    }
+                    let size = ResourceId::new(resource_id.as_str())
+                        .ok()
+                        .and_then(|id| self.repository.resource_metadata(&id).ok().flatten())
+                        .map_or(0, |stored| stored.size.max(0) as u64);
+                    attachments.push((resource_id.clone(), size));
+                }
+                _ => {}
             }
-            resource_ids.push(id);
+            blocks.push(block);
+        }
+        if blocks.is_empty() {
+            return Ok(PasteOutcome {
+                unavailable: unavailable.len(),
+            });
         }
         // Published before the editor changes, so the journal written for
         // this edit already allows these resources.
-        extend_resource_allowlist(&mut self.resource_ids, &resource_ids);
+        extend_resource_allowlist(&mut self.resource_ids, &available);
         let editor = self.editor.clone();
         let images = editor
             .update(cx, |editor, editor_cx| {
-                let result = editor.paste_fragment(&fragment);
+                let result = editor.paste_blocks(&crate::native_editor::core::CopiedBlocks {
+                    blocks: blocks.clone(),
+                    open_start: fragment.open_start,
+                    open_end: fragment.open_end,
+                });
                 if result.is_ok() {
                     for (resource_id, size) in &attachments {
-                        let _ = editor.register_attachment(resource_id, *size as u64);
+                        let _ = editor.register_attachment(resource_id, *size);
                     }
                 }
                 editor_cx.notify();
@@ -2764,10 +3041,15 @@ impl NoteSession {
             })
             .map_err(|error| SaveError::new(error.to_string()))?;
         for (node_id, resource_id) in images {
-            let Some(FragmentSegment::Image { natural_size, .. }) = fragment
-                .segments
-                .iter()
-                .find(|segment| segment.resource_id() == Some(resource_id.as_str()))
+            let Some(natural_size) =
+                editor
+                    .read(cx)
+                    .document()
+                    .block(node_id)
+                    .and_then(|block| match block.content {
+                        BlockContent::Image { natural_size, .. } => Some(natural_size),
+                        _ => None,
+                    })
             else {
                 continue;
             };
@@ -2779,7 +3061,7 @@ impl NoteSession {
                 .entry(resource_id.clone())
                 .or_insert_with(|| PersistedImageHydration {
                     resource_id: id,
-                    natural_size: *natural_size,
+                    natural_size,
                     legacy_node_ids: Vec::new(),
                     inline_node_ids: Vec::new(),
                 });
@@ -2791,7 +3073,9 @@ impl NoteSession {
         // "Still saving" is the expected answer here, not a failure.
         let _ = self.flush(FlushReason::ManualSync, cx);
         cx.notify();
-        Ok(())
+        Ok(PasteOutcome {
+            unavailable: unavailable.len(),
+        })
     }
 
     /// Drain the renderer's viewport-resident image IDs into this retained

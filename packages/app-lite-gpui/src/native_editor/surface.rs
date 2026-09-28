@@ -10,7 +10,7 @@ use super::images::BudgetedImageCache;
 use super::model::{BlockKind, DocPoint};
 use super::render;
 use crate::components::{
-    BlockDown, BlockUp, Copy, Delete, DeleteBack, End, FocusNext, FocusPrev, Home, MoveLeft,
+    BlockDown, BlockUp, Copy, Cut, Delete, DeleteBack, End, FocusNext, FocusPrev, Home, MoveLeft,
     MoveRight, Newline, PageDown, PageUp, Redo, SelectAll, SelectEnd, SelectHome, SelectLeft,
     SelectRight, Undo, WordSelectLeft, WordSelectRight,
 };
@@ -150,6 +150,11 @@ pub(crate) enum EditorSurfaceEvent {
         resource_id: String,
     },
     DismissFindInNote,
+    /// Copy or cut with full structure and resources, which only the owner
+    /// (with the library) can put on the clipboard.
+    Clipboard {
+        cut: bool,
+    },
     /// Double-click on a table cell: the shell opens its cell editor.
     EditTableCell {
         node_id: super::model::NodeId,
@@ -172,6 +177,9 @@ pub struct EditorSurface {
     // a larger scroll column (title, toolbar, body), so it mounts the same
     // surface as an embedded canvas and keeps that established scroll owner.
     embedded_frame: Option<(f32, f32)>,
+    /// Copy and cut go to the subscriber as `EditorSurfaceEvent::Clipboard`
+    /// instead of placing plain text here.
+    clipboard_to_owner: bool,
     accepts_pointer_input: bool,
     // A distant result first seeks through the height index. The next canvas
     // pass shapes that viewport, then uses the exact text range to correct
@@ -224,6 +232,7 @@ impl EditorSurface {
             hooks: EditorSurfaceHooks::default(),
             find_panel_open: false,
             embedded_frame,
+            clipboard_to_owner: false,
             accepts_pointer_input,
             pending_find_reveal: None,
             _editor_subscription: subscription,
@@ -305,6 +314,10 @@ impl EditorSurface {
     /// Update the spike's measured body frame without taking over its outer
     /// scroll container. This is intentionally a presentation detail; both
     /// modes keep the same EditorCore and `paint_entity` path.
+    pub(crate) fn route_clipboard_to_owner(&mut self) {
+        self.clipboard_to_owner = true;
+    }
+
     pub fn set_embedded_frame(&mut self, width: f32, height: f32) {
         self.embedded_frame = Some((width.max(1.0), height.max(1.0)));
     }
@@ -653,20 +666,38 @@ impl Render for EditorSurface {
             window.refresh();
         });
         let copy_editor = editor.clone();
+        let copy_surface = cx.entity().downgrade();
+        let to_owner = self.clipboard_to_owner;
         surface = surface.on_action(move |_action: &Copy, _window, cx| {
-            let editor = copy_editor.read(cx);
-            let text = editor.copy_plain_text();
-            // Images and attachments ride along as metadata so a paste in
-            // this app references the same stored resource; other apps read
-            // the plain text.
-            match editor.copy_fragment() {
-                Some(fragment) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
-                        text, fragment,
-                    ));
-                }
-                None if !text.is_empty() => cx.write_to_clipboard(ClipboardItem::new_string(text)),
-                None => {}
+            if to_owner {
+                let _ = copy_surface.update(cx, |_, surface_cx| {
+                    surface_cx.emit(EditorSurfaceEvent::Clipboard { cut: false })
+                });
+                return;
+            }
+            let text = copy_editor.read(cx).copy_plain_text();
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        });
+        let cut_editor = editor.clone();
+        let cut_surface = cx.entity().downgrade();
+        surface = surface.on_action(move |_action: &Cut, _window, cx| {
+            if to_owner {
+                let _ = cut_surface.update(cx, |_, surface_cx| {
+                    surface_cx.emit(EditorSurfaceEvent::Clipboard { cut: true })
+                });
+                return;
+            }
+            let cut = cut_editor.update(cx, |editor, editor_cx| {
+                let result = editor.cut_selection();
+                editor_cx.notify();
+                result
+            });
+            if let Ok(text) = cut
+                && !text.is_empty()
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
         });
         let surface = surface.child(editor_canvas(

@@ -20,10 +20,7 @@ use gpui::TestAppContext;
 
 use super::find::{FindError, FindMatch, FindState, FindSummary};
 use super::history::History;
-use super::images::{
-    CLIPBOARD_FRAGMENT_VERSION, ClipboardFragment, FragmentSegment, ImageMetadata, ImagePayload,
-    ImageStore, image_format_from_path,
-};
+use super::images::{ImageMetadata, ImagePayload, ImageStore, image_format_from_path};
 use super::input;
 use super::layout::LayoutRegistry;
 use super::model::{
@@ -31,6 +28,14 @@ use super::model::{
     TextAlignment, insertion_marks,
 };
 use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
+
+/// Blocks copied from a selection with the openness of each end.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CopiedBlocks {
+    pub blocks: Vec<Block>,
+    pub open_start: bool,
+    pub open_end: bool,
+}
 
 fn image_dimensions(payload: &ImagePayload) -> Option<(u32, u32)> {
     if payload.format == gpui::ImageFormat::Svg {
@@ -1260,102 +1265,69 @@ impl EditorCore {
             .unwrap_or_default()
     }
 
-    /// The selection as a clipboard fragment when it holds an image or an
-    /// attachment; None otherwise, when the plain text says everything.
-    /// Tables travel as their cell text.
-    pub fn copy_fragment(&self) -> Option<ClipboardFragment> {
+    /// The selected blocks, boundary text cut with its styles, and whether
+    /// each end is open (ProseMirror's `openStart`/`openEnd`): a text
+    /// selection is open where it ends inside a text block; selecting the
+    /// whole note, like an AllSelection, or an atom is closed. Empty for a
+    /// caret.
+    pub fn copy_blocks(&self) -> CopiedBlocks {
         if self.selection.is_caret() {
-            return None;
+            return CopiedBlocks::default();
         }
         let anchor = self.flat_offset_for_point(self.selection.anchor);
         let head = self.flat_offset_for_point(self.selection.head);
         let (start, end) = (anchor.min(head), anchor.max(head));
-        let mut segments = Vec::new();
-        let mut carries_resource = false;
-        let mut cursor = 0usize;
-        for (index, block) in self.document.blocks().iter().enumerate() {
-            if index > 0 {
-                // The separator between blocks is one byte of flat text.
-                if (start..end).contains(&cursor) {
-                    segments.push(FragmentSegment::Break);
-                }
-                cursor += 1;
-            }
-            if cursor >= end {
-                break;
-            }
-            let length = match &block.content {
-                BlockContent::Text { text, .. } => text.len(),
-                _ => '\u{fffc}'.len_utf8(),
-            };
-            let (from, to) = (start.max(cursor), end.min(cursor + length));
-            if from < to {
-                match &block.content {
-                    BlockContent::Text { text, .. } => {
-                        if let Some(slice) = text.get(from - cursor..to - cursor) {
-                            segments.push(FragmentSegment::Text {
-                                text: slice.to_owned(),
-                            });
-                        }
-                    }
-                    BlockContent::Image {
-                        resource_id,
-                        natural_size,
-                        natural_size_known,
-                        display_width,
-                        ..
-                    } => {
-                        carries_resource = true;
-                        segments.push(FragmentSegment::Image {
-                            resource_id: resource_id.clone(),
-                            natural_size: *natural_size,
-                            natural_size_known: *natural_size_known,
-                            display_width: *display_width,
-                        });
-                    }
-                    BlockContent::Attachment {
-                        resource_id,
-                        filename,
-                        media_type,
-                    } => {
-                        carries_resource = true;
-                        segments.push(FragmentSegment::Attachment {
-                            resource_id: resource_id.clone(),
-                            filename: filename.clone(),
-                            media_type: media_type.clone(),
-                        });
-                    }
-                    BlockContent::Table(table) => {
-                        for (row_index, row) in table.rows.iter().enumerate() {
-                            if row_index > 0 {
-                                segments.push(FragmentSegment::Break);
-                            }
-                            segments.push(FragmentSegment::Text {
-                                text: row.join("\t"),
-                            });
-                        }
-                    }
-                    BlockContent::Empty => {}
-                }
-            }
-            cursor += length;
+        let whole = start == 0 && end == self.document.flat_utf8_len();
+        let blocks = self.document.slice_flat(start, end);
+        let is_text = |block: Option<&Block>| {
+            matches!(
+                block.map(|block| &block.content),
+                Some(BlockContent::Text { .. })
+            )
+        };
+        CopiedBlocks {
+            open_start: !whole && is_text(blocks.first()),
+            open_end: !whole && is_text(blocks.last()),
+            blocks,
         }
-        carries_resource.then_some(ClipboardFragment {
-            version: CLIPBOARD_FRAGMENT_VERSION,
-            segments,
-        })
     }
 
-    /// Inserts a copied fragment at the selection (replacing a range) as one
-    /// undo step. Returns each image node inserted with its resource id; on
-    /// failure nothing of the paste remains.
-    pub fn paste_fragment(
+    /// Pastes copied blocks at the selection (replacing a range) as one undo
+    /// step; redo replays the same nodes. Returns each image node inserted
+    /// with its resource id. On failure nothing of the paste remains.
+    pub fn paste_blocks(
         &mut self,
-        fragment: &ClipboardFragment,
+        copied: &CopiedBlocks,
     ) -> Result<Vec<(NodeId, String)>, DocumentError> {
+        let blocks = &copied.blocks;
         self.ensure_editable()?;
         let depth = self.history.undo_depth();
-        let result = self.apply_fragment_segments(fragment);
+        let result = (|| {
+            if !self.selection.is_caret() {
+                self.delete_selection()?;
+            }
+            let (transaction, caret) = self.document.plan_paste_blocks(
+                self.selection.head,
+                blocks,
+                copied.open_start,
+                copied.open_end,
+            )?;
+            let inserted: Vec<NodeId> = match &transaction {
+                Transaction::RestoreBlocks { blocks, .. } => {
+                    blocks.iter().map(|block| block.id).collect()
+                }
+                _ => Vec::new(),
+            };
+            self.apply_with_selection(transaction)?;
+            self.selection = Selection::caret(caret);
+            Ok(inserted
+                .into_iter()
+                .filter_map(|node_id| match &self.document.block(node_id)?.content {
+                    BlockContent::Image { resource_id, .. } => Some((node_id, resource_id.clone())),
+                    _ => None,
+                })
+                .collect())
+        })();
         match result {
             Ok(images) => {
                 self.history.merge_since(depth);
@@ -1371,92 +1343,6 @@ impl EditorCore {
                 Err(error)
             }
         }
-    }
-
-    fn apply_fragment_segments(
-        &mut self,
-        fragment: &ClipboardFragment,
-    ) -> Result<Vec<(NodeId, String)>, DocumentError> {
-        if !self.selection.is_caret() {
-            self.delete_selection()?;
-        }
-        let mut images = Vec::new();
-        let is_atom = |segment: Option<&FragmentSegment>| {
-            matches!(
-                segment,
-                Some(FragmentSegment::Image { .. } | FragmentSegment::Attachment { .. })
-            )
-        };
-        for (index, segment) in fragment.segments.iter().enumerate() {
-            let transaction = match segment {
-                // Inserting an atom already splits the paragraph around it.
-                FragmentSegment::Break
-                    if is_atom(index.checked_sub(1).and_then(|i| fragment.segments.get(i)))
-                        || is_atom(fragment.segments.get(index + 1)) =>
-                {
-                    continue;
-                }
-                FragmentSegment::Text { text } if text.is_empty() => continue,
-                FragmentSegment::Text { text } => Transaction::InsertText {
-                    selection: self.selection,
-                    text: text.clone(),
-                },
-                FragmentSegment::Break => Transaction::SplitBlock {
-                    at: self.selection.head,
-                },
-                FragmentSegment::Image {
-                    resource_id,
-                    natural_size,
-                    ..
-                } => Transaction::InsertImage {
-                    selection: self.selection,
-                    resource_id: resource_id.clone(),
-                    natural_size: *natural_size,
-                },
-                FragmentSegment::Attachment {
-                    resource_id,
-                    filename,
-                    media_type,
-                } => Transaction::InsertAttachment {
-                    selection: self.selection,
-                    resource_id: resource_id.clone(),
-                    filename: filename.clone(),
-                    media_type: media_type.clone(),
-                },
-            };
-            let outcome = self.apply_with_selection(transaction)?;
-            self.selection = outcome.selection;
-            if let FragmentSegment::Image {
-                resource_id,
-                display_width,
-                ..
-            } = segment
-            {
-                let node_id = outcome
-                    .changed_nodes
-                    .iter()
-                    .copied()
-                    .find(|node_id| {
-                        matches!(
-                            self.document.block(*node_id).map(|block| &block.content),
-                            Some(BlockContent::Image { resource_id: id, .. }) if id == resource_id
-                        ) && !images.iter().any(|(seen, _)| seen == node_id)
-                    })
-                    .ok_or_else(|| {
-                        DocumentError::InvalidOperation("pasted image node not found".into())
-                    })?;
-                if display_width.is_some() {
-                    let selection = self.selection;
-                    self.apply_with_selection(Transaction::SetImageDisplayWidth {
-                        node_id,
-                        display_width: *display_width,
-                    })?;
-                    self.selection = selection;
-                }
-                images.push((node_id, resource_id.clone()));
-            }
-        }
-        Ok(images)
     }
 
     pub fn copy_all_plain_text(&self) -> String {

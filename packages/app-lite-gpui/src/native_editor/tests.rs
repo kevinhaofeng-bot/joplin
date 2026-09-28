@@ -8157,74 +8157,215 @@ fn inserting_a_table_splits_the_paragraph_saves_and_undoes(cx: &mut gpui::TestAp
 }
 
 #[gpui::test]
-fn a_copied_image_and_attachment_paste_back_as_themselves_in_one_undo_step(
+fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
     cx: &mut gpui::TestAppContext,
 ) {
-    use super::images::FragmentSegment;
-    let mut source = EditorCore::for_test("前后", cx);
-    source.set_caret_utf8("前".len());
-    source.insert_fixture_image("img", (40, 30)).unwrap();
-    source
-        .apply(super::transaction::Transaction::InsertAttachment {
-            selection: source.selection(),
-            resource_id: "doc".into(),
-            filename: "说明.pdf".into(),
-            media_type: "application/pdf".into(),
-        })
-        .unwrap();
-    source.select_all();
-    let fragment = source.copy_fragment().expect("resources make a fragment");
-    let kinds: Vec<&str> = fragment
-        .segments
-        .iter()
-        .map(|segment| match segment {
-            FragmentSegment::Text { .. } => "text",
-            FragmentSegment::Break => "break",
-            FragmentSegment::Image { .. } => "image",
-            FragmentSegment::Attachment { .. } => "attachment",
-        })
-        .collect();
-    assert_eq!(
-        kinds,
-        [
-            "text",
-            "break",
-            "image",
-            "break",
-            "attachment",
-            "break",
-            "text"
-        ]
+    use super::model::{Block, NodeId, StyledRun, TextAlignment};
+    let text_block = |id: u64, kind: BlockKind, text: &str, styles: Vec<StyledRun>| Block {
+        id: NodeId::new_internal(id),
+        kind,
+        content: BlockContent::Text {
+            text: text.into(),
+            styles: styles.into_iter().collect(),
+        },
+        alignment: TextAlignment::Left,
+        revision: 0,
+    };
+    let source_document = Document::from_blocks(vec![
+        text_block(
+            1,
+            BlockKind::Heading { level: 2 },
+            "标题文字",
+            vec![StyledRun::new(0..6, [Mark::Bold])],
+        ),
+        text_block(2, BlockKind::BulletItem { depth: 0 }, "要点一", vec![]),
+        Block {
+            id: NodeId::new_internal(3),
+            kind: BlockKind::Image,
+            content: BlockContent::Image {
+                resource_id: "img".into(),
+                alt: "图".into(),
+                natural_size_known: true,
+                natural_size: (40, 30),
+                display_width: Some(20),
+                link: None,
+            },
+            alignment: TextAlignment::Left,
+            revision: 0,
+        },
+        Block {
+            id: NodeId::new_internal(4),
+            kind: BlockKind::Attachment,
+            content: BlockContent::Attachment {
+                resource_id: "doc".into(),
+                filename: "说明.pdf".into(),
+                media_type: "application/pdf".into(),
+            },
+            alignment: TextAlignment::Left,
+            revision: 0,
+        },
+        text_block(
+            5,
+            BlockKind::Paragraph,
+            "末段内容",
+            vec![StyledRun::new(6..12, [Mark::Italic])],
+        ),
+    ])
+    .unwrap();
+    let mut source = EditorCore::from_document(source_document, cx);
+    // From inside the heading ("标|题文字") to inside the last paragraph.
+    source.set_selection_for_test(Selection::new(
+        DocPoint::new(NodeId::new_internal(1), "标".len()),
+        DocPoint::new(NodeId::new_internal(5), "末段".len()),
+    ));
+    let copied = source.copy_blocks();
+    assert!(
+        copied.open_start && copied.open_end,
+        "a text selection is open at both ends"
     );
-    assert_eq!(fragment.plain_text(), "前\n\n\n后");
-
-    let mut plain = EditorCore::for_test("纯文本", cx);
-    plain.select_all();
-    assert!(plain.copy_fragment().is_none(), "text alone stays plain");
-
-    let mut target = EditorCore::for_test("甲乙", cx);
-    target.set_caret_utf8("甲".len());
-    let depth = target.undo_depth();
-    let images = target.paste_fragment(&fragment).unwrap();
-    assert_eq!(images.len(), 1);
-    let shape = |editor: &EditorCore| {
-        editor
-            .document()
-            .blocks()
+    let summary = |blocks: &[Block]| {
+        blocks
             .iter()
             .map(|block| match &block.content {
-                BlockContent::Text { text, .. } => format!("text:{text}"),
-                BlockContent::Image { resource_id, .. } => format!("image:{resource_id}"),
+                BlockContent::Text { text, styles } => format!(
+                    "{:?}:{text}:{:?}",
+                    block.kind,
+                    styles
+                        .iter()
+                        .map(|run| (run.range.clone(), run.marks.to_vec()))
+                        .collect::<Vec<_>>()
+                ),
+                BlockContent::Image {
+                    resource_id,
+                    display_width,
+                    ..
+                } => format!("image:{resource_id}:{display_width:?}"),
                 BlockContent::Attachment { resource_id, .. } => format!("attachment:{resource_id}"),
                 _ => "other".into(),
             })
             .collect::<Vec<_>>()
     };
-    let pasted = vec!["text:甲前", "image:img", "attachment:doc", "text:后乙"];
-    assert_eq!(shape(&target), pasted);
+    assert_eq!(
+        summary(&copied.blocks),
+        vec![
+            "Heading { level: 2 }:题文字:[(0..3, [Bold])]".to_owned(),
+            "BulletItem { depth: 0 }:要点一:[]".to_owned(),
+            "image:img:Some(20)".to_owned(),
+            "attachment:doc".to_owned(),
+            "Paragraph:末段:[]".to_owned(),
+        ]
+    );
+
+    let mut target = EditorCore::for_test("甲乙", cx);
+    target.set_caret_utf8("甲".len());
+    let depth = target.undo_depth();
+    let images = target.paste_blocks(&copied).unwrap();
+    assert_eq!(images.len(), 1);
+    let pasted = summary(
+        target
+            .document()
+            .blocks()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    assert_eq!(
+        pasted,
+        vec![
+            "Paragraph:甲题文字:[(3..6, [Bold])]".to_owned(),
+            "BulletItem { depth: 0 }:要点一:[]".to_owned(),
+            "image:img:Some(20)".to_owned(),
+            "attachment:doc".to_owned(),
+            "Paragraph:末段乙:[]".to_owned(),
+        ],
+        "open slice: the heading's text joins the paragraph, the tail joins the last block"
+    );
+    let last = target.document().blocks().iter().last().unwrap().id;
+    assert_eq!(
+        target.selection(),
+        Selection::caret(DocPoint::new(last, "末段".len()))
+    );
     assert_eq!(target.undo_depth(), depth + 1, "one undo step");
+    let ids: Vec<NodeId> = target
+        .document()
+        .blocks()
+        .iter()
+        .map(|block| block.id)
+        .collect();
     target.undo().unwrap();
-    assert_eq!(shape(&target), vec!["text:甲乙"]);
+    assert_eq!(target.copy_all_plain_text(), "甲乙");
     target.redo().unwrap();
-    assert_eq!(shape(&target), pasted);
+    assert_eq!(
+        target
+            .document()
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>(),
+        ids,
+        "redo replays the same nodes"
+    );
+    assert_eq!(
+        summary(
+            target
+                .document()
+                .blocks()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice()
+        ),
+        pasted
+    );
+
+    // Pasting a heading onto an empty line keeps it a heading.
+    let mut empty = EditorCore::for_test("", cx);
+    empty
+        .paste_blocks(&super::core::CopiedBlocks {
+            blocks: copied.blocks[..1].to_vec(),
+            ..copied.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        summary(
+            empty
+                .document()
+                .blocks()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice()
+        ),
+        vec!["Heading { level: 2 }:题文字:[(0..3, [Bold])]".to_owned()]
+    );
+
+    // Selecting the whole note is closed at both ends (ProseMirror's
+    // AllSelection): every block keeps its kind and nothing merges.
+    source.select_all();
+    let whole = source.copy_blocks();
+    assert!(!whole.open_start && !whole.open_end);
+    let mut closed = EditorCore::for_test("甲乙", cx);
+    closed.set_caret_utf8("甲".len());
+    closed.paste_blocks(&whole).unwrap();
+    assert_eq!(
+        summary(
+            closed
+                .document()
+                .blocks()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice()
+        ),
+        vec![
+            "Paragraph:甲:[]".to_owned(),
+            "Heading { level: 2 }:标题文字:[(0..6, [Bold])]".to_owned(),
+            "BulletItem { depth: 0 }:要点一:[]".to_owned(),
+            "image:img:Some(20)".to_owned(),
+            "attachment:doc".to_owned(),
+            "Paragraph:末段内容:[(6..12, [Italic])]".to_owned(),
+            "Paragraph:乙:[]".to_owned(),
+        ]
+    );
 }

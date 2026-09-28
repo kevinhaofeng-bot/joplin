@@ -1,4 +1,5 @@
 mod card_thumbnail;
+mod clipboard;
 mod library_backup;
 mod library_import;
 #[cfg(test)]
@@ -2518,7 +2519,9 @@ impl LibraryShell {
                     let mut surface =
                         EditorSurface::new(editor, surface_mode, Some(image_cache.clone()), cx);
                     #[cfg(not(test))]
-                    let surface = EditorSurface::new(editor, surface_mode, Some(image_cache), cx);
+                    let mut surface =
+                        EditorSurface::new(editor, surface_mode, Some(image_cache), cx);
+                    surface.route_clipboard_to_owner();
                     #[cfg(test)]
                     surface.set_paint_hooks(EditorSurfaceHooks::new(
                         move |_window, _app| {
@@ -2545,6 +2548,9 @@ impl LibraryShell {
                             column,
                         } => {
                             shell.open_table_cell_editor(*node_id, *row, *column, shell_cx);
+                        }
+                        EditorSurfaceEvent::Clipboard { cut } => {
+                            shell.copy_from_editor(*cut, shell_cx);
                         }
                     },
                 ));
@@ -3159,11 +3165,18 @@ impl LibraryShell {
                     return Err("笔记已关闭，未粘贴".to_owned());
                 };
                 Self::discard_resource_insert_intent(&session, saved_intent, cx);
-                session
+                let outcome = session
                     .update(cx, |session, session_cx| {
                         session.paste_fragment(&fragment, session_cx)
                     })
                     .map_err(|error| error.to_string())?;
+                if outcome.unavailable > 0 {
+                    self.resource_notice = Some(format!(
+                        "{} 个图片或附件未粘贴：本资料库中没有，复制时也未能导出其文件",
+                        outcome.unavailable
+                    ));
+                    cx.notify();
+                }
                 let editor = session.read_with(cx, |session, _| session.editor().clone());
                 focus_editor(&editor, window, cx);
                 Ok(())
