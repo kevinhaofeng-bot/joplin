@@ -8531,6 +8531,100 @@ async fn mounted_list_command_over_text_and_an_image_saves_and_undoes_durably(
 }
 
 #[gpui::test]
+async fn mounted_tag_buttons_act_on_every_selected_note(cx: &mut TestAppContext) {
+    // Evernote names a multi-selection's scope ("已选择 {N} 条笔记") and its
+    // tag operations cover all of them ("从 {N} 笔记中移除标签「{TAG}」").
+    let (_profile, repository) = repository();
+    let shared = repository.create_tag("共有").unwrap();
+    let own = repository.create_tag("独有").unwrap();
+    let note = |title: &str| {
+        repository
+            .create_note(CreateNote {
+                title: title.into(),
+                notebook_id: None,
+                document: rich_document(title),
+            })
+            .unwrap()
+            .id
+    };
+    let (first, second, other) = (note("甲"), note("乙"), note("丙"));
+    for id in [&first, &second, &other] {
+        repository.add_note_tag(id, &shared.id).unwrap();
+    }
+    repository.add_note_tag(&first, &own.id).unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(first.clone()), window, shell_cx);
+            shell.apply_action(
+                AppAction::ToggleNoteInSelection(second.clone()),
+                window,
+                shell_cx,
+            );
+        });
+    });
+    redraw(cx);
+    let toggle = cx.debug_bounds("library-toggle-organization").unwrap();
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    redraw(cx);
+    let mut click = |selector: String, cx: &mut VisualTestContext| {
+        let selector: &'static str = Box::leak(selector.into_boxed_str());
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector}"));
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        redraw(cx);
+        assert_eq!(
+            view.read_with(cx, |shell, app| shell
+                .model
+                .read(app)
+                .selected_note_ids()
+                .len()),
+            2,
+            "the selection survives each organization change"
+        );
+    };
+    let tags = |id: &NoteId| repository.load_note(id).unwrap().unwrap().tag_ids;
+
+    click(
+        format!("library-organization-tag-remove-{}", own.id.as_str()),
+        cx,
+    );
+    assert!(tags(&first) == vec![shared.id.clone()] && tags(&second) == vec![shared.id.clone()]);
+    click(
+        format!("library-organization-tag-{}", shared.id.as_str()),
+        cx,
+    );
+    assert!(tags(&first).is_empty() && tags(&second).is_empty());
+    click(format!("library-organization-tag-{}", own.id.as_str()), cx);
+    assert!(tags(&first) == vec![own.id.clone()] && tags(&second) == vec![own.id.clone()]);
+    click("library-organization-clear-tags".to_owned(), cx);
+    assert!(tags(&first).is_empty() && tags(&second).is_empty());
+    assert_eq!(
+        tags(&other),
+        vec![shared.id.clone()],
+        "an unselected note keeps its tags"
+    );
+}
+
+#[test]
+fn organization_tag_labels_name_the_selection_they_change() {
+    let id = app_lite_core::TagId::parse("0".repeat(32)).unwrap();
+    let labels = |carried, selected| {
+        super::organization_tag_actions(&id, "T", carried, selected)
+            .into_iter()
+            .map(|(_, _, label)| label)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(labels(0, 1), vec!["添加 #T"]);
+    assert_eq!(labels(1, 1), vec!["移除 #T"]);
+    assert_eq!(labels(0, 3), vec!["为 3 篇添加 #T"]);
+    assert_eq!(labels(3, 3), vec!["从 3 篇移除 #T"]);
+    assert_eq!(labels(1, 3), vec!["为其余 2 篇添加 #T", "从 1 篇移除 #T"]);
+}
+
+#[gpui::test]
 async fn stale_delayed_session_save_cannot_overwrite_the_newly_selected_note(
     cx: &mut TestAppContext,
 ) {

@@ -2213,6 +2213,95 @@ impl LibraryRepository {
         Ok(())
     }
 
+    /// Removes one tag from every listed note that carries it, in a single
+    /// transaction: a missing or trashed member fails the whole batch.
+    pub fn remove_tag_from_notes(
+        &self,
+        note_ids: &[NoteId],
+        tag_id: &TagId,
+    ) -> Result<(), LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        require_tag(&transaction, tag_id)?;
+        let mut changed = Vec::new();
+        for note_id in note_ids {
+            let mut tag_ids = active_note_tag_ids(&transaction, note_id)?;
+            let Some(position) = tag_ids.iter().position(|candidate| candidate == tag_id) else {
+                continue;
+            };
+            tag_ids.remove(position);
+            replace_note_tags_in_transaction(
+                &transaction,
+                self.id_source.as_ref(),
+                note_id,
+                &tag_ids,
+                now,
+                "tags",
+            )?;
+            changed.push(note_id.clone());
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.publish(changed.iter().flat_map(note_tag_events).collect());
+        Ok(())
+    }
+
+    /// Gives every listed note exactly `tag_ids` in one transaction; an empty
+    /// list clears them. Notes already in that state are left untouched.
+    pub fn set_tags_for_notes(
+        &self,
+        note_ids: &[NoteId],
+        tag_ids: &[TagId],
+    ) -> Result<(), LibraryError> {
+        let tag_ids = normalized_tag_ids(tag_ids)?;
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        let mut changed = Vec::new();
+        for note_id in note_ids {
+            if active_note_tag_ids(&transaction, note_id)? == tag_ids {
+                continue;
+            }
+            replace_note_tags_in_transaction(
+                &transaction,
+                self.id_source.as_ref(),
+                note_id,
+                &tag_ids,
+                now,
+                "tags",
+            )?;
+            changed.push(note_id.clone());
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.publish(changed.iter().flat_map(note_tag_events).collect());
+        Ok(())
+    }
+
+    /// How many of the listed active notes carry each tag, in tag order of
+    /// first appearance.
+    pub fn tag_counts_for_notes(
+        &self,
+        note_ids: &[NoteId],
+    ) -> Result<Vec<(TagId, usize)>, LibraryError> {
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        let mut counts: Vec<(TagId, usize)> = Vec::new();
+        for note_id in note_ids {
+            for tag_id in active_note_tag_ids(&transaction, note_id)? {
+                match counts
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == tag_id)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((tag_id, 1)),
+                }
+            }
+        }
+        Ok(counts)
+    }
+
     /// Copies an active note into `notebook_id` (default: the source's
     /// notebook) as a new note: same title, body, attachments (shared
     /// resource references) and tags; fresh history. One transaction.

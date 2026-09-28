@@ -798,6 +798,75 @@ fn batch_tagging_is_all_or_nothing() {
         .unwrap();
 }
 
+#[test]
+fn batch_tag_removal_and_clearing_cover_every_selected_note_or_none() {
+    let (_profile, _path, repository) = repository();
+    let shared = repository.create_tag("共有").unwrap();
+    let own = repository.create_tag("独有").unwrap();
+    let first = create_note(&repository, "一", None);
+    let second = create_note(&repository, "二", None);
+    let untouched = create_note(&repository, "三", None);
+    let trashed = create_note(&repository, "四", None);
+    for id in [&first, &second, &untouched] {
+        repository.add_note_tag(id, &shared.id).unwrap();
+    }
+    repository.add_note_tag(&first, &own.id).unwrap();
+    repository.trash_note(&trashed).unwrap();
+    let tags = |id: &app_lite_core::NoteId| repository.load_note(id).unwrap().unwrap().tag_ids;
+
+    assert_eq!(
+        repository
+            .tag_counts_for_notes(&[first.clone(), second.clone()])
+            .unwrap(),
+        vec![(shared.id.clone(), 2), (own.id.clone(), 1)]
+    );
+    assert!(
+        repository
+            .remove_tag_from_notes(&[first.clone(), trashed.clone()], &shared.id)
+            .is_err()
+    );
+    assert_eq!(
+        tags(&first),
+        vec![shared.id.clone(), own.id.clone()],
+        "rolled back"
+    );
+
+    // A partially tagged selection: only the notes carrying the tag change.
+    repository
+        .remove_tag_from_notes(&[first.clone(), second.clone()], &own.id)
+        .unwrap();
+    assert_eq!(tags(&first), vec![shared.id.clone()]);
+    assert_eq!(tags(&second), vec![shared.id.clone()]);
+
+    assert!(
+        repository
+            .set_tags_for_notes(&[first.clone(), trashed.clone()], &[])
+            .is_err()
+    );
+    assert_eq!(tags(&first), vec![shared.id.clone()], "rolled back");
+    repository
+        .set_tags_for_notes(&[first.clone(), second.clone()], &[])
+        .unwrap();
+    assert!(tags(&first).is_empty() && tags(&second).is_empty());
+    assert_eq!(
+        tags(&untouched),
+        vec![shared.id.clone()],
+        "an unselected note keeps its tags"
+    );
+    assert_eq!(
+        repository
+            .list_notes(app_lite_core::ListQuery::for_route(
+                app_lite_core::LibraryRoute::Tags([shared.id.clone()].into())
+            ))
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec![untouched.clone()],
+        "the tag filter no longer lists the cleared notes"
+    );
+}
+
 /// Evernote expunges every selected guid (renderer 9435.js `[As.EXPUNGE]`
 /// → `us.di({ noteGuids })`). One transaction: every target leaves a
 /// tombstone, a search removal and a sync purge, or none does; attachments

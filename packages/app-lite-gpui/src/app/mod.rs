@@ -10,7 +10,7 @@ use app_lite_core::{
     CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
     LibraryNavigationIndex, LibraryRepository, LibraryRoute, LibraryShellState, ListQuery, Note,
     NoteId, NoteOrganizationState, NoteProjection, NotebookId, ResourceId, SearchHit,
-    SortDirection, SortField,
+    SortDirection, SortField, TagId,
 };
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -326,9 +326,10 @@ impl AppModel {
                 })
             }
             AppAction::SetSelectedNoteTags(tag_ids) => {
-                self.selected_note_for_organization().and_then(|note_id| {
+                self.selected_note_for_organization().and_then(|_| {
+                    let note_ids = self.selected_note_ids();
                     self.apply_organization_mutation("笔记标签已更新", move |repository| {
-                        repository.set_note_tags(&note_id, &tag_ids)
+                        repository.set_tags_for_notes(&note_ids, &tag_ids)
                     })
                 })
             }
@@ -341,9 +342,10 @@ impl AppModel {
                 })
             }
             AppAction::RemoveTagFromSelectedNote(tag_id) => {
-                self.selected_note_for_organization().and_then(|note_id| {
+                self.selected_note_for_organization().and_then(|_| {
+                    let note_ids = self.selected_note_ids();
                     self.apply_organization_mutation("笔记标签已更新", move |repository| {
-                        repository.remove_note_tag(&note_id, &tag_id)
+                        repository.remove_tag_from_notes(&note_ids, &tag_id)
                     })
                 })
             }
@@ -573,6 +575,21 @@ impl AppModel {
             }
         }
         ids
+    }
+
+    /// How many selected notes carry each tag. A single selection reads the
+    /// mounted note; a multi-selection reads the repository.
+    pub fn selected_note_tag_counts(&self) -> Vec<(TagId, usize)> {
+        let ids = self.selected_note_ids();
+        if ids.len() <= 1 {
+            return self
+                .active_note()
+                .map(|note| note.tag_ids.iter().map(|id| (id.clone(), 1)).collect())
+                .unwrap_or_default();
+        }
+        self.repository
+            .tag_counts_for_notes(&ids)
+            .unwrap_or_default()
     }
 
     fn toggle_note_in_selection(&mut self, id: NoteId) -> Result<(), LibraryError> {

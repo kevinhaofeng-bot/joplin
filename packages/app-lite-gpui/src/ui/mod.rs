@@ -5024,15 +5024,13 @@ impl LibraryShell {
         if !self.organization_panel_open {
             return None;
         }
-        let (route, index, selected_tag_ids, has_selected_note) =
+        let (route, index, tag_counts, selected_count, has_selected_note) =
             self.model.read_with(cx, |model, _| {
                 (
                     model.navigation().route().clone(),
                     model.navigation_index().clone(),
-                    model
-                        .active_note()
-                        .map(|note| note.tag_ids.clone())
-                        .unwrap_or_default(),
+                    model.selected_note_tag_counts(),
+                    model.selected_note_ids().len(),
                     model.navigation().selected_note_id().is_some(),
                 )
             });
@@ -5261,40 +5259,38 @@ impl LibraryShell {
             .flex_wrap()
             .gap(px(4.0));
         for tag in &index.tags {
-            let id = tag.id.clone();
-            let selected = selected_tag_ids.contains(&id);
-            let selector = format!("library-organization-tag-{}", id.as_str());
-            let action = if selected {
-                AppAction::RemoveTagFromSelectedNote(id.clone())
-            } else {
-                AppAction::AddTagToSelectedNote(id.clone())
-            };
-            tag_targets = tag_targets.child(
-                div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .px(px(6.0))
-                    .py(px(3.0))
-                    .rounded(px(4.0))
-                    .bg(if selected {
-                        rgba(0x00a82d20)
-                    } else {
-                        rgba(0xf1f4f1ff)
-                    })
-                    .text_size(px(10.0))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |shell, _event, window, cx| {
-                            shell.apply_action(action.clone(), window, cx)
-                        }),
-                    )
-                    .child(if selected {
-                        format!("移除 #{}", tag.title)
-                    } else {
-                        format!("添加 #{}", tag.title)
-                    }),
-            );
+            let carried = tag_counts
+                .iter()
+                .find(|(id, _)| *id == tag.id)
+                .map_or(0, |(_, count)| *count);
+            for (suffix, action, label) in
+                organization_tag_actions(&tag.id, &tag.title, carried, selected_count)
+            {
+                let selected = matches!(action, AppAction::RemoveTagFromSelectedNote(_));
+                let selector = format!("library-organization-tag{suffix}-{}", tag.id.as_str());
+                tag_targets = tag_targets.child(
+                    div()
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector.clone())
+                        .px(px(6.0))
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .bg(if selected {
+                            rgba(0x00a82d20)
+                        } else {
+                            rgba(0xf1f4f1ff)
+                        })
+                        .text_size(px(10.0))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _event, window, cx| {
+                                shell.apply_action(action.clone(), window, cx)
+                            }),
+                        )
+                        .child(label),
+                );
+            }
         }
 
         let trash_controls: Option<gpui::AnyElement> =
@@ -5367,7 +5363,16 @@ impl LibraryShell {
             .children(destructive_confirmation);
         if has_selected_note && !is_trash_route {
             panel = panel
-                .child(div().text_color(rgba(0x718075ff)).child("移动当前笔记"))
+                .child(
+                    div()
+                        .id("library-organization-move-heading")
+                        .debug_selector(|| "library-organization-move-heading".to_owned())
+                        .text_color(rgba(0x718075ff))
+                        .child(match selected_count {
+                            count if count > 1 => format!("移动 {count} 篇笔记"),
+                            _ => "移动当前笔记".to_owned(),
+                        }),
+                )
                 .child(move_targets)
                 .child(
                     div()
@@ -5377,7 +5382,10 @@ impl LibraryShell {
                         .child(div().text_color(rgba(0x718075ff)).child("标签"))
                         .child(library_action_button(
                             "library-organization-clear-tags",
-                            "清空标签".to_owned(),
+                            match selected_count {
+                                count if count > 1 => format!("清空 {count} 篇笔记的标签"),
+                                _ => "清空标签".to_owned(),
+                            },
                             AppAction::SetSelectedNoteTags(Vec::new()),
                             cx,
                         )),
@@ -7132,6 +7140,38 @@ fn open_application_error_window(
         move |_window, cx| cx.new(|_| StartupErrorView { title, message }),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Tag buttons for the selected notes, as `(selector suffix, action, label)`.
+/// A multi-selection names its scope; a tag some of the notes carry offers
+/// both adding it to the rest and removing it from those.
+fn organization_tag_actions(
+    id: &app_lite_core::TagId,
+    title: &str,
+    carried: usize,
+    selected: usize,
+) -> Vec<(&'static str, AppAction, String)> {
+    let add = AppAction::AddTagToSelectedNote(id.clone());
+    let remove = AppAction::RemoveTagFromSelectedNote(id.clone());
+    if selected <= 1 {
+        return vec![if carried > 0 {
+            ("", remove, format!("移除 #{title}"))
+        } else {
+            ("", add, format!("添加 #{title}"))
+        }];
+    }
+    match carried {
+        0 => vec![("", add, format!("为 {selected} 篇添加 #{title}"))],
+        all if all >= selected => vec![("", remove, format!("从 {selected} 篇移除 #{title}"))],
+        some => vec![
+            (
+                "",
+                add,
+                format!("为其余 {} 篇添加 #{title}", selected - some),
+            ),
+            ("-remove", remove, format!("从 {some} 篇移除 #{title}")),
+        ],
+    }
 }
 
 fn library_action_button(
