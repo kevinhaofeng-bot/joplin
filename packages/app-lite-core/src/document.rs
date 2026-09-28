@@ -82,11 +82,13 @@ impl CanonicalDocument {
         let mut prefix = [0_u8; 12];
         getrandom::getrandom(&mut prefix).map_err(|_| DocumentError::Entropy)?;
         let root = parse_dom(input)?;
-        let mut pasted = Some(PastedState {
+        let state = PastedState {
             prefix,
             images: Vec::new(),
             rules: collect_style_sheets(&root),
-        });
+        };
+        group_word_lists(&root, &state);
+        let mut pasted = Some(state);
         let document = project_dom(&root, &mut pasted);
         drain_dom(root);
         Ok(PastedHtml {
@@ -1477,6 +1479,8 @@ fn project_table(table: &DomHandle, pasted: &mut Option<PastedState>) -> Option<
             }
             Some("tr") => row_nodes.push(child.clone()),
             Some("colgroup") => {}
+            // Pasted mode emits the caption above the table.
+            Some("caption" | "style" | "meta") if pasted.is_some() => {}
             None if is_ignorable_table_child(child) => {}
             _ => return None,
         }
@@ -1500,20 +1504,34 @@ fn project_table(table: &DomHandle, pasted: &mut Option<PastedState>) -> Option<
             let DomData::Element { attrs, .. } = &cell.data else {
                 return None;
             };
-            for span in ["colspan", "rowspan"] {
-                if attribute(&attrs.borrow(), span)
-                    .is_some_and(|value| value.trim().parse::<u32>().ok() != Some(1))
-                {
-                    return None;
+            let span = |name| {
+                attribute(&attrs.borrow(), name).map(|value| value.trim().parse::<u32>().ok())
+            };
+            let mut padding = 0;
+            if pasted.is_some() {
+                // No merged cells in the model: a spanned cell keeps its
+                // column position with empty cells after it.
+                padding = span("colspan").flatten().unwrap_or(1).clamp(1, 64) - 1;
+            } else {
+                for name in ["colspan", "rowspan"] {
+                    if span(name).is_some_and(|value| value != Some(1)) {
+                        return None;
+                    }
                 }
             }
             let projected = project_dom(cell, pasted);
             let inlines = match projected.blocks.as_slice() {
                 [] => Vec::new(),
                 [Block::Paragraph { inlines, .. }] => inlines.clone(),
+                blocks if pasted.is_some() => cell_lines(blocks)?,
                 _ => return None,
             };
             cells.push(TableCell { inlines });
+            for _ in 0..padding {
+                cells.push(TableCell {
+                    inlines: Vec::new(),
+                });
+            }
         }
         if cells.len() > MAX_TABLE_COLUMNS {
             return None;
@@ -1524,6 +1542,38 @@ fn project_table(table: &DomHandle, pasted: &mut Option<PastedState>) -> Option<
         rows.push(TableRow { cells });
     }
     Some(Block::Table { rows, header })
+}
+
+/// A pasted cell's paragraphs (Google Docs and Word put `<p>` in every
+/// cell) as lines of one cell; a nested table or list still flattens the
+/// whole table.
+fn cell_lines(blocks: &[Block]) -> Option<Vec<Inline>> {
+    let mut lines = Vec::new();
+    for block in blocks {
+        let inlines = match block {
+            Block::Paragraph { inlines, .. }
+            | Block::Heading { inlines, .. }
+            | Block::Quote { inlines, .. }
+            | Block::Code { inlines, .. } => inlines.clone(),
+            Block::Image {
+                resource_id,
+                alt,
+                presentation,
+                link,
+            } => vec![Inline::Image {
+                resource_id: resource_id.clone(),
+                alt: alt.clone(),
+                display_width: presentation.display_width,
+                link: link.clone(),
+            }],
+            _ => return None,
+        };
+        if !lines.is_empty() {
+            lines.push(Inline::SoftBreak);
+        }
+        lines.extend(inlines);
+    }
+    Some(lines)
 }
 
 fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalDocument {
@@ -1574,13 +1624,21 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         .map(|state| state.declarations(&tag, &attrs.borrow()))
                         .unwrap_or_default();
                     let marks = if pasted {
-                        if pasted_element_is_hidden(&tag, &declarations) {
+                        if pasted_element_is_hidden(&tag, &declarations)
+                            || (tag == "caption" && !Rc::ptr_eq(&node, root))
+                        {
                             continue;
                         }
                         pasted_marks(&declarations, marks)
                     } else {
                         marks
                     };
+                    // Evernote `transformers/whitespaces.ts`: pre-wrapped
+                    // text keeps its line breaks.
+                    let preformatted = preformatted
+                        || declarations
+                            .iter()
+                            .any(|(name, value)| name == "white-space" && value.starts_with("pre"));
                     let children = node.children.borrow().clone();
                     if tag == "ul" || tag == "ol" {
                         let kind = if tag == "ol" {
@@ -1606,7 +1664,12 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         continue;
                     }
                     if tag == "li" && !projection.list_contexts.is_empty() {
-                        let style = block_style(&attrs.borrow(), 0);
+                        let mut style = block_style(&attrs.borrow(), 0);
+                        if pasted {
+                            // Nesting depth survives the flat list model as indent.
+                            let depth = (projection.list_contexts.len() - 1).min(8) as u8;
+                            style.indent = style.indent.max(depth);
+                        }
                         let checked = if projection
                             .list_contexts
                             .last()
@@ -1630,7 +1693,16 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         }
                         continue;
                     }
-                    if let Some(level) = heading_level(&tag) {
+                    let aria_heading = if pasted
+                        && matches!(tag.as_str(), "p" | "div")
+                        && attribute(&attrs.borrow(), "role").as_deref() == Some("heading")
+                    {
+                        attribute(&attrs.borrow(), "aria-level")
+                            .and_then(|level| heading_level(&format!("h{}", level.trim())))
+                    } else {
+                        None
+                    };
+                    if let Some(level) = heading_level(&tag).or(aria_heading) {
                         if !projection.list_contexts.is_empty() {
                             projection.begin_list_block();
                             projection.ensure_current();
@@ -1673,6 +1745,28 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                     // canonical model can preserve, so it remains ordinary
                     // visible inline content rather than being silently
                     // hoisted across list boundaries.
+                    if pasted && projection.list_contexts.is_empty() && tag == "table" {
+                        let caption = children
+                            .iter()
+                            .find(|child| element_name(child).as_deref() == Some("caption"));
+                        if let Some(caption) = caption {
+                            let mut pasted_state = projection.pasted.take();
+                            let projected = project_dom(caption, &mut pasted_state);
+                            projection.pasted = pasted_state;
+                            for block in projected.blocks {
+                                projection.structural_block(match block {
+                                    Block::Paragraph { style, inlines } => Block::Paragraph {
+                                        style: BlockStyle {
+                                            alignment: Alignment::Center,
+                                            ..style
+                                        },
+                                        inlines,
+                                    },
+                                    other => other,
+                                });
+                            }
+                        }
+                    }
                     if projection.list_contexts.is_empty() && tag == "table" {
                         let mut pasted_state = projection.pasted.take();
                         let table = project_table(&node, &mut pasted_state);
@@ -2678,6 +2772,140 @@ fn collect_style_sheets(root: &DomHandle) -> Vec<StyleRule> {
         pending.extend(node.children.borrow().iter().rev().cloned());
     }
     rules
+}
+
+/// Word pastes a list as paragraphs styled `mso-list: l0 level2 lfo1`, each
+/// led by a hidden bullet or number; rebuild them as nested `ul`/`ol` as
+/// Evernote's `clipboard/transformers/msoffice.ts` does.
+fn group_word_lists(root: &DomHandle, state: &PastedState) {
+    let element = |tag: &str| {
+        DomSink::node(DomData::Element {
+            name: QualName::new(None, ns!(html), tag.into()),
+            attrs: RefCell::new(Vec::new()),
+            template_contents: RefCell::new(None),
+            mathml_annotation_xml_integration_point: false,
+        })
+    };
+    let mut pending = vec![root.clone()];
+    while let Some(parent) = pending.pop() {
+        let children = parent.children.borrow().clone();
+        if !children
+            .iter()
+            .any(|child| word_list_item(child, state).is_some())
+        {
+            pending.extend(children);
+            continue;
+        }
+        // (level, ordered, list) from the outermost list inward.
+        let mut open: Vec<(u32, bool, DomHandle)> = Vec::new();
+        let mut regrouped = Vec::with_capacity(children.len());
+        for child in children {
+            let Some((level, ordered, first)) = word_list_item(&child, state) else {
+                if matches!(&child.data, DomData::Text(text) if is_formatting_whitespace(&text.borrow()))
+                    && !open.is_empty()
+                {
+                    continue;
+                }
+                open.clear();
+                pending.push(child.clone());
+                regrouped.push(child);
+                continue;
+            };
+            if first {
+                open.clear();
+            }
+            while open.last().is_some_and(|(open_level, open_ordered, _)| {
+                *open_level > level || (*open_level == level && *open_ordered != ordered)
+            }) {
+                open.pop();
+            }
+            if open
+                .last()
+                .is_none_or(|(open_level, ..)| *open_level < level)
+            {
+                let list = element(if ordered { "ol" } else { "ul" });
+                match open.last() {
+                    Some((_, _, outer)) => {
+                        let last_item = outer.children.borrow().last().cloned();
+                        match last_item {
+                            Some(item) => DomSink::append_node(&item, list.clone()),
+                            None => DomSink::append_node(outer, list.clone()),
+                        }
+                    }
+                    None => {
+                        DomSink::set_parent(&parent, &list);
+                        regrouped.push(list.clone());
+                    }
+                }
+                open.push((level, ordered, list));
+            }
+            let (_, _, list) = open.last().expect("a list is open");
+            let item = element("li");
+            DomSink::append_node(list, item.clone());
+            *child.parent.borrow_mut() = None;
+            DomSink::append_node(&item, child.clone());
+            pending.push(child);
+        }
+        *parent.children.borrow_mut() = regrouped;
+    }
+}
+
+/// `(level, ordered, starts a new list)` of a Word list paragraph.
+fn word_list_item(node: &DomHandle, state: &PastedState) -> Option<(u32, bool, bool)> {
+    let tag = element_name(node)?;
+    if !matches!(
+        tag.as_str(),
+        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+    ) {
+        return None;
+    }
+    let DomData::Element { attrs, .. } = &node.data else {
+        return None;
+    };
+    let attrs = attrs.borrow();
+    let declarations = state.declarations(&tag, &attrs);
+    let (_, value) = declarations
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "mso-list")?;
+    let level = value
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("level"))?
+        .parse::<u32>()
+        .ok()?
+        .clamp(1, 9);
+    let mut marker = String::new();
+    let mut pending = vec![node.clone()];
+    while let Some(current) = pending.pop() {
+        if let DomData::Element { attrs, .. } = &current.data
+            && element_name(&current).as_deref() == Some("span")
+            && state
+                .declarations("span", &attrs.borrow())
+                .iter()
+                .any(|(name, value)| name == "mso-list" && value == "ignore")
+        {
+            collect_text(&current, &mut marker);
+            break;
+        }
+        pending.extend(current.children.borrow().iter().rev().cloned());
+    }
+    let marker = marker.trim();
+    let ordered = marker != "o" && marker.chars().any(|c| c.is_ascii_alphanumeric());
+    let class = attribute(&attrs, "class")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let first = class == "msolistparagraph" || class.contains("cxspfirst");
+    Some((level, ordered, first))
+}
+
+fn collect_text(node: &DomHandle, output: &mut String) {
+    let mut pending = vec![node.clone()];
+    while let Some(current) = pending.pop() {
+        if let DomData::Text(text) = &current.data {
+            output.push_str(&text.borrow());
+        }
+        pending.extend(current.children.borrow().iter().rev().cloned());
+    }
 }
 
 fn pasted_element_is_hidden(tag: &str, declarations: &[(String, String)]) -> bool {
@@ -3864,6 +4092,40 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                 "<pre data-joplin-lite-block-code=\"true\">code&nbsp;&nbsp;x<br>&nbsp;&nbsp;y</pre>",
                 "<hr data-joplin-lite-block-divider=\"true\">",
                 "<p>word item</p>"
+            )
+        );
+        let word = CanonicalDocument::parse_pasted_html(concat!(
+            "<p class=MsoListParagraphCxSpFirst style='text-indent:-18pt;mso-list:l0 level1 lfo1'>",
+            "<span style='mso-list:Ignore'>·<span style='font:7.0pt \"Times\"'>&nbsp;</span></span>one</p>\n",
+            "<p class=MsoListParagraphCxSpMiddle style='mso-list:l0 level2 lfo1'>",
+            "<span style='mso-list:Ignore'>o<span>&nbsp;</span></span>nested</p>\n",
+            "<p class=MsoListParagraphCxSpLast style='mso-list:l0 level1 lfo1'>",
+            "<span style='mso-list:Ignore'>·</span><b>two</b></p>\n",
+            "<p class=MsoNormal>after</p>",
+            "<p class=MsoListParagraph style='mso-list:l1 level1 lfo2'><span style='mso-list:Ignore'>1.</span>first</p>",
+            "<p class=MsoListParagraph style='mso-list:l1 level1 lfo2'><span style='mso-list:Ignore'>2.</span>second</p>"
+        ))
+        .unwrap();
+        assert_eq!(
+            word.document.to_canonical_html().as_str(),
+            concat!(
+                "<ul><li>one</li><li data-indent=\"1\">nested</li><li><strong>two</strong></li></ul>",
+                "<p>after</p><ol><li>first</li><li>second</li></ol>"
+            )
+        );
+        let office = CanonicalDocument::parse_pasted_html(concat!(
+            "<p role=\"heading\" aria-level=\"2\"><span>Medium heading</span></p>",
+            "<p style=\"white-space: pre-wrap\">line one\nline two</p>",
+            "<table><caption>Sales</caption><tbody><tr><td><p>a1</p><p>a2</p></td><td>b</td></tr>",
+            "<tr><td colspan=\"2\"><p dir=\"ltr\"><span style=\"font-weight:700\">wide</span></p></td></tr></tbody></table>"
+        ))
+        .unwrap();
+        assert_eq!(
+            office.document.to_canonical_html().as_str(),
+            concat!(
+                "<h2>Medium heading</h2><p>line one<br>line two</p><p data-align=\"center\">Sales</p>",
+                "<table data-joplin-lite-table=\"true\"><tbody><tr><td>a1<br>a2</td><td>b</td></tr>",
+                "<tr><td><strong>wide</strong></td><td></td></tr></tbody></table>"
             )
         );
         // macOS's RTF→HTML writer (TextEdit, Notes) and Word use class rules.
