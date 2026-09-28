@@ -272,7 +272,31 @@ async fn mounted_readable_restore_of_a_damaged_bundle_says_what_is_wrong(cx: &mu
             "清单损坏",
             (|bundle: &std::path::Path| std::fs::write(bundle.join("manifest.json"), b"{").unwrap())
                 as fn(&std::path::Path),
-            "manifest.json 无法读取",
+            "数据文件无法解析",
+        ),
+        (
+            "历史损坏",
+            |bundle: &std::path::Path| {
+                let history = std::fs::read_dir(bundle.join("history"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::write(history, b"[]").unwrap();
+            },
+            "未通过完整性校验",
+        ),
+        (
+            "版本不符",
+            |bundle: &std::path::Path| {
+                let manifest = bundle.join("manifest.json");
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+                value["version"] = serde_json::json!(999);
+                std::fs::write(manifest, value.to_string()).unwrap();
+            },
+            "格式或版本不受支持",
         ),
         (
             "缺少目录",
@@ -303,6 +327,9 @@ async fn mounted_readable_restore_of_a_damaged_bundle_says_what_is_wrong(cx: &mu
         cx.run_until_parked();
         let message = notice(&view, cx);
         assert!(message.contains(expected), "{name}: {message}");
+        if name != "版本不符" {
+            assert!(!message.contains("格式或版本"), "{name}: {message}");
+        }
         assert!(
             message.contains("未创建新资料库") && message.contains("详情："),
             "{message}"

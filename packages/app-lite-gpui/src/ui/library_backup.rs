@@ -540,10 +540,14 @@ fn readable_restore_error_message(error: &ReadableExportError, has_manifest: boo
         ReadableExportError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
             "导出包不完整：缺少所需的文件或文件夹，可能已被移动或删改"
         }
-        ReadableExportError::Json(_) => "导出包的 manifest.json 无法读取，可能已损坏",
-        ReadableExportError::InvalidManifest(_) => "导出包的格式或版本不受支持",
-        ReadableExportError::ResourceVerification(_) => {
-            "导出包中的附件与清单记录不一致，可能已被修改"
+        ReadableExportError::Json(_) => "导出包中的数据文件无法解析，可能已损坏",
+        ReadableExportError::InvalidManifest(reason)
+            if reason.contains("format or version") || reason.contains("bundle version") =>
+        {
+            "导出包的格式或版本不受支持"
+        }
+        ReadableExportError::InvalidManifest(_) | ReadableExportError::ResourceVerification(_) => {
+            "导出包未通过完整性校验（正文、历史或附件记录不一致），可能已被修改或损坏"
         }
         _ => "恢复过程出错",
     };
