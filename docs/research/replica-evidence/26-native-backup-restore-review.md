@@ -30,3 +30,15 @@
 Claude 提交 `acc64fbe8`：状态消息换行、操作单独一行，并通过 occlude 避免下层正文抢走按钮点击。主代理在其施工中间态曾独立复现“可见但点击后未切换”；提交后的同名测试独立重跑通过。
 
 命令 `cargo test --bin velotype mounted_restore_status_keeps_its_open_button_on_screen_and_clickable -- --nocapture`，退出 0，1 通过、0 失败。日志 `/tmp/joplin-restore-ui-committed-independent.log`。覆盖三/二/一栏、窄窗边界和点击打开后活动库改变，但属于挂载测试，不是签名包实机。新候选构建中，实机门仍未关闭。
+
+## 新签名候选实机补验：本样本恢复使用闭环通过
+
+- 候选 `/tmp/joplin-restore-candidate/20260928T085044Z-52fe7e9ae/Joplin Lite.app`，0.7.2 / 16327，SHA-256 `54c7a7a9c921516a60b95c9a5b0b3b0934c5f737bdbbeea0c82b4c08f872f551`，ad-hoc 整包校验通过，未公证。构建开始时产品源文件干净；完成时仅新增测试文件修改，未发生产品运行代码修改。
+- 新隔离根 `/tmp/joplin-restore-ui.LP9GMd`，初始 profile 为其 `library` 子目录，避免与旧测试共享活动库指针。
+- 原生菜单/系统对话框恢复到 `imported-libraries/backup-native-20260928a-1790585678`。
+- 1160×789 三栏窗口中消息完整换行，“打开导入的资料库”按钮可见。真实鼠标点击后活动指针改变，旧窗口替换为恢复库窗口，7 篇笔记实际显示。截图 `restore-ready.png`、`restored-open.png`。
+- 在“你好”笔记末尾粘贴“恢复后追加验收 20260928”，Cmd-S 后数据库正文为 `<p>nihaou<br>恢复后追加验收 20260928</p>`。
+- 通过原生退出菜单结束 PID75373，再明确指定该恢复 profile 启动新 PID76199；截图 `restored-restarted.png` 显示追加内容仍在。此步骤证明关库重开持久化，不证明不带 profile 环境变量时自动选择恢复库的启动行为。
+- 点击“新版编辑验收”笔记：列表、粗体/斜体/下划线、图片和图片后文字都显示，截图 `restored-image-note.png`。图片为合成 Vision OCR English 测试图。
+
+以上截图均位于新隔离根。此项通过的是本合成样本的恢复→点击打开→编辑保存→明确指定恢复库重启闭环；大规模迁移、带标签/堆栈样本、完整多媒体和其他交付门仍不能据此放行。
