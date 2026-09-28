@@ -18,6 +18,10 @@
 | 第五批：批量移除/清空标签与数量文案 | 按 Evernote 行为实现 | 本人实际读取的只有本地化字符串：`main-readable/src/modules/64482__localization-catalog.js` 的 `Boron.notesMultiSelectionContext.title`（"已选择 {N} 条笔记"）、`...editTags`，以及 886/905 行 `AiCopilot.organizationPlan.op.addTagToNotes/removeTagFromNotes.title`（"向/从 {N} 笔记…标签"）。执行路径由 Codex 在 evidence38 读取：renderer `9435.js` 13155–13252 行（EDIT_TAGS 作用于整个选区） |
 | 第六批：OCR 期间的图形内存 | 本项目自有性能缺陷修复 | 无 |
 | 测试隔离：索引/OCR 测试闸门 | 本项目自有测试基础设施修复 | 无 |
+| 第七批：删除笔记本 | 按 Evernote 用户契约实现 | `main-readable/src/modules/64482__localization-catalog.js` 4224 行与 `32150__localization-catalog.js` 4219 行 `ModalManager.deleteNotebook.confirmation`（“笔记本中的任何笔记都将被移动到回收站”）；Codex evidence41 另读 `63570__module-63570.js` 266–279 行 `expungeNotebook`。执行端未在解包文件中找到，无法继续追踪 |
+| 第八批：列表视图与排序持久化 | 按 Evernote 行为实现 | `main-readable/src/modules/51244__get-string-user-setting.js` 153/183/297/309 行（GLOBAL/NOTEBOOKS/STACKS/TRASH_NOTE_VIEW_OPTIONS_KEY）、234/237 行（SEARCH_SORT_PREFERENCE_GLOBAL/_NOTEBOOK）；renderer `9435.js` 31827–31851（四个持久化存储）、33039–33048（先写全局再写当前上下文）、62691–62739（有上下文设置时用它，否则用全局） |
+| 第九批：可读恢复的中文错误 | 本项目自有 UI 修复（可读导出是自托管功能） | 无 |
+| 启动内存峰值 | 调查，未改代码 | 无 |
 
 ## 第一批：正文文档首尾跳转（`aae2684c1`）
 
@@ -233,4 +237,111 @@ Codex 的独立运行发现 index_scheduler 测试间歇失败或挂起。我把
 ### 可供独立打包的源码检查点
 
 `3b9496844`。此前的提交依次为 5e170c03e、0fbec38e3、e049fdd60、2b415da9c、38a79bee0。
+
+## 第七批：删除笔记本会把笔记移到废纸篓（`f1751565e`）
+
+问题来自 Codex evidence41：Evernote 删除笔记本时会确认“笔记本中的任何笔记都将被移动到回收站”，而我们把这些笔记移到了默认笔记本。
+
+现在 `delete_notebook` 在同一事务中完成以下几件事：
+- 删除笔记本；
+- 把其中仍在使用的笔记放进废纸篓，保留附件、历史，也保留它们原来的笔记本 id；
+- 按“移到废纸篓”加入同步队列。
+
+另外：
+- 已经在废纸篓中的笔记不改动；
+- 从废纸篓恢复这些笔记时，由于原笔记本已不存在，笔记会进入默认笔记本（使用已有的恢复逻辑）；
+- 默认笔记本仍然不能删除，解散笔记本组的行为不变；
+- 确认框文字改为“确认删除当前笔记本？笔记本中的任何笔记都将被移动到废纸篓。”
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `organization_stage_c::deleting_a_notebook_moves_its_notes_to_trash_whole_and_reversibly` | 带附件与历史的笔记；已在废纸篓的笔记保持原删除时间；其他笔记本不受影响；默认笔记本不可删；用 SQLite 触发器在中途制造失败后整体回滚；重新打开；同步队列中有 trash 操作；恢复后进入默认笔记本，附件和历史都在 |
+| `sync_two_clients::a_notebook_deleted_on_one_device_leaves_its_notes_in_trash_on_both` | A 删除笔记本后同步到 B：三篇笔记在 B 上都在废纸篓，附件可读；A 的历史不变。B 恢复其中一篇并同步回 A：该笔记在 A 上进入默认笔记本；笔记本没有复活；两端没有任何未删除的笔记指向不存在的笔记本 |
+| `ui::tests::mounted_organization_panel_renames_and_deletes_the_active_notebook_by_id` | 挂载面板中先取消确认：什么都没变（笔记本和笔记都在）。再次删除并确认：笔记进入废纸篓，界面回到“全部笔记”，没有选中项，也没有编辑会话 |
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| 对照：换回旧版 `repository.rs` | 本地两项测试失败 | `/tmp/joplin-claude-notebook-trash-red.log` |
+| 对照：同上，运行同步测试 | 失败：B 上的笔记没有进入废纸篓 | `/tmp/joplin-claude-notebook-trash-sync-red.log` |
+| gpui / core 全量 | 1465 通过 / 350 通过，均为 0 失败 | `/tmp/joplin-claude-notebook-trash-full.log`，`/tmp/joplin-claude-notebook-trash-core.log` |
+
+仍需验证：签名包中的原生删除确认、废纸篓显示和恢复（Codex 正在隔离 profile 中实机验收）。
+
+## 第八批：列表视图与排序在重启后保留（`d431a9bbf`）
+
+问题来自 evidence43：列表视图和排序只存在内存中，正常退出再打开后恢复为默认。
+
+- **视图：** 保存一个全局值，另外为笔记本、笔记本组、废纸篓各自保存自己的值。切换视图时，同时更新全局值和当前上下文的值；某个上下文没有自己的值时，使用全局值。这对应 Evernote `9435.js` 33039–33048 行的写法。
+- **排序：** 按路由保存。其中“全部笔记”相当于 Evernote 的全局排序，“笔记本”相当于按笔记本保存的排序。笔记本组、标签和废纸篓的排序也会保存；Evernote 是否保存这三类的排序尚未核实。
+- **存储：** 设置键为 `library-shell.list-view` 和 `library-shell.note-sorts`，写在各自资料库的 settings 表中。
+- **写入顺序：** 先把设置写入数据库，成功后才更新界面状态。写入失败时视图和排序都保持原样，并返回错误。
+- **兼容：** 读不懂的旧值或损坏的值会被忽略，按默认值打开，不会阻止资料库打开。
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `list_view_and_sort_survive_reopening_the_library_with_the_selection` | 重启后：全局视图、选中笔记和“全部笔记”的排序都保留；笔记本、笔记本组、废纸篓各自的视图，以及笔记本和废纸篓各自的排序都保留；没有自己设置的笔记本使用全局视图 |
+| `a_list_setting_that_cannot_be_saved_changes_nothing` | 用 SQLite 触发器让写入失败：视图、排序和列表顺序都不变；移除触发器后可以正常保存 |
+| `old_or_unreadable_list_settings_open_with_defaults` | 设置不存在、为旧格式、JSON 损坏或出现未知值时都按默认值打开 |
+| `list_settings_belong_to_their_own_library` | 两个资料库的设置互不影响 |
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| 对照：app 相关文件换回 HEAD（不持久化） | 2 项失败 | `/tmp/joplin-claude-list-prefs-red.log` |
+| 对照：先改内存再写入 | 写入失败测试失败 | `/tmp/joplin-claude-list-prefs-order-red.log` |
+| 全量 | 1469 通过、0 失败 | `/tmp/joplin-claude-list-prefs-full.log` |
+
+补充：排序变更时，`prepare_navigation_commit` 会先写一次窗格和选中笔记的状态。排序不会改变这两项，所以这次写入与原值相同；即使随后排序写入失败，也不会留下不一致的状态。
+
+Codex 在 d431a9bbf 构建了独立候选包（sha256 `d8378b55c7430fd9eb8cf0d789f1a922ea003be13825c04e6f0975fa7b17d65d`），正在实机验证设置和删除行为。
+
+## 第九批：可读恢复失败时的中文说明（`18b57b1cd`）
+
+问题来自 evidence39：选择一个不是导出包的文件夹恢复时，提示中直接出现英文系统错误（`readable export I/O failed: No such file or directory`）。
+
+现在提示会用中文说明原因，并在末尾以“（详情：…）”附上原始错误，便于排查。核心校验逻辑没有改动。
+
+| 情况 | 提示原因 |
+| --- | --- |
+| 文件夹里没有 `manifest.json` | 所选文件夹不是可读导出包，请选择用“导出整个资料库为可读 HTML…”生成的文件夹 |
+| 有 manifest，但缺少所需的文件或文件夹 | 导出包不完整，可能已被移动或删改 |
+| manifest 无法解析 | manifest.json 无法读取，可能已损坏 |
+| 格式或版本不受支持 | 导出包的格式或版本不受支持 |
+| 附件与清单不一致 | 附件与清单记录不一致，可能已被修改 |
+
+以上各种情况的提示结尾都保留“未创建新资料库，当前资料库未改动”。是否存在 `manifest.json` 在后台任务中检查，不占用界面线程。
+
+测试：
+- `mounted_readable_restore_of_a_non_bundle_leaves_no_new_library`：在原有断言上增加对中文原因和“详情”的检查；
+- `mounted_readable_restore_of_a_damaged_bundle_says_what_is_wrong`：先真实导出一份，再分别写坏 manifest、删除 `notes` 目录，然后执行恢复并检查提示。
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| 对照：换回旧版 `library_backup.rs` | 2 项失败 | `/tmp/joplin-claude-restore-message-red.log` |
+| 全量 | 1470 通过 | `/tmp/joplin-claude-restore-message-full.log` |
+
+## 启动内存峰值调查（evidence44，未改代码）
+
+Codex 在已完成索引的 1666 篇隔离副本上测得空闲占用 93.7M，但峰值为 615.4M。原始数据见 `/tmp/joplin-claude-memory-evidence/startup-peak-2026-09-28.txt`。
+
+每 0.5 秒采样一次图形占用，结果如下：
+
+| 被测程序 | 启动时 | 之后 | 峰值 |
+| --- | --- | --- | --- |
+| 本应用（18b57b1cd release），空库 | 前 3.5 s 为 526 MB dirty | 降为 11 MB；约 10 s 处又短暂回到 530 MB | 613.3M |
+| 本应用，417 张图、OCR 已完成的库 | 前 2 s 为 526 MB | 降为 7.6 MB | 612.5M |
+| GPUI 0.2.2 自带的 `examples/hello_world.rs`，未改动，release 构建，完全不含本应用代码 | 前 2–3 s 为 524 MB dirty（两轮一致） | 降为约 10 MB，514 MB 计为可回收 | 576.4M / 573.3M |
+
+hello_world 进程中同样有 16 个 32 MiB 的 IOAccelerator（graphics）区域。GPUI 的 `metal_renderer.rs` 没有显式分配 32 MiB：它只创建一个命令队列（252 行），`maximum_drawable_count` 为 3（146 行），instance buffer 为 2 MiB，图集纹理至少 1024²。
+
+结论与边界：
+- 约 575 MB 的启动峰值在 GPUI/Metal 的最小程序中就会出现，本应用在此之上只多出约 40 MB。
+- 这块内存在连续绘制时处于 dirty 状态，停止绘制约一秒后转为可回收。
+- 驱动为什么保留这 512 MiB 没有做驱动层验证。在不修改 GPUI 或 Metal 使用方式的前提下，本应用无法直接消除这一峰值。
+- 因此不能宣称已满足启动峰值门槛。这是框架与驱动层面的限制，需要用户或 Codex 决定：接受并如实记录，还是投入修改 GPUI 渲染器。
+- 仍未测量：全新 OCR 队列、连续编辑、快速切换、图片缩放等交互场景下的占用。
+- 证据文件的 sha256：本应用 `342c4427593664fa766aa2525bced53cacea82e514bb5d85bd90669e448c5b34`，hello_world `a4283292a15a471a726d72bf76020c01dd9632f67901442ad7e8327ed0bb4d96`；hello_world 源码保存在 `/tmp/joplin-claude-memory-evidence/gpuihello-src`。
+
+### 当前源码检查点
+
+`18b57b1cd`（本节报告另行提交）。
 
