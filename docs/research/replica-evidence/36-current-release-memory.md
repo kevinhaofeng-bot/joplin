@@ -25,3 +25,9 @@ footprint 类别：IOAccelerator(graphics)526MB、IOSurface42MB、其他 IOAccel
 已确认差异主要在图形资源，尚未确定具体分配调用。直接阅读当前依赖 GPUI0.2.2 的 metal_atlas.rs / metal_renderer.rs：atlas 按需创建、默认1024²、上限16384²；renderer 包含全视口 path 中间纹理/MSAA，instance buffer 默认2MiB。仅是下一步排查线索，不能据静态代码断言526MB全来自某一纹理。需比较空库与同尺寸窗口、缩放窗口、图片/缩略图缓存及实际GPU分配。
 
 诊断进程已通过自己的原生退出菜单结束，不保留额外高内存测试进程。修改交 Claude，Codex 不改源代码。
+
+## 同窗口空库对照
+
+同一二进制、新建 `/tmp/joplin-empty-memory.xm40cs/library`（0篇、0资源），PID88142。CGWindowList 确认窗口1160×789；启动约26秒 RSS57136KiB，footprint84MB。完整输出在该目录 `footprint.txt`、`vmmap.txt`。
+
+空库：IOSurface42MB、IOAccelerator16MB，与真实库相近；graphics dirty7648KiB、reclaimable160MB。真实库 graphics dirty526MB、reclaimable0。因此不能将真实库约630MB说成固定的空窗口启动开销；加载内容后图形资源驻留/可回收状态差异是下一步排查重点。尚未锁定具体纹理、驱动账目或缓存行为，不能直接断言是缩略图泄漏。对照进程已正常退出。
