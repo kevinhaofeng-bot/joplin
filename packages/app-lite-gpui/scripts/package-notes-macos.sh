@@ -58,11 +58,21 @@ PLIST
 # No CFBundleDocumentTypes: installing must not change default file associations.
 # No icon: only the donor Velotype icon exists and a product icon has not been chosen.
 
+# Sign the whole bundle (the linker only signed the bare executable, whose
+# signature then does not match the bundle). With no identity configured the
+# signature is ad-hoc: valid for local use, not notarized.
+SIGN_IDENTITY="${JOPLIN_LITE_SIGN_IDENTITY:--}"
+codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" \
+  --timestamp=none "$APP_DIR"
+codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+if [ "$SIGN_IDENTITY" = "-" ]; then SIGNATURE="ad-hoc (not notarized)"; else SIGNATURE="$SIGN_IDENTITY"; fi
+
 {
   echo "app: $APP_NAME ($BUNDLE_ID) $VERSION ($BUILD_NUMBER)"
   echo "commit: $COMMIT"
   echo "worktree_dirty_for_app_sources: $DIRTY"
   echo "binary_sha256: $(shasum -a 256 "$APP_DIR/Contents/MacOS/$EXECUTABLE" | awk '{print $1}')"
+  echo "signature: $SIGNATURE"
   echo "cargo_lock_sha256: $(shasum -a 256 "$PROJECT_ROOT/Cargo.lock" | awk '{print $1}')"
   echo "rustc: $(rustc --version)"
   echo "built_at_utc: $STAMP"
