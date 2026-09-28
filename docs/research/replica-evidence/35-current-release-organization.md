@@ -29,3 +29,11 @@ Cmd 点击第二篇后两卡均高亮（`batch-selected.png`），实际点击�
 继续读 `app/mod.rs` 320–350：`MoveSelectedNote` 和 `AddTagToSelectedNote` 取 `selected_note_ids()`，而 `SetSelectedNoteTags` 与 `RemoveTagFromSelectedNote` 仅取 `selected_note_for_organization()` 返回的一篇 ID。所以清空/移除标签确实未实现批量作用，即使选区保留多篇也只会处理当前一篇。此前关于“可能只是选区重置”的不确定性不能掩盖这个已明确的实现缺口。
 
 交 Claude 修复：批量清空/移除应使用明确的选中集合，或提供清晰的单篇/多篇操作入口；按既定完整批量组织目标，不应只改文案而丢掉批量移除能力。补多篇标签交集/并集、部分已标记、操作后过滤结果、重开持久化回归。Codex 未改实现。
+
+## 批量软删除与恢复通过（本样本）
+
+实际切到全部笔记、普通点击首篇并 Cmd 点击第二篇，再用原生“移至废纸篓”；数据库两篇 deleted_time 同为 `1790588857372`。进入废纸篓重新多选，按钮明确显示“恢复 2 篇笔记”，点击后两篇恢复。
+
+`before-batch-trash.txt` 与 `after-batch-restore.txt` 对比退出0、无差异：逐条比较 ID、notebook_id、deleted_time（恢复后0）、body_html 长度及完整十六进制正文、所有 note_tags。文件与 `batch-trash.png`、`batch-restore-button.png` 均在隔离根目录。保存的两篇正文、归属及标签关系均未丢失。
+
+不覆盖永久删除、资源回收保留期、重启后生命周期状态；未删除任何正式资料。
