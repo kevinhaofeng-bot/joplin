@@ -10179,6 +10179,57 @@ async fn mounted_paste_from_another_app_keeps_formatting_and_stores_its_images(
     );
 }
 
+/// Evernote's `computeSliceDepths`: pasted HTML that starts with a heading,
+/// list, table or code block keeps its own blocks; inline content joins the
+/// paragraph at the caret.
+#[gpui::test]
+async fn mounted_paste_from_another_app_merges_like_evernote(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let cases = [
+        ("<h2>标题</h2><p>尾</p>", "<p>前</p><h2>标题</h2><p>尾后</p>"),
+        ("<b>粗</b>", "<p>前<strong>粗</strong>后</p>"),
+        ("<ul><li>项</li></ul>", "<p>前</p><ul><li>项</li></ul><p>后</p>"),
+    ];
+    let notes: Vec<_> = cases
+        .iter()
+        .map(|_| {
+            repository
+                .create_note(CreateNote {
+                    title: "目标".into(),
+                    notebook_id: None,
+                    document: rich_document("前后"),
+                })
+                .unwrap()
+        })
+        .collect();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    for ((html, expected), note) in cases.into_iter().zip(&notes) {
+        open_note_body(&view, &note.id, cx);
+        cx.simulate_keystrokes("cmd-end left");
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell
+                    .complete_clipboard_payload_for_test(
+                        crate::native_editor::images::ClipboardPayload {
+                            html: Some(html.into()),
+                            ..Default::default()
+                        },
+                        window,
+                        shell_cx,
+                    )
+                    .unwrap();
+            });
+        });
+        redraw(cx);
+        cx.dispatch_action(crate::app::SyncCurrent);
+        redraw(cx);
+        let stored = repository.load_note(&note.id).unwrap().unwrap();
+        assert_eq!(stored.body_html, expected, "{html}");
+    }
+}
+
 /// A copy from another library still pastes its image: the library that
 /// lacks it imports the copy's exported file after checking its SHA-256,
 /// as Evernote hands the copied `resources` to a paste.

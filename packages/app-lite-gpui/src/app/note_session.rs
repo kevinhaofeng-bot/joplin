@@ -3166,19 +3166,33 @@ impl NoteSession {
                 }
             }
         }
-        let blocks = pasted
+        let blocks: Vec<_> = pasted
             .document
             .blocks()
             .iter()
             .cloned()
             .flat_map(|block| resolve_pasted_block(block, &imported, &failed))
             .collect();
+        // Evernote `clipboardparser.ts` `computeSliceDepths`/`shouldPreserve`:
+        // a leading heading, list, table or code block keeps its own block
+        // instead of merging into the caret's paragraph.
+        use app_lite_core::document::Block;
+        let open_start = !matches!(
+            blocks.first(),
+            Some(
+                Block::Heading { .. }
+                    | Block::List { .. }
+                    | Block::Table { .. }
+                    | Block::Code { .. }
+            )
+        );
+        let open_end = open_start || blocks.len() > 1;
         let html = CanonicalDocument::from_blocks(blocks)
             .to_canonical_html()
             .as_str()
             .to_owned();
         let mut outcome =
-            self.paste_canonical_html(&html, available, Vec::new(), (true, true), cx)?;
+            self.paste_canonical_html(&html, available, Vec::new(), (open_start, open_end), cx)?;
         outcome.unavailable = failed.len();
         Ok(outcome)
     }
