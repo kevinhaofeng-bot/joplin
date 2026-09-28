@@ -964,20 +964,70 @@ const MAX_CLIPBOARD_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A new private directory for one copy's resource files. Older ones are
 /// removed: the clipboard holds only the latest copy.
-fn fresh_clipboard_directory() -> std::io::Result<PathBuf> {
-    let root = std::env::temp_dir().join("joplin-lite-clipboard");
+/// A copy replaces only its owner's earlier export: another running
+/// instance may still have its own copy on the pasteboard. Exports left by
+/// instances that have exited are removed.
+pub(crate) fn fresh_clipboard_directory() -> std::io::Result<PathBuf> {
+    fresh_clipboard_directory_in(
+        &std::env::temp_dir().join("joplin-lite-clipboard"),
+        &clipboard_export_owner(),
+    )
+}
+
+/// The process; in tests, the test's thread, since each test has its own
+/// clipboard but all share one process.
+fn clipboard_export_owner() -> String {
+    #[cfg(test)]
+    {
+        let thread = format!("{:?}", std::thread::current().id());
+        let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
+        format!("{}-t{thread}", std::process::id())
+    }
+    #[cfg(not(test))]
+    {
+        std::process::id().to_string()
+    }
+}
+
+pub(crate) fn fresh_clipboard_directory_in(root: &Path, owner: &str) -> std::io::Result<PathBuf> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&root)?;
-    if let Ok(entries) = std::fs::read_dir(&root) {
+        .create(root)?;
+    if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
-            let _ = std::fs::remove_dir_all(entry.path());
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stale = if name == owner {
+                true
+            } else if let Some(pid) = name
+                .split('-')
+                .next()
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            {
+                !process_is_running(pid)
+            } else {
+                // The earlier layout: one export directly under the root.
+                name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            };
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
         }
     }
-    let directory = root.join(uuid::Uuid::new_v4().simple().to_string());
+    let owned = root.join(owner);
+    std::fs::DirBuilder::new().mode(0o700).create(&owned)?;
+    let directory = owned.join(uuid::Uuid::new_v4().simple().to_string());
     std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
     Ok(directory)
+}
+
+fn process_is_running(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// The resource's own file name, made safe; numbered only on a clash.

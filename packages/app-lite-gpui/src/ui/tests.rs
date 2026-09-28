@@ -10187,9 +10187,15 @@ async fn mounted_paste_from_another_app_merges_like_evernote(cx: &mut TestAppCon
     cx.update(|app| crate::components::init(app));
     let (_profile, repository) = repository();
     let cases = [
-        ("<h2>标题</h2><p>尾</p>", "<p>前</p><h2>标题</h2><p>尾后</p>"),
+        (
+            "<h2>标题</h2><p>尾</p>",
+            "<p>前</p><h2>标题</h2><p>尾后</p>",
+        ),
         ("<b>粗</b>", "<p>前<strong>粗</strong>后</p>"),
-        ("<ul><li>项</li></ul>", "<p>前</p><ul><li>项</li></ul><p>后</p>"),
+        (
+            "<ul><li>项</li></ul>",
+            "<p>前</p><ul><li>项</li></ul><p>后</p>",
+        ),
     ];
     let notes: Vec<_> = cases
         .iter()
@@ -10268,6 +10274,11 @@ async fn mounted_paste_into_another_library_imports_the_copied_image(cx: &mut Te
     open_note_body(&first_view, &source.id, &mut first_window);
     first_window.dispatch_action(SelectAll);
     first_window.dispatch_action(Copy);
+    // Another clipboard owner copies in between (another app instance, or a
+    // test running in parallel); it must not delete this copy's files.
+    std::thread::spawn(|| crate::app::note_session::fresh_clipboard_directory().unwrap())
+        .join()
+        .unwrap();
 
     let second_model = first_window
         .cx

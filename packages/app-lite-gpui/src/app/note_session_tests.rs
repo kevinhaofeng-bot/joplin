@@ -3285,3 +3285,52 @@ async fn stale_background_codec_failure_cannot_poison_a_newer_fixed_generation(
         "the corrected non-nested list must be durable"
     );
 }
+
+/// A copy removes its owner's earlier export and those of exited instances,
+/// never another running owner's: that one may still be on the pasteboard
+/// (another app instance; in tests, another test's clipboard).
+#[test]
+fn a_copy_keeps_exports_that_other_running_owners_may_still_paste() {
+    use super::note_session::fresh_clipboard_directory_in;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let exported = |owner: &str| {
+        let directory = fresh_clipboard_directory_in(root, owner).unwrap();
+        let file = directory.join("photo.png");
+        std::fs::write(&file, b"png").unwrap();
+        file
+    };
+    let mut exited = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let exited_pid = exited.id().to_string();
+    exited.wait().unwrap();
+    let legacy = root.join("0123456789abcdef0123456789abcdef");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let me = std::process::id().to_string();
+    let other = format!("{}-t2", unsafe { libc::getppid() });
+    let other_test = format!("{me}-t999999");
+
+    let exited_export = exported(&exited_pid);
+    let other_export = exported(&other);
+    let other_test_export = exported(&other_test);
+    let earlier = exported(&me);
+    let latest = exported(&me);
+
+    assert!(
+        other_export.is_file(),
+        "another running instance keeps its copy"
+    );
+    assert!(
+        other_test_export.is_file(),
+        "another owner in this process keeps its copy"
+    );
+    assert!(latest.is_file());
+    assert!(!earlier.exists(), "this owner's earlier copy is replaced");
+    assert!(
+        !exited_export.exists(),
+        "an exited instance's copy is removed"
+    );
+    assert!(
+        !legacy.exists(),
+        "the earlier single-level layout is removed"
+    );
+}
