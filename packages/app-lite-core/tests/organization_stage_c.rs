@@ -180,7 +180,7 @@ fn moving_and_incrementally_editing_tags_preserves_durable_relationship_order() 
 }
 
 #[test]
-fn deleting_notebook_rehomes_notes_and_deleting_tag_removes_its_route_relation() {
+fn deleting_notebook_trashes_notes_and_deleting_tag_removes_its_route_relation() {
     // A soft-deleted active organization must never leave a live note pointing
     // at an unavailable notebook/tag. The next AppModel commit can therefore
     // deterministically fall back without hydrating a wrong session.
@@ -202,7 +202,7 @@ fn deleting_notebook_rehomes_notes_and_deleting_tag_removes_its_route_relation()
         .load_note(&note)
         .expect("load note")
         .expect("note");
-    assert_eq!(repaired.notebook_id, default.id);
+    assert!(repaired.deleted_time.is_some(), "the note went to Trash");
     assert!(repaired.tag_ids.is_empty());
     let index = repository
         .list_navigation_index()
@@ -213,8 +213,154 @@ fn deleting_notebook_rehomes_notes_and_deleting_tag_removes_its_route_relation()
 
     let reopened = LibraryRepository::open(path).expect("reopen repository");
     let persisted = reopened.load_note(&note).expect("reload").expect("note");
-    assert_eq!(persisted.notebook_id, default.id);
+    assert!(persisted.deleted_time.is_some());
     assert!(persisted.tag_ids.is_empty());
+    reopened.restore_note(&note).expect("restore");
+    let restored = reopened.load_note(&note).expect("reload").expect("note");
+    assert_eq!(restored.notebook_id, default.id, "its notebook is gone");
+}
+
+/// Evernote's delete-notebook confirmation promises "Any notes in the
+/// notebook will be moved to Trash." (main-readable 32150 localization
+/// catalog `ModalManager.deleteNotebook.confirmation`), and the default
+/// notebook cannot be deleted.
+#[test]
+fn deleting_a_notebook_moves_its_notes_to_trash_whole_and_reversibly() {
+    let (_profile, path, repository) = repository();
+    let notebook = repository.create_notebook("旧本", None).unwrap();
+    let other = repository.create_notebook("他本", None).unwrap();
+    let image = repository
+        .import_image(b"notebook image", "a.png", "image/png", "png")
+        .unwrap();
+    let with_image = repository
+        .create_note(CreateNote {
+            title: "带图".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: image_document(&[image.clone()]),
+        })
+        .unwrap();
+    repository
+        .save_note(SaveNote {
+            id: with_image.id.clone(),
+            expected_revision: with_image.revision,
+            title: "带图 改".into(),
+            document: image_document(&[image.clone()]),
+            resource_ids: vec![image.clone()],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    let plain = create_note(&repository, "纯文字", Some(notebook.id.clone()));
+    let already_trashed = create_note(&repository, "早已删除", Some(notebook.id.clone()));
+    repository.trash_note(&already_trashed).unwrap();
+    let elsewhere = create_note(&repository, "他本笔记", Some(other.id.clone()));
+    let database = Connection::open(&path).unwrap();
+    let count = |sql: &str, id: &str| {
+        database
+            .query_row(sql, [id], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let history = |id: &NoteId| {
+        count(
+            "SELECT count(*) FROM note_revisions WHERE note_id = ?1",
+            id.as_str(),
+        )
+    };
+    let history_before = history(&with_image.id);
+    let trashed_at = repository
+        .load_note(&already_trashed)
+        .unwrap()
+        .unwrap()
+        .deleted_time;
+
+    let default = repository.default_notebook().unwrap();
+    assert!(repository.delete_notebook(&default.id).is_err());
+
+    // A failure part-way leaves every note and the notebook as they were.
+    database
+        .execute_batch(&format!(
+            "CREATE TRIGGER abort_notebook_trash BEFORE UPDATE OF deleted_time ON notes
+             WHEN NEW.id = '{}' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            plain.as_str()
+        ))
+        .unwrap();
+    assert!(repository.delete_notebook(&notebook.id).is_err());
+    assert!(
+        repository
+            .load_note(&with_image.id)
+            .unwrap()
+            .unwrap()
+            .deleted_time
+            .is_none()
+    );
+    assert!(
+        repository
+            .list_navigation_index()
+            .unwrap()
+            .notebooks
+            .iter()
+            .any(|candidate| candidate.id == notebook.id)
+    );
+    database
+        .execute_batch("DROP TRIGGER abort_notebook_trash")
+        .unwrap();
+
+    repository.delete_notebook(&notebook.id).unwrap();
+    drop(repository);
+    let repository = LibraryRepository::open(&path).unwrap();
+    for id in [&with_image.id, &plain] {
+        let note = repository.load_note(id).unwrap().unwrap();
+        assert!(note.deleted_time.is_some(), "moved to Trash");
+        assert_eq!(note.notebook_id, notebook.id);
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM sync_outbox WHERE entity_id = ?1 AND operation = 'trash'",
+                id.as_str()
+            ),
+            1
+        );
+    }
+    assert_eq!(
+        repository
+            .load_note(&already_trashed)
+            .unwrap()
+            .unwrap()
+            .deleted_time,
+        trashed_at,
+        "a note already in Trash is left alone"
+    );
+    assert!(
+        repository
+            .load_note(&elsewhere)
+            .unwrap()
+            .unwrap()
+            .deleted_time
+            .is_none()
+    );
+    assert_eq!(
+        repository
+            .list_notes(ListQuery::for_route(LibraryRoute::Trash))
+            .unwrap()
+            .len(),
+        3
+    );
+
+    repository.restore_note(&with_image.id).unwrap();
+    let restored = repository.load_note(&with_image.id).unwrap().unwrap();
+    assert_eq!(restored.notebook_id, default.id);
+    assert_eq!(restored.title, "带图 改");
+    assert_eq!(history(&with_image.id), history_before, "history is kept");
+    assert_eq!(
+        repository.read_resource_bytes(&image).unwrap().unwrap(),
+        b"notebook image"
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM note_resources WHERE note_id = ?1",
+            with_image.id.as_str()
+        ),
+        1,
+        "the attachment stays with its note"
+    );
 }
 
 #[test]

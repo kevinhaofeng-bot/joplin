@@ -273,7 +273,7 @@ impl PendingDestructiveAction {
     fn label(&self) -> String {
         match self {
             Self::DeleteStack(_) => "确认解散当前笔记本组？组内笔记本和笔记会保留。".to_owned(),
-            Self::DeleteNotebook(_) => "确认删除当前笔记本？其中笔记会移至默认笔记本。".to_owned(),
+            Self::DeleteNotebook(_) => "确认删除当前笔记本？笔记本中的任何笔记都将被移动到废纸篓。".to_owned(),
             Self::DeleteTag(_) => "确认删除当前标签？笔记正文不会删除。".to_owned(),
             Self::PurgeNote(_) => "确认永久删除当前笔记？此操作不可撤销。".to_owned(),
             Self::PurgeNotes(ids) => {

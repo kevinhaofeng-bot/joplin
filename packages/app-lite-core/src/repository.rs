@@ -2439,10 +2439,11 @@ impl LibraryRepository {
         Ok(())
     }
 
-    /// Retires a non-default notebook in one transaction and moves every
-    /// surviving durable note relationship to the default notebook. Notes are
-    /// never left pointing at a route that the navigation index no longer
-    /// exposes, including notes currently in Trash that may later be restored.
+    /// Retires a non-default notebook and moves its notes to Trash in one
+    /// transaction, as Evernote's delete confirmation promises ("Any notes in
+    /// the notebook will be moved to Trash."). Notes keep their attachments,
+    /// history and notebook id; restoring one whose notebook is gone puts it
+    /// in the default notebook.
     pub fn delete_notebook(&self, id: &NotebookId) -> Result<(), LibraryError> {
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
@@ -2458,25 +2459,25 @@ impl LibraryRepository {
         if is_default != 0 {
             return Err(LibraryError::DefaultNotebookCannotBeDeleted);
         }
-        let fallback = default_notebook_id(&transaction)?;
-        let note_ids = note_ids_for_notebook(&transaction, id)?;
+        let note_ids = active_note_ids_for_notebook(&transaction, id)?;
         let mut events = vec![LibraryEvent::OrganizationChanged];
         for note_id in note_ids {
             let note_revision = next_note_revision_any(&transaction, &note_id)?;
             let updated = next_note_time(&transaction, &note_id, now)?;
             transaction.execute(
-                "UPDATE notes SET notebook_id = ?2, updated_time = ?3, revision = ?4 WHERE id = ?1",
-                params![note_id.as_str(), fallback.as_str(), updated, note_revision],
+                "UPDATE notes SET deleted_time = ?2, updated_time = ?3, revision = ?4 WHERE id = ?1 AND deleted_time = 0",
+                params![note_id.as_str(), now, updated, note_revision],
             )?;
-            queue_search(&transaction, &note_id, updated, "organization")?;
+            queue_search(&transaction, &note_id, updated, "trash")?;
             enqueue_sync(
                 &transaction,
                 self.id_source.as_ref(),
                 &EntityRef::Note(note_id.clone()),
                 note_revision,
-                "move",
+                "trash",
                 updated,
             )?;
+            events.push(LibraryEvent::NoteTrashed(note_id.clone()));
             events.push(LibraryEvent::NoteProjectionChanged(note_id.clone()));
             events.push(LibraryEvent::SearchProjectionQueued(note_id.clone()));
             events.push(LibraryEvent::SyncQueued(EntityRef::Note(note_id)));
@@ -4188,12 +4189,12 @@ fn note_tag_events(note_id: &NoteId) -> Vec<LibraryEvent> {
     ]
 }
 
-fn note_ids_for_notebook(
+fn active_note_ids_for_notebook(
     transaction: &Transaction<'_>,
     notebook_id: &NotebookId,
 ) -> Result<Vec<NoteId>, LibraryError> {
-    let mut statement =
-        transaction.prepare("SELECT id FROM notes WHERE notebook_id = ?1 ORDER BY id")?;
+    let mut statement = transaction
+        .prepare("SELECT id FROM notes WHERE notebook_id = ?1 AND deleted_time = 0 ORDER BY id")?;
     statement
         .query_map([notebook_id.as_str()], |row| {
             NoteId::parse(row.get::<_, String>(0)?).map_err(invalid_column)

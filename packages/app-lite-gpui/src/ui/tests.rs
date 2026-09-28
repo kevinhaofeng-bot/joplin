@@ -3818,13 +3818,23 @@ async fn mounted_organization_panel_renames_and_deletes_the_active_notebook_by_i
             session_before_confirmation
         );
     });
-    assert_eq!(
+    let after_cancel = repository
+        .load_note(&note.id)
+        .expect("read note after cancelled confirmation")
+        .expect("cancel must be a database no-op");
+    assert_eq!(after_cancel.notebook_id, notebook.id);
+    assert!(
+        after_cancel.deleted_time.is_none(),
+        "cancel trashes nothing"
+    );
+    assert!(
         repository
-            .load_note(&note.id)
-            .expect("read note after cancelled confirmation")
-            .expect("cancel must be a database no-op")
-            .notebook_id,
-        notebook.id
+            .list_navigation_index()
+            .unwrap()
+            .notebooks
+            .iter()
+            .any(|candidate| candidate.id == notebook.id),
+        "cancel keeps the notebook"
     );
 
     let delete = cx
@@ -3837,20 +3847,24 @@ async fn mounted_organization_panel_renames_and_deletes_the_active_notebook_by_i
         .expect("second destructive click reopens a typed confirmation");
     cx.simulate_click(confirm.center(), Modifiers::default());
     redraw(cx);
-    assert_eq!(
-        repository
-            .load_note(&note.id)
-            .expect("read rehomed note")
-            .expect("note remains after container deletion")
-            .notebook_id,
-        default_notebook,
-        "ordinary notebook deletion must rehome its note rather than trash or purge it"
+    // Evernote: "Any notes in the notebook will be moved to Trash."
+    let trashed = repository
+        .load_note(&note.id)
+        .expect("read trashed note")
+        .expect("note remains after container deletion");
+    assert!(
+        trashed.deleted_time.is_some(),
+        "the note is in Trash, not purged"
     );
     view.read_with(cx, |shell, app| {
         let model = shell.model.read(app);
         assert_eq!(model.navigation().route(), &LibraryRoute::AllNotes);
-        assert_eq!(model.navigation().selected_note_id(), Some(&note.id));
-        assert_eq!(model.active_session_note_id(), Some(&note.id));
+        assert_eq!(model.navigation().selected_note_id(), None);
+        assert_eq!(
+            model.active_session_note_id(),
+            None,
+            "no editor on a trashed note"
+        );
         assert!(
             model
                 .navigation_index()
@@ -3859,6 +3873,14 @@ async fn mounted_organization_panel_renames_and_deletes_the_active_notebook_by_i
                 .all(|candidate| candidate.id != notebook.id)
         );
     });
+    repository
+        .restore_note(&note.id)
+        .expect("restore from Trash");
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().notebook_id,
+        default_notebook,
+        "a restored note whose notebook is gone lands in the default notebook"
+    );
 }
 
 #[gpui::test]

@@ -549,3 +549,149 @@ fn an_unsaved_edit_overtaken_by_a_remote_version_is_kept_as_a_conflict_copy() {
         "a trashed copy is settled"
     );
 }
+
+/// Evernote moves a deleted notebook's notes to Trash (main-readable 32150
+/// localization `ModalManager.deleteNotebook.confirmation`). Another device
+/// must see the same Trash, and a restore there must not bring the notebook
+/// back or leave a note pointing at it.
+#[test]
+fn a_notebook_deleted_on_one_device_leaves_its_notes_in_trash_on_both() {
+    let (_server_root, store) = server();
+    let a = client();
+    let notebook = a.repo.create_notebook("旧本", None).unwrap();
+    let image = a
+        .repo
+        .import_image(b"synced notebook image", "a.png", "image/png", "png")
+        .unwrap();
+    let with_image = a
+        .repo
+        .create_note(CreateNote {
+            title: "带图".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Image {
+                    resource_id: image.clone(),
+                    alt: "图".into(),
+                    display_width: None,
+                    link: None,
+                }],
+            }]),
+        })
+        .unwrap();
+    let edited = a
+        .repo
+        .create_note(CreateNote {
+            title: "改过".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: text("第一版"),
+        })
+        .unwrap();
+    save(&a, &edited.id, "改过", "第二版");
+    let earlier = a
+        .repo
+        .create_note(CreateNote {
+            title: "早已删除".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: text("早就在废纸篓"),
+        })
+        .unwrap();
+    a.repo.trash_note(&earlier.id).unwrap();
+    sync(&a, &store);
+    let b = client();
+    sync(&b, &store);
+
+    let history = |client: &Client, id: &NoteId| -> i64 {
+        rusqlite::Connection::open(client._root.path().join("library.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM note_revisions WHERE note_id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let history_before = history(&a, &edited.id);
+    a.repo.delete_notebook(&notebook.id).unwrap();
+    sync(&a, &store);
+    sync(&b, &store);
+
+    for id in [&with_image.id, &edited.id, &earlier.id] {
+        let note = b.repo.load_note(id).unwrap().expect("still on B");
+        assert!(
+            note.deleted_time.is_some(),
+            "{} is in Trash on B",
+            note.title
+        );
+    }
+    assert_eq!(
+        b.repo.load_note(&edited.id).unwrap().unwrap().body_html,
+        a.repo.load_note(&edited.id).unwrap().unwrap().body_html
+    );
+    assert_eq!(
+        b.repo.read_resource_bytes(&image).unwrap().unwrap(),
+        b"synced notebook image"
+    );
+    assert_eq!(
+        history(&a, &edited.id),
+        history_before,
+        "A keeps the history"
+    );
+    assert!(
+        b.repo
+            .list_navigation_index()
+            .unwrap()
+            .notebooks
+            .iter()
+            .all(|candidate| candidate.id != notebook.id)
+    );
+
+    b.repo.restore_note(&with_image.id).unwrap();
+    let default = b.repo.default_notebook().unwrap().id;
+    assert_eq!(
+        b.repo
+            .load_note(&with_image.id)
+            .unwrap()
+            .unwrap()
+            .notebook_id,
+        default
+    );
+    sync(&b, &store);
+    sync(&a, &store);
+
+    let back = a.repo.load_note(&with_image.id).unwrap().unwrap();
+    assert!(back.deleted_time.is_none(), "the restore reaches A");
+    assert_eq!(back.notebook_id, a.repo.default_notebook().unwrap().id);
+    assert_eq!(
+        a.repo.read_resource_bytes(&image).unwrap().unwrap(),
+        b"synced notebook image"
+    );
+    for client in [&a, &b] {
+        assert!(
+            client
+                .repo
+                .load_note(&edited.id)
+                .unwrap()
+                .unwrap()
+                .deleted_time
+                .is_some()
+        );
+        let index = client.repo.list_navigation_index().unwrap();
+        assert!(
+            index
+                .notebooks
+                .iter()
+                .all(|candidate| candidate.id != notebook.id),
+            "not resurrected"
+        );
+        for note in client.repo.list_notes(ListQuery::default()).unwrap() {
+            assert!(
+                index
+                    .notebooks
+                    .iter()
+                    .any(|candidate| candidate.id == note.notebook_id),
+                "no live note points at a missing notebook"
+            );
+        }
+    }
+}
