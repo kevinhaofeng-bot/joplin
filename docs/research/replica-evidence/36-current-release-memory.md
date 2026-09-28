@@ -39,3 +39,9 @@ footprint 类别：IOAccelerator(graphics)526MB、IOSurface42MB、其他 IOAccel
 随后 `footprint-late.txt` 仍报告物理占用620MB、峰值631MB，graphics526MB且reclaimable0。两个工具对purgeable与计费账目的表述不同；不能将512MiB直接从physical footprint扣除，也不能据此断言实际不可回收或确定泄漏。至少可排除“仅启动瞬时峰值，稍候自然回落至低内存”的解释。
 
 下一步实现方应对这16个32MiB区域追踪Metal/驱动分配来源，并比较内容路径和空库；当前没有证据把它们直接归因于某个atlas、缩略图或instance buffer。原始输出保存在 `/tmp/joplin-current-memory.tPavET/`。进程经其自身原生退出菜单正常退出；未修改实现代码或原资料库。
+
+## Claude对照实验的独立原始输出核对
+
+Codex读取Claude scratchpad `mem-out/{empty,text,images,top8,top8-small}/footprint.txt`（基路径 `/private/tmp/claude-501/-Users-kevinhao-Projects-joplin/7ec497ae-baa7-4faf-80bf-dc5acc1fff91/scratchpad`）。可确认记录的数字：empty71MB、text82MB、images614MB、top8 93MB、top8-small102MB；images的graphics dirty530MB/reclaimable0，其余这些样本graphics dirty约7.5–12MB/reclaimable514MB。来自施工方合成fixture，未独立核对每个fixture内容及完整运行控制，不能替代原真实规模隔离库复测。
+
+审读 `ui/mod.rs::spawn_derived_text_scheduler` 1399–1522：每次Some(Ok(...))分支调用shell_cx.notify，DerivedTextIndexed也触发notify，即使未刷新活动搜索。与Claude提出的OCR工作/刷新关联线索相符，但这是静态可行路径而不是因果证明。需要同一fixture、相同窗口条件、OCR前后及受控刷新比较，且不能靠禁用OCR让性能门表面通过。当前仍未认定根因或修复。
