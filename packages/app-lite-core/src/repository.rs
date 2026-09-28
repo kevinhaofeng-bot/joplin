@@ -1,3 +1,4 @@
+use crate::PastedImageJob;
 mod sync_store;
 pub use sync_store::{RemoteResourceRef, SyncConflict, SyncFailure, SyncInflight};
 
@@ -1584,6 +1585,76 @@ impl LibraryRepository {
     /// returned. Attachments are untouched, as for one note.
     pub fn trash_notes(&self, ids: &[NoteId]) -> Result<(), LibraryError> {
         self.set_deleted(ids, true)
+    }
+
+    /// Records web images pasted into `note_id` that are still to be
+    /// fetched, so a fetch cut short by closing the note or quitting resumes.
+    pub fn add_pasted_image_jobs(
+        &self,
+        note_id: &NoteId,
+        jobs: &[PastedImageJob],
+    ) -> Result<(), LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        for job in jobs {
+            transaction.execute(
+                "INSERT INTO pasted_image_jobs (id, note_id, url, alt, link, attempts, created_time)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                 ON CONFLICT(id) DO NOTHING",
+                params![job.id.as_str(), note_id.as_str(), &job.url, &job.alt, &job.link, now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Outstanding pasted-image fetches, oldest first; of one note, or all.
+    pub fn pasted_image_jobs(
+        &self,
+        note_id: Option<&NoteId>,
+    ) -> Result<Vec<PastedImageJob>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, note_id, url, alt, link, attempts FROM pasted_image_jobs
+             WHERE ?1 IS NULL OR note_id = ?1 ORDER BY created_time, rowid",
+        )?;
+        statement
+            .query_map([note_id.map(NoteId::as_str)], |row| {
+                Ok(PastedImageJob {
+                    id: ResourceId::new(row.get::<_, String>(0)?).map_err(invalid_column)?,
+                    note_id: NoteId::parse(row.get::<_, String>(1)?).map_err(invalid_column)?,
+                    url: row.get(2)?,
+                    alt: row.get(3)?,
+                    link: row.get(4)?,
+                    attempts: row.get::<_, i64>(5)?.max(0) as u32,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn remove_pasted_image_job(&self, id: &ResourceId) -> Result<(), LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        connection.execute("DELETE FROM pasted_image_jobs WHERE id = ?1", [id.as_str()])?;
+        Ok(())
+    }
+
+    /// Counts one more unfinished attempt; returns the new count, or None
+    /// when the job is gone.
+    pub fn record_pasted_image_attempt(
+        &self,
+        id: &ResourceId,
+    ) -> Result<Option<u32>, LibraryError> {
+        let connection = self.connection.lock().expect("library mutex poisoned");
+        Ok(connection
+            .query_row(
+                "UPDATE pasted_image_jobs SET attempts = attempts + 1 WHERE id = ?1 RETURNING attempts",
+                [id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|attempts| attempts.max(0) as u32))
     }
 
     pub fn restore_note(&self, id: &NoteId) -> Result<(), LibraryError> {

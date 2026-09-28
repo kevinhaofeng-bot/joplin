@@ -1,5 +1,4 @@
 use app_lite_core::document::Block;
-#[cfg(feature = "test-support")]
 use app_lite_core::schema::SCHEMA_VERSION;
 use app_lite_core::{
     AssociateResource, CanonicalDocument, CreateNote, EditJournalEntry, LibraryError,
@@ -1648,7 +1647,7 @@ fn v11_library_upgrades_by_adding_only_the_deferred_table() {
     // A v11 library whose default notebook was replaced by an adopted one.
     connection
         .execute_batch(
-            "DROP TABLE sync_deferred; UPDATE notebooks SET is_default=0; PRAGMA user_version = 11;",
+            "DROP TABLE sync_deferred; DROP TABLE pasted_image_jobs; UPDATE notebooks SET is_default=0; PRAGMA user_version = 11;",
         )
         .unwrap();
     let count = |connection: &Connection, table: &str| {
@@ -1673,10 +1672,95 @@ fn v11_library_upgrades_by_adding_only_the_deferred_table() {
         "no notebook created"
     );
     assert_eq!(count(&connection, "sync_deferred"), 0);
+    assert_eq!(count(&connection, "pasted_image_jobs"), 0);
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        12
+        SCHEMA_VERSION
     );
+}
+
+/// v12 → v13 only adds the pasted-image job table: note bodies, revisions
+/// and notebooks are untouched, and opening again changes nothing more.
+#[test]
+fn v12_library_upgrades_by_adding_only_the_pasted_image_job_table() {
+    let profile = tempdir().unwrap();
+    let path = profile.path().join("library.sqlite");
+    let repository = LibraryRepository::open(&path).unwrap();
+    let note = repository
+        .create_note(app_lite_core::CreateNote {
+            title: "升级前".into(),
+            notebook_id: None,
+            document: app_lite_core::CanonicalDocument::parse_html("<p>正文</p>").unwrap(),
+        })
+        .unwrap();
+    drop(repository);
+    let connection = Connection::open(&path).unwrap();
+    // An odd but valid v12 body that a rewrite would normalise differently.
+    connection
+        .execute_batch(
+            "DROP TABLE pasted_image_jobs; UPDATE notebooks SET is_default=0; PRAGMA user_version = 12;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE notes SET body_html = '<p>正文  原样</p>' WHERE id = ?1",
+            [note.id.as_str()],
+        )
+        .unwrap();
+    let state = |connection: &Connection| {
+        connection
+            .query_row(
+                "SELECT body_html, revision, (SELECT count(*) FROM notebooks), (SELECT count(*) FROM sync_outbox) FROM notes WHERE id = ?1",
+                [note.id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let before = state(&connection);
+    drop(connection);
+    for open in 0..2 {
+        let repository = LibraryRepository::open(&path).unwrap();
+        if open == 0 {
+            repository
+                .add_pasted_image_jobs(
+                    &note.id,
+                    &[app_lite_core::PastedImageJob {
+                        id: app_lite_core::ResourceId::new("0123456789abcdef0123456789abcdef")
+                            .unwrap(),
+                        note_id: note.id.clone(),
+                        url: "https://example.com/a.png".into(),
+                        alt: "图".into(),
+                        link: None,
+                        attempts: 0,
+                    }],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            repository.pasted_image_jobs(Some(&note.id)).unwrap().len(),
+            1
+        );
+        drop(repository);
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            state(&connection),
+            before,
+            "open {open}: nothing else changes"
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
 }

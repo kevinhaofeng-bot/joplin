@@ -4,9 +4,13 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 /// v12: remote note changes waiting for an attachment that has not arrived
 /// yet, kept (instead of skipped) and applied once it has.
+/// Images pasted from another app that are still being fetched; each note
+/// body meanwhile holds a link to the image's source (local only, never
+/// synced).
+const PASTED_IMAGE_JOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS pasted_image_jobs (id TEXT PRIMARY KEY NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE, url TEXT NOT NULL, alt TEXT NOT NULL, link TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_time INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS pasted_image_jobs_note_idx ON pasted_image_jobs(note_id);";
 const SYNC_DEFERRED_TABLE: &str = "CREATE TABLE IF NOT EXISTS sync_deferred (entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, op_id TEXT NOT NULL, revision INTEGER NOT NULL, change_json TEXT NOT NULL, created_time INTEGER NOT NULL, PRIMARY KEY(entity_type, entity_id));";
 /// The durable identity of the extractor implementation currently compiled
 /// into the client. A future extractor changes this one value; v10 reopen
@@ -49,6 +53,12 @@ pub(crate) fn migrate_schema(
     if version == 11 {
         transaction.execute_batch(SYNC_DEFERRED_TABLE)?;
         transaction.execute_batch("PRAGMA user_version = 12")?;
+        version = 12;
+    }
+    // v12 -> v13 likewise only adds a table.
+    if version == 12 {
+        transaction.execute_batch(PASTED_IMAGE_JOBS_TABLE)?;
+        transaction.execute_batch("PRAGMA user_version = 13")?;
         version = SCHEMA_VERSION;
     }
     if version == SCHEMA_VERSION {
@@ -194,7 +204,8 @@ CREATE INDEX IF NOT EXISTS notes_list_idx ON notes(deleted_time, updated_time DE
         )?;
     }
     transaction.execute_batch(SYNC_DEFERRED_TABLE)?;
-    transaction.execute_batch("PRAGMA user_version = 12")?;
+    transaction.execute_batch(PASTED_IMAGE_JOBS_TABLE)?;
+    transaction.execute_batch("PRAGMA user_version = 13")?;
     before_commit();
     // The test hook models the last pathname/descriptor race.  It must run
     // before the final identity check so a swapped profile aborts the still

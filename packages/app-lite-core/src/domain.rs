@@ -115,6 +115,19 @@ pub struct NoteOrganizationState {
     pub revision: i64,
 }
 
+/// A web image pasted into a note and not yet stored. `id` is the image's
+/// placeholder in the editor; the saved body links to `link` (or `url`)
+/// with `alt` (or "[图片]") as its text until the image is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedImageJob {
+    pub id: ResourceId,
+    pub note_id: NoteId,
+    pub url: String,
+    pub alt: String,
+    pub link: Option<String>,
+    pub attempts: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateNote {
     pub title: String,
