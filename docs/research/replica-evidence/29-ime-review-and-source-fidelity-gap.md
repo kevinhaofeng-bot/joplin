@@ -13,6 +13,8 @@
 
 执行时工作区还含输入跟踪功能改动；不是仅 checkout 该提交的独立构建。测试通过不代表之前实机的异常字符已定位，更不代表当前运行的旧候选含此修复。输入跟踪应默认关闭，只对隔离合成内容启用；已要求 Claude 为新建文本日志设置 Unix 0600 权限。
 
+随后提交 `386849488` 提供可选跟踪，`c428952b4` 为新日志设置 0600。主代理独立执行 `input_trace_records_body_composition_and_keys_reaching_the_app`（日志 `/tmp/joplin-input-trace-independent.log`）以及 `input_trace::tests::a_new_trace_file_is_private_to_its_owner`（日志 `/tmp/joplin-trace-permissions-independent.log`），各 1 通过、退出 0。源码未配置 `JOPLIN_LITE_INPUT_TRACE` 时不创建日志，事件详情闭包也不求值；新建文件的权限测试通过不代表已有文件会自动改权限。后续实机只使用全新私有临时目录中的合成输入。
+
 ## Evernote 实现差异：不能视为已完成复刻
 
 主代理实际重新读取：`/Users/kevinhao/Projects/joplin-reconstruction/evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/list/list.ts`。
