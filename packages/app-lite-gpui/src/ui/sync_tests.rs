@@ -387,6 +387,61 @@ async fn mounted_clear_certificate_and_cancel_buttons_do_not_write_until_save(
 }
 
 #[gpui::test]
+async fn late_certificate_picker_result_cannot_replace_a_reopened_settings_draft(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    let _ = open_settings(&view, cx);
+    let old_pick = view.update(cx, |shell, _| shell.begin_sync_certificate_pick().unwrap());
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.cancel_sync_settings(window, shell_cx)
+        })
+    });
+    let _ = open_settings(&view, cx);
+    let current_generation = view.read_with(cx, |shell, _| {
+        shell.sync_settings.as_ref().unwrap().picker_generation
+    });
+    assert_ne!(old_pick, current_generation);
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_sync_certificate_pick(
+            old_pick,
+            Ok(("old certificate".into(), "old.pem".into())),
+            shell_cx,
+        );
+    });
+    assert!(view.read_with(cx, |shell, _| {
+        shell
+            .sync_settings
+            .as_ref()
+            .unwrap()
+            .certificate_pem
+            .is_none()
+    }));
+    let new_pick = view.update(cx, |shell, _| shell.begin_sync_certificate_pick().unwrap());
+    assert_ne!(new_pick, old_pick);
+    view.update(cx, |shell, shell_cx| {
+        shell.complete_sync_certificate_pick(
+            new_pick,
+            Ok(("new certificate".into(), "new.pem".into())),
+            shell_cx,
+        );
+    });
+    assert_eq!(
+        view.read_with(cx, |shell, _| {
+            shell
+                .sync_settings
+                .as_ref()
+                .unwrap()
+                .certificate_pem
+                .clone()
+        }),
+        Some("new certificate".into())
+    );
+}
+
+#[gpui::test]
 async fn sync_now_uploads_and_the_open_note_follows_a_remote_edit(cx: &mut TestAppContext) {
     let fixture = fixture();
     fixture.configure(TOKEN);

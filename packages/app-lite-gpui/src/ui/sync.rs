@@ -104,7 +104,7 @@ pub(super) struct SyncSettings {
     pub(super) certificate_pem: Option<String>,
     certificate_label: Option<String>,
     pub(super) error: Option<String>,
-    picker_generation: u64,
+    pub(super) picker_generation: u64,
 }
 
 impl SyncConfig {
@@ -637,7 +637,8 @@ impl LibraryShell {
         cx: &mut Context<Self>,
     ) {
         if let Some(settings) = self.sync_settings.as_mut() {
-            settings.picker_generation += 1;
+            settings.picker_generation = self.next_sync_settings_generation;
+            self.next_sync_settings_generation += 1;
             settings.certificate_pem = None;
             settings.certificate_label = None;
             settings.error = None;
@@ -651,11 +652,9 @@ impl LibraryShell {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(settings) = self.sync_settings.as_mut() else {
+        let Some(generation) = self.begin_sync_certificate_pick() else {
             return;
         };
-        settings.picker_generation += 1;
-        let generation = settings.picker_generation;
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -680,25 +679,43 @@ impl LibraryShell {
             };
             if let Some(result) = result {
                 let _ = this.update(cx, |shell, shell_cx| {
-                    if let Some(settings) = shell
-                        .sync_settings
-                        .as_mut()
-                        .filter(|settings| settings.picker_generation == generation)
-                    {
-                        match result {
-                            Ok((pem, label)) => {
-                                settings.certificate_pem = Some(pem);
-                                settings.certificate_label = Some(label);
-                                settings.error = None;
-                            }
-                            Err(error) => settings.error = Some(error),
-                        }
-                        shell_cx.notify();
-                    }
+                    shell.complete_sync_certificate_pick(generation, result, shell_cx)
                 });
             }
         })
         .detach();
+    }
+
+    pub(super) fn begin_sync_certificate_pick(&mut self) -> Option<u64> {
+        let settings = self.sync_settings.as_mut()?;
+        let generation = self.next_sync_settings_generation;
+        self.next_sync_settings_generation += 1;
+        settings.picker_generation = generation;
+        Some(generation)
+    }
+
+    pub(super) fn complete_sync_certificate_pick(
+        &mut self,
+        generation: u64,
+        result: Result<(String, String), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(settings) = self
+            .sync_settings
+            .as_mut()
+            .filter(|settings| settings.picker_generation == generation)
+        else {
+            return;
+        };
+        match result {
+            Ok((pem, label)) => {
+                settings.certificate_pem = Some(pem);
+                settings.certificate_label = Some(label);
+                settings.error = None;
+            }
+            Err(error) => settings.error = Some(error),
+        }
+        cx.notify();
     }
 
     pub(super) fn sync_failures(&self, cx: &App) -> Vec<SyncFailure> {
