@@ -549,6 +549,20 @@ impl EditorSurface {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // A key here reached the app, not the input method.
+        super::input_trace::record("body", "key_down", || {
+            let modifiers = &event.keystroke.modifiers;
+            serde_json::json!({
+                "key": event.keystroke.key,
+                "key_char": event.keystroke.key_char,
+                "cmd": modifiers.platform,
+                "ctrl": modifiers.control,
+                "alt": modifiers.alt,
+                "shift": modifiers.shift,
+                "held": event.is_held,
+                "composing": self.editor.read(cx).marked_text().is_some(),
+            })
+        });
         if self.find_panel_open && matches!(event.keystroke.key.as_str(), "escape" | "esc") {
             cx.emit(EditorSurfaceEvent::DismissFindInNote);
             cx.stop_propagation();

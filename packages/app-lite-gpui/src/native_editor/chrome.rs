@@ -443,6 +443,7 @@ impl EntityInputHandler for TitleInput {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        super::input_trace::record("title", "unmark_text", || serde_json::Value::Null);
         if self.read_only {
             return;
         }
@@ -457,6 +458,11 @@ impl EntityInputHandler for TitleInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        super::input_trace::record(
+            "title",
+            "replace_text_in_range",
+            || serde_json::json!({ "range": super::input_trace::range(range.as_ref()), "text": text }),
+        );
         if self.replace_utf16(range, text) {
             cx.notify();
         }
@@ -470,6 +476,13 @@ impl EntityInputHandler for TitleInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        super::input_trace::record("title", "replace_and_mark_text_in_range", || {
+            serde_json::json!({
+                "range": super::input_trace::range(range.as_ref()),
+                "text": text,
+                "selected": super::input_trace::range(selected_range.as_ref()),
+            })
+        });
         if self.replace_and_mark_utf16(range, text, selected_range) {
             cx.notify();
         }

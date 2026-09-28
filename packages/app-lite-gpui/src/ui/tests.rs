@@ -5379,6 +5379,97 @@ async fn body_pinyin_composition_survives_autosave_and_commits_once(cx: &mut Tes
     assert!(!saved.body_html.contains("zai"), "{}", saved.body_html);
 }
 
+/// The opt-in input trace records what the input method asked of the body
+/// and which keys reached the app, with whether a composition was open, so
+/// a real-machine run can tell a leaked key from an input-method commit.
+#[gpui::test]
+async fn input_trace_records_body_composition_and_keys_reaching_the_app(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "追踪".into(),
+            notebook_id: None,
+            document: rich_document("前"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    cx.simulate_keystrokes("cmd-end");
+    crate::native_editor::input_trace::take_for_test();
+    cx.simulate_input("a");
+    assert!(
+        crate::native_editor::input_trace::take_for_test().is_empty(),
+        "off unless asked for"
+    );
+    crate::native_editor::input_trace::capture_for_test();
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                None,
+                "ni",
+                Some(2..2),
+                window,
+                editor_cx,
+            );
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "你", window, editor_cx,
+            );
+        })
+    });
+    cx.simulate_keystrokes("x");
+    let lines: Vec<serde_json::Value> = crate::native_editor::input_trace::take_for_test()
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let events: Vec<_> = lines
+        .iter()
+        .map(|line| {
+            (
+                line["target"].as_str().unwrap(),
+                line["event"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        &events[..2],
+        [
+            ("body", "replace_and_mark_text_in_range"),
+            ("body", "replace_text_in_range"),
+        ],
+        "{lines:#?}"
+    );
+    assert_eq!(lines[0]["detail"]["text"], "ni");
+    assert_eq!(lines[1]["detail"]["text"], "你");
+    assert_eq!(
+        lines[1]["detail"]["marked"], "ni",
+        "committed over the composition"
+    );
+    let key = lines
+        .iter()
+        .find(|line| line["event"] == "key_down")
+        .unwrap_or_else(|| panic!("the key that reached the app is traced: {lines:#?}"));
+    assert_eq!(key["detail"]["key"], "x");
+    assert_eq!(key["detail"]["composing"], false);
+}
+
 #[gpui::test]
 async fn document_jumps_do_not_steal_title_search_or_settings_focus(cx: &mut TestAppContext) {
     let (profile, repository) = repository();

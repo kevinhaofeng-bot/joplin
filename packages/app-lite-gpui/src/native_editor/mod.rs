@@ -9,6 +9,7 @@ pub mod fixtures;
 pub mod history;
 pub mod images;
 pub mod input;
+pub(crate) mod input_trace;
 pub mod layout;
 pub mod model;
 pub mod render;

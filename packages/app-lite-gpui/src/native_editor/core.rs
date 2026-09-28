@@ -3686,6 +3686,11 @@ impl EntityInputHandler for EditorCore {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        super::input_trace::record(
+            "body",
+            "unmark_text",
+            || serde_json::json!({ "marked": self.marked_text() }),
+        );
         // A read-only session never owns an IME composition. More
         // importantly, do not let a delayed platform unmark callback mutate
         // composition bookkeeping after Task 4 has deliberately disabled all
@@ -3712,6 +3717,13 @@ impl EntityInputHandler for EditorCore {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        super::input_trace::record("body", "replace_text_in_range", || {
+            serde_json::json!({
+                "range": super::input_trace::range(range_utf16.as_ref()),
+                "text": new_text,
+                "marked": self.marked_text(),
+            })
+        });
         if self.is_read_only() {
             return;
         }
@@ -3761,6 +3773,14 @@ impl EntityInputHandler for EditorCore {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        super::input_trace::record("body", "replace_and_mark_text_in_range", || {
+            serde_json::json!({
+                "range": super::input_trace::range(range_utf16.as_ref()),
+                "text": new_text,
+                "selected": super::input_trace::range(new_selected_range_utf16.as_ref()),
+                "marked": self.marked_text(),
+            })
+        });
         if self.is_read_only() {
             return;
         }

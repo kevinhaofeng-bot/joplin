@@ -1,0 +1,87 @@
+//! Opt-in record of text input, for diagnosing input methods on a real
+//! machine. With `JOPLIN_LITE_INPUT_TRACE=/path/to/file` set when the app
+//! starts, every input-method call on the note body and title, and every key
+//! that reaches the body's own key handling, is appended to that file as one
+//! JSON line. Off (and free) otherwise. It records the typed text, so use it
+//! only with test content.
+
+use std::io::Write as _;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn sink() -> Option<&'static Mutex<std::fs::File>> {
+    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    SINK.get_or_init(|| {
+        let path = std::env::var_os("JOPLIN_LITE_INPUT_TRACE")?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(Mutex::new)
+    })
+    .as_ref()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LINES: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Starts collecting this thread's trace lines in memory.
+#[cfg(test)]
+pub(crate) fn capture_for_test() {
+    TEST_LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_for_test() -> Vec<String> {
+    TEST_LINES.with(|lines| lines.borrow_mut().take().unwrap_or_default())
+}
+
+fn enabled() -> bool {
+    #[cfg(test)]
+    if TEST_LINES.with(|lines| lines.borrow().is_some()) {
+        return true;
+    }
+    sink().is_some()
+}
+
+/// Records one event; `detail` is only built when tracing is on.
+pub(crate) fn record(target: &str, event: &str, detail: impl FnOnce() -> serde_json::Value) {
+    if !enabled() {
+        return;
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    let line = serde_json::json!({
+        "ms": millis as u64,
+        "target": target,
+        "event": event,
+        "detail": detail(),
+    })
+    .to_string();
+    #[cfg(test)]
+    if TEST_LINES.with(|lines| {
+        lines
+            .borrow_mut()
+            .as_mut()
+            .map(|lines| lines.push(line.clone()))
+            .is_some()
+    }) {
+        return;
+    }
+    if let Some(sink) = sink()
+        && let Ok(mut file) = sink.lock()
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+pub(crate) fn range(range: Option<&std::ops::Range<usize>>) -> serde_json::Value {
+    match range {
+        Some(range) => serde_json::json!([range.start, range.end]),
+        None => serde_json::Value::Null,
+    }
+}
