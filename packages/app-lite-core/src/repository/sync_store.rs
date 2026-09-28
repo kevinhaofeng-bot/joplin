@@ -410,7 +410,7 @@ fn entity_payload(
     let payload = match kind {
         "note" => transaction
             .query_row(
-                "SELECT title,body_html,notebook_id,created_time,updated_time,deleted_time FROM notes WHERE id=?1",
+                "SELECT title,body_html,notebook_id,created_time,updated_time,deleted_time,selected_thumbnail_id FROM notes WHERE id=?1",
                 [id],
                 |row| {
                     Ok(json!({
@@ -420,6 +420,7 @@ fn entity_payload(
                         "created_time": row.get::<_, i64>(3)?,
                         "updated_time": row.get::<_, i64>(4)?,
                         "deleted_time": row.get::<_, i64>(5)?,
+                        "selected_thumbnail_id": row.get::<_, Option<String>>(6)?,
                     }))
                 },
             )
@@ -1029,8 +1030,8 @@ impl LibraryRepository {
             |row| row.get(0),
         )?;
         transaction.execute(
-            "INSERT INTO notes (id,title,body_html,body_text,snippet,notebook_id,created_time,updated_time,deleted_time,revision)
-             SELECT ?2, title || ?3, body_html, body_text, snippet, notebook_id, ?4, ?4, 0, 1 FROM notes WHERE id=?1",
+            "INSERT INTO notes (id,title,body_html,body_text,snippet,notebook_id,selected_thumbnail_id,created_time,updated_time,deleted_time,revision)
+             SELECT ?2, title || ?3, body_html, body_text, snippet, notebook_id, selected_thumbnail_id, ?4, ?4, 0, 1 FROM notes WHERE id=?1",
             params![original.as_str(), copy.as_str(), CONFLICT_SUFFIX, now],
         )?;
         transaction.execute(
@@ -1073,6 +1074,7 @@ struct RemoteNote {
     notebook_id: String,
     tag_ids: Vec<String>,
     resource_ids: Vec<crate::ResourceId>,
+    selected_thumbnail_id: Option<crate::ResourceId>,
     created_time: i64,
     updated_time: i64,
     deleted_time: i64,
@@ -1135,6 +1137,24 @@ impl RemoteNote {
                 ))));
             }
         }
+        let selected_thumbnail_id = match payload.get("selected_thumbnail_id") {
+            None | Some(Value::Null) => None, // Older clients omit this field.
+            Some(Value::String(value)) => {
+                let Ok(resource) = crate::ResourceId::new(value.clone()) else {
+                    return Ok(Err(Skip("invalid thumbnail id".into())));
+                };
+                if !resource_ids.contains(&resource) {
+                    return Ok(Err(Skip("thumbnail is not associated with note".into())));
+                }
+                let valid: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM resources WHERE id=?1 AND deleted_time=0 AND mime LIKE 'image/%')",
+                    [resource.as_str()], |row| row.get(0),
+                )?;
+                if !valid { return Ok(Err(Skip("thumbnail is not an image".into()))); }
+                Some(resource)
+            }
+            _ => return Ok(Err(Skip("invalid thumbnail id".into()))),
+        };
         let notebook_exists: i64 = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM notebooks WHERE id=?1 AND deleted_time=0)",
             [notebook_id],
@@ -1167,6 +1187,7 @@ impl RemoteNote {
             notebook_id,
             tag_ids: known_tags,
             resource_ids,
+            selected_thumbnail_id,
             created_time: number("created_time").unwrap_or(0),
             updated_time: number("updated_time").unwrap_or(0),
             deleted_time: number("deleted_time").unwrap_or(0),
@@ -1194,11 +1215,19 @@ impl RemoteNote {
             "SELECT tag_id FROM note_tags WHERE note_id=?1 ORDER BY position, tag_id",
             id.as_str(),
         )?;
+        // Older payloads do not express a cover preference. A new payload's
+        // explicit cover is visible note state and must not be discarded just
+        // because its title and body match a pending local edit.
+        let cover_matches = match self.selected_thumbnail_id.as_ref() {
+            Some(remote) => super::selected_thumbnail_id(transaction, id, None)?.as_ref() == Some(remote),
+            None => true,
+        };
         Ok(title == self.title
             && body_html == self.body_html
             && notebook_id == self.notebook_id
             && (deleted_time != 0) == (self.deleted_time != 0)
-            && tags == self.tag_ids)
+            && tags == self.tag_ids
+            && cover_matches)
     }
 
     fn write(
@@ -1246,9 +1275,8 @@ impl RemoteNote {
         }
         super::replace_note_resources(transaction, id, &self.resource_ids)?;
         transaction.execute(
-            "UPDATE notes SET selected_thumbnail_id=NULL WHERE id=?1 AND selected_thumbnail_id IS NOT NULL
-               AND NOT EXISTS(SELECT 1 FROM note_resources WHERE note_id=?1 AND resource_id=notes.selected_thumbnail_id AND is_associated=1)",
-            [id.as_str()],
+            "UPDATE notes SET selected_thumbnail_id=?2 WHERE id=?1",
+            params![id.as_str(), super::selected_thumbnail_id(transaction, id, self.selected_thumbnail_id.as_ref())?.as_ref().map(crate::ResourceId::as_str)],
         )?;
         super::queue_search(transaction, id, now, "remote")?;
         super::queue_derived_text_for_note(transaction, id, now)?;

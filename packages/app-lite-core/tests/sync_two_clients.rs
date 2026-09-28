@@ -307,6 +307,45 @@ fn a_malformed_remote_body_is_a_visible_failure_and_does_not_block_later_changes
 }
 
 #[test]
+fn legacy_note_payload_works_but_invalid_cover_references_are_rejected() {
+    let (_root, store) = server();
+    let a = client();
+    let resource = a.repo.import_resource(b"file", "test.txt", "text/plain", "txt").unwrap();
+    let document = CanonicalDocument::from_blocks(vec![Block::Attachment {
+        resource_id: resource.clone(), filename: "test.txt".into(), media_type: "text/plain".into(),
+    }]);
+    a.repo.create_note(CreateNote { title: "seed".into(), notebook_id: None, document: document.clone() }).unwrap();
+    sync(&a, &store);
+    let variants = [None, Some(serde_json::json!(7)), Some(serde_json::json!("../invalid")),
+        Some(serde_json::json!("a".repeat(32))), Some(serde_json::json!(resource.as_str()))];
+    let device = "e".repeat(32);
+    for (index, cover) in variants.into_iter().enumerate() {
+        let mut payload = serde_json::json!({
+            "title": "legacy", "body_html": document.to_canonical_html().as_str(),
+            "notebook_id": a.repo.default_notebook().unwrap().id.as_str(),
+            "tag_ids": [], "resource_ids": [resource.as_str()],
+            "created_time": 1, "updated_time": 1, "deleted_time": 0,
+        });
+        if let Some(cover) = cover { payload["selected_thumbnail_id"] = cover; }
+        store.push(PushRequest {
+            protocol: PROTOCOL_VERSION, device_id: device.clone(), ops: vec![Operation {
+                op_id: format!("{:032x}", index + 100), device_id: device.clone(),
+                entity: EntityRef { kind: EntityKind::Note, id: format!("{:032x}", index + 1) },
+                base_revision: 0, action: Action::Put { payload },
+            }],
+        }).unwrap();
+    }
+    let b = client();
+    let report = sync(&b, &store);
+    assert_eq!(report.skipped, 4);
+    assert!(b.repo.load_note(&NoteId::parse(format!("{:032x}", 1)).unwrap()).unwrap().is_some());
+    for index in 2..=5 {
+        assert!(b.repo.load_note(&NoteId::parse(format!("{index:032x}")).unwrap()).unwrap().is_none());
+    }
+    assert_eq!(b.repo.sync_failures().unwrap().len(), 4);
+}
+
+#[test]
 fn identical_offline_edits_do_not_create_a_conflict_copy() {
     let (_server_root, store) = server();
     let a = client();
