@@ -83,3 +83,20 @@
 | 构建日志 | `/tmp/joplin-acceptance-fix/package-659095680.log` |
 
 没有安装到 /Applications，没有启动，也没有打开任何真实资料库。
+
+## 补充：包签名（`13e84445f`）
+
+Codex 独立检查发现 `659095680` 的包无法通过 `codesign --verify --deep --strict`，报错 “code has no resources but signature indicates they must be present”：只有链接器给可执行文件加了 ad-hoc 签名，整个包没有签名。
+
+打包脚本现在对整个 `.app` 签名：没有配置 `JOPLIN_LITE_SIGN_IDENTITY` 时使用 ad-hoc。签名后立即严格校验，并在 `BUILD-INFO.txt` 中记录签名类型；可执行文件哈希在签名之后计算。未做公证，不声称已公证。上表中 `659095680` 的包已被取代。
+
+| 项目 | 值 |
+| --- | --- |
+| 包路径 | `/tmp/joplin-final-claude/dist-notes/20260928T053143Z-13e84445f/Joplin Lite.app` |
+| 源码提交 | `13e84445f49361914955a2ef97d49888a28b7536`（`worktree_dirty_for_app_sources: no`），应用代码与 `659095680` 相同，另含报告与打包脚本 |
+| 可执行文件 SHA256（签名后） | `f2f75c263aca37f6109e5d8b388cddffd8dca2234498b395d9d8f8e657b15303`（已用 `shasum -a 256` 复核） |
+| 签名 | ad-hoc，`Identifier=com.arielkevin.joplinlite`；`codesign --verify --deep --strict --verbose=2` 输出 “valid on disk” 和 “satisfies its Designated Requirement” |
+| 版本 | 0.7.2 (16298) |
+| 构建日志 | `/tmp/joplin-acceptance-fix/package-13e84445f.log` |
+
+产品图标仍然缺失，保留为最终交付缺口。
