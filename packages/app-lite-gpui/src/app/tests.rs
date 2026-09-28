@@ -2442,6 +2442,91 @@ fn trash_route_restore_and_purge_are_typed_and_do_not_revive_a_wrong_session() {
 
 /// Evernote's Trash action menu restores every selected guid (renderer
 /// 9435.js `[As.RESTORE]: () => e(us.eA({ guids: s }))`), all or none.
+/// Evernote's Trash action menu expunges every selected guid (renderer
+/// 9435.js `[As.EXPUNGE]: () => e(us.di({ noteGuids: s }))`), all or none.
+#[test]
+fn purge_notes_deletes_exactly_the_captured_trash_notes_or_none() {
+    let (_profile, repository) = repository();
+    let ids: Vec<_> = ["一", "二", "三", "四"]
+        .into_iter()
+        .map(|title| create(&repository, title))
+        .collect();
+    repository.trash_notes(&ids).expect("trash fixtures");
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Trash,
+            selected_note_id: None,
+        })
+        .expect("navigate trash");
+    let listed: Vec<_> = model
+        .projections()
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    let (primary, extra) = (listed[1].clone(), listed[2].clone());
+    model
+        .dispatch(AppAction::SelectNote(primary.clone()))
+        .expect("select");
+    model
+        .dispatch(AppAction::ToggleNoteInSelection(extra.clone()))
+        .expect("cmd-click");
+    let exists = |id: &NoteId| repository.load_note(id).expect("load").is_some();
+
+    // Restored elsewhere meanwhile: nothing is deleted.
+    repository.restore_note(&extra).expect("restore elsewhere");
+    assert!(
+        model
+            .dispatch(AppAction::PurgeNotes(vec![primary.clone(), extra.clone()]))
+            .is_err()
+    );
+    assert!(exists(&primary) && exists(&extra), "all or none");
+    assert_eq!(model.navigation().selected_note_id(), Some(&primary));
+    assert!(matches!(model.status(), AppStatus::Error(_)));
+    assert!(model.dispatch(AppAction::PurgeNotes(Vec::new())).is_err());
+    repository.trash_note(&extra).expect("back to trash");
+    model.refresh_list().expect("refresh");
+
+    model
+        .dispatch(AppAction::PurgeNotes(vec![primary.clone(), extra.clone()]))
+        .expect("purge captured notes");
+    assert!(!exists(&primary) && !exists(&extra));
+    let remaining: Vec<_> = listed
+        .iter()
+        .filter(|id| **id != primary && **id != extra)
+        .cloned()
+        .collect();
+    assert!(remaining.iter().all(exists), "the others are untouched");
+    assert_eq!(
+        model
+            .projections()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>(),
+        remaining
+    );
+    let selected = model.navigation().selected_note_id().cloned();
+    assert!(
+        selected.as_ref().is_some_and(|id| remaining.contains(id)),
+        "a remaining Trash note is selected: {selected:?}"
+    );
+    assert_eq!(model.selected_note_ids().len(), 1, "multi-selection ends");
+    assert_eq!(model.status(), &AppStatus::Ready);
+
+    // PurgeSelected (no confirmation of its own) also takes the whole selection.
+    model
+        .dispatch(AppAction::SelectNote(remaining[0].clone()))
+        .expect("select");
+    model
+        .dispatch(AppAction::ToggleNoteInSelection(remaining[1].clone()))
+        .expect("cmd-click");
+    model
+        .dispatch(AppAction::PurgeSelected)
+        .expect("purge selected");
+    assert!(remaining.iter().all(|id| !exists(id)));
+    assert!(model.projections().is_empty());
+}
+
 #[test]
 fn restore_selected_restores_every_selected_trash_note_or_none() {
     let (_profile, repository) = repository();

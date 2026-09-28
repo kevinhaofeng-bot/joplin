@@ -1599,46 +1599,81 @@ impl LibraryRepository {
     }
 
     pub fn purge_note(&self, id: &NoteId) -> Result<(), LibraryError> {
+        self.purge_notes(std::slice::from_ref(id))
+    }
+
+    /// Permanently deletes every note in one transaction, as Evernote
+    /// expunges all selected guids: if any is missing or not in Trash, none
+    /// is deleted and `NotFound` is returned. Each note leaves a tombstone,
+    /// a search removal and a sync purge; an attachment is reclaimed only
+    /// when no surviving note or retained history still references it.
+    pub fn purge_notes(&self, ids: &[NoteId]) -> Result<(), LibraryError> {
+        if ids.is_empty() {
+            return Err(LibraryError::NotFound);
+        }
+        let mut unique: Vec<&NoteId> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
         let now = self.now();
         let mut connection = self.connection.lock().expect("library mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (revision, deleted_time): (i64, i64) = transaction
-            .query_row(
-                "SELECT revision, deleted_time FROM notes WHERE id = ?1 AND deleted_time <> 0",
+        let mut resource_candidates: Vec<PurgeResourceCandidate> = Vec::new();
+        for id in &unique {
+            // Dropping the transaction on any error rolls back every note.
+            let (revision, deleted_time): (i64, i64) = transaction
+                .query_row(
+                    "SELECT revision, deleted_time FROM notes WHERE id = ?1 AND deleted_time <> 0",
+                    [id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or(LibraryError::NotFound)?;
+            let final_revision = revision
+                .checked_add(1)
+                .ok_or(LibraryError::InvalidSnapshot)?;
+            for candidate in purge_resource_candidates(&transaction, id)? {
+                if !resource_candidates
+                    .iter()
+                    .any(|known| known.id == candidate.id)
+                {
+                    resource_candidates.push(candidate);
+                }
+            }
+            transaction.execute("INSERT INTO tombstones (entity_type, entity_id, final_revision, deleted_time, purged_time) VALUES ('note', ?1, ?2, ?3, ?4)", params![id.as_str(), final_revision, deleted_time, now])?;
+            // Permanent delete removes the retained history bodies as well.
+            transaction.execute(
+                "DELETE FROM note_revisions WHERE note_id = ?1",
                 [id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or(LibraryError::NotFound)?;
-        let final_revision = revision
-            .checked_add(1)
-            .ok_or(LibraryError::InvalidSnapshot)?;
-        let resource_candidates = purge_resource_candidates(&transaction, id)?;
-        transaction.execute("INSERT INTO tombstones (entity_type, entity_id, final_revision, deleted_time, purged_time) VALUES ('note', ?1, ?2, ?3, ?4)", params![id.as_str(), final_revision, deleted_time, now])?;
-        // Permanent delete removes the retained history bodies as well.
-        transaction.execute(
-            "DELETE FROM note_revisions WHERE note_id = ?1",
-            [id.as_str()],
-        )?;
-        transaction.execute("DELETE FROM notes WHERE id = ?1", [id.as_str()])?;
-        queue_search(&transaction, id, now, "purge")?;
-        enqueue_sync(
-            &transaction,
-            self.id_source.as_ref(),
-            &EntityRef::Note(id.clone()),
-            final_revision,
-            "purge",
-            now,
-        )?;
+            )?;
+            transaction.execute("DELETE FROM notes WHERE id = ?1", [id.as_str()])?;
+            queue_search(&transaction, id, now, "purge")?;
+            enqueue_sync(
+                &transaction,
+                self.id_source.as_ref(),
+                &EntityRef::Note((*id).clone()),
+                final_revision,
+                "purge",
+                now,
+            )?;
+        }
+        // Decided after every target is gone, so an attachment shared only
+        // by purged notes is reclaimed once and one shared with a survivor
+        // is kept.
         let reclaimed_resources =
             self.reclaim_unreferenced_purge_resources(&transaction, resource_candidates, now)?;
         transaction.commit()?;
         drop(connection);
-        let mut events = vec![
-            LibraryEvent::NoteProjectionChanged(id.clone()),
-            LibraryEvent::SearchProjectionQueued(id.clone()),
-            LibraryEvent::SyncQueued(EntityRef::Note(id.clone())),
-        ];
+        let mut events = Vec::new();
+        for id in &unique {
+            events.extend([
+                LibraryEvent::NoteProjectionChanged((*id).clone()),
+                LibraryEvent::SearchProjectionQueued((*id).clone()),
+                LibraryEvent::SyncQueued(EntityRef::Note((*id).clone())),
+            ]);
+        }
         events.extend(
             reclaimed_resources
                 .into_iter()

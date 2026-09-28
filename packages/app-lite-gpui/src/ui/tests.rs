@@ -9853,6 +9853,239 @@ async fn mounted_restore_selected_restores_every_selected_note(cx: &mut TestAppC
     assert_eq!(ids(&reopened_model), vec![listed[1].clone()]);
 }
 
+/// Three Trash notes sharing one image with a note outside Trash, the first
+/// and third Cmd-selected and the organization panel open.
+fn mount_trash_multi_selection<'a>(
+    cx: &'a mut TestAppContext,
+) -> (
+    tempfile::TempDir,
+    Arc<LibraryRepository>,
+    Entity<LibraryShell>,
+    &'a mut VisualTestContext,
+    Vec<NoteId>,
+    ResourceId,
+    NoteId,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let image = repository
+        .import_resource(&png_fixture(), "photo.png", "image/png", "png")
+        .unwrap();
+    let with_image = |title: &str| {
+        repository
+            .create_note(CreateNote {
+                title: title.into(),
+                notebook_id: None,
+                document: CanonicalDocument::from_blocks(vec![Block::Image {
+                    resource_id: image.clone(),
+                    alt: title.into(),
+                    presentation: ImagePresentation {
+                        natural_size: Some((1, 1)),
+                        ..Default::default()
+                    },
+                    link: None,
+                }]),
+            })
+            .unwrap()
+            .id
+    };
+    let keeper = with_image("保留");
+    let notes: Vec<NoteId> = ["甲", "乙", "丙"].into_iter().map(with_image).collect();
+    repository.trash_notes(&notes).unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::NavigateTo {
+                    route: LibraryRoute::Trash,
+                    selected_note_id: None,
+                },
+                window,
+                shell_cx,
+            )
+        });
+    });
+    redraw(cx);
+    let listed: Vec<NoteId> = view.read_with(cx, |shell, app| {
+        shell
+            .model
+            .read(app)
+            .projections()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect()
+    });
+    assert_eq!(listed.len(), 3);
+    click_note_card(0, Modifiers::default(), cx);
+    click_note_card(
+        2,
+        Modifiers {
+            platform: true,
+            ..Default::default()
+        },
+        cx,
+    );
+    let toggle = cx
+        .debug_bounds("library-toggle-organization")
+        .expect("organization trigger in Trash");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    redraw(cx);
+    (profile, repository, view, cx, listed, image, keeper)
+}
+
+fn click_note_card(index: usize, modifiers: Modifiers, cx: &mut VisualTestContext) {
+    let card = cx
+        .debug_bounds(Box::leak(
+            format!("library-note-card-{index}").into_boxed_str(),
+        ))
+        .or_else(|| {
+            cx.debug_bounds("library-selected-note-card")
+                .filter(|_| index == 0)
+        })
+        .unwrap_or_else(|| panic!("card {index}"));
+    cx.simulate_click(card.center(), modifiers);
+    redraw(cx);
+}
+
+fn click_selector(selector: &'static str, cx: &mut VisualTestContext) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector}"));
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    redraw(cx);
+}
+
+/// Permanent Delete on a Trash multi-selection names the exact count, and
+/// only the confirmation deletes exactly those notes; an image a surviving
+/// note still shows is kept.
+#[gpui::test]
+async fn mounted_purge_selected_confirms_the_count_and_deletes_exactly_those_notes(
+    cx: &mut TestAppContext,
+) {
+    let (profile, repository, view, cx, listed, image, keeper) = mount_trash_multi_selection(cx);
+    let targets = vec![listed[0].clone(), listed[2].clone()];
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell.model.read(app).selected_note_ids()),
+        targets
+    );
+    click_selector("library-organization-purge-selected", cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell
+            .destructive_confirmation_label_for_test()),
+        Some("确认永久删除这 2 篇笔记？此操作不可撤销。".to_owned())
+    );
+    assert!(
+        targets
+            .iter()
+            .all(|id| repository.load_note(id).unwrap().is_some()),
+        "nothing is deleted before confirmation"
+    );
+    click_selector("library-organization-confirm-destructive", cx);
+
+    for id in &targets {
+        assert!(repository.load_note(id).unwrap().is_none());
+    }
+    assert!(repository.load_note(&listed[1]).unwrap().is_some());
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(model.selected_note_ids(), vec![listed[1].clone()]);
+        assert_eq!(
+            model
+                .projections()
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec![listed[1].clone()]
+        );
+        assert!(shell.resource_notice.is_none());
+        assert!(shell.destructive_confirmation_label_for_test().is_none());
+    });
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    assert!(
+        targets
+            .iter()
+            .all(|id| reopened.load_note(id).unwrap().is_none())
+    );
+    assert_eq!(
+        reopened.read_resource_bytes(&image).unwrap().unwrap(),
+        png_fixture(),
+        "still shown by the surviving notes"
+    );
+    assert_eq!(
+        reopened.load_note(&keeper).unwrap().unwrap().resource_ids,
+        vec![image]
+    );
+}
+
+/// A pending confirmation acts only on what it showed: a changed selection,
+/// route or target status voids it, and nothing is deleted.
+#[gpui::test]
+async fn mounted_purge_confirmation_is_void_once_its_targets_change(cx: &mut TestAppContext) {
+    let mut outcomes = Vec::new();
+    for change in ["selection", "route", "restored elsewhere"] {
+        let (_profile, repository, view, cx, listed, _image, _keeper) =
+            mount_trash_multi_selection(cx);
+        click_selector("library-organization-purge-selected", cx);
+        let pending = |view: &Entity<LibraryShell>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |shell, _| {
+                shell.destructive_confirmation_label_for_test()
+            })
+        };
+        assert!(pending(&view, cx).is_some());
+        match change {
+            "selection" => click_note_card(
+                1,
+                Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
+                cx,
+            ),
+            "route" => {
+                cx.update(|window, app| {
+                    view.update(app, |shell, shell_cx| {
+                        shell.apply_action(
+                            AppAction::NavigateTo {
+                                route: LibraryRoute::AllNotes,
+                                selected_note_id: None,
+                            },
+                            window,
+                            shell_cx,
+                        )
+                    });
+                });
+                redraw(cx);
+            }
+            _ => repository.restore_note(&listed[2]).unwrap(),
+        }
+        // Either the change already withdrew the confirmation, or confirming
+        // it now is refused. Debug bounds can outlive a withdrawn element,
+        // so ask the shell rather than the layout.
+        let still_pending = pending(&view, cx).is_some();
+        if still_pending {
+            click_selector("library-organization-confirm-destructive", cx);
+            assert_eq!(
+                view.read_with(cx, |shell, _| shell.resource_notice.clone()),
+                Some("待确认的目标已变化；请重新打开操作。".to_owned()),
+                "{change}"
+            );
+        }
+        assert!(
+            listed
+                .iter()
+                .all(|id| repository.load_note(id).unwrap().is_some()),
+            "{change}: nothing is deleted"
+        );
+        outcomes.push((change, still_pending));
+    }
+    // A status change elsewhere reaches only the confirmation check.
+    assert!(
+        outcomes.contains(&("restored elsewhere", true)),
+        "{outcomes:?}"
+    );
+}
+
 #[gpui::test]
 async fn mounted_multi_selection_trash_moves_every_selected_note_and_keeps_a_valid_selection(
     cx: &mut TestAppContext,

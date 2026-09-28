@@ -131,6 +131,8 @@ pub enum AppAction {
     RestoreNote(NoteId),
     RestoreSelected,
     PurgeNote(NoteId),
+    /// Exactly these notes, captured when permanent deletion was confirmed.
+    PurgeNotes(Vec<NoteId>),
     PurgeSelected,
     ToggleSidebar,
     ToggleNoteList,

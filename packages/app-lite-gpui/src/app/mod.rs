@@ -240,6 +240,7 @@ impl AppModel {
                 | AppAction::RestoreNote(_)
                 | AppAction::RestoreSelected
                 | AppAction::PurgeNote(_)
+                | AppAction::PurgeNotes(_)
                 | AppAction::PurgeSelected
         );
         let result = self.dispatch_inner(action);
@@ -272,6 +273,7 @@ impl AppModel {
                 | AppAction::RestoreNote(_)
                 | AppAction::RestoreSelected
                 | AppAction::PurgeNote(_)
+                | AppAction::PurgeNotes(_)
                 | AppAction::PurgeSelected
         );
         let result = match action {
@@ -378,11 +380,20 @@ impl AppModel {
                 .apply_organization_mutation("笔记已永久删除", move |repository| {
                     repository.purge_note(&id)
                 }),
-            AppAction::PurgeSelected => self.selected_note_for_organization().and_then(|id| {
-                self.apply_organization_mutation("笔记已永久删除", move |repository| {
-                    repository.purge_note(&id)
-                })
-            }),
+            // Evernote's multi-select EXPUNGE of all selected guids; one
+            // transaction, all or none.
+            AppAction::PurgeNotes(ids) if ids.is_empty() => Err(LibraryError::NotFound),
+            AppAction::PurgeNotes(ids) => self
+                .apply_organization_mutation("笔记已永久删除", move |repository| {
+                    repository.purge_notes(&ids)
+                }),
+            AppAction::PurgeSelected => match self.selected_note_ids() {
+                ids if ids.is_empty() => Err(LibraryError::NotFound),
+                ids => self
+                    .apply_organization_mutation("笔记已永久删除", move |repository| {
+                        repository.purge_notes(&ids)
+                    }),
+            },
             AppAction::ToggleSidebar => {
                 self.panes.sidebar_visible = !self.panes.sidebar_visible;
                 self.persist_shell_state()

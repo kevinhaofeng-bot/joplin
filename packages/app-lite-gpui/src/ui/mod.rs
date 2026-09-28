@@ -238,6 +238,8 @@ enum PendingDestructiveAction {
     DeleteNotebook(NotebookId),
     DeleteTag(TagId),
     PurgeNote(NoteId),
+    /// The Trash multi-selection at the moment Permanent Delete was pressed.
+    PurgeNotes(Vec<NoteId>),
 }
 
 impl PendingDestructiveAction {
@@ -247,15 +249,19 @@ impl PendingDestructiveAction {
             Self::DeleteNotebook(id) => AppAction::DeleteNotebook(id.clone()),
             Self::DeleteTag(id) => AppAction::DeleteTag(id.clone()),
             Self::PurgeNote(id) => AppAction::PurgeNote(id.clone()),
+            Self::PurgeNotes(ids) => AppAction::PurgeNotes(ids.clone()),
         }
     }
 
-    const fn label(&self) -> &'static str {
+    fn label(&self) -> String {
         match self {
-            Self::DeleteStack(_) => "确认解散当前笔记本组？组内笔记本和笔记会保留。",
-            Self::DeleteNotebook(_) => "确认删除当前笔记本？其中笔记会移至默认笔记本。",
-            Self::DeleteTag(_) => "确认删除当前标签？笔记正文不会删除。",
-            Self::PurgeNote(_) => "确认永久删除当前笔记？此操作不可撤销。",
+            Self::DeleteStack(_) => "确认解散当前笔记本组？组内笔记本和笔记会保留。".to_owned(),
+            Self::DeleteNotebook(_) => "确认删除当前笔记本？其中笔记会移至默认笔记本。".to_owned(),
+            Self::DeleteTag(_) => "确认删除当前标签？笔记正文不会删除。".to_owned(),
+            Self::PurgeNote(_) => "确认永久删除当前笔记？此操作不可撤销。".to_owned(),
+            Self::PurgeNotes(ids) => {
+                format!("确认永久删除这 {} 篇笔记？此操作不可撤销。", ids.len())
+            }
         }
     }
 }
@@ -1921,6 +1927,7 @@ impl LibraryShell {
                 AppAction::RestoreNote(_)
                     | AppAction::RestoreSelected
                     | AppAction::PurgeNote(_)
+                    | AppAction::PurgeNotes(_)
                     | AppAction::PurgeSelected
             );
         if !bypass_read_only_trash_flush
@@ -2115,6 +2122,9 @@ impl LibraryShell {
             {
                 Some(FlushReason::ManualSync)
             }
+            AppAction::PurgeNotes(ids) if active_id.as_ref().is_some_and(|id| ids.contains(id)) => {
+                Some(FlushReason::ManualSync)
+            }
             AppAction::RestoreSelected | AppAction::PurgeSelected => {
                 active_id.map(|_| FlushReason::ManualSync)
             }
@@ -2222,6 +2232,13 @@ impl LibraryShell {
             count if count > 1 => format!("恢复 {count} 篇笔记"),
             _ => "恢复当前笔记".to_owned(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn destructive_confirmation_label_for_test(&self) -> Option<String> {
+        self.pending_destructive_action
+            .as_ref()
+            .map(PendingDestructiveAction::label)
     }
 
     fn trash_selected(&mut self, _: &TrashSelected, window: &mut Window, cx: &mut Context<Self>) {
@@ -4576,6 +4593,25 @@ impl LibraryShell {
                         .iter()
                         .any(|projection| projection.id == *id)
             }
+            // Still in Trash, still exactly the selection that was shown in
+            // the confirmation, and each note still in Trash in the library
+            // (a restore elsewhere may not have reached the list yet).
+            PendingDestructiveAction::PurgeNotes(ids) => {
+                let repository = model.repository();
+                model.navigation().route() == &LibraryRoute::Trash
+                    && model.selected_note_ids() == *ids
+                    && ids.iter().all(|id| {
+                        model
+                            .projections()
+                            .iter()
+                            .any(|projection| projection.id == *id)
+                            && repository
+                                .note_organization_state(id)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|state| state.deleted_time.is_some())
+                    })
+            }
         })
     }
 
@@ -5210,16 +5246,21 @@ impl LibraryShell {
                     ))
                     .child(library_destructive_action_button(
                         "library-organization-purge-selected",
-                        "永久删除".to_owned(),
-                        self.model.read_with(cx, |model, _| {
-                            PendingDestructiveAction::PurgeNote(
-                                model
-                                    .navigation()
-                                    .selected_note_id()
-                                    .expect("Trash controls require a selected typed note")
-                                    .clone(),
-                            )
-                        }),
+                        match self.model.read(cx).selected_note_ids().len() {
+                            count if count > 1 => format!("永久删除 {count} 篇笔记"),
+                            _ => "永久删除".to_owned(),
+                        },
+                        self.model
+                            .read_with(cx, |model, _| match model.selected_note_ids() {
+                                ids if ids.len() > 1 => PendingDestructiveAction::PurgeNotes(ids),
+                                _ => PendingDestructiveAction::PurgeNote(
+                                    model
+                                        .navigation()
+                                        .selected_note_id()
+                                        .expect("Trash controls require a selected typed note")
+                                        .clone(),
+                                ),
+                            }),
                         cx,
                     ))
                     .into_any_element()

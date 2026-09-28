@@ -797,3 +797,178 @@ fn batch_tagging_is_all_or_nothing() {
         .add_tag_to_notes(&[first.clone()], &tag.id)
         .unwrap();
 }
+
+/// Evernote expunges every selected guid (renderer 9435.js `[As.EXPUNGE]`
+/// → `us.di({ noteGuids })`). One transaction: every target leaves a
+/// tombstone, a search removal and a sync purge, or none does; attachments
+/// go only when nothing surviving, including history, references them.
+#[test]
+fn purging_several_notes_is_one_transaction_and_keeps_shared_attachments() {
+    let (profile, path, repository) = repository();
+    let import = |name: &str| {
+        repository
+            .import_image(name.as_bytes(), name, "image/png", "png")
+            .unwrap()
+    };
+    let (own, shared_by_targets, shared_with_survivor, in_history) = (
+        import("own"),
+        import("targets"),
+        import("survivor"),
+        import("history"),
+    );
+    let owner = |title: &str, images: Vec<app_lite_core::ResourceId>| {
+        let note = repository
+            .create_note(CreateNote {
+                title: title.into(),
+                notebook_id: None,
+                document: CanonicalDocument::default(),
+            })
+            .unwrap();
+        associate_images(&repository, &note, images).id
+    };
+    let first = owner("一", vec![own.clone(), shared_by_targets.clone()]);
+    let second = owner(
+        "二",
+        vec![shared_by_targets.clone(), shared_with_survivor.clone()],
+    );
+    let survivor = owner("存活", vec![shared_with_survivor.clone()]);
+    // Another note that once showed `in_history` keeps it in its history.
+    let historian = repository
+        .load_note(&owner("历史", vec![in_history.clone()]))
+        .unwrap()
+        .unwrap();
+    repository
+        .save_note(SaveNote {
+            id: historian.id.clone(),
+            expected_revision: historian.revision,
+            title: "历史".into(),
+            document: CanonicalDocument::default(),
+            resource_ids: vec![],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    let third = owner("三", vec![in_history.clone()]);
+    let active = owner("未删除", vec![]);
+    repository
+        .trash_notes(&[first.clone(), second.clone(), third.clone()])
+        .unwrap();
+    let database = Connection::open(&path).unwrap();
+    let count = |sql: &str, id: &str| {
+        database
+            .query_row(sql, [id], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let tombstones = |id: &str| count("SELECT count(*) FROM tombstones WHERE entity_id = ?1", id);
+    let purges = |id: &str| {
+        count(
+            "SELECT count(*) FROM sync_outbox WHERE entity_id = ?1 AND operation = 'purge'",
+            id,
+        )
+    };
+    let blob = |id: &app_lite_core::ResourceId| {
+        repository.resource_metadata(id).unwrap().map(|stored| {
+            profile
+                .path()
+                .join("resources")
+                .join("blobs")
+                .join(stored.sha256.as_str())
+        })
+    };
+    let own_blob = blob(&own).unwrap();
+
+    // An active target: nothing is deleted, queued or reclaimed.
+    assert!(
+        repository
+            .purge_notes(&[first.clone(), active.clone(), second.clone()])
+            .is_err()
+    );
+    for id in [&first, &second] {
+        let kept = repository.load_note(id).unwrap().expect("rolled back");
+        assert!(kept.deleted_time.is_some());
+        assert_eq!(tombstones(id.as_str()), 0);
+        assert_eq!(purges(id.as_str()), 0);
+    }
+    assert!(repository.resource_metadata(&own).unwrap().is_some());
+    assert!(own_blob.exists());
+    assert!(repository.purge_notes(&[]).is_err());
+
+    // A failure while reclaiming attachments rolls back every note too.
+    database
+        .execute_batch(
+            "CREATE TRIGGER abort_resource_gc BEFORE DELETE ON resources
+             BEGIN SELECT RAISE(ABORT, 'injected resource GC failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        repository
+            .purge_notes(&[first.clone(), second.clone()])
+            .is_err()
+    );
+    assert!(repository.load_note(&first).unwrap().is_some());
+    assert!(repository.load_note(&second).unwrap().is_some());
+    assert_eq!(tombstones(first.as_str()) + tombstones(second.as_str()), 0);
+    database
+        .execute_batch("DROP TRIGGER abort_resource_gc;")
+        .unwrap();
+
+    repository
+        .purge_notes(&[first.clone(), second.clone(), third.clone(), first.clone()])
+        .unwrap();
+    for id in [&first, &second, &third] {
+        assert!(repository.load_note(id).unwrap().is_none());
+        assert_eq!(tombstones(id.as_str()), 1, "one tombstone each");
+        assert_eq!(purges(id.as_str()), 1, "one sync purge each");
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM search_queue WHERE note_id = ?1 AND reason = 'purge'",
+                id.as_str()
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM note_revisions WHERE note_id = ?1",
+                id.as_str()
+            ),
+            0,
+            "their own history goes with them"
+        );
+    }
+    assert!(repository.resource_metadata(&own).unwrap().is_none());
+    assert!(!own_blob.exists());
+    assert!(
+        repository
+            .resource_metadata(&shared_by_targets)
+            .unwrap()
+            .is_none(),
+        "shared only by the purged notes: reclaimed once"
+    );
+    assert_eq!(tombstones(shared_by_targets.as_str()), 1);
+    assert_eq!(
+        repository
+            .read_resource_bytes(&shared_with_survivor)
+            .unwrap()
+            .unwrap(),
+        b"survivor",
+        "still used by a surviving note"
+    );
+    assert_eq!(
+        repository
+            .read_resource_bytes(&in_history)
+            .unwrap()
+            .unwrap(),
+        b"history",
+        "still shown by another note's history"
+    );
+    assert!(repository.load_note(&survivor).unwrap().is_some());
+    assert!(repository.load_note(&active).unwrap().is_some());
+
+    drop(database);
+    drop(repository);
+    let reopened = LibraryRepository::open(&path).unwrap();
+    assert!(reopened.load_note(&first).unwrap().is_none());
+    assert_eq!(
+        reopened.load_note(&survivor).unwrap().unwrap().resource_ids,
+        vec![shared_with_survivor]
+    );
+}
