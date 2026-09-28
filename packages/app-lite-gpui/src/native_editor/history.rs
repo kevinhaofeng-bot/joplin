@@ -371,6 +371,15 @@ impl History {
     /// resource insertion.  It deliberately has no document effect: the
     /// caller has already applied its inverse and must prevent a future Redo
     /// from resurrecting a resource that never committed to SQLite.
+    /// Drop the newest undo entry without applying it. Only for an entry
+    /// the caller knows left the document as it was (a cancelled input
+    /// method composition), so Undo is not spent on a step that does nothing.
+    pub(crate) fn discard_last_noop(&mut self) -> Result<(), DocumentError> {
+        let entry = self.undo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
+        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        Ok(())
+    }
+
     pub(crate) fn discard_next_redo(&mut self) -> Result<(), DocumentError> {
         let entry = self.redo.pop_back().ok_or(DocumentError::HistoryEmpty)?;
         self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);

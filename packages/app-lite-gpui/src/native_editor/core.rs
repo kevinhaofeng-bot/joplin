@@ -2184,6 +2184,13 @@ impl EditorCore {
         self.composition_base =
             (!new_text.is_empty()).then_some(self.composition_base.unwrap_or(visible_selection));
         if new_text.is_empty() {
+            // The input method cleared its text (Escape): a composition that
+            // began at a caret left the note as it was, and its history
+            // entry would make the next Undo do nothing. One that replaced
+            // a selection did delete that text and keeps its entry.
+            if updating_composition && base_range.is_empty() {
+                let _ = self.history.discard_last_noop();
+            }
             self.composition_base_range = None;
         } else if !updating_composition {
             self.composition_base_range = Some(base_range);

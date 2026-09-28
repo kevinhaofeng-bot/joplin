@@ -5248,6 +5248,137 @@ async fn document_jumps_reveal_the_caret_in_a_long_note_and_save_nothing(cx: &mu
     );
 }
 
+/// Pinyin composed in the note body the way a macOS input method drives it
+/// (NSTextInputClient setMarkedText … insertText), with the note's autosave
+/// deadlines passing between keystrokes. The composition must survive every
+/// save: while it lasts the input method owns the keys (candidate digits,
+/// Space, Return), so losing it mid-way leaks raw keys into the note.
+#[gpui::test]
+async fn body_pinyin_composition_survives_autosave_and_commits_once(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "输入法".into(),
+            notebook_id: None,
+            document: rich_document("前"),
+        })
+        .unwrap();
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.clone().unwrap());
+    session.update(cx, |session, _| session.enable_deadline_tasks_for_test());
+    let editor = session.read_with(cx, |session, _| session.editor().clone());
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    cx.simulate_keystrokes("cmd-end");
+    let focused = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| editor.read(app).focus_handle().is_focused(window))
+    };
+    assert!(focused(cx));
+    let pass_deadlines = |cx: &mut VisualTestContext| {
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(600));
+            cx.executor().advance_clock(Duration::from_millis(600));
+            cx.run_until_parked();
+            redraw(cx);
+        }
+    };
+    let mark = |text: &str, cx: &mut VisualTestContext| {
+        let caret = text.encode_utf16().count();
+        cx.update(|window, app| {
+            editor.update(app, |editor, editor_cx| {
+                <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                    editor,
+                    None,
+                    text,
+                    Some(caret..caret),
+                    window,
+                    editor_cx,
+                )
+            })
+        });
+    };
+    let marked_range = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| {
+            editor.update(app, |editor, editor_cx| {
+                <EditorCore as EntityInputHandler>::marked_text_range(editor, window, editor_cx)
+            })
+        })
+    };
+    let undo_before = editor.read_with(cx, |editor, _| editor.undo_depth());
+    let mut first_range = None;
+    for composing in ["n", "ni", "ni h", "ni ha", "ni hao"] {
+        mark(composing, cx);
+        pass_deadlines(cx);
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.marked_text().map(str::to_owned)),
+            Some(composing.to_owned()),
+            "an autosave must not end the composition"
+        );
+        let range = marked_range(cx).expect("the input method still sees marked text");
+        assert_eq!(
+            range.start,
+            *first_range.get_or_insert(range.start),
+            "in the same place"
+        );
+    }
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            <EditorCore as EntityInputHandler>::replace_text_in_range(
+                editor, None, "你好", window, editor_cx,
+            )
+        })
+    });
+    pass_deadlines(cx);
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert_eq!(body, "前你好");
+    assert!(marked_range(cx).is_none());
+    let saved = repository.load_note(&note.id).unwrap().unwrap();
+    assert!(saved.body_html.contains("前你好"), "{}", saved.body_html);
+    assert!(!saved.body_html.contains("ni"), "{}", saved.body_html);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.undo_depth()),
+        undo_before + 1,
+        "one committed word, one undo step"
+    );
+    assert!(focused(cx), "saving did not move focus away from the body");
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert_eq!(
+        body, "前",
+        "one undo removes the whole word, no pinyin left"
+    );
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+
+    // Escape: the input method clears its marked text and unmarks.
+    mark("zai", cx);
+    pass_deadlines(cx);
+    mark("", cx);
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            <EditorCore as EntityInputHandler>::unmark_text(editor, window, editor_cx)
+        })
+    });
+    pass_deadlines(cx);
+    let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
+    assert_eq!(body, "前你好", "a cancelled composition leaves nothing");
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.undo_depth()),
+        undo_before + 1
+    );
+    let saved = repository.load_note(&note.id).unwrap().unwrap();
+    assert!(!saved.body_html.contains("zai"), "{}", saved.body_html);
+}
+
 #[gpui::test]
 async fn document_jumps_do_not_steal_title_search_or_settings_focus(cx: &mut TestAppContext) {
     let (profile, repository) = repository();

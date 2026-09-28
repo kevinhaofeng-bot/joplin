@@ -8403,3 +8403,31 @@ fn a_table_cell_image_is_requested_once_and_handed_to_the_loader(cx: &mut gpui::
     );
     assert!(editor.take_pending_image_hydration_requests().is_empty());
 }
+
+/// Escape during a composition (the input method sets empty marked text):
+/// at a caret nothing changed, so Undo is not spent on it; over a selection
+/// the selected text was replaced, and one Undo brings it back.
+#[gpui::test]
+fn a_cancelled_composition_leaves_undo_as_it_found_it(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    let depth = editor.undo_depth();
+    for text in ["z", "zai", ""] {
+        editor.replace_and_mark_utf16(None, text, None).unwrap();
+    }
+    assert_eq!(editor.copy_all_plain_text(), "前后");
+    assert_eq!(editor.undo_depth(), depth, "nothing to undo");
+
+    editor.select_document_range(0, "前".len());
+    for text in ["z", "zai", ""] {
+        editor.replace_and_mark_utf16(None, text, None).unwrap();
+    }
+    assert_eq!(
+        editor.copy_all_plain_text(),
+        "后",
+        "the selection was replaced"
+    );
+    assert_eq!(editor.undo_depth(), depth + 1);
+    editor.undo().unwrap();
+    assert_eq!(editor.copy_all_plain_text(), "前后");
+}
