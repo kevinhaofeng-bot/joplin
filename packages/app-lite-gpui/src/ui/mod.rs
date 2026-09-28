@@ -1456,12 +1456,10 @@ impl LibraryShell {
                                     )
                                     | None
                             );
-                            if this
-                                .update(cx, |shell, shell_cx| {
-                                    shell_cx.notify();
-                                })
-                                .is_err()
-                            {
+                            // Nothing on screen reflects a single job. With a
+                            // redraw per job, a 417-image backlog measured
+                            // 512MiB more graphics footprint until it drained.
+                            if this.update(cx, |_, _| {}).is_err() {
                                 break;
                             }
                         }
@@ -1511,8 +1509,8 @@ impl LibraryShell {
                             });
                             if invalidated {
                                 shell.schedule_active_search_refresh(shell_cx);
+                                shell_cx.notify();
                             }
-                            shell_cx.notify();
                         })
                         .is_err()
                 {

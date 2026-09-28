@@ -694,3 +694,57 @@ async fn mounted_scheduler_close_finishes_only_active_index_transaction(cx: &mut
         "the active atomic note is acknowledged only after its committed projection"
     );
 }
+
+#[gpui::test]
+async fn a_finished_derived_job_does_not_redraw_the_library(cx: &mut TestAppContext) {
+    // A large backlog runs about two jobs a second; with a redraw each time a
+    // measured 512MiB of graphics footprint stayed until the backlog drained
+    // (docs/research/claude-implementation-report-2026-09-28.md).
+    let (_profile, repository) = repository();
+    let resource = repository
+        .import_resource(
+            b"unsupported image source",
+            "fixture.gif",
+            "image/gif",
+            "gif",
+        )
+        .expect("import unsupported-image fixture");
+    repository
+        .create_note(CreateNote {
+            title: "GIF owner".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "fixture.gif".into(),
+                media_type: "image/gif".into(),
+            }]),
+        })
+        .expect("queue a derived job before opening");
+    let (shell, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    let notifications = Rc::new(std::cell::Cell::new(0usize));
+    let counter = Rc::clone(&notifications);
+    let _observation =
+        cx.update(|_, app| app.observe(&shell, move |_, _| counter.set(counter.get() + 1)));
+    cx.executor()
+        .advance_clock(DERIVED_IMAGE_STARTUP_DELAY + std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    // Parallel tests share the one extractor slot; wait (bounded) for ours.
+    for _ in 0..200 {
+        if matches!(
+            repository.derived_text_status(&resource).unwrap(),
+            Some(DerivedTextStatus::Failed { .. })
+        ) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+    }
+    assert!(matches!(
+        repository.derived_text_status(&resource).unwrap(),
+        Some(DerivedTextStatus::Failed { attempts: 1, .. })
+    ));
+    assert_eq!(notifications.get(), 0);
+}
