@@ -10,7 +10,7 @@ use app_lite_core::{
     CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
     LibraryNavigationIndex, LibraryRepository, LibraryRoute, LibraryShellState, ListQuery, Note,
     NoteId, NoteOrganizationState, NoteProjection, NotebookId, ResourceId, SearchHit,
-    SortDirection, SortField, TagId,
+    SortDirection, SortField, SortSpec, TagId,
 };
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -130,7 +130,7 @@ pub struct AppModel {
     navigation_index: LibraryNavigationIndex,
     active_session: Option<ActiveSession>,
     panes: PaneState,
-    list_view_mode: ListViewMode,
+    list_view: ListViewPreferences,
     status: AppStatus,
     status_origin: StatusOrigin,
     // A repository mutation can commit before the subsequent projection
@@ -175,11 +175,185 @@ struct PreparedOrganizationCommit {
     active_session: Option<ActiveSession>,
 }
 
+// Evernote keeps its note list view (`GLOBAL_NOTE_VIEW_OPTIONS_KEY`) and
+// sort (`SEARCH_SORT_PREFERENCE_GLOBAL`/`_NOTEBOOK`) as user settings
+// (main-readable 51244__get-string-user-setting.js), so both survive a
+// restart. Sort here is per route, as the in-memory model already was.
+const LIST_VIEW_SETTING: &str = "library-shell.list-view";
+const NOTE_SORTS_SETTING: &str = "library-shell.note-sorts";
+
+/// Evernote writes the global view and the current notebook's, stack's or
+/// Trash's own (renderer 9435.js 33039–33048, stores registered at
+/// 31827–31851); a context without its own uses the global one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ListViewPreferences {
+    global: ListViewMode,
+    contexts: std::collections::BTreeMap<LibraryRoute, ListViewMode>,
+}
+
+impl ListViewPreferences {
+    fn context(route: &LibraryRoute) -> Option<&LibraryRoute> {
+        matches!(
+            route,
+            LibraryRoute::Notebook(_) | LibraryRoute::Stack(_) | LibraryRoute::Trash
+        )
+        .then_some(route)
+    }
+
+    fn mode_for(&self, route: &LibraryRoute) -> ListViewMode {
+        Self::context(route)
+            .and_then(|context| self.contexts.get(context))
+            .copied()
+            .unwrap_or(self.global)
+    }
+
+    fn with_mode(&self, route: &LibraryRoute, mode: ListViewMode) -> Self {
+        let mut next = self.clone();
+        next.global = mode;
+        if let Some(context) = Self::context(route) {
+            next.contexts.insert(context.clone(), mode);
+        }
+        next
+    }
+
+    fn setting_value(&self) -> String {
+        serde_json::json!({
+            "global": self.global.setting_value(),
+            "contexts": self
+                .contexts
+                .iter()
+                .map(|(route, mode)| (route_setting_key(route), mode.setting_value()))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    /// Anything this build cannot read falls back to the defaults.
+    fn from_setting_value(value: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(value) else {
+            return Self::default();
+        };
+        let global = value["global"]
+            .as_str()
+            .and_then(ListViewMode::from_setting_value)
+            .unwrap_or_default();
+        let contexts = value["contexts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let route = route_from_setting_key(entry.get(0)?.as_str()?)?;
+                let mode = ListViewMode::from_setting_value(entry.get(1)?.as_str()?)?;
+                Self::context(&route)?;
+                Some((route, mode))
+            })
+            .collect();
+        Self { global, contexts }
+    }
+}
+
+fn route_setting_key(route: &LibraryRoute) -> String {
+    match route {
+        LibraryRoute::AllNotes => "all".to_owned(),
+        LibraryRoute::Notebook(id) => format!("notebook:{}", id.as_str()),
+        LibraryRoute::Stack(id) => format!("stack:{}", id.as_str()),
+        LibraryRoute::Tags(ids) => format!(
+            "tags:{}",
+            ids.iter().map(TagId::as_str).collect::<Vec<_>>().join(",")
+        ),
+        LibraryRoute::Trash => "trash".to_owned(),
+    }
+}
+
+fn route_from_setting_key(key: &str) -> Option<LibraryRoute> {
+    match key.split_once(':') {
+        None if key == "all" => Some(LibraryRoute::AllNotes),
+        None if key == "trash" => Some(LibraryRoute::Trash),
+        Some(("notebook", id)) => NotebookId::parse(id).ok().map(LibraryRoute::Notebook),
+        Some(("stack", id)) => app_lite_core::StackId::parse(id)
+            .ok()
+            .map(LibraryRoute::Stack),
+        Some(("tags", ids)) => LibraryRoute::tags(
+            ids.split(',')
+                .map(TagId::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?,
+        )
+        .ok(),
+        _ => None,
+    }
+}
+
+fn sort_setting_value(sort: SortSpec) -> String {
+    let field = match sort.field() {
+        SortField::Updated => "updated",
+        SortField::Deleted => "deleted",
+        SortField::Title => "title",
+    };
+    let direction = match sort.direction() {
+        SortDirection::Ascending => "asc",
+        SortDirection::Descending => "desc",
+    };
+    format!("{field}:{direction}")
+}
+
+fn sort_from_setting_value(value: &str) -> Option<SortSpec> {
+    let (field, direction) = value.split_once(':')?;
+    let field = match field {
+        "updated" => SortField::Updated,
+        "deleted" => SortField::Deleted,
+        "title" => SortField::Title,
+        _ => return None,
+    };
+    let direction = match direction {
+        "asc" => SortDirection::Ascending,
+        "desc" => SortDirection::Descending,
+        _ => return None,
+    };
+    Some(SortSpec::new(field, direction))
+}
+
+/// An entry that no longer parses is dropped rather than failing the open.
+fn read_note_sorts(
+    repository: &LibraryRepository,
+) -> Result<std::collections::BTreeMap<LibraryRoute, SortSpec>, LibraryError> {
+    let Some(value) = repository.read_setting(NOTE_SORTS_SETTING)? else {
+        return Ok(Default::default());
+    };
+    let entries: Vec<(String, String)> = serde_json::from_str(&value).unwrap_or_default();
+    Ok(entries
+        .iter()
+        .filter_map(|(route, sort)| {
+            Some((
+                route_from_setting_key(route)?,
+                sort_from_setting_value(sort)?,
+            ))
+        })
+        .collect())
+}
+
+fn write_note_sorts(
+    repository: &LibraryRepository,
+    sorts: &std::collections::BTreeMap<LibraryRoute, SortSpec>,
+) -> Result<(), LibraryError> {
+    let entries: Vec<(String, String)> = sorts
+        .iter()
+        .map(|(route, sort)| (route_setting_key(route), sort_setting_value(*sort)))
+        .collect();
+    let value = serde_json::to_string(&entries).expect("sort settings serialize");
+    repository.write_setting(NOTE_SORTS_SETTING, &value)
+}
+
 impl AppModel {
     pub fn open(repository: Arc<LibraryRepository>) -> Result<Self, LibraryError> {
         let saved_shell_state = repository.read_library_shell_state()?;
         let panes = PaneState::from_shell_state(&saved_shell_state);
-        let navigation = NavigationState::default();
+        let mut navigation = NavigationState::default();
+        navigation.restore_route_sorts(read_note_sorts(&repository)?);
+        let list_view = repository
+            .read_setting(LIST_VIEW_SETTING)?
+            .map(|value| ListViewPreferences::from_setting_value(&value))
+            .unwrap_or_default();
         let navigation_index = repository.list_navigation_index()?;
         let projections = repository.list_notes(
             ListQuery::for_route(navigation.route().clone()).with_sort(navigation.sort()),
@@ -196,7 +370,7 @@ impl AppModel {
             navigation_index,
             active_session: None,
             panes,
-            list_view_mode: ListViewMode::default(),
+            list_view,
             status: AppStatus::Ready,
             status_origin: StatusOrigin::Neutral,
             partial_commit_message: None,
@@ -404,14 +578,19 @@ impl AppModel {
                 self.panes.list_visible = !self.panes.list_visible;
                 self.persist_shell_state()
             }
+            // A preference changes on screen only once it is saved.
             AppAction::SetListViewMode(mode) => {
-                self.list_view_mode = mode;
+                let list_view = self.list_view.with_mode(self.navigation.route(), mode);
+                self.repository
+                    .write_setting(LIST_VIEW_SETTING, &list_view.setting_value())?;
+                self.list_view = list_view;
                 Ok(())
             }
             AppAction::SetSort(sort) => {
                 let mut candidate = self.navigation.clone();
                 candidate.set_sort_for_route(sort.sort_spec());
                 let prepared = self.prepare_navigation_commit(candidate)?;
+                write_note_sorts(&self.repository, prepared.navigation.route_sorts())?;
                 self.commit_navigation(prepared);
                 Ok(())
             }
@@ -1298,7 +1477,7 @@ impl AppModel {
         &self.status
     }
     pub fn list_view_mode(&self) -> ListViewMode {
-        self.list_view_mode
+        self.list_view.mode_for(self.navigation.route())
     }
     pub fn sort(&self) -> NoteSort {
         NoteSort::from_sort_spec(self.navigation.sort())

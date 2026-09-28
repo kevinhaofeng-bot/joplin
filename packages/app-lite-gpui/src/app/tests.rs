@@ -2823,3 +2823,211 @@ fn a_multi_selection_trash_that_cannot_complete_trashes_nothing_and_says_so() {
     assert_eq!(model.navigation().selected_note_id(), Some(&kept));
     assert_eq!(model.active_session_note_id(), Some(&kept));
 }
+
+#[test]
+fn list_view_and_sort_survive_reopening_the_library_with_the_selection() {
+    // Evernote stores both as user settings (main-readable
+    // 51244__get-string-user-setting.js: GLOBAL/NOTEBOOKS/STACKS/
+    // TRASH_NOTE_VIEW_OPTIONS_KEY, SEARCH_SORT_PREFERENCE_GLOBAL/_NOTEBOOK).
+    let (profile, repository) = repository();
+    let notebook = repository.create_notebook("本子", None).unwrap();
+    let other = repository.create_notebook("另一本", None).unwrap();
+    let stack = repository.create_stack("一组").unwrap();
+    repository.create_notebook("组内", Some(&stack.id)).unwrap();
+    create(&repository, "Alpha");
+    let zulu = create(&repository, "Zulu");
+    for title in ["Beta", "Gamma"] {
+        repository
+            .create_note(CreateNote {
+                title: title.into(),
+                notebook_id: Some(notebook.id.clone()),
+                document: CanonicalDocument::default(),
+            })
+            .unwrap();
+    }
+    let go = |model: &mut AppModel, route: LibraryRoute, selected: Option<NoteId>| {
+        model
+            .dispatch(AppAction::NavigateTo {
+                route,
+                selected_note_id: selected,
+            })
+            .unwrap()
+    };
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    model
+        .dispatch(AppAction::SetSort(NoteSort::TitleAscending))
+        .unwrap();
+    go(
+        &mut model,
+        LibraryRoute::Notebook(notebook.id.clone()),
+        None,
+    );
+    model
+        .dispatch(AppAction::SetListViewMode(ListViewMode::Snippets))
+        .unwrap();
+    model
+        .dispatch(AppAction::SetSort(NoteSort::TitleDescending))
+        .unwrap();
+    go(&mut model, LibraryRoute::Stack(stack.id.clone()), None);
+    model
+        .dispatch(AppAction::SetListViewMode(ListViewMode::Cards))
+        .unwrap();
+    go(&mut model, LibraryRoute::Trash, None);
+    model
+        .dispatch(AppAction::SetListViewMode(ListViewMode::Snippets))
+        .unwrap();
+    model
+        .dispatch(AppAction::SetSort(NoteSort::TitleAscending))
+        .unwrap();
+    // Later, on All Notes, a new global view; each context keeps its own.
+    go(&mut model, LibraryRoute::AllNotes, Some(zulu.clone()));
+    model
+        .dispatch(AppAction::SetListViewMode(ListViewMode::Compact))
+        .unwrap();
+    drop(model);
+    drop(repository);
+
+    let repository =
+        Arc::new(LibraryRepository::open(profile.path().join("library.sqlite")).unwrap());
+    let mut reopened = AppModel::open(Arc::clone(&repository)).unwrap();
+    let titles = |model: &AppModel| {
+        model
+            .projections()
+            .iter()
+            .map(|projection| projection.title_prefix.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(reopened.list_view_mode(), ListViewMode::Compact);
+    assert_eq!(
+        titles(&reopened),
+        ["Alpha", "Beta", "Gamma", "Zulu"],
+        "All Notes by title"
+    );
+    assert_eq!(reopened.navigation().selected_note_id(), Some(&zulu));
+    go(
+        &mut reopened,
+        LibraryRoute::Notebook(notebook.id.clone()),
+        None,
+    );
+    assert_eq!(
+        reopened.list_view_mode(),
+        ListViewMode::Snippets,
+        "its own view"
+    );
+    assert_eq!(
+        titles(&reopened),
+        ["Gamma", "Beta"].map(str::to_owned).to_vec(),
+        "its own sort"
+    );
+    go(
+        &mut reopened,
+        LibraryRoute::Notebook(other.id.clone()),
+        None,
+    );
+    assert_eq!(
+        reopened.list_view_mode(),
+        ListViewMode::Compact,
+        "global fallback"
+    );
+    go(&mut reopened, LibraryRoute::Stack(stack.id.clone()), None);
+    assert_eq!(
+        reopened.list_view_mode(),
+        ListViewMode::Cards,
+        "the stack's own view"
+    );
+    go(&mut reopened, LibraryRoute::Trash, None);
+    assert_eq!(
+        reopened.list_view_mode(),
+        ListViewMode::Snippets,
+        "Trash's own view"
+    );
+    assert_eq!(
+        reopened.sort(),
+        NoteSort::TitleAscending,
+        "Trash's own sort"
+    );
+}
+
+#[test]
+fn old_or_unreadable_list_settings_open_with_defaults() {
+    let (_profile, repository) = repository();
+    let fresh = AppModel::open(Arc::clone(&repository)).unwrap();
+    assert_eq!(fresh.list_view_mode(), ListViewMode::default());
+    for (view, sorts) in [
+        ("compact", "not json"),
+        (
+            "{\"global\":\"gallery\",\"contexts\":[[\"all\",\"cards\"],[\"notebook:x\",\"compact\"]]}",
+            "[[\"all\",\"sideways:up\"],[\"shelf:1\",\"title:asc\"]]",
+        ),
+    ] {
+        repository
+            .write_setting("library-shell.list-view", view)
+            .unwrap();
+        repository
+            .write_setting("library-shell.note-sorts", sorts)
+            .unwrap();
+        let model = AppModel::open(Arc::clone(&repository)).unwrap();
+        assert_eq!(model.list_view_mode(), ListViewMode::default());
+        assert_eq!(model.sort(), NoteSort::UpdatedDescending);
+    }
+}
+
+#[test]
+fn a_list_setting_that_cannot_be_saved_changes_nothing() {
+    let (profile, repository) = repository();
+    create(&repository, "Alpha");
+    create(&repository, "Zulu");
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    let before = titles_of(&model);
+    let database = rusqlite::Connection::open(profile.path().join("library.sqlite")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER no_list_insert BEFORE INSERT ON settings WHEN NEW.key LIKE 'library-shell.%' BEGIN SELECT RAISE(ABORT, 'injected'); END;
+             CREATE TRIGGER no_list_update BEFORE UPDATE ON settings WHEN NEW.key LIKE 'library-shell.%' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+    assert!(
+        model
+            .dispatch(AppAction::SetListViewMode(ListViewMode::Compact))
+            .is_err()
+    );
+    assert_eq!(model.list_view_mode(), ListViewMode::default());
+    assert!(
+        model
+            .dispatch(AppAction::SetSort(NoteSort::TitleAscending))
+            .is_err()
+    );
+    assert_eq!(model.sort(), NoteSort::UpdatedDescending);
+    assert_eq!(titles_of(&model), before, "the list keeps its order");
+    database
+        .execute_batch("DROP TRIGGER no_list_insert; DROP TRIGGER no_list_update;")
+        .unwrap();
+    model
+        .dispatch(AppAction::SetListViewMode(ListViewMode::Compact))
+        .unwrap();
+    assert_eq!(model.list_view_mode(), ListViewMode::Compact);
+}
+
+#[test]
+fn list_settings_belong_to_their_own_library() {
+    let (_first_profile, first) = repository();
+    let (_second_profile, second) = repository();
+    let mut model = AppModel::open(Arc::clone(&first)).unwrap();
+    model
+        .dispatch(AppAction::SetListViewMode(ListViewMode::Compact))
+        .unwrap();
+    model
+        .dispatch(AppAction::SetSort(NoteSort::TitleDescending))
+        .unwrap();
+    let other = AppModel::open(second).unwrap();
+    assert_eq!(other.list_view_mode(), ListViewMode::default());
+    assert_eq!(other.sort(), NoteSort::UpdatedDescending);
+}
+
+fn titles_of(model: &AppModel) -> Vec<String> {
+    model
+        .projections()
+        .iter()
+        .map(|projection| projection.title_prefix.clone())
+        .collect()
+}

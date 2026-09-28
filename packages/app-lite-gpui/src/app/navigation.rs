@@ -288,6 +288,14 @@ impl NavigationState {
         }
     }
 
+    pub(crate) fn route_sorts(&self) -> &BTreeMap<LibraryRoute, SortSpec> {
+        &self.route_sorts
+    }
+
+    pub(crate) fn restore_route_sorts(&mut self, sorts: BTreeMap<LibraryRoute, SortSpec>) {
+        self.route_sorts = sorts;
+    }
+
     pub(crate) fn set_sort_for_route(&mut self, sort: SortSpec) {
         self.route_sorts.insert(self.route.clone(), sort);
     }

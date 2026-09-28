@@ -35,6 +35,20 @@ pub enum ListViewMode {
 }
 
 impl ListViewMode {
+    pub(crate) const fn setting_value(self) -> &'static str {
+        match self {
+            Self::Cards => "cards",
+            Self::Snippets => "snippets",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub(crate) fn from_setting_value(value: &str) -> Option<Self> {
+        [Self::Cards, Self::Snippets, Self::Compact]
+            .into_iter()
+            .find(|mode| mode.setting_value() == value)
+    }
+
     pub const fn next(self) -> Self {
         match self {
             Self::Cards => Self::Snippets,
