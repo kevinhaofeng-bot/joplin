@@ -124,24 +124,43 @@ fn decode_data_uri(data: &str) -> Result<Vec<u8>, String> {
     let (header, payload) = data
         .split_once(',')
         .ok_or_else(|| "图片数据无效".to_owned())?;
-    // Base64 is 4/3 of the decoded size; reject before allocating.
-    if payload.len() / 4 * 3 > app_lite_core::MAX_IMAGE_BYTES + 3 {
-        return Err("图片太大".to_owned());
-    }
+    let too_large = || "图片太大".to_owned();
+    // The limit is on decoded bytes, counted exactly before allocating:
+    // percent-encoding triples the text and MIME base64 adds line breaks.
     if !header.to_ascii_lowercase().ends_with(";base64") {
+        if percent_decoded_len(payload) > app_lite_core::MAX_IMAGE_BYTES {
+            return Err(too_large());
+        }
         return Ok(percent_decode_bytes(payload));
+    }
+    let digits = payload
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+        .count();
+    if digits / 4 * 3 + (digits % 4).saturating_sub(1) > app_lite_core::MAX_IMAGE_BYTES {
+        return Err(too_large());
     }
     let compact: String = payload
         .chars()
         .filter(|c| !c.is_ascii_whitespace())
         .collect();
-    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+    base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(compact.trim_end_matches('='))
-        .map_err(|_| "图片数据无效".to_owned())?;
-    if bytes.len() > app_lite_core::MAX_IMAGE_BYTES {
-        return Err("图片太大".to_owned());
+        .map_err(|_| "图片数据无效".to_owned())
+}
+
+fn percent_decoded_len(value: &str) -> usize {
+    let bytes = value.as_bytes();
+    let mut length = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = bytes[index] == b'%'
+            && bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+            && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit);
+        index += if escape { 3 } else { 1 };
+        length += 1;
     }
-    Ok(bytes)
+    length
 }
 
 /// RFC 3986 percent-decoding to raw bytes: `+` stays `+`, and a `%` not
@@ -308,5 +327,67 @@ mod data_uri_tests {
             .expect("a valid image");
         assert!(import.is_image());
         assert_eq!(decode_data_uri("text/plain,a+b%2").unwrap(), b"a+b%2");
+    }
+}
+
+#[cfg(test)]
+mod data_uri_limit_tests {
+    use super::*;
+    use app_lite_core::MAX_IMAGE_BYTES;
+
+    fn percent(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("%{byte:02X}")).collect()
+    }
+
+    fn base64_lines(bytes: &[u8]) -> String {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    /// The limit is on decoded bytes whatever the encoding: percent-encoding
+    /// triples the text and MIME base64 adds line breaks, and neither may
+    /// push an image at the limit over it.
+    #[test]
+    fn the_image_size_limit_applies_to_decoded_bytes_in_every_encoding() {
+        let encodings: [(&str, fn(&[u8]) -> String); 3] = [
+            ("image/png;base64", |bytes| {
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            }),
+            ("image/png;base64", base64_lines),
+            ("image/png", percent),
+        ];
+        for (header, encode) in encodings {
+            let at_limit = vec![0x89_u8; MAX_IMAGE_BYTES];
+            assert_eq!(
+                decode_data_uri(&format!("{header},{}", encode(&at_limit)))
+                    .map(|bytes| bytes.len()),
+                Ok(MAX_IMAGE_BYTES),
+                "{header}: exactly at the limit"
+            );
+            let over = vec![0x89_u8; MAX_IMAGE_BYTES + 1];
+            assert_eq!(
+                decode_data_uri(&format!("{header},{}", encode(&over))),
+                Err("图片太大".to_owned()),
+                "{header}: one byte over"
+            );
+        }
+
+        // A real image at the limit, percent-encoded, is stored as an image.
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(5, 4)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png.resize(MAX_IMAGE_BYTES, 0);
+        let import =
+            fetch_pasted_images(&[(format!("data:image/png,{}", percent(&png)), "大图".into())])
+                .pop()
+                .unwrap()
+                .expect("an image exactly at the limit");
+        assert!(import.is_image());
     }
 }
