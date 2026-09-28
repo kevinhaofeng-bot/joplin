@@ -22,6 +22,8 @@
 
 另启动第四次（PID57768），保存`footprint-raw.txt`后结束该测试进程：总footprint115MB，IOSurface42MB、IOAccelerator16MB、graphics dirty11MB及reclaimable130MB。只能说明第四次图形资源分类，不可倒推首次640MB根因。
 
+再次从原导入测试库克隆全新副本`/tmp/joplin-memory-fresh.xFvhbe/profile`，首次启动10秒后PID58404的RSS84608KiB（82.6MiB）、footprint115MB；原始报告`/tmp/joplin-memory-fresh.xFvhbe/footprint.txt`，其中IOSurface42MB、IOAccelerator16MB、graphics dirty14MB/reclaimable322MB。本次未复现640MB，不能据此确认首次异常已修复或证明其根因。
+
 ## 验收边界
 
 这一旧候选包的真实库副本空闲RSS三次均低于120MiB；这不是新版本验收，更不是典型文档160MiB、输入p95<16ms、首帧/搜索预算通过。需新候选复测并保留每次原始报告，进一步区分首次缓存建立、图形内存、可回收与驻留内存。
