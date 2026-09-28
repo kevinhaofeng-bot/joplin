@@ -60,6 +60,7 @@ anyhow = "1"
 base64 = "0.23"
 uuid = "1.23"
 sha2 = "0.10"
+tempfile = "3"
 gpui = "0.2"
 sum_tree = { package = "gpui_sum_tree", version = "0.2.2" }
 loro_fractional_index = "1.13.0"
@@ -76,7 +77,7 @@ usvg = "0.45.1"
 semver = "1"
 toml = "1"
 chromiumoxide = { version = "0.9.1", default-features = false, features = ["bytes"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 url = "2"
 pulldown-cmark = "0.13"
 cssparser = "0.37"
