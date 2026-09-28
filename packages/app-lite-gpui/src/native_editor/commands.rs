@@ -360,9 +360,8 @@ impl CommandCatalogue {
                     selected_items(editor.document(), start, end)
                         .iter()
                         .filter_map(|item| match item {
-                            SelectedItem::Text { kind, .. } | SelectedItem::Grouped { kind } => {
-                                Some(Some(kind))
-                            }
+                            SelectedItem::Text { kind, .. }
+                            | SelectedItem::Grouped { kind, .. } => Some(Some(kind)),
                             SelectedItem::Standalone { .. } => is_list.then_some(None),
                         })
                         .fold(
@@ -650,7 +649,7 @@ fn apply_list_command(command: EditorCommand, editor: &mut EditorCore) -> Result
     let items = selected_items(document, start, end);
     let remove = !items.is_empty()
         && items.iter().all(|item| match item {
-            SelectedItem::Text { kind, .. } | SelectedItem::Grouped { kind } => {
+            SelectedItem::Text { kind, .. } | SelectedItem::Grouped { kind, .. } => {
                 block_kind_matches_command(kind, command)
             }
             SelectedItem::Standalone { .. } => false,
@@ -672,12 +671,26 @@ fn apply_list_command(command: EditorCommand, editor: &mut EditorCore) -> Result
     } else {
         Vec::new()
     };
-    let mut transactions: Vec<_> = items
+    // A selected resource retypes its item through the item's text row.
+    let mut rows = Vec::new();
+    for item in &items {
+        let row = match item {
+            SelectedItem::Text { id, kind, len } => Some((*id, kind.clone(), *len)),
+            SelectedItem::Grouped {
+                kind,
+                row: Some((id, len)),
+            } => Some((*id, kind.clone(), *len)),
+            _ => None,
+        };
+        if let Some(row) = row
+            && !rows.iter().any(|(id, _, _)| *id == row.0)
+        {
+            rows.push(row);
+        }
+    }
+    let mut transactions: Vec<_> = rows
         .iter()
-        .filter_map(|item| {
-            let SelectedItem::Text { id, kind, len } = item else {
-                return None;
-            };
+        .filter_map(|(id, kind, len)| {
             if unwrapped.iter().any(|group| group.members.contains(id)) {
                 return None;
             }
@@ -790,8 +803,10 @@ enum SelectedItem {
         kind: BlockKind,
         len: usize,
     },
+    /// `row` is the item's text row, which carries its list type.
     Grouped {
         kind: BlockKind,
+        row: Option<(NodeId, usize)>,
     },
     Standalone {
         id: NodeId,
@@ -826,6 +841,10 @@ fn selected_items(document: &Document, start: usize, end: usize) -> Vec<Selected
                 {
                     Some(group) => SelectedItem::Grouped {
                         kind: group.kind.clone(),
+                        row: group.members.iter().find_map(|id| {
+                            let text = document.block(*id)?.content.as_text()?;
+                            Some((*id, text.len()))
+                        }),
                     },
                     None => SelectedItem::Standalone {
                         id: block.id,
@@ -1099,6 +1118,63 @@ mod tests {
             );
             editor.undo().unwrap();
             assert_eq!(editor.document().semantic_snapshot(), wrapped);
+        }
+    }
+
+    #[gpui::test]
+    fn a_selected_list_resource_alone_changes_its_own_item_type(cx: &mut gpui::TestAppContext) {
+        // `insertOrToggleList` retypes existing list items with `setNodeMarkup`,
+        // whichever child of the item the selection covers.
+        for resource in [IMAGE, ATTACHMENT] {
+            let mut editor = opened(&format!("<ul><li>甲</li><li>{resource}</li></ul>"), cx);
+            let original = editor.document().semantic_snapshot();
+            let atom = editor
+                .document()
+                .blocks()
+                .iter()
+                .find(|block| block.content.as_text().is_none())
+                .unwrap()
+                .id;
+            let catalogue = CommandCatalogue::new();
+            for (command, list) in [
+                (EditorCommand::OrderedList, "<ol><li>{r}</li></ol>"),
+                (
+                    EditorCommand::CheckList,
+                    r#"<ul data-type="checklist"><li data-checked="false">{r}</li></ul>"#,
+                ),
+            ] {
+                editor.set_selection_for_test(crate::native_editor::model::Selection::new(
+                    crate::native_editor::model::DocPoint::with_affinity(
+                        atom,
+                        0,
+                        crate::native_editor::model::Affinity::Before,
+                    ),
+                    crate::native_editor::model::DocPoint::with_affinity(
+                        atom,
+                        0,
+                        crate::native_editor::model::Affinity::After,
+                    ),
+                ));
+                assert!(catalogue.state(command, &editor).enabled);
+                let depth = editor.undo_depth();
+                catalogue
+                    .execute(command, CommandArgument::None, &mut editor)
+                    .unwrap();
+                assert_eq!(editor.undo_depth(), depth + 1, "{command:?} is one step");
+                let expected = saved(&opened(
+                    &format!("<ul><li>甲</li></ul>{}", list.replace("{r}", resource)),
+                    cx,
+                ));
+                assert_eq!(saved(&editor), expected, "{command:?}");
+                assert_eq!(
+                    saved(&opened(&expected, cx)),
+                    expected,
+                    "reopened {command:?}"
+                );
+            }
+            editor.undo().unwrap();
+            editor.undo().unwrap();
+            assert_eq!(editor.document().semantic_snapshot(), original);
         }
     }
 
