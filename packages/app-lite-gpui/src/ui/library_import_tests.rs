@@ -285,3 +285,103 @@ async fn mounted_copy_note_menu_action_creates_and_selects_a_copy(cx: &mut TestA
         "the copy is selected"
     );
 }
+
+/// A restore's long success message and its Open button stay inside the
+/// window with three, two or one columns and in a narrow window; clicking
+/// the button itself (not dispatching the action) opens the restored copy.
+#[gpui::test]
+async fn mounted_restore_status_keeps_its_open_button_on_screen_and_clickable(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{Modifiers, point, px, size};
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    cx.dispatch_action(crate::app::CreateNote);
+    cx.run_until_parked();
+    // A long folder name makes the message long, as real backups are.
+    let backup = fixture
+        .base
+        .parent()
+        .unwrap()
+        .join("二〇二六年九月二十八日下午整理完毕的整个资料库完整备份（含全部附件与历史版本）");
+    cx.dispatch_action(crate::app::BackupLibrary);
+    cx.run_until_parked();
+    let target = backup.clone();
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_library_backup_picker_for_test(Ok(Some(target)), shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.dispatch_action(crate::app::RestoreLibrary);
+    cx.run_until_parked();
+    let source = backup.clone();
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_library_restore_picker_for_test(Ok(Some(source)), shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    let restored = view
+        .read_with(cx, |shell, _| shell.imported_library_ready_for_test())
+        .expect("restored library ready to open");
+
+    let toggle = |cx: &mut VisualTestContext, action: crate::app::AppAction| {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(action, window, shell_cx)
+            })
+        });
+    };
+    let on_screen =
+        |cx: &mut VisualTestContext, label: &str, window_size: gpui::Size<gpui::Pixels>| {
+            cx.update(|window, app| window.draw(app).clear());
+            cx.run_until_parked();
+            let window = gpui::Bounds::new(point(px(0.0), px(0.0)), window_size);
+            for selector in ["library-import-status", "library-import-open"] {
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{label}: {selector} not drawn"));
+                assert!(
+                    bounds.left() >= window.left()
+                        && bounds.right() <= window.right()
+                        && bounds.top() >= window.top()
+                        && bounds.bottom() <= window.bottom(),
+                    "{label}: {selector} {bounds:?} leaves the window {window:?}"
+                );
+            }
+        };
+    let wide = size(px(1160.0), px(789.0));
+    cx.simulate_resize(wide);
+    on_screen(cx, "three columns", wide);
+    toggle(cx, crate::app::AppAction::ToggleNoteList);
+    on_screen(cx, "two columns", wide);
+    toggle(cx, crate::app::AppAction::ToggleSidebar);
+    on_screen(cx, "one column", wide);
+    toggle(cx, crate::app::AppAction::ToggleSidebar);
+    toggle(cx, crate::app::AppAction::ToggleNoteList);
+    let narrow = size(px(760.0), px(600.0));
+    cx.simulate_resize(narrow);
+    on_screen(cx, "narrow, three columns", narrow);
+
+    let open = cx.debug_bounds("library-import-open").unwrap();
+    // The button acts on mouse-down, which closes this window.
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: open.center(),
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    let app: &mut TestAppContext = cx;
+    app.run_until_parked();
+    assert_eq!(
+        crate::library_profile::resolve_active(&fixture.base),
+        restored
+    );
+    assert_eq!(
+        app.update(|app| app.windows()).len(),
+        1,
+        "the restored library replaced the window"
+    );
+}
