@@ -513,3 +513,81 @@ Codex 读取的源码（我已复核）是 common-editor `apps/peso/schema.ts` 1
 
 **源码检查点：** `eeeb07fd6`。
 
+
+## 第十四批：文字颜色（`08adbf71b`、`5dfcf65b9`）与纯表格笔记的初始选区（`6975b88ed`）
+
+### Evernote 源码对应
+
+- 颜色数据：common-editor `textformatter/schema.ts` 470–554 行的 forecolor mark，保存为 `<span style="color: …">`；深色模式下设置的颜色另写 `--inversion-type-color: simple`。
+- 命令语义：`textformatter/commands/forecolor.ts`。
+  - 有选区时，替换选区内的颜色；
+  - 光标处的颜色存为待用样式，作用于下一次输入；
+  - 传 `null` 时恢复默认颜色；
+  - 选区内颜色不一时，查询结果为混合。
+- 合法颜色：`utils/color.ts` 的 `isValidColor` 使用 `color-string`，其 `node_modules/color-string/index.js` 156–174 行支持逗号分隔的 `hwb()`。
+- 色板：`apps/peso/defs.ts` 50–61 行 `forecolorPalette.light` 的 14 个颜色，顺序与值都一致。
+- 空文档的选区：`selection/commands/setselectiontoend.ts` 调用 ProseMirror 的 `Selection.atEnd`，找不到文字位置时落在已有的原子节点上，不会指向不存在的节点（evidence60）。
+
+### 实现
+
+**core（`08adbf71b`）**
+- `TextColor` 保存 sRGB 与 alpha，解析交给 `cssparser` 0.29.6：CSS Color 3 的全部关键字、3/4/6/8 位十六进制、数字或百分比形式的 `rgb()`/`rgba()`、`hsl()`/`hsla()`。
+- 逗号形式的 `hwb(h[deg], w%, b%[, a])` 由 cssparser 的 tokenizer 读取，再用它的 `hwb_to_rgb` 转换，没有自写颜色换算。
+- `currentcolor`、带多余内容的值和非颜色值都不会成为颜色。
+- 保存形式：不透明为 `#rrggbb`；半透明为 `rgba(r, g, b, a)`，alpha 保留三位小数，不做压平。
+- ENML、JEX 和粘贴都保留颜色；JEX 中 span 除 `color` 与 `--inversion-type-color` 外的样式照旧拦截。
+
+**gpui（`5dfcf65b9`）**
+- `Transaction::SetTextColor`：光标处设置时进入待用样式，并与粗体共用同一套生命周期。审查中发现光标颜色原先没有记录 `pending_marks_at`，光标移开后颜色不会清除，已补上。
+- 更多菜单中的“字体颜色”打开色板，内容为“默认”加 14 色；当前颜色有描边；选色后焦点回到编辑器。
+- 正文和表格都按 alpha 绘制颜色。
+- 更多菜单限高 300px，加入这一行后“Outdent list”落到可见区域之外。挂载测试改为先滚动再点击，没有放宽菜单。
+
+**纯表格笔记（`6975b88ed`）**
+- 原因：`Document::end_selection` 在没有文字块时返回 `NodeId(0)`，History 在修改前验证选区时拒绝，因此单元格的编辑无法保存。
+- 修复：没有文字块时，选区落在最后一个已有块的 offset 0。`validate_point` 本来就允许非文字块的 offset 0。History 验证没有放宽，也不插入可见段落。
+
+### 测试
+
+- core：
+  - `document_roundtrip::text_colour_round_trips_as_evernote_writes_it_and_rejects_non_colours`：rebeccapurple、百分比 rgb、hsl/hsla、8 位十六进制 alpha、`rgba(…, 0.5)`、transparent、`!important`、四种逗号 hwb（含负色相、deg、alpha、w+b≥1 的灰色）。每种都覆盖 parse_html、粘贴和保存后重读。拒绝项包括 currentcolor、hwb 缺参数、hwb 后跟多余内容、`turn` 单位以及注入值。
+  - `enml_convert`：hsl、`<font color>` 关键字、rgba alpha、hwb 导入；currentcolor 和 `url()` 被丢弃。
+  - `jex_html_conversion`、`sync_two_clients::text_colour_survives_a_round_trip_through_another_device`（与上下标共用往返辅助函数）。
+- gpui：
+  - `text_color_sets_replaces_resets_and_carries_at_the_caret`：替换颜色、混合状态、一步撤销、默认清除、光标移开再回来清除、分次输入续用光标颜色。
+  - `font_color_palette_colours_and_resets_the_selection`：挂载 chrome，依次点击 More → 字体颜色 → 色块。选区保持不变；Cmd‑Z 和 Cmd‑Shift‑Z 后颜色与选区都正确；再点“默认”清除颜色。
+  - `cell_text_colour_keeps_alpha_and_saves_a_new_colour`：纯表格笔记，没有前置段落，也没有注入选区。保留半透明蓝，给另一段加 hwb 绿后保存；主编辑器撤销、重做后分别保存；再用新的 NoteSession 重新打开，结果一致。
+  - `an_atom_only_document_starts_on_an_existing_block_and_edits_with_history`：仅表格、仅图片、图片加附件三种文档。初始选区落在最后一块上，编辑、撤销、重做、导出后重新打开，结果都一致。
+
+### 对照（隔离副本，独立 `CARGO_TARGET_DIR`，未触碰共享源码）
+
+- 修复前，纯表格用例在共享工作区失败，未保存颜色：`/tmp/joplin-claude-table-only-red.log`。
+- 去掉 `end_selection` 修复：atom-only 和纯表格两项都失败。
+- 去掉光标颜色的 `pending_marks_at`：颜色测试在“光标移开再回来清除”一步失败（此前的版本没有这一步，所以对照没有失败，已补上）。
+- 去掉逗号 hwb 分支：core 颜色测试失败（`/tmp/joplin-claude-colour-hwb-negative-control.log`；同一日志中后面的 gpui 编译失败是因为隔离副本当时缺少 fixture，不计入结果）。
+- 以上两项对照的脚本与输出：`/tmp/joplin-claude-colour-table-negative-controls.{sh,log}`。
+
+### 原子提交与逐个验证
+
+- `08adbf71b` core 与两个 Cargo.lock（新增 cssparser 0.29.6 及其依赖，离线解析）。
+- `5dfcf65b9` gpui 颜色部分。由于 model.rs 和 tests.rs 中同时有纯表格修复，这一提交只通过索引暂存，没有改动共享工作区文件。在把暂存内容导出的隔离目录中完整运行：1484 通过、0 失败、2 忽略，另有 17 通过，退出码 0（`/tmp/joplin-claude-colour-intermediate-5dfcf65b9-gpui.log`）。
+- `6975b88ed` 纯表格修复加两项回归。
+- 最终 HEAD `6975b88ed` 全量（均 `--offline --locked`，退出码 0）：
+  - App：1486 通过、0 失败、2 忽略，另有 17 通过（`/tmp/joplin-claude-colour-gpui-full.log`）；
+  - core：33 组共 357 通过、0 失败、1 忽略（`/tmp/joplin-claude-colour-core-full.log`）。
+
+复跑命令：在 `packages/app-lite-gpui` 与 `packages/app-lite-core` 下分别运行 `cargo test --offline --locked`；单项加过滤器，例如 `cargo test --offline --locked --bin velotype -- cell_text_colour atom_only text_color font_color`。
+
+### rustfmt
+
+只整理了我改动的部分。`table_cell_editor_tests.rs` 在 HEAD 已有 16 处 rustfmt 差异，保持原样。`lib.rs` 的检查会连带 `sync_store.rs` 中原有的差异，同样未改动。
+
+### 仍未完成或未验证
+
+- 打开表格单元格时，Library 工具栏和色板仍然作用于主编辑器，没有接到单元格编辑器。单元格颜色目前只经过命令层和保存通路的验证，界面上还不能直接给单元格文字选色。这是界面接线缺口，本批没有改设计。
+- 深色模式反色：编辑器只有浅色主题。`--inversion-type-color` 只保存和往返，不参与绘制。
+- 颜色写在链接之内，与 Evernote 相同；code 和高亮的层叠顺序差异仍按第十三批所述，未处理。
+- 另一个已有行为：只有一张图片的文档，全选后按删除返回 `CannotRemoveLastNode`，而 Evernote 会留下空段落。本批没有修改，留作后续问题。
+- 挂载测试环境不是真实 GPU 窗口。色板外观、alpha 绘制效果和纯表格笔记的实机操作，都需要 Codex 做原生验收。
+- 图标打包（evidence57）按指示暂缓。
+
