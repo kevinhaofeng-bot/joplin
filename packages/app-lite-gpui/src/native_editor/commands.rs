@@ -831,6 +831,7 @@ fn apply_list_command(command: EditorCommand, editor: &mut EditorCore) -> Result
                     kind: kind.clone(),
                     content: BlockContent::text(""),
                     alignment: TextAlignment::Left,
+                    quoted: false,
                     revision: 0,
                 }],
             });

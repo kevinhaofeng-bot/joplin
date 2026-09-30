@@ -192,6 +192,7 @@ pub fn import_canonical_with_resources(
                                     Alignment::Center => TextAlignment::Center,
                                     Alignment::Right => TextAlignment::Right,
                                 },
+                                quoted: false,
                                 revision: 0,
                             });
                         } else if let Inline::Attachment {
@@ -380,6 +381,7 @@ pub fn import_canonical_with_resources(
                         link: link.clone(),
                     },
                     alignment: TextAlignment::Left,
+                    quoted: false,
                     revision: 0,
                 });
             }
@@ -398,6 +400,7 @@ pub fn import_canonical_with_resources(
                         media_type: media_type.clone(),
                     },
                     alignment: TextAlignment::Left,
+                    quoted: false,
                     revision: 0,
                 });
             }
@@ -424,6 +427,7 @@ pub fn import_canonical_with_resources(
                         canonical: block.clone(),
                     })),
                     alignment: TextAlignment::Left,
+                    quoted: false,
                     revision: 0,
                 });
             }
@@ -432,6 +436,7 @@ pub fn import_canonical_with_resources(
                 kind: BlockKind::Divider,
                 content: BlockContent::Empty,
                 alignment: TextAlignment::Left,
+                quoted: false,
                 revision: 0,
             }),
         }
@@ -475,6 +480,7 @@ fn attachment_block(
             media_type: media_type.to_owned(),
         },
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     }
 }
@@ -518,6 +524,7 @@ fn push_inline_group(
                         link: link.clone(),
                     },
                     alignment: TextAlignment::Left,
+                    quoted: false,
                     revision: 0,
                 });
             }
@@ -898,6 +905,7 @@ fn export_text_block(
                 TextAlignment::Right => Alignment::Right,
             },
             indent: 0,
+            quoted: block.quoted,
         },
         export_inlines(text, styles, block_index)?,
     ))
@@ -1038,6 +1046,7 @@ fn text_block(
         kind => kind,
     };
     let (text, styles) = import_inlines(inlines, block_index)?;
+    let quoted = style.quoted && is_quotable_kind(&kind);
     Ok(Block {
         id,
         kind,
@@ -1047,8 +1056,21 @@ fn text_block(
             Alignment::Center => TextAlignment::Center,
             Alignment::Right => TextAlignment::Right,
         },
+        quoted,
         revision: 0,
     })
+}
+
+/// What Evernote's quoteblock holds besides paragraphs (quoteblock/schema.ts
+/// 14); a quoted paragraph is its own kind.
+pub(crate) fn is_quotable_kind(kind: &BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::Heading { .. }
+            | BlockKind::BulletItem { .. }
+            | BlockKind::OrderedItem { .. }
+            | BlockKind::CheckItem { .. }
+    )
 }
 
 fn import_inlines(
@@ -1132,6 +1154,7 @@ mod tests {
                 style: BlockStyle {
                     alignment: Alignment::Center,
                     indent: 0,
+                    quoted: false,
                 },
                 inlines: vec![
                     Inline::Text {
@@ -1170,6 +1193,7 @@ mod tests {
                     style: BlockStyle {
                         alignment: Alignment::Right,
                         indent: 0,
+                        quoted: false,
                     },
                     inlines: vec![Inline::Text {
                         text: "完成".into(),
@@ -1293,6 +1317,7 @@ mod tests {
             style: BlockStyle {
                 alignment: Alignment::Left,
                 indent: 1,
+                quoted: false,
             },
             inlines: vec![Inline::Text {
                 text: "不能丢失缩进".into(),
@@ -2062,6 +2087,7 @@ mod tests {
                 style: BlockStyle {
                     alignment: Alignment::Center,
                     indent: 0,
+                    quoted: false,
                 },
                 inlines: vec![marked("标题")],
             },

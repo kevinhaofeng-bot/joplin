@@ -763,9 +763,34 @@ impl<'a> Converter<'a> {
     }
 
     fn blocks(&mut self) -> Result<Vec<Block>> {
+        self.blocks_until(None)
+    }
+
+    /// Blocks up to `end` (left for the caller), or to the end of the body.
+    /// Inside a quote (`end` is its end) they form Evernote's quoteblock,
+    /// `( p | todolist | ol | ul | h )+` (common-editor quoteblock/schema.ts
+    /// 14): paragraphs become quote paragraphs, headings and lists are marked
+    /// quoted, and anything else still blocks.
+    fn blocks_until(&mut self, end: Option<TagEnd>) -> Result<Vec<Block>> {
+        let in_quote = matches!(end, Some(TagEnd::BlockQuote(_)));
         let mut blocks = Vec::new();
-        while let Some(event) = self.next() {
+        loop {
+            if let (Some(Event::End(found)), Some(end)) = (self.peek(), end)
+                && *found == end
+            {
+                break;
+            }
+            let Some(event) = self.next() else {
+                break;
+            };
             match event {
+                Event::Start(Tag::Paragraph) if in_quote => {
+                    let inlines = self.inlines(TagEnd::Paragraph, Marks::default(), false)?;
+                    blocks.push(Block::Quote {
+                        style: BlockStyle::default(),
+                        inlines,
+                    });
+                }
                 Event::Rule => blocks.push(Block::Divider),
                 Event::Start(Tag::BlockQuote(kind)) => {
                     if kind.is_some() {
@@ -774,19 +799,49 @@ impl<'a> Converter<'a> {
                             "Alert quote type has no canonical mapping",
                         );
                     }
-                    // Each paragraph of a quote becomes its own adjacent quote block.
-                    loop {
-                        self.expect_start_paragraph()?;
-                        let inlines = self.inlines(TagEnd::Paragraph, Marks::default(), false)?;
-                        blocks.push(Block::Quote {
-                            style: BlockStyle::default(),
-                            inlines,
-                        });
-                        if !matches!(self.peek(), Some(Event::Start(Tag::Paragraph))) {
-                            break;
-                        }
-                    }
+                    let children = self.blocks_until(Some(TagEnd::BlockQuote(kind)))?;
                     self.expect_end(TagEnd::BlockQuote(kind))?;
+                    if children.is_empty() {
+                        return self.blocked(
+                            JexBodyBlockerKind::UnsupportedStructure,
+                            "Quote contains non-paragraph structure",
+                        );
+                    }
+                    for child in children {
+                        blocks.push(match child {
+                            quote @ Block::Quote { .. } if !in_quote => quote,
+                            Block::Heading {
+                                level,
+                                mut style,
+                                inlines,
+                            } => {
+                                style.quoted = true;
+                                Block::Heading {
+                                    level,
+                                    style,
+                                    inlines,
+                                }
+                            }
+                            Block::List {
+                                kind,
+                                mut items,
+                                start,
+                            } => {
+                                for item in &mut items {
+                                    item.style.quoted = true;
+                                }
+                                Block::List { kind, items, start }
+                            }
+                            // A nested quote, code, table, divider or block
+                            // media is not quoteblock content.
+                            _ => {
+                                return self.blocked(
+                                    JexBodyBlockerKind::UnsupportedStructure,
+                                    "Quote contains non-paragraph structure",
+                                );
+                            }
+                        });
+                    }
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {
                     // A fence's info string is Evernote's code block
@@ -916,17 +971,6 @@ impl<'a> Converter<'a> {
             }
         }
         Ok(blocks)
-    }
-
-    fn expect_start_paragraph(&mut self) -> Result<()> {
-        if matches!(self.next(), Some(Event::Start(Tag::Paragraph))) {
-            Ok(())
-        } else {
-            self.blocked(
-                JexBodyBlockerKind::UnsupportedStructure,
-                "Quote contains non-paragraph structure",
-            )
-        }
     }
 }
 

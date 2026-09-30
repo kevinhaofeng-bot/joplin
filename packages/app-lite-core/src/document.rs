@@ -203,6 +203,10 @@ pub enum Alignment {
 pub struct BlockStyle {
     pub alignment: Alignment,
     pub indent: u8,
+    /// A heading or list item inside a quote container, as Evernote's
+    /// quoteblock holds `( p | todolist | ol | ul | h )+` (common-editor
+    /// quoteblock/schema.ts 14). A quoted paragraph is a [`Block::Quote`].
+    pub quoted: bool,
 }
 
 impl Default for BlockStyle {
@@ -210,6 +214,7 @@ impl Default for BlockStyle {
         Self {
             alignment: Alignment::Left,
             indent: 0,
+            quoted: false,
         }
     }
 }
@@ -516,157 +521,194 @@ fn serialize_html(document: &CanonicalDocument) -> String {
         return String::new();
     }
     let mut output = String::new();
-    for block in &document.blocks {
-        match block {
-            Block::Paragraph { style, inlines } => {
-                serialize_block("p", style, inlines, &mut output)
+    let blocks = &document.blocks;
+    let mut index = 0;
+    while index < blocks.len() {
+        // A run of quoted blocks holding a heading or list is one quote
+        // container; a run of quoted paragraphs keeps its own markers.
+        let run = blocks[index..]
+            .iter()
+            .take_while(|block| quote_member(block).is_some())
+            .count();
+        if blocks[index..index + run]
+            .iter()
+            .any(|block| quote_member(block) == Some(true))
+        {
+            output.push_str("<blockquote data-joplin-lite-quote-container=\"true\">");
+            for block in &blocks[index..index + run] {
+                serialize_top_block(block, true, &mut output);
             }
-            Block::Heading {
-                level,
-                style,
-                inlines,
-            } => {
-                let tag = match level {
-                    HeadingLevel::One => "h1",
-                    HeadingLevel::Two => "h2",
-                    HeadingLevel::Three => "h3",
-                    HeadingLevel::Four => "h4",
-                    HeadingLevel::Five => "h5",
-                    HeadingLevel::Six => "h6",
-                };
-                serialize_block(tag, style, inlines, &mut output);
-            }
-            Block::List { kind, items, start } => {
-                let (tag, checklist) = match kind {
-                    ListKind::Unordered => ("ul", false),
-                    ListKind::Ordered => ("ol", false),
-                    ListKind::Checklist => ("ul", true),
-                };
-                output.push('<');
-                output.push_str(tag);
-                if checklist {
-                    output.push_str(" data-type=\"checklist\"");
-                }
-                if let Some(start) = start {
-                    output.push_str(" start=\"");
-                    output.push_str(&start.to_string());
-                    output.push('"');
-                }
-                output.push('>');
-                for item in items {
-                    output.push_str("<li");
-                    if checklist {
-                        output.push_str(" data-checked=\"");
-                        output.push_str(if item.checked == Some(true) {
-                            "true"
-                        } else {
-                            "false"
-                        });
-                        output.push('"');
-                    }
-                    serialize_style_attributes(&item.style, &mut output);
-                    output.push('>');
-                    if item.inlines.is_empty() {
-                        output.push_str("<br data-joplin-lite-empty-item=\"true\">");
-                    } else if item.inlines.len() == 1
-                        && matches!(item.inlines[0], Inline::SoftBreak)
-                    {
-                        output.push_str("<br data-joplin-lite-soft-break=\"true\">");
-                    } else {
-                        serialize_inlines(&item.inlines, &mut output);
-                    }
-                    output.push_str("</li>");
-                }
-                output.push_str("</");
-                output.push_str(tag);
-                output.push('>');
-            }
-            // These markers distinguish the native editor's structural
-            // blocks from legacy HTML. In particular, old `<pre>` content
-            // remains a preformatted paragraph instead of changing shape on
-            // its next save.
-            Block::Quote { style, inlines } => serialize_marked_block(
-                "blockquote",
-                "data-joplin-lite-block-quote",
-                style,
-                inlines,
-                &mut output,
-            ),
-            Block::Code {
-                style,
-                inlines,
-                language,
-            } => serialize_optional_marked_block(
-                "pre",
-                Some("data-joplin-lite-block-code"),
-                language
-                    .as_deref()
-                    .map(|language| ("data-language", language)),
-                style,
-                inlines,
-                &mut output,
-            ),
-            Block::Image {
-                resource_id,
-                alt,
-                presentation,
-                link,
-            } => {
-                let link = open_image_link(link.as_deref(), &mut output);
-                output.push_str("<img data-joplin-lite-block-image=\"true\" src=\":/");
-                escape_attribute(resource_id.as_str(), &mut output);
-                output.push_str("\" alt=\"");
-                escape_attribute(alt, &mut output);
-                output.push('\"');
-                serialize_image_presentation(presentation, &mut output);
-                output.push('>');
-                if link {
-                    output.push_str("</a>");
-                }
-            }
-            Block::Attachment {
-                resource_id,
-                filename,
-                media_type,
-            } => {
-                output.push_str("<a data-joplin-lite-block-attachment=\"true\" href=\":/");
-                escape_attribute(resource_id.as_str(), &mut output);
-                output.push_str("\" data-resource-id=\"");
-                escape_attribute(resource_id.as_str(), &mut output);
-                output.push_str("\" data-filename=\"");
-                escape_attribute(filename, &mut output);
-                output.push_str("\" data-media-type=\"");
-                escape_attribute(media_type, &mut output);
-                output.push_str("\">");
-                escape_text_run(filename, &[], 0, &mut output);
-                output.push_str("</a>");
-            }
-            Block::Divider => output.push_str("<hr data-joplin-lite-block-divider=\"true\">"),
-            Block::Table { rows, header } => {
-                output.push_str("<table data-joplin-lite-table=\"true\"><tbody>");
-                for (row_index, row) in rows.iter().enumerate() {
-                    let tag = if *header && row_index == 0 {
-                        "th"
-                    } else {
-                        "td"
-                    };
-                    output.push_str("<tr>");
-                    for cell in &row.cells {
-                        output.push('<');
-                        output.push_str(tag);
-                        output.push('>');
-                        serialize_inlines(&cell.inlines, &mut output);
-                        output.push_str("</");
-                        output.push_str(tag);
-                        output.push('>');
-                    }
-                    output.push_str("</tr>");
-                }
-                output.push_str("</tbody></table>");
-            }
+            output.push_str("</blockquote>");
+            index += run;
+            continue;
         }
+        serialize_top_block(&blocks[index], false, &mut output);
+        index += 1;
     }
     output
+}
+
+/// Whether a block is inside a quote: `Some(true)` for a quoted heading or
+/// list, `Some(false)` for a quote paragraph.
+fn quote_member(block: &Block) -> Option<bool> {
+    match block {
+        Block::Quote { .. } => Some(false),
+        Block::Heading { style, .. } if style.quoted => Some(true),
+        Block::List { items, .. } if items.first().is_some_and(|item| item.style.quoted) => {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+fn serialize_top_block(block: &Block, in_quote_container: bool, output: &mut String) {
+    match block {
+        Block::Quote { style, inlines } if in_quote_container => {
+            serialize_block("p", style, inlines, output)
+        }
+        Block::Paragraph { style, inlines } => serialize_block("p", style, inlines, output),
+        Block::Heading {
+            level,
+            style,
+            inlines,
+        } => {
+            let tag = match level {
+                HeadingLevel::One => "h1",
+                HeadingLevel::Two => "h2",
+                HeadingLevel::Three => "h3",
+                HeadingLevel::Four => "h4",
+                HeadingLevel::Five => "h5",
+                HeadingLevel::Six => "h6",
+            };
+            serialize_block(tag, style, inlines, output);
+        }
+        Block::List { kind, items, start } => {
+            let (tag, checklist) = match kind {
+                ListKind::Unordered => ("ul", false),
+                ListKind::Ordered => ("ol", false),
+                ListKind::Checklist => ("ul", true),
+            };
+            output.push('<');
+            output.push_str(tag);
+            if checklist {
+                output.push_str(" data-type=\"checklist\"");
+            }
+            if let Some(start) = start {
+                output.push_str(" start=\"");
+                output.push_str(&start.to_string());
+                output.push('"');
+            }
+            output.push('>');
+            for item in items {
+                output.push_str("<li");
+                if checklist {
+                    output.push_str(" data-checked=\"");
+                    output.push_str(if item.checked == Some(true) {
+                        "true"
+                    } else {
+                        "false"
+                    });
+                    output.push('"');
+                }
+                serialize_style_attributes(&item.style, output);
+                output.push('>');
+                if item.inlines.is_empty() {
+                    output.push_str("<br data-joplin-lite-empty-item=\"true\">");
+                } else if item.inlines.len() == 1 && matches!(item.inlines[0], Inline::SoftBreak) {
+                    output.push_str("<br data-joplin-lite-soft-break=\"true\">");
+                } else {
+                    serialize_inlines(&item.inlines, output);
+                }
+                output.push_str("</li>");
+            }
+            output.push_str("</");
+            output.push_str(tag);
+            output.push('>');
+        }
+        // These markers distinguish the native editor's structural
+        // blocks from legacy HTML. In particular, old `<pre>` content
+        // remains a preformatted paragraph instead of changing shape on
+        // its next save.
+        Block::Quote { style, inlines } => serialize_marked_block(
+            "blockquote",
+            "data-joplin-lite-block-quote",
+            style,
+            inlines,
+            output,
+        ),
+        Block::Code {
+            style,
+            inlines,
+            language,
+        } => serialize_optional_marked_block(
+            "pre",
+            Some("data-joplin-lite-block-code"),
+            language
+                .as_deref()
+                .map(|language| ("data-language", language)),
+            style,
+            inlines,
+            output,
+        ),
+        Block::Image {
+            resource_id,
+            alt,
+            presentation,
+            link,
+        } => {
+            let link = open_image_link(link.as_deref(), output);
+            output.push_str("<img data-joplin-lite-block-image=\"true\" src=\":/");
+            escape_attribute(resource_id.as_str(), output);
+            output.push_str("\" alt=\"");
+            escape_attribute(alt, output);
+            output.push('\"');
+            serialize_image_presentation(presentation, output);
+            output.push('>');
+            if link {
+                output.push_str("</a>");
+            }
+        }
+        Block::Attachment {
+            resource_id,
+            filename,
+            media_type,
+        } => {
+            output.push_str("<a data-joplin-lite-block-attachment=\"true\" href=\":/");
+            escape_attribute(resource_id.as_str(), output);
+            output.push_str("\" data-resource-id=\"");
+            escape_attribute(resource_id.as_str(), output);
+            output.push_str("\" data-filename=\"");
+            escape_attribute(filename, output);
+            output.push_str("\" data-media-type=\"");
+            escape_attribute(media_type, output);
+            output.push_str("\">");
+            escape_text_run(filename, &[], 0, output);
+            output.push_str("</a>");
+        }
+        Block::Divider => output.push_str("<hr data-joplin-lite-block-divider=\"true\">"),
+        Block::Table { rows, header } => {
+            output.push_str("<table data-joplin-lite-table=\"true\"><tbody>");
+            for (row_index, row) in rows.iter().enumerate() {
+                let tag = if *header && row_index == 0 {
+                    "th"
+                } else {
+                    "td"
+                };
+                output.push_str("<tr>");
+                for cell in &row.cells {
+                    output.push('<');
+                    output.push_str(tag);
+                    output.push('>');
+                    serialize_inlines(&cell.inlines, output);
+                    output.push_str("</");
+                    output.push_str(tag);
+                    output.push('>');
+                }
+                output.push_str("</tr>");
+            }
+            output.push_str("</tbody></table>");
+        }
+    }
 }
 
 fn serialize_block(tag: &str, style: &BlockStyle, inlines: &[Inline], output: &mut String) {
@@ -859,7 +901,17 @@ fn block_is_empty(block: &Block) -> bool {
 fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
     blocks
         .into_iter()
+        .flat_map(split_list_at_quote_boundaries)
         .map(|block| match block {
+            // Only headings and list items carry the flag; a quoted
+            // paragraph is a quote paragraph, and nothing else can be quoted.
+            Block::Paragraph { style, inlines } if style.quoted => Block::Quote {
+                style: normalize_style(BlockStyle {
+                    quoted: false,
+                    ..style
+                }),
+                inlines: normalize_inlines(inlines),
+            },
             Block::Paragraph { style, inlines } => Block::Paragraph {
                 style: normalize_style(style),
                 inlines: normalize_inlines(inlines),
@@ -890,7 +942,10 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                     .collect(),
             },
             Block::Quote { style, inlines } => Block::Quote {
-                style: normalize_style(style),
+                style: normalize_style(BlockStyle {
+                    quoted: false,
+                    ..style
+                }),
                 inlines: normalize_inlines(inlines),
             },
             Block::Code {
@@ -898,7 +953,10 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 inlines,
                 language,
             } => Block::Code {
-                style: normalize_style(style),
+                style: normalize_style(BlockStyle {
+                    quoted: false,
+                    ..style
+                }),
                 inlines: normalize_inlines(inlines),
                 language: language.filter(|language| valid_code_language(language)),
             },
@@ -939,6 +997,8 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 },
             ) = (normalized.last_mut(), &block)
                 && previous_kind == kind
+                && previous_items.first().map(|item| item.style.quoted)
+                    == items.first().map(|item| item.style.quoted)
             {
                 previous_items.extend(items.clone());
             } else {
@@ -946,6 +1006,37 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
             }
             normalized
         })
+}
+
+/// A list is inside or outside a quote as a whole, like Evernote's `ol`/`ul`
+/// inside or outside a quoteblock.
+fn split_list_at_quote_boundaries(block: Block) -> Vec<Block> {
+    let Block::List { kind, items, start } = block else {
+        return vec![block];
+    };
+    let mut lists: Vec<Block> = Vec::new();
+    for item in items {
+        match lists.last_mut() {
+            Some(Block::List { items: run, .. })
+                if run.last().map(|last| last.style.quoted) == Some(item.style.quoted) =>
+            {
+                run.push(item)
+            }
+            _ => lists.push(Block::List {
+                kind,
+                start: if lists.is_empty() { start } else { None },
+                items: vec![item],
+            }),
+        }
+    }
+    if lists.is_empty() {
+        lists.push(Block::List {
+            kind,
+            items: Vec::new(),
+            start,
+        });
+    }
+    lists
 }
 
 fn normalize_style(mut style: BlockStyle) -> BlockStyle {
@@ -1811,6 +1902,22 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
             }
             ProjectionFrame::FinishList => projection.finish_list(),
             ProjectionFrame::FinishListItem => projection.finish_list_item(),
+            ProjectionFrame::QuoteContainer { blocks_before } => {
+                projection.flush();
+                for block in &mut projection.document.blocks[blocks_before..] {
+                    match block {
+                        Block::Paragraph { style, .. }
+                        | Block::Heading { style, .. }
+                        | Block::Quote { style, .. } => style.quoted = true,
+                        Block::List { items, .. } => {
+                            for item in items {
+                                item.style.quoted = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             ProjectionFrame::SetCodeLanguage {
                 blocks_before,
                 language,
@@ -2052,6 +2159,25 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         projection.block_divider();
                         continue;
                     }
+                    if projection.list_contexts.is_empty()
+                        && !pasted
+                        && tag == "blockquote"
+                        && attribute(&attrs.borrow(), "data-joplin-lite-quote-container").as_deref()
+                            == Some("true")
+                    {
+                        projection.flush();
+                        pending.push(ProjectionFrame::QuoteContainer {
+                            blocks_before: projection.document.blocks.len(),
+                        });
+                        for child in children.into_iter().rev() {
+                            pending.push(ProjectionFrame::Visit {
+                                node: child,
+                                marks: marks.clone(),
+                                preformatted,
+                            });
+                        }
+                        continue;
+                    }
                     let native_structural_text = (tag == "blockquote"
                         && attribute(&attrs.borrow(), "data-joplin-lite-block-quote").as_deref()
                             == Some("true"))
@@ -2256,6 +2382,10 @@ enum ProjectionFrame {
         blocks_before: usize,
         kind: BlockKind,
         style: BlockStyle,
+    },
+    /// Runs after a quote container's children: marks what they produced.
+    QuoteContainer {
+        blocks_before: usize,
     },
     /// Runs after its code block's FinishBlock.
     SetCodeLanguage {
@@ -2951,7 +3081,11 @@ fn block_style(attrs: &[Attribute], default_indent: u8) -> BlockStyle {
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or(default_indent)
         .min(8);
-    BlockStyle { alignment, indent }
+    BlockStyle {
+        alignment,
+        indent,
+        quoted: false,
+    }
 }
 
 fn parse_declarations(style: &str) -> impl Iterator<Item = (String, String)> + '_ {
@@ -3405,6 +3539,7 @@ mod tests {
                 style: BlockStyle {
                     alignment: Alignment::Center,
                     indent: 2,
+                    quoted: false,
                 },
                 inlines: vec![Inline::Text {
                     text: "标题".into(),
@@ -3732,6 +3867,7 @@ mod tests {
                 style: BlockStyle {
                     alignment: Alignment::Center,
                     indent: 2,
+                    quoted: false,
                 },
                 inlines: Vec::new(),
             },
@@ -3739,6 +3875,7 @@ mod tests {
                 style: BlockStyle {
                     alignment: Alignment::Right,
                     indent: 1,
+                    quoted: false,
                 },
                 inlines: Vec::new(),
             },
@@ -3953,6 +4090,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                     style: BlockStyle {
                         alignment: Alignment::Right,
                         indent: 9,
+                        quoted: false,
                     },
                     inlines: vec![Inline::Text {
                         text: "bullet".into(),

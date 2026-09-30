@@ -182,10 +182,27 @@ fn list_depth(kind: &BlockKind) -> Option<u8> {
     }
 }
 
+/// Evernote's common-editor blockquote (ce.css): a 2px left border in
+/// --color-icon-fill-tertiary-enabled (light theme grey-30 #4e4d4c) and 16px
+/// left padding.
+pub(crate) const QUOTE_BAR_WIDTH: f32 = 2.0;
+pub(crate) const QUOTE_INSET: f32 = QUOTE_BAR_WIDTH + 16.0;
+pub(crate) const QUOTE_BAR_COLOR: u32 = 0x4e4d4cff;
+
+/// A quote paragraph, or a heading or list item inside a quote container.
+pub(crate) fn is_quote_block(block: &super::model::Block) -> bool {
+    block.kind == BlockKind::Quote || block.quoted
+}
+
 fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
     let left = list_depth(&block.kind)
         .map(|depth| depth as f32 * LIST_DEPTH_INDENT)
-        .unwrap_or(0.0);
+        .unwrap_or(0.0)
+        + if is_quote_block(block) {
+            QUOTE_INSET
+        } else {
+            0.0
+        };
     let available_width = (width - left).max(1.0);
     let (block_width, block_height) = match &block.content {
         BlockContent::Image {

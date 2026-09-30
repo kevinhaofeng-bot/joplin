@@ -35,6 +35,7 @@ struct RenderBlock {
     shaped_background_run_count: usize,
     line_height: Option<Pixels>,
     marker: Option<String>,
+    quote: bool,
     image_resource: Option<Resource>,
     image_resource_id: Option<String>,
     image_natural_max_edge: Option<u32>,
@@ -397,6 +398,7 @@ fn snapshot_with_image_viewport(
                     .is_inline_group_continuation(block.node_id))
                 .then(|| list_marker(&kind, layout.ordered_number(block.node_id)))
                 .flatten(),
+                quote: model_block.is_some_and(super::layout::is_quote_block),
                 image_resource,
                 image_resource_id,
                 image_natural_max_edge,
@@ -806,6 +808,20 @@ fn paint_snapshot(
                 }
             }
             line_top += line.size(line_height).height;
+        }
+        if block.quote {
+            // Consecutive quote blocks draw one continuous bar.
+            let bar = Bounds::new(
+                point(
+                    block.layout.bounds.left() - px(super::layout::QUOTE_INSET),
+                    block.layout.bounds.top(),
+                ),
+                gpui::size(
+                    px(super::layout::QUOTE_BAR_WIDTH),
+                    block.layout.bounds.size.height,
+                ),
+            );
+            window.paint_quad(fill(bar, rgba(super::layout::QUOTE_BAR_COLOR)));
         }
         if let Some(marker) = block.marker.as_deref() {
             let style = window.text_style();
@@ -1421,6 +1437,7 @@ mod tests {
             shaped_background_run_count: 0,
             line_height: None,
             marker: None,
+            quote: false,
             image_resource: None,
             image_resource_id: None,
             image_natural_max_edge: None,

@@ -693,7 +693,13 @@ fn multi_paragraph_quote_becomes_adjacent_quote_blocks() {
         CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
         converted.document
     );
-    for body in ["> 引\n>\n> - 列表", "> # 标题"] {
+    // Not quoteblock content in Evernote (quoteblock/schema.ts 14).
+    for body in [
+        "> 引\n>\n> ```\ncode\n> ```",
+        "> 引\n>\n> > 嵌套",
+        "> 引\n>\n> ---",
+        "> | a |\n> |---|\n> | 1 |",
+    ] {
         assert!(
             convert_jex_note_body(NOTE, "quote.md", 1, body, &resources()).is_err(),
             "body={body}"
@@ -1035,4 +1041,28 @@ fn fenced_code_keeps_its_language_as_evernote_syntax_language() {
             "{body}"
         );
     }
+}
+
+#[test]
+fn quote_with_lists_and_headings_becomes_one_quote_container() {
+    // Evernote quoteblock holds `( p | todolist | ol | ul | h )+`
+    // (common-editor quoteblock/schema.ts 14).
+    let body = "> ## 要点\n>\n> 说明\n>\n> - 一\n> - 二\n>\n> 1. 甲\n\n- 外面";
+    let converted = convert_jex_note_body(NOTE, "quote.md", 1, body, &resources())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.canonical_html,
+        "<blockquote data-joplin-lite-quote-container=\"true\"><h2>要点</h2><p>说明</p><ul><li>一</li><li>二</li></ul><ol><li>甲</li></ol></blockquote><ul><li>外面</li></ul>"
+    );
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        converted.document
+    );
+    // Paragraph-only quotes keep their existing per-paragraph form.
+    let converted =
+        convert_jex_note_body(NOTE, "quote.md", 1, "> 一\n>\n> 二", &resources()).unwrap();
+    assert_eq!(
+        converted.canonical_html,
+        "<blockquote data-joplin-lite-block-quote=\"true\">一</blockquote><blockquote data-joplin-lite-block-quote=\"true\">二</blockquote>"
+    );
 }

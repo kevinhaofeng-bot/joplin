@@ -147,6 +147,7 @@ fn ordered_fixture(count: usize) -> Vec<Block> {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("item-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         })
         .collect()
@@ -663,6 +664,7 @@ fn ordered_tail_edit_has_bounded_numbering_scratch_and_keeps_marker() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("ordered-item-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         })
         .collect();
@@ -714,6 +716,7 @@ fn ordered_tail_kind_depth_change_recomputes_locally_and_keeps_numbers_correct()
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("ordered-item-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         })
         .collect();
@@ -767,6 +770,7 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
             kind: BlockKind::Paragraph,
             content: BlockContent::text(format!("paragraph-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         })
         .collect();
@@ -980,6 +984,7 @@ fn batched_splices_and_restore_blocks_replay_in_order_through_history() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("restored"),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     };
     let restore = Transaction::RestoreBlocks {
@@ -1074,6 +1079,7 @@ fn restore_blocks_rejects_zero_and_internal_duplicate_ids_atomically() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("zero"),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     };
     let result = document.apply(Transaction::RestoreBlocks {
@@ -1189,6 +1195,7 @@ fn block_sequence_range_edges_use_right_boundary() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text(text),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     };
     assert!(blocks.iter_range(0..0).next().is_none());
@@ -1447,6 +1454,7 @@ fn non_monotonic_node_ids_keep_selection_geometry_in_document_order() {
                 link: None,
             },
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         })
         .collect();
@@ -1473,6 +1481,7 @@ fn capacity_exhaustion_does_not_copy_a_100k_block_order_buffer() {
             kind: BlockKind::Paragraph,
             content: BlockContent::text(format!("paragraph-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         })
         .collect();
@@ -1542,6 +1551,7 @@ fn run_mixed_sum_tree_fixture(block_count: usize) -> (usize, usize) {
             },
             content: BlockContent::text(format!("row-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         })
         .collect::<Vec<_>>();
@@ -1886,6 +1896,7 @@ fn max_node_id_cannot_be_allocated_again() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("max"),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     };
     let mut document = Document::from_blocks(vec![block.clone()]).expect("max id is readable");
@@ -1907,6 +1918,7 @@ fn max_node_id_cannot_be_allocated_again() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("before"),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     };
     let mut document = Document::from_blocks(vec![paragraph_block]).expect("near-max id is valid");
@@ -1933,6 +1945,7 @@ fn same_id_restore_reports_non_structural_metadata() {
         kind: original.kind.clone(),
         content: BlockContent::text("after"),
         alignment: original.alignment,
+        quoted: original.quoted,
         revision: original.revision,
     };
     let outcome = document
@@ -2028,6 +2041,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("prefix-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         });
     }
@@ -2037,6 +2051,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             kind: BlockKind::Paragraph,
             content: BlockContent::text(format!("middle-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         });
     }
@@ -2046,6 +2061,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("suffix-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         });
     }
@@ -2584,6 +2600,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("left-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         });
     }
@@ -2592,6 +2609,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("boundary"),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     });
     for index in 0..64 {
@@ -2600,6 +2618,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("right-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         });
     }
@@ -2608,6 +2627,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text(format!("distant-suffix-{index}")),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     }));
     let mut document = Document::from_blocks(blocks).expect("ordered sequence fixture");
@@ -2654,6 +2674,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("item-{index}")),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         })
         .collect::<Vec<_>>();
@@ -2662,6 +2683,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
         kind: BlockKind::Paragraph,
         content: BlockContent::text("boundary"),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     });
     blocks.extend((0..20_000).map(|index| Block {
@@ -2669,6 +2691,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
         kind: BlockKind::Paragraph,
         content: BlockContent::text(format!("suffix-{index}")),
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     }));
     let mut document = Document::from_blocks(blocks).expect("checkpoint fixture");
@@ -2990,6 +3013,7 @@ fn validate_styles_scans_graphemes_once_per_text_on_transactions() {
             kind: BlockKind::Paragraph,
             content: BlockContent::Text { text, styles },
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         };
         let mut doc = Document::from_blocks(vec![block]).unwrap();
@@ -5077,6 +5101,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             kind: BlockKind::Paragraph,
             content: BlockContent::text("nine"),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         },
         Block {
@@ -5091,6 +5116,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
                 link: None,
             },
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         },
         Block {
@@ -5098,6 +5124,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             kind: BlockKind::Divider,
             content: BlockContent::Empty,
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         },
         Block {
@@ -5105,6 +5132,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             kind: BlockKind::Paragraph,
             content: BlockContent::text("three"),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         },
         Block {
@@ -5119,6 +5147,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
                 link: None,
             },
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         },
     ];
@@ -8174,6 +8203,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
             styles: styles.into_iter().collect(),
         },
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     };
     let source_document = Document::from_blocks(vec![
@@ -8196,6 +8226,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
                 link: None,
             },
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         },
         Block {
@@ -8207,6 +8238,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
                 media_type: "application/pdf".into(),
             },
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         },
         text_block(
@@ -8565,6 +8597,7 @@ fn a_run_never_keeps_both_script_marks() {
                 styles: smallvec::smallvec![StyledRun { range: 0..2, marks }],
             },
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         }])
     };
@@ -8771,6 +8804,7 @@ fn an_atom_only_document_starts_on_an_existing_block_and_edits_with_history(
         kind,
         content,
         alignment: TextAlignment::Left,
+        quoted: false,
         revision: 0,
     };
     let image = BlockContent::Image {
@@ -9136,4 +9170,80 @@ async fn table_cells_shape_superscript_at_its_own_size(cx: &mut gpui::TestAppCon
     );
     assert!(sup_rows < plain_rows, "{sup_rows} vs {plain_rows}");
     assert!(sub_rows < plain_rows, "{sub_rows} vs {plain_rows}");
+}
+
+#[gpui::test]
+fn quote_container_edits_keep_lists_and_headings_inside_the_quote(cx: &mut gpui::TestAppContext) {
+    // Evernote quoteblock `( p | todolist | ol | ul | h )+` (common-editor
+    // quoteblock/schema.ts 14): Enter in a quoted list item makes another
+    // quoted item; Enter on an empty one makes a paragraph that stays in the
+    // quote; undo and redo restore both; the saved HTML is one container.
+    let stored = "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2><ul><li>一</li></ul></blockquote><p>外</p>";
+    let canonical = app_lite_core::CanonicalDocument::parse_html(stored).unwrap();
+    let document = super::codec::import_canonical(&canonical).unwrap();
+    assert_eq!(
+        document
+            .blocks()
+            .iter()
+            .map(|block| (block.kind.clone(), block.quoted))
+            .collect::<Vec<_>>(),
+        vec![
+            (BlockKind::Heading { level: 2 }, true),
+            (BlockKind::BulletItem { depth: 0 }, true),
+            (BlockKind::Paragraph, false),
+        ]
+    );
+    let export = |editor: &EditorCore| {
+        super::codec::export_canonical(editor.document())
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned()
+    };
+    let mut editor = EditorCore::from_document(document, cx);
+    assert_eq!(export(&editor), stored);
+    let item = editor.document().blocks()[1].id;
+    editor.set_selection_for_test(Selection::caret(DocPoint::new(item, "一".len())));
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_text("二").unwrap();
+    let two_items = "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2><ul><li>一</li><li>二</li></ul></blockquote><p>外</p>";
+    assert_eq!(export(&editor), two_items);
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_text("段").unwrap();
+    let with_paragraph = "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2><ul><li>一</li><li>二</li></ul><p>段</p></blockquote><p>外</p>";
+    assert_eq!(export(&editor), with_paragraph);
+    while export(&editor) != two_items {
+        editor.undo().unwrap();
+    }
+    while export(&editor) != with_paragraph {
+        editor.redo().unwrap();
+    }
+    // Reopening what was saved gives the same structure.
+    let reopened = super::codec::import_canonical(
+        &app_lite_core::CanonicalDocument::parse_html(&export(&editor)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        super::codec::export_canonical(&reopened)
+            .unwrap()
+            .to_canonical_html()
+            .as_str(),
+        with_paragraph
+    );
+    // Quote blocks sit right of the bar, list items further by their depth.
+    let mut layout = LayoutRegistry::new();
+    layout.layout_document(editor.document(), 0.0, 1_000.0, 680.0);
+    let left = |index: usize| {
+        f32::from(
+            layout
+                .block_layout(editor.document().blocks()[index].id)
+                .unwrap()
+                .bounds
+                .left(),
+        )
+    };
+    assert_eq!(left(0), super::layout::QUOTE_INSET);
+    assert_eq!(left(3), super::layout::QUOTE_INSET);
+    assert_eq!(left(4), 0.0);
 }

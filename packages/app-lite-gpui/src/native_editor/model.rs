@@ -294,6 +294,10 @@ pub struct Block {
     pub kind: BlockKind,
     pub content: BlockContent,
     pub alignment: TextAlignment,
+    /// A heading or list item inside a quote container (Evernote quoteblock,
+    /// common-editor quoteblock/schema.ts 14). A quoted paragraph is a
+    /// [`BlockKind::Quote`] and keeps this false.
+    pub quoted: bool,
     pub revision: u64,
 }
 
@@ -304,6 +308,7 @@ impl Block {
             kind,
             content: BlockContent::text(text),
             alignment: TextAlignment::Left,
+            quoted: false,
             revision: 0,
         }
     }
@@ -567,6 +572,7 @@ impl StructuralInsert {
             kind,
             content,
             alignment,
+            quoted: false,
             revision,
         }
     }
@@ -1547,10 +1553,10 @@ impl Document {
         for (position, block) in blocks.iter().enumerate() {
             if position == 0 && open_start && is_text(block) {
                 let (first_text, first_styles) = text_parts(&block.content)?;
-                let (kind, alignment) = if left_text.is_empty() {
-                    (block.kind.clone(), block.alignment)
+                let (kind, alignment, quoted) = if left_text.is_empty() {
+                    (block.kind.clone(), block.alignment, block.quoted)
                 } else {
-                    (target.kind.clone(), target.alignment)
+                    (target.kind.clone(), target.alignment, target.quoted)
                 };
                 let mut merged_styles = left_styles.clone();
                 merged_styles.extend(clip_styles(
@@ -1568,6 +1574,7 @@ impl Document {
                         styles: merged_styles,
                     },
                     alignment,
+                    quoted,
                     revision: target.revision,
                 });
                 continue;
@@ -1581,6 +1588,7 @@ impl Document {
                         styles: left_styles.clone(),
                     },
                     alignment: target.alignment,
+                    quoted: target.quoted,
                     revision: target.revision,
                 });
             }
@@ -1616,6 +1624,7 @@ impl Document {
                     styles: right_styles,
                 },
                 alignment: target.alignment,
+                quoted: target.quoted,
                 revision: target.revision,
             });
             DocPoint::with_affinity(id, 0, Affinity::Before)
@@ -2596,6 +2605,11 @@ impl Document {
             members.dedup();
             // An insertion point materialized beside an image belongs to the
             // same semantic parent, not a fresh default-style paragraph.
+            let group_quoted = group
+                .members
+                .iter()
+                .filter_map(|id| self.block(*id))
+                .any(|block| block.quoted);
             for id in members.iter().filter(|id| id.raw() >= allocation_start) {
                 let index = self
                     .blocks
@@ -2604,6 +2618,7 @@ impl Document {
                 let mut block = self.blocks[index].clone();
                 if is_text_block(&block) {
                     block.kind = group.kind.clone();
+                    block.quoted = group_quoted && super::codec::is_quotable_kind(&block.kind);
                     block.alignment = parent_alignments[group_index];
                     self.blocks.replace(index, block);
                 }
@@ -3473,6 +3488,7 @@ impl Document {
             } else {
                 TextAlignment::Left
             },
+            quoted: start_is_text && start_block.quoted,
             revision: start_block.revision,
         };
         self.blocks
@@ -3498,6 +3514,7 @@ impl Document {
                 styles: left_styles,
             },
             alignment: original.alignment,
+            quoted: original.quoted,
             revision: original.revision,
         };
         let right = Block {
@@ -3508,6 +3525,7 @@ impl Document {
                 styles: right_styles,
             },
             alignment: original.alignment,
+            quoted: original.quoted,
             revision: original.revision,
         };
         self.blocks
@@ -3609,8 +3627,13 @@ impl Document {
         let mut changed_nodes = SmallVec::new();
         let mut replacements = originals.clone();
         for block in &mut replacements {
-            if is_text_block(block) && block.kind != kind {
-                block.kind = kind.clone();
+            if !is_text_block(block) {
+                continue;
+            }
+            let (next_kind, next_quoted) = quote_aware_kind(block, &kind);
+            if block.kind != next_kind || block.quoted != next_quoted {
+                block.kind = next_kind;
+                block.quoted = next_quoted;
                 push_unique(&mut changed_nodes, block.id);
             }
         }
@@ -4182,6 +4205,7 @@ impl Document {
                 styles: left_styles,
             },
             alignment: original_block.alignment,
+            quoted: original_block.quoted,
             revision: original_block.revision,
         };
         let image = structural.block(image_id, TextAlignment::Left, 0);
@@ -4193,6 +4217,7 @@ impl Document {
                 styles: right_styles,
             },
             alignment: original_block.alignment,
+            quoted: original_block.quoted,
             revision: original_block.revision,
         };
         self.blocks.splice(
@@ -4455,6 +4480,22 @@ fn is_text_kind(kind: &BlockKind) -> bool {
     )
 }
 
+/// A quoted heading or list item changing kind stays inside its quote, as
+/// Evernote's quoteblock turns its p/ol/ul/h children into one another
+/// (quoteblock/schema.ts 14): as a paragraph it is a quote paragraph; as a
+/// code block, which a quote cannot hold, it leaves. A quote paragraph set to
+/// a paragraph leaves the quote as before.
+fn quote_aware_kind(block: &Block, kind: &BlockKind) -> (BlockKind, bool) {
+    if !block.quoted {
+        return (kind.clone(), false);
+    }
+    match kind {
+        BlockKind::Paragraph | BlockKind::Quote => (BlockKind::Quote, false),
+        kind if super::codec::is_quotable_kind(kind) => (kind.clone(), true),
+        kind => (kind.clone(), false),
+    }
+}
+
 fn is_text_block(block: &Block) -> bool {
     matches!(block.content, BlockContent::Text { .. }) && is_text_kind(&block.kind)
 }
@@ -4486,6 +4527,9 @@ fn is_structural_block(block: &Block) -> bool {
 
 fn validate_block_invariants(block: &Block) -> Result<(), DocumentError> {
     validate_kind(&block.kind)?;
+    if block.quoted && !super::codec::is_quotable_kind(&block.kind) {
+        return Err(DocumentError::InvalidBlockContent(block.id));
+    }
     match (&block.kind, &block.content) {
         (BlockKind::Image, BlockContent::Image { .. })
         | (BlockKind::Attachment, BlockContent::Attachment { .. })

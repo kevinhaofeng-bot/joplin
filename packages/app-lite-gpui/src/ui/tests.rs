@@ -12542,3 +12542,65 @@ async fn move_to_trash_is_unavailable_without_a_note_to_move(cx: &mut TestAppCon
         }
     }
 }
+
+#[gpui::test]
+async fn quote_container_note_edits_save_and_reopen(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let stored = "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2><ul><li>一</li></ul></blockquote><p>外</p>";
+    let note = repository
+        .create_note(CreateNote {
+            title: "引用".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html(stored).unwrap(),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|_, app| {
+        editor.update(app, |editor, editor_cx| {
+            let item = editor.document().blocks()[1].id;
+            editor.set_selection_for_test(Selection::caret(DocPoint::new(item, "一".len())));
+            editor.insert_paragraph_break().unwrap();
+            editor.insert_text("二").unwrap();
+            editor_cx.notify();
+        })
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx)
+        })
+    });
+    cx.run_until_parked();
+    let expected = "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2><ul><li>一</li><li>二</li></ul></blockquote><p>外</p>";
+    let saved = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(saved.body_html, expected);
+    let reopened = cx.new(|cx| {
+        crate::app::note_session::NoteSession::open(
+            saved,
+            Arc::clone(&repository),
+            Arc::new(ManualSaveClock::default()),
+            cx,
+        )
+        .unwrap()
+    });
+    let html = reopened.read_with(cx, |session, app| {
+        crate::native_editor::codec::export_canonical(session.editor().read(app).document())
+            .unwrap()
+            .to_canonical_html()
+    });
+    assert_eq!(html.as_str(), expected);
+}

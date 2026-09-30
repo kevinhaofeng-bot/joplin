@@ -588,3 +588,65 @@ fn code_block_language_round_trips_and_only_a_language_name_is_kept() {
         [Block::Code { language: None, .. }]
     ));
 }
+
+#[test]
+fn quote_container_round_trips_and_holds_only_quoteblock_content() {
+    let stored = "<p>前</p><blockquote data-joplin-lite-quote-container=\"true\"><h3>题</h3><p>段</p><ul data-type=\"checklist\"><li data-checked=\"true\">办</li></ul></blockquote><ul data-type=\"checklist\"><li data-checked=\"false\">外</li></ul>";
+    let document = CanonicalDocument::parse_html(stored).unwrap();
+    assert!(matches!(
+        document.blocks(),
+        [
+            Block::Paragraph { .. },
+            Block::Heading {
+                style: BlockStyle { quoted: true, .. },
+                ..
+            },
+            Block::Quote { .. },
+            Block::List { .. },
+            Block::List { .. },
+        ]
+    ));
+    assert_eq!(document.to_canonical_html().as_str(), stored);
+    for (input, output) in [
+        // Only paragraphs: the existing per-paragraph quote form.
+        (
+            "<blockquote data-joplin-lite-quote-container=\"true\"><p>一</p><p>二</p></blockquote>",
+            "<blockquote data-joplin-lite-block-quote=\"true\">一</blockquote><blockquote data-joplin-lite-block-quote=\"true\">二</blockquote>",
+        ),
+        // Code is not quoteblock content; it stays, outside the container.
+        (
+            "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2><pre data-joplin-lite-block-code=\"true\">x</pre></blockquote>",
+            "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2></blockquote><pre data-joplin-lite-block-code=\"true\">x</pre>",
+        ),
+    ] {
+        assert_eq!(
+            CanonicalDocument::parse_html(input)
+                .unwrap()
+                .to_canonical_html()
+                .as_str(),
+            output,
+            "{input}"
+        );
+    }
+    // A list half inside a quote splits at the boundary.
+    let item = |text: &str, quoted| app_lite_core::document::ListItem {
+        checked: None,
+        style: BlockStyle {
+            quoted,
+            ..BlockStyle::default()
+        },
+        inlines: vec![Inline::Text {
+            text: text.into(),
+            marks: Marks::default(),
+        }],
+    };
+    let mixed = CanonicalDocument::from_blocks(vec![Block::List {
+        kind: app_lite_core::document::ListKind::Unordered,
+        items: vec![item("里", true), item("外", false)],
+        start: None,
+    }]);
+    assert_eq!(
+        mixed.to_canonical_html().as_str(),
+        "<blockquote data-joplin-lite-quote-container=\"true\"><ul><li>里</li></ul></blockquote><ul><li>外</li></ul>"
+    );
+}
