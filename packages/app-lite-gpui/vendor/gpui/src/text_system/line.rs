@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, Half, Hsla, LineLayout, Pixels, Point, Result, SharedString, StrikethroughStyle,
-    TextAlign, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px,
-    size,
+    App, Bounds, Half, Hsla, LineLayout, Pixels, Point, Result, RunScript, SharedString,
+    StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black,
+    fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -24,6 +24,10 @@ pub struct DecorationRun {
 
     /// The strikethrough style for this run
     pub strikethrough: Option<StrikethroughStyle>,
+
+    /// Size and baseline of the run's text, which its underline and
+    /// strikethrough follow (Joplin Lite local change).
+    pub script: Option<RunScript>,
 }
 
 /// A line of text that has been shaped and decorated.
@@ -185,6 +189,22 @@ impl WrappedLine {
     }
 }
 
+/// How far a run's underline and strikethrough move from where the line's own
+/// text puts them: script text keeps GPUI's placement relative to its own
+/// smaller glyphs and raised or lowered baseline (Joplin Lite local change).
+fn script_decoration_shift(layout: &LineLayout, script: Option<RunScript>) -> (Pixels, Pixels) {
+    let Some(script) = script else {
+        return (Pixels::ZERO, Pixels::ZERO);
+    };
+    let scale = script.size_permille as f32 / 1000.0;
+    let rise = script.rise(layout.font_size);
+    // GPUI puts the underline 0.618 descents below the baseline and the
+    // strikethrough a quarter ascent above the line's usual position.
+    let underline = layout.descent * 0.618 * (scale - 1.0) - rise;
+    let strikethrough = layout.ascent * 0.25 * (1.0 - scale) - rise;
+    (underline, strikethrough)
+}
+
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -212,6 +232,7 @@ fn paint_line(
         let mut color = black();
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
+        let mut decoration_script: Option<RunScript> = None;
         let text_system = cx.text_system().clone();
         let mut glyph_origin = point(
             aligned_origin_x(
@@ -295,8 +316,16 @@ fn paint_line(
                     }
 
                     if let Some(style_run) = style_run {
+                        // Joplin Lite: script text carries its own lines, as
+                        // Evernote nests underline and strikethrough inside
+                        // <sup>/<sub>, so they break where the script does.
+                        let script_changed = style_run.script != decoration_script;
+                        decoration_script = style_run.script;
+                        let (underline_dy, strikethrough_dy) =
+                            script_decoration_shift(layout, style_run.script);
                         if let Some((_, underline_style)) = &mut current_underline
-                            && style_run.underline.as_ref() != Some(underline_style)
+                            && (script_changed
+                                || style_run.underline.as_ref() != Some(underline_style))
                         {
                             finished_underline = current_underline.take();
                         }
@@ -304,7 +333,10 @@ fn paint_line(
                             current_underline.get_or_insert((
                                 point(
                                     glyph_origin.x,
-                                    glyph_origin.y + baseline_offset.y + (layout.descent * 0.618),
+                                    glyph_origin.y
+                                        + baseline_offset.y
+                                        + (layout.descent * 0.618)
+                                        + underline_dy,
                                 ),
                                 UnderlineStyle {
                                     color: Some(run_underline.color.unwrap_or(style_run.color)),
@@ -314,7 +346,8 @@ fn paint_line(
                             ));
                         }
                         if let Some((_, strikethrough_style)) = &mut current_strikethrough
-                            && style_run.strikethrough.as_ref() != Some(strikethrough_style)
+                            && (script_changed
+                                || style_run.strikethrough.as_ref() != Some(strikethrough_style))
                         {
                             finished_strikethrough = current_strikethrough.take();
                         }
@@ -323,7 +356,8 @@ fn paint_line(
                                 point(
                                     glyph_origin.x,
                                     glyph_origin.y
-                                        + (((layout.ascent * 0.5) + baseline_offset.y) * 0.5),
+                                        + (((layout.ascent * 0.5) + baseline_offset.y) * 0.5)
+                                        + strikethrough_dy,
                                 ),
                                 StrikethroughStyle {
                                     color: Some(run_strikethrough.color.unwrap_or(style_run.color)),
@@ -590,5 +624,79 @@ fn aligned_origin_x(
         TextAlign::Left => origin.x,
         TextAlign::Center => (origin.x * 2.0 + align_width - line_width) / 2.0,
         TextAlign::Right => origin.x + align_width - line_width,
+    }
+}
+
+// Joplin Lite: script text carries its own underline and strikethrough.
+#[cfg(test)]
+mod script_decoration_tests {
+    use super::script_decoration_shift;
+    use crate::{
+        LineLayout, RunScript, TestAppContext, TextRun, UnderlineStyle, WindowTextSystem, font, px,
+    };
+
+    const SUPERSCRIPT: RunScript = RunScript {
+        size_permille: 833,
+        rise_permille: 333,
+    };
+    const SUBSCRIPT: RunScript = RunScript {
+        size_permille: 833,
+        rise_permille: -200,
+    };
+
+    #[test]
+    fn lines_follow_the_script_texts_own_baseline() {
+        let layout = LineLayout {
+            font_size: px(20.),
+            ascent: px(18.),
+            descent: px(5.),
+            ..Default::default()
+        };
+        assert_eq!(script_decoration_shift(&layout, None), (px(0.), px(0.)));
+        let (under_up, strike_up) = script_decoration_shift(&layout, Some(SUPERSCRIPT));
+        let (under_down, strike_down) = script_decoration_shift(&layout, Some(SUBSCRIPT));
+        // Superscript lines rise with its text (y grows downward); subscript
+        // lines drop with it.
+        assert!(
+            under_up < px(-6.) && strike_up < px(-5.),
+            "{under_up:?} {strike_up:?}"
+        );
+        assert!(
+            under_down > px(3.) && strike_down > px(3.),
+            "{under_down:?} {strike_down:?}"
+        );
+    }
+
+    #[crate::test]
+    fn decoration_runs_break_where_script_text_starts_and_ends(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let underline = Some(UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            });
+            let run = |len, script| TextRun {
+                len,
+                font: font("Helvetica"),
+                color: Default::default(),
+                background_color: None,
+                underline,
+                strikethrough: None,
+                script,
+            };
+            let line = text_system.shape_line(
+                "x22y".into(),
+                px(20.),
+                &[run(1, None), run(2, Some(SUPERSCRIPT)), run(1, None)],
+                None,
+            );
+            assert_eq!(
+                line.decoration_runs
+                    .iter()
+                    .map(|run| (run.len, run.script))
+                    .collect::<Vec<_>>(),
+                vec![(1, None), (2, Some(SUPERSCRIPT)), (1, None)]
+            );
+        });
     }
 }

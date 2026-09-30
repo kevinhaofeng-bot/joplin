@@ -24,11 +24,17 @@ what is drawn. GPUI 0.2.2 shapes a line at one font size.
   glyph takes the script of the span its character came from.
 - Painting (`text_system/line.rs::paint_line`): glyphs paint at their run's
   size and baseline, and the visibility check uses the shifted bounds.
-  Underline and strikethrough stay on the line's baseline and run across a
-  script boundary.
+- Underline and strikethrough follow the script text, as Evernote nests them
+  inside `<sup>`/`<sub>` (common-editor `apps/peso/schema.ts` marks order):
+  `DecorationRun` carries the script, decoration runs split where the script
+  changes, a line ends there even if its style is the same, and
+  `script_decoration_shift` places it relative to the script text's own size
+  and baseline.
 - The test platform's `NoopTextSystem` advances script runs at their size, so
   app tests can check the geometry. Linux and Windows shaping ignore the
   script (`script: None`); Joplin Lite ships on macOS.
 
 Tests: `platform::mac::text_system::tests::test_layout_line_script_run_uses_its_own_size_and_baseline`
-and `..._adjacent_scripts_keep_their_own_script_per_glyph` (real CoreText).
+and `..._adjacent_scripts_keep_their_own_script_per_glyph` (real CoreText);
+`text_system::line::script_decoration_tests` (line placement and where
+decoration runs break).

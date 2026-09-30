@@ -381,6 +381,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.background_color == run.background_color
+                && last_run.script == run.script
             {
                 last_run.len += run.len as u32;
                 continue;
@@ -391,6 +392,7 @@ impl WindowTextSystem {
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
+                script: run.script,
             });
         }
 
@@ -440,6 +442,7 @@ impl WindowTextSystem {
                     && last_run.underline == run.underline
                     && last_run.strikethrough == run.strikethrough
                     && last_run.background_color == run.background_color
+                    && last_run.script == run.script
                 {
                     last_run.len += run_len_within_line as u32;
                     false
@@ -450,6 +453,7 @@ impl WindowTextSystem {
                         background_color: run.background_color,
                         underline: run.underline,
                         strikethrough: run.strikethrough,
+                        script: run.script,
                     });
                     true
                 };
