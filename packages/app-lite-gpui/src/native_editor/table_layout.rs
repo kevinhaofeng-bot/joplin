@@ -34,6 +34,7 @@ pub(crate) struct RunMarks {
     pub(crate) link: bool,
     pub(crate) code: bool,
     pub(crate) script: Option<app_lite_core::Script>,
+    pub(crate) color: Option<app_lite_core::TextColor>,
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +243,7 @@ fn run_marks(marks: &Marks, header: bool) -> RunMarks {
         link: marks.link.is_some(),
         code: marks.inline_code,
         script: marks.script,
+        color: marks.color,
     }
 }
 
@@ -254,7 +256,9 @@ fn text_run(len: usize, marks: RunMarks, base: &Font) -> TextRun {
     if marks.italic {
         font.style = FontStyle::Italic;
     }
-    let color: Hsla = if marks.link {
+    let color: Hsla = if let Some(color) = marks.color {
+        super::layout::text_color(color)
+    } else if marks.link {
         gpui::blue()
     } else {
         rgba(0x25342bff).into()

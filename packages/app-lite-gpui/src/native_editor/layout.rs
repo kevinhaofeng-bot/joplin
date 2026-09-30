@@ -203,6 +203,13 @@ fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
     )
 }
 
+/// A stored text colour as drawn. The editor has one light theme, so the
+/// logical light-mode colour is shown as is.
+pub(crate) fn text_color(color: app_lite_core::TextColor) -> Hsla {
+    let [r, g, b] = color.rgb();
+    rgba(u32::from_be_bytes([r, g, b, color.alpha()])).into()
+}
+
 /// Superscript and subscript as Evernote shows its `<sup>`/`<sub>` (textformatter
 /// schema toDOM): the browser defaults, a smaller size (`font-size: smaller`)
 /// raised about a third or lowered about a fifth of the line's size. Shaped
@@ -274,7 +281,15 @@ fn styled_text_runs(
         let link = marks.iter().any(|mark| matches!(mark, Mark::Link(_)));
         let underline = marks.iter().any(|mark| matches!(mark, Mark::Underline)) || link;
         let strike = marks.iter().any(|mark| matches!(mark, Mark::Strike));
-        let color = if link { gpui::blue() } else { gpui::black() };
+        // Evernote's forecolor sits inside the link, so it wins over the
+        // link's own colour (apps/peso/schema.ts marks order).
+        let color = marks
+            .iter()
+            .find_map(|mark| match mark {
+                Mark::Color(color) => Some(text_color(*color)),
+                _ => None,
+            })
+            .unwrap_or(if link { gpui::blue() } else { gpui::black() });
         shaped.push(TextRun {
             len: end - start,
             font,

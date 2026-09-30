@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use super::core::EditorCore;
+use super::core::{EditorCore, TextColorState};
 use super::model::{
     Affinity, Block, BlockContent, BlockKind, DocPoint, Document, DocumentError, InlineGroup, Mark,
     NodeId, Selection, TextAlignment,
@@ -30,6 +30,7 @@ pub enum EditorCommand {
     Strike,
     Superscript,
     Subscript,
+    TextColor,
     Highlight,
     BulletList,
     OrderedList,
@@ -50,6 +51,8 @@ pub enum CommandArgument {
     None,
     LinkUrl(String),
     ImagePath(std::path::PathBuf),
+    /// A colour for `TextColor`; `None` returns text to the default colour.
+    TextColor(Option<app_lite_core::TextColor>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +220,15 @@ const COMMANDS: &[CommandDescriptor] = &[
         group: 2,
         primary: false,
     },
+    // Evernote `FormattingBar.fontColor`.
+    CommandDescriptor {
+        command: EditorCommand::TextColor,
+        label: "Font color",
+        label_zh: "字体颜色",
+        icon_path: None,
+        group: 2,
+        primary: false,
+    },
     CommandDescriptor {
         command: EditorCommand::Highlight,
         label: "Highlight",
@@ -340,6 +352,18 @@ impl CommandCatalogue {
             },
             EditorCommand::Undo => return history_state(editor.undo_depth()),
             EditorCommand::Redo => return history_state(editor.redo_depth()),
+            // Evernote forecolor.ts: selected text, or the pending style at a
+            // collapsed caret. "On" means a colour other than the default.
+            EditorCommand::TextColor => {
+                return CommandState {
+                    enabled: !editor.selected_text_ranges().is_empty() || editor.caret_in_text(),
+                    toggle: match editor.selection_text_color() {
+                        TextColorState::Default => ToggleState::Off,
+                        TextColorState::Mixed => ToggleState::Mixed,
+                        TextColorState::Color(_) => ToggleState::On,
+                    },
+                };
+            }
             EditorCommand::Bold
             | EditorCommand::Italic
             | EditorCommand::Underline
@@ -538,6 +562,12 @@ impl CommandCatalogue {
             EditorCommand::OutdentList => {
                 editor.apply(Transaction::OutdentList { selection })?;
             }
+            EditorCommand::TextColor => {
+                let CommandArgument::TextColor(color) = argument else {
+                    unreachable!("validate_argument checked TextColor's argument");
+                };
+                editor.apply(Transaction::SetTextColor { selection, color })?;
+            }
         }
         Ok(())
     }
@@ -569,12 +599,23 @@ fn validate_argument(
             command,
             expected: "CommandArgument::LinkUrl",
         }),
+        (EditorCommand::TextColor, CommandArgument::TextColor(color)) => {
+            Ok(CommandArgument::TextColor(color))
+        }
+        (EditorCommand::TextColor, _) => Err(CommandError::ArgumentMismatch {
+            command,
+            expected: "CommandArgument::TextColor",
+        }),
         (_, CommandArgument::None) => Ok(CommandArgument::None),
         (_, CommandArgument::LinkUrl(_)) => Err(CommandError::ArgumentMismatch {
             command,
             expected: "CommandArgument::None",
         }),
         (_, CommandArgument::ImagePath(_)) => Err(CommandError::ArgumentMismatch {
+            command,
+            expected: "CommandArgument::None",
+        }),
+        (_, CommandArgument::TextColor(_)) => Err(CommandError::ArgumentMismatch {
             command,
             expected: "CommandArgument::None",
         }),
@@ -950,6 +991,9 @@ mod tests {
                     }
                     EditorCommand::Link => {
                         CommandArgument::LinkUrl("https://example.com/read-only".into())
+                    }
+                    EditorCommand::TextColor => {
+                        CommandArgument::TextColor(app_lite_core::TextColor::parse("red"))
                     }
                     _ => CommandArgument::None,
                 };

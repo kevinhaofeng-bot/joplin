@@ -231,6 +231,14 @@ impl AttachmentMetadata {
     }
 }
 
+/// The text colour a selection or caret shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextColorState {
+    Default,
+    Mixed,
+    Color(app_lite_core::TextColor),
+}
+
 pub struct EditorCore {
     pub(crate) focus: FocusHandle,
     access: EditorAccess,
@@ -833,6 +841,7 @@ impl EditorCore {
             Transaction::SetBlockKind { .. }
             | Transaction::ToggleMark { .. }
             | Transaction::SetLink { .. }
+            | Transaction::SetTextColor { .. }
             | Transaction::SetAlignment { .. }
             | Transaction::IndentList { .. }
             | Transaction::OutdentList { .. }
@@ -1041,6 +1050,55 @@ impl EditorCore {
     /// The tuple is `(any, all)`; an empty selection uses the mark at the
     /// caret, preserving the familiar toolbar state while still allowing the
     /// command catalogue to disable operations that would otherwise be no-op.
+    /// The text colour of the selection, as Evernote's forecolor query
+    /// (textformatter/commands/forecolor.ts `queryCommandValue`): one colour,
+    /// the default, or mixed when the selected text differs.
+    pub(crate) fn selection_text_color(&self) -> TextColorState {
+        let color_of = |marks: &[Mark]| {
+            marks.iter().find_map(|mark| match mark {
+                Mark::Color(color) => Some(*color),
+                _ => None,
+            })
+        };
+        let ranges = self.selected_text_ranges();
+        if ranges.is_empty() {
+            return color_of(&self.document.caret_marks(self.selection))
+                .map_or(TextColorState::Default, TextColorState::Color);
+        }
+        let mut seen: Option<Option<app_lite_core::TextColor>> = None;
+        for (node_id, range) in ranges {
+            let styles = self
+                .document
+                .block(node_id)
+                .and_then(|block| block.content.styles())
+                .unwrap_or(&[]);
+            let mut cuts = vec![range.start, range.end];
+            for run in styles {
+                if run.range.end > range.start && run.range.start < range.end {
+                    cuts.push(run.range.start.max(range.start));
+                    cuts.push(run.range.end.min(range.end));
+                }
+            }
+            cuts.sort_unstable();
+            cuts.dedup();
+            for pair in cuts.windows(2) {
+                let color = styles
+                    .iter()
+                    .find(|run| run.range.start <= pair[0] && pair[1] <= run.range.end)
+                    .and_then(|run| color_of(&run.marks));
+                match seen {
+                    None => seen = Some(color),
+                    Some(previous) if previous != color => return TextColorState::Mixed,
+                    _ => {}
+                }
+            }
+        }
+        match seen.flatten() {
+            Some(color) => TextColorState::Color(color),
+            None => TextColorState::Default,
+        }
+    }
+
     pub(crate) fn selection_mark_state(&self, mark: &super::model::Mark) -> (bool, bool) {
         let ranges = self.selected_text_ranges();
         if !ranges.is_empty() {
@@ -1701,7 +1759,8 @@ impl EditorCore {
             self.resource_anchor_replacement_for_transaction(&transaction);
         let caret_toggle = matches!(
             &transaction,
-            Transaction::ToggleMark { selection, .. } if selection.is_caret()
+            Transaction::ToggleMark { selection, .. }
+                | Transaction::SetTextColor { selection, .. } if selection.is_caret()
         );
         let outcome =
             self.history

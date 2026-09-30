@@ -47,6 +47,12 @@ pub enum Transaction {
         selection: Selection,
         url: Option<String>,
     },
+    /// Evernote forecolor: sets the colour of the selected text, or with
+    /// `None` returns it to the default (textformatter/commands/forecolor.ts).
+    SetTextColor {
+        selection: Selection,
+        color: Option<app_lite_core::TextColor>,
+    },
     SetAlignment {
         selection: Selection,
         alignment: TextAlignment,
@@ -123,6 +129,7 @@ impl Transaction {
             | Self::SetBlockKind { selection, .. }
             | Self::ToggleMark { selection, .. }
             | Self::SetLink { selection, .. }
+            | Self::SetTextColor { selection, .. }
             | Self::SetAlignment { selection, .. }
             | Self::IndentList { selection }
             | Self::OutdentList { selection }

@@ -23,7 +23,7 @@ use super::chrome::{EVERNOTE_GREEN, ToolbarPlacement, toolbar_placement};
 use super::commands::{
     CommandArgument, CommandCatalogue, CommandDescriptor, EditorCommand, ToggleState,
 };
-use super::core::EditorCore;
+use super::core::{EditorCore, TextColorState};
 use super::model::{Mark, Selection};
 use super::surface::focus_editor;
 
@@ -422,6 +422,7 @@ pub struct EditorCommandChrome {
     host: EditorCommandChromeHost,
     more_open: bool,
     link_popover: Option<Entity<LinkPopover>>,
+    color_palette_anchor: Option<Point<Pixels>>,
     more_trigger_bounds: Option<Bounds<Pixels>>,
     insert_image_dispatch: Arc<dyn Fn(AnyWindowHandle, &mut App)>,
     _editor_subscription: Subscription,
@@ -451,6 +452,7 @@ impl EditorCommandChrome {
                 // presentation state, so URL-field edits cannot falsely
                 // dismiss the Link popover.
                 chrome.more_open = false;
+                chrome.color_palette_anchor = None;
             }
             cx.notify();
         });
@@ -461,6 +463,7 @@ impl EditorCommandChrome {
             host,
             more_open: false,
             link_popover: None,
+            color_palette_anchor: None,
             more_trigger_bounds: None,
             insert_image_dispatch: Arc::new(insert_image_dispatch),
             _editor_subscription: subscription,
@@ -478,7 +481,7 @@ impl EditorCommandChrome {
     }
 
     pub fn has_open_overlay(&self) -> bool {
-        self.more_open || self.link_popover.is_some()
+        self.more_open || self.link_popover.is_some() || self.color_palette_anchor.is_some()
     }
 
     pub fn has_link_popover(&self) -> bool {
@@ -494,6 +497,7 @@ impl EditorCommandChrome {
         if dismissed {
             self.more_open = false;
             self.link_popover = None;
+            self.color_palette_anchor = None;
             focus_editor(&self.editor, window, cx);
             cx.notify();
         }
@@ -503,6 +507,11 @@ impl EditorCommandChrome {
     #[cfg(test)]
     pub(crate) fn more_open_for_test(&self) -> bool {
         self.more_open
+    }
+
+    #[cfg(test)]
+    pub(crate) fn color_palette_open_for_test(&self) -> bool {
+        self.color_palette_anchor.is_some()
     }
 
     #[cfg(test)]
@@ -775,6 +784,13 @@ impl EditorCommandChrome {
             self.open_link_popover_at(anchor, window, cx);
             return;
         }
+        if command == EditorCommand::TextColor {
+            self.more_open = false;
+            self.color_palette_anchor = Some(anchor.unwrap_or_default());
+            focus_editor(&self.editor, window, cx);
+            cx.notify();
+            return;
+        }
         let _ = self.editor.update(cx, |editor, editor_cx| {
             let result = self
                 .catalogue
@@ -787,6 +803,114 @@ impl EditorCommandChrome {
         }
         focus_editor(&self.editor, window, cx);
         cx.notify();
+    }
+
+    pub(crate) fn apply_text_color(
+        &mut self,
+        color: Option<app_lite_core::TextColor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.editor.update(cx, |editor, editor_cx| {
+            let result = self.catalogue.execute(
+                EditorCommand::TextColor,
+                CommandArgument::TextColor(color),
+                editor,
+            );
+            editor_cx.notify();
+            result
+        });
+        self.color_palette_anchor = None;
+        focus_editor(&self.editor, window, cx);
+        cx.notify();
+    }
+
+    // Evernote's font colour dropdown: a default entry and the light theme's
+    // forecolorPalette (common-editor apps/peso/defs.ts 50–61).
+    fn render_color_palette(
+        &self,
+        anchor: Point<Pixels>,
+        content_mask: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let current = match self.editor.read(cx).selection_text_color() {
+            TextColorState::Color(color) => Some(color),
+            TextColorState::Default | TextColorState::Mixed => None,
+        };
+        let mask_left = f32::from(content_mask.left());
+        let mask_right = f32::from(content_mask.right());
+        let mask_top = f32::from(content_mask.top());
+        let mask_bottom = f32::from(content_mask.bottom());
+        let (width, height) = (236.0_f32, 112.0_f32);
+        let left = f32::from(anchor.x)
+            .max(mask_left)
+            .min((mask_right - width).max(mask_left));
+        let top = (f32::from(anchor.y) + 16.0)
+            .min((mask_bottom - height).max(mask_top))
+            .max(mask_top);
+        let chrome = cx.entity();
+        let default_row = div()
+            .id("text-color-default")
+            .debug_selector(|| "text-color-default".to_owned())
+            .h(px(28.0))
+            .px(px(6.0))
+            .flex()
+            .items_center()
+            .rounded(px(4.0))
+            .text_size(px(13.0))
+            .text_color(rgba(0x172033ff))
+            .cursor_pointer()
+            .hover(|this| this.bg(rgba(0x17203312)))
+            .on_mouse_down(MouseButton::Left, {
+                let chrome = chrome.clone();
+                move |_event, window, cx| {
+                    cx.stop_propagation();
+                    let _ = chrome.update(cx, |chrome, chrome_cx| {
+                        chrome.apply_text_color(None, window, chrome_cx)
+                    });
+                }
+            })
+            .child("默认");
+        let swatches = TEXT_COLOR_PALETTE.iter().map(|hex| {
+            let color = app_lite_core::TextColor::parse(hex).expect("palette colour");
+            let selected = current.is_some_and(|current| current.rgb() == color.rgb());
+            let chrome = chrome.clone();
+            let [r, g, b] = color.rgb();
+            div()
+                .id(*hex)
+                .debug_selector(move || format!("text-color-{hex}"))
+                .size(px(24.0))
+                .rounded(px(4.0))
+                .bg(rgba(u32::from_be_bytes([r, g, b, 0xff])))
+                .border(px(if selected { 2.0 } else { 1.0 }))
+                .border_color(rgba(if selected { EVERNOTE_GREEN } else { 0x17203326 }))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    cx.stop_propagation();
+                    let _ = chrome.update(cx, |chrome, chrome_cx| {
+                        chrome.apply_text_color(Some(color), window, chrome_cx)
+                    });
+                })
+        });
+        div()
+            .id("text-color-palette")
+            .debug_selector(|| "text-color-palette".to_owned())
+            .absolute()
+            .top(px(top))
+            .left(px(left))
+            .w(px(width))
+            .occlude()
+            .p(px(8.0))
+            .rounded(px(6.0))
+            .bg(rgba(0xffffffff))
+            .border(px(1.0))
+            .border_color(rgba(0xc7d0ddff))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(default_row)
+            .child(div().flex().flex_wrap().gap(px(6.0)).children(swatches))
+            .into_any_element()
     }
 
     fn render_link_popover(
@@ -1391,9 +1515,17 @@ impl EditorCommandChrome {
         if let Some(popover) = self.link_popover.clone() {
             overlays.push(self.render_link_popover(popover, content_mask, cx));
         }
+        if let Some(anchor) = self.color_palette_anchor {
+            overlays.push(self.render_color_palette(anchor, content_mask, cx));
+        }
         EditorCommandChromeRender { toolbar, overlays }
     }
 }
+
+const TEXT_COLOR_PALETTE: [&str; 14] = [
+    "#333333", "#5A5A5A", "#8C8C8C", "#BFBFBF", "#FFFFFF", "#5724C2", "#B629D4", "#FC1233",
+    "#FB5F2C", "#E59E25", "#18A841", "#1AA9B2", "#1885E2", "#0D3A99",
+];
 
 fn toolbar_group(command: EditorCommand) -> u8 {
     match command {

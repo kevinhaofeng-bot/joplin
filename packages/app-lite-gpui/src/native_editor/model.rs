@@ -120,6 +120,8 @@ pub enum Mark {
     InlineCode,
     Superscript,
     Subscript,
+    /// Evernote forecolor; no colour mark means the default text colour.
+    Color(app_lite_core::TextColor),
 }
 
 impl Mark {
@@ -2729,6 +2731,11 @@ impl Document {
                 let (selection, changed_nodes, inverse) = self.apply_set_link(selection, url)?;
                 (selection, changed_nodes, inverse, None)
             }
+            Transaction::SetTextColor { selection, color } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_set_text_color(selection, color)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::SetAlignment {
                 selection,
                 alignment,
@@ -3723,10 +3730,49 @@ impl Document {
         Ok((selection, changed_nodes, inverse))
     }
 
+    /// Evernote forecolor (textformatter/commands/forecolor.ts): `applyMark`
+    /// with a colour, `clearMark` without; at a collapsed caret it changes the
+    /// stored marks the next typing takes.
+    fn apply_set_text_color(
+        &mut self,
+        selection: Selection,
+        color: Option<app_lite_core::TextColor>,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        let is_color = |mark: &Mark| matches!(mark, Mark::Color(_));
+        let mark = color.map(Mark::Color);
+        self.validate_selection(selection)?;
+        let (start_index, start_offset, end_index, _) = self.selection_bounds(selection)?;
+        if selection.is_caret()
+            && start_index == end_index
+            && is_text_block(&self.blocks[start_index])
+        {
+            let mut marks = self.caret_marks(selection);
+            marks.retain(|existing| !is_color(existing));
+            marks.extend(mark);
+            normalize_marks(&mut marks);
+            self.pending_marks = PendingMarks(Some((selection.head.node_id, start_offset, marks)));
+            return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+        }
+        self.apply_set_value_mark(selection, is_color, mark)
+    }
+
     fn apply_set_link(
         &mut self,
         selection: Selection,
         url: Option<String>,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        self.apply_set_value_mark(
+            selection,
+            |mark| matches!(mark, Mark::Link(_)),
+            url.map(Mark::Link),
+        )
+    }
+
+    fn apply_set_value_mark(
+        &mut self,
+        selection: Selection,
+        is_kind: impl Fn(&Mark) -> bool + Copy,
+        mark: Option<Mark>,
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         self.validate_selection(selection)?;
         let (start_index, start_offset, end_index, end_offset) =
@@ -3753,7 +3799,8 @@ impl Document {
                 continue;
             }
             let (text, styles) = text_parts(&block.content)?;
-            let updated = set_link_range(text, styles, range_start, range_end, url.as_deref());
+            let updated =
+                set_value_mark_range(text, styles, range_start, range_end, is_kind, mark.clone());
             if updated.as_slice() != styles {
                 block.content = BlockContent::Text {
                     text: text.to_owned(),
@@ -4937,12 +4984,15 @@ fn toggle_style_range(
     updated
 }
 
-fn set_link_range(
+/// Replaces the one mark of a kind that carries a value (a link, a colour)
+/// over `start..end`; `None` removes it.
+fn set_value_mark_range(
     text: &str,
     styles: &[StyledRun],
     start: usize,
     end: usize,
-    url: Option<&str>,
+    is_kind: impl Fn(&Mark) -> bool,
+    mark: Option<Mark>,
 ) -> SmallVec<[StyledRun; 4]> {
     let mut boundaries = vec![start, end];
     for run in styles {
@@ -4960,9 +5010,9 @@ fn set_link_range(
         .collect::<Vec<_>>();
     for (segment_start, segment_end) in segments {
         let mut marks = marks_for_segment(styles, segment_start, segment_end);
-        marks.retain(|mark| !matches!(mark, Mark::Link(_)));
-        if let Some(url) = url {
-            marks.push(Mark::Link(url.to_owned()));
+        marks.retain(|existing| !is_kind(existing));
+        if let Some(mark) = &mark {
+            marks.push(mark.clone());
         }
         normalize_marks(&mut marks);
         if !marks.is_empty() {

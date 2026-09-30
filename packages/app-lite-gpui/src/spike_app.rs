@@ -2372,6 +2372,34 @@ mod tests {
         jpeg
     }
 
+    // The More menu is height-limited, so a lower row is scrolled into view
+    // before it is clicked, as a user would.
+    fn click_more_command(cx: &mut VisualTestContext, label: &'static str) {
+        let trigger = cx
+            .debug_bounds("evernote-native-spike-more-trigger")
+            .expect("More trigger");
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        redraw(cx);
+        let menu = cx
+            .debug_bounds("evernote-native-spike-more-menu")
+            .expect("More menu");
+        for _ in 0..16 {
+            let row = cx.debug_bounds(label).expect("More command");
+            if row.top() >= menu.top() && row.bottom() <= menu.bottom() {
+                cx.simulate_click(row.center(), Modifiers::default());
+                redraw(cx);
+                return;
+            }
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: menu.center(),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-36.0))),
+                ..Default::default()
+            });
+            redraw(cx);
+        }
+        panic!("{label} never scrolled into the More menu");
+    }
+
     fn build_view(window: &mut Window, cx: &mut Context<SpikeView>) -> SpikeView {
         let editor = cx.new(|cx| EditorCore::new(Document::from_paragraphs(["alpha", "beta"]), cx));
         editor.read(cx).focus_handle().focus(window);
@@ -3302,14 +3330,7 @@ mod tests {
                 editor_cx.notify();
             });
         });
-        let trigger = cx
-            .debug_bounds("evernote-native-spike-more-trigger")
-            .expect("More trigger");
-        cx.simulate_click(trigger.center(), Modifiers::default());
-        redraw(cx);
-        let outdent = cx.debug_bounds("Outdent list").expect("Outdent command");
-        cx.simulate_click(outdent.center(), Modifiers::default());
-        redraw(cx);
+        click_more_command(cx, "Outdent list");
         view.read_with(cx, |view, cx| {
             let editor = view.editor.read(cx);
             assert_eq!(editor.undo_depth(), before_bullet_outdent + 1);
@@ -3334,16 +3355,7 @@ mod tests {
                 editor_cx.notify();
             });
         });
-        let trigger = cx
-            .debug_bounds("evernote-native-spike-more-trigger")
-            .expect("More trigger remains mounted");
-        cx.simulate_click(trigger.center(), Modifiers::default());
-        redraw(cx);
-        let outdent = cx
-            .debug_bounds("Outdent list")
-            .expect("Outdent command remains available");
-        cx.simulate_click(outdent.center(), Modifiers::default());
-        redraw(cx);
+        click_more_command(cx, "Outdent list");
         view.read_with(cx, |view, cx| {
             let editor = view.editor.read(cx);
             assert_eq!(editor.undo_depth(), before_ordered_outdent + 1);
@@ -3355,6 +3367,71 @@ mod tests {
                     .all(|block| matches!(block.kind, BlockKind::OrderedItem { depth: 0 }))
             );
         });
+    }
+
+    #[gpui::test]
+    async fn font_color_palette_colours_and_resets_the_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        let selection = view.update(cx, |view, cx| {
+            view.editor.update(cx, |editor, editor_cx| {
+                let node = editor.document().first_node_id().unwrap();
+                editor.set_selection_for_test(Selection::new(
+                    DocPoint::new(node, 1),
+                    DocPoint::new(node, 3),
+                ));
+                editor_cx.notify();
+                editor.selection()
+            })
+        });
+        let colors = |view: &Entity<SpikeView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                let editor = view.editor.read(cx);
+                let node = editor.document().first_node_id().unwrap();
+                editor
+                    .document()
+                    .block(node)
+                    .unwrap()
+                    .content
+                    .styles()
+                    .unwrap()
+                    .iter()
+                    .map(|run| (run.range.clone(), run.marks.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let pick = |swatch: &'static str, cx: &mut VisualTestContext| {
+            let trigger = cx
+                .debug_bounds("evernote-native-spike-more-trigger")
+                .expect("More trigger");
+            cx.simulate_click(trigger.center(), Modifiers::default());
+            redraw(cx);
+            let row = cx.debug_bounds("Font color").expect("Font color command");
+            cx.simulate_click(row.center(), Modifiers::default());
+            redraw(cx);
+            let swatch = cx.debug_bounds(swatch).expect("palette entry");
+            cx.simulate_click(swatch.center(), Modifiers::default());
+            redraw(cx);
+        };
+        let red = app_lite_core::TextColor::parse("#FC1233").unwrap();
+        pick("text-color-#FC1233", cx);
+        assert_eq!(colors(&view, cx), vec![(1..3, vec![Mark::Color(red)])]);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.command_chrome.read(cx).color_palette_open_for_test());
+            assert_eq!(view.editor.read(cx).selection(), selection);
+        });
+        cx.simulate_keystrokes("cmd-z");
+        redraw(cx);
+        assert_eq!(colors(&view, cx), vec![]);
+        cx.simulate_keystrokes("cmd-shift-z");
+        redraw(cx);
+        assert_eq!(colors(&view, cx), vec![(1..3, vec![Mark::Color(red)])]);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).selection(), selection);
+        });
+        pick("text-color-default", cx);
+        assert_eq!(colors(&view, cx), vec![]);
     }
 
     #[gpui::test]

@@ -943,6 +943,7 @@ fn canonical_marks(marks: &[Mark]) -> Marks {
             Mark::InlineCode => output.inline_code = true,
             Mark::Superscript => output.script = Some(app_lite_core::Script::Superscript),
             Mark::Subscript => output.script = Some(app_lite_core::Script::Subscript),
+            Mark::Color(color) => output.color = Some(*color),
         }
     }
     output
@@ -1084,6 +1085,9 @@ fn native_marks(marks: &Marks) -> SmallVec<[Mark; 4]> {
         Some(app_lite_core::Script::Superscript) => output.push(Mark::Superscript),
         Some(app_lite_core::Script::Subscript) => output.push(Mark::Subscript),
         None => {}
+    }
+    if let Some(color) = marks.color {
+        output.push(Mark::Color(color));
     }
     output
 }
@@ -1983,6 +1987,7 @@ mod tests {
                 inline_code: true,
                 link: Some("https://example.test/格式".into()),
                 script: Some(app_lite_core::Script::Superscript),
+                color: Some(app_lite_core::TextColor::new([0xfc, 0x12, 0x33])),
             },
         };
         let lowered = |text: &str| Inline::Text {

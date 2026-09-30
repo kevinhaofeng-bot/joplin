@@ -1,7 +1,7 @@
 use super::commands::{
     CommandArgument, CommandCatalogue, CommandError, EditorCommand, ToggleState,
 };
-use super::core::EditorCore;
+use super::core::{EditorCore, TextColorState};
 use super::find::{FindError, MAX_FIND_QUERY_BYTES};
 use super::history::History;
 use super::images::{
@@ -6372,6 +6372,9 @@ fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
         let argument = match descriptor.command {
             EditorCommand::Link => CommandArgument::LinkUrl("https://example.com".into()),
             EditorCommand::InsertImage => CommandArgument::ImagePath(image_path.clone()),
+            EditorCommand::TextColor => {
+                CommandArgument::TextColor(app_lite_core::TextColor::parse("red"))
+            }
             _ => CommandArgument::None,
         };
         let state = catalogue.state(descriptor.command, &editor);
@@ -8662,6 +8665,92 @@ fn pending_bold_on_then_off_covers_separate_typing_events(cx: &mut gpui::TestApp
             ("ab中".to_owned(), vec![Mark::Bold]),
             ("cd文".to_owned(), vec![]),
         ]
+    );
+}
+
+#[gpui::test]
+fn text_color_sets_replaces_resets_and_carries_at_the_caret(cx: &mut gpui::TestAppContext) {
+    // Evernote textformatter/commands/forecolor.ts: a colour replaces the
+    // selection's colour, `null` returns it to the default, the query is
+    // mixed for mixed colours, and at a caret the colour is stored for input.
+    let catalogue = CommandCatalogue::new();
+    let red = app_lite_core::TextColor::parse("#FC1233").unwrap();
+    let blue = app_lite_core::TextColor::parse("rgba(24, 133, 226, 0.5)").unwrap();
+    let set = |editor: &mut EditorCore, color| {
+        catalogue
+            .execute(
+                EditorCommand::TextColor,
+                CommandArgument::TextColor(color),
+                editor,
+            )
+            .unwrap()
+    };
+    let mut editor = EditorCore::for_test("abcd", cx);
+    let node = editor.document().first_node_id().unwrap();
+    editor.set_selection_for_test(Selection::new(
+        DocPoint::new(node, 0),
+        DocPoint::new(node, 2),
+    ));
+    set(&mut editor, Some(red));
+    assert_eq!(editor.selection_text_color(), TextColorState::Color(red));
+    editor.set_selection_for_test(Selection::new(
+        DocPoint::new(node, 1),
+        DocPoint::new(node, 4),
+    ));
+    assert_eq!(editor.selection_text_color(), TextColorState::Mixed);
+    assert_eq!(
+        catalogue.state(EditorCommand::TextColor, &editor).toggle,
+        ToggleState::Mixed
+    );
+    let depth = editor.undo_depth();
+    set(&mut editor, Some(blue));
+    assert_eq!(
+        styled_segments(&editor, 0),
+        vec![
+            ("a".to_owned(), vec![Mark::Color(red)]),
+            ("bcd".to_owned(), vec![Mark::Color(blue)]),
+        ]
+    );
+    assert_eq!(editor.undo_depth(), depth + 1);
+    editor.undo().unwrap();
+    assert_eq!(
+        styled_segments(&editor, 0),
+        vec![
+            ("ab".to_owned(), vec![Mark::Color(red)]),
+            ("cd".to_owned(), vec![]),
+        ]
+    );
+    editor.set_selection_for_test(Selection::new(
+        DocPoint::new(node, 0),
+        DocPoint::new(node, 4),
+    ));
+    set(&mut editor, None);
+    assert_eq!(
+        styled_segments(&editor, 0),
+        vec![("abcd".to_owned(), vec![])]
+    );
+    assert_eq!(editor.selection_text_color(), TextColorState::Default);
+
+    editor.set_caret_utf8(4);
+    set(&mut editor, Some(red));
+    editor.move_left();
+    editor.move_right();
+    assert_eq!(
+        editor.selection_text_color(),
+        TextColorState::Default,
+        "moving away and back drops the caret colour"
+    );
+    set(&mut editor, Some(red));
+    assert_eq!(editor.selection_text_color(), TextColorState::Color(red));
+    editor.insert_text("中").unwrap();
+    editor.insert_text("e").unwrap();
+    assert_eq!(
+        styled_segments(&editor, 0),
+        vec![
+            ("abcd".to_owned(), vec![]),
+            ("中e".to_owned(), vec![Mark::Color(red)]),
+        ],
+        "a caret colour keeps applying to separate typing events"
     );
 }
 
