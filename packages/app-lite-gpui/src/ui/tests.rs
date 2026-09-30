@@ -12494,3 +12494,51 @@ async fn an_empty_list_shows_what_its_route_means_not_an_empty_library(cx: &mut 
         .unwrap();
     assert_eq!(notes.len(), 1);
 }
+
+#[gpui::test]
+async fn move_to_trash_is_unavailable_without_a_note_to_move(cx: &mut TestAppContext) {
+    // evidence31: in an empty Trash the native 移至废纸篓 menu ran and showed
+    // "requested entity was not found". It is only available for selected
+    // notes outside the Trash; the menu follows action availability.
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "可移入废纸篓".into(),
+            notebook_id: None,
+            document: rich_document("正文"),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    let available = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| window.is_action_available(&TrashSelected, app))
+    };
+    for (route, selected, expected) in [
+        (LibraryRoute::Trash, None, false),
+        (LibraryRoute::AllNotes, None, false),
+        (LibraryRoute::AllNotes, Some(note.id.clone()), true),
+    ] {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(
+                    AppAction::NavigateTo {
+                        route: route.clone(),
+                        selected_note_id: selected.clone(),
+                    },
+                    window,
+                    shell_cx,
+                );
+                shell.focus_handle.focus(window);
+            })
+        });
+        redraw(cx);
+        assert_eq!(available(cx), expected, "{route:?} {selected:?}");
+        if !expected {
+            cx.simulate_keystrokes("cmd-shift-backspace");
+            redraw(cx);
+            view.read_with(cx, |shell, app| {
+                assert_eq!(shell.model.read(app).status(), &AppStatus::Ready);
+            });
+        }
+    }
+}

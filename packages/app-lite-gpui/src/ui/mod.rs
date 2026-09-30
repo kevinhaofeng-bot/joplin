@@ -6777,6 +6777,10 @@ impl Render for LibraryShell {
             cx,
         );
         let organization_panel = self.render_organization_panel(cx);
+        // Evernote offers Move to Trash only for selected notes outside the
+        // Trash; without a handler GPUI disables the native menu item too.
+        let can_trash =
+            route != LibraryRoute::Trash && !self.model.read(cx).selected_note_ids().is_empty();
         let mut root = div()
             .id("library-shell")
             .debug_selector(|| "library-shell".to_owned())
@@ -6787,7 +6791,6 @@ impl Render for LibraryShell {
             .key_context("LibraryShell")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::create_note))
-            .on_action(cx.listener(Self::trash_selected))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_note_list))
             .on_action(cx.listener(Self::cycle_list_view_mode))
@@ -6834,6 +6837,9 @@ impl Render for LibraryShell {
                     .children(organization_panel)
                     .child(editor_pane),
             );
+        if can_trash {
+            root = root.on_action(cx.listener(Self::trash_selected));
+        }
         for overlay in toolbar_overlays {
             root = root.child(overlay);
         }
