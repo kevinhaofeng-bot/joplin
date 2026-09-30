@@ -28,6 +28,30 @@ pub struct LineLayout {
     pub len: usize,
 }
 
+/// A run shaped at a fraction of the line's font size and raised or lowered
+/// from its baseline, as superscript and subscript are. Thousandths of the
+/// line's font size, so runs stay hashable for the layout cache.
+/// (Joplin Lite local change; see JOPLIN-PATCHES.md.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RunScript {
+    /// Glyph size, in thousandths of the line's font size.
+    pub size_permille: u16,
+    /// Baseline shift upward, in thousandths of the line's font size.
+    pub rise_permille: i16,
+}
+
+impl RunScript {
+    /// The run's font size.
+    pub fn font_size(&self, line_font_size: Pixels) -> Pixels {
+        line_font_size * (self.size_permille as f32 / 1000.0)
+    }
+
+    /// How far the run's baseline sits above the line's.
+    pub fn rise(&self, line_font_size: Pixels) -> Pixels {
+        line_font_size * (self.rise_permille as f32 / 1000.0)
+    }
+}
+
 /// A run of text that has been shaped .
 #[derive(Debug, Clone)]
 pub struct ShapedRun {
@@ -35,6 +59,22 @@ pub struct ShapedRun {
     pub font_id: FontId,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
+    /// Size and baseline of the run when it is not the line's own.
+    pub script: Option<RunScript>,
+}
+
+impl ShapedRun {
+    /// The size its glyphs were shaped and are painted at.
+    pub fn font_size(&self, line_font_size: Pixels) -> Pixels {
+        self.script
+            .map_or(line_font_size, |script| script.font_size(line_font_size))
+    }
+
+    /// How far its baseline sits above the line's.
+    pub fn rise(&self, line_font_size: Pixels) -> Pixels {
+        self.script
+            .map_or(Pixels::ZERO, |script| script.rise(line_font_size))
+    }
 }
 
 /// A single glyph, ready to paint.
@@ -597,6 +637,7 @@ impl LineLayoutCache {
 pub struct FontRun {
     pub(crate) len: usize,
     pub(crate) font_id: FontId,
+    pub(crate) script: Option<RunScript>,
 }
 
 trait AsCacheKeyRef {

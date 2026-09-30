@@ -457,6 +457,7 @@ impl WindowTextSystem {
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
+                    && font_run.script == run.script
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -464,6 +465,7 @@ impl WindowTextSystem {
                     font_runs.push(FontRun {
                         len: run_len_within_line,
                         font_id,
+                        script: run.script,
                     });
                 }
 
@@ -560,6 +562,7 @@ impl WindowTextSystem {
 
             if let Some(font_run) = font_runs.last_mut()
                 && Some(font_run.font_id) == last_font
+                && font_run.script == run.script
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -569,6 +572,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    script: run.script,
                 });
             }
         }
@@ -743,6 +747,9 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+    /// Shaped smaller and off the baseline, as superscript and subscript
+    /// (Joplin Lite local change).
+    pub script: Option<RunScript>,
 }
 
 #[cfg(all(target_os = "macos", test))]

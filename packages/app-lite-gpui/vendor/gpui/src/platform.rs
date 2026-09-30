@@ -663,7 +663,7 @@ impl PlatformTextSystem for NoopTextSystem {
         Ok((raster_bounds.size, Vec::new()))
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, _runs: &[FontRun]) -> LineLayout {
+    fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         let mut position = px(0.);
         let metrics = self.font_metrics(FontId(0));
         let em_width = font_size
@@ -672,31 +672,46 @@ impl PlatformTextSystem for NoopTextSystem {
                 .unwrap()
                 .width
             / metrics.units_per_em as f32;
-        let mut glyphs = Vec::new();
+        // Joplin Lite: a script run advances at its own size, as on macOS.
+        let script_at = |index: usize| {
+            let mut start = 0;
+            for run in font_runs {
+                if index < start + run.len {
+                    return run.script;
+                }
+                start += run.len;
+            }
+            None
+        };
+        let mut runs: Vec<ShapedRun> = Vec::default();
         for (ix, c) in text.char_indices() {
+            let script = script_at(ix);
+            let scale = script.map_or(1.0, |script| script.size_permille as f32 / 1000.0);
             if let Some(glyph) = self.glyph_for_char(FontId(0), c) {
-                glyphs.push(ShapedGlyph {
+                let shaped = ShapedGlyph {
                     id: glyph,
                     position: point(position, px(0.)),
                     index: ix,
                     is_emoji: glyph.0 == 2,
-                });
+                };
+                match runs.last_mut() {
+                    Some(run) if run.script == script => run.glyphs.push(shaped),
+                    _ => runs.push(ShapedRun {
+                        font_id: FontId(0),
+                        glyphs: vec![shaped],
+                        script,
+                    }),
+                }
                 if glyph.0 == 2 {
-                    position += em_width * 2.0;
+                    position += em_width * 2.0 * scale;
                 } else {
-                    position += em_width;
+                    position += em_width * scale;
                 }
             } else {
-                position += em_width
+                position += em_width * scale
             }
         }
-        let mut runs = Vec::default();
-        if !glyphs.is_empty() {
-            runs.push(ShapedRun {
-                font_id: FontId(0),
-                glyphs,
-            });
-        } else {
+        if runs.is_empty() {
             position = px(0.);
         }
 

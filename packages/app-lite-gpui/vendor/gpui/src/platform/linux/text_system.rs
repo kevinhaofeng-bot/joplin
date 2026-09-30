@@ -442,6 +442,7 @@ impl CosmicTextSystemState {
                 runs.push(ShapedRun {
                     font_id,
                     glyphs: vec![shaped_glyph],
+                    script: None,
                 });
             }
         }

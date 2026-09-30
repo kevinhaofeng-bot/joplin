@@ -440,6 +440,7 @@ impl MacTextSystemState {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
+        let mut script_ranges: Vec<(usize, usize, Option<crate::RunScript>)> = Vec::new();
 
         {
             let mut ix_converter = StringIndexConverter::new(&text);
@@ -468,16 +469,25 @@ impl MacTextSystemState {
                 let cf_range = CFRange::init(utf16_start, utf16_end - utf16_start);
                 let font = &self.fonts[run.font_id.0];
 
+                // A script run is shaped at its own size, so its advances,
+                // and so wrapping and hit testing, are its real ones.
+                let run_font_size = run
+                    .script
+                    .map_or(font_size, |script| script.font_size(font_size));
+                let rise = run.script.map_or(0.0, |script| script.rise(font_size).0);
                 let font_metrics = font.metrics();
-                let font_scale = font_size.0 / font_metrics.units_per_em as f32;
-                max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
-                max_descent = max_descent.max(-font_metrics.descent * font_scale);
+                let font_scale = run_font_size.0 / font_metrics.units_per_em as f32;
+                max_ascent = max_ascent.max(font_metrics.ascent * font_scale + rise);
+                max_descent = max_descent.max(-font_metrics.descent * font_scale - rise);
+                script_ranges.push((utf16_start as usize, utf16_end as usize, run.script));
 
                 unsafe {
                     string.set_attribute(
                         cf_range,
                         kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
+                        &font
+                            .native_font()
+                            .clone_with_font_size(run_font_size.into()),
                     );
                 }
             }
@@ -497,16 +507,6 @@ impl MacTextSystemState {
             };
             let font_id = self.id_for_native_font(font);
 
-            let mut glyphs = match runs.last_mut() {
-                Some(run) if run.font_id == font_id => &mut run.glyphs,
-                _ => {
-                    runs.push(ShapedRun {
-                        font_id,
-                        glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
-                    });
-                    &mut runs.last_mut().unwrap().glyphs
-                }
-            };
             for ((&glyph_id, position), &glyph_utf16_ix) in run
                 .glyphs()
                 .iter()
@@ -514,6 +514,24 @@ impl MacTextSystemState {
                 .zip(run.string_indices().iter())
             {
                 let mut glyph_utf16_ix = usize::try_from(glyph_utf16_ix).unwrap();
+                // Joplin Lite: CoreText may join adjacent spans whose fonts
+                // are equal (a superscript next to a subscript), so each glyph
+                // takes the script of the span its character came from.
+                let script = script_ranges
+                    .iter()
+                    .find(|(start, end, _)| *start <= glyph_utf16_ix && glyph_utf16_ix < *end)
+                    .and_then(|(_, _, script)| *script);
+                let glyphs = match runs.last_mut() {
+                    Some(run) if run.font_id == font_id && run.script == script => &mut run.glyphs,
+                    _ => {
+                        runs.push(ShapedRun {
+                            font_id,
+                            glyphs: Vec::new(),
+                            script,
+                        });
+                        &mut runs.last_mut().unwrap().glyphs
+                    }
+                };
                 let r = self
                     .zwnjs_scratch_space
                     .binary_search_by(|&it| it.cmp(&glyph_utf16_ix));
@@ -719,6 +737,7 @@ mod tests {
         let mut style = FontRun {
             font_id,
             len: line.len(),
+            script: None,
         };
 
         let layout = fonts.layout_line(line, px(16.), &[style]);
@@ -740,10 +759,12 @@ mod tests {
             FontRun {
                 len: "\u{feff}".len(),
                 font_id,
+                script: None,
             },
             FontRun {
                 len: "ab".len(),
                 font_id,
+                script: None,
             },
         ];
         let layout = fonts.layout_line(line, px(16.), font_runs);
@@ -762,8 +783,16 @@ mod tests {
 
         let text = "hello world";
         let font_runs = &[
-            FontRun { font_id, len: 5 }, // "hello"
-            FontRun { font_id, len: 6 }, // " world"
+            FontRun {
+                font_id,
+                len: 5,
+                script: None,
+            }, // "hello"
+            FontRun {
+                font_id,
+                len: 6,
+                script: None,
+            }, // " world"
         ];
 
         let layout = fonts.layout_line(text, px(16.), font_runs);
@@ -783,11 +812,16 @@ mod tests {
         // Test with different font runs - should not insert ZWNJ
         let font_id2 = fonts.font_id(&font("Times")).unwrap_or(font_id);
         let font_runs_different = &[
-            FontRun { font_id, len: 5 }, // "hello"
+            FontRun {
+                font_id,
+                len: 5,
+                script: None,
+            }, // "hello"
             // " world"
             FontRun {
                 font_id: font_id2,
                 len: 6,
+                script: None,
             },
         ];
 
@@ -812,15 +846,31 @@ mod tests {
         let font_id = fonts.font_id(&font("Helvetica")).unwrap();
 
         let text = "hello";
-        let font_runs = &[FontRun { font_id, len: 5 }];
+        let font_runs = &[FontRun {
+            font_id,
+            len: 5,
+            script: None,
+        }];
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, text.len());
 
         let text = "abc";
         let font_runs = &[
-            FontRun { font_id, len: 1 }, // "a"
-            FontRun { font_id, len: 1 }, // "b"
-            FontRun { font_id, len: 1 }, // "c"
+            FontRun {
+                font_id,
+                len: 1,
+                script: None,
+            }, // "a"
+            FontRun {
+                font_id,
+                len: 1,
+                script: None,
+            }, // "b"
+            FontRun {
+                font_id,
+                len: 1,
+                script: None,
+            }, // "c"
         ];
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, text.len());
@@ -842,5 +892,137 @@ mod tests {
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
+    }
+
+    // Joplin Lite: a script run is shaped by CoreText at its own size.
+    #[test]
+    fn test_layout_line_script_run_uses_its_own_size_and_baseline() {
+        use crate::RunScript;
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+        let text = "x22y";
+        let plain = fonts.layout_line(
+            text,
+            px(20.),
+            &[FontRun {
+                font_id,
+                len: text.len(),
+                script: None,
+            }],
+        );
+        let script = RunScript {
+            size_permille: 833,
+            rise_permille: 333,
+        };
+        let raised = fonts.layout_line(
+            text,
+            px(20.),
+            &[
+                FontRun {
+                    font_id,
+                    len: 1,
+                    script: None,
+                },
+                FontRun {
+                    font_id,
+                    len: 2,
+                    script: Some(script),
+                },
+                FontRun {
+                    font_id,
+                    len: 1,
+                    script: None,
+                },
+            ],
+        );
+        let x_of = |layout: &crate::LineLayout, index: usize| {
+            layout
+                .runs
+                .iter()
+                .flat_map(|run| &run.glyphs)
+                .find(|glyph| glyph.index == index)
+                .unwrap()
+                .position
+                .x
+        };
+        let plain_digits = x_of(&plain, 3) - x_of(&plain, 1);
+        let raised_digits = x_of(&raised, 3) - x_of(&raised, 1);
+        let ratio = raised_digits / plain_digits;
+        assert!((ratio - 0.833).abs() < 0.01, "digit advance ratio {ratio}");
+        assert!(raised.width < plain.width);
+        assert_eq!(
+            raised.runs.iter().map(|run| run.script).collect::<Vec<_>>(),
+            vec![None, Some(script), None]
+        );
+        assert!(
+            raised.ascent > plain.ascent,
+            "the raised run lifts the line's ascent"
+        );
+    }
+
+    // Joplin Lite: adjacent superscript and subscript spans use equal fonts,
+    // which CoreText may join into one glyph run; each glyph must keep the
+    // script of its own span.
+    #[test]
+    fn test_layout_line_adjacent_scripts_keep_their_own_script_per_glyph() {
+        use crate::RunScript;
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+        let superscript = RunScript {
+            size_permille: 833,
+            rise_permille: 333,
+        };
+        let subscript = RunScript {
+            size_permille: 833,
+            rise_permille: -200,
+        };
+        for text in ["x2323y", "中上下文"] {
+            let chars: Vec<(usize, char)> = text.char_indices().collect();
+            let len = |from: usize, to: usize| {
+                chars.get(to).map_or(text.len(), |(index, _)| *index) - chars[from].0
+            };
+            let middle = (chars.len() - 2) / 2;
+            let runs = [
+                FontRun {
+                    font_id,
+                    len: len(0, 1),
+                    script: None,
+                },
+                FontRun {
+                    font_id,
+                    len: len(1, 1 + middle),
+                    script: Some(superscript),
+                },
+                FontRun {
+                    font_id,
+                    len: len(1 + middle, 1 + 2 * middle),
+                    script: Some(subscript),
+                },
+                FontRun {
+                    font_id,
+                    len: len(1 + 2 * middle, chars.len()),
+                    script: None,
+                },
+            ];
+            let layout = fonts.layout_line(text, px(20.), &runs);
+            let script_of = |index: usize| {
+                layout
+                    .runs
+                    .iter()
+                    .find(|run| run.glyphs.iter().any(|glyph| glyph.index == index))
+                    .map(|run| run.script)
+                    .expect("glyph shaped")
+            };
+            for (position, (index, _)) in chars.iter().enumerate() {
+                let expected = if position == 0 || position == chars.len() - 1 {
+                    None
+                } else if position <= middle {
+                    Some(superscript)
+                } else {
+                    Some(subscript)
+                };
+                assert_eq!(script_of(*index), expected, "{text}: char {position}");
+            }
+        }
     }
 }

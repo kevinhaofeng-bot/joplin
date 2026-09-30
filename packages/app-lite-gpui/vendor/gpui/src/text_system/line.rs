@@ -228,7 +228,10 @@ fn paint_line(
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            // Joplin Lite: a script run paints at its own size and baseline.
+            let run_font_size = run.font_size(layout.font_size);
+            let run_rise = point(px(0.), -run.rise(layout.font_size));
+            max_glyph_size = text_system.bounding_box(run.font_id, run_font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -363,7 +366,7 @@ fn paint_line(
                 }
 
                 let max_glyph_bounds = Bounds {
-                    origin: glyph_origin,
+                    origin: glyph_origin + run_rise,
                     size: max_glyph_size,
                 };
 
@@ -371,17 +374,17 @@ fn paint_line(
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     if glyph.is_emoji {
                         window.paint_emoji(
-                            glyph_origin + baseline_offset,
+                            glyph_origin + baseline_offset + run_rise,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run_font_size,
                         )?;
                     } else {
                         window.paint_glyph(
-                            glyph_origin + baseline_offset,
+                            glyph_origin + baseline_offset + run_rise,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run_font_size,
                             color,
                         )?;
                     }
