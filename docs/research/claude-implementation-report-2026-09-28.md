@@ -480,3 +480,36 @@ cargo test --bin velotype superscript_is_shaped_smaller table_cells_shape_supers
 
 App 全量测试使用的是测试平台的模拟整形，只能说明整条流程确实使用了缩小后的几何，不能证明 CoreText 的实际效果。CoreText 的效果由上面两个 mac 测试直接验证，最终视觉效果以 Codex 的实机验收为准。
 
+## 第十三批：上下标内的装饰线按 Evernote 的嵌套绘制（`4aba287cb`、`eeeb07fd6`）
+
+**更正：** 第十二批补充中“装饰线在主基线上连续，与 Evernote 一致”的结论是错的。当时的依据是我们自己写出的 HTML 嵌套，不能证明与 Evernote 一致。
+
+Codex 读取的源码（我已复核）是 common-editor `apps/peso/schema.ts` 121–153 行。其中 marks 的注册顺序注释为“the order here is significant”：`fontfamily, code, bold, fontname, fontsize, lineheight, highlight, italic, subscript, superscript, link, forecolor, baseforecolor, strikethrough, underline`。ProseMirror 按注册顺序嵌套，越靠前越在外层，所以在 Evernote 的 DOM 中，链接、删除线、下划线都在 `<sup>`/`<sub>` 之内，跟随上下标文字的位置和字号绘制，并在上下标与普通文字的交界处断开。Codex 在 evidence56 中另外记录了 ProseMirror 自带的序列化器和 Peso HTMLSerializer 的源码。
+
+**保存（core `serialize_text`）：**
+- 带上下标的文字按 `mark, strong, em, sup/sub, a, s, u, code` 的顺序嵌套；
+- 不带上下标的文字保持原来的顺序 `a, mark, s, strong, em, u, code`，逐字节不变，因此现有笔记不会被整体改写，也不会引起同步变化；
+- 两种顺序都能读回同样的格式。
+
+**绘制（vendored GPUI）：**
+- `DecorationRun` 带上 script，文字在上下标与普通之间切换时，装饰线分段断开；
+- `paint_line` 在分段的 script 改变时结束当前线段，即使线的样式相同也不接续；
+- `script_decoration_shift` 在 GPUI 原有的定位公式上叠加上下标的缩放和基线升降。
+
+**测试：**
+- core：`script_text_nests_link_and_decorations_inside_like_evernote`（新顺序、旧顺序读回、无上下标时 HTML 不变）；`sync_two_clients::superscript_and_subscript_survive_a_round_trip_through_another_device`（A → 服务器 → B → 在 B 编辑 → A → 重新打开）。
+- GPUI：`script_decoration_tests::lines_follow_the_script_texts_own_baseline`、`decoration_runs_break_where_script_text_starts_and_ends`（真实的 `shape_line`）。
+
+**对照（均在隔离副本或 worktree 中运行）：**
+- core 用旧顺序运行新测试，失败，输出为 `<a><s><u><sup>`（`/tmp/joplin-claude-decoration-order-control.log`）；
+- GPUI 去掉 script 比较并把偏移设为零，两项都失败（`/tmp/joplin-claude-decoration-gpui-control.log`）。
+
+**全量：** core 354、vendored GPUI 73（另 1 项忽略）、App 1482，均为 0 失败。
+
+**仍然不同或未验证：**
+- Evernote 把 `code` 放在最外层，粗体在高亮之外，链接在上下标之内而颜色在链接之内。本批只改了与上下标相关的嵌套，其他顺序差异不影响格式本身，但会影响导出 HTML 在浏览器中的层叠效果，尚未处理；
+- `paint_line` 在 script 边界结束线段的逻辑没有自动测试（测试平台不绘制）。线的位置函数和分段断开两部分已分别测试，最终效果以实机验收为准；
+- 新包的原生视觉验收仍未完成（Codex 的 CUA 连接中断）。
+
+**源码检查点：** `eeeb07fd6`。
+
