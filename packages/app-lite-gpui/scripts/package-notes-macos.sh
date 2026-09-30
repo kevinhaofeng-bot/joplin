@@ -39,6 +39,11 @@ BUILD_NUMBER="$(git -C "$REPO_ROOT" rev-list --count HEAD)"
 APP_DIR="$OUT_DIR/$APP_NAME.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BINARY" "$APP_DIR/Contents/MacOS/$EXECUTABLE"
+# The simplified non-green Dock mouse (evidence57); the older large artwork
+# stays in the repository unchanged and is not packaged.
+ICON_SOURCE="$PROJECT_ROOT/assets/AppIcon-dock-v2.png"
+ICON_FILE="$APP_DIR/Contents/Resources/AppIcon.icns"
+"$PROJECT_ROOT/scripts/make-app-icon.sh" "$ICON_SOURCE" "$ICON_FILE"
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -47,6 +52,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <key>CFBundleDisplayName</key><string>$APP_NAME</string>
 <key>CFBundleExecutable</key><string>$EXECUTABLE</string>
 <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$VERSION</string>
 <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
@@ -56,7 +62,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 # No CFBundleDocumentTypes: installing must not change default file associations.
-# No icon: only the donor Velotype icon exists and a product icon has not been chosen.
+# Only this new bundle carries the icon: no icon cache reset, no install.
 
 # Sign the whole bundle (the linker only signed the bare executable, whose
 # signature then does not match the bundle). With no identity configured the
@@ -65,6 +71,8 @@ SIGN_IDENTITY="${JOPLIN_LITE_SIGN_IDENTITY:--}"
 codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" \
   --timestamp=none "$APP_DIR"
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$APP_DIR/Contents/Info.plist")" == AppIcon ]] \
+  || { echo "Info.plist does not name AppIcon" >&2; exit 1; }
 if [ "$SIGN_IDENTITY" = "-" ]; then SIGNATURE="ad-hoc (not notarized)"; else SIGNATURE="$SIGN_IDENTITY"; fi
 
 {
@@ -73,6 +81,8 @@ if [ "$SIGN_IDENTITY" = "-" ]; then SIGNATURE="ad-hoc (not notarized)"; else SIG
   echo "worktree_dirty_for_app_sources: $DIRTY"
   echo "binary_sha256: $(shasum -a 256 "$APP_DIR/Contents/MacOS/$EXECUTABLE" | awk '{print $1}')"
   echo "signature: $SIGNATURE"
+  echo "icon_source_sha256: $(shasum -a 256 "$ICON_SOURCE" | awk '{print $1}')"
+  echo "icon_icns_sha256: $(shasum -a 256 "$ICON_FILE" | awk '{print $1}')"
   echo "cargo_lock_sha256: $(shasum -a 256 "$PROJECT_ROOT/Cargo.lock" | awk '{print $1}')"
   echo "rustc: $(rustc --version)"
   echo "built_at_utc: $STAMP"
