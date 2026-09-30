@@ -8809,3 +8809,147 @@ fn links_and_code_do_not_extend_at_their_edges(cx: &mut gpui::TestAppContext) {
         );
     }
 }
+
+#[gpui::test]
+async fn superscript_is_shaped_smaller_so_spacing_hits_and_wrapping_follow_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    // evidence51: script text must take its real, smaller geometry in
+    // shaping, not a normal-width slot with a small glyph painted inside.
+    let mut cx = cx.add_empty_window();
+    let text = "ab".to_owned() + &"2".repeat(160) + "cd";
+    let geometry = |script: Option<Mark>, cx: &mut gpui::VisualTestContext| {
+        let mut document = Document::from_paragraph(text.clone());
+        let node = document.first_node_id().unwrap();
+        if let Some(mark) = script {
+            document
+                .apply(Transaction::ToggleMark {
+                    selection: Selection::new(
+                        DocPoint::new(node, 2),
+                        DocPoint::new(node, text.len() - 2),
+                    ),
+                    mark,
+                })
+                .unwrap();
+        }
+        let mut layout = LayoutRegistry::new();
+        cx.update(|window, _| {
+            layout.shape_visible_with_window(&document, 0.0, 1_000.0, 680.0, window);
+        });
+        let cached = layout.block_layout(node).unwrap();
+        let lines = cached
+            .text_lines
+            .iter()
+            .map(|line| line.wrap_boundaries.len() + 1)
+            .sum::<usize>();
+        let scripts = cached.text_lines[0]
+            .unwrapped_layout
+            .runs
+            .iter()
+            .filter_map(|run| run.script)
+            .collect::<Vec<_>>();
+        let one_digit = layout.selection_rects(Selection::new(
+            DocPoint::new(node, 2),
+            DocPoint::new(node, 3),
+        ))[0]
+            .size
+            .width;
+        let bounds = cached.bounds;
+        let hit = layout
+            .point_to_doc(point(
+                bounds.left()
+                    + one_digit * 2.3
+                    + layout.selection_rects(Selection::new(
+                        DocPoint::new(node, 0),
+                        DocPoint::new(node, 2),
+                    ))[0]
+                        .size
+                        .width,
+                bounds.top() + px(4.0),
+            ))
+            .unwrap()
+            .utf8_offset;
+        (lines, scripts, one_digit, hit)
+    };
+    let (plain_lines, plain_scripts, plain_digit, plain_hit) = geometry(None, &mut cx);
+    for mark in [Mark::Superscript, Mark::Subscript] {
+        let (lines, scripts, digit, hit) = geometry(Some(mark.clone()), &mut cx);
+        assert!(plain_scripts.is_empty());
+        assert_eq!(scripts.len(), 1, "{mark:?} shapes as one script run");
+        assert_eq!(scripts[0].size_permille, 833);
+        assert_eq!(scripts[0].rise_permille > 0, mark == Mark::Superscript);
+        let ratio = f32::from(digit) / f32::from(plain_digit);
+        assert!(
+            (ratio - 0.833).abs() < 0.01,
+            "{mark:?} advance ratio {ratio}"
+        );
+        assert!(
+            lines < plain_lines,
+            "{mark:?} wraps later: {lines} vs {plain_lines}"
+        );
+        // The same x lands on the same digit count within each run's own
+        // widths: a click follows the smaller glyphs.
+        assert_eq!(
+            (plain_hit, hit),
+            (4, 4),
+            "{mark:?} hit testing uses its own advances"
+        );
+    }
+}
+
+#[gpui::test]
+async fn table_cells_shape_superscript_at_its_own_size(cx: &mut gpui::TestAppContext) {
+    use super::table_layout::{CellPiece, TableLayoutKey, measure_table};
+    let mut cx = cx.add_empty_window();
+    let digits = "2".repeat(400);
+    let measure = |cell: String, cx: &mut gpui::VisualTestContext| {
+        let html = format!(
+            "<table data-joplin-lite-table=\"true\"><tbody><tr><td>{cell}</td></tr></tbody></table>"
+        );
+        let block = app_lite_core::CanonicalDocument::parse_html(&html)
+            .unwrap()
+            .blocks()[0]
+            .clone();
+        let table = super::model::TableContent::from_canonical(block).unwrap();
+        cx.update(|window, _| {
+            let layout = measure_table(
+                &table,
+                TableLayoutKey {
+                    revision: 1,
+                    width: 300.0,
+                    image_generation: 0,
+                    font: window.text_style().font(),
+                },
+                window.text_system(),
+                &|_| None,
+            );
+            let CellPiece::Text { lines, .. } = &layout.cells[0][0].pieces[0] else {
+                panic!("text piece");
+            };
+            let rows = lines
+                .iter()
+                .map(|line| line.wrap_boundaries.len() + 1)
+                .sum::<usize>();
+            let scripts = lines
+                .iter()
+                .flat_map(|line| {
+                    line.unwrapped_layout
+                        .runs
+                        .iter()
+                        .filter_map(|run| run.script)
+                })
+                .count();
+            (rows, scripts, layout.row_heights[0])
+        })
+    };
+    let (plain_rows, plain_scripts, _) = measure(format!("x{digits}"), &mut cx);
+    let (sup_rows, sup_scripts, _) = measure(format!("x<sup>{digits}</sup>"), &mut cx);
+    let (sub_rows, sub_scripts, _) = measure(format!("x<sub>{digits}</sub>"), &mut cx);
+    assert_eq!(plain_scripts, 0);
+    assert!(
+        sup_scripts > 0 && sub_scripts > 0,
+        "cell runs carry the script"
+    );
+    assert!(sup_rows < plain_rows, "{sup_rows} vs {plain_rows}");
+    assert!(sub_rows < plain_rows, "{sub_rows} vs {plain_rows}");
+}

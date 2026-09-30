@@ -12,7 +12,7 @@ use std::mem::size_of;
 use std::ops::Range;
 
 use gpui::{
-    Bounds, Font, FontStyle, FontWeight, Hsla, Pixels, Point, ShapedGlyph, SharedString,
+    Bounds, Font, FontStyle, FontWeight, Hsla, Pixels, Point, RunScript, ShapedGlyph, SharedString,
     StrikethroughStyle, TextAlign, TextRun, TextStyle, UnderlineStyle, WrapBoundary, WrappedLine,
     WrappedLineLayout, point, px, rgba, size,
 };
@@ -203,6 +203,27 @@ fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
     )
 }
 
+/// Superscript and subscript as Evernote shows its `<sup>`/`<sub>` (textformatter
+/// schema toDOM): the browser defaults, a smaller size (`font-size: smaller`)
+/// raised about a third or lowered about a fifth of the line's size. Shaped
+/// at that size, so spacing, wrapping and hit testing follow the glyphs.
+pub(crate) fn script_for(superscript: bool, subscript: bool) -> Option<RunScript> {
+    const SIZE_PERMILLE: u16 = 833;
+    if superscript {
+        Some(RunScript {
+            size_permille: SIZE_PERMILLE,
+            rise_permille: 333,
+        })
+    } else if subscript {
+        Some(RunScript {
+            size_permille: SIZE_PERMILLE,
+            rise_permille: -200,
+        })
+    } else {
+        None
+    }
+}
+
 fn styled_text_runs(
     block: &super::model::Block,
     text: &SharedString,
@@ -216,6 +237,7 @@ fn styled_text_runs(
             background_color: None,
             underline: None,
             strikethrough: None,
+            script: None,
         }];
     };
     let mut boundaries = vec![0, text.len()];
@@ -270,6 +292,10 @@ fn styled_text_runs(
                 color: Some(color),
                 thickness: underline_thickness,
             }),
+            script: script_for(
+                marks.contains(&Mark::Superscript),
+                marks.contains(&Mark::Subscript),
+            ),
         });
     }
     if shaped.is_empty() {
@@ -280,6 +306,7 @@ fn styled_text_runs(
             background_color: None,
             underline: None,
             strikethrough: None,
+            script: None,
         }]
     } else {
         shaped

@@ -149,6 +149,7 @@ fn build_text_runs(
             background_color,
             underline,
             strikethrough,
+            script: None,
         });
     }
 
@@ -227,6 +228,7 @@ fn build_code_text_runs(
                 wavy: false,
             }),
             strikethrough: None,
+            script: None,
         });
     }
 
@@ -695,6 +697,7 @@ impl Element for CodeLanguageInputElement {
             background_color: None,
             underline: None,
             strikethrough: None,
+            script: None,
         };
 
         let runs = if let Some(marked_range) = input
@@ -908,6 +911,7 @@ impl Element for BlockTextElement {
             background_color: None,
             underline: None,
             strikethrough: None,
+            script: None,
         };
 
         let runs: Vec<TextRun> = if !is_placeholder {
@@ -1033,6 +1037,7 @@ impl Element for BlockTextElement {
                             background_color: None,
                             underline: None,
                             strikethrough: None,
+                            script: None,
                         }],
                         None,
                     )
@@ -1287,6 +1292,7 @@ mod tests {
                         background_color: None,
                         underline: None,
                         strikethrough: None,
+                        script: None,
                     }],
                     Some(width),
                     None,
@@ -1520,6 +1526,7 @@ mod tests {
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                script: None,
             };
             let runs = super::build_text_runs(
                 block,

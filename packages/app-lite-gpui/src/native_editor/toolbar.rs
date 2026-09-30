@@ -848,6 +848,7 @@ impl EditorCommandChrome {
                         background_color: None,
                         underline: None,
                         strikethrough: None,
+                        script: None,
                     }],
                     None,
                 );

@@ -820,6 +820,7 @@ fn paint_snapshot(
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    script: None,
                 }],
                 None,
             );
@@ -1103,6 +1104,7 @@ fn paint_table(
                             background_color: None,
                             underline: None,
                             strikethrough: None,
+                            script: None,
                         }],
                         Some(text_width),
                         None,
@@ -1165,6 +1167,7 @@ fn paint_attachment_card(
             background_color: None,
             underline: None,
             strikethrough: None,
+            script: None,
         }],
         None,
     );
@@ -1204,6 +1207,7 @@ fn paint_attachment_card(
             background_color: None,
             underline: None,
             strikethrough: None,
+            script: None,
         }],
         None,
     );

@@ -33,6 +33,7 @@ pub(crate) struct RunMarks {
     pub(crate) highlight: bool,
     pub(crate) link: bool,
     pub(crate) code: bool,
+    pub(crate) script: Option<app_lite_core::Script>,
 }
 
 #[derive(Clone, Debug)]
@@ -240,6 +241,7 @@ fn run_marks(marks: &Marks, header: bool) -> RunMarks {
         highlight: marks.highlight,
         link: marks.link.is_some(),
         code: marks.inline_code,
+        script: marks.script,
     }
 }
 
@@ -278,6 +280,10 @@ fn text_run(len: usize, marks: RunMarks, base: &Font) -> TextRun {
             color: Some(color),
             thickness,
         }),
+        script: super::layout::script_for(
+            marks.script == Some(app_lite_core::Script::Superscript),
+            marks.script == Some(app_lite_core::Script::Subscript),
+        ),
     }
 }
 

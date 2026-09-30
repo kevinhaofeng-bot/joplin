@@ -433,6 +433,7 @@ fn measure_cell_preferred_width(
         background_color: None,
         underline: None,
         strikethrough: None,
+        script: None,
     };
     let runs = measurement_runs(&cache, &base_run);
     let font_size = px(theme.typography.text_size);
@@ -489,6 +490,7 @@ fn measurement_runs(
             background_color: None,
             underline: None,
             strikethrough: None,
+            script: None,
         });
     }
 

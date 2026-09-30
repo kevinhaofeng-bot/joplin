@@ -501,6 +501,7 @@ impl SpikeView {
                         background_color: None,
                         underline: None,
                         strikethrough: None,
+                        script: None,
                     }],
                     None,
                 );
