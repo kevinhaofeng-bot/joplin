@@ -421,3 +421,32 @@ Codex 复核发现 18b57b1cd 的措辞有两处不准确：
 
 **可供构建的源码检查点：** `7acfa24af`。
 
+## 第十二批：上下标的真实字号与基线（`4b8fbe350`、`63a35dfc7`、`bf02a5381`）
+
+Codex 审查否定了此前的方案：保留正常字号的前进宽度、只绘制缩小的字形，会导致间距和点击命中都不对。现在改为在整形阶段就使用上下标的真实几何，折行、光标、选区和点击命中都跟随实际绘制的字形。
+
+**为什么要改 GPUI：** GPUI 0.2.2 对整行只接受一个字号。因此 vendored 了 GPUI（`packages/app-lite-gpui/vendor/gpui`，通过 `[patch.crates-io]` 引用；原样导入与修改分开提交；改动说明见 `vendor/gpui/JOPLIN-PATCHES.md`）。
+
+**GPUI 的改动：**
+- 新增 `RunScript { size_permille, rise_permille }`，`TextRun`、`FontRun`、`ShapedRun` 都带上它；
+- macOS 上每个 run 的 CTFont 按各自字号创建，CoreText 返回真实的前进宽度和行宽，行的 ascent/descent 计入基线偏移；
+- 每个字形按其字符所在的文字范围确定上下标：真实 CoreText 测试证实，相邻的上标和下标会被合并成同一个 CTRun；
+- 绘制时每个字形使用所在 run 的字号和基线；可见性判断的边界计入了偏移。
+
+**App 的改动：** `layout::script_for` 设置为 0.833 倍字号，上标上移 0.333，下标下移 0.2。这对应浏览器显示 Evernote 所写 `<sup>`/`<sub>` 时的默认效果（font-size: smaller、vertical-align: super/sub）。正文和表格单元格都已接通。
+
+**测试：**
+- 真实 CoreText 测试：`test_layout_line_script_run_uses_its_own_size_and_baseline`（数字前进宽度约为 0.833 倍，行宽变小，ascent 增加）；`test_layout_line_adjacent_scripts_keep_their_own_script_per_glyph`（拉丁和中文两组，上标与下标紧邻）。对照中改回“按 CTRun 第一个字形”的旧逻辑后，后者失败：下标字符被当成上标（`/tmp/joplin-claude-adjacent-script-control.log`）。
+- App 层几何测试 `superscript_is_shaped_smaller_so_spacing_hits_and_wrapping_follow_it`：上标、下标的前进宽度比例都约为 0.833，折行更晚，按缩小后的位置点击命中正确。
+- `table_cells_shape_superscript_at_its_own_size`：单元格的 run 带有 script，折行行数少于普通文字。
+- 这两项 App 测试的负对照在独立的 git worktree 和独立的构建目录中运行，均失败（`/tmp/joplin-claude-script-shaping-control.log`）。
+- vendored GPUI lib 测试 71 通过；App 全量 1482 通过、0 失败。
+
+**已知差异与仍需验证：**
+- 下划线和删除线仍画在行的主基线上，跨越上下标时是连续的。如果删除线只作用于上标文字本身，浏览器会穿过上标字形，我们没有这样做；
+- Linux 和 Windows 的整形忽略 script（产品只在 macOS 发布）；
+- 实际显示效果、中文与拉丁混排、输入法下的光标位置，都需要 Codex 实机验证；
+- 跨设备同步测试（A → 服务器 → B → 编辑 → A → 重新打开）尚未补。
+
+**构建说明：** 单独检出 `63a35dfc7` 时 App 编译不过，因为 App 的 `TextRun` 字面量在 `bf02a5381` 中才补上字段。构建请以 `bf02a5381` 为检查点。
+
