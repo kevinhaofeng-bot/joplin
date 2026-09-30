@@ -442,3 +442,110 @@ fn script_text_nests_link_and_decorations_inside_like_evernote() {
         plain
     );
 }
+
+#[test]
+fn text_colour_round_trips_as_evernote_writes_it_and_rejects_non_colours() {
+    use app_lite_core::TextColor;
+    // Evernote forecolor toENML/toClipboard: <span style="color: …">, with
+    // `--inversion-type-color: simple` for a colour chosen in dark mode; it
+    // sits inside a link (apps/peso/schema.ts marks order).
+    let written = "<p><a href=\"https://example.test\"><span style=\"color: #fc1233\"><strong>红</strong></span></a><span style=\"color: #1885e2; --inversion-type-color: simple\">蓝</span>黑</p>";
+    let parsed = CanonicalDocument::parse_html(written).unwrap();
+    assert_eq!(parsed.to_canonical_html().as_str(), written);
+    let Block::Paragraph { inlines, .. } = &parsed.blocks()[0] else {
+        panic!("paragraph");
+    };
+    let colors: Vec<_> = inlines
+        .iter()
+        .map(|inline| match inline {
+            Inline::Text { marks, .. } => marks.color,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        colors,
+        vec![
+            Some(TextColor::new([0xfc, 0x12, 0x33])),
+            Some(TextColor::new([0x18, 0x85, 0xe2]).with_simple_inversion(true)),
+            None,
+        ]
+    );
+    // Forms Evernote's color-string accepts (utils/color.ts isValidColor)
+    // become one safe stored form; alpha is kept, never flattened.
+    for (input, css) in [
+        ("#F00", "#ff0000"),
+        ("rgb(24, 133, 226)", "#1885e2"),
+        ("rgba(24, 133, 226, 1)", "#1885e2"),
+        ("red", "#ff0000"),
+        ("RebeccaPurple", "#663399"),
+        ("rgb(100%, 50%, 0%)", "#ff8000"),
+        ("hsl(120, 100%, 25%)", "#008000"),
+        ("hsla(0, 100%, 50%, 0.5)", "rgba(255, 0, 0, 0.502)"),
+        ("#ff000080", "rgba(255, 0, 0, 0.502)"),
+        ("rgba(0, 0, 0, 0.5)", "rgba(0, 0, 0, 0.502)"),
+        ("transparent", "rgba(0, 0, 0, 0)"),
+        ("#1885E2 !important", "#1885e2"),
+        // color-string's comma hwb(), which CSS itself does not accept.
+        ("hwb(0, 0%, 0%)", "#ff0000"),
+        ("hwb(120deg, 20%, 30%)", "#33b333"),
+        ("hwb(-120, 0%, 0%, 0.5)", "rgba(0, 0, 255, 0.502)"),
+        ("hwb(0, 60%, 60%)", "#808080"),
+    ] {
+        assert_eq!(TextColor::parse(input).unwrap().css(), css, "{input}");
+        let html = format!("<p><span style=\"color: {input}\">x</span></p>");
+        let stored = CanonicalDocument::parse_html(&html)
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned();
+        assert_eq!(
+            stored,
+            format!("<p><span style=\"color: {css}\">x</span></p>")
+        );
+        let pasted = CanonicalDocument::parse_pasted_html(&html).unwrap();
+        assert_eq!(
+            pasted.document.to_canonical_html().as_str(),
+            stored,
+            "{input} pasted"
+        );
+        assert_eq!(
+            CanonicalDocument::parse_html(&stored)
+                .unwrap()
+                .to_canonical_html()
+                .as_str(),
+            stored,
+            "{input} round-trips"
+        );
+    }
+    // A value that is not a plain colour never becomes a mark or reaches CSS.
+    for input in [
+        "expression(alert(1))",
+        "url(https://example.test/x)",
+        "#12345",
+        "currentcolor",
+        "red; background: url(x)",
+        "hwb(0, 0%)",
+        "hwb(0, 0%, 0%) red",
+        "hwb(0turn, 0%, 0%)",
+    ] {
+        assert!(TextColor::parse(input).is_none(), "{input}");
+        let html = format!("<p><span style=\"color: {input}\">x</span></p>");
+        let canonical = CanonicalDocument::parse_html(&html)
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned();
+        assert!(
+            !canonical.contains("url(") && !canonical.contains("expression"),
+            "{canonical}"
+        );
+    }
+    let plain = "<p><strong>x</strong></p>";
+    assert_eq!(
+        CanonicalDocument::parse_html(plain)
+            .unwrap()
+            .to_canonical_html()
+            .as_str(),
+        plain
+    );
+}

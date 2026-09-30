@@ -700,9 +700,25 @@ fn a_notebook_deleted_on_one_device_leaves_its_notes_in_trash_on_both() {
 /// Evernote nests it, survive A -> server -> B -> edit -> A -> reopen.
 #[test]
 fn superscript_and_subscript_survive_a_round_trip_through_another_device() {
+    round_trip_through_another_device(
+        "<p>E=mc<sup><u>2</u></sup> and H<sub>2</sub>O</p>",
+        "<p>E=mc<sup><u>2</u></sup> and H<sub>2</sub>O, edited on B</p>",
+    );
+}
+
+/// Text colour, with its alpha and dark-mode inversion marker, survives the
+/// same round trip.
+#[test]
+fn text_colour_survives_a_round_trip_through_another_device() {
+    round_trip_through_another_device(
+        "<p><span style=\"color: #fc1233\">红</span><span style=\"color: rgba(24, 133, 226, 0.502); --inversion-type-color: simple\">蓝</span></p>",
+        "<p><span style=\"color: #fc1233\">红</span><span style=\"color: rgba(24, 133, 226, 0.502); --inversion-type-color: simple\">蓝</span>, edited on B</p>",
+    );
+}
+
+fn round_trip_through_another_device(html: &str, edited: &str) {
     let (_server_root, store) = server();
     let a = client();
-    let html = "<p>E=mc<sup><u>2</u></sup> and H<sub>2</sub>O</p>";
     let note = a
         .repo
         .create_note(CreateNote {
@@ -718,7 +734,6 @@ fn superscript_and_subscript_survive_a_round_trip_through_another_device() {
     sync(&b, &store);
     let received = b.repo.load_note(&note.id).unwrap().unwrap();
     assert_eq!(received.body_html, html);
-    let edited = "<p>E=mc<sup><u>2</u></sup> and H<sub>2</sub>O, edited on B</p>";
     b.repo
         .save_note(SaveNote {
             id: note.id.clone(),

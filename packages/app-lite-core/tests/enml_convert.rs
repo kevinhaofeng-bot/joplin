@@ -216,13 +216,21 @@ fn media_blocker_path_uses_its_actual_child_index() {
 #[test]
 fn evernote_presentational_styles_map_to_marks_instead_of_blocking() {
     // Real Evernote ENML wraps almost every run in styled div/span/font.
-    // Semantic styles become marks; font/size/colour are presentational and
-    // are not representable, so they are dropped rather than blocking.
-    let enml = r##"<en-note><div style="text-align:left;font-family:Arial"><span style="font-weight: bold; color: rgb(0, 0, 0);">粗</span><span style="font-style:italic">斜</span><span style="text-decoration: underline;">下</span><span style="text-decoration:line-through">删</span><span style="--en-highlight:yellow;background-color: #ffef9e;">亮</span><font face="Arial" color="#333333">字</font><span style="font-size:14px">普通</span></div></en-note>"##;
+    // Semantic styles and the text colour (Evernote's forecolor, parsed from
+    // `color` styles and `<font color>`) become marks; font family and size
+    // are not representable yet and are dropped rather than blocking.
+    let enml = r##"<en-note><div style="text-align:left;font-family:Arial"><span style="font-weight: bold; color: rgb(0, 0, 0);">粗</span><span style="font-style:italic">斜</span><span style="text-decoration: underline;">下</span><span style="text-decoration:line-through">删</span><span style="--en-highlight:yellow;background-color: #ffef9e;">亮</span><font face="Arial" color="#333333">字</font><span style="font-size:14px">普通</span><span style="color:#FC1233;--inversion-type-color:simple">红</span></div></en-note>"##;
     let result = convert_enml(enml, &resources()).unwrap();
     assert_eq!(
         result.html.as_str(),
-        "<p><strong>粗</strong><em>斜</em><u>下</u><s>删</s><mark>亮</mark>字普通</p>"
+        "<p><span style=\"color: #000000\"><strong>粗</strong></span><em>斜</em><u>下</u><s>删</s><mark>亮</mark><span style=\"color: #333333\">字</span>普通<span style=\"color: #fc1233; --inversion-type-color: simple\">红</span></p>"
+    );
+    // Other color-string forms keep their colour and alpha; a value that is
+    // not a colour is dropped instead of reaching the stored CSS.
+    let forms = r#"<en-note><div><span style="color:hsl(120, 100%, 25%)">绿</span><font color="rebeccapurple">紫</font><span style="color:rgba(255, 0, 0, 0.5)">半</span><span style="color:hwb(240, 0%, 0%)">蓝</span><span style="color:currentcolor">当</span><font color="url(x)">坏</font></div></en-note>"#;
+    assert_eq!(
+        convert_enml(forms, &resources()).unwrap().html.as_str(),
+        "<p><span style=\"color: #008000\">绿</span><span style=\"color: #663399\">紫</span><span style=\"color: rgba(255, 0, 0, 0.502)\">半</span><span style=\"color: #0000ff\">蓝</span>当坏</p>"
     );
 }
 

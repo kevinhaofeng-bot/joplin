@@ -12,6 +12,7 @@ pub mod sync;
 
 pub use document::{
     CanonicalDocument, CanonicalHtml, DocumentError, PastedHtml, PastedImage, Script, SearchText,
+    TextColor,
 };
 pub use domain::*;
 pub use import_export::*;

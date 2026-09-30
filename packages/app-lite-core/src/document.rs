@@ -235,6 +235,150 @@ pub struct Marks {
     pub link: Option<String>,
     pub inline_code: bool,
     pub script: Option<Script>,
+    pub color: Option<TextColor>,
+}
+
+/// Evernote's `forecolor` mark: a text colour, kept as the light-mode colour
+/// and written as `<span style="color: …">` (common-editor
+/// textformatter/schema.ts toENML/toClipboard). A colour set in dark mode is
+/// marked for simple inversion (`--inversion-type-color: simple`).
+///
+/// Stored as sRGB with alpha: every CSS colour the parser accepts becomes that
+/// one safe form, and alpha is kept rather than dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TextColor {
+    rgba: [u8; 4],
+    simple_inversion: bool,
+}
+
+impl TextColor {
+    pub const fn new(rgb: [u8; 3]) -> Self {
+        Self::with_alpha([rgb[0], rgb[1], rgb[2]], 255)
+    }
+
+    pub const fn with_alpha(rgb: [u8; 3], alpha: u8) -> Self {
+        Self {
+            rgba: [rgb[0], rgb[1], rgb[2], alpha],
+            simple_inversion: false,
+        }
+    }
+
+    /// A CSS colour, parsed by Servo's `cssparser` (CSS Color 3: every
+    /// keyword, 3/4/6/8-digit hex, `rgb()`/`rgba()` with numbers or
+    /// percentages, `hsl()`/`hsla()`). Evernote accepts what `color-string`
+    /// parses (utils/color.ts `isValidColor`), which also reads a comma
+    /// `hwb()` that CSS does not; that form is read as `color-string` does.
+    /// `currentcolor`, trailing tokens and anything else are not a colour mark.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let value = value
+            .strip_suffix("!important")
+            .map_or(value, str::trim_end);
+        let mut input = cssparser::ParserInput::new(value);
+        let mut parser = cssparser::Parser::new(&mut input);
+        let color = match parser.try_parse(cssparser::Color::parse) {
+            Ok(color) => color,
+            Err(_) => return Self::parse_comma_hwb(&mut parser),
+        };
+        parser.expect_exhausted().ok()?;
+        match color {
+            cssparser::Color::RGBA(rgba) => Some(Self::with_alpha(
+                [rgba.red, rgba.green, rgba.blue],
+                rgba.alpha,
+            )),
+            cssparser::Color::CurrentColor => None,
+        }
+    }
+
+    // color-string `get.hwb` (node_modules/color-string/index.js 156–174):
+    // `hwb(h[deg], w%, b%[, a])`, hue wrapped, whiteness, blackness and alpha
+    // clamped. Converted by cssparser's CSS Color 4 `hwb_to_rgb`.
+    fn parse_comma_hwb(parser: &mut cssparser::Parser) -> Option<Self> {
+        parser.expect_function_matching("hwb").ok()?;
+        let parsed = parser.parse_nested_block(|arguments| {
+            let hue = match arguments.next()?.clone() {
+                cssparser::Token::Number { value, .. } => value,
+                cssparser::Token::Dimension { value, unit, .. }
+                    if unit.eq_ignore_ascii_case("deg") =>
+                {
+                    value
+                }
+                token => return Err(arguments.new_unexpected_token_error(token)),
+            };
+            arguments.expect_comma()?;
+            let whiteness = arguments.expect_percentage()?.clamp(0.0, 1.0);
+            arguments.expect_comma()?;
+            let blackness = arguments.expect_percentage()?.clamp(0.0, 1.0);
+            let alpha = if arguments.try_parse(|input| input.expect_comma()).is_ok() {
+                arguments.expect_number()?.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            Ok::<_, cssparser::ParseError<()>>((
+                hue.rem_euclid(360.0) / 360.0,
+                whiteness,
+                blackness,
+                alpha,
+            ))
+        });
+        let (hue, whiteness, blackness, alpha) = parsed.ok()?;
+        parser.expect_exhausted().ok()?;
+        let (red, green, blue) = cssparser::hwb_to_rgb(hue, whiteness, blackness);
+        let unit = |value: f32| (value * 255.0).round().clamp(0.0, 255.0) as u8;
+        Some(Self::with_alpha(
+            [unit(red), unit(green), unit(blue)],
+            unit(alpha),
+        ))
+    }
+
+    pub const fn rgb(&self) -> [u8; 3] {
+        [self.rgba[0], self.rgba[1], self.rgba[2]]
+    }
+
+    pub const fn alpha(&self) -> u8 {
+        self.rgba[3]
+    }
+
+    pub const fn simple_inversion(&self) -> bool {
+        self.simple_inversion
+    }
+
+    pub const fn with_simple_inversion(mut self, simple: bool) -> Self {
+        self.simple_inversion = simple;
+        self
+    }
+
+    /// `#rrggbb` when opaque, else `rgba(r, g, b, a)`.
+    pub fn css(&self) -> String {
+        let [r, g, b, a] = self.rgba;
+        if a == 255 {
+            format!("#{r:02x}{g:02x}{b:02x}")
+        } else {
+            let alpha = (a as f32 / 255.0 * 1000.0).round() / 1000.0;
+            format!("rgba({r}, {g}, {b}, {alpha})")
+        }
+    }
+
+    pub(crate) fn style(&self) -> String {
+        if self.simple_inversion {
+            format!("color: {}; --inversion-type-color: simple", self.css())
+        } else {
+            format!("color: {}", self.css())
+        }
+    }
+}
+
+/// The colour a `style` gives text, with any `--inversion-type-color`.
+fn declared_color(declarations: &[(String, String)]) -> Option<TextColor> {
+    let color = declarations
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "color")
+        .and_then(|(_, value)| TextColor::parse(value))?;
+    let simple = declarations
+        .iter()
+        .any(|(name, value)| name == "--inversion-type-color" && value.trim() == "simple");
+    Some(color.with_simple_inversion(simple))
 }
 
 /// Evernote's `superscript` and `subscript` marks exclude each other
@@ -923,6 +1067,7 @@ fn normalize_marks(marks: &Marks) -> Marks {
         link: marks.link.clone().filter(|value| valid_link(value)),
         inline_code: marks.inline_code,
         script: marks.script,
+        color: marks.color,
     }
 }
 
@@ -996,6 +1141,9 @@ fn serialize_text(
         Script::Subscript => "sub",
     });
     let link = marks.link.is_some().then_some("a");
+    // Evernote's forecolor comes right after the link, so a colour inside a
+    // link shows (apps/peso/schema.ts marks order).
+    let color = marks.color.is_some().then_some("span");
     let tags: Vec<&str> = match script {
         // Evernote nests the link, strikethrough and underline inside the
         // script mark (common-editor apps/peso/schema.ts marks order), so they
@@ -1006,6 +1154,7 @@ fn serialize_text(
             marks.italic.then_some("em"),
             Some(script),
             link,
+            color,
             marks.strikethrough.then_some("s"),
             marks.underline.then_some("u"),
             marks.inline_code.then_some("code"),
@@ -1015,6 +1164,7 @@ fn serialize_text(
         .collect(),
         None => [
             link,
+            color,
             marks.highlight.then_some("mark"),
             marks.strikethrough.then_some("s"),
             marks.bold.then_some("strong"),
@@ -1030,6 +1180,12 @@ fn serialize_text(
         if *tag == "a" {
             output.push_str("<a href=\"");
             escape_attribute(marks.link.as_deref().unwrap_or_default(), output);
+            output.push_str("\">");
+        } else if *tag == "span"
+            && let Some(color) = marks.color
+        {
+            output.push_str("<span style=\"");
+            escape_attribute(&color.style(), output);
             output.push_str("\">");
         } else {
             output.push('<');
@@ -1986,10 +2142,21 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         } else {
                             None
                         },
+                        color: marks.color,
                     };
                     // Inline CSS outranks the tag, as it does in a browser.
                     let next_marks = if pasted {
                         pasted_marks(&declarations, next_marks)
+                    } else if tag == "span"
+                        && let Some(color) = attribute(&attrs.borrow(), "style").and_then(|style| {
+                            declared_color(&parse_declarations(&style).collect::<Vec<_>>())
+                        })
+                    {
+                        // The stored form of a text colour.
+                        ProjectionMarks {
+                            color: Some(color),
+                            ..next_marks
+                        }
                     } else {
                         next_marks
                     };
@@ -2050,6 +2217,7 @@ struct ProjectionMarks {
     link: Option<Rc<str>>,
     inline_code: bool,
     script: Option<Script>,
+    color: Option<TextColor>,
 }
 
 fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
@@ -2061,6 +2229,7 @@ fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
         && public.link.as_deref() == projected.link.as_deref()
         && public.inline_code == projected.inline_code
         && public.script == projected.script
+        && public.color == projected.color
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2420,6 +2589,7 @@ impl Projection {
             link,
             inline_code: projected.inline_code,
             script: projected.script,
+            color: projected.color,
         }
     }
 
@@ -2998,6 +3168,11 @@ fn pasted_marks(declarations: &[(String, String)], mut marks: ProjectionMarks) -
                 "sub" => marks.script = Some(Script::Subscript),
                 _ => {}
             },
+            "color" => {
+                if let Some(color) = declared_color(declarations) {
+                    marks.color = Some(color);
+                }
+            }
             _ => {}
         }
     }

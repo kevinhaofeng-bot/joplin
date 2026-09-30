@@ -199,3 +199,25 @@ fn enforces_html_body_url_and_depth_budgets() {
         JexBodyBlockerKind::ParserBudget
     );
 }
+
+#[test]
+fn keeps_evernote_text_colour_and_superscript_but_refuses_other_span_styles() {
+    let body = "<p>E=mc<sup>2</sup> <span style=\"color: rgb(252, 18, 51)\">红</span></p>";
+    let converted = convert_jex_note_body(NOTE, "colour.html", 2, body, &resources()).unwrap();
+    assert_eq!(
+        converted.canonical_html,
+        "<p>E=mc<sup>2</sup> <span style=\"color: #fc1233\">红</span></p>"
+    );
+    for body in [
+        "<p><span style=\"font-size: 20px\">大</span></p>",
+        "<p><span style=\"color: #fc1233; font-weight: bold\">混</span></p>",
+        "<p><span style=\"color: expression(x)\">坏</span></p>",
+    ] {
+        let error = convert_jex_note_body(NOTE, "span.html", 2, body, &resources()).unwrap_err();
+        assert_eq!(
+            error.kind,
+            JexBodyBlockerKind::UnsupportedAttribute,
+            "{body}"
+        );
+    }
+}

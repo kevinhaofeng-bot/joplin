@@ -29,6 +29,7 @@ thiserror = "2"
 tempfile = "3"
 rcgen = "0.13"
 xml-syntax-reader = { path = "vendor/xml-syntax-reader-0.2.0" }
+cssparser = "=0.29.6"
 
 [dev-dependencies]
 app-lite-protocol = { path = "../app-lite-protocol", features = ["client"] }

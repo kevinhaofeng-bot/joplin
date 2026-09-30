@@ -455,6 +455,36 @@ impl Context<'_> {
                 }
                 nested.link = Some(self.external_url(href)?);
             }
+            // Evernote's forecolor, written `<span style="color: …">`. Any
+            // other style stays unsupported rather than silently dropped.
+            "span" => {
+                self.attrs(element, &["style"])?;
+                let style = element.attrs.get("style").map(String::as_str).unwrap_or("");
+                let mut color = None;
+                let mut simple = false;
+                for declaration in style.split(';').filter(|part| !part.trim().is_empty()) {
+                    let Some((name, value)) = declaration.split_once(':') else {
+                        return self.block(Kind::UnsupportedAttribute, "Malformed HTML style");
+                    };
+                    match name.trim().to_ascii_lowercase().as_str() {
+                        "color" => color = crate::document::TextColor::parse(value),
+                        "--inversion-type-color" => simple = value.trim() == "simple",
+                        _ => {
+                            return self.block(
+                                Kind::UnsupportedAttribute,
+                                "HTML span style other than text colour",
+                            );
+                        }
+                    }
+                }
+                let Some(color) = color else {
+                    return self.block(
+                        Kind::UnsupportedAttribute,
+                        "HTML span without a readable text colour",
+                    );
+                };
+                nested.color = Some(color.with_simple_inversion(simple));
+            }
             _ => {
                 return self.block(
                     Kind::UnsupportedStructure,
@@ -462,7 +492,7 @@ impl Context<'_> {
                 );
             }
         }
-        if element.tag != "a" {
+        if element.tag != "a" && element.tag != "span" {
             self.attrs(element, &[])?;
         }
         if element.children.is_empty() {

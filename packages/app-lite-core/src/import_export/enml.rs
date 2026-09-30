@@ -508,7 +508,20 @@ impl RenderContext<'_> {
                     out.push_str("\">");
                 } else if tag == "span" {
                     self.attrs(element, &["name"], path)?;
-                    let marks = style_marks(element.attrs.get("style").map(String::as_str));
+                    let style = element.attrs.get("style").map(String::as_str);
+                    let marks = style_marks(style);
+                    // Evernote's forecolor: a `color` style, or `<font color>`.
+                    let color = style_color(style).or_else(|| {
+                        element
+                            .attrs
+                            .get("color")
+                            .and_then(|value| crate::document::TextColor::parse(value))
+                    });
+                    if let Some(color) = color {
+                        out.push_str("<span style=\"");
+                        escape(&color.style(), out);
+                        out.push_str("\">");
+                    }
                     for mark in &marks {
                         out.push('<');
                         out.push_str(mark);
@@ -521,6 +534,9 @@ impl RenderContext<'_> {
                         out.push_str("</");
                         out.push_str(mark);
                         out.push('>');
+                    }
+                    if color.is_some() {
+                        out.push_str("</span>");
                     }
                     return Ok(());
                 } else {
@@ -739,6 +755,22 @@ fn is_presentational_attribute(name: &str) -> bool {
 }
 
 /// Canonical mark tags implied by an inline `style` declaration list.
+fn style_color(style: Option<&str>) -> Option<crate::document::TextColor> {
+    let mut color = None;
+    let mut simple = false;
+    for declaration in style.unwrap_or_default().split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        match property.trim().to_ascii_lowercase().as_str() {
+            "color" => color = crate::document::TextColor::parse(value).or(color),
+            "--inversion-type-color" => simple = value.trim() == "simple",
+            _ => {}
+        }
+    }
+    color.map(|color| color.with_simple_inversion(simple))
+}
+
 fn style_marks(style: Option<&str>) -> Vec<&'static str> {
     let mut marks = Vec::new();
     for declaration in style.unwrap_or_default().split(';') {
