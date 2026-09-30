@@ -591,3 +591,101 @@ Codex 读取的源码（我已复核）是 common-editor `apps/peso/schema.ts` 1
 - 挂载测试环境不是真实 GPU 窗口。色板外观、alpha 绘制效果和纯表格笔记的实机操作，都需要 Codex 做原生验收。
 - 图标打包（evidence57）按指示暂缓。
 
+
+## 第十五批：按路由区分的空列表（`b97a61b02`）、废纸篓菜单（`9664485e2`）、Dock 图标打包（`d249b330f`）
+
+### Evernote 源码对应（空列表）
+
+以只读方式解析 `/Applications/Evernote.app/Contents/Resources/app.asar`，只把引用相关文案键的 renderer 文件取到 scratchpad。安装的 App 未作改动。中文文案取自 `main-readable/src/modules/64482__localization-catalog.js`。
+
+| Evernote 列表组件 | 条件 | 文案键（中文） | 本项目 |
+|---|---|---|---|
+| AllNotesNoteList（7873.js / 9106.js） | 空且无筛选 | `AllNotes.empty.title`（创建第一条笔记） | 所有笔记：保留原首次使用空态“从第一篇笔记开始 / 新建第一篇笔记”（`library-empty-state`） |
+| AllNotesNoteList | 空且有筛选 | `Search.results.noResults` + `noResultsPrompt`（未找到笔记 / 尝试使用不同的关键词或筛选条件。） | 搜索：`search-empty-state`，无新建按钮 |
+| NotebookNoteList（1503.js，`EMPTY_LIST` / `FILTERED_LIST` 三态） | 空 | `Notebook.empty.title` / `.text`（一切从笔记开始 / 点击侧边栏中的+新建笔记按钮创建笔记。） | 笔记本：`notebook-empty-state`，按钮“新建笔记”，笔记建在该笔记本中 |
+| StackNoteList（7468.js） | 空 | 同一个 Notebook.empty 组件（module 416978） | 笔记本组：同样的文案，但没有按钮。在组内新建需要选择笔记本（`create_note` 对多个子笔记本会明确报错） |
+| TrashNoteList（2195.js） | 空 | `Trash.empty.header`（废纸篓是空的）+ `Trash.empty.description` | 废纸篓：`trash-empty-state`，无新建按钮；说明文字为改写（见下） |
+| 标签 | Evernote 的标签视图是笔记列表上的筛选 | 按筛选后为空处理：未找到笔记 | 标签：`filtered-empty-state`，无新建按钮 |
+
+与 Evernote 的差异：
+- 废纸篓说明改写为“当废纸篓中有笔记时，可以在这里还原或删除它们。”Evernote 原文让用户点“…”，而本项目的列表没有该按钮。
+- 所有笔记沿用已验收的首次使用文案，没有改为 Evernote 的“创建第一条笔记”。
+- 只有废纸篓中有笔记、而其余地方为空时，“所有笔记”仍显示“资料库为空”。这与事实不符。要改正，需要在渲染时知道废纸篓数量，而当前导航索引不含该数据，因此留作后续问题，没有在渲染中查询 SQL。
+
+### 废纸篓菜单（evidence31）
+
+- 问题：没有选中笔记时，原生“移至废纸篓”菜单仍会执行，显示 `requested entity was not found`。
+- 修复：`TrashSelected` 的处理器只在满足两个条件时注册：有选中笔记，且当前不在废纸篓。
+- GPUI 按 `is_action_available` 验证原生菜单项（`vendor/gpui/src/platform/app_menu.rs` 238 行），因此菜单项会被禁用，Cmd‑Shift‑Backspace 也不再触发。
+- 右键菜单本来只对选中的笔记出现，未改动。
+
+### 测试
+
+- `ui::tests::an_empty_list_shows_what_its_route_means_not_an_empty_library`：挂载 LibraryShell，资料库中有一篇真实笔记。
+  - 所有笔记：不显示空态；
+  - 废纸篓、空笔记本、空笔记本组、未使用的标签：各自的空态、标题和按钮都符合预期；
+  - 真实搜索提交（`begin_search` + `commit_search_results`）无结果：显示搜索空态；
+  - 点击空笔记本的“新建笔记”：空态消失，笔记建在该笔记本中。
+  - GPUI 的 `Frame::clear` 不清 `debug_bounds`，旧帧的选择器会残留，无法据此判断某元素是否已消失。因此测试读取每帧实际渲染的空态记录（仅测试构建有），并用 `debug_bounds` 确认该元素确实绘制出来。
+- `ui::tests::move_to_trash_is_unavailable_without_a_note_to_move`：
+  - 废纸篓无选择、所有笔记无选择：动作不可用，按快捷键后状态仍为 Ready；
+  - 所有笔记中有选中笔记：动作可用。
+- 真正的空资料库仍由原有的 `mounted_default_light_route_keeps_every_editor_state_opaque_and_contrasted` 覆盖 `library-empty-state`。
+
+**对照**（隔离副本，独立 `CARGO_TARGET_DIR`，脚本与输出为 `/tmp/joplin-claude-empty-state-negative-controls.{sh,log}`）：
+- 让所有路由都回到资料库空态：路由测试失败，输出正是 evidence53 的症状——废纸篓显示“从第一篇笔记开始”并带新建按钮；
+- 无条件注册移入废纸篓：可用性测试失败。
+
+**全量与中间提交：**
+- 中间提交 `b97a61b02` 只经索引暂存，没有改动共享工作区文件。导出为独立目录后单独运行：1487 通过、0 失败、2 忽略，另有 17 通过（`/tmp/joplin-claude-empty-state-intermediate-gpui.log`）。
+- 工作区全量结果见 `/tmp/joplin-claude-empty-state-gpui-full.log`。该次运行之后我对 `mod.rs` 和 `tests.rs` 只做了 rustfmt 格式调整，最终 HEAD 的全量结果见下文。
+
+### Dock 图标（evidence57）
+
+- 源图：Codex 生成的 `assets/AppIcon-dock-v2.png`（1254px，带 alpha，SHA256 `1c75fcaf…a3b4`），已原样提交，文件未改动。旧素材也未改动。
+- `scripts/make-app-icon.sh`：
+  - 要求源图为正方形且不小于 1024px；
+  - 用 `sips` 生成 16/32/128/256/512 pt 的 1x 与 2x，共 10 个 representation；
+  - 用 `iconutil` 打包。
+  - 各尺寸都由同一张简化、非绿色的图缩放而来，所以无论 Dock 选用哪个尺寸，显示的都是这只老鼠。
+- `scripts/package-notes-macos.sh`：
+  - 加入 `Contents/Resources/AppIcon.icns` 和 `CFBundleIconFile=AppIcon`；
+  - 签名后核对 plist；
+  - BUILD-INFO 记录 `icon_source_sha256` 与 `icon_icns_sha256`。
+  - 仍只写入新的输出目录：不安装、不重置图标缓存、不写 `CFBundleDocumentTypes`。
+- `scripts/test-app-icon.sh`：
+  - 生成后再用 `iconutil` 解回 iconset，检查 10 个文件的像素尺寸、四角透明（alpha=0）、可见像素中没有绿色；
+  - 负控：绿色图必须不通过颜色检查，非正方形源必须被拒绝且不生成 icns。
+  - 结果：退出码 0；各尺寸 green=0，四角 alpha 为 0；icns SHA256 `37f8129b…54b2`（`/tmp/joplin-claude-icon-test.log`）。
+
+**隔离打包：** 在 HEAD `d249b330f` 运行 `scripts/package-notes-macos.sh /tmp/joplin-claude-icon-candidate`，退出码 0（`/tmp/joplin-claude-icon-package.log`）。
+- 输出：`/tmp/joplin-claude-icon-candidate/20260930T202805Z-d249b330f/Joplin Lite.app`，`worktree_dirty_for_app_sources: no`；
+- binary SHA256 `100ecc5c…aaa2`，icns SHA256 与测试生成的一致，为 `37f8129b…54b2`；
+- 签名为 ad-hoc，未公证。
+
+**对打包结果的独立核验**（`/tmp/joplin-claude-icon-bundle-verify.log`）：
+- plist 中 `CFBundleIconFile=AppIcon`，没有 `CFBundleDocumentTypes`，`plutil -lint` 通过；
+- `codesign --verify --deep --strict` 通过，Sealed Resources files=1（即 icns）；
+- 从包内 icns 解出的 10 个 representation，尺寸、四角透明、无绿色都符合要求。
+
+小尺寸对照图 `/tmp/joplin-claude-icon-sizes-16-32-64-128.png`（最近邻放大）：深灰底、象牙白老鼠。16px 时只剩双耳与头形，但仍可辨认。
+
+**未做：**
+- 没有启动 App，因为启动可能打开真实资料库；
+- 没有安装，`/Applications` 下没有 Joplin Lite；
+- 没有重置图标缓存。
+- 因此 Dock、Launchpad、Finder 的实际显示，以及 Dock 在高分屏上选用哪个尺寸，都需要 Codex 在隔离环境中实机核验。
+
+**最终 HEAD `d249b330f` 全量**（均 `--offline --locked`，退出码 0）：
+- App：1488 通过、0 失败、2 忽略，另有 17 通过（`/tmp/joplin-claude-batch15-gpui-full.log`）；
+- core：33 组共 357 通过、0 失败、1 忽略（`/tmp/joplin-claude-batch15-core-full.log`）；
+- 图标：`scripts/test-app-icon.sh` 退出码 0（`/tmp/joplin-claude-icon-test.log`）。
+
+### 仍未完成或未验证
+
+- 空列表、菜单禁用状态和图标都没有做实机视觉验收。
+- 只有废纸篓中有笔记、而其余地方为空时，“所有笔记”的“资料库为空”文案不准确（见上）。
+- 废纸篓中有选中笔记时，“移至废纸篓”现在不可用，但原生菜单没有对应的“还原 / 永久删除”项，这两个操作仍只在右键菜单中。
+- 图标仍是 ad-hoc 签名，未公证。最终安装包，以及从旧版本升级，属于后续安装关卡。
+- 其余交付关卡没有推进：迁移保真（85 篇降级、严格 1581 篇）、多模态、NAS 常驻、启动内存峰值、最终安装包。
+
