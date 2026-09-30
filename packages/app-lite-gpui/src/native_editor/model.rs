@@ -2388,6 +2388,7 @@ impl Document {
     fn numbering_range_for(&self, transaction: &Transaction) -> Option<Range<usize>> {
         match transaction {
             Transaction::SetBlockKind { selection, .. }
+            | Transaction::SetQuote { selection, .. }
             | Transaction::IndentList { selection }
             | Transaction::OutdentList { selection } => {
                 let bounds = self.selection_bounds(*selection).ok()?;
@@ -2466,6 +2467,7 @@ impl Document {
             | Transaction::SplitBlock { .. }
             | Transaction::MergeBlocks { .. }
             | Transaction::SetBlockKind { .. }
+            | Transaction::SetQuote { .. }
             | Transaction::SetAlignment { .. }
             | Transaction::IndentList { .. }
             | Transaction::OutdentList { .. }
@@ -2754,6 +2756,10 @@ impl Document {
             Transaction::SetBlockKind { selection, kind } => {
                 let (selection, changed_nodes, inverse) =
                     self.apply_set_block_kind(selection, kind)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::SetQuote { selection, quote } => {
+                let (selection, changed_nodes, inverse) = self.apply_set_quote(selection, quote)?;
                 (selection, changed_nodes, inverse, None)
             }
             Transaction::ToggleMark { selection, mark } => {
@@ -3650,6 +3656,130 @@ impl Document {
         Ok((selection, changed_nodes, inverse))
     }
 
+    /// Whether block `index` is inside a quote: a quote paragraph, a quoted
+    /// heading or list item, or media inline in one (an inline group).
+    pub(crate) fn block_in_quote(&self, index: usize) -> bool {
+        let Some(block) = self.blocks.get(index) else {
+            return false;
+        };
+        if block.kind == BlockKind::Quote || block.quoted {
+            return true;
+        }
+        self.inline_groups
+            .iter()
+            .find(|group| group.members.contains(&block.id))
+            .is_some_and(|group| {
+                group
+                    .members
+                    .iter()
+                    .filter_map(|id| self.block(*id))
+                    .any(|member| {
+                        is_text_block(member) && (member.kind == BlockKind::Quote || member.quoted)
+                    })
+            })
+    }
+
+    /// Whether the selected blocks may all be wrapped in a quote: Evernote's
+    /// quoteblock holds `( p | todolist | ol | ul | h )+` (quoteblock/schema.ts
+    /// 14); media inline in a paragraph goes with it.
+    pub(crate) fn can_wrap_in_quote(&self, selection: Selection) -> bool {
+        let Ok((start, _, end, _)) = self.selection_bounds(selection) else {
+            return false;
+        };
+        let (start, end) = self.semantic_parent_range(start, end);
+        (start..=end).all(|index| {
+            let block = &self.blocks[index];
+            match block.kind {
+                BlockKind::Paragraph | BlockKind::Quote => true,
+                ref kind if super::codec::is_quotable_kind(kind) => true,
+                _ => !is_text_block(block) && self.is_inline_group_member(block.id),
+            }
+        })
+    }
+
+    fn is_inline_group_member(&self, id: NodeId) -> bool {
+        self.inline_groups
+            .iter()
+            .any(|group| group.members.contains(&id))
+    }
+
+    fn apply_set_quote(
+        &mut self,
+        selection: Selection,
+        quote: bool,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        self.validate_selection(selection)?;
+        let (start, _, end, _) = self.selection_bounds(selection)?;
+        let (mut start, mut end) = self.semantic_parent_range(start, end);
+        if quote && !self.can_wrap_in_quote(selection) {
+            return Err(DocumentError::InvalidOperation(
+                "a quote holds only paragraphs, headings and lists".into(),
+            ));
+        }
+        if !quote {
+            // The whole quote goes, not just the selected part of it.
+            if self.block_in_quote(start) {
+                while start > 0 && self.block_in_quote(start - 1) {
+                    start -= 1;
+                }
+            }
+            if self.block_in_quote(end) {
+                while end + 1 < self.blocks.len() && self.block_in_quote(end + 1) {
+                    end += 1;
+                }
+            }
+        }
+        let originals = self.blocks.collect_range(start..end.saturating_add(1));
+        let mut replacements = originals.clone();
+        let mut changed_nodes = SmallVec::new();
+        let mut first_changed = None;
+        for block in &mut replacements {
+            if !is_text_block(block) {
+                continue;
+            }
+            let (kind, quoted) = match (&block.kind, quote) {
+                (BlockKind::Paragraph, true) => (BlockKind::Quote, false),
+                (BlockKind::Quote, false) => (BlockKind::Paragraph, false),
+                (kind, quoted) if super::codec::is_quotable_kind(kind) => (kind.clone(), quoted),
+                (kind, _) => (kind.clone(), block.quoted),
+            };
+            if block.kind != kind || block.quoted != quoted {
+                block.kind = kind;
+                block.quoted = quoted;
+                first_changed.get_or_insert(block.id);
+                push_unique(&mut changed_nodes, block.id);
+            }
+        }
+        if changed_nodes.is_empty() {
+            return Ok((selection, changed_nodes, TransactionBatch::default()));
+        }
+        self.blocks
+            .splice(start..end.saturating_add(1), replacements);
+        // quoteblock.ts: after wrapping, the wrapped content is selected;
+        // unwrapping at a caret puts it at the start of what was the quote.
+        let selection = if quote {
+            let first = self.blocks[start].id;
+            let last = &self.blocks[end];
+            let last_offset = last.content.as_text().map_or(0, str::len);
+            Selection::new(
+                DocPoint::with_affinity(first, 0, Affinity::After),
+                DocPoint::with_affinity(last.id, last_offset, Affinity::Before),
+            )
+        } else if selection.is_caret() {
+            first_changed.map_or(selection, |id| {
+                Selection::caret(DocPoint::with_affinity(id, 0, Affinity::After))
+            })
+        } else {
+            selection
+        };
+        let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
+            index: start,
+            remove_count: end - start + 1,
+            blocks: originals,
+        }]);
+        Ok((selection, changed_nodes, inverse))
+    }
+
     pub(crate) fn has_pending_marks(&self) -> bool {
         self.pending_marks.0.is_some()
     }
@@ -4484,8 +4614,12 @@ fn is_text_kind(kind: &BlockKind) -> bool {
 /// Evernote's quoteblock turns its p/ol/ul/h children into one another
 /// (quoteblock/schema.ts 14): as a paragraph it is a quote paragraph; as a
 /// code block, which a quote cannot hold, it leaves. A quote paragraph set to
-/// a paragraph leaves the quote as before.
+/// a heading or list stays; set to a paragraph it leaves the quote as before.
 fn quote_aware_kind(block: &Block, kind: &BlockKind) -> (BlockKind, bool) {
+    // A quote paragraph made a heading or list stays in its quote.
+    if block.kind == BlockKind::Quote && super::codec::is_quotable_kind(kind) {
+        return (kind.clone(), true);
+    }
     if !block.quoted {
         return (kind.clone(), false);
     }

@@ -35,6 +35,7 @@ pub enum EditorCommand {
     BulletList,
     OrderedList,
     CheckList,
+    Quote,
     Link,
     AlignLeft,
     AlignCenter,
@@ -229,6 +230,15 @@ const COMMANDS: &[CommandDescriptor] = &[
         group: 2,
         primary: false,
     },
+    // Evernote's quoteblock command (common-editor quoteblock/commands).
+    CommandDescriptor {
+        command: EditorCommand::Quote,
+        label: "Quote",
+        label_zh: "引用",
+        icon_path: None,
+        group: 3,
+        primary: false,
+    },
     CommandDescriptor {
         command: EditorCommand::Highlight,
         label: "Highlight",
@@ -351,6 +361,23 @@ impl CommandCatalogue {
                 toggle: ToggleState::Off,
             },
             EditorCommand::Undo => return history_state(editor.undo_depth()),
+            // quoteblock/commands queryCommandValue: on when any selected
+            // block is inside a quote; then it unwraps, else it wraps what
+            // a quote can hold.
+            EditorCommand::Quote => {
+                let Some((start, end)) = editor.selected_block_indices() else {
+                    return disabled();
+                };
+                let in_quote = (start..=end).any(|index| editor.document().block_in_quote(index));
+                return CommandState {
+                    enabled: in_quote || editor.document().can_wrap_in_quote(editor.selection()),
+                    toggle: if in_quote {
+                        ToggleState::On
+                    } else {
+                        ToggleState::Off
+                    },
+                };
+            }
             EditorCommand::Redo => return history_state(editor.redo_depth()),
             // Evernote forecolor.ts: selected text, or the pending style at a
             // collapsed caret. "On" means a colour other than the default.
@@ -519,6 +546,10 @@ impl CommandCatalogue {
             EditorCommand::Redo => editor.redo()?,
             EditorCommand::BulletList | EditorCommand::OrderedList | EditorCommand::CheckList => {
                 apply_list_command(command, editor)?;
+            }
+            EditorCommand::Quote => {
+                let quote = self.state(EditorCommand::Quote, editor).toggle != ToggleState::On;
+                editor.apply(Transaction::SetQuote { selection, quote })?;
             }
             EditorCommand::Paragraph
             | EditorCommand::Heading1

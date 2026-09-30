@@ -57,6 +57,13 @@ pub enum Transaction {
         selection: Selection,
         alignment: TextAlignment,
     },
+    /// Evernote's quoteblock toggle (common-editor quoteblock/quoteblock.ts
+    /// insertQuoteblockAtSelection): `true` wraps the selected blocks in a
+    /// quote, `false` unwraps every whole quote the selection touches.
+    SetQuote {
+        selection: Selection,
+        quote: bool,
+    },
     IndentList {
         selection: Selection,
     },
@@ -131,6 +138,7 @@ impl Transaction {
             | Self::SetLink { selection, .. }
             | Self::SetTextColor { selection, .. }
             | Self::SetAlignment { selection, .. }
+            | Self::SetQuote { selection, .. }
             | Self::IndentList { selection }
             | Self::OutdentList { selection }
             | Self::InsertImage { selection, .. }

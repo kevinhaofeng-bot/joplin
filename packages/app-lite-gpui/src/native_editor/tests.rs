@@ -9247,3 +9247,88 @@ fn quote_container_edits_keep_lists_and_headings_inside_the_quote(cx: &mut gpui:
     assert_eq!(left(3), super::layout::QUOTE_INSET);
     assert_eq!(left(4), 0.0);
 }
+
+#[gpui::test]
+fn quote_toggle_takes_only_quoteblock_content_and_restarts_numbering(
+    cx: &mut gpui::TestAppContext,
+) {
+    let open = |html: &str, cx: &mut gpui::TestAppContext| {
+        EditorCore::from_document(
+            super::codec::import_canonical_with_resources(
+                &app_lite_core::CanonicalDocument::parse_html(html).unwrap(),
+                &[app_lite_core::ResourceId::new("a".repeat(32)).unwrap()],
+            )
+            .unwrap(),
+            cx,
+        )
+    };
+    let export = |editor: &EditorCore| {
+        super::codec::export_canonical(editor.document())
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned()
+    };
+    let catalogue = CommandCatalogue::new();
+    let select_all_blocks = |editor: &mut EditorCore| {
+        let blocks = editor.document().blocks();
+        let first = blocks[0].id;
+        let last = blocks.iter().last().unwrap();
+        let end = last.content.as_text().map_or(0, str::len);
+        let last = last.id;
+        editor.set_selection_for_test(Selection::new(
+            DocPoint::new(first, 0),
+            DocPoint::new(last, end),
+        ));
+    };
+    // Code cannot be in Evernote's quoteblock: the command is off.
+    let mut editor = open(
+        "<p>甲</p><pre data-joplin-lite-block-code=\"true\">x</pre>",
+        cx,
+    );
+    select_all_blocks(&mut editor);
+    assert!(!catalogue.state(EditorCommand::Quote, &editor).enabled);
+    // A quote paragraph holding an inline image is one inline group: it is
+    // unwrapped and wrapped again whole, image included.
+    let quoted = "<blockquote data-joplin-lite-block-quote=\"true\">图<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">后</blockquote>";
+    let mut editor = open(quoted, cx);
+    assert!(!editor.document().inline_groups().is_empty());
+    let first = editor.document().blocks()[0].id;
+    editor.set_selection_for_test(Selection::caret(DocPoint::new(first, 0)));
+    catalogue
+        .execute(EditorCommand::Quote, CommandArgument::None, &mut editor)
+        .unwrap();
+    assert_eq!(
+        export(&editor),
+        "<p>图<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">后</p>"
+    );
+    catalogue
+        .execute(EditorCommand::Quote, CommandArgument::None, &mut editor)
+        .unwrap();
+    assert_eq!(export(&editor), quoted);
+    // Quoting the first items of a numbered list: saved as two lists, so the
+    // editor numbers the rest from 1 as well.
+    let mut editor = open("<ol><li>一</li><li>二</li><li>三</li></ol>", cx);
+    let ids: Vec<_> = editor
+        .document()
+        .blocks()
+        .iter()
+        .map(|block| block.id)
+        .collect();
+    editor.set_selection_for_test(Selection::new(
+        DocPoint::new(ids[0], 0),
+        DocPoint::new(ids[1], "二".len()),
+    ));
+    catalogue
+        .execute(EditorCommand::Quote, CommandArgument::None, &mut editor)
+        .unwrap();
+    assert_eq!(
+        export(&editor),
+        "<blockquote data-joplin-lite-quote-container=\"true\"><ol><li>一</li><li>二</li></ol></blockquote><ol><li>三</li></ol>"
+    );
+    let numbers = super::layout::ordered_number_summary(editor.document());
+    assert_eq!(
+        ids.iter().map(|id| numbers[id]).collect::<Vec<_>>(),
+        vec![1, 2, 1]
+    );
+}

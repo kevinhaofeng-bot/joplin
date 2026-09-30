@@ -843,6 +843,7 @@ impl EditorCore {
             | Transaction::SetLink { .. }
             | Transaction::SetTextColor { .. }
             | Transaction::SetAlignment { .. }
+            | Transaction::SetQuote { .. }
             | Transaction::IndentList { .. }
             | Transaction::OutdentList { .. }
             | Transaction::SetImageDisplayWidth { .. }

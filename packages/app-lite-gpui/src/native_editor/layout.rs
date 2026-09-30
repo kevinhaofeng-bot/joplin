@@ -632,9 +632,28 @@ fn numbering_kind_for(document: &Document, block: &super::model::Block) -> Numbe
             (NumberingKind::Ordered(depth), Some(start)) => {
                 NumberingKind::OrderedFrom(depth, start)
             }
+            // A list inside a quote and one outside it are two lists when
+            // saved, so the numbering restarts at the quote boundary.
+            (NumberingKind::Ordered(depth), None) if crosses_quote_boundary(document, block) => {
+                NumberingKind::OrderedFrom(depth, 1)
+            }
             (kind, _) => kind,
         }
     }
+}
+
+fn crosses_quote_boundary(document: &Document, block: &super::model::Block) -> bool {
+    let Ok(index) = document.node_index(block.id) else {
+        return false;
+    };
+    (0..index)
+        .rev()
+        .map(|previous| &document.blocks()[previous])
+        .find(|previous| !document.is_inline_group_continuation(previous.id))
+        .is_some_and(|previous| {
+            !matches!(numbering_kind(&previous.kind), NumberingKind::Boundary)
+                && previous.quoted != block.quoted
+        })
 }
 
 /// A compact, document-order height index. This follows GPUI's list

@@ -12604,3 +12604,170 @@ async fn quote_container_note_edits_save_and_reopen(cx: &mut TestAppContext) {
     });
     assert_eq!(html.as_str(), expected);
 }
+
+// The shared More menu is height-limited; scroll a lower row into view before
+// clicking it, as a user would.
+fn click_library_more_command(cx: &mut VisualTestContext, label: &'static str) {
+    let trigger = cx
+        .debug_bounds("library-editor-command-more-trigger")
+        .expect("More trigger");
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    redraw(cx);
+    let menu = cx
+        .debug_bounds("library-editor-command-more-menu")
+        .expect("More menu");
+    for _ in 0..16 {
+        let row = cx.debug_bounds(label).expect("More command");
+        if row.top() >= menu.top() && row.bottom() <= menu.bottom() {
+            cx.simulate_click(row.center(), Modifiers::default());
+            redraw(cx);
+            return;
+        }
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: menu.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-36.0))),
+            ..Default::default()
+        });
+        redraw(cx);
+    }
+    panic!("{label} never scrolled into the More menu");
+}
+
+#[gpui::test]
+async fn toolbar_quote_wraps_and_unwraps_whole_quotes_with_history_ime_and_save(
+    cx: &mut TestAppContext,
+) {
+    // Evernote quoteblock/quoteblock.ts insertQuoteblockAtSelection: outside
+    // a quote the selected p/h/lists are wrapped and then selected; inside
+    // one the whole quote is unwrapped, a caret going to its start.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let original = "<h2>题</h2><p>甲</p><ul><li>一</li><li>二</li></ul><p>后</p>";
+    let note = repository
+        .create_note(CreateNote {
+            title: "引用切换".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html(original).unwrap(),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    let html = |cx: &mut VisualTestContext| {
+        cx.update(|_, app| {
+            crate::native_editor::codec::export_canonical(editor.read(app).document())
+                .unwrap()
+                .to_canonical_html()
+                .as_str()
+                .to_owned()
+        })
+    };
+    let ids = cx.update(|_, app| {
+        editor
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>()
+    });
+    let points = |cx: &mut VisualTestContext| {
+        cx.update(|_, app| {
+            let selection = editor.read(app).selection();
+            (
+                (selection.anchor.node_id, selection.anchor.utf8_offset),
+                (selection.head.node_id, selection.head.utf8_offset),
+            )
+        })
+    };
+    let set = |cx: &mut VisualTestContext, selection: Selection| {
+        cx.update(|_, app| {
+            editor.update(app, |editor, editor_cx| {
+                editor.set_selection_for_test(selection);
+                editor_cx.notify();
+            })
+        });
+        redraw(cx);
+    };
+
+    set(
+        cx,
+        Selection::new(DocPoint::new(ids[0], 0), DocPoint::new(ids[3], "二".len())),
+    );
+    click_library_more_command(cx, "Quote");
+    let wrapped = "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2><p>甲</p><ul><li>一</li><li>二</li></ul></blockquote><p>后</p>";
+    assert_eq!(html(cx), wrapped);
+    assert_eq!(points(cx), ((ids[0], 0), (ids[3], "二".len())));
+
+    // A caret anywhere in the quote unwraps all of it.
+    set(cx, Selection::caret(DocPoint::new(ids[2], "一".len())));
+    click_library_more_command(cx, "Quote");
+    assert_eq!(html(cx), original);
+    assert_eq!(points(cx), ((ids[0], 0), (ids[0], 0)));
+
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert_eq!(html(cx), wrapped);
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    assert_eq!(html(cx), original);
+
+    // During IME composition the toolbar commits the composed text first.
+    let end = cx.update(|_, app| editor.read(app).document().flat_utf16_len());
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(end..end),
+                "候选",
+                Some((end + 2)..(end + 2)),
+                window,
+                editor_cx,
+            );
+        })
+    });
+    redraw(cx);
+    click_library_more_command(cx, "Quote");
+    let quoted_tail = "<h2>题</h2><p>甲</p><ul><li>一</li><li>二</li></ul><blockquote data-joplin-lite-block-quote=\"true\">后候选</blockquote>";
+    assert_eq!(html(cx), quoted_tail);
+    assert!(cx.update(|_, app| editor.read(app).marked_text().is_none()));
+    // From a caret, the wrapped block's whole content ends up selected.
+    assert_eq!(points(cx), ((ids[4], 0), (ids[4], "后候选".len())));
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx)
+        })
+    });
+    cx.run_until_parked();
+    let saved = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(saved.body_html, quoted_tail);
+    let reopened = cx.new(|cx| {
+        crate::app::note_session::NoteSession::open(
+            saved,
+            Arc::clone(&repository),
+            Arc::new(ManualSaveClock::default()),
+            cx,
+        )
+        .unwrap()
+    });
+    let reopened_html = reopened.read_with(cx, |session, app| {
+        crate::native_editor::codec::export_canonical(session.editor().read(app).document())
+            .unwrap()
+            .to_canonical_html()
+    });
+    assert_eq!(reopened_html.as_str(), quoted_tail);
+}
