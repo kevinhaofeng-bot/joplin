@@ -275,3 +275,8 @@ etagere = { opt-level = 3 }
 image = { opt-level = 3 }
 serde = { opt-level = 3 }
 serde_json = { opt-level = 3 }
+
+# GPUI 0.2.2 with per-run script size and baseline in text shaping; see
+# vendor/gpui/JOPLIN-PATCHES.md.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
