@@ -13,8 +13,8 @@ use super::render;
 use crate::components::{
     BlockDown, BlockUp, BoldSelection, Copy, Cut, Delete, DeleteBack, End, FocusNext, FocusPrev,
     Home, ItalicSelection, JumpToBottom, JumpToTop, MoveLeft, MoveRight, Newline, PageDown, PageUp,
-    Redo, SelectAll, SelectEnd, SelectHome, SelectLeft, SelectRight, UnderlineSelection, Undo,
-    WordSelectLeft, WordSelectRight,
+    Redo, SelectAll, SelectEnd, SelectHome, SelectLeft, SelectRight, SubscriptSelection,
+    SuperscriptSelection, UnderlineSelection, Undo, WordSelectLeft, WordSelectRight,
 };
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
@@ -696,6 +696,18 @@ impl Render for EditorSurface {
                 editor,
                 UnderlineSelection,
                 EditorCommand::Underline
+            );
+            bind_format_action!(
+                surface,
+                editor,
+                SuperscriptSelection,
+                EditorCommand::Superscript
+            );
+            bind_format_action!(
+                surface,
+                editor,
+                SubscriptSelection,
+                EditorCommand::Subscript
             );
         }
         // Preserve the donor's standard key context on the one shared

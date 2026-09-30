@@ -139,6 +139,8 @@
     "preferences_shortcut_italic_selection": "",
     "preferences_shortcut_underline_selection": "",
     "preferences_shortcut_code_selection": "",
+    "preferences_shortcut_superscript_selection": "",
+    "preferences_shortcut_subscript_selection": "",
     "preferences_shortcut_indent_block": "",
     "preferences_shortcut_outdent_block": "",
     "preferences_shortcut_exit_code_block": "",

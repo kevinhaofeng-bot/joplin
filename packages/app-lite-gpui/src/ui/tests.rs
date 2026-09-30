@@ -5060,6 +5060,49 @@ async fn mounted_body_cmd_b_i_u_use_command_history_and_persist_canonical_marks(
 }
 
 #[gpui::test]
+async fn mounted_cmd_b_in_an_empty_body_bolds_every_later_typing_event(cx: &mut TestAppContext) {
+    // evidence54: Cmd-B, "Bold中文928", then a separate "CONTINUE" saved as
+    // <p><strong>Bold中文928</strong>CONTINUE</p>. Evernote keeps typing bold.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "待输入样式".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        });
+    });
+    redraw(cx);
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_keystrokes("cmd-b");
+    redraw(cx);
+    cx.simulate_input("Bold中文928");
+    redraw(cx);
+    cx.simulate_input("CONTINUE");
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-b");
+    cx.simulate_input("x");
+    redraw(cx);
+    cx.simulate_input("y");
+    redraw(cx);
+    let save = cx.debug_bounds("library-sync-current").unwrap();
+    cx.simulate_click(save.center(), Modifiers::default());
+    redraw(cx);
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().body_html,
+        "<p><strong>Bold中文928CONTINUE</strong>xy</p>"
+    );
+}
+
+#[gpui::test]
 async fn document_jump_shortcuts_move_body_caret_before_editing(cx: &mut TestAppContext) {
     let (profile, repository) = repository();
     cx.update(|app| {

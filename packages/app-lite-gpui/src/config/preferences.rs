@@ -1234,6 +1234,12 @@ impl PreferencesWindow {
                 strings.preferences_shortcut_underline_selection.clone()
             }
             ShortcutCommand::CodeSelection => strings.preferences_shortcut_code_selection.clone(),
+            ShortcutCommand::SuperscriptSelection => {
+                strings.preferences_shortcut_superscript_selection.clone()
+            }
+            ShortcutCommand::SubscriptSelection => {
+                strings.preferences_shortcut_subscript_selection.clone()
+            }
             ShortcutCommand::IndentBlock => strings.preferences_shortcut_indent_block.clone(),
             ShortcutCommand::OutdentBlock => strings.preferences_shortcut_outdent_block.clone(),
             ShortcutCommand::ExitCodeBlock => strings.preferences_shortcut_exit_code_block.clone(),

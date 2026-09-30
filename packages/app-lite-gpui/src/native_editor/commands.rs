@@ -28,6 +28,8 @@ pub enum EditorCommand {
     Italic,
     Underline,
     Strike,
+    Superscript,
+    Subscript,
     Highlight,
     BulletList,
     OrderedList,
@@ -197,6 +199,24 @@ const COMMANDS: &[CommandDescriptor] = &[
         group: 2,
         primary: false,
     },
+    // Evernote `FormattingBar.superscript` / `.subscript`; keymap Ctrl-Cmd-=
+    // and Ctrl-Cmd-- (common-editor textformatter/keymap.ts).
+    CommandDescriptor {
+        command: EditorCommand::Superscript,
+        label: "Superscript",
+        label_zh: "上标",
+        icon_path: None,
+        group: 2,
+        primary: false,
+    },
+    CommandDescriptor {
+        command: EditorCommand::Subscript,
+        label: "Subscript",
+        label_zh: "下标",
+        icon_path: None,
+        group: 2,
+        primary: false,
+    },
     CommandDescriptor {
         command: EditorCommand::Highlight,
         label: "Highlight",
@@ -324,14 +344,19 @@ impl CommandCatalogue {
             | EditorCommand::Italic
             | EditorCommand::Underline
             | EditorCommand::Strike
+            | EditorCommand::Superscript
+            | EditorCommand::Subscript
             | EditorCommand::Highlight
             | EditorCommand::Link => {
                 let mark = mark_for_command(command);
                 let (any, all) = editor.selection_mark_state(&mark);
                 // Evernote marks the text of a mixed selection and leaves its
                 // resources alone (ProseMirror `addMark` skips atoms).
+                // Evernote `boolformat.ts`: a collapsed caret toggles the
+                // pending style. A link needs selected text.
                 return CommandState {
-                    enabled: !editor.selected_text_ranges().is_empty(),
+                    enabled: !editor.selected_text_ranges().is_empty()
+                        || (command != EditorCommand::Link && editor.caret_in_text()),
                     toggle: toggle_state(any, all),
                 };
             }
@@ -484,6 +509,8 @@ impl CommandCatalogue {
             | EditorCommand::Italic
             | EditorCommand::Underline
             | EditorCommand::Strike
+            | EditorCommand::Superscript
+            | EditorCommand::Subscript
             | EditorCommand::Highlight => {
                 editor.apply(Transaction::ToggleMark {
                     selection,
@@ -618,6 +645,8 @@ fn mark_for_command(command: EditorCommand) -> Mark {
         EditorCommand::Underline => Mark::Underline,
         EditorCommand::Strike => Mark::Strike,
         EditorCommand::Highlight => Mark::Highlight,
+        EditorCommand::Superscript => Mark::Superscript,
+        EditorCommand::Subscript => Mark::Subscript,
         EditorCommand::Link => Mark::Link(String::new()),
         _ => unreachable!("{command:?} is not a mark command"),
     }

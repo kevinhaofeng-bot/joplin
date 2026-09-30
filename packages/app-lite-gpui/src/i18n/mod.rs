@@ -217,6 +217,8 @@ pub struct I18nStrings {
     pub preferences_shortcut_italic_selection: String,
     pub preferences_shortcut_underline_selection: String,
     pub preferences_shortcut_code_selection: String,
+    pub preferences_shortcut_superscript_selection: String,
+    pub preferences_shortcut_subscript_selection: String,
     pub preferences_shortcut_indent_block: String,
     pub preferences_shortcut_outdent_block: String,
     pub preferences_shortcut_exit_code_block: String,
@@ -450,6 +452,8 @@ struct I18nStringsDe {
     preferences_shortcut_italic_selection: Option<String>,
     preferences_shortcut_underline_selection: Option<String>,
     preferences_shortcut_code_selection: Option<String>,
+    preferences_shortcut_superscript_selection: Option<String>,
+    preferences_shortcut_subscript_selection: Option<String>,
     preferences_shortcut_indent_block: Option<String>,
     preferences_shortcut_outdent_block: Option<String>,
     preferences_shortcut_exit_code_block: Option<String>,
@@ -635,6 +639,8 @@ const I18N_STRING_KEYS: &[&str] = &[
     "preferences_shortcut_italic_selection",
     "preferences_shortcut_underline_selection",
     "preferences_shortcut_code_selection",
+    "preferences_shortcut_superscript_selection",
+    "preferences_shortcut_subscript_selection",
     "preferences_shortcut_indent_block",
     "preferences_shortcut_outdent_block",
     "preferences_shortcut_exit_code_block",
@@ -1026,6 +1032,12 @@ impl I18nStringsDe {
             preferences_shortcut_code_selection: self
                 .preferences_shortcut_code_selection
                 .unwrap_or(defaults.preferences_shortcut_code_selection),
+            preferences_shortcut_superscript_selection: self
+                .preferences_shortcut_superscript_selection
+                .unwrap_or(defaults.preferences_shortcut_superscript_selection),
+            preferences_shortcut_subscript_selection: self
+                .preferences_shortcut_subscript_selection
+                .unwrap_or(defaults.preferences_shortcut_subscript_selection),
             preferences_shortcut_indent_block: self
                 .preferences_shortcut_indent_block
                 .unwrap_or(defaults.preferences_shortcut_indent_block),
@@ -1325,6 +1337,8 @@ impl I18nStrings {
             preferences_shortcut_italic_selection: "斜体".into(),
             preferences_shortcut_underline_selection: "下划线".into(),
             preferences_shortcut_code_selection: "行内代码".into(),
+            preferences_shortcut_superscript_selection: "上标".into(),
+            preferences_shortcut_subscript_selection: "下标".into(),
             preferences_shortcut_indent_block: "缩进块".into(),
             preferences_shortcut_outdent_block: "取消缩进块".into(),
             preferences_shortcut_exit_code_block: "退出代码块".into(),
@@ -1539,6 +1553,8 @@ impl I18nStrings {
             preferences_shortcut_italic_selection: "Italic".into(),
             preferences_shortcut_underline_selection: "Underline".into(),
             preferences_shortcut_code_selection: "Inline Code".into(),
+            preferences_shortcut_superscript_selection: "Superscript".into(),
+            preferences_shortcut_subscript_selection: "Subscript".into(),
             preferences_shortcut_indent_block: "Indent Block".into(),
             preferences_shortcut_outdent_block: "Outdent Block".into(),
             preferences_shortcut_exit_code_block: "Exit Code Block".into(),

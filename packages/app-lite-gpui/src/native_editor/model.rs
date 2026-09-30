@@ -118,9 +118,21 @@ pub enum Mark {
     Highlight,
     Link(String),
     InlineCode,
+    Superscript,
+    Subscript,
 }
 
 impl Mark {
+    /// Evernote's superscript and subscript marks exclude each other
+    /// (common-editor textformatter/schema.ts `excludes`).
+    pub(crate) fn excluded(&self) -> Option<Mark> {
+        match self {
+            Self::Superscript => Some(Self::Subscript),
+            Self::Subscript => Some(Self::Superscript),
+            _ => None,
+        }
+    }
+
     pub(crate) fn estimated_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + match self {
@@ -1286,7 +1298,22 @@ pub struct Document {
     /// First number of an ordered list that does not start at 1, keyed by
     /// the list's first item. Keys of removed items are simply ignored.
     list_starts: BTreeMap<NodeId, u32>,
+    pending_marks: PendingMarks,
 }
+
+/// Evernote `utils/mark.ts::toggleMark`: at a collapsed caret a mark toggle
+/// changes the stored marks the next typed text takes (`addStoredMark`),
+/// not the document. Editor state, so it takes no part in equality.
+#[derive(Clone, Debug, Default)]
+struct PendingMarks(Option<(NodeId, usize, SmallVec<[Mark; 4]>)>);
+
+impl PartialEq for PendingMarks {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PendingMarks {}
 
 #[derive(Clone, Copy, Debug)]
 struct SelectionBounds {
@@ -1375,6 +1402,7 @@ impl Document {
             revision: 0,
             inline_groups: Vec::new(),
             list_starts: BTreeMap::new(),
+            pending_marks: PendingMarks::default(),
         };
         debug_assert!(document.validate_invariants().is_ok());
         document
@@ -1395,6 +1423,7 @@ impl Document {
             revision: 0,
             inline_groups: Vec::new(),
             list_starts: BTreeMap::new(),
+            pending_marks: PendingMarks::default(),
         };
         document.validate_invariants()?;
         Ok(document)
@@ -3188,8 +3217,27 @@ impl Document {
         new_text.push_str(&text);
         new_text.push_str(&old_text[insertion_offset..]);
         let mut new_styles = insert_styles(old_styles, insertion_offset, inserted_len);
-        if is_empty {
-            let inherited = insertion_marks(old_styles, insertion_offset, selection.head.affinity);
+        // Read, not taken: an IME update re-inserts at the same caret.
+        let pending = self
+            .pending_marks
+            .0
+            .as_ref()
+            .and_then(|(node, offset, marks)| {
+                (is_empty && *node == block_id && *offset == insertion_offset)
+                    .then(|| marks.clone())
+            });
+        if let Some(marks) = pending {
+            // The typed text takes exactly the stored marks.
+            clear_marks_in_range(&mut new_styles, insertion_offset, inserted_len);
+            if !marks.is_empty() {
+                new_styles.push(StyledRun {
+                    range: insertion_offset..insertion_offset.saturating_add(inserted_len),
+                    marks,
+                });
+            }
+            normalize_styles(&mut new_styles);
+        } else if is_empty {
+            let inherited = insertion_marks(old_styles, insertion_offset);
             if !inherited.is_empty() {
                 new_styles.push(StyledRun {
                     range: insertion_offset..insertion_offset.saturating_add(inserted_len),
@@ -3553,6 +3601,40 @@ impl Document {
         Ok((selection, changed_nodes, inverse))
     }
 
+    pub(crate) fn has_pending_marks(&self) -> bool {
+        self.pending_marks.0.is_some()
+    }
+
+    pub(crate) fn set_pending_marks(
+        &mut self,
+        node: NodeId,
+        offset: usize,
+        marks: SmallVec<[Mark; 4]>,
+    ) {
+        self.pending_marks = PendingMarks(Some((node, offset, marks)));
+    }
+
+    /// The editor ends stored marks when its caret leaves them.
+    pub(crate) fn clear_pending_marks(&mut self) {
+        self.pending_marks = PendingMarks::default();
+    }
+
+    /// The marks typing at this caret would take: the stored ones, else
+    /// those the text around it passes on.
+    pub(crate) fn caret_marks(&self, selection: Selection) -> SmallVec<[Mark; 4]> {
+        let head = selection.head;
+        if let Some((node, offset, marks)) = &self.pending_marks.0
+            && *node == head.node_id
+            && *offset == head.utf8_offset
+        {
+            return marks.clone();
+        }
+        self.block(head.node_id)
+            .and_then(|block| block.content.styles())
+            .map(|styles| insertion_marks(styles, head.utf8_offset))
+            .unwrap_or_default()
+    }
+
     fn apply_toggle_mark(
         &mut self,
         selection: Selection,
@@ -3562,28 +3644,64 @@ impl Document {
         let (start_index, start_offset, end_index, end_offset) =
             self.selection_bounds(selection)?;
         if start_index == end_index && start_offset == end_offset {
+            if is_text_block(&self.blocks[start_index]) {
+                let mut marks = self.caret_marks(selection);
+                if marks.contains(&mark) {
+                    marks.retain(|candidate| *candidate != mark);
+                } else {
+                    if let Some(excluded) = mark.excluded() {
+                        marks.retain(|candidate| *candidate != excluded);
+                    }
+                    marks.push(mark);
+                }
+                normalize_marks(&mut marks);
+                self.pending_marks = PendingMarks(Some((
+                    selection.head.node_id,
+                    selection.head.utf8_offset,
+                    marks,
+                )));
+            }
             return Ok((selection, SmallVec::new(), TransactionBatch::default()));
         }
         let originals = self
             .blocks
             .collect_range(start_index..end_index.saturating_add(1));
+        let text_ranges: Vec<_> = originals
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, block)| {
+                let index = start_index.saturating_add(offset);
+                let (range_start, range_end) = self.text_range_for_block(
+                    index,
+                    start_index,
+                    start_offset,
+                    end_index,
+                    end_offset,
+                )?;
+                (is_text_block(block) && range_start < range_end).then_some((
+                    offset,
+                    range_start,
+                    range_end,
+                ))
+            })
+            .collect();
+        // Evernote `utils/mark.ts::toggleMark`: if any of the selection has
+        // the mark it is removed from all of it, otherwise added to all.
+        let remove = text_ranges.iter().any(|(offset, range_start, range_end)| {
+            originals[*offset].content.styles().is_some_and(|styles| {
+                styles.iter().any(|run| {
+                    run.range.start < *range_end
+                        && run.range.end > *range_start
+                        && run.marks.contains(&mark)
+                })
+            })
+        });
         let mut replacements = originals.clone();
         let mut changed_nodes = SmallVec::new();
-        for (offset, block) in replacements.iter_mut().enumerate() {
-            let index = start_index.saturating_add(offset);
-            let Some((range_start, range_end)) =
-                self.text_range_for_block(index, start_index, start_offset, end_index, end_offset)
-            else {
-                continue;
-            };
-            if !is_text_block(block) {
-                continue;
-            }
-            if range_start == range_end {
-                continue;
-            }
+        for (offset, range_start, range_end) in text_ranges {
+            let block = &mut replacements[offset];
             let (text, styles) = text_parts(&block.content)?;
-            let updated = toggle_style_range(text, styles, range_start, range_end, &mark);
+            let updated = toggle_style_range(text, styles, range_start, range_end, &mark, remove);
             if updated.as_slice() != styles {
                 block.content = BlockContent::Text {
                     text: text.to_owned(),
@@ -4393,6 +4511,11 @@ fn validate_styles(node_id: NodeId, text: &str, styles: &[StyledRun]) -> Result<
                 "styled run marks are not sorted and deduplicated".into(),
             ));
         }
+        if run.marks.contains(&Mark::Superscript) && run.marks.contains(&Mark::Subscript) {
+            return Err(DocumentError::InvalidOperation(
+                "a styled run cannot be both superscript and subscript".into(),
+            ));
+        }
         if let Some(previous) = previous {
             if previous.range.end > run.range.start {
                 return Err(DocumentError::InvalidOperation(
@@ -4651,6 +4774,31 @@ fn clip_styles(
     clipped
 }
 
+/// Removes every mark from `start..start + len`, splitting runs across it.
+fn clear_marks_in_range(styles: &mut SmallVec<[StyledRun; 4]>, start: usize, len: usize) {
+    let end = start.saturating_add(len);
+    let mut kept = SmallVec::new();
+    for run in styles.drain(..) {
+        if run.range.end <= start || run.range.start >= end {
+            kept.push(run);
+            continue;
+        }
+        if run.range.start < start {
+            kept.push(StyledRun {
+                range: run.range.start..start,
+                marks: run.marks.clone(),
+            });
+        }
+        if run.range.end > end {
+            kept.push(StyledRun {
+                range: end..run.range.end,
+                marks: run.marks,
+            });
+        }
+    }
+    *styles = kept;
+}
+
 fn insert_styles(
     styles: &[StyledRun],
     offset: usize,
@@ -4677,26 +4825,32 @@ fn insert_styles(
     shifted
 }
 
-/// Resolve the marks used by a collapsed-caret insertion.  Affinity is the
-/// single boundary rule shared by command state and model insertion:
-/// `Before` looks to the run ending at the seam, while `After` looks to the
-/// run beginning at the seam.  Strict interior offsets belong to their
-/// containing run.  This avoids a toolbar state that claims Bold while the
-/// next inserted grapheme is unstyled.
-pub(crate) fn insertion_marks(
-    styles: &[StyledRun],
-    offset: usize,
-    affinity: Affinity,
-) -> SmallVec<[Mark; 4]> {
-    styles
+/// The marks typing at a collapsed caret takes, as ProseMirror's
+/// `ResolvedPos.marks()` which Evernote's editor uses: inside a run, its
+/// marks; at a seam, those of the text before (at a block start, the text
+/// after), less the non-inclusive link and code marks (Evernote link and
+/// code mark specs set `inclusive: false`) unless the other side has them.
+pub(crate) fn insertion_marks(styles: &[StyledRun], offset: usize) -> SmallVec<[Mark; 4]> {
+    let covering = |at: usize| {
+        styles
+            .iter()
+            .find(|run| run.range.start <= at && at < run.range.end)
+            .map(|run| run.marks.clone())
+            .unwrap_or_default()
+    };
+    if let Some(run) = styles
         .iter()
-        .find(|run| {
-            (run.range.start < offset && offset < run.range.end)
-                || (run.range.end == offset && affinity == Affinity::Before)
-                || (run.range.start == offset && affinity == Affinity::After)
-        })
-        .map(|run| run.marks.clone())
-        .unwrap_or_default()
+        .find(|run| run.range.start < offset && offset < run.range.end)
+    {
+        return run.marks.clone();
+    }
+    let after = covering(offset);
+    let (mut main, other) = match offset.checked_sub(1) {
+        Some(before) => (covering(before), after),
+        None => (after, SmallVec::new()),
+    };
+    main.retain(|mark| !matches!(mark, Mark::Link(_) | Mark::InlineCode) || other.contains(mark));
+    main
 }
 
 fn delete_text(
@@ -4743,6 +4897,7 @@ fn toggle_style_range(
     start: usize,
     end: usize,
     mark: &Mark,
+    remove: bool,
 ) -> SmallVec<[StyledRun; 4]> {
     let mut boundaries = vec![start, end];
     for run in styles {
@@ -4757,16 +4912,15 @@ fn toggle_style_range(
         .windows(2)
         .filter_map(|window| (window[0] < window[1]).then_some((window[0], window[1])))
         .collect::<Vec<_>>();
-    let remove = !segments.is_empty()
-        && segments.iter().all(|(segment_start, segment_end)| {
-            marks_for_segment(styles, *segment_start, *segment_end).contains(mark)
-        });
     let mut updated = SmallVec::new();
     for (segment_start, segment_end) in segments {
         let mut marks = marks_for_segment(styles, segment_start, segment_end);
         if remove {
             marks.retain(|candidate| candidate != mark);
         } else if !marks.contains(mark) {
+            if let Some(excluded) = mark.excluded() {
+                marks.retain(|candidate| *candidate != excluded);
+            }
             marks.push(mark.clone());
         }
         normalize_marks(&mut marks);
@@ -4860,9 +5014,14 @@ fn marks_for_segment(styles: &[StyledRun], start: usize, end: usize) -> SmallVec
         .unwrap_or_default()
 }
 
+/// A run never holds both script marks; a pair that arrives from elsewhere
+/// keeps the superscript deterministically.
 fn normalize_marks(marks: &mut SmallVec<[Mark; 4]>) {
     marks.sort();
     marks.dedup();
+    if marks.contains(&Mark::Superscript) {
+        marks.retain(|mark| *mark != Mark::Subscript);
+    }
 }
 
 fn normalize_styles(styles: &mut SmallVec<[StyledRun; 4]>) {

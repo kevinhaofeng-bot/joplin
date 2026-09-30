@@ -1871,7 +1871,13 @@ async fn journal_checkpoint_is_a_compact_readable_delta_not_a_second_full_docume
         .expect("read compact checkpoint")
         .expect("checkpoint");
     assert!(journal.delta_utf8.contains("\"version\":2"));
-    assert!(journal.delta_utf8.contains("\"insert\":\"新\""));
+    // Typed after a link, the character is outside it (Evernote's link mark
+    // is non-inclusive) but keeps bold and italic: a small local HTML edit.
+    assert!(
+        journal
+            .delta_utf8
+            .contains("\"insert\":\"strong><em>新</em></strong><\"")
+    );
     assert!(!journal.delta_utf8.contains("\"body_html\""));
     assert!(
         journal.delta_utf8.len() * 20 < note.body_html.len(),

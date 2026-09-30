@@ -49,6 +49,8 @@ actions!(
         ItalicSelection,
         UnderlineSelection,
         CodeSelection,
+        SuperscriptSelection,
+        SubscriptSelection,
         IndentBlock,
         OutdentBlock,
         ExitCodeBlock,
@@ -149,6 +151,8 @@ pub(crate) enum ShortcutCommand {
     ItalicSelection,
     UnderlineSelection,
     CodeSelection,
+    SuperscriptSelection,
+    SubscriptSelection,
     IndentBlock,
     OutdentBlock,
     ExitCodeBlock,
@@ -440,6 +444,21 @@ const SHORTCUT_DEFINITIONS: &[ShortcutDefinition] = &[
         default_keys: &["cmd-`", "ctrl-`"],
         context: BLOCK_CONTEXT,
     },
+    // Evernote textformatter/keymap.ts (macOS): Ctrl-Cmd-= / Ctrl-Cmd--.
+    ShortcutDefinition {
+        command: ShortcutCommand::SuperscriptSelection,
+        id: "superscript_selection",
+        category: ShortcutCategory::Formatting,
+        default_keys: &["ctrl-cmd-=", "ctrl-alt-="],
+        context: BLOCK_CONTEXT,
+    },
+    ShortcutDefinition {
+        command: ShortcutCommand::SubscriptSelection,
+        id: "subscript_selection",
+        category: ShortcutCategory::Formatting,
+        default_keys: &["ctrl-cmd--", "ctrl-alt--"],
+        context: BLOCK_CONTEXT,
+    },
     ShortcutDefinition {
         command: ShortcutCommand::IndentBlock,
         id: "indent_block",
@@ -721,6 +740,10 @@ fn key_binding_for(
         ShortcutCommand::ItalicSelection => KeyBinding::new(key, ItalicSelection, context),
         ShortcutCommand::UnderlineSelection => KeyBinding::new(key, UnderlineSelection, context),
         ShortcutCommand::CodeSelection => KeyBinding::new(key, CodeSelection, context),
+        ShortcutCommand::SuperscriptSelection => {
+            KeyBinding::new(key, SuperscriptSelection, context)
+        }
+        ShortcutCommand::SubscriptSelection => KeyBinding::new(key, SubscriptSelection, context),
         ShortcutCommand::IndentBlock => KeyBinding::new(key, IndentBlock, context),
         ShortcutCommand::OutdentBlock => KeyBinding::new(key, OutdentBlock, context),
         ShortcutCommand::ExitCodeBlock => KeyBinding::new(key, ExitCodeBlock, context),

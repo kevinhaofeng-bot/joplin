@@ -941,6 +941,8 @@ fn canonical_marks(marks: &[Mark]) -> Marks {
             Mark::Highlight => output.highlight = true,
             Mark::Link(url) => output.link = Some(url.clone()),
             Mark::InlineCode => output.inline_code = true,
+            Mark::Superscript => output.script = Some(app_lite_core::Script::Superscript),
+            Mark::Subscript => output.script = Some(app_lite_core::Script::Subscript),
         }
     }
     output
@@ -1077,6 +1079,11 @@ fn native_marks(marks: &Marks) -> SmallVec<[Mark; 4]> {
     }
     if marks.inline_code {
         output.push(Mark::InlineCode);
+    }
+    match marks.script {
+        Some(app_lite_core::Script::Superscript) => output.push(Mark::Superscript),
+        Some(app_lite_core::Script::Subscript) => output.push(Mark::Subscript),
+        None => {}
     }
     output
 }
@@ -1975,12 +1982,25 @@ mod tests {
                 highlight: true,
                 inline_code: true,
                 link: Some("https://example.test/格式".into()),
+                script: Some(app_lite_core::Script::Superscript),
+            },
+        };
+        let lowered = |text: &str| Inline::Text {
+            text: text.into(),
+            marks: Marks {
+                script: Some(app_lite_core::Script::Subscript),
+                ..Marks::default()
             },
         };
         let document = CanonicalDocument::from_blocks(vec![
             CanonicalBlock::Paragraph {
                 style: BlockStyle::default(),
-                inlines: vec![marked("段落"), Inline::SoftBreak, marked("换行")],
+                inlines: vec![
+                    marked("段落"),
+                    Inline::SoftBreak,
+                    marked("换行"),
+                    lowered("下标"),
+                ],
             },
             CanonicalBlock::Heading {
                 level: HeadingLevel::Three,

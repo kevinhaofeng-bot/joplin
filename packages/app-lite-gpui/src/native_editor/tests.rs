@@ -6771,7 +6771,7 @@ fn mixed_max_depth_indent_is_disabled_before_atomic_execution(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
-fn collapsed_caret_state_and_insertion_share_affinity_boundary_rule(cx: &mut gpui::TestAppContext) {
+fn collapsed_caret_state_and_insertion_share_one_mark_rule(cx: &mut gpui::TestAppContext) {
     let catalogue = CommandCatalogue::default();
     let mut editor = EditorCore::for_test("ab", cx);
     let node = editor.document().blocks()[0].id;
@@ -6785,8 +6785,9 @@ fn collapsed_caret_state_and_insertion_share_affinity_boundary_rule(cx: &mut gpu
         })
         .unwrap();
 
-    // Before the styled run is unstyled; after the run is styled. The same
-    // answer must drive both the toolbar state and inserted-run inheritance.
+    // At a block start the caret takes the marks of the text after it
+    // (ProseMirror `ResolvedPos.marks()`, used by Evernote's editor). The
+    // same answer drives both the toolbar state and the inserted text.
     editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
         node,
         0,
@@ -6794,7 +6795,7 @@ fn collapsed_caret_state_and_insertion_share_affinity_boundary_rule(cx: &mut gpu
     )));
     assert_eq!(
         catalogue.state(EditorCommand::Bold, &editor).toggle,
-        ToggleState::Off
+        ToggleState::On
     );
     editor.insert_text("X").unwrap();
     let styles = editor.document().blocks()[0]
@@ -6804,8 +6805,8 @@ fn collapsed_caret_state_and_insertion_share_affinity_boundary_rule(cx: &mut gpu
     assert!(
         styles
             .iter()
-            .any(|run| run.range == (1..2) && run.marks.contains(&Mark::Bold)),
-        "the original styled run should remain attached after an unstyled insertion"
+            .any(|run| run.range == (0..2) && run.marks.contains(&Mark::Bold)),
+        "the inserted text joins the bold run it was typed before"
     );
 
     let mut editor = EditorCore::for_test("ab", cx);
@@ -6856,9 +6857,10 @@ fn collapsed_caret_state_and_insertion_share_affinity_boundary_rule(cx: &mut gpu
         1,
         Affinity::After,
     )));
+    // Bold is inclusive, so either affinity at its end continues it.
     assert_eq!(
         catalogue.state(EditorCommand::Bold, &editor).toggle,
-        ToggleState::Off
+        ToggleState::On
     );
     editor.insert_text("Y").unwrap();
     let styles = editor.document().blocks()[0]
@@ -6868,8 +6870,8 @@ fn collapsed_caret_state_and_insertion_share_affinity_boundary_rule(cx: &mut gpu
     assert!(
         styles
             .iter()
-            .any(|run| run.range == (0..1) && run.marks.contains(&Mark::Bold)),
-        "insertion at the styled run's after-affinity seam must remain unstyled"
+            .any(|run| run.range == (0..2) && run.marks.contains(&Mark::Bold)),
+        "typing at the end of a bold run continues it at either affinity"
     );
 }
 
@@ -8430,4 +8432,380 @@ fn a_cancelled_composition_leaves_undo_as_it_found_it(cx: &mut gpui::TestAppCont
     assert_eq!(editor.undo_depth(), depth + 1);
     editor.undo().unwrap();
     assert_eq!(editor.copy_all_plain_text(), "前后");
+}
+
+#[test]
+fn superscript_and_subscript_exclude_each_other_and_undo_in_one_step() {
+    // Evernote common-editor textformatter/schema.ts: `subscript` excludes
+    // `superscript` and vice versa.
+    let text = "水H2O x2 中";
+    let mut doc = Document::from_paragraph(text);
+    let node = doc.first_node_id().unwrap();
+    let mut history = History::new(16, 1024 * 1024);
+    let mixed = Selection::new(
+        DocPoint::new(node, "水".len()),
+        DocPoint::new(node, text.len()),
+    );
+    let marks = |doc: &Document| match &doc.blocks()[0].content {
+        BlockContent::Text { styles, .. } => styles
+            .iter()
+            .map(|run| (run.range.clone(), run.marks.to_vec()))
+            .collect::<Vec<_>>(),
+        _ => panic!("expected text block"),
+    };
+    history
+        .apply(
+            &mut doc,
+            Transaction::ToggleMark {
+                selection: mixed,
+                mark: Mark::Bold,
+            },
+        )
+        .unwrap();
+    history
+        .apply(
+            &mut doc,
+            Transaction::ToggleMark {
+                selection: mixed,
+                mark: Mark::Superscript,
+            },
+        )
+        .unwrap();
+    let superscript = marks(&doc);
+    history
+        .apply(
+            &mut doc,
+            Transaction::ToggleMark {
+                selection: mixed,
+                mark: Mark::Subscript,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        marks(&doc),
+        vec![("水".len()..text.len(), vec![Mark::Bold, Mark::Subscript])],
+        "the subscript replaces the superscript and keeps the bold"
+    );
+    history.undo(&mut doc).unwrap();
+    assert_eq!(marks(&doc), superscript);
+    history
+        .apply(
+            &mut doc,
+            Transaction::ToggleMark {
+                selection: mixed,
+                mark: Mark::Superscript,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        marks(&doc),
+        vec![("水".len()..text.len(), vec![Mark::Bold])],
+        "toggling it off keeps the text and the other marks"
+    );
+}
+
+#[test]
+fn a_mark_toggle_removes_it_everywhere_when_any_selected_text_has_it() {
+    // Evernote `utils/mark.ts::toggleMark` (220–247): `has` is true if ANY
+    // selected range has the mark; then it is removed from every range,
+    // otherwise added to every range (`boolformat.ts`: mixed → uniform).
+    let mut doc = Document::from_paragraphs(["上标段", "普通段"]);
+    let first = doc.blocks()[0].id;
+    let second = doc.blocks()[1].id;
+    doc.apply(Transaction::ToggleMark {
+        selection: Selection::new(
+            DocPoint::new(first, 0),
+            DocPoint::new(first, "上标段".len()),
+        ),
+        mark: Mark::Superscript,
+    })
+    .unwrap();
+    let across = Selection::new(
+        DocPoint::new(first, 0),
+        DocPoint::new(second, "普通段".len()),
+    );
+    let styles = |doc: &Document, index: usize| match &doc.blocks()[index].content {
+        BlockContent::Text { styles, .. } => styles.to_vec(),
+        _ => panic!("expected text block"),
+    };
+    doc.apply(Transaction::ToggleMark {
+        selection: across,
+        mark: Mark::Superscript,
+    })
+    .unwrap();
+    assert!(
+        styles(&doc, 0).is_empty() && styles(&doc, 1).is_empty(),
+        "mixed superscript/plain becomes all plain, not all superscript"
+    );
+    doc.apply(Transaction::ToggleMark {
+        selection: across,
+        mark: Mark::Superscript,
+    })
+    .unwrap();
+    for index in [0, 1] {
+        assert_eq!(styles(&doc, index).len(), 1);
+        assert_eq!(
+            styles(&doc, index)[0].marks.as_slice(),
+            [Mark::Superscript].as_slice()
+        );
+    }
+}
+
+#[test]
+fn a_run_never_keeps_both_script_marks() {
+    let both = |marks| {
+        Document::from_blocks(vec![Block {
+            id: NodeId::new_internal(1),
+            kind: BlockKind::Paragraph,
+            content: BlockContent::Text {
+                text: "x2".into(),
+                styles: smallvec::smallvec![StyledRun { range: 0..2, marks }],
+            },
+            alignment: TextAlignment::Left,
+            revision: 0,
+        }])
+    };
+    // A hand-built run holding both is rejected, not silently repaired...
+    assert!(both(smallvec::smallvec![Mark::Superscript, Mark::Subscript]).is_err());
+    assert!(both(smallvec::smallvec![Mark::Superscript]).is_ok());
+    // ...while the normalizing constructor keeps one of them.
+    let normalized = StyledRun::new(0..2, [Mark::Subscript, Mark::Bold, Mark::Superscript]);
+    assert_eq!(
+        normalized.marks.as_slice(),
+        [Mark::Bold, Mark::Superscript].as_slice()
+    );
+    assert!(both(normalized.marks).is_ok());
+}
+
+#[gpui::test]
+fn pending_bold_keeps_applying_to_separate_typing_events(cx: &mut gpui::TestAppContext) {
+    // evidence54: after a caret Bold toggle the first typing is bold, but
+    // the next separate typing came out plain. Evernote `utils/mark.ts`
+    // stores the mark for the next input; ProseMirror then takes the marks
+    // of the text before the caret, so continued typing stays bold.
+    let mut editor = EditorCore::for_test("", cx);
+    let catalogue = CommandCatalogue::new();
+    catalogue
+        .execute(EditorCommand::Bold, CommandArgument::None, &mut editor)
+        .unwrap();
+    editor.insert_text("Bold中文928").unwrap();
+    editor.insert_text("CONTINUE").unwrap();
+    for letter in ["x", "y"] {
+        editor.insert_text(letter).unwrap();
+    }
+    let node = editor.document().first_node_id().unwrap();
+    let BlockContent::Text { text, styles } = &editor.document().block(node).unwrap().content
+    else {
+        panic!("text block");
+    };
+    assert_eq!(text, "Bold中文928CONTINUExy");
+    assert_eq!(
+        styles
+            .iter()
+            .map(|run| (run.range.clone(), run.marks.to_vec()))
+            .collect::<Vec<_>>(),
+        vec![(0..text.len(), vec![Mark::Bold])],
+        "every separate typing event stays bold"
+    );
+    assert_eq!(
+        catalogue.state(EditorCommand::Bold, &editor).toggle,
+        ToggleState::On,
+        "the toolbar still shows Bold"
+    );
+}
+
+/// (text, marks) of each styled stretch in block `index`, plain ones too.
+fn styled_segments(editor: &EditorCore, index: usize) -> Vec<(String, Vec<Mark>)> {
+    let BlockContent::Text { text, styles } = &editor.document().blocks()[index].content else {
+        panic!("text block");
+    };
+    let mut cuts = vec![0, text.len()];
+    for run in styles {
+        cuts.extend([run.range.start, run.range.end]);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .map(|pair| {
+            let marks = styles
+                .iter()
+                .find(|run| run.range.start <= pair[0] && pair[1] <= run.range.end)
+                .map(|run| run.marks.to_vec())
+                .unwrap_or_default();
+            (text[pair[0]..pair[1]].to_owned(), marks)
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn pending_bold_on_then_off_covers_separate_typing_events(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("", cx);
+    let catalogue = CommandCatalogue::new();
+    let bold = |editor: &mut EditorCore| {
+        catalogue
+            .execute(EditorCommand::Bold, CommandArgument::None, editor)
+            .unwrap()
+    };
+    bold(&mut editor);
+    editor.insert_text("ab").unwrap();
+    editor.insert_text("中").unwrap();
+    bold(&mut editor);
+    assert_eq!(
+        catalogue.state(EditorCommand::Bold, &editor).toggle,
+        ToggleState::Off
+    );
+    editor.insert_text("cd").unwrap();
+    editor.insert_text("文").unwrap();
+    assert_eq!(
+        styled_segments(&editor, 0),
+        vec![
+            ("ab中".to_owned(), vec![Mark::Bold]),
+            ("cd文".to_owned(), vec![]),
+        ]
+    );
+}
+
+#[gpui::test]
+fn a_pending_mark_ends_when_the_caret_moves_away_and_back(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("ab", cx);
+    editor.set_caret_utf8(1);
+    let catalogue = CommandCatalogue::new();
+    catalogue
+        .execute(EditorCommand::Bold, CommandArgument::None, &mut editor)
+        .unwrap();
+    assert_eq!(
+        catalogue.state(EditorCommand::Bold, &editor).toggle,
+        ToggleState::On
+    );
+    editor.move_right();
+    editor.move_left();
+    assert_eq!(editor.selection().head.utf8_offset, 1);
+    assert_eq!(
+        catalogue.state(EditorCommand::Bold, &editor).toggle,
+        ToggleState::Off
+    );
+    editor.insert_text("X").unwrap();
+    assert_eq!(
+        styled_segments(&editor, 0),
+        vec![("aXb".to_owned(), vec![])]
+    );
+}
+
+#[gpui::test]
+fn a_pending_mark_survives_ime_updates_commit_and_cancel(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::new();
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    catalogue
+        .execute(EditorCommand::Bold, CommandArgument::None, &mut editor)
+        .unwrap();
+    for text in ["n", "ni"] {
+        editor.replace_and_mark_utf16(None, text, None).unwrap();
+    }
+    editor.commit_marked_text("你").unwrap();
+    editor.insert_text("好").unwrap();
+    assert_eq!(
+        styled_segments(&editor, 0),
+        vec![
+            ("前".to_owned(), vec![]),
+            ("你好".to_owned(), vec![Mark::Bold]),
+            ("后".to_owned(), vec![]),
+        ]
+    );
+
+    let mut editor = EditorCore::for_test("前后", cx);
+    editor.set_caret_utf8("前".len());
+    catalogue
+        .execute(EditorCommand::Bold, CommandArgument::None, &mut editor)
+        .unwrap();
+    for text in ["z", ""] {
+        editor.replace_and_mark_utf16(None, text, None).unwrap();
+    }
+    assert_eq!(editor.copy_all_plain_text(), "前后", "cancelled");
+    editor.insert_text("X").unwrap();
+    assert_eq!(
+        styled_segments(&editor, 0),
+        vec![
+            ("前".to_owned(), vec![]),
+            ("X".to_owned(), vec![Mark::Bold]),
+            ("后".to_owned(), vec![]),
+        ],
+        "a cancelled composition keeps the stored mark"
+    );
+}
+
+#[gpui::test]
+fn enter_carries_inclusive_typing_style_into_the_new_paragraph(cx: &mut gpui::TestAppContext) {
+    // Evernote paragraph/keymap.ts insertParagraph: a split at the end keeps
+    // the stored or preceding marks, less non-inclusive ones.
+    let catalogue = CommandCatalogue::new();
+    let mut editor = EditorCore::for_test("ab", cx);
+    editor.set_caret_utf8(2);
+    catalogue
+        .execute(EditorCommand::Bold, CommandArgument::None, &mut editor)
+        .unwrap();
+    editor.insert_text("c").unwrap();
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_text("d").unwrap();
+    editor.insert_text("e").unwrap();
+    assert_eq!(
+        styled_segments(&editor, 1),
+        vec![("de".to_owned(), vec![Mark::Bold])]
+    );
+
+    let mut editor = EditorCore::for_test("ab", cx);
+    let node = editor.document().blocks()[0].id;
+    editor
+        .apply(Transaction::SetLink {
+            selection: Selection::new(DocPoint::new(node, 0), DocPoint::new(node, 2)),
+            url: Some("https://example.test".into()),
+        })
+        .unwrap();
+    editor.set_caret_utf8(2);
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_text("d").unwrap();
+    assert_eq!(styled_segments(&editor, 1), vec![("d".to_owned(), vec![])]);
+}
+
+#[gpui::test]
+fn links_and_code_do_not_extend_at_their_edges(cx: &mut gpui::TestAppContext) {
+    // Evernote's link and code marks are `inclusive: false`.
+    for mark in [Mark::Link("https://example.test".into()), Mark::InlineCode] {
+        let mut editor = EditorCore::for_test("abc", cx);
+        let node = editor.document().blocks()[0].id;
+        editor
+            .apply(match &mark {
+                Mark::Link(url) => Transaction::SetLink {
+                    selection: Selection::new(DocPoint::new(node, 0), DocPoint::new(node, 2)),
+                    url: Some(url.clone()),
+                },
+                _ => Transaction::ToggleMark {
+                    selection: Selection::new(DocPoint::new(node, 0), DocPoint::new(node, 2)),
+                    mark: mark.clone(),
+                },
+            })
+            .unwrap();
+        for (offset, affinity) in [(2, Affinity::Before), (2, Affinity::After)] {
+            editor.set_selection_for_test(Selection::caret(DocPoint::with_affinity(
+                node, offset, affinity,
+            )));
+            editor.insert_text("X").unwrap();
+            editor.undo().unwrap();
+        }
+        editor.set_caret_utf8(2);
+        editor.insert_text("X").unwrap();
+        editor.set_caret_utf8(0);
+        editor.insert_text("S").unwrap();
+        editor.set_caret_utf8(2);
+        editor.insert_text("I").unwrap();
+        assert_eq!(
+            styled_segments(&editor, 0),
+            vec![
+                ("S".to_owned(), vec![]),
+                ("aIb".to_owned(), vec![mark.clone()]),
+                ("Xc".to_owned(), vec![]),
+            ],
+            "{mark:?}: outside at both edges, inside within"
+        );
+    }
 }
