@@ -450,3 +450,33 @@ Codex 审查否定了此前的方案：保留正常字号的前进宽度、只�
 
 **构建说明：** 单独检出 `63a35dfc7` 时 App 编译不过，因为 App 的 `TextRun` 字面量在 `bf02a5381` 中才补上字段。构建请以 `bf02a5381` 为检查点。
 
+### 第十二批补充：审查项的处理与复跑命令
+
+**文字可见性判断（裁剪）：** 已在 `63a35dfc7` 修复。`vendor/gpui/src/text_system/line.rs` 中 `max_glyph_bounds` 的原点改为 `glyph_origin + run_rise`，上移或下移的字形按它实际所在的位置判断是否可见。这一项没有单独的测试，因为测试平台不会光栅化字形。
+
+**装饰线的基线和合并（有意为之，已写入文档，未实机对照）：**
+- 本应用序列化时的嵌套顺序是 `a → mark → s → strong → em → u → sup/sub → code`（app-lite-core `document.rs::serialize_text`），所以 `<u>`/`<s>` 总是 `<sup>`/`<sub>` 的祖先。
+- 按 CSS Text Decoration 的规则，祖先元素的装饰线按祖先盒子的位置绘制，并延伸到 vertical-align 偏移的后代。因此浏览器（也就是 Evernote 的 DOM）显示我们写出的 HTML 时，下划线和删除线在主基线上连续。
+- GPUI 的 `DecorationRun` 只比较颜色和样式，不比较 script，所以跨上下标时合并为连续的一段，画在主基线上，与上述效果一致。
+- 未覆盖的情况：删除线仅作用于上标本身（即 `<sup><s>…</s></sup>`），这种写法我们不会产生。
+- 尚未用 Evernote 实机截图对照。
+
+**复跑命令（源码冻结在 `bf02a5381`，HEAD `dd2114dfc` 之后只改了文档）：**
+
+```sh
+cd packages/app-lite-gpui/vendor/gpui
+CARGO_TARGET_DIR=<独立目录> cargo test --lib --features test-support platform::mac::text_system -- --nocapture
+CARGO_TARGET_DIR=<独立目录> cargo test --lib --features test-support
+cd ../..
+cargo test --bin velotype superscript_is_shaped_smaller table_cells_shape_superscript
+```
+
+| 测试 | 结果 | 日志 |
+| --- | --- | --- |
+| 真实 CoreText（mac text_system，5 项，含两个新的上下标测试） | exit 0，5 通过 | `/tmp/joplin-claude-coretext-script-tests.log`（开头记有提交号和命令） |
+| vendored GPUI lib 全部测试 | exit 0，71 通过、1 忽略 | `/tmp/joplin-claude-gpui-vendor-lib-full.log` |
+| 相邻上下标对照（改回按 CTRun 分配） | 失败：下标字符被当成上标 | `/tmp/joplin-claude-adjacent-script-control.log` |
+| App 几何测试（测试平台的模拟整形） | 通过；对照失败 | `/tmp/joplin-claude-script-shaping-full.log`，`/tmp/joplin-claude-script-shaping-control.log` |
+
+App 全量测试使用的是测试平台的模拟整形，只能说明整条流程确实使用了缩小后的几何，不能证明 CoreText 的实际效果。CoreText 的效果由上面两个 mac 测试直接验证，最终视觉效果以 Codex 的实机验收为准。
+
