@@ -870,3 +870,83 @@ Evernote 的 ENML 用 `<en-codeblock>` 或 `--en-codeblock:true` 表示代码块
 - ENML 中的 `<blockquote>`、粘贴的 blockquote 里含列表的情况，本批都没有改。
 - 引用样式只有浅色主题；两段相邻的独立引用会合并成一段显示。
 - 视觉和实机验收仍需 Codex 完成。
+
+## 第十八批：引用切换（`bd58556a1`）与 ENML、粘贴中的引用（`5d867fbc8`）
+
+### 引用切换（`bd58556a1`）
+
+**Evernote 对应**（common-editor `quoteblock/commands/quoteblock.ts`、`quoteblock/quoteblock.ts` `insertQuoteblockAtSelection`）：
+- `queryCommandValue`：选区的任一范围在引用内（`isRangeInQuoteblock`）时，命令为开启状态；
+- 已在引用内：把选区触及的每一段引用整体解开，内容放回原处（`tr.replaceWith(..., node.content)`）；选区折叠时，光标移到原引用的开头（`firstExtractedPos`）；
+- 不在引用内：选区扩展到整块，内容必须是 `( p | todolist | ol | ul | h )+`（`validContent`），否则返回 false；包裹后选中全部被包裹的内容（`newAnchor = pos + 2`，`newHead = newAnchor + size - 2`）；选区为空时包裹当前块。
+
+**实现：**
+- `Transaction::SetQuote { selection, quote }`：解开时向两侧扩展到整段引用，包裹时扩展到整块及其行内分组；
+- 段落与引用段落互换，标题和列表设置或清除 `quoted`；
+- 一次操作只产生一步撤销（`RestoreBlocks`）；
+- 它属于 `changes_parent` 操作，所以带图片的引用段落（行内分组）会整组包裹或解开；
+- 选区按上面的 Evernote 规则设置。
+
+**命令与界面：**
+- `EditorCommand::Quote` 放在更多菜单中，显示“引用”；
+- 选区内有代码块、表格或独立的块级媒体时，命令禁用；
+- 引用段落改成标题或列表时仍留在引用中；改成普通段落时离开引用，与原来一致。
+
+**编号：** 保存时，引用内的列表和引用外的列表是两个独立列表，所以原生编辑器的有序编号也在引用边界处从 1 重新开始（`layout::crosses_quote_boundary`）。
+
+**测试：**
+- `ui::tests::toolbar_quote_wraps_and_unwraps_whole_quotes_with_history_ime_and_save`：挂载 LibraryShell，通过真实的更多菜单点击（带滚动）依次验证：
+  - 包裹标题、段落和列表，检查导出和选区；
+  - 光标在引用内时解开整段引用，光标回到开头；
+  - Cmd‑Z / Cmd‑Shift‑Z；
+  - IME 组合进行中点击，组合文字先提交再被包裹，从光标包裹后选中整块；
+  - ManualSync 保存后与数据库一致，用新的 NoteSession 重开后一致。
+- `native_editor::tests::quote_toggle_takes_only_quoteblock_content_and_restarts_numbering`：含代码块时命令禁用；带行内图片的引用段落（分组）整体解开并重新包裹；有序列表前两项被引用后的编号为 1, 2, 1。
+- 负控（`/tmp/joplin-claude-quote-toggle-negative-controls.{sh,log}`）：
+  - 解开时只处理选中的块：挂载测试失败；
+  - 去掉编号在引用边界的重新计数：边界测试失败；
+  - 包裹后不设置 Evernote 选区：第一次对照没有失败，因为测试中包裹前后的选区恰好相同，测试不够严。补上“从光标包裹后选中整块”的断言后重跑，挂载测试失败。
+
+### ENML 与粘贴中的引用（`5d867fbc8`）
+
+**Evernote 对应：** `quoteblock/schema.ts` 的 `parseENML` 与 `parseClipboard` 都按 `blockquote` 解析，内容为 `( p | todolist | ol | ul | h )+`。
+
+**ENML：** 此前 `<blockquote>` 会让整篇阻断。现在转为引用容器：
+- div 作为段落，保留行内图片；
+- 带 en-todo 的 div 转为待办；
+- 标题、列表保留；
+- 代码块、表格、嵌套引用阻断。
+
+**粘贴：** 此前含块级子元素（p/div/ul/ol/h）的 blockquote 会被压成一个引用段落，列表和标题丢失。现在转为同样的容器：
+- 引用中的多个段落保持分开，原测试的预期 `quoted<br>second` 相应改为两个引用段落；
+- 只含行内文字的 blockquote 仍是一个引用段落。
+
+**测试：**
+- `enml_convert::evernote_blockquote_imports_as_a_quote_container`：正向，以及代码块、表格、嵌套引用三种阻断；修改前该用例失败，报 `unsupported block <blockquote>`；
+- `document_roundtrip::pasted_blockquote_with_lists_and_headings_becomes_a_quote_container`；
+- `ui::tests::pasted_blockquote_with_a_list_lands_as_a_quote_container_and_saves`：挂载 LibraryShell，走剪贴板粘贴流程，保存后数据库中为容器结构；
+- 负控：去掉 ENML 分支、关闭粘贴容器判断，对应测试都失败（`/tmp/joplin-claude-quote-paths-negative-controls.{sh,log}`）。
+
+**迁移：** JEX 不经过这两条路径，只读审计仍为 1598/69（`audit-quote-paths.log`）。在 HEAD `5d867fbc8` 上：
+- 重新导入：降级 69，blob 全部核对无误（`/tmp/joplin-claude-migration.pLtZsa/import-quote-toggle.log`）；
+- 原生往返：1667 篇，`failure_categories={}`（`/tmp/joplin-claude-quote-toggle-native-roundtrip.log`）。
+
+**全量**（HEAD `5d867fbc8`，均 `--offline --locked`，退出码 0）：
+- App：1494 通过、0 失败、2 忽略（`/tmp/joplin-claude-batch18-gpui-full.log`）；
+- core：33 组共 366 通过、0 失败、1 忽略（`/tmp/joplin-claude-batch18-core-full.log`）。
+
+原 JEX 的 SHA256 仍为 `320f684f…c6cf`。
+
+### 仍未完成或与 Evernote 不同
+
+- Evernote quoteblock 的按键行为（`quoteblock/keymap.ts`）尚未实现：
+  - 引用开头按退格解开整段引用；
+  - 在引用后的段落开头按退格，把该段并入引用；
+  - 在引用内的空段落上按回车或退格，把引用拆成两段；
+  - 在引用前的段落末尾按 Delete，把引用的第一块拉出来。
+
+  现在的行为：引用段落开头按退格只让该段离开引用；空列表项按回车变成引用段落。
+- 本项目用扁平模型：新包裹的块若紧邻已有引用，会并成一段；Evernote 会生成两个相邻的 quoteblock。
+- 旧格式中“段落内含图片”在原生编辑器里本来就拆成“文字块、块级图片、文字块”。在其中一个文字块上包裹时，只包裹该文字块；选区跨过这种独立的块级图片时命令禁用。Evernote 的图片始终在段落内。
+- 没有“引用”的快捷键和工具栏图标（Evernote 在 `typebehind.ts` 中有输入 `>` 触发的规则，也未实现）。
+- 视觉和实机验收仍需 Codex 完成。
