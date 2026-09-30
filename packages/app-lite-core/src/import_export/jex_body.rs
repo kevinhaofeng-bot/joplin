@@ -157,12 +157,31 @@ impl<'a> Converter<'a> {
     }
 
     fn inlines(&mut self, end: TagEnd, marks: Marks, in_link: bool) -> Result<Vec<Inline>> {
+        self.inlines_until(InlineEnd::Tag(end), marks, in_link)
+    }
+
+    fn inlines_until(
+        &mut self,
+        end: InlineEnd,
+        marks: Marks,
+        in_link: bool,
+    ) -> Result<Vec<Inline>> {
         let mut out = Vec::new();
         loop {
             let event = match self.peek() {
-                Some(Event::End(found)) if *found == end => break,
+                Some(Event::End(found)) if end == InlineEnd::Tag(*found) => break,
+                Some(Event::InlineHtml(html))
+                    if matches!(end, InlineEnd::Html(name)
+                        if InlineHtmlTag::parse(html)
+                            .is_some_and(|tag| tag.closing && tag.name == name)) =>
+                {
+                    self.next();
+                    return Ok(out);
+                }
                 // A tight item's text ends where its nested list starts.
-                Some(Event::Start(Tag::List(_))) if end == TagEnd::Item => return Ok(out),
+                Some(Event::Start(Tag::List(_))) if end == InlineEnd::Tag(TagEnd::Item) => {
+                    return Ok(out);
+                }
                 Some(_) => self.next().expect("peeked event exists"),
                 None => {
                     return self.blocked(
@@ -324,6 +343,8 @@ impl<'a> Converter<'a> {
                     });
                 }
                 Event::InlineHtml(html) if is_line_break(&html) => out.push(Inline::SoftBreak),
+                Event::InlineHtml(html)
+                    if self.inline_html(&html, &marks, in_link, &mut out)? => {}
                 Event::Html(_) | Event::InlineHtml(_) | Event::Start(Tag::HtmlBlock) => {
                     return self.blocked(
                         JexBodyBlockerKind::RawHtml,
@@ -338,8 +359,133 @@ impl<'a> Converter<'a> {
                 }
             }
         }
-        self.expect_end(end)?;
+        match end {
+            InlineEnd::Tag(end) => self.expect_end(end)?,
+            InlineEnd::Html(_) => unreachable!("an HTML end returns from the loop"),
+        }
         Ok(out)
+    }
+
+    /// Inline HTML that Evernote parses into marks or an image (common-editor
+    /// textformatter/schema.ts 320-349 for b/strong, i/em, u, s/strike/del,
+    /// sup/sub, mark; link/schema.ts 43-57 takes only `a[href]`, so an id or
+    /// name anchor keeps its text). Returns false for anything else, which
+    /// stays a raw-HTML blocker rather than being dropped.
+    fn inline_html(
+        &mut self,
+        html: &str,
+        marks: &Marks,
+        in_link: bool,
+        out: &mut Vec<Inline>,
+    ) -> Result<bool> {
+        let Some(tag) = InlineHtmlTag::parse(html) else {
+            return Ok(false);
+        };
+        if tag.closing {
+            return Ok(false);
+        }
+        if tag.name == "img" {
+            if in_link && marks.link.is_none() {
+                return self.blocked(
+                    JexBodyBlockerKind::LinkedImage,
+                    "Linked image cannot retain both targets",
+                );
+            }
+            // The strict HTML converter owns image attribute, width and
+            // resource checks, exactly as for an HTML block.
+            let converted = super::jex_html::convert_html_body(
+                self.note_id,
+                self.path,
+                &format!("<p>{}</p>", html.trim()),
+                self.resources,
+            )
+            .map_err(|mut error| {
+                error.kind = JexBodyBlockerKind::RawHtml;
+                error
+            })?;
+            let [Block::Paragraph { inlines, .. }] = converted.document.blocks() else {
+                return Ok(false);
+            };
+            let [
+                Inline::Image {
+                    resource_id,
+                    alt,
+                    display_width,
+                    ..
+                },
+            ] = inlines.as_slice()
+            else {
+                return Ok(false);
+            };
+            self.occurrences
+                .extend(converted.ordered_resource_occurrences);
+            out.push(Inline::Image {
+                resource_id: resource_id.clone(),
+                alt: alt.clone(),
+                display_width: *display_width,
+                link: marks.link.clone(),
+            });
+            return Ok(true);
+        }
+        let mut nested = marks.clone();
+        let name = match tag.name.as_str() {
+            "a" if !tag.attributes.is_empty()
+                && tag
+                    .attributes
+                    .iter()
+                    .all(|attribute| matches!(attribute.as_str(), "id" | "name")) =>
+            {
+                "a"
+            }
+            _ if !tag.attributes.is_empty() => return Ok(false),
+            "b" => {
+                nested.bold = true;
+                "b"
+            }
+            "strong" => {
+                nested.bold = true;
+                "strong"
+            }
+            "i" => {
+                nested.italic = true;
+                "i"
+            }
+            "em" => {
+                nested.italic = true;
+                "em"
+            }
+            "u" => {
+                nested.underline = true;
+                "u"
+            }
+            "s" => {
+                nested.strikethrough = true;
+                "s"
+            }
+            "strike" => {
+                nested.strikethrough = true;
+                "strike"
+            }
+            "del" => {
+                nested.strikethrough = true;
+                "del"
+            }
+            "mark" => {
+                nested.highlight = true;
+                "mark"
+            }
+            "sup" => {
+                nested.script = Some(crate::document::Script::Superscript);
+                "sup"
+            }
+            "sub" => {
+                nested.script = Some(crate::document::Script::Subscript);
+                "sub"
+            }
+            _ => return Ok(false),
+        };
+        out.extend(self.inlines_until(InlineEnd::Html(name), nested, in_link)?);
+        Ok(true)
     }
 
     fn paragraph(&mut self) -> Result<Block> {
@@ -791,6 +937,72 @@ fn strip_bare_document_wrappers(html: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineEnd {
+    Tag(TagEnd),
+    /// The matching closing tag of an inline HTML element.
+    Html(&'static str),
+}
+
+/// One whole HTML tag as CommonMark reports inline HTML: its lowercase name,
+/// whether it closes, and its attribute names. Anything else is not a tag.
+struct InlineHtmlTag {
+    name: String,
+    closing: bool,
+    attributes: Vec<String>,
+}
+
+impl InlineHtmlTag {
+    fn parse(html: &str) -> Option<Self> {
+        let inner = html.trim().strip_prefix('<')?.strip_suffix('>')?;
+        let (closing, inner) = match inner.strip_prefix('/') {
+            Some(rest) => (true, rest),
+            None => (false, inner),
+        };
+        let inner = inner.strip_suffix('/').unwrap_or(inner);
+        let name_end = inner
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(inner.len());
+        let name = inner[..name_end].to_ascii_lowercase();
+        if name.is_empty() {
+            return None;
+        }
+        let mut attributes = Vec::new();
+        let mut rest = inner[name_end..].trim_start();
+        if closing && !rest.is_empty() {
+            return None;
+        }
+        while !rest.is_empty() {
+            let attribute_end = rest
+                .find(|c: char| c == '=' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            let attribute = &rest[..attribute_end];
+            if attribute.is_empty()
+                || !attribute
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+            {
+                return None;
+            }
+            attributes.push(attribute.to_ascii_lowercase());
+            rest = rest[attribute_end..].trim_start();
+            if let Some(value) = rest.strip_prefix('=') {
+                let value = value.trim_start();
+                let consumed = match value.chars().next()? {
+                    quote @ ('"' | '\'') => value[1..].find(quote)? + 2,
+                    _ => value.find(char::is_whitespace).unwrap_or(value.len()),
+                };
+                rest = value[consumed..].trim_start();
+            }
+        }
+        Some(Self {
+            name,
+            closing,
+            attributes,
+        })
+    }
 }
 
 fn is_line_break(html: &str) -> bool {

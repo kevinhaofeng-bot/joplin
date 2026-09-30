@@ -369,7 +369,13 @@ fn failed_second_note_cleans_only_owned_children_and_existing_profile_parent_is_
 fn unsupported_markdown_degrades_to_readable_source_text_with_report() {
     // Plan task 2: a table/raw HTML note imports as readable text and is
     // reported, instead of blocking every other note in the library.
-    let table = note(HTML, "表格", "|A|B|\n|-|-|\n|1|<b>2</b>|", 1, "");
+    let table = note(
+        HTML,
+        "表格",
+        "|A|B|\n|-|-|\n|1|<span class=\"x\">2</span>|",
+        1,
+        "",
+    );
     let plain = note(MD, "普通", "正文", 1, "");
     let source = archive(|tar| {
         append(tar, &format!("{MD}.md"), plain.as_bytes());
@@ -388,7 +394,7 @@ fn unsupported_markdown_degrades_to_readable_source_text_with_report() {
         .unwrap()
         .unwrap()
         .body_text;
-    for visible in ["|A|B|", "|1|<b>2</b>|"] {
+    for visible in ["|A|B|", "|1|<span class=\"x\">2</span>|"] {
         assert!(body.contains(visible), "{visible} in {body:?}");
     }
 }

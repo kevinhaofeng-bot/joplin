@@ -504,6 +504,8 @@ fn embedded_html_converts_only_when_the_strict_html_converter_accepts_it() {
             "<ol>\n<li>一</li>\n<li>二</li>\n</ol>",
             "<ol><li>一</li><li>二</li></ol>",
         ),
+        // Superscript became representable after this test was written.
+        ("上<sup>标</sup>", "<p>上<sup>标</sup></p>"),
     ];
     for (body, html) in cases {
         let converted = convert_jex_note_body(NOTE, "html.md", 1, body, &resources())
@@ -520,11 +522,7 @@ fn embedded_html_converts_only_when_the_strict_html_converter_accepts_it() {
         converted.ordered_resource_occurrences,
         vec![ResourceId::new(TARGET_IMAGE).unwrap()]
     );
-    for body in [
-        "<font color=\"red\">红</font>",
-        "上<sup>标</sup>",
-        "<script>alert(1)</script>",
-    ] {
+    for body in ["<font color=\"red\">红</font>", "<script>alert(1)</script>"] {
         assert!(
             convert_jex_note_body(NOTE, "html.md", 1, body, &resources()).is_err(),
             "body={body}"
@@ -938,4 +936,72 @@ fn gfm_tables_convert_with_header_inline_content_and_resource_images() {
         ),
         Err(error) if error.kind == JexBodyBlockerKind::UnsupportedImageSource
     ));
+}
+
+#[test]
+fn inline_html_maps_to_evernote_marks_anchors_and_resized_images() {
+    // Joplin Markdown mixes inline HTML into paragraphs. Evernote parses
+    // b/strong, i/em, u, s/strike/del, mark and sup/sub into marks
+    // (textformatter/schema.ts 320-349) and takes only `a[href]` as a link
+    // (link/schema.ts 43-57), so an id anchor keeps its text.
+    let body = format!(
+        "H<sub>2</sub>O x<sup>**2**</sup> <del>旧</del> <u>下</u> <mark>亮</mark> <a id=\"锚\">目录</a><a name=\"n\"></a> [外](https://example.com) 前<img width=\"120\" height=\"80\" src=\":/{IMAGE}\"/>后"
+    );
+    let converted = convert_jex_note_body(NOTE, "inline.md", 1, &body, &resources())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.canonical_html,
+        format!(
+            "<p>H<sub>2</sub>O x<strong><sup>2</sup></strong> <s>旧</s> <u>下</u> <mark>亮</mark> 目录 <a href=\"https://example.com\">外</a> 前<img src=\":/{TARGET_IMAGE}\" alt=\"\" data-joplin-lite-display-width=\"120\">后</p>"
+        )
+    );
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        converted.document
+    );
+    assert_eq!(
+        converted.ordered_resource_occurrences,
+        vec![ResourceId::new(TARGET_IMAGE).unwrap()]
+    );
+
+    // Still blocked, never silently dropped: other tags or attributes,
+    // mis-nesting, an unclosed tag, and an image that is not a verified
+    // resource image.
+    for (body, kind) in [
+        (
+            "<span class=\"x\">字</span>".to_owned(),
+            JexBodyBlockerKind::RawHtml,
+        ),
+        (
+            "<sup style=\"color:red\">字</sup>".to_owned(),
+            JexBodyBlockerKind::RawHtml,
+        ),
+        (
+            "<a id=\"x\" href=\"https://e.com\">字</a>".to_owned(),
+            JexBodyBlockerKind::RawHtml,
+        ),
+        (
+            "<b>一<i>二</b>三</i>".to_owned(),
+            JexBodyBlockerKind::RawHtml,
+        ),
+        (
+            "<sup>未闭合".to_owned(),
+            JexBodyBlockerKind::UnsupportedStructure,
+        ),
+        (
+            "<img src=\"https://example.com/a.png\">".to_owned(),
+            JexBodyBlockerKind::RawHtml,
+        ),
+        (
+            format!("<img src=\":/{PDF}\">"),
+            JexBodyBlockerKind::RawHtml,
+        ),
+        (
+            format!("[<img src=\":/{IMAGE}\">](:/{PDF})"),
+            JexBodyBlockerKind::LinkedImage,
+        ),
+    ] {
+        let error = convert_jex_note_body(NOTE, "bad.md", 1, &body, &resources()).unwrap_err();
+        assert_eq!(error.kind, kind, "{body}");
+    }
 }
