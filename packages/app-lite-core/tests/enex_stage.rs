@@ -408,3 +408,34 @@ fn missing_attachment_data_leaves_a_visible_placeholder_and_a_report() {
     assert!(html.contains("附件缺失"), "{html}");
     assert!(html.contains("<img"), "{html}");
 }
+
+/// An Evernote code block (codeblock/schema.ts parseENML) imports as a code
+/// block with its syntaxLanguage and its attachment, not as flattened text,
+/// and the note is not reported as degraded.
+#[test]
+fn evernote_code_block_imports_with_language_and_attachment() {
+    let parent = tempdir().unwrap();
+    let bytes = b"code-image";
+    let hash = format!("{:x}", Md5::digest(bytes));
+    let xml = format!(
+        "<en-export><note><title>代码</title><content><![CDATA[<en-note><div style=\"--en-codeblock:true; --en-syntaxLanguage:python\"><div>def f():</div><div>  return 1<en-media hash=\"{hash}\" type=\"image/png\"/></div></div></en-note>]]></content>{}</note></en-export>",
+        resource(bytes, "image/png", "code.png"),
+    );
+    let source = archive(&xml);
+    let stage = stage_enex_file(source.path(), parent.path()).unwrap();
+    assert!(stage.report().degraded_notes.is_empty());
+    let db = rusqlite::Connection::open(stage.profile_path().join("library.sqlite")).unwrap();
+    let html: String = db
+        .query_row("SELECT body_html FROM notes", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        html.starts_with(
+            "<pre data-joplin-lite-block-code=\"true\" data-language=\"python\">def f():<br>&nbsp;&nbsp;return 1<img src=\":/"
+        ),
+        "{html}"
+    );
+    let attached: i64 = db
+        .query_row("SELECT count(*) FROM note_resources", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(attached, 1);
+}

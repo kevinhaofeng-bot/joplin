@@ -282,3 +282,50 @@ fn evernote_superscript_and_subscript_are_kept() {
         "<p>H<sub>2</sub>O x<sup>2上</sup><sub>下</sub></p>"
     );
 }
+
+#[test]
+fn evernote_code_blocks_keep_language_lines_and_resources() {
+    // common-editor codeblock/schema.ts parseENML: `div[style*="codeblock"]`
+    // whose --en-codeblock is true (or white-space pre* with a monospace
+    // font), and `pre`; the content is plain text lines (plaintext nodes
+    // carry no marks) and syntaxLanguage comes from --en-syntaxLanguage.
+    let enml = format!(
+        r#"<en-note><div style="box-sizing: border-box; --en-codeblock:true; --en-syntaxLanguage:rust; font-family: monospace"><div>fn main() {{</div><div>    <span style="color:red"><b>x</b></span>();</div><div><br/></div><div>图<en-media hash="{IMAGE_MD5}" type="image/png"/></div><div>}}</div></div><div style="-en-codeblock:true">a<br/>b</div><div style="--en-codeblock:false; white-space: pre-wrap; font-family: Menlo, monospace">单行</div><pre>预&lt;格式&gt;</pre><div>后</div></en-note>"#
+    );
+    let result = convert_enml(&enml, &resources()).unwrap();
+    assert_eq!(
+        result.html.as_str(),
+        format!(
+            "<pre data-joplin-lite-block-code=\"true\" data-language=\"rust\">fn main() {{<br>&nbsp;&nbsp;&nbsp;&nbsp;x();<br><br>图<img src=\":/{IMAGE_ID}\" alt=\"图.png\"><br>}}</pre><pre data-joplin-lite-block-code=\"true\">a<br>b</pre><pre data-joplin-lite-block-code=\"true\">单行</pre><pre data-joplin-lite-block-code=\"true\">预&lt;格式&gt;</pre><p>后</p>"
+        )
+    );
+    assert_eq!(
+        result.resource_ids,
+        vec![ResourceId::new(IMAGE_ID).unwrap()]
+    );
+    // Indentation survives, as the canonical model keeps visible spaces
+    // (document.rs nbsp_tabs_and_newlines_have_deterministic_visible_model_forms).
+    let Block::Code { inlines, .. } = &result.document.blocks()[0] else {
+        panic!("code block");
+    };
+    assert!(inlines.iter().any(|inline| matches!(
+        inline,
+        app_lite_core::document::Inline::Text { text, .. } if text == "\u{a0}\u{a0}\u{a0}\u{a0}x();"
+    )));
+
+    // Not a code block without "codeblock" in its style; a language that is
+    // not one name, or block structure inside, blocks instead of flattening.
+    let monospace =
+        r#"<en-note><div style="white-space: pre; font-family: monospace">x</div></en-note>"#;
+    assert_eq!(
+        convert_enml(monospace, &resources()).unwrap().html.as_str(),
+        "<p>x</p>"
+    );
+    for enml in [
+        r#"<en-note><div style="--en-codeblock:true; --en-syntaxLanguage:rust ignore">x</div></en-note>"#,
+        r#"<en-note><div style="--en-codeblock:true"><table><tr><td>x</td></tr></table></div></en-note>"#,
+        r#"<en-note><div style="--en-codeblock:true"><ul><li>x</li></ul></div></en-note>"#,
+    ] {
+        assert!(convert_enml(enml, &resources()).is_err(), "{enml}");
+    }
+}

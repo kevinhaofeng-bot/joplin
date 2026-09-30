@@ -342,6 +342,10 @@ impl RenderContext<'_> {
                 out.push_str("</p>");
                 Ok(())
             }
+            Child::Element(element) if element.name == "pre" || enml_code_block(element) => {
+                self.attrs(element, &[], path)?;
+                self.code_block(element, path, out)
+            }
             Child::Element(element) => match element.name.as_str() {
                 "div" | "p" | "h1" | "h2" | "h3" => {
                     self.attrs(element, &[], path)?;
@@ -726,6 +730,95 @@ impl RenderContext<'_> {
         }
         Ok(())
     }
+    /// Evernote's code block (common-editor codeblock/schema.ts): its content
+    /// is plain text lines, one per child div or `<br>`, without marks. Its
+    /// syntaxLanguage is kept. Evernote reduces an en-media inside to text;
+    /// here the resource is kept in place instead of being lost.
+    fn code_block(
+        &mut self,
+        element: &Element,
+        path: &str,
+        out: &mut String,
+    ) -> Result<(), EnmlFidelityBlocker> {
+        let language = en_style_attribute(element.attrs.get("style"), "syntaxLanguage");
+        if language
+            .as_deref()
+            .is_some_and(|language| !crate::document::valid_code_language(language))
+        {
+            return Err(blocked(
+                path,
+                "code block language is not one language name",
+            ));
+        }
+        let mut lines = CodeLines::default();
+        for (i, child) in element.children.iter().enumerate() {
+            self.code_content(child, &format!("{path}/{i}"), &mut lines)?;
+        }
+        lines.end_line();
+        out.push_str("<pre data-joplin-lite-block-code=\"true\"");
+        if let Some(language) = language {
+            out.push_str(" data-language=\"");
+            escape(&language, out);
+            out.push('"');
+        }
+        out.push('>');
+        out.push_str(&lines.done.join("<br>"));
+        out.push_str("</pre>");
+        Ok(())
+    }
+
+    fn code_content(
+        &mut self,
+        child: &Child,
+        path: &str,
+        lines: &mut CodeLines,
+    ) -> Result<(), EnmlFidelityBlocker> {
+        let element = match child {
+            // Indentation between line divs, not code text.
+            Child::Text(text) if text.contains('\n') && is_xml_formatting_whitespace(text) => {
+                return Ok(());
+            }
+            Child::Text(text) => {
+                escape(text, &mut lines.current);
+                lines.has_content = true;
+                return Ok(());
+            }
+            Child::Element(element) => element,
+        };
+        match element.name.as_str() {
+            "br" => {
+                self.attrs(element, &[], path)?;
+                lines.break_line();
+            }
+            "en-media" => {
+                self.media(element, path, &mut lines.current, true)?;
+                lines.has_content = true;
+            }
+            "div" | "p" => {
+                self.attrs(element, &[], path)?;
+                lines.end_line();
+                for (i, item) in element.children.iter().enumerate() {
+                    self.code_content(item, &format!("{path}/{i}"), lines)?;
+                }
+                lines.end_line();
+            }
+            "span" | "font" | "b" | "strong" | "i" | "em" | "u" | "s" | "strike" | "del"
+            | "mark" | "sup" | "sub" | "code" | "a" => {
+                self.attrs(element, &["href"], path)?;
+                for (i, item) in element.children.iter().enumerate() {
+                    self.code_content(item, &format!("{path}/{i}"), lines)?;
+                }
+            }
+            name => {
+                return Err(blocked(
+                    path,
+                    format!("unsupported <{name}> inside a code block"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn attrs(
         &self,
         element: &Element,
@@ -742,6 +835,69 @@ impl RenderContext<'_> {
         }
         Ok(())
     }
+}
+
+/// Plain text lines of a code block, as canonical HTML fragments.
+#[derive(Default)]
+struct CodeLines {
+    done: Vec<String>,
+    current: String,
+    has_content: bool,
+}
+
+impl CodeLines {
+    fn break_line(&mut self) {
+        self.done.push(std::mem::take(&mut self.current));
+        self.has_content = false;
+    }
+
+    /// A block boundary ends a line only if it holds something since the
+    /// last break, like `<div>a<br></div>` giving one line.
+    fn end_line(&mut self) {
+        if self.has_content {
+            self.break_line();
+        }
+    }
+}
+
+/// An Evernote `--en-<name>` style attribute (common-editor utils/schema.ts
+/// getAttributesFromStyle, which also accepts a single-dash `-en-`).
+fn en_style_attribute(style: Option<&String>, name: &str) -> Option<String> {
+    style?.split(';').find_map(|declaration| {
+        let (property, value) = declaration.split_once(':')?;
+        let property = property.trim();
+        let property = property
+            .strip_prefix("--en-")
+            .or_else(|| property.strip_prefix("-en-"))?;
+        (property == name).then(|| value.trim().to_owned())
+    })
+}
+
+/// codeblock/schema.ts parseENML: `div[style*="codeblock"]` that is either
+/// marked `codeblock: true` or white-space pre/pre-wrap/pre-line with a
+/// monospace font family.
+fn enml_code_block(element: &Element) -> bool {
+    let Some(style) = element.attrs.get("style") else {
+        return false;
+    };
+    if element.name != "div" || !style.contains("codeblock") {
+        return false;
+    }
+    if en_style_attribute(Some(style), "codeblock").as_deref() == Some("true") {
+        return true;
+    }
+    let declaration = |name: &str| {
+        style.split(';').find_map(|declaration| {
+            let (property, value) = declaration.split_once(':')?;
+            property
+                .trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_ascii_lowercase())
+        })
+    };
+    declaration("white-space")
+        .is_some_and(|value| matches!(value.as_str(), "pre" | "pre-wrap" | "pre-line"))
+        && declaration("font-family").is_some_and(|value| value.contains("monospace"))
 }
 
 /// Attributes Evernote writes for appearance only. The canonical document has
