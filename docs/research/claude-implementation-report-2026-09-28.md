@@ -22,6 +22,8 @@
 | 第八批：列表视图与排序持久化 | 按 Evernote 行为实现 | `main-readable/src/modules/51244__get-string-user-setting.js` 153/183/297/309 行（GLOBAL/NOTEBOOKS/STACKS/TRASH_NOTE_VIEW_OPTIONS_KEY）、234/237 行（SEARCH_SORT_PREFERENCE_GLOBAL/_NOTEBOOK）；renderer `9435.js` 31827–31851（四个持久化存储）、33039–33048（先写全局再写当前上下文）、62691–62739（有上下文设置时用它，否则用全局） |
 | 第九批：可读恢复的中文错误 | 本项目自有 UI 修复（可读导出是自托管功能） | 无 |
 | 启动内存峰值 | 调查，未改代码 | 无 |
+| 第十批：上下标数据通路 | 按 Evernote 源码实现 | `common-editor/.../textformatter/schema.ts` 346–349（解析 `sub`/`sup` 标签及 `vertical-align`）、614–633（两者 `excludes` 互斥，输出 `<sub>`/`<sup>`）；`textformatter/keymap.ts` 22–23（Ctrl-Cmd-= / Ctrl-Cmd--）；`64482__localization-catalog.js` 的 `FormattingBar.superscript`/`subscript` |
+| 第十一批：光标处的输入样式（evidence54） | 按 Evernote 源码实现 | `utils/mark.ts` 220–247（`toggleMark`：选区中任一处有该格式即全部移除，否则全部添加；光标处改待输入格式）；`textformatter/commands/boolformat.ts`；`link/schema.ts:62` 与 `textformatter/schema.ts:380`（链接、代码 `inclusive: false`）；`paragraph/keymap.ts` 102–130 与 `list/keymap.ts` 428（回车带入样式）。光标格式的解析规则按 ProseMirror `ResolvedPos.marks()`，这是 Evernote 编辑器所用的库 |
 
 ## 第一批：正文文档首尾跳转（`aae2684c1`）
 
@@ -357,4 +359,65 @@ Codex 复核发现 18b57b1cd 的措辞有两处不准确：
 测试增加了两个场景：历史文件被改写，以及 manifest 版本改为 999。历史被改写时，提示中不得出现“格式或版本”。
 
 对照：用 18b57b1cd 的措辞运行新测试，失败于写坏 manifest 的场景（`/tmp/joplin-claude-restore-message-narrow-red.log`）。全量测试 1470 通过（`/tmp/joplin-claude-restore-message-narrow-full.log`）。
+
+## 第十批：上下标的数据通路（`9704f7221`，以及 `7acfa24af` 中的编辑器部分）
+
+核心格式新增上下标：`Marks.script: Option<Script>`，用类型保证上标和下标互斥。
+
+- 存储为 `<sup>`/`<sub>`；嵌套时内层生效；粘贴的 HTML 中 `vertical-align: super/sub` 会被识别；ENML 和 JEX HTML 导入会保留它们，不再拒绝或压平。
+- 旧 HTML 的解析和序列化结果不变。反向兼容的风险：旧版应用读到新数据时会保留文字，但丢失上下标。
+- 编辑器侧：新增 `Mark::Superscript`/`Subscript`；编解码双向映射；切换其中一个会移除另一个；`from_blocks` 拒绝同时含两者的片段，而 `StyledRun::new` 会规范化为只保留上标；“更多”菜单中加入“上标”“下标”，快捷键 Ctrl-Cmd-= 和 Ctrl-Cmd--。
+
+**尚未完成（不能标记为通过）：**
+- 基线的上移、下移还没有绘制，现在显示为普通文字；
+- 命中测试、光标和选区与视觉效果的一致性待渲染完成后验证；
+- 表格单元格的绘制尚未处理上下标；
+- 跨设备同步测试（A → 服务器 → B → 编辑 → A → 重新打开）尚未补。
+
+测试：
+- core：`superscript_and_subscript_round_trip_and_exclude_each_other`、`evernote_superscript_and_subscript_are_kept`，并把原先断言 `<sub>` 被拒绝的用例改为 `<q>`；
+- gpui：编解码往返测试扩展到上下标；`superscript_and_subscript_exclude_each_other_and_undo_in_one_step`；`a_run_never_keeps_both_script_marks`（构造函数规范化与原始片段拒绝两个约定都覆盖）。
+
+## 第十一批：光标处的输入样式（evidence54，`7acfa24af`）
+
+**根因：** 输入后光标的 affinity 被设为 `After`，而旧的 `insertion_marks` 在 `After` 时只看光标之后开始的片段。所以在粗体片段末尾连续输入时，第二次输入不继承格式。这不只影响待输入样式，在已有粗体文字末尾连续打字也会从第二个字起丢失粗体。
+
+**修复：** 光标处的格式改按 ProseMirror `ResolvedPos.marks()` 的规则解析：
+- 位于片段内部时，取该片段的格式；
+- 位于边界时，取前一段文字的格式（位于块首时取后一段）；
+- 链接和代码是非 inclusive 的格式，除非两侧都有，否则不延续。
+
+同一批中其余按 Evernote 源码实现的内容：
+- **格式切换：** 选区中任一处带有该格式，就在整个选区移除，否则整体添加，跨段落同样适用（此前是逐段判断）。
+- **光标处的待输入格式：** 光标折叠时切换格式，只记录下一次输入要用的格式，不修改文档。它由 `EditorCore` 管理：光标移到其他位置（包括只改变 affinity）即清除；输入法组合的更新、提交、取消过程中都保留；同一位置插入时采用。所有选区赋值都统一经过 `set_selection`。
+- **回车：** 在段落末尾回车，或在列表项开头之后回车，新块会带入前面的 inclusive 格式（或待输入格式）。标题不带入。
+
+**两条旧测试改为 Evernote 语义：**
+- `collapsed_caret_state_and_insertion_share_one_mark_rule`：在粗体文字之前的块首位置、以及粗体文字末尾（affinity 为 After），都延续粗体；
+- `journal_checkpoint...`：在链接之后输入的字不在链接内，但保留粗体和斜体，日志记录的仍是一小段局部变化。
+
+**新增测试：**
+- `pending_bold_keeps_applying_to_separate_typing_events`：复现 evidence54，分多次独立输入；
+- `pending_bold_on_then_off_covers_separate_typing_events`：开、输入两次、关、再输入两次；
+- `a_pending_mark_ends_when_the_caret_moves_away_and_back`；
+- `a_pending_mark_survives_ime_updates_commit_and_cancel`；
+- `enter_carries_inclusive_typing_style_into_the_new_paragraph`：带入粗体，不带入链接；
+- `links_and_code_do_not_extend_at_their_edges`：两种 affinity 下，在左右边界都不延续，在片段内部延续；
+- `a_mark_toggle_removes_it_everywhere_when_any_selected_text_has_it`：区分 ANY 与 ALL 两种规则；
+- 挂载测试 `mounted_cmd_b_in_an_empty_body_bolds_every_later_typing_event`：真实按键 Cmd-B，分两次输入“Bold中文928”和“CONTINUE”，再 Cmd-B 后输入 x、y，数据库中为 `<p><strong>Bold中文928CONTINUE</strong>xy</p>`。
+
+| 命令 | 结果 | 日志 |
+| --- | --- | --- |
+| 修复前的复现测试 | 前 13 字节为粗体，CONTINUE 为普通文字 | `/tmp/joplin-claude-pending-bold-red.log` |
+| 对照：临时换回旧 affinity 规则 | 3 项新测试全部失败 | `/tmp/joplin-claude-pending-bold-control.log` |
+| 全量 gpui / core / native | 1480 / 352 / 225 通过，均为 0 失败 | `/tmp/joplin-claude-pending-style-full2.log` 等 |
+
+**过程说明：** 对照是在共享的 `.shared-target` 中临时替换源码后运行的。Codex 在同一秒（22:15:37）的独立运行因此用到了对照版本，日志 `/tmp/joplin-codex-resume-pending-bold.log` 中的失败值与对照完全一致。源码随即恢复，复查 `/tmp/joplin-claude-pending-bold-recheck.log` 通过。之后的对照改用独立副本和单独的 `CARGO_TARGET_DIR`，并在 Codex 测试或打包期间冻结源码。
+
+**已知与 Evernote 不同的地方：**
+- 待输入格式只在光标折叠且位于文字块时生效；
+- 输入法取消后，待输入格式仍保留；Evernote 在这种情况下的行为尚未做实机对照；
+- 真实拼音输入法下的行为仍需实机验证。
+
+**可供构建的源码检查点：** `7acfa24af`。
 
