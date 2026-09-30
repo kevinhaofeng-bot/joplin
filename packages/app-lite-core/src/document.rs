@@ -991,64 +991,57 @@ fn serialize_text(
     index: usize,
     output: &mut String,
 ) {
-    if let Some(link) = marks.link.as_deref() {
-        output.push_str("<a href=\"");
-        escape_attribute(link, output);
-        output.push_str("\">");
-    }
-    if marks.highlight {
-        output.push_str("<mark>");
-    }
-    if marks.strikethrough {
-        output.push_str("<s>");
-    }
-    if marks.bold {
-        output.push_str("<strong>");
-    }
-    if marks.italic {
-        output.push_str("<em>");
-    }
-    if marks.underline {
-        output.push_str("<u>");
-    }
     let script = marks.script.map(|script| match script {
         Script::Superscript => "sup",
         Script::Subscript => "sub",
     });
-    if let Some(tag) = script {
-        output.push('<');
-        output.push_str(tag);
-        output.push('>');
-    }
-    if marks.inline_code {
-        output.push_str("<code>");
+    let link = marks.link.is_some().then_some("a");
+    let tags: Vec<&str> = match script {
+        // Evernote nests the link, strikethrough and underline inside the
+        // script mark (common-editor apps/peso/schema.ts marks order), so they
+        // follow the raised or lowered text.
+        Some(script) => [
+            marks.highlight.then_some("mark"),
+            marks.bold.then_some("strong"),
+            marks.italic.then_some("em"),
+            Some(script),
+            link,
+            marks.strikethrough.then_some("s"),
+            marks.underline.then_some("u"),
+            marks.inline_code.then_some("code"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        None => [
+            link,
+            marks.highlight.then_some("mark"),
+            marks.strikethrough.then_some("s"),
+            marks.bold.then_some("strong"),
+            marks.italic.then_some("em"),
+            marks.underline.then_some("u"),
+            marks.inline_code.then_some("code"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    };
+    for tag in &tags {
+        if *tag == "a" {
+            output.push_str("<a href=\"");
+            escape_attribute(marks.link.as_deref().unwrap_or_default(), output);
+            output.push_str("\">");
+        } else {
+            output.push('<');
+            output.push_str(tag);
+            output.push('>');
+        }
     }
     escape_text_run(text, inlines, index, output);
-    if marks.inline_code {
-        output.push_str("</code>");
-    }
-    if let Some(tag) = script {
+    for tag in tags.iter().rev() {
         output.push_str("</");
         output.push_str(tag);
         output.push('>');
-    }
-    if marks.underline {
-        output.push_str("</u>");
-    }
-    if marks.italic {
-        output.push_str("</em>");
-    }
-    if marks.bold {
-        output.push_str("</strong>");
-    }
-    if marks.strikethrough {
-        output.push_str("</s>");
-    }
-    if marks.highlight {
-        output.push_str("</mark>");
-    }
-    if marks.link.is_some() {
-        output.push_str("</a>");
     }
 }
 

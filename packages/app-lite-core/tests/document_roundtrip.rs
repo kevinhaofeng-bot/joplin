@@ -414,3 +414,31 @@ fn superscript_and_subscript_round_trip_and_exclude_each_other() {
     );
     let _ = Marks::default();
 }
+
+#[test]
+fn script_text_nests_link_and_decorations_inside_like_evernote() {
+    // Evernote registers subscript/superscript before link, strikethrough and
+    // underline (common-editor apps/peso/schema.ts marks, "the order here is
+    // significant"), so they nest inside <sup>/<sub> and follow its text.
+    let written = "<p>x<sup><a href=\"https://example.test\"><s><u>2</u></s></a></sup></p>";
+    let parsed = CanonicalDocument::parse_html(written).unwrap();
+    assert_eq!(parsed.to_canonical_html().as_str(), written);
+    // The earlier order reads as the same marks and is written the new way.
+    let earlier = "<p>x<a href=\"https://example.test\"><s><u><sup>2</sup></u></s></a></p>";
+    assert_eq!(
+        CanonicalDocument::parse_html(earlier)
+            .unwrap()
+            .to_canonical_html()
+            .as_str(),
+        written
+    );
+    // Text without a script mark keeps its exact earlier form.
+    let plain = "<p><a href=\"https://example.test\"><s><strong><u>x</u></strong></s></a></p>";
+    assert_eq!(
+        CanonicalDocument::parse_html(plain)
+            .unwrap()
+            .to_canonical_html()
+            .as_str(),
+        plain
+    );
+}

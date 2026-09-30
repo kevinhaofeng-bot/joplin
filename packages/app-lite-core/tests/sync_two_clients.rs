@@ -695,3 +695,50 @@ fn a_notebook_deleted_on_one_device_leaves_its_notes_in_trash_on_both() {
         }
     }
 }
+
+/// Superscript and subscript, with an underline inside the superscript as
+/// Evernote nests it, survive A -> server -> B -> edit -> A -> reopen.
+#[test]
+fn superscript_and_subscript_survive_a_round_trip_through_another_device() {
+    let (_server_root, store) = server();
+    let a = client();
+    let html = "<p>E=mc<sup><u>2</u></sup> and H<sub>2</sub>O</p>";
+    let note = a
+        .repo
+        .create_note(CreateNote {
+            title: "公式".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html(html).unwrap(),
+        })
+        .unwrap();
+    assert_eq!(note.body_html, html);
+    sync(&a, &store);
+
+    let b = client();
+    sync(&b, &store);
+    let received = b.repo.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(received.body_html, html);
+    let edited = "<p>E=mc<sup><u>2</u></sup> and H<sub>2</sub>O, edited on B</p>";
+    b.repo
+        .save_note(SaveNote {
+            id: note.id.clone(),
+            expected_revision: received.revision,
+            title: received.title,
+            document: CanonicalDocument::parse_html(edited).unwrap(),
+            resource_ids: vec![],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    sync(&b, &store);
+    sync(&a, &store);
+
+    let path = a._root.path().join("library.sqlite");
+    let root = a._root;
+    drop(a.repo);
+    let reopened = LibraryRepository::open(path).unwrap();
+    assert_eq!(
+        reopened.load_note(&note.id).unwrap().unwrap().body_html,
+        edited
+    );
+    drop(root);
+}
