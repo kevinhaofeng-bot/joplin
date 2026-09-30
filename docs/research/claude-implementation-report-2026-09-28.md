@@ -790,3 +790,83 @@ Evernote 的 ENML 用 `<en-codeblock>` 或 `--en-codeblock:true` 表示代码块
 - 迁移的视觉验收（图文、列表、表格、附件、长文）仍未做；
 - 71 篇降级的可接受性，由 Codex 结合原文逐篇判断。
 
+
+## 第十七批：ENEX 代码块（`2f848a980`）与容器型引用（`39cd18525`）
+
+### ENEX 代码块（`2f848a980`）
+
+**Evernote 对应**（common-editor `codeblock/schema.ts`）：
+- parseENML 的两条规则：
+  - `div[style*="codeblock"]`，并且满足以下之一：`--en-codeblock` 为 true；或 `white-space` 为 `pre`/`pre-wrap`/`pre-line` 且字体族含 `monospace`；
+  - `<pre>`。
+- 内容由 `getContent` 取纯文本并按行拆分（`plaintext` 节点 `marks: ''`，不带格式）。
+- `syntaxLanguage` 由 `--en-syntaxLanguage` 给出。`utils/schema.ts` 的 `getAttributesFromStyle` 也接受单横线的 `-en-`。
+
+**修复前：** 多行代码块报 `unsupported inline <div>`，整篇阻断；单个 div 形式的代码块变成普通段落，代码块语义被静默丢失。
+
+**实现**（`enml.rs`）：
+- 按上述规则识别代码块；
+- 子 div、`<br>` 按行分隔，空行和缩进都保留（canonical 模型用 NBSP 表示需要保留的空格）；
+- 行内格式按 Evernote 规则去掉；
+- 语言必须是单个语言名，否则阻断；
+- 代码块内的表格、列表等块结构阻断。
+- 有意与 Evernote 不同的一点：Evernote 会把代码块里的 en-media 压成纯文本，这里保留资源，不静默丢弃。
+
+**测试：**
+- `enml_convert::evernote_code_blocks_keep_language_lines_and_resources`：
+  - 正向：双横线、单横线、false 加等宽字体、`<pre>`、语言、行结构与缩进、格式去除、资源保留；
+  - 负向：style 中没有 codeblock 字样的等宽 div 仍是段落；多词语言、表格、列表阻断。
+- `enex_stage::evernote_code_block_imports_with_language_and_attachment`：ENEX 整条导入链路，笔记不降级，`note_resources` 有 1 条。
+- 负控：关闭识别后测试失败（`/tmp/joplin-claude-enml-codeblock-negative-control.{sh,log}`）。
+- core 全量 361 通过。
+- JEX 迁移不走 ENML 路径，只读审计仍为 1596/71（`audit-enml-codeblock.log`）。没有可用的真实 ENEX 源，所以没有 ENEX 迁移计数。
+
+### 容器型引用（`39cd18525`）
+
+**Evernote 对应：**
+- `quoteblock/schema.ts` 14 行：`content: '( p | todolist | ol | ul | h ) +'`，quoteblock 不能包含 quoteblock、代码块或表格；
+- `quoteblock.ts`：加引用时把选中的 p/列表/标题整体包进去，在引用内再次切换则把整块引用解开；
+- 样式来自 `ce.css`：`blockquote { border-left: var(--spacing-0-25) solid var(--color-icon-fill-tertiary-enabled); padding-left: var(--spacing-2) }`，浅色主题取值为 2px、`#4e4d4c`（`body` 下为 grey‑30）、16px。
+
+**canonical（core）：**
+- `BlockStyle.quoted` 标记位于引用内的标题或列表项；引用内的段落仍用 `Block::Quote`；代码块等不能带这个标记，规范化时清除。
+- 序列化：一段连续的引用块中只要含有标题或列表，就整体写成 `<blockquote data-joplin-lite-quote-container="true">`，子元素为 p/h/ul/ol。只有段落的引用保持原来的逐段形式，逐字节不变。
+- 列表不会跨越引用边界，内外混合的列表会拆开；引用内外的同类列表不会合并。
+- 解析时，容器子元素按常规解析，结束时统一标记。
+
+**JEX：** 引用中的段落、标题、列表组成容器；嵌套引用、代码块、表格、分隔线、块级媒体仍阻断。
+
+**原生编辑器：**
+- `Block.quoted` 与 alignment 一样，随拆分、合并、粘贴、撤销和重做传递；
+- 引用内的标题或列表项改变类型时仍留在引用中：在空列表项上按回车或退格，会变成引用段落；
+- 引用段落设为普通段落时离开引用，与原来一致；
+- 引用块向右缩进 18px，并画 2px 竖线，相邻的引用块连成一条。
+
+**测试：**
+- core：
+  - `quote_container_round_trips_and_holds_only_quoteblock_content`：往返；只含段落的容器写回逐段形式；容器内的代码块移到引用外；混合列表拆开；
+  - `quote_with_lists_and_headings_becomes_one_quote_container`；
+  - 原测试中“引用内含列表或标题必须阻断”的两个样例，现在是本次支持的内容，改为代码块、嵌套引用、分隔线、表格四个仍应阻断的样例。
+- gpui：
+  - `quote_container_edits_keep_lists_and_headings_inside_the_quote`：导入时各块的 `quoted` 正确；引用列表中回车产生引用内的新项；空项回车变为引用段落；撤销和重做；重开；布局左移 18px；
+  - `ui::tests::quote_container_note_edits_save_and_reopen`：挂载 LibraryShell，编辑后经 ManualSync 写入资料库，再用新的 NoteSession 重开，结构一致。
+- 负控（`/tmp/joplin-claude-quote-negative-controls.{sh,log}`）：JEX 不标记引用、原生改类型时丢掉引用、codec 导入时丢掉 `quoted`，三种情况下对应测试都失败。
+
+**迁移（隔离副本，源 SHA256 `320f684f…c6cf` 未变）：**
+
+| 项目 | 结果 | 日志 |
+|---|---|---|
+| 只读审计 | 严格通过 1596 → 1598，警告 71 → 69 | `/tmp/joplin-claude-migration.pLtZsa/audit-quote.log` |
+| 新导入 | 降级 69，blob 全部核对无误 | `/tmp/joplin-claude-migration.pLtZsa/import-quote.log` |
+| 原生往返 | 1667 篇，`failure_categories={}` | `/tmp/joplin-claude-quote-native-roundtrip.log` |
+
+原来 7 篇“引用内含非段落结构”中，2 篇完全通过。剩下 5 篇在隔离副本中按子块类型诊断（只输出类型名）：3 篇是引用中嵌套引用，Evernote 同样不支持；2 篇仍报原来的原因。
+
+**全量**（最终 HEAD `39cd18525`，均 `--offline --locked`，退出码 0）：App 1491 通过、0 失败、2 忽略，另有 17 通过（`/tmp/joplin-claude-batch17-gpui-full.log`）；core 33 组共 364 通过、0 失败、1 忽略（`/tmp/joplin-claude-batch17-core-full.log`）。完成后再次核对，原 JEX 的 SHA256 未变。
+
+### 边界与剩余
+
+- 编辑器没有“引用”切换命令，这是此前就存在的缺口；Evernote 的整块包裹和解开还没有对应的交互。
+- ENML 中的 `<blockquote>`、粘贴的 blockquote 里含列表的情况，本批都没有改。
+- 引用样式只有浅色主题；两段相邻的独立引用会合并成一段显示。
+- 视觉和实机验收仍需 Codex 完成。
