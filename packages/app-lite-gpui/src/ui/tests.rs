@@ -12374,3 +12374,123 @@ async fn mounted_paste_leaves_out_an_unobtainable_image_and_says_so(cx: &mut Tes
     assert!(body.contains("文字"), "{body}");
     assert!(!body.contains('\u{fffc}'), "{body:?}");
 }
+
+#[gpui::test]
+async fn an_empty_list_shows_what_its_route_means_not_an_empty_library(cx: &mut TestAppContext) {
+    // evidence53: an empty Trash (and any empty route) said the whole library
+    // was empty and offered 新建第一篇笔记. Evernote picks the empty state per
+    // note list (see RouteEmptyState).
+    let (_profile, repository) = repository();
+    repository
+        .create_note(CreateNote {
+            title: "已有笔记".into(),
+            notebook_id: None,
+            document: rich_document("资料库并不为空"),
+        })
+        .expect("create note");
+    let empty_notebook = repository.create_notebook("空笔记本", None).unwrap();
+    let stack = repository.create_stack("空笔记本组").unwrap();
+    repository
+        .create_notebook("组内空笔记本", Some(&stack.id))
+        .unwrap();
+    let tag = repository.create_tag("未使用标签").unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    let shown = |cx: &mut VisualTestContext| {
+        let state = view.read_with(cx, |shell, _| shell.rendered_empty_state_for_test);
+        if let Some(state) = state {
+            assert!(cx.debug_bounds(state.id()).is_some(), "{state:?} is drawn");
+        }
+        state.map(|state| (state.id(), state.title(), state.create_label().is_some()))
+    };
+    assert_eq!(shown(cx), None, "All Notes lists the note");
+    for (route, expected) in [
+        (
+            LibraryRoute::Trash,
+            ("trash-empty-state", "废纸篓是空的", false),
+        ),
+        (
+            LibraryRoute::Notebook(empty_notebook.id.clone()),
+            ("notebook-empty-state", "一切从笔记开始", true),
+        ),
+        (
+            LibraryRoute::Stack(stack.id.clone()),
+            ("notebook-empty-state", "一切从笔记开始", false),
+        ),
+        (
+            LibraryRoute::tags(vec![tag.id.clone()]).unwrap(),
+            ("filtered-empty-state", "未找到笔记", false),
+        ),
+    ] {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(
+                    AppAction::NavigateTo {
+                        route: route.clone(),
+                        selected_note_id: None,
+                    },
+                    window,
+                    shell_cx,
+                )
+            })
+        });
+        redraw(cx);
+        assert_eq!(shown(cx), Some(expected), "{route:?}");
+    }
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::NavigateTo {
+                    route: LibraryRoute::AllNotes,
+                    selected_note_id: None,
+                },
+                window,
+                shell_cx,
+            );
+            shell.model.update(shell_cx, |model, _| {
+                let mut query = SearchQuery::parse("没有这样的内容");
+                query.set_page(0, SearchQuery::MAX_PAGE_SIZE).unwrap();
+                let generation = model.begin_search("没有这样的内容");
+                model
+                    .commit_search_results(
+                        generation,
+                        "没有这样的内容".into(),
+                        repository.search(query).expect("search"),
+                        None,
+                    )
+                    .expect("commit empty SearchRoute");
+            });
+        })
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(shown(cx), Some(("search-empty-state", "未找到笔记", false)));
+
+    // The empty notebook's button creates the note in that notebook.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .model
+                .update(shell_cx, |model, _| model.set_search_query(None));
+            shell.apply_action(
+                AppAction::NavigateTo {
+                    route: LibraryRoute::Notebook(empty_notebook.id.clone()),
+                    selected_note_id: None,
+                },
+                window,
+                shell_cx,
+            )
+        })
+    });
+    redraw(cx);
+    let create = cx.debug_bounds("create-first-note").expect("create button");
+    cx.simulate_click(create.center(), Modifiers::default());
+    redraw(cx);
+    assert_eq!(shown(cx), None);
+    let notes = repository
+        .list_notes(app_lite_core::ListQuery::for_route(LibraryRoute::Notebook(
+            empty_notebook.id.clone(),
+        )))
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+}

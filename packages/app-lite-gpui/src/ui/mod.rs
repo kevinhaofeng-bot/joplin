@@ -675,6 +675,9 @@ pub struct LibraryShell {
     card_thumbnail_viewport_reconciliations: usize,
     #[cfg(test)]
     library_surface_paint_hooks_for_test: Arc<LibrarySurfacePaintHooks>,
+    // GPUI keeps stale debug bounds across frames, so tests read this instead.
+    #[cfg(test)]
+    rendered_empty_state_for_test: Option<RouteEmptyState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1195,6 +1198,8 @@ impl LibraryShell {
             card_thumbnail_viewport_reconciliations: 0,
             #[cfg(test)]
             library_surface_paint_hooks_for_test: Arc::new(LibrarySurfacePaintHooks::default()),
+            #[cfg(test)]
+            rendered_empty_state_for_test: None,
         };
         shell.sync_editor_surface(cx);
         // Web images pasted before the last quit and not fetched yet.
@@ -6077,51 +6082,55 @@ impl LibraryShell {
 
     fn render_editor_panel(
         &mut self,
-        items_empty: bool,
+        empty_state: Option<RouteEmptyState>,
         note: Option<Note>,
         available_width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> LibraryEditorRender {
-        if items_empty {
-            return LibraryEditorRender::plain(
-                div()
-                    .id("library-empty-state")
-                    .debug_selector(|| "library-empty-state".to_owned())
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(14.0))
-                    .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::EmptyState))
-                    .text_color(self.evernote_primary_text_fill())
-                    .child(div().text_size(px(22.0)).child("从第一篇笔记开始"))
-                    .child(
-                        div()
-                            .text_color(self.evernote_muted_text_fill())
-                            .child("资料库为空，所有内容都将保存在此设备。"),
-                    )
-                    .child(
-                        div()
-                            .id("create-first-note")
-                            .debug_selector(|| "create-first-note".to_owned())
-                            .px(px(16.0))
-                            .py(px(10.0))
-                            .rounded(px(7.0))
-                            .bg(rgba(0x00a82dff))
-                            .text_color(rgba(0xffffffff))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|shell, _event, window, cx| {
-                                    shell.apply_action(AppAction::CreateNote, window, cx)
-                                }),
-                            )
-                            .child("新建第一篇笔记"),
-                    )
-                    .into_any_element(),
-            );
+        #[cfg(test)]
+        {
+            self.rendered_empty_state_for_test = empty_state;
+        }
+        if let Some(empty) = empty_state {
+            let mut state = div()
+                .id(empty.id())
+                .debug_selector(move || empty.id().to_owned())
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(14.0))
+                .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::EmptyState))
+                .text_color(self.evernote_primary_text_fill())
+                .child(div().text_size(px(22.0)).child(empty.title()))
+                .child(
+                    div()
+                        .text_color(self.evernote_muted_text_fill())
+                        .child(empty.detail()),
+                );
+            if let Some(label) = empty.create_label() {
+                state = state.child(
+                    div()
+                        .id("create-first-note")
+                        .debug_selector(|| "create-first-note".to_owned())
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .rounded(px(7.0))
+                        .bg(rgba(0x00a82dff))
+                        .text_color(rgba(0xffffffff))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event, window, cx| {
+                                shell.apply_action(AppAction::CreateNote, window, cx)
+                            }),
+                        )
+                        .child(label),
+                );
+            }
+            return LibraryEditorRender::plain(state.into_any_element());
         }
         if let Some(error) = &self.unsupported_document {
             let title = note.map_or_else(|| "无法显示笔记".to_owned(), |note| note.title);
@@ -6665,6 +6674,7 @@ impl Render for LibraryShell {
                 .primary_stroke
                 .store(0, Ordering::Relaxed);
         }
+        let searching = self.model.read(cx).navigation().search_query().is_some();
         let (items, selected, panes, status, mode, sort, active_note, navigation_index, route) =
             self.model.read_with(cx, |model, _| {
                 (
@@ -6704,7 +6714,9 @@ impl Render for LibraryShell {
             pane: editor_pane,
             overlays: editor_overlays,
         } = self.render_editor_panel(
-            items.is_empty(),
+            items
+                .is_empty()
+                .then(|| RouteEmptyState::for_route(&route, searching)),
             active_note,
             available_editor_width,
             window,
@@ -7367,3 +7379,71 @@ mod table_render_tests;
 mod tests;
 #[cfg(test)]
 mod toolbar_adaptation_tests;
+
+/// What an empty note list means on the current route. Evernote 11.32.5
+/// renderer (app.asar): AllNotesNoteList (7873.js) shows `AllNotes.empty`
+/// without a filter and `Search.results.noResults` with one;
+/// NotebookNoteList (1503.js) and StackNoteList (7468.js) show
+/// `Notebook.empty`; TrashNoteList (2195.js) shows `Trash.empty.header`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteEmptyState {
+    Library,
+    Notebook,
+    Stack,
+    Tags,
+    Search,
+    Trash,
+}
+
+impl RouteEmptyState {
+    fn for_route(route: &LibraryRoute, searching: bool) -> Self {
+        if searching {
+            return Self::Search;
+        }
+        match route {
+            LibraryRoute::AllNotes => Self::Library,
+            LibraryRoute::Notebook(_) => Self::Notebook,
+            LibraryRoute::Stack(_) => Self::Stack,
+            LibraryRoute::Tags(_) => Self::Tags,
+            LibraryRoute::Trash => Self::Trash,
+        }
+    }
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Library => "library-empty-state",
+            Self::Notebook | Self::Stack => "notebook-empty-state",
+            Self::Tags => "filtered-empty-state",
+            Self::Search => "search-empty-state",
+            Self::Trash => "trash-empty-state",
+        }
+    }
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Library => "从第一篇笔记开始",
+            Self::Notebook | Self::Stack => "一切从笔记开始",
+            Self::Tags | Self::Search => "未找到笔记",
+            Self::Trash => "废纸篓是空的",
+        }
+    }
+
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::Library => "资料库为空，所有内容都将保存在此设备。",
+            Self::Notebook | Self::Stack => "点击侧边栏中的+新建笔记按钮创建笔记。",
+            Self::Tags | Self::Search => "尝试使用不同的关键词或筛选条件。",
+            Self::Trash => "当废纸篓中有笔记时，可以在这里还原或删除它们。",
+        }
+    }
+
+    // A stack is not a note container: creating there needs a notebook
+    // choice, so it offers no one-click button (see create_note).
+    const fn create_label(self) -> Option<&'static str> {
+        match self {
+            Self::Library => Some("新建第一篇笔记"),
+            Self::Notebook => Some("新建笔记"),
+            Self::Stack | Self::Tags | Self::Search | Self::Trash => None,
+        }
+    }
+}
