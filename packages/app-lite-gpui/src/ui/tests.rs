@@ -12771,3 +12771,57 @@ async fn toolbar_quote_wraps_and_unwraps_whole_quotes_with_history_ime_and_save(
     });
     assert_eq!(reopened_html.as_str(), quoted_tail);
 }
+
+#[gpui::test]
+async fn pasted_blockquote_with_a_list_lands_as_a_quote_container_and_saves(
+    cx: &mut TestAppContext,
+) {
+    // quoteblock/schema.ts parseClipboard: a pasted blockquote's p/ol/ul/h.
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "粘贴引用".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html("<p>前</p>").unwrap(),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|_, app| {
+        editor.update(app, |editor, editor_cx| {
+            let first = editor.document().blocks()[0].id;
+            editor.set_selection_for_test(Selection::caret(DocPoint::new(first, "前".len())));
+            editor_cx.notify();
+        })
+    });
+    paste_html_for_test(
+        &view,
+        "<blockquote><h3>要点</h3><ul><li>一</li><li>二</li></ul></blockquote><p>后</p>".into(),
+        cx,
+    );
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx)
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().body_html,
+        "<p>前</p><blockquote data-joplin-lite-quote-container=\"true\"><h3>要点</h3><ul><li>一</li><li>二</li></ul></blockquote><p>后</p>"
+    );
+}

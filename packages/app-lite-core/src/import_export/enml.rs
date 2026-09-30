@@ -425,6 +425,7 @@ impl RenderContext<'_> {
                     Ok(())
                 }
                 "ul" | "ol" => self.list(element, path, out),
+                "blockquote" => self.quote_block(element, path, out),
                 "en-media" => self.media(element, path, out, false),
                 "br" => {
                     self.attrs(element, &[], path)?;
@@ -764,6 +765,76 @@ impl RenderContext<'_> {
         out.push('>');
         out.push_str(&lines.done.join("<br>"));
         out.push_str("</pre>");
+        Ok(())
+    }
+
+    /// Evernote's quoteblock (common-editor quoteblock/schema.ts): parseENML
+    /// takes `blockquote`, holding `( p | todolist | ol | ul | h )+`. Its
+    /// paragraphs keep inline media; code, tables and quotes cannot be in one.
+    fn quote_block(
+        &mut self,
+        element: &Element,
+        path: &str,
+        out: &mut String,
+    ) -> Result<(), EnmlFidelityBlocker> {
+        self.attrs(element, &[], path)?;
+        out.push_str("<blockquote data-joplin-lite-quote-container=\"true\">");
+        let mut paragraph_open = false;
+        for (i, child) in element.children.iter().enumerate() {
+            let child_path = format!("{path}/{i}");
+            let block = match child {
+                Child::Text(text) if is_xml_formatting_whitespace(text) => continue,
+                Child::Text(_) => None,
+                Child::Element(item) => match item.name.as_str() {
+                    "b" | "strong" | "i" | "em" | "u" | "s" | "strike" | "del" | "mark"
+                    | "span" | "a" | "en-media" | "font" | "sup" | "sub" => None,
+                    _ => Some(item),
+                },
+            };
+            let Some(item) = block else {
+                if !paragraph_open {
+                    out.push_str("<p>");
+                    paragraph_open = true;
+                }
+                self.inline(child, &child_path, out)?;
+                continue;
+            };
+            if paragraph_open {
+                out.push_str("</p>");
+                paragraph_open = false;
+            }
+            match item.name.as_str() {
+                "div" | "p" if enml_code_block(item) => {
+                    return Err(blocked(&child_path, "code block inside a quote"));
+                }
+                "div" | "p" => {
+                    let checkbox = item.children.iter().find(|child| {
+                        !matches!(child, Child::Text(text) if is_xml_formatting_whitespace(text))
+                    });
+                    if matches!(checkbox, Some(Child::Element(todo)) if todo.name == "en-todo") {
+                        self.block(child, &child_path, out)?;
+                    } else {
+                        self.attrs(item, &[], &child_path)?;
+                        out.push_str("<p>");
+                        for (j, inline) in item.children.iter().enumerate() {
+                            self.inline(inline, &format!("{child_path}/{j}"), out)?;
+                        }
+                        out.push_str("</p>");
+                    }
+                }
+                "h1" | "h2" | "h3" | "ul" | "ol" | "br" => self.block(child, &child_path, out)?,
+                name => {
+                    return Err(blocked(
+                        &child_path,
+                        format!("unsupported <{name}> inside a quote"),
+                    ));
+                }
+            }
+        }
+        if paragraph_open {
+            out.push_str("</p>");
+        }
+        out.push_str("</blockquote>");
         Ok(())
     }
 

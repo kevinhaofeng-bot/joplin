@@ -650,3 +650,16 @@ fn quote_container_round_trips_and_holds_only_quoteblock_content() {
         "<blockquote data-joplin-lite-quote-container=\"true\"><ul><li>里</li></ul></blockquote><ul><li>外</li></ul>"
     );
 }
+
+#[test]
+fn pasted_blockquote_with_lists_and_headings_becomes_a_quote_container() {
+    // quoteblock/schema.ts parseClipboard: a blockquote's p/ol/ul/h content.
+    let pasted = CanonicalDocument::parse_pasted_html(
+        "<blockquote><h3>要点</h3><p>说明</p><ol><li>一</li><li>二</li></ol></blockquote><p>外</p><blockquote>只有文字</blockquote>",
+    )
+    .unwrap();
+    assert_eq!(
+        pasted.document.to_canonical_html().as_str(),
+        "<blockquote data-joplin-lite-quote-container=\"true\"><h3>要点</h3><p>说明</p><ol><li>一</li><li>二</li></ol></blockquote><p>外</p><blockquote data-joplin-lite-block-quote=\"true\">只有文字</blockquote>"
+    );
+}

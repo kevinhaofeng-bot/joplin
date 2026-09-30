@@ -329,3 +329,27 @@ fn evernote_code_blocks_keep_language_lines_and_resources() {
         assert!(convert_enml(enml, &resources()).is_err(), "{enml}");
     }
 }
+
+#[test]
+fn evernote_blockquote_imports_as_a_quote_container() {
+    // common-editor quoteblock/schema.ts: parseENML takes `blockquote`, its
+    // content `( p | todolist | ol | ul | h )+`.
+    let enml = format!(
+        r#"<en-note><blockquote><h2>要点</h2><div>说明<en-media hash="{IMAGE_MD5}" type="image/png"/></div><ul><li>一</li></ul><div><en-todo checked="true"/>已办</div></blockquote><div>外</div><blockquote><div>只有文字</div></blockquote></en-note>"#
+    );
+    let result = convert_enml(&enml, &resources()).unwrap();
+    assert_eq!(
+        result.html.as_str(),
+        format!(
+            "<blockquote data-joplin-lite-quote-container=\"true\"><h2>要点</h2><p>说明<img src=\":/{IMAGE_ID}\" alt=\"图.png\"></p><ul><li>一</li></ul><ul data-type=\"checklist\"><li data-checked=\"true\">已办</li></ul></blockquote><p>外</p><blockquote data-joplin-lite-block-quote=\"true\">只有文字</blockquote>"
+        )
+    );
+    // Code, tables and nested quotes are not quoteblock content.
+    for enml in [
+        r#"<en-note><blockquote><div style="--en-codeblock:true">x</div></blockquote></en-note>"#,
+        r#"<en-note><blockquote><table><tr><td>x</td></tr></table></blockquote></en-note>"#,
+        r#"<en-note><blockquote><blockquote><div>x</div></blockquote></blockquote></en-note>"#,
+    ] {
+        assert!(convert_enml(enml, &resources()).is_err(), "{enml}");
+    }
+}

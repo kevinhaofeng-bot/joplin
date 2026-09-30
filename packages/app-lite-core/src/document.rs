@@ -2159,11 +2159,25 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         projection.block_divider();
                         continue;
                     }
+                    // A pasted blockquote holding blocks is Evernote's quoteblock
+                    // (quoteblock/schema.ts parseClipboard: its p/ol/ul/h content
+                    // is parsed as such); one holding only inline text stays a
+                    // single quote paragraph.
+                    let pasted_quote_container =
+                        pasted && tag == "blockquote" && children.iter().any(|child| {
+                            matches!(&child.data, DomData::Element { name, .. }
+                            if matches!(
+                                name.local.to_string().to_ascii_lowercase().as_str(),
+                                "p" | "div" | "ul" | "ol" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                            ))
+                        });
                     if projection.list_contexts.is_empty()
-                        && !pasted
-                        && tag == "blockquote"
-                        && attribute(&attrs.borrow(), "data-joplin-lite-quote-container").as_deref()
-                            == Some("true")
+                        && (pasted_quote_container
+                            || (!pasted
+                                && tag == "blockquote"
+                                && attribute(&attrs.borrow(), "data-joplin-lite-quote-container")
+                                    .as_deref()
+                                    == Some("true")))
                     {
                         projection.flush();
                         pending.push(ProjectionFrame::QuoteContainer {
@@ -4499,7 +4513,8 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                 "<p>Plain <s><em><u>styled</u></em></s> <mark>marked</mark> clear <a href=\"https://example.com/x\">link</a></p>",
                 "<ul><li>one</li><li>two <img src=\":/image0\" alt=\"small\"></li></ul>",
                 "<p>before</p><img data-joplin-lite-block-image=\"true\" src=\":/image1\" alt=\"pic\"><p>after</p>",
-                "<blockquote data-joplin-lite-block-quote=\"true\">quoted<br>second</blockquote>",
+                // Evernote parseClipboard keeps a quote's paragraphs (quoteblock/schema.ts).
+                "<blockquote data-joplin-lite-block-quote=\"true\">quoted</blockquote><blockquote data-joplin-lite-block-quote=\"true\">second</blockquote>",
                 "<pre data-joplin-lite-block-code=\"true\">code&nbsp;&nbsp;x<br>&nbsp;&nbsp;y</pre>",
                 "<hr data-joplin-lite-block-divider=\"true\">",
                 "<p>word item</p>"
