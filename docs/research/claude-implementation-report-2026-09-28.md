@@ -689,3 +689,104 @@ Codex 读取的源码（我已复核）是 common-editor `apps/peso/schema.ts` 1
 - 图标仍是 ad-hoc 签名，未公证。最终安装包，以及从旧版本升级，属于后续安装关卡。
 - 其余交付关卡没有推进：迁移保真（85 篇降级、严格 1581 篇）、多模态、NAS 常驻、启动内存峰值、最终安装包。
 
+
+## 第十六批：迁移保真（`8bb589151`、`86383e2dc`、`3d6ceaea0`）
+
+### 隔离副本与基线
+
+- 此前的隔离副本 `/tmp/joplin-migration-current.MeMdVA` 已被清理，本轮重新建立。
+- 源文件为 `/Users/kevinhao/JoplinBackup/default/all_notebooks.jex`，只读取，不修改。它已被 Joplin 自动备份更新（mtime 2026‑09‑30 22:27），SHA256 为 `320f684f…c6cf`，与证据中的 `8544080e…` 不同，共 1667 篇（比原来多 1 篇）。因此本轮基线是新导出，数字不能与 1581/85 直接比较。
+- 复制到 `/tmp/joplin-claude-migration.pLtZsa/src/`，设为只读，复制前后 SHA256 一致（`/tmp/joplin-claude-migration-source-sha-before.txt`）。
+- HEAD `92c2f734e` 下的隔离导入（`import-verify.log`）：
+  - 1667 笔记、31 笔记本、2 组、64 标签、4153 资源、4127 blob；
+  - blob 重新哈希 0 不符，源 blob 缺失 0、多余 0；
+  - 降级 85，首个原因的分布与 evidence47 相同。
+- 只读审计：严格通过 1582、警告 85。
+
+所有输出只含计数、source_id 和结构形态，不包含正文或属性值。
+
+### 行内 HTML（`86383e2dc`，探针 `8bb589151`）
+
+新增探针模式 `JOPLIN_LITE_AUDIT_HTML_SHAPES=1`：对每篇 Raw HTML 笔记只输出标签名、属性名和 style 中的 CSS 属性名。21 篇 Raw HTML 笔记的实际形态：
+- 13 篇只有 `<a id>` 锚点；
+- 约 8 篇有 Joplin 缩放的行内 `<img src=":/id" width height>`；
+- 各 1 篇 `<sup>`、`<del>`；
+- 2 篇是大段粘贴的富 HTML（带 p 样式、onclick 等）。
+
+**Evernote 对应：**
+- `textformatter/schema.ts` 320–349：b/strong、i/em、u、s/strike/del、mark、sup/sub 解析为格式标记；
+- `link/schema.ts` 43–57：只把 `a[href]` 当作链接，所以只有 id 或 name 的锚点保留文字、不加链接。
+
+**实现**（`jex_body.rs`）：
+- Markdown 行内循环识别成对的行内 HTML，无属性的格式标签转为对应标记，标签之间的 Markdown 照常解析；
+- `<img>` 交给严格 HTML 转换器，沿用它的属性白名单、width 像素值和已验证资源检查；
+- 其他标签或属性、错误嵌套、未闭合的标签仍阻断，不会被丢弃。
+
+**测试：**
+- `inline_html_maps_to_evernote_marks_anchors_and_resized_images`：正向映射、canonical 往返、资源出现顺序，另有 8 个仍应阻断的样例；
+- 更新了两个旧测试。`上<sup>标</sup>` 原本被断言阻断（`becdff6d6` 写这项测试时还没有上标），现在改为转换；降级路径测试原用表格单元格中的 `<b>`，现在它不再降级，所以改用不受支持的 `<span class>`。
+- 负控：`inline_html` 一律返回 false 时两项失败（`/tmp/joplin-claude-inline-html-negative-control.{sh,log}`）。
+
+**效果：** 严格通过 1582 → 1594，降级 85 → 73。原 21 篇的去向：
+- 12 篇完全通过；
+- 7 篇 HTML 解决后，暴露出下一个原因：外链图片 +4、链接 title +2、不安全链接 +1；
+- 2 篇行内 `<img>` 指向的资源不是 png/jpeg/gif/webp，仍阻断；
+- 1 篇大段富 HTML 仍阻断。
+
+`<font color>` 和 `<span style=color>` 在 Markdown 行内 HTML 中仍阻断：本批没有加颜色映射，涉及的笔记同时还有其他阻断。
+
+### 代码块语言（`3d6ceaea0`）
+
+动手前在隔离副本中做了“假设放行”实验（`/tmp/joplin-claude-migration-whatif*.{sh,log}`），只在副本中进行，不进入产品代码：放行代码块语言可净增 3 篇，放行链接和图片 title 可净增 4 篇，两者同时放行可净增 7 篇。
+
+**Evernote 对应：** `codeblock/schema.ts` 12 行定义了 `syntaxLanguage`。
+
+**实现：**
+- canonical `Block::Code.language`，序列化为 `<pre data-language>`，只接受 highlight.js 风格的名称（1–32 个字符，范围 `A-Za-z0-9+#._-`）；
+- 围栏的 info 字符串是单个语言名时即转为该语言；
+- 多词 info 字符串、`{.rust}` 写法，以及 Joplin 会渲染为图表、乐谱、剧本的 mermaid/abc/fountain 围栏，仍阻断，不会退化成代码显示；
+- 粘贴的 HTML 不设置语言；
+- 原生编辑器仿照列表起始号，用按块索引的旁表保存语言。编辑块内文字后保存，语言仍在；含行内图片的代码块（分组）也保留。后者是新测试第一次运行就发现的缺陷，已修复。
+
+**测试：**
+- core：`fenced_code_keeps_its_language_as_evernote_syntax_language`、`code_block_language_round_trips_and_only_a_language_name_is_kept`（含注入值与空值被丢弃、粘贴不设语言）；
+- gpui：`code_block_language_survives_editing_and_saves_with_its_block`，codec 全结构往返夹具改为带 `rust`；
+- 负控：导入时丢掉语言，core 测试失败；codec 不写入旁表，两项 gpui 测试失败（`/tmp/joplin-claude-code-language-negative-controls.{sh,log}`）。
+
+**效果：** 严格通过 1594 → 1596，降级 73 → 71。实验预测 +3，差的 1 篇属于应继续阻断的围栏（mermaid 或多词 info）。
+
+### 验证（均为隔离副本）
+
+| 项目 | 结果 | 日志 |
+|---|---|---|
+| 新转换器重新导入（`86383e2dc`） | 降级 73，blob 全部核对无误 | `/tmp/joplin-claude-migration.pLtZsa/import-inline-html.log` |
+| 同上，原生往返 | 1667 篇，`failure_categories={}` | `/tmp/joplin-claude-migration-native-roundtrip.log` |
+| 重新导入（`3d6ceaea0`） | 降级 71，blob 全部核对无误 | `/tmp/joplin-claude-migration.pLtZsa/import-code-language.log` |
+| 同上，原生往返 | 1667 篇，`failure_categories={}` | `/tmp/joplin-claude-code-language-native-roundtrip.log` |
+| core 全量 | 33 组共 360 通过、0 失败、1 忽略 | `/tmp/joplin-claude-code-language-core-full.log` |
+| App 全量 | 1489 通过、0 失败、2 忽略，另有 17 通过 | `/tmp/joplin-claude-code-language-gpui-full.log` |
+
+原生往返只比较资源顺序和非空白文字，不代替排版与视觉验收。
+
+### 剩余 71 篇（首个原因）与判断
+
+| 首个原因 | 篇数 | 判断 |
+|---|---|---|
+| 行内构造（主要是 `$…$` 行内数学） | 17 | Evernote 没有行内公式节点，只有块级 formulablock（`$$…$$`，`formulablock/doubleDollarSignTypeBehind.ts`）；`inlineMathSuggestionsEnabled` 是计算建议，不是 LaTeX。按已定原则保留源码、不展平，继续标为降级 |
+| 外链图片 | 17 | 需要抓取外部资源，按约束不无条件抓取 |
+| 链接 title / 图片 title | 8 + 1 | Evernote link 有 `title` 属性（`link/schema.ts` 11）。需要把链接标记改为带 title 的结构，会贯穿编辑器的链接命令，改动面大；实验表明可净增 4 篇 |
+| 引用内含列表或标题 | 7 | Evernote quoteblock 的内容为 `(p \| todolist \| ol \| ul \| h)+`（`quoteblock/schema.ts` 14）。canonical Quote 只能容纳行内内容，是确实存在的模型缺口；修复需要容器型引用，原生编辑器也要支持 |
+| 链接图片双目标 / 不安全链接 / 非标准图片类型等 | 各 1–4 | 逐项保持阻断，都有明确原因 |
+| mermaid 围栏（包含在代码语言等类别中） | — | Evernote 有 `mermaidblock`，需要新增节点类型与渲染 |
+
+### 另发现的 ENEX 缺口（不在本次 JEX 审计范围内）
+
+Evernote 的 ENML 用 `<en-codeblock>` 或 `--en-codeblock:true` 表示代码块（`codeblock/schema.ts` 99–140），但 `enml.rs` 没有识别，ENEX 导入的代码块很可能变成普通段落。这需要单独修复并补 ENEX 测试，本批没有改动。
+
+### 边界
+
+- 原资料库与原 JEX 只读取，未修改；
+- 没有启动 App，没有安装；
+- 迁移的视觉验收（图文、列表、表格、附件、长文）仍未做；
+- 71 篇降级的可接受性，由 Codex 结合原文逐篇判断。
+
