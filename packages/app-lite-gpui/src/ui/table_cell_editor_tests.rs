@@ -131,6 +131,20 @@ fn mount_with_clock<'a>(
     gpui::Entity<LibraryShell>,
     &'a mut VisualTestContext,
 ) {
+    mount_body(cx, clock, TABLE)
+}
+
+fn mount_body<'a>(
+    cx: &'a mut TestAppContext,
+    clock: Arc<ManualSaveClock>,
+    body: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<LibraryRepository>,
+    app_lite_core::NoteId,
+    gpui::Entity<LibraryShell>,
+    &'a mut VisualTestContext,
+) {
     cx.update(|app| crate::components::init(app));
     let root = tempfile::tempdir().unwrap();
     let repository = Arc::new(LibraryRepository::open(root.path().join("library.sqlite")).unwrap());
@@ -146,7 +160,7 @@ fn mount_with_clock<'a>(
             id: note.id.clone(),
             expected_revision: note.revision,
             title: "表格".into(),
-            document: CanonicalDocument::parse_html(TABLE).unwrap(),
+            document: CanonicalDocument::parse_html(body).unwrap(),
             resource_ids: vec![],
             selected_thumbnail_id: None,
         })
@@ -307,6 +321,81 @@ fn saved_body(
     });
     cx.run_until_parked();
     repository.load_note(note).unwrap().unwrap().body_html
+}
+
+#[gpui::test]
+async fn cell_text_colour_keeps_alpha_and_saves_a_new_colour(cx: &mut TestAppContext) {
+    use crate::native_editor::commands::{CommandArgument, CommandCatalogue, EditorCommand};
+    use crate::native_editor::model::{DocPoint, Selection};
+    let table = "<table data-joplin-lite-table=\"true\"><tbody><tr><td><span style=\"color: rgba(24, 133, 226, 0.502)\">蓝</span>白</td></tr></tbody></table>";
+    let (_root, repository, note, view, cx) =
+        mount_body(cx, Arc::new(ManualSaveClock::default()), table);
+    let (node, _) = table_node(&view, cx);
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.open_table_cell_editor(node, 0, 0, shell_cx)
+        })
+    });
+    cx.run_until_parked();
+    let editor = view.read_with(cx, |shell, _| {
+        shell.table_cell_editor.as_ref().unwrap().editor.clone()
+    });
+    cx.update(|_, app| {
+        editor.update(app, |editor, _| {
+            let block = editor.document().first_node_id().unwrap();
+            editor.set_selection_for_test(Selection::new(
+                DocPoint::new(block, "蓝".len()),
+                DocPoint::new(block, "蓝白".len()),
+            ));
+            CommandCatalogue::new()
+                .execute(
+                    EditorCommand::TextColor,
+                    CommandArgument::TextColor(app_lite_core::TextColor::parse(
+                        "hwb(120, 0%, 50%)",
+                    )),
+                    editor,
+                )
+                .unwrap();
+        })
+    });
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.commit_table_cell_editor(false, shell_cx)
+        })
+    });
+    cx.run_until_parked();
+    let coloured = "<table data-joplin-lite-table=\"true\"><tbody><tr><td><span style=\"color: rgba(24, 133, 226, 0.502)\">蓝</span><span style=\"color: #008000\">白</span></td></tr></tbody></table>";
+    assert_eq!(saved_body(&view, cx, &repository, &note), coloured);
+    // The table-only note now also undoes, redoes and reopens its cell edit.
+    let main = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|_, app| main.update(app, |editor, _| editor.undo().unwrap()));
+    assert_eq!(saved_body(&view, cx, &repository, &note), table);
+    cx.update(|_, app| main.update(app, |editor, _| editor.redo().unwrap()));
+    assert_eq!(saved_body(&view, cx, &repository, &note), coloured);
+    let base = repository.load_note(&note).unwrap().unwrap();
+    let reopened = cx.new(|cx| {
+        crate::app::note_session::NoteSession::open(
+            base,
+            repository.clone(),
+            Arc::new(ManualSaveClock::default()),
+            cx,
+        )
+        .unwrap()
+    });
+    let html = reopened.read_with(cx, |session, app| {
+        crate::native_editor::codec::export_canonical(session.editor().read(app).document())
+            .unwrap()
+            .to_canonical_html()
+    });
+    assert_eq!(html.as_str(), coloured);
 }
 
 #[gpui::test]

@@ -1759,7 +1759,13 @@ impl Document {
                 Affinity::After,
             ));
         }
-        Selection::caret(DocPoint::new(NodeId::new_internal(0), 0))
+        // Like ProseMirror's `Selection.atEnd` (Evernote setselectiontoend.ts),
+        // an atom-only document ends on its last atom, never a missing node.
+        let node = self
+            .blocks
+            .last()
+            .map_or(NodeId::new_internal(0), |block| block.id);
+        Selection::caret(DocPoint::new(node, 0))
     }
 
     pub fn semantic_snapshot(&self) -> SemanticSnapshot {

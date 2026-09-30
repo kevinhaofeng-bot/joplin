@@ -8755,6 +8755,101 @@ fn text_color_sets_replaces_resets_and_carries_at_the_caret(cx: &mut gpui::TestA
 }
 
 #[gpui::test]
+fn an_atom_only_document_starts_on_an_existing_block_and_edits_with_history(
+    cx: &mut gpui::TestAppContext,
+) {
+    // evidence60: a table-only note began on a missing NodeId(0), so History
+    // refused every edit. ProseMirror `Selection.atEnd` (Evernote
+    // setselectiontoend.ts) ends on an existing atom instead.
+    let resources = [
+        app_lite_core::ResourceId::new("a".repeat(32)).unwrap(),
+        app_lite_core::ResourceId::new("b".repeat(32)).unwrap(),
+        app_lite_core::ResourceId::new("c".repeat(32)).unwrap(),
+    ];
+    let atom = |id, kind, content| Block {
+        id: NodeId::new(id),
+        kind,
+        content,
+        alignment: TextAlignment::Left,
+        revision: 0,
+    };
+    let image = BlockContent::Image {
+        resource_id: "a".repeat(32),
+        alt: "图".into(),
+        natural_size_known: true,
+        natural_size: (4, 2),
+        display_width: None,
+        link: None,
+    };
+    let attachment = BlockContent::Attachment {
+        resource_id: "b".repeat(32),
+        filename: "合同.pdf".into(),
+        media_type: "application/pdf".into(),
+    };
+    let table = app_lite_core::CanonicalDocument::parse_html(
+        "<table data-joplin-lite-table=\"true\"><tbody><tr><td>甲</td></tr></tbody></table>",
+    )
+    .unwrap();
+    for document in [
+        super::codec::import_canonical(&table).unwrap(),
+        Document::from_blocks(vec![atom(1, BlockKind::Image, image.clone())]).unwrap(),
+        Document::from_blocks(vec![
+            atom(1, BlockKind::Image, image),
+            atom(2, BlockKind::Attachment, attachment),
+        ])
+        .unwrap(),
+    ] {
+        let mut editor = EditorCore::from_document(document, cx);
+        let last = editor.document().blocks().last().unwrap().id;
+        assert_eq!(editor.selection(), Selection::caret(DocPoint::new(last, 0)));
+        let export = |editor: &EditorCore| {
+            super::codec::export_canonical_with_resources(editor.document(), Some(&resources))
+                .unwrap()
+                .to_canonical_html()
+        };
+        let original = export(&editor);
+        if matches!(
+            editor.document().blocks()[0].content,
+            BlockContent::Table(_)
+        ) {
+            let app_lite_core::document::Block::Paragraph { inlines, .. } =
+                app_lite_core::CanonicalDocument::parse_html("<p><strong>乙</strong></p>")
+                    .unwrap()
+                    .blocks()[0]
+                    .clone()
+            else {
+                panic!("paragraph");
+            };
+            editor.set_table_cell(last, 0, 0, inlines).unwrap();
+        } else {
+            let selection = editor.selection();
+            editor
+                .apply(Transaction::InsertAttachment {
+                    selection,
+                    resource_id: "c".repeat(32),
+                    filename: "新.pdf".into(),
+                    media_type: "application/pdf".into(),
+                })
+                .unwrap();
+        }
+        let edited = export(&editor);
+        assert_ne!(edited, original);
+        editor.undo().unwrap();
+        assert_eq!(export(&editor), original);
+        editor.redo().unwrap();
+        assert_eq!(export(&editor), edited);
+        let reopened = super::codec::import_canonical_with_resources(
+            &super::codec::export_canonical_with_resources(editor.document(), Some(&resources))
+                .unwrap(),
+            &resources,
+        )
+        .unwrap();
+        let reopened = EditorCore::from_document(reopened, cx);
+        assert_eq!(export(&reopened), edited);
+    }
+}
+
+#[gpui::test]
 fn a_pending_mark_ends_when_the_caret_moves_away_and_back(cx: &mut gpui::TestAppContext) {
     let mut editor = EditorCore::for_test("ab", cx);
     editor.set_caret_utf8(1);
