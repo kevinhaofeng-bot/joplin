@@ -234,6 +234,15 @@ pub struct Marks {
     pub highlight: bool,
     pub link: Option<String>,
     pub inline_code: bool,
+    pub script: Option<Script>,
+}
+
+/// Evernote's `superscript` and `subscript` marks exclude each other
+/// (common-editor textformatter/schema.ts); stored as `<sup>`/`<sub>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Script {
+    Superscript,
+    Subscript,
 }
 
 /// Presentation metadata retained by a structural image block. Resource bytes
@@ -913,6 +922,7 @@ fn normalize_marks(marks: &Marks) -> Marks {
         highlight: marks.highlight,
         link: marks.link.clone().filter(|value| valid_link(value)),
         inline_code: marks.inline_code,
+        script: marks.script,
     }
 }
 
@@ -1001,12 +1011,26 @@ fn serialize_text(
     if marks.underline {
         output.push_str("<u>");
     }
+    let script = marks.script.map(|script| match script {
+        Script::Superscript => "sup",
+        Script::Subscript => "sub",
+    });
+    if let Some(tag) = script {
+        output.push('<');
+        output.push_str(tag);
+        output.push('>');
+    }
     if marks.inline_code {
         output.push_str("<code>");
     }
     escape_text_run(text, inlines, index, output);
     if marks.inline_code {
         output.push_str("</code>");
+    }
+    if let Some(tag) = script {
+        output.push_str("</");
+        output.push_str(tag);
+        output.push('>');
     }
     if marks.underline {
         output.push_str("</u>");
@@ -1954,6 +1978,12 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                             || matches!(tag.as_str(), "del" | "s" | "strike"),
                         highlight: marks.highlight || tag == "mark",
                         inline_code: marks.inline_code || tag == "code",
+                        // The innermost one wins, as Evernote's `excludes`.
+                        script: match tag.as_str() {
+                            "sup" => Some(Script::Superscript),
+                            "sub" => Some(Script::Subscript),
+                            _ => marks.script,
+                        },
                         link: if marks.link.is_some() {
                             marks.link.clone()
                         } else if tag == "a" {
@@ -2026,6 +2056,7 @@ struct ProjectionMarks {
     highlight: bool,
     link: Option<Rc<str>>,
     inline_code: bool,
+    script: Option<Script>,
 }
 
 fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
@@ -2036,6 +2067,7 @@ fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
         && public.highlight == projected.highlight
         && public.link.as_deref() == projected.link.as_deref()
         && public.inline_code == projected.inline_code
+        && public.script == projected.script
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2394,6 +2426,7 @@ impl Projection {
             highlight: projected.highlight,
             link,
             inline_code: projected.inline_code,
+            script: projected.script,
         }
     }
 
@@ -2967,6 +3000,11 @@ fn pasted_marks(declarations: &[(String, String)], mut marks: ProjectionMarks) -
             "background-color" | "background" => {
                 marks.highlight |= highlighting_background(value);
             }
+            "vertical-align" => match value.as_str() {
+                "super" => marks.script = Some(Script::Superscript),
+                "sub" => marks.script = Some(Script::Subscript),
+                _ => {}
+            },
             _ => {}
         }
     }

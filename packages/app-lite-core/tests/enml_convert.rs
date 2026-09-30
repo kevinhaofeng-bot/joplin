@@ -66,7 +66,7 @@ fn blocks_unsupported_semantics_and_unverified_media() {
     // evernote_presentational_styles_map_to_marks_instead_of_blocking).
     for body in [
         "<table><tr><td>x</td></tr></table>",
-        "<div><sub>x</sub></div>",
+        "<div><q>x</q></div>",
         "<div><a href=\"javascript:alert(1)\">x</a></div>",
         "<div><a href=\"https://host:bad/x\">x</a></div>",
         "<div><en-media hash=\"cccccccccccccccccccccccccccccccc\" type=\"image/png\"/></div>",
@@ -261,4 +261,16 @@ fn tel_links_accept_percent_encoded_separators_only() {
         let enml = format!(r#"<en-note><div><a href="{bad}">x</a></div></en-note>"#);
         assert!(convert_enml(&enml, &resources()).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn evernote_superscript_and_subscript_are_kept() {
+    // Evernote textformatter/schema.ts parses `sup`/`sub` tags and
+    // `vertical-align` styles into its superscript/subscript marks.
+    let enml = r#"<en-note><div>H<sub>2</sub>O x<sup>2</sup><span style="vertical-align: super">上</span><span style="vertical-align:sub">下</span></div></en-note>"#;
+    let result = convert_enml(enml, &resources()).unwrap();
+    assert_eq!(
+        result.html.as_str(),
+        "<p>H<sub>2</sub>O x<sup>2上</sup><sub>下</sub></p>"
+    );
 }

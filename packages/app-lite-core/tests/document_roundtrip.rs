@@ -373,3 +373,44 @@ fn tables_with_spans_or_block_cells_keep_the_generic_path() {
         [Block::Paragraph { .. }, Block::Table { rows, .. }] if rows.len() == 1
     ));
 }
+
+#[test]
+fn superscript_and_subscript_round_trip_and_exclude_each_other() {
+    use app_lite_core::Script;
+    // Each run carries all of its tags, as every other mark does.
+    let html = "<p>H<sub>2</sub>O and <strong>x</strong><strong><sup>2</sup></strong></p>";
+    let parsed =
+        CanonicalDocument::parse_html("<p>H<sub>2</sub>O and <strong>x<sup>2</sup></strong></p>")
+            .unwrap();
+    assert_eq!(parsed.to_canonical_html().as_str(), html);
+    assert_eq!(
+        CanonicalDocument::parse_html(html)
+            .unwrap()
+            .to_canonical_html()
+            .as_str(),
+        html
+    );
+    let Block::Paragraph { inlines, .. } = &parsed.blocks()[0] else {
+        panic!("paragraph");
+    };
+    assert!(inlines.iter().any(|inline| matches!(
+        inline,
+        Inline::Text { text, marks } if text == "2" && marks.script == Some(Script::Subscript)
+    )));
+    // Evernote's marks exclude each other: the inner one wins.
+    let nested = CanonicalDocument::parse_html("<p><sup>a<sub>b</sub></sup></p>").unwrap();
+    assert_eq!(
+        nested.to_canonical_html().as_str(),
+        "<p><sup>a</sup><sub>b</sub></p>"
+    );
+    // HTML written before this mark existed reads the same as before.
+    let old = "<p>plain <strong>bold</strong></p>";
+    assert_eq!(
+        CanonicalDocument::parse_html(old)
+            .unwrap()
+            .to_canonical_html()
+            .as_str(),
+        old
+    );
+    let _ = Marks::default();
+}

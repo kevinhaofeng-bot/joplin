@@ -423,6 +423,8 @@ impl Context<'_> {
             "s" | "strike" | "del" => nested.strikethrough = true,
             "mark" => nested.highlight = true,
             "code" => nested.inline_code = true,
+            "sup" => nested.script = Some(crate::document::Script::Superscript),
+            "sub" => nested.script = Some(crate::document::Script::Subscript),
             "a" => {
                 if in_link {
                     return self.block(

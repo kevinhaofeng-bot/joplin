@@ -452,6 +452,8 @@ impl RenderContext<'_> {
                     "u" => "u",
                     "s" | "strike" | "del" => "s",
                     "mark" => "mark",
+                    "sup" => "sup",
+                    "sub" => "sub",
                     "span" | "font" => "span",
                     "a" => "a",
                     "br" => "br",
@@ -759,6 +761,8 @@ fn style_marks(style: Option<&str>) -> Vec<&'static str> {
                 Some("s")
             }
             "--en-highlight" => Some("mark"),
+            "vertical-align" if value == "super" => Some("sup"),
+            "vertical-align" if value == "sub" => Some("sub"),
             _ => None,
         };
         if let Some(mark) = mark
