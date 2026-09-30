@@ -549,3 +549,42 @@ fn text_colour_round_trips_as_evernote_writes_it_and_rejects_non_colours() {
         plain
     );
 }
+
+#[test]
+fn code_block_language_round_trips_and_only_a_language_name_is_kept() {
+    let stored =
+        "<pre data-joplin-lite-block-code=\"true\" data-language=\"objective-c\">x<br></pre>";
+    let document = CanonicalDocument::parse_html(stored).unwrap();
+    assert!(matches!(
+        document.blocks(),
+        [Block::Code { language: Some(language), .. }] if language == "objective-c"
+    ));
+    assert_eq!(document.to_canonical_html().as_str(), stored);
+    for (input, output) in [
+        (
+            "<pre data-joplin-lite-block-code=\"true\" data-language=\"x&quot; onclick=&quot;y\">x</pre>",
+            "<pre data-joplin-lite-block-code=\"true\">x</pre>",
+        ),
+        (
+            "<pre data-joplin-lite-block-code=\"true\" data-language=\"\">x</pre>",
+            "<pre data-joplin-lite-block-code=\"true\">x</pre>",
+        ),
+    ] {
+        assert_eq!(
+            CanonicalDocument::parse_html(input)
+                .unwrap()
+                .to_canonical_html()
+                .as_str(),
+            output,
+            "{input}"
+        );
+    }
+    // Pasted HTML is not trusted to name a language.
+    let pasted = CanonicalDocument::parse_pasted_html("<pre data-language=\"rust\">x</pre>")
+        .unwrap()
+        .document;
+    assert!(matches!(
+        pasted.blocks(),
+        [Block::Code { language: None, .. }]
+    ));
+}

@@ -1488,9 +1488,11 @@ fn resolve_pasted_block(
         Block::Code {
             style,
             inlines: content,
+            language,
         } => vec![Block::Code {
             style,
             inlines: inlines(content),
+            language,
         }],
         Block::List { kind, items, start } => vec![Block::List {
             kind,

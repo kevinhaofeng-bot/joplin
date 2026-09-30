@@ -1300,6 +1300,9 @@ pub struct Document {
     /// First number of an ordered list that does not start at 1, keyed by
     /// the list's first item. Keys of removed items are simply ignored.
     list_starts: BTreeMap<NodeId, u32>,
+    /// Evernote's code block syntaxLanguage, keyed by the code block (or its
+    /// inline group's first member). Keys of removed blocks are ignored.
+    code_languages: BTreeMap<NodeId, String>,
     pending_marks: PendingMarks,
 }
 
@@ -1404,6 +1407,7 @@ impl Document {
             revision: 0,
             inline_groups: Vec::new(),
             list_starts: BTreeMap::new(),
+            code_languages: BTreeMap::new(),
             pending_marks: PendingMarks::default(),
         };
         debug_assert!(document.validate_invariants().is_ok());
@@ -1425,6 +1429,7 @@ impl Document {
             revision: 0,
             inline_groups: Vec::new(),
             list_starts: BTreeMap::new(),
+            code_languages: BTreeMap::new(),
             pending_marks: PendingMarks::default(),
         };
         document.validate_invariants()?;
@@ -1820,6 +1825,14 @@ impl Document {
 
     pub(crate) fn list_start(&self, id: NodeId) -> Option<u32> {
         self.list_starts.get(&id).copied()
+    }
+
+    pub(crate) fn set_code_languages(&mut self, languages: BTreeMap<NodeId, String>) {
+        self.code_languages = languages;
+    }
+
+    pub(crate) fn code_language(&self, id: NodeId) -> Option<&str> {
+        self.code_languages.get(&id).map(String::as_str)
     }
 
     pub(crate) fn inline_groups(&self) -> &[InlineGroup] {

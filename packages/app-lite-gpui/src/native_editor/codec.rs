@@ -138,6 +138,7 @@ pub fn import_canonical_with_resources(
     let mut native = Vec::new();
     let mut inline_groups = Vec::new();
     let mut list_starts = std::collections::BTreeMap::new();
+    let mut code_languages = std::collections::BTreeMap::new();
     let mut next_id = 1_u64;
 
     for (block_index, block) in document.blocks().iter().enumerate() {
@@ -327,7 +328,12 @@ pub fn import_canonical_with_resources(
                     block_index,
                 )?);
             }
-            CanonicalBlock::Code { style, inlines } => {
+            CanonicalBlock::Code {
+                style,
+                inlines,
+                language,
+            } => {
+                let first = native.len();
                 if has_inline_image(inlines) {
                     push_inline_group(
                         &mut native,
@@ -339,15 +345,18 @@ pub fn import_canonical_with_resources(
                         available_resources,
                         block_index,
                     )?;
-                    continue;
+                } else {
+                    native.push(text_block(
+                        next_node_id(&mut next_id),
+                        BlockKind::Code,
+                        style,
+                        inlines,
+                        block_index,
+                    )?);
                 }
-                native.push(text_block(
-                    next_node_id(&mut next_id),
-                    BlockKind::Code,
-                    style,
-                    inlines,
-                    block_index,
-                )?);
+                if let (Some(language), Some(first)) = (language, native.get(first)) {
+                    code_languages.insert(first.id, language.clone());
+                }
             }
             CanonicalBlock::Image {
                 resource_id,
@@ -435,6 +444,7 @@ pub fn import_canonical_with_resources(
         Document::from_blocks(native).map_err(CanonicalImportError::InvalidDocument)?;
     document.set_inline_groups(inline_groups);
     document.set_list_starts(list_starts);
+    document.set_code_languages(code_languages);
     Ok(document)
 }
 
@@ -676,7 +686,11 @@ pub fn export_canonical_with_resources(
                         }
                     }
                     BlockKind::Quote => CanonicalBlock::Quote { style, inlines },
-                    BlockKind::Code => CanonicalBlock::Code { style, inlines },
+                    BlockKind::Code => CanonicalBlock::Code {
+                        style,
+                        inlines,
+                        language: document.code_language(block.id).map(str::to_owned),
+                    },
                     BlockKind::Paragraph => CanonicalBlock::Paragraph { style, inlines },
                     _ => {
                         return Err(CanonicalExportError::UnsupportedBlockKind {
@@ -742,7 +756,11 @@ pub fn export_canonical_with_resources(
             }
             BlockKind::Code => {
                 let (style, inlines) = export_text_block(block, block_index)?;
-                output.push(CanonicalBlock::Code { style, inlines });
+                output.push(CanonicalBlock::Code {
+                    style,
+                    inlines,
+                    language: document.code_language(block.id).map(str::to_owned),
+                });
             }
             BlockKind::Image => {
                 let BlockContent::Image {
@@ -1581,6 +1599,38 @@ mod tests {
     }
 
     #[test]
+    fn code_block_language_survives_editing_and_saves_with_its_block() {
+        // Evernote codeblock syntaxLanguage (codeblock/schema.ts 12), also on
+        // a code block that holds an inline image (an inline group).
+        let canonical = CanonicalDocument::parse_html(
+            "<pre data-joplin-lite-block-code=\"true\" data-language=\"rust\">let x;</pre><p>间</p><pre data-joplin-lite-block-code=\"true\" data-language=\"c++\">图<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">后</pre><pre data-joplin-lite-block-code=\"true\">无</pre>",
+        )
+        .unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap(), canonical);
+        let code = document.blocks()[0].id;
+        document
+            .apply(crate::native_editor::transaction::Transaction::InsertText {
+                selection: crate::native_editor::model::Selection::caret(
+                    crate::native_editor::model::DocPoint::new(code, "let x".len()),
+                ),
+                text: " = 1".into(),
+            })
+            .unwrap();
+        let html = super::export_canonical(&document)
+            .unwrap()
+            .to_canonical_html();
+        assert!(
+            html.as_str().starts_with(
+                "<pre data-joplin-lite-block-code=\"true\" data-language=\"rust\">let x = 1;</pre>"
+            ),
+            "{}",
+            html.as_str()
+        );
+        assert!(html.as_str().contains("data-language=\"c++\""));
+    }
+
+    #[test]
     fn h4_to_h6_open_as_native_headings_and_save_unchanged() {
         let canonical =
             CanonicalDocument::parse_html("<h4>四</h4><h5>五</h5><h6>六<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\"></h6>")
@@ -2049,6 +2099,7 @@ mod tests {
             CanonicalBlock::Code {
                 style: BlockStyle::default(),
                 inlines: vec![marked("let 中文 = true;")],
+                language: Some("rust".into()),
             },
             CanonicalBlock::Image {
                 resource_id: resource_id.clone(),

@@ -789,17 +789,33 @@ impl<'a> Converter<'a> {
                     self.expect_end(TagEnd::BlockQuote(kind))?;
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {
-                    if matches!(&kind, pulldown_cmark::CodeBlockKind::Fenced(language) if !language.is_empty())
-                    {
-                        return self.blocked(
-                            JexBodyBlockerKind::UnsupportedStructure,
-                            "Code language metadata has no canonical mapping",
-                        );
-                    }
+                    // A fence's info string is Evernote's code block
+                    // syntaxLanguage when it is one language name; anything
+                    // more (attributes, several words) has no mapping. Joplin
+                    // renders mermaid, abc and fountain fences as diagrams,
+                    // music and screenplay, not as code.
+                    let language = match &kind {
+                        pulldown_cmark::CodeBlockKind::Fenced(info) if !info.is_empty() => {
+                            if !crate::document::valid_code_language(info)
+                                || matches!(
+                                    info.to_ascii_lowercase().as_str(),
+                                    "mermaid" | "abc" | "fountain"
+                                )
+                            {
+                                return self.blocked(
+                                    JexBodyBlockerKind::UnsupportedStructure,
+                                    "Code language metadata has no canonical mapping",
+                                );
+                            }
+                            Some(info.to_string())
+                        }
+                        _ => None,
+                    };
                     let inlines = self.inlines(TagEnd::CodeBlock, Marks::default(), false)?;
                     blocks.push(Block::Code {
                         style: BlockStyle::default(),
                         inlines,
+                        language,
                     });
                 }
                 Event::Start(Tag::Paragraph) => blocks.push(self.paragraph()?),

@@ -647,7 +647,11 @@ impl Context<'_> {
                 }
                 let style = BlockStyle::default();
                 if element.tag == "pre" {
-                    Ok(Block::Code { style, inlines })
+                    Ok(Block::Code {
+                        style,
+                        inlines,
+                        language: None,
+                    })
                 } else {
                     Ok(Block::Quote { style, inlines })
                 }

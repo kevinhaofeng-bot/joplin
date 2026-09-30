@@ -1005,3 +1005,34 @@ fn inline_html_maps_to_evernote_marks_anchors_and_resized_images() {
         assert_eq!(error.kind, kind, "{body}");
     }
 }
+
+#[test]
+fn fenced_code_keeps_its_language_as_evernote_syntax_language() {
+    // Evernote's code block carries syntaxLanguage (common-editor
+    // codeblock/schema.ts 12); a one-word fence info string maps to it.
+    let converted = convert_jex_note_body(NOTE, "code.md", 1, "```c++\nint x;\n```", &resources())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.canonical_html,
+        "<pre data-joplin-lite-block-code=\"true\" data-language=\"c++\">int x;<br></pre>"
+    );
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        converted.document
+    );
+    // Not a single language name, or a fence Joplin renders as a diagram,
+    // music or screenplay: still blocked rather than shown as code.
+    for body in [
+        "```rust ignore\nx\n```",
+        "```{.rust}\nx\n```",
+        "```ABC\nX:1\n```",
+        "```fountain\nINT. ROOM\n```",
+    ] {
+        let error = convert_jex_note_body(NOTE, "code.md", 1, body, &resources()).unwrap_err();
+        assert_eq!(
+            error.kind,
+            JexBodyBlockerKind::UnsupportedStructure,
+            "{body}"
+        );
+    }
+}

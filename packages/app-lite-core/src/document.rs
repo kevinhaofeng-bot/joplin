@@ -140,6 +140,9 @@ pub enum Block {
     Code {
         style: BlockStyle,
         inlines: Vec<Inline>,
+        /// Evernote's `syntaxLanguage` (common-editor codeblock/schema.ts 12),
+        /// written `data-language`; always a [`valid_code_language`].
+        language: Option<String>,
     },
     /// A resource-backed image at block position. Inline images remain part
     /// of the legacy HTML projection; Task 4's native editor maps this
@@ -589,9 +592,16 @@ fn serialize_html(document: &CanonicalDocument) -> String {
                 inlines,
                 &mut output,
             ),
-            Block::Code { style, inlines } => serialize_marked_block(
+            Block::Code {
+                style,
+                inlines,
+                language,
+            } => serialize_optional_marked_block(
                 "pre",
-                "data-joplin-lite-block-code",
+                Some("data-joplin-lite-block-code"),
+                language
+                    .as_deref()
+                    .map(|language| ("data-language", language)),
                 style,
                 inlines,
                 &mut output,
@@ -660,7 +670,7 @@ fn serialize_html(document: &CanonicalDocument) -> String {
 }
 
 fn serialize_block(tag: &str, style: &BlockStyle, inlines: &[Inline], output: &mut String) {
-    serialize_optional_marked_block(tag, None, style, inlines, output);
+    serialize_optional_marked_block(tag, None, None, style, inlines, output);
 }
 
 fn serialize_marked_block(
@@ -670,12 +680,13 @@ fn serialize_marked_block(
     inlines: &[Inline],
     output: &mut String,
 ) {
-    serialize_optional_marked_block(tag, Some(marker), style, inlines, output);
+    serialize_optional_marked_block(tag, Some(marker), None, style, inlines, output);
 }
 
 fn serialize_optional_marked_block(
     tag: &str,
     marker: Option<&str>,
+    attribute: Option<(&str, &str)>,
     style: &BlockStyle,
     inlines: &[Inline],
     output: &mut String,
@@ -686,6 +697,13 @@ fn serialize_optional_marked_block(
         output.push(' ');
         output.push_str(marker);
         output.push_str("=\"true\"");
+    }
+    if let Some((name, value)) = attribute {
+        output.push(' ');
+        output.push_str(name);
+        output.push_str("=\"");
+        escape_attribute(value, output);
+        output.push('"');
     }
     serialize_style_attributes(style, output);
     output.push('>');
@@ -875,9 +893,14 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 style: normalize_style(style),
                 inlines: normalize_inlines(inlines),
             },
-            Block::Code { style, inlines } => Block::Code {
+            Block::Code {
+                style,
+                inlines,
+                language,
+            } => Block::Code {
                 style: normalize_style(style),
                 inlines: normalize_inlines(inlines),
+                language: language.filter(|language| valid_code_language(language)),
             },
             Block::Image {
                 resource_id,
@@ -1259,6 +1282,20 @@ fn next_flow_char(inlines: &[Inline], index: usize) -> Option<char> {
         Some(Inline::Image { .. } | Inline::Attachment { .. }) => Some('\u{fffc}'),
         _ => None,
     }
+}
+
+/// A code block language as Evernote's highlight.js names them (`rust`,
+/// `c++`, `objective-c`, `c#`): 1-32 ASCII letters, digits and `+#._-`,
+/// starting with a letter or digit.
+pub fn valid_code_language(language: &str) -> bool {
+    (1..=32).contains(&language.len())
+        && language
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && language
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '#' | '.' | '_' | '-'))
 }
 
 fn escape_attribute(text: &str, output: &mut String) {
@@ -1774,6 +1811,16 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
             }
             ProjectionFrame::FinishList => projection.finish_list(),
             ProjectionFrame::FinishListItem => projection.finish_list_item(),
+            ProjectionFrame::SetCodeLanguage {
+                blocks_before,
+                language,
+            } => {
+                for block in &mut projection.document.blocks[blocks_before..] {
+                    if let Block::Code { language: slot, .. } = block {
+                        *slot = Some(language.clone());
+                    }
+                }
+            }
             ProjectionFrame::FinishListBlock { preserve_empty } => {
                 projection.finish_list_block(preserve_empty)
             }
@@ -2027,6 +2074,16 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         };
                         projection.begin_block(kind, style);
                         projection.text_block_depth += 1;
+                        if tag == "pre"
+                            && !pasted
+                            && let Some(language) = attribute(&attrs.borrow(), "data-language")
+                                .filter(|language| valid_code_language(language))
+                        {
+                            pending.push(ProjectionFrame::SetCodeLanguage {
+                                blocks_before,
+                                language,
+                            });
+                        }
                         pending.push(ProjectionFrame::FinishBlock {
                             blocks_before,
                             kind,
@@ -2200,6 +2257,11 @@ enum ProjectionFrame {
         kind: BlockKind,
         style: BlockStyle,
     },
+    /// Runs after its code block's FinishBlock.
+    SetCodeLanguage {
+        blocks_before: usize,
+        language: String,
+    },
     FinishList,
     FinishListItem,
     FinishListBlock {
@@ -2351,7 +2413,11 @@ impl Projection {
                 inlines,
             },
             BlockKind::Quote => Block::Quote { style, inlines },
-            BlockKind::Code => Block::Code { style, inlines },
+            BlockKind::Code => Block::Code {
+                style,
+                inlines,
+                language: None,
+            },
         });
     }
 
@@ -3393,6 +3459,7 @@ mod tests {
                 }],
             },
             Block::Code {
+                language: None,
                 style: BlockStyle::default(),
                 inlines: vec![Inline::Text {
                     text: "let x = 1;".into(),
