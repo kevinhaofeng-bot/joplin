@@ -98,6 +98,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         skeleton.chars().take(400).collect::<String>()
                     );
                 }
+                if std::env::var_os("JOPLIN_LITE_AUDIT_HTML_SHAPES").is_some()
+                    && error.kind == app_lite_core::JexBodyBlockerKind::RawHtml
+                {
+                    println!("html_shape\t{id}\t{}", html_shape(body));
+                }
                 *failures.entry(reason.clone()).or_default() += 1;
                 // Structural categories only, never source text or titles.
                 if markup == 1 {
@@ -539,4 +544,75 @@ fn nonempty_cells_beyond(row: &str, header: usize) -> usize {
         }
     }
     lost
+}
+
+/// Per note: each raw HTML tag as inline/block, with its attribute names and
+/// the CSS property names of a style attribute. Never values or text.
+fn html_shape(body: &str) -> String {
+    let mut shapes = std::collections::BTreeMap::<String, usize>::new();
+    for event in pulldown_cmark::Parser::new_ext(body, pulldown_cmark::Options::all()) {
+        let (context, html) = match &event {
+            pulldown_cmark::Event::InlineHtml(html) => ("inline", html),
+            pulldown_cmark::Event::Html(html) => ("block", html),
+            _ => continue,
+        };
+        for part in html.split('<').skip(1) {
+            let tag = part.split('>').next().unwrap_or_default();
+            let closing = tag.starts_with('/');
+            let name: String = tag
+                .trim_start_matches('/')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let mut attributes = Vec::new();
+            let mut rest = &tag[name.len().min(tag.len())..];
+            while let Some(eq) = rest.find('=') {
+                let attribute = rest[..eq]
+                    .rsplit(|c: char| c.is_whitespace())
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let after = rest[eq + 1..].trim_start();
+                let (value, remainder) = match after.chars().next() {
+                    Some(quote @ ('"' | '\'')) => {
+                        let inner = &after[1..];
+                        let end = inner.find(quote).unwrap_or(inner.len());
+                        (&inner[..end], &inner[(end + 1).min(inner.len())..])
+                    }
+                    _ => {
+                        let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                        (&after[..end], &after[end..])
+                    }
+                };
+                if attribute == "style" {
+                    let properties = value
+                        .split(';')
+                        .filter_map(|declaration| declaration.split(':').next())
+                        .map(|property| property.trim().to_ascii_lowercase())
+                        .filter(|property| !property.is_empty())
+                        .collect::<Vec<_>>();
+                    attributes.push(format!("style({})", properties.join(",")));
+                } else {
+                    attributes.push(attribute);
+                }
+                rest = remainder;
+            }
+            let key = format!(
+                "{context}:{}{name}{}",
+                if closing { "/" } else { "" },
+                if attributes.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", attributes.join(" "))
+                }
+            );
+            *shapes.entry(key).or_default() += 1;
+        }
+    }
+    shapes
+        .into_iter()
+        .map(|(shape, count)| format!("{shape}×{count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
