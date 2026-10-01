@@ -42,9 +42,6 @@ pub(crate) struct TableCellEditor {
     // Revision of the note's table block as this cell last wrote or read it:
     // any other change to the table (rows added or removed) moves it on.
     table_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    // Whether the cell had the keyboard focus at its last paint, which is
-    // where an image button or menu action means to insert.
-    focused: bool,
     // Where the cell's editing area was painted, for drops.
     pub(crate) bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
 }
@@ -82,11 +79,12 @@ impl LibraryShell {
         )
     }
 
-    /// The open cell, if it had the keyboard focus at its last paint.
-    pub(super) fn focused_table_cell(&self) -> bool {
-        self.table_cell_editor
-            .as_ref()
-            .is_some_and(|cell| cell.focused)
+    /// Whether `focused` (what had the focus when a button or menu acted)
+    /// is the open cell's editor.
+    pub(super) fn table_cell_is(&self, focused: Option<&gpui::FocusHandle>, cx: &App) -> bool {
+        self.table_cell_editor.as_ref().is_some_and(|cell| {
+            focused.is_some_and(|focused| cell.editor.read(cx).focus_handle() == focused)
+        })
     }
 
     /// The open cell's point under `position`, if the drop lands in it.
@@ -405,7 +403,6 @@ impl LibraryShell {
             error: None,
             open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             table_revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision)),
-            focused: false,
             bounds: Default::default(),
         });
         cx.notify();
@@ -582,7 +579,6 @@ impl LibraryShell {
             cell.needs_focus = false;
             crate::native_editor::surface::focus_editor(&cell.editor, window, cx);
         }
-        cell.focused = cell.editor.read(cx).focus_handle().is_focused(window);
         let bounds = cell.bounds.clone();
         let title = format!(
             "编辑单元格（第 {} 行，第 {} 列）",
@@ -637,6 +633,8 @@ impl LibraryShell {
                             |_, _, _, _| {},
                         )
                         .absolute()
+                        .top_0()
+                        .left_0()
                         .size_full(),
                     ),
                 )

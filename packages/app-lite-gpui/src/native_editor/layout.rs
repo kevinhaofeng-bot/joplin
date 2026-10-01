@@ -1446,6 +1446,77 @@ impl LayoutRegistry {
         layout.link_at(content, point(position.x + px(self.table_scroll_offset(node_id)), position.y))
     }
 
+    /// The table cell under `position` and the source offset of the caret
+    /// there (table_layout::TableLayout::source_offset_at).
+    pub(crate) fn table_source_offset_at(
+        &self,
+        position: Point<Pixels>,
+    ) -> Option<(NodeId, usize, usize, usize)> {
+        let node_id = self.atomic_block_at(position)?;
+        let bounds = self
+            .visible
+            .iter()
+            .find(|block| block.node_id == node_id)?
+            .bounds;
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let layout = self.table_layouts.get(&node_id)?;
+        let mut content = bounds;
+        content.size.width = px(layout.column_width * layout.cells.first()?.len() as f32);
+        let (row, column, offset) = layout.source_offset_at(
+            content,
+            point(
+                position.x + px(self.table_scroll_offset(node_id)),
+                position.y,
+            ),
+        )?;
+        Some((node_id, row, column, offset))
+    }
+
+    /// Where the glyph at a cell's source offset is painted (tests).
+    #[cfg(test)]
+    pub(crate) fn table_source_position(
+        &self,
+        node_id: NodeId,
+        row: usize,
+        column: usize,
+        offset: usize,
+    ) -> Option<Point<Pixels>> {
+        use super::table_layout::CellPiece;
+        let bounds = self
+            .visible
+            .iter()
+            .find(|block| block.node_id == node_id)?
+            .bounds;
+        let layout = self.table_layouts.get(&node_id)?;
+        let cell = layout.cells.get(row)?.get(column)?;
+        let (left, top) = layout.content_origin(row, column);
+        let origin = point(
+            bounds.left() + px(left - self.table_scroll_offset(node_id)),
+            bounds.top() + px(top),
+        );
+        for (piece, &source) in cell.pieces.iter().zip(&cell.sources) {
+            if let CellPiece::Text { top, lines, .. } = piece {
+                let mut line_top = px(*top);
+                let mut byte_start = source;
+                for line in lines {
+                    if offset >= byte_start && offset <= byte_start + line.len() {
+                        let at =
+                            line.position_for_index(offset - byte_start, px(TABLE_LINE_HEIGHT))?;
+                        return Some(point(
+                            origin.x + at.x,
+                            origin.y + line_top + at.y + px(TABLE_LINE_HEIGHT / 2.0),
+                        ));
+                    }
+                    line_top += line.size(px(TABLE_LINE_HEIGHT)).height;
+                    byte_start += line.len() + 1;
+                }
+            }
+        }
+        None
+    }
+
     /// View-only horizontal motion; the document and undo history stay unchanged.
     pub(crate) fn scroll_table_at(&mut self, position: Point<Pixels>, delta: f32) -> bool {
         let Some(node_id) = self.atomic_block_at(position) else { return false; };

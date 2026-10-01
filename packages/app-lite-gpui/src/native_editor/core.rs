@@ -1681,6 +1681,55 @@ impl EditorCore {
             .ok_or_else(|| "单元格已不在表格中".into())
     }
 
+    /// In a table cell's editor, the caret at a source offset of the cell
+    /// (table_layout::MEDIA_SOURCE_LEN): text bytes, one for each line
+    /// break between blocks that are not parts of one line, and media.
+    pub(crate) fn cell_point_at_source_offset(&self, offset: usize) -> DocPoint {
+        let media = super::table_layout::MEDIA_SOURCE_LEN;
+        let mut source = 0;
+        let mut last = None;
+        for (index, block) in self.document.blocks().iter().enumerate() {
+            if index > 0 && !self.document.is_inline_group_continuation(block.id) {
+                source += 1;
+            }
+            match block.content.as_text() {
+                Some(text) => {
+                    if offset <= source + text.len() {
+                        let mut at = offset.saturating_sub(source).min(text.len());
+                        while !text.is_char_boundary(at) {
+                            at -= 1;
+                        }
+                        return DocPoint::new(block.id, at);
+                    }
+                    source += text.len();
+                }
+                None => {
+                    if offset <= source {
+                        return DocPoint::with_affinity(block.id, 0, Affinity::Before);
+                    }
+                    source += media;
+                    if offset <= source {
+                        let next_is_part =
+                            self.document.blocks().get(index + 1).is_some_and(|next| {
+                                self.document.is_inline_group_continuation(next.id)
+                            });
+                        if !next_is_part {
+                            return DocPoint::with_affinity(block.id, 0, Affinity::After);
+                        }
+                    }
+                }
+            }
+            last = Some(block);
+        }
+        match last {
+            Some(block) => match block.content.as_text() {
+                Some(text) => DocPoint::new(block.id, text.len()),
+                None => DocPoint::with_affinity(block.id, 0, Affinity::After),
+            },
+            None => self.selection.head,
+        }
+    }
+
     pub(crate) fn forget_table_resource(&mut self, resource_id: &str) {
         self.history.forget_table_resource(resource_id);
     }

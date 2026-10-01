@@ -1220,9 +1220,7 @@ async fn picker_from_a_focused_cell_inserts_into_that_cell(cx: &mut TestAppConte
     let editor = open_cell_at_end(&view, cx, 1, 1);
     draw(cx);
     // Cancelled: nothing changes.
-    let token = view
-        .update(cx, |shell, shell_cx| shell.begin_resource_picker(shell_cx))
-        .unwrap();
+    let token = press_image_button(&view, cx);
     view.update(cx, |shell, shell_cx| {
         shell.cancel_resource_picker_for_test(token, shell_cx)
     });
@@ -1233,12 +1231,8 @@ async fn picker_from_a_focused_cell_inserts_into_that_cell(cx: &mut TestAppConte
             .is_empty()
     );
     // Opened twice: only the latest chooser may complete.
-    let stale = view
-        .update(cx, |shell, shell_cx| shell.begin_resource_picker(shell_cx))
-        .unwrap();
-    let token = view
-        .update(cx, |shell, shell_cx| shell.begin_resource_picker(shell_cx))
-        .unwrap();
+    let stale = press_image_button(&view, cx);
+    let token = press_image_button(&view, cx);
     let path = png_file(&root, "chosen.png");
     let stale_result = cx.update(|window, app| {
         view.update(app, |shell, shell_cx| {
@@ -1286,9 +1280,7 @@ async fn picker_completing_after_its_cell_closed_is_refused(cx: &mut TestAppCont
     let (root, repository, note, view, cx) = mount(cx);
     open_cell_at_end(&view, cx, 1, 1);
     draw(cx);
-    let token = view
-        .update(cx, |shell, shell_cx| shell.begin_resource_picker(shell_cx))
-        .unwrap();
+    let token = press_image_button(&view, cx);
     cx.simulate_keystrokes("escape");
     draw(cx);
     let path = png_file(&root, "late.png");
@@ -1372,53 +1364,308 @@ async fn cell_insert_refuses_a_structural_change_between_identical_cells(cx: &mu
 // Evernote dragdrop/plugin.ts takes the drop coordinate (posAtCoords): in
 // an open cell it is that cell's point; on a table whose cell is not open
 // there is no editable cell point here, so the drop is refused visibly.
-#[gpui::test]
-async fn drop_into_the_open_cell_goes_there_and_on_a_closed_cell_is_refused(
-    cx: &mut TestAppContext,
-) {
-    let (root, repository, note, view, cx) = mount(cx);
-    let editor = open_cell_at_end(&view, cx, 1, 1);
-    draw(cx);
-    // Where the cell's editing area is painted in the window.
-    let inside = view
-        .read_with(cx, |shell, _| {
-            shell.table_cell_editor.as_ref().unwrap().bounds.get()
-        })
-        .expect("painted")
-        .center();
-    let intent = view.update(cx, |shell, shell_cx| {
-        shell.capture_drop_intent_at(inside, shell_cx)
+/// The toolbar's image button, as clicked: it notes what has the focus,
+/// hands the focus back to the note's editor, and the shell then routes the
+/// chooser (`EditorCommandChromeEvent::RequestInsertImage`).
+fn press_image_button(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+) -> super::ResourcePickerToken {
+    let chrome = view.read_with(cx, |shell, _| {
+        shell.command_chrome.clone().expect("toolbar")
     });
-    let intent = intent.expect("a cell point").expect("an intent");
-    let path = png_file(&root, "dropped.png");
+    cx.update(|window, app| {
+        chrome.update(app, |chrome, chrome_cx| {
+            chrome.execute_command_for_test(
+                crate::native_editor::commands::EditorCommand::InsertImage,
+                window,
+                chrome_cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        shell
+            .pending_resource_insert
+            .as_ref()
+            .map(|pending| pending.token)
+    })
+    .unwrap_or_else(|| panic!("no chooser pending: {}", notice(view, cx)))
+}
+
+fn complete_picker(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+    token: super::ResourcePickerToken,
+    path: std::path::PathBuf,
+) {
     cx.update(|window, app| {
         view.update(app, |shell, shell_cx| {
-            shell.complete_resource_drop_paths(vec![path.clone()], intent, window, shell_cx)
+            shell.complete_resource_picker_path_for_token_for_test(token, path, window, shell_cx)
         })
     })
     .unwrap();
     draw(cx);
-    assert_eq!(
-        editor
+}
+
+const TWO_LINES: &str = "<table data-joplin-lite-table=\"true\"><tbody><tr><td>甲乙丙<br>丁戊</td><td>一</td></tr></tbody></table>";
+
+// Source offsets of the cell 甲乙丙<br>丁戊 (three bytes a character, one
+// for the break) and where resource.ts insertResourceAtPosition puts the
+// image: before the text at its start, splitting it elsewhere.
+fn offset_cases(image: &str) -> [(usize, String); 5] {
+    let img = format!("<img src=\":/{image}\" alt=\"\">");
+    [
+        (0, format!("{img}<br>甲乙丙<br>丁戊")),
+        (3, format!("甲<br>{img}<br>乙丙<br>丁戊")),
+        (9, format!("甲乙丙<br>{img}<br><br>丁戊")),
+        (13, format!("甲乙丙<br>丁<br>{img}<br>戊")),
+        (16, format!("甲乙丙<br>丁戊<br>{img}<br>")),
+    ]
+}
+
+/// A point inside a glyph rather than on a boundary: right of a line's
+/// start, past its end, else in the right half of the glyph before (GPUI's
+/// closest-index rounds the left half of a line's last glyph to the line
+/// end, so a boundary exactly there is ambiguous).
+fn inside_glyph(position: gpui::Point<gpui::Pixels>, offset: usize) -> gpui::Point<gpui::Pixels> {
+    let dx = match offset {
+        0 | 10 => 1.0,
+        9 | 16 => 3.0,
+        _ => -2.0,
+    };
+    gpui::point(position.x + px(dx), position.y)
+}
+
+fn first_cell_html(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) -> String {
+    let inlines = main_cell_text(view, cx, 0, 0);
+    let document = CanonicalDocument::from_blocks(vec![app_lite_core::document::Block::Table {
+        rows: vec![app_lite_core::document::TableRow {
+            cells: vec![app_lite_core::document::TableCell { inlines }],
+        }],
+        header: false,
+    }]);
+    let html = document.to_canonical_html().as_str().to_owned();
+    let start = html.find("<td>").unwrap() + 4;
+    html[start..html.rfind("</td>").unwrap()].to_owned()
+}
+
+// A click in the open cell puts the caret at the glyph boundary under it,
+// and a drop there inserts at that same point (dragdrop/plugin.ts:
+// posAtCoords of the drop event).
+#[gpui::test]
+async fn click_and_drop_in_the_open_cell_land_at_the_point_under_the_pointer(
+    cx: &mut TestAppContext,
+) {
+    use crate::native_editor::model::DocPoint;
+    for (offset, _) in offset_cases("") {
+        let (root, _repository, _note, view, cx) =
+            mount_body(cx, Arc::new(ManualSaveClock::default()), TWO_LINES);
+        let editor = open_cell_at_end(&view, cx, 0, 0);
+        draw(cx);
+        let block = editor.read_with(cx, |editor, _| editor.document().blocks()[0].id);
+        let position = editor
+            .read_with(cx, |editor, _| editor.layout().caret_bounds(block, offset))
+            .expect("caret geometry")
+            .center();
+        let position = inside_glyph(position, offset);
+        cx.simulate_click(position, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.selection().head),
+            DocPoint::new(block, offset),
+            "click at {offset}"
+        );
+        view.update(cx, |shell, shell_cx| {
+            shell.record_drop_position(position, shell_cx)
+        });
+        let intent = view
+            .update(cx, |shell, shell_cx| shell.take_drop_intent(shell_cx))
+            .unwrap();
+        let path = png_file(&root, "dropped.png");
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.complete_resource_drop_paths(vec![path], intent, window, shell_cx)
+            })
+        })
+        .unwrap();
+        draw(cx);
+        let image = editor
             .read_with(cx, |editor, _| cell_image_ids(editor))
-            .len(),
-        1
+            .pop()
+            .expect("dropped");
+        let expected = offset_cases(&image)
+            .into_iter()
+            .find(|(at, _)| *at == offset)
+            .unwrap()
+            .1;
+        assert_eq!(first_cell_html(&view, cx), expected, "drop at {offset}");
+    }
+}
+
+// The same drops onto the table with the cell not open: the cell opens with
+// the caret at the dropped point and takes the image there.
+#[gpui::test]
+async fn drop_on_an_unopened_cell_opens_it_and_inserts_at_the_point(cx: &mut TestAppContext) {
+    for (offset, _) in offset_cases("") {
+        let (root, _repository, _note, view, cx) =
+            mount_body(cx, Arc::new(ManualSaveClock::default()), TWO_LINES);
+        draw(cx);
+        let (node, _) = table_node(&view, cx);
+        let position = main_editor(&view, cx)
+            .read_with(cx, |editor, _| {
+                editor.layout().table_source_position(node, 0, 0, offset)
+            })
+            .expect("glyph geometry");
+        let position = inside_glyph(position, offset);
+        view.update(cx, |shell, shell_cx| {
+            shell.record_drop_position(position, shell_cx)
+        });
+        assert_eq!(open_cell(&view, cx), None, "a drag does not open cells");
+        let intent = view
+            .update(cx, |shell, shell_cx| shell.take_drop_intent(shell_cx))
+            .unwrap();
+        assert_eq!(open_cell(&view, cx), Some((0, 0)));
+        let path = png_file(&root, "dropped.png");
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.complete_resource_drop_paths(vec![path], intent, window, shell_cx)
+            })
+        })
+        .unwrap();
+        draw(cx);
+        let editor = view.read_with(cx, |shell, _| {
+            shell.table_cell_editor.as_ref().unwrap().editor.clone()
+        });
+        let image = editor
+            .read_with(cx, |editor, _| cell_image_ids(editor))
+            .pop()
+            .expect("dropped");
+        let expected = offset_cases(&image)
+            .into_iter()
+            .find(|(at, _)| *at == offset)
+            .unwrap()
+            .1;
+        assert_eq!(first_cell_html(&view, cx), expected, "drop at {offset}");
+    }
+}
+
+// Over an image in a cell, the upper half is before it, the lower after.
+#[gpui::test]
+async fn drop_on_a_cell_image_goes_before_or_after_it_by_half(cx: &mut TestAppContext) {
+    for before in [true, false] {
+        let (root, repository, note, view, cx) = mount(cx);
+        let editor = open_cell_at_end(&view, cx, 1, 1);
+        paste_png(cx);
+        cx.run_until_parked();
+        let first = editor
+            .read_with(cx, |editor, _| cell_image_ids(editor))
+            .pop()
+            .unwrap();
+        view.update(cx, |shell, shell_cx| {
+            shell.commit_table_cell_editor(false, shell_cx)
+        });
+        saved_body(&view, cx, &repository, &note);
+        let image_bounds = (0..5)
+            .find_map(|_| {
+                crate::native_editor::render::take_test_table_cell_paints();
+                cx.update(|window, app| window.draw(app).clear());
+                let paints = crate::native_editor::render::take_test_table_cell_paints();
+                cx.run_until_parked();
+                paints
+                    .iter()
+                    .rev()
+                    .find(|paint| paint.row == 1 && paint.column == 1)
+                    .and_then(|paint| paint.images.first().map(|(_, bounds, _)| *bounds))
+            })
+            .expect("image painted");
+        let y = if before {
+            image_bounds.top() + image_bounds.size.height / 4.0
+        } else {
+            image_bounds.bottom() - image_bounds.size.height / 4.0
+        };
+        let position = gpui::point(image_bounds.center().x, y);
+        view.update(cx, |shell, shell_cx| {
+            shell.record_drop_position(position, shell_cx)
+        });
+        let intent = view
+            .update(cx, |shell, shell_cx| shell.take_drop_intent(shell_cx))
+            .unwrap();
+        let path = png_file(&root, "second.png");
+        std::fs::write(&path, {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(5, 3, image::Rgba([200, 10, 10, 255]))
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        })
+        .unwrap();
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.complete_resource_drop_paths(vec![path], intent, window, shell_cx)
+            })
+        })
+        .unwrap();
+        draw(cx);
+        let ids = view
+            .read_with(cx, |shell, app| {
+                shell
+                    .table_cell_editor
+                    .as_ref()
+                    .map(|cell| cell_image_ids(cell.editor.read(app)))
+            })
+            .expect("the cell opened");
+        let second = ids
+            .iter()
+            .find(|id| **id != first)
+            .expect("second image")
+            .clone();
+        let order = if before {
+            [second, first]
+        } else {
+            [first, second]
+        };
+        assert_eq!(ids, order, "before={before}");
+    }
+}
+
+// The button routes by what has the focus when it is pressed, not by the
+// last paint: focus moved without a frame between still counts.
+#[gpui::test]
+async fn image_button_follows_the_focus_at_the_press_not_the_last_paint(cx: &mut TestAppContext) {
+    let (root, repository, note, view, cx) = mount(cx);
+    let cell = open_cell_at_end(&view, cx, 1, 1);
+    draw(cx);
+    let main = main_editor(&view, cx);
+    // The body takes the focus; no frame is drawn before the press.
+    cx.update(|window, app| main.read(app).focus_handle().focus(window));
+    let token = press_image_button(&view, cx);
+    complete_picker(&view, cx, token, png_file(&root, "body.png"));
+    assert!(
+        cell.read_with(cx, |editor, _| cell_image_ids(editor))
+            .is_empty()
+    );
+    assert_eq!(
+        main.read_with(cx, |editor, _| cell_image_ids(editor)).len(),
+        1,
+        "{}",
+        notice(&view, cx)
+    );
+    // And back to the cell, again without a frame.
+    cx.update(|window, app| cell.read(app).focus_handle().focus(window));
+    let token = press_image_button(&view, cx);
+    complete_picker(&view, cx, token, png_file(&root, "cell.png"));
+    assert_eq!(
+        cell.read_with(cx, |editor, _| cell_image_ids(editor)).len(),
+        1,
+        "{}",
+        notice(&view, cx)
     );
     view.update(cx, |shell, shell_cx| {
         shell.commit_table_cell_editor(false, shell_cx)
     });
-    draw(cx);
-    let (_, bounds) = table_node(&view, cx);
-    // Dragged over the table, then dropped: refused, not put at the body
-    // caret.
-    view.update(cx, |shell, shell_cx| {
-        shell.record_drop_position(bounds.center(), shell_cx)
-    });
-    let on_table = view.update(cx, |shell, shell_cx| shell.take_drop_intent(shell_cx));
-    assert!(on_table.is_err(), "a closed cell is no drop target");
     let body = saved_body(&view, cx, &repository, &note);
-    assert_eq!(body.matches("<img").count(), 1, "{body}");
-    assert!(body.starts_with("<p>前</p><table"), "{body}");
+    assert_eq!(body.matches("<img").count(), 2, "{body}");
 }
 
 #[gpui::test]
@@ -1583,4 +1830,35 @@ async fn cell_text_is_not_written_into_a_cell_that_moved_under_it(cx: &mut TestA
     cx.run_until_parked();
     let body = saved_body(&view, cx, &repository, &note);
     assert!(!body.contains("字"), "{body}");
+}
+
+// Rows added between the drag over a cell and the drop: the measured point
+// may name another, identical cell now, so the drop is refused.
+#[gpui::test]
+async fn drop_on_a_cell_whose_table_changed_since_the_drag_is_refused(cx: &mut TestAppContext) {
+    let table = "<table data-joplin-lite-table=\"true\"><tbody><tr><td>同</td><td>同</td></tr><tr><td>同</td><td>同</td></tr></tbody></table>";
+    let (_root, repository, note, view, cx) =
+        mount_body(cx, Arc::new(ManualSaveClock::default()), table);
+    draw(cx);
+    let (node, _) = table_node(&view, cx);
+    let main = main_editor(&view, cx);
+    let position = main
+        .read_with(cx, |editor, _| {
+            editor.layout().table_source_position(node, 1, 1, 0)
+        })
+        .expect("cell geometry");
+    let position = inside_glyph(position, 0);
+    view.update(cx, |shell, shell_cx| {
+        shell.record_drop_position(position, shell_cx)
+    });
+    cx.update(|_, app| main.update(app, |editor, _| editor.insert_table_row(node, 0).unwrap()));
+    let refused = view.update(cx, |shell, shell_cx| shell.take_drop_intent(shell_cx));
+    assert!(refused.is_err_and(|error| error.contains("表格在拖放过程中已改变")));
+    assert_eq!(
+        open_cell(&view, cx),
+        None,
+        "no cell opened for a stale point"
+    );
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(!body.contains("<img"), "{body}");
 }

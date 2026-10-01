@@ -118,9 +118,14 @@ impl EditorCommandChromeSurfaceContract {
 /// A host consumes this typed request with its own platform adapter.  The
 /// shared chrome never learns about profile paths, staged resource workers, or
 /// a picker implementation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum EditorCommandChromeEvent {
-    RequestInsertImage { window: AnyWindowHandle },
+    /// `focused` is what had the keyboard focus when the button was used,
+    /// before the chrome hands focus back to its editor.
+    RequestInsertImage {
+        window: AnyWindowHandle,
+        focused: Option<gpui::FocusHandle>,
+    },
 }
 
 /// The primary row belongs in a host's normal flow; menus/popovers are
@@ -505,6 +510,16 @@ impl EditorCommandChrome {
     }
 
     #[cfg(test)]
+    pub(crate) fn execute_command_for_test(
+        &mut self,
+        command: EditorCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command(command, false, None, window, cx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn more_open_for_test(&self) -> bool {
         self.more_open
     }
@@ -771,6 +786,7 @@ impl EditorCommandChrome {
             let window_handle = window.window_handle();
             cx.emit(EditorCommandChromeEvent::RequestInsertImage {
                 window: window_handle,
+                focused: window.focused(cx),
             });
             (self.insert_image_dispatch)(window_handle, cx);
             focus_editor(&self.editor, window, cx);

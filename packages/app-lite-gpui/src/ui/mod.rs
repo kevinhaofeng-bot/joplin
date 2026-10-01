@@ -580,9 +580,19 @@ pub struct LibraryShell {
     queued_resource_inserts: VecDeque<QueuedResourceInsert>,
     resource_queue_completion_scheduled: bool,
     pending_drop_intent: Option<InsertIntent>,
-    // Why the last drag position takes no drop (a table whose cell is not
-    // open); the drop is then refused instead of going to the body caret.
+    // Why the last drag position takes no drop; the drop is then refused
+    // instead of going to the body caret.
     pending_drop_refusal: Option<String>,
+    // A table cell (not open) and source offset the last drag position
+    // fell on, with the table's revision then; the drop opens that cell
+    // there unless the table changed meanwhile.
+    pending_drop_cell: Option<(
+        crate::native_editor::model::NodeId,
+        usize,
+        usize,
+        usize,
+        u64,
+    )>,
     resource_notice: Option<String>,
     unsupported_document: Option<String>,
     save_error: Option<ShellSaveError>,
@@ -1134,6 +1144,7 @@ impl LibraryShell {
             resource_queue_completion_scheduled: false,
             pending_drop_intent: None,
             pending_drop_refusal: None,
+            pending_drop_cell: None,
             resource_notice: None,
             unsupported_document: None,
             save_error: None,
@@ -2468,6 +2479,7 @@ impl LibraryShell {
         self.pending_resource_insert = None;
         self.pending_drop_intent = None;
         self.pending_drop_refusal = None;
+        self.pending_drop_cell = None;
         self.discard_queued_resource_inserts();
         self.resource_notice = None;
 
@@ -2533,10 +2545,21 @@ impl LibraryShell {
                     self._command_chrome_event_subscription = Some(cx.subscribe(
                         &command_chrome,
                         |shell, _chrome, event, shell_cx| match event {
-                            EditorCommandChromeEvent::RequestInsertImage { .. } => {
-                                if let Err(error) = shell.begin_resource_picker(shell_cx) {
+                            EditorCommandChromeEvent::RequestInsertImage { window, focused } => {
+                                if let Err(error) =
+                                    shell.request_insert_image(focused.as_ref(), shell_cx)
+                                {
                                     shell.resource_notice = Some(format!("资源未插入：{error}"));
                                     shell_cx.notify();
+                                }
+                                // The chrome hands focus to the note's editor; a
+                                // cell being edited keeps it instead.
+                                if shell.table_cell_is(focused.as_ref(), shell_cx) {
+                                    let _ = shell_cx.update_window(*window, |_, window, _| {
+                                        if let Some(focused) = focused.as_ref() {
+                                            focused.focus(window);
+                                        }
+                                    });
                                 }
                             }
                         },
@@ -2687,8 +2710,30 @@ impl LibraryShell {
     /// picker, pasteboard and drop routes.  Keeping this tiny state mutation
     /// synchronous makes cancellation harmless and lets the OS panel live
     /// outside the GPUI view borrow.
+    /// The chooser for the body's caret.
+    #[cfg(test)]
     pub(crate) fn begin_resource_picker(
         &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<ResourcePickerToken, String> {
+        self.begin_resource_picker_for(false, cx)
+    }
+
+    /// The image button: the chooser's file goes to the caret of whichever
+    /// editor had the focus when it was used (resource.ts insert replaces
+    /// that selection), the open cell's or the body's.
+    pub(crate) fn request_insert_image(
+        &mut self,
+        focused: Option<&gpui::FocusHandle>,
+        cx: &mut Context<Self>,
+    ) -> Result<ResourcePickerToken, String> {
+        let cell_focused = self.table_cell_is(focused, cx);
+        self.begin_resource_picker_for(cell_focused, cx)
+    }
+
+    fn begin_resource_picker_for(
+        &mut self,
+        cell_focused: bool,
         cx: &mut Context<Self>,
     ) -> Result<ResourcePickerToken, String> {
         if self.active_session_is_read_only(cx) {
@@ -2697,9 +2742,7 @@ impl LibraryShell {
         let Some(session) = self.note_session.clone() else {
             return Err("请先选择一篇笔记再插入资源".to_owned());
         };
-        // The chooser inserts where the caret was: in the open cell when it
-        // had the focus, else in the body.
-        let intent = if self.focused_table_cell() {
+        let intent = if cell_focused {
             self.capture_cell_resource_insert_intent(None, cx)
                 .unwrap_or_else(|| Err("单元格已关闭".to_owned()))?
         } else {
@@ -3096,7 +3139,8 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<ResourcePickerPrompt, String> {
-        let token = self.begin_resource_picker(cx)?;
+        let cell_focused = self.table_cell_has_focus(window, cx);
+        let token = self.begin_resource_picker_for(cell_focused, cx)?;
         let window = window
             .window_handle()
             .downcast::<LibraryShell>()
@@ -3351,13 +3395,14 @@ impl LibraryShell {
             Self::discard_resource_insert_intent(&session, intent, cx);
         }
         self.pending_drop_refusal = None;
-        self.pending_drop_intent = match self.capture_drop_intent_at(position, cx) {
-            Ok(intent) => intent,
-            Err(error) => {
-                self.pending_drop_refusal = Some(error);
-                None
+        self.pending_drop_cell = None;
+        match self.drop_target_at(position, cx) {
+            Ok(DropTarget::Insert(intent)) => self.pending_drop_intent = intent,
+            Ok(DropTarget::Cell(node_id, row, column, offset, revision)) => {
+                self.pending_drop_cell = Some((node_id, row, column, offset, revision));
             }
-        };
+            Err(error) => self.pending_drop_refusal = Some(error),
+        }
     }
 
     /// The intent a drop now uses: where the drag last was, refused where
@@ -3369,6 +3414,29 @@ impl LibraryShell {
         if let Some(refusal) = self.pending_drop_refusal.take() {
             return Err(refusal);
         }
+        if let Some((node_id, row, column, offset, revision)) = self.pending_drop_cell.take() {
+            // The point was measured on the table as it was; an identical
+            // cell may sit at those coordinates now.
+            let current = self.note_session.as_ref().and_then(|session| {
+                let editor = session.read(cx).editor().read(cx);
+                editor.document().block(node_id).map(|block| block.revision)
+            });
+            if current != Some(revision) {
+                return Err("表格在拖放过程中已改变，未放入；请重新拖放".to_owned());
+            }
+            // dragdrop/plugin.ts: a drop in a table goes into that cell at
+            // the dropped point. Here the cell opens for it.
+            self.open_table_cell_editor(node_id, row, column, cx);
+            let point = self
+                .table_cell_editor
+                .as_ref()
+                .filter(|cell| (cell.node_id, cell.row, cell.column) == (node_id, row, column))
+                .map(|cell| cell.editor.read(cx).cell_point_at_source_offset(offset))
+                .ok_or_else(|| "无法打开要放入的单元格".to_owned())?;
+            return self
+                .capture_cell_resource_insert_intent(Some(Selection::caret(point)), cx)
+                .unwrap_or_else(|| Err("无法打开要放入的单元格".to_owned()));
+        }
         match self.pending_drop_intent.take() {
             Some(intent) => Ok(intent),
             None => self
@@ -3379,23 +3447,32 @@ impl LibraryShell {
         }
     }
 
-    /// The insert point a drop at `position` would use.
-    pub(crate) fn capture_drop_intent_at(
+    /// Where a drop at `position` goes. dragdrop/plugin.ts: the drop
+    /// coordinate decides (posAtCoords); in the open cell it is the cell's
+    /// point under it, on a table a cell and its text offset.
+    fn drop_target_at(
         &mut self,
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
-    ) -> Result<Option<InsertIntent>, String> {
+    ) -> Result<DropTarget, String> {
         let Some(session) = self.note_session.clone() else {
-            return Ok(None);
+            return Ok(DropTarget::Insert(None));
         };
-        // dragdrop/plugin.ts: the drop coordinate decides. In the open cell
-        // it is the cell's point under it.
         if let Some(point) = self.table_cell_drop_point(position, cx) {
             return self
                 .capture_cell_resource_insert_intent(point.map(Selection::caret), cx)
-                .transpose();
+                .transpose()
+                .map(DropTarget::Insert);
         }
         let editor = session.read_with(cx, |session, _| session.editor().clone());
+        if let Some((node_id, row, column, offset, revision)) = editor.read_with(cx, |editor, _| {
+            let (node_id, row, column, offset) =
+                editor.layout().table_source_offset_at(position)?;
+            let revision = editor.document().block(node_id)?.revision;
+            Some((node_id, row, column, offset, revision))
+        }) {
+            return Ok(DropTarget::Cell(node_id, row, column, offset, revision));
+        }
         let on_table = editor.read_with(cx, |editor, _| {
             editor
                 .layout()
@@ -3409,10 +3486,11 @@ impl LibraryShell {
                 })
         });
         if on_table {
-            return Err("要把文件放进表格，请先双击打开该单元格，再拖到单元格编辑框中".to_owned());
+            return Err("无法确定表格中的放入位置".to_owned());
         }
         let point = editor.update(cx, |editor, _| editor.point_from_layout(position));
-        Self::capture_resource_insert_intent(&session, point.map(Selection::caret), cx).map(Some)
+        Self::capture_resource_insert_intent(&session, point.map(Selection::caret), cx)
+            .map(|intent| DropTarget::Insert(Some(intent)))
     }
 
     fn on_external_paths_drop(
@@ -6674,6 +6752,17 @@ fn prompt_for_resource_path(prompt_request: ResourcePickerPrompt, cx: &mut App) 
 /// `EditorCommandChrome` queues its typed event before calling this adapter.
 /// Defer the window lookup until that event has captured the `InsertIntent`
 /// and the current window update has returned to GPUI.
+enum DropTarget {
+    Insert(Option<InsertIntent>),
+    Cell(
+        crate::native_editor::model::NodeId,
+        usize,
+        usize,
+        usize,
+        u64,
+    ),
+}
+
 fn dispatch_library_resource_picker(window: AnyWindowHandle, cx: &mut App) {
     cx.defer(move |app| {
         let Some(window) = window.downcast::<LibraryShell>() else {

@@ -65,7 +65,16 @@ pub(crate) enum CellPiece {
 pub(crate) struct CellLayout {
     pub(crate) pieces: Vec<CellPiece>,
     pub(crate) height: f32,
+    /// Where each piece starts in the cell's source offsets (see
+    /// [`MEDIA_SOURCE_LEN`]), and the offset of the cell's end.
+    pub(crate) sources: Vec<usize>,
+    pub(crate) source_len: usize,
 }
+
+/// A cell's source offsets count its text bytes, one per line break and
+/// this many for an image or file, so that a point in the laid-out table and
+/// a caret in the cell's editor name the same place.
+pub(crate) const MEDIA_SOURCE_LEN: usize = '\u{FFFC}'.len_utf8();
 
 /// What `TableLayout` was measured from; a different key means measure
 /// again.
@@ -119,6 +128,60 @@ impl TableLayout {
             }
         }
         None
+    }
+
+    /// The cell under `position` and the source offset (see
+    /// [`MEDIA_SOURCE_LEN`]) of the caret there: the glyph boundary nearest
+    /// on its line, before or after an image by which half is hit, the
+    /// start of the piece below a gap and the cell's end below its content.
+    pub(crate) fn source_offset_at(
+        &self,
+        bounds: Bounds<Pixels>,
+        position: Point<Pixels>,
+    ) -> Option<(usize, usize, usize)> {
+        let hit = self.hit(bounds, position)?;
+        let cell = self.cells.get(hit.row)?.get(hit.column)?;
+        let (left, top) = self.content_origin(hit.row, hit.column);
+        let x = (position.x - bounds.left() - px(left)).max(px(0.0));
+        let y = position.y - bounds.top() - px(top);
+        for (piece, &source) in cell.pieces.iter().zip(&cell.sources) {
+            match piece {
+                CellPiece::Text { top, lines, .. } => {
+                    let mut line_top = px(*top);
+                    let mut byte_start = 0;
+                    if y < line_top {
+                        return Some((hit.row, hit.column, source));
+                    }
+                    for line in lines {
+                        let height = line.size(px(TABLE_LINE_HEIGHT)).height;
+                        if y < line_top + height {
+                            let index = line
+                                .closest_index_for_position(
+                                    gpui::point(x, y - line_top),
+                                    px(TABLE_LINE_HEIGHT),
+                                )
+                                .unwrap_or_else(|index| index);
+                            return Some((hit.row, hit.column, source + byte_start + index));
+                        }
+                        line_top += height;
+                        byte_start += line.len() + 1;
+                    }
+                }
+                CellPiece::Image { top, height, .. }
+                | CellPiece::Attachment { top, height, .. } => {
+                    if y < px(top + height) {
+                        let before = y < px(top + height / 2.0);
+                        let offset = if before {
+                            source
+                        } else {
+                            source + MEDIA_SOURCE_LEN
+                        };
+                        return Some((hit.row, hit.column, offset));
+                    }
+                }
+            }
+        }
+        Some((hit.row, hit.column, cell.source_len))
     }
 
     pub(crate) fn height(&self) -> f32 {
@@ -379,16 +442,21 @@ fn measure_cell(
     let mut runs: Vec<TextRun> = Vec::new();
     let mut described: Vec<(String, RunMarks)> = Vec::new();
     let mut links = Vec::new();
+    let mut sources = Vec::new();
+    let mut source = 0;
     let plain = run_marks(&Marks::default(), header);
     let flush = |text: &mut String,
                  runs: &mut Vec<TextRun>,
                  described: &mut Vec<(String, RunMarks)>,
                  links: &mut Vec<(std::ops::Range<usize>, String)>,
                  pieces: &mut Vec<CellPiece>,
+                 sources: &mut Vec<usize>,
+                 source: usize,
                  y: &mut f32| {
         // A break with nothing after it still ends the line.
         let lines = shape(text, runs, width, text_system);
         if !lines.is_empty() {
+            sources.push(source - text.len());
             pieces.push(CellPiece::Text {
                 top: *y,
                 lines: lines.clone(),
@@ -411,19 +479,32 @@ fn measure_cell(
                 text.push_str(run);
                 runs.push(text_run(run.len(), marks, font));
                 described.push((run.clone(), marks));
+                source += run.len();
             }
             Inline::SoftBreak => {
                 text.push('\n');
                 runs.push(text_run(1, plain, font));
+                source += 1;
             }
             Inline::Image {
                 resource_id,
                 display_width,
                 ..
             } => {
-                flush(&mut text, &mut runs, &mut described, &mut links, &mut pieces, &mut y);
+                flush(
+                    &mut text,
+                    &mut runs,
+                    &mut described,
+                    &mut links,
+                    &mut pieces,
+                    &mut sources,
+                    source,
+                    &mut y,
+                );
                 let natural = image_size(resource_id.as_str()).unwrap_or(IMAGE_PLACEHOLDER);
                 let (image_width, image_height) = image_layout_size(width, natural, *display_width);
+                sources.push(source);
+                source += MEDIA_SOURCE_LEN;
                 pieces.push(CellPiece::Image {
                     top: y,
                     width: image_width,
@@ -437,7 +518,16 @@ fn measure_cell(
                 filename,
                 ..
             } => {
-                flush(&mut text, &mut runs, &mut described, &mut links, &mut pieces, &mut y);
+                flush(
+                    &mut text,
+                    &mut runs,
+                    &mut described,
+                    &mut links,
+                    &mut pieces,
+                    &mut sources,
+                    source,
+                    &mut y,
+                );
                 let label = format!("📎 {filename}");
                 let marks = RunMarks {
                     link: true,
@@ -454,6 +544,8 @@ fn measure_cell(
                     .map(|line| f32::from(line.width()))
                     .fold(0.0, f32::max);
                 let height = lines_height(&lines);
+                sources.push(source);
+                source += MEDIA_SOURCE_LEN;
                 pieces.push(CellPiece::Attachment {
                     top: y,
                     width: (label_width + 2.0 * ATTACHMENT_LABEL_PADDING).min(width),
@@ -465,7 +557,16 @@ fn measure_cell(
             }
         }
     }
-    flush(&mut text, &mut runs, &mut described, &mut links, &mut pieces, &mut y);
+    flush(
+        &mut text,
+        &mut runs,
+        &mut described,
+        &mut links,
+        &mut pieces,
+        &mut sources,
+        source,
+        &mut y,
+    );
     // Trailing gap after a final image or label is not content.
     if matches!(
         pieces.last(),
@@ -476,6 +577,8 @@ fn measure_cell(
     CellLayout {
         pieces,
         height: y.max(0.0),
+        sources,
+        source_len: source,
     }
 }
 
