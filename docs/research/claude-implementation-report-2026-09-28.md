@@ -1471,3 +1471,107 @@ rustfmt 只处理了本批改动；与 HEAD 相比，格式差异为 0。
 - **沿用之前的缺项**：多单元格选区、表格附件、复杂单元格块、网页图片粘贴到单元格、解码缓存的实机测量。
 
 没有安装，没有推送，没有改动原资料库、服务器、默认 profile 或已安装的 App，也没有碰 Codex 的 evidence 74–76 和 `replica-delivery-status.md`。
+
+## 第二十五批：拖放进未打开的单元格、命中几何、按钮焦点（`62c5d2a09`）
+
+本批交付后停止写入产品代码，留给 Codex 构建干净候选包。产品整体范围不变，不称完成。
+
+### Evernote 对应
+
+源码根目录：`evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/`。
+
+- `resource/resource.ts` 353–361：如果 `caretLocationPluginKey` 中有坐标，资源插入时用 `posAtCoords` 把坐标换算成位置，再交给 `insertResourceAtPosition`。外部文件拖放就是通过 `caretLocation` 记下的松手坐标插入的（`dragdrop/plugin.ts` 116–120 会在拖放或资源更新后清除这个坐标）。
+- `dragdrop/plugin.ts`：
+  - 444–447：落点 `$mouse` 来自 `posAtCoords(eventCoords(event))`；
+  - 518–521：落在表格内时，直接 `replaceRangeWith` 到该单元格的位置。
+- `dragdrop/dragdrop.ts` 64–67：`getDropInsertPos` 以 `$context.pos`（即落点）为基准。
+
+### 第二十四批的缺陷与本批修复
+
+**单元格拖放区域错位**：
+- 第二十四批记录单元格编辑区边界的 canvas 用了 `absolute()`，却没有设置 `top`/`left`。于是它落在默认的流式位置，也就是 160px 高的编辑表面的**下方**。
+- 实测单元格编辑器布局的 y=161.5，记录的边界 y=320.5，相差正好 160 左右。
+- 所以第二十四批报告的“布局坐标与绘制位置不一致”，问题出在这个 canvas，不在编辑器布局。第二十四批的拖放测试用的也是同一组错误边界，所以没有发现。
+- 本批加上了 `top_0().left_0()`。负控 E 去掉这两项后，打开单元格中的点击和拖放测试失败。
+
+**按钮焦点**：
+- chrome 在发出 `RequestInsertImage` **之后**会把焦点交回正文编辑器，而壳层的订阅在效果刷新时才执行，所以不管是“上次绘制时记录的焦点”还是订阅时读到的焦点，都不对。
+- 本批让事件携带点击当时的 `window.focused(cx)`，壳层按它路由，焦点在单元格时把焦点还给单元格。这样再次按按钮、按 Esc、以及选择器完成后，焦点都仍在单元格中。
+- 菜单路径（`open_library_resource_picker`）直接读取 `window` 的实时焦点。
+- 原有的 `begin_resource_picker(cx)` 保留为“正文光标”语义，只在测试中使用（`#[cfg(test)]`）。
+
+### 拖放进未打开的单元格
+
+- **偏移约定**（`table_layout::MEDIA_SOURCE_LEN`）：文字按字节计，单元格内每个换行计 1，每张图片或每个文件计一个占位符（U+FFFC 的字节数）。`measure_cell` 为每个片段记录起始偏移（`CellLayout.sources` 和 `source_len`），不改变 `CellPiece` 的各个变体。
+- **布局端**（`TableLayout::source_offset_at` 和 `LayoutRegistry::table_source_offset_at`）：
+  - 文字行：取最近的字形边界（`closest_index_for_position`）；
+  - 图片：按上半区或下半区取图片前或图片后；
+  - 片段间的空隙：取下一片段的开头；
+  - 内容下方：取单元格末尾；
+  - 已考虑表格的横向滚动。
+- **编辑器端**（`EditorCore::cell_point_at_source_offset`）：按原生块遍历，同一行内分组的块之间不计换行，把偏移映射到光标（图片块带 Before 或 After 亲和）。
+- **壳层流程**：
+  - 拖动经过时（`record_drop_position`）只记录 (表格, 行, 列, 偏移, 表格块修订号)，**不打开**单元格；
+  - 松手时（`take_drop_intent`），表格块的修订号已变化就拒绝，提示“表格在拖放过程中已改变”，不打开任何单元格；
+  - 否则打开该单元格，在该偏移处生成单元格意图，再走原有的资源链。
+
+### 测试（`ui/table_cell_editor_tests.rs`）
+
+| 测试 | 覆盖内容 |
+|---|---|
+| `click_and_drop_in_the_open_cell_land_at_the_point_under_the_pointer` | 两行单元格 `甲乙丙<br>丁戊`，偏移 0（开头）、3（中间）、9（第一行行尾）、13（第二行中间）、16（末尾）。每个偏移都检查：点击后光标精确等于该偏移；在同一点拖放后，单元格内容符合 `insertResourceAtPosition` 的预期（开头插在前，其余位置拆分） |
+| `drop_on_an_unopened_cell_opens_it_and_inserts_at_the_point` | 同样五个偏移，单元格未打开：拖动时不打开单元格；松手后打开 (0,0)，并在该点插入 |
+| `drop_on_a_cell_image_goes_before_or_after_it_by_half` | 落在单元格内已有图片的上四分之一处，新图在前；下四分之一处，新图在后 |
+| `image_button_follows_the_focus_at_the_press_not_the_last_paint` | 不绘制任何帧，把焦点移到正文后按按钮，图片进正文；再移回单元格后按按钮，图片进单元格 |
+| `drop_on_a_cell_whose_table_changed_since_the_drag_is_refused` | 每格内容都是“同”；拖动记录 (1,1) 后，在上方插入一行再松手：拒绝，不打开单元格，正文没有图片 |
+| 第二十四批的选择器测试 | 改为调用真实按钮路径 `execute_command_for_test`（发出事件、把焦点交回正文、壳层路由），断言不变 |
+| 第二十四批的 `drop_into_the_open_cell_goes_there_and_on_a_closed_cell_is_refused` | **已被上面几项替代**：它断言“未打开的单元格会拒绝拖放”，而本批合同要求打开该格并插入 |
+
+**测试中点的取法**：点取在字形内部，不压在边界上：行首向右 1px，行中取左侧字的右半部，行尾越过末尾 3px。原因见下文“GPUI 观察”。
+
+### 负控（隔离副本，每个用例 60 秒闹钟）
+
+| 控制 | 改动 | 结果 |
+|---|---|---|
+| A | 事件不携带焦点 | 两项选择器和焦点测试失败 |
+| B | 不把焦点还给单元格 | 两项选择器测试失败 |
+| C | 表格偏移不可命中 | 未打开单元格的拖放测试失败 |
+| D | 偏移映射总落到末尾 | 同上失败 |
+| E | canvas 不定位 | 打开单元格的点击和拖放测试失败 |
+| F | 图片总按“上半区”处理 | 图片上下半区测试失败 |
+| G | 松手时不比较修订号 | 陈旧落点测试失败 |
+
+日志：A–F 在 `/tmp/joplin-claude-batch25-negative-controls.{sh,log}`，G 在 `/tmp/joplin-claude-batch25-negative-control-G.{sh,log}`。
+
+### 全量（工作区等同 `62c5d2a09`，`--offline --locked`，20 分钟上限，退出码 0）
+
+- App：1527 通过、0 失败、2 忽略，15.6 秒（`/tmp/joplin-claude-batch25-gpui-full.log`）；
+- core：368 通过、0 失败（`/tmp/joplin-claude-batch25-core-full.log`）。
+
+**警告**：改动的文件中没有新增警告（与第二十四批日志逐条对比）。期间曾出现两条新增的未使用警告，都已修正：一是我把新函数插到了既有 `#[cfg(test)]` 属性与它修饰的函数之间；二是 `begin_resource_picker` 只剩测试在用。
+
+**诊断代码**：已全部移除，`src` 中 `ZZDIAG`/`zz_diag` 的计数为 0。
+
+**格式**：`core.rs` 和 `toolbar.rs` 在 HEAD 没有格式差异，整文件格式化；其余文件只应用与本批改动行相交的格式块。
+
+### GPUI 观察（未改动 vendor）
+
+`WrappedLineLayout::closest_index_for_position` 处理一行**最后一个字**时，只要 x 越过该字的起点，就会取到行尾。实测例子：
+- 第一行“甲乙丙”，x=20 落在“丙”的左半（16.8–25.2），应得 6，实际得 9；
+- 第二行“丁戊”，x=8.400024 得到行尾 6。
+
+正文编辑器的点击走的也是同一个函数，所以这是既有行为：点在一行最后一个字的左半时，光标会落到行尾，与 Evernote（浏览器）的最近边界不一致。本批没有修改，列为剩余项。
+
+### 原生选择器（Codex 实机结论，引用）
+
+冻结的第二十三批签名包用 `/usr/bin/open -n --env JOPLIN_LITE_PROFILE=…` 经 LaunchServices 启动时，NSOpenPanel 能正常显示，图片立即出现在正文中，保存后经正常退出再重开，内容仍在；直接执行二进制时，会复现面板 XPC 断言。这与第二十四批的只读诊断一致，不需要改 GPUI。**这只是正文的证据**，最新的单元格路由还没有实机验证。
+
+### 剩余（明确未完成）
+
+- 上述 GPUI 行尾字左半的取整偏差。
+- 拖放进未打开的单元格时，会**打开**该单元格编辑器，而 Evernote 在原位插入、不打开任何编辑框。这是本项目“单元格须在编辑器中编辑”的结构所致的差异。
+- 落点在单元格内但不在任何文字行或图片上（例如单元格内边距中）时，取最近片段的开头或单元格末尾，没有像 `posAtCoords` 那样逐像素对照。
+- 单元格内的附件卡片片段可以命中偏移，但单元格编辑器中的附件仍会被拒绝（沿用第二十三批的缺项）。
+- 多单元格选区、复杂单元格块、网页图片粘贴到单元格、解码缓存的实机测量，以及最新单元格路由的实机验证，都尚未完成。
+
+没有安装，没有推送，没有改动原资料库、服务器或已安装的 App，也没有碰 Codex 的 evidence 74–79 和 `replica-delivery-status.md`。
