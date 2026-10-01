@@ -849,6 +849,7 @@ impl EditorCore {
             | Transaction::SetTextColor { .. }
             | Transaction::SetAlignment { .. }
             | Transaction::SetQuote { .. }
+            | Transaction::ToggleCheck { .. }
             | Transaction::SplitQuoteAt { .. }
             | Transaction::IndentList { .. }
             | Transaction::OutdentList { .. }
@@ -3200,6 +3201,37 @@ impl EditorCore {
                     "later edit cannot be safely mapped around failed resource insertion".into(),
                 )
             })
+    }
+
+    /// The checklist item whose box is at `position`: the list marker area of
+    /// its first line (render.rs paints the marker at the block's left edge).
+    pub(crate) fn check_marker_at(&self, position: Point<Pixels>) -> Option<NodeId> {
+        self.layout.visible().iter().find_map(|layout| {
+            let block = self.document.block(layout.node_id)?;
+            if !matches!(block.kind, BlockKind::CheckItem { .. })
+                || self.document.is_inline_group_continuation(block.id)
+            {
+                return None;
+            }
+            let line = self
+                .layout
+                .line_height(block.id)
+                .unwrap_or(layout.bounds.size.height);
+            let marker = Bounds::new(
+                layout.bounds.origin,
+                gpui::size(layout.text_inset, line.min(layout.bounds.size.height)),
+            );
+            marker.contains(&position).then_some(block.id)
+        })
+    }
+
+    /// Evernote list/plugin.ts handleTodoListMouseEvent: ticking a box is
+    /// one undoable change that leaves the selection where it was.
+    pub(crate) fn toggle_check(&mut self, node: NodeId) -> Result<(), DocumentError> {
+        let selection = self.selection;
+        let outcome = self.apply_with_selection(Transaction::ToggleCheck { node, selection })?;
+        self.set_selection(outcome.selection);
+        Ok(())
     }
 
     fn apply_quote_key(&mut self, transaction: Transaction) -> Result<(), DocumentError> {

@@ -64,6 +64,13 @@ pub enum Transaction {
         selection: Selection,
         quote: bool,
     },
+    /// Evernote list/plugin.ts handleTodoListMouseEvent: a click on a
+    /// checklist item's box flips `checked` (`setNodeMarkup`), leaving the
+    /// selection where it was.
+    ToggleCheck {
+        node: NodeId,
+        selection: Selection,
+    },
     /// quoteblock/keymap.ts removeEmptyLineAndSplitQuoteblock: the empty
     /// quote paragraph `node` leaves its quote, splitting it if more follows.
     SplitQuoteAt {
@@ -149,6 +156,7 @@ impl Transaction {
             | Self::SetTextColor { selection, .. }
             | Self::SetAlignment { selection, .. }
             | Self::SetQuote { selection, .. }
+            | Self::ToggleCheck { selection, .. }
             | Self::IndentList { selection }
             | Self::OutdentList { selection }
             | Self::InsertImage { selection, .. }

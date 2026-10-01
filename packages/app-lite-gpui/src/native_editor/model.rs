@@ -2488,6 +2488,7 @@ impl Document {
             | Transaction::MergeBlocks { .. }
             | Transaction::SetBlockKind { .. }
             | Transaction::SetQuote { .. }
+            | Transaction::ToggleCheck { .. }
             | Transaction::SetAlignment { .. }
             | Transaction::IndentList { .. }
             | Transaction::OutdentList { .. }
@@ -2780,6 +2781,11 @@ impl Document {
             }
             Transaction::SetQuote { selection, quote } => {
                 let (selection, changed_nodes, inverse) = self.apply_set_quote(selection, quote)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::ToggleCheck { node, selection } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_toggle_check(node, selection)?;
                 (selection, changed_nodes, inverse, None)
             }
             Transaction::SplitQuoteAt { node } => {
@@ -3712,6 +3718,37 @@ impl Document {
                         is_text_block(member) && (member.kind == BlockKind::Quote || member.quoted)
                     })
             })
+    }
+
+    fn apply_toggle_check(
+        &mut self,
+        node: NodeId,
+        selection: Selection,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        let index = self.node_index(node)?;
+        let original = self.blocks[index].clone();
+        let BlockKind::CheckItem { depth, checked } = original.kind else {
+            return Err(DocumentError::InvalidOperation(
+                "only a checklist item has a box to tick".into(),
+            ));
+        };
+        let mut toggled = original.clone();
+        toggled.kind = BlockKind::CheckItem {
+            depth,
+            checked: !checked,
+        };
+        self.blocks.replace(index, toggled);
+        let mut changed_nodes = SmallVec::new();
+        push_unique(&mut changed_nodes, node);
+        Ok((
+            selection,
+            changed_nodes,
+            TransactionBatch(vec![Transaction::RestoreBlocks {
+                index,
+                remove_count: 1,
+                blocks: vec![original],
+            }]),
+        ))
     }
 
     /// Whether block `index` begins a quote container.

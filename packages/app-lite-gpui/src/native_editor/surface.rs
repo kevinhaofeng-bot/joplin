@@ -415,6 +415,22 @@ impl EditorSurface {
                 return;
             }
         }
+        // Evernote list/plugin.ts: a click on a checklist box ticks it and
+        // does not move the caret.
+        if !self.mode.is_read_only() && !event.modifiers.shift {
+            let ticked = self.editor.update(cx, |editor, editor_cx| {
+                let node = editor.check_marker_at(event.position)?;
+                let ticked = editor.toggle_check(node).is_ok();
+                editor_cx.notify();
+                Some(ticked)
+            });
+            if ticked.is_some() {
+                self.pointer_anchor = None;
+                focus_editor(&self.editor, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         // Evernote table/plugin.ts lets Cmd/Ctrl-click links bypass cell selection.
         if event.modifiers.platform || event.modifiers.control {
             if let Some(url) = self.editor.read(cx).layout().table_link_at(event.position) {

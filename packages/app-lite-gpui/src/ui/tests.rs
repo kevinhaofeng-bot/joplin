@@ -13165,3 +13165,129 @@ async fn quote_keys_follow_evernote_quoteblock_keymap(cx: &mut TestAppContext) {
     });
     assert_eq!(reopened_html.as_str(), deleted);
 }
+
+#[gpui::test]
+async fn clicking_a_checklist_box_ticks_it_undoably_and_saves(cx: &mut TestAppContext) {
+    // evidence69: a click on the box only moved the caret. Evernote
+    // list/plugin.ts handleTodoListMouseEvent flips `checked` with
+    // setNodeMarkup, leaving the selection; a click on the text places the
+    // caret as usual.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let stored = "<ul data-type=\"checklist\"><li data-checked=\"false\">First</li><li data-checked=\"false\">Second</li></ul>";
+    let note = repository
+        .create_note(CreateNote {
+            title: "待办".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html(stored).unwrap(),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    let ids = cx.update(|_, app| {
+        editor
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>()
+    });
+    let checked = |cx: &mut VisualTestContext| {
+        cx.update(|_, app| {
+            editor
+                .read(app)
+                .document()
+                .blocks()
+                .iter()
+                .map(|block| matches!(block.kind, BlockKind::CheckItem { checked: true, .. }))
+                .collect::<Vec<_>>()
+        })
+    };
+    let head = |cx: &mut VisualTestContext| {
+        cx.update(|_, app| {
+            let point = editor.read(app).selection().head;
+            (point.node_id, point.utf8_offset)
+        })
+    };
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            editor.set_selection_for_test(Selection::caret(DocPoint::new(ids[1], 3)));
+            editor.focus_handle().focus(window);
+            editor_cx.notify();
+        })
+    });
+    redraw(cx);
+    let first = cx.update(|_, app| {
+        let layout = editor.read(app).layout().block_layout(ids[0]).unwrap();
+        (layout.bounds, layout.text_inset)
+    });
+    let line = cx.update(|_, app| editor.read(app).layout().line_height(ids[0]).unwrap());
+    let in_box = point(first.0.left() + first.1 / 2.0, first.0.top() + line / 2.0);
+    let on_text = point(
+        first.0.left() + first.1 + px(6.0),
+        first.0.top() + line / 2.0,
+    );
+
+    cx.simulate_click(in_box, Modifiers::default());
+    redraw(cx);
+    assert_eq!(checked(cx), vec![true, false]);
+    assert_eq!(head(cx), (ids[1], 3), "ticking leaves the caret alone");
+
+    // A click on the text only places the caret.
+    cx.simulate_click(on_text, Modifiers::default());
+    redraw(cx);
+    assert_eq!(checked(cx), vec![true, false]);
+    assert_eq!(head(cx).0, ids[0]);
+
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert_eq!(checked(cx), vec![false, false]);
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    assert_eq!(checked(cx), vec![true, false]);
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx)
+        })
+    });
+    cx.run_until_parked();
+    let saved = repository.load_note(&note.id).unwrap().unwrap();
+    let ticked = "<ul data-type=\"checklist\"><li data-checked=\"true\">First</li><li data-checked=\"false\">Second</li></ul>";
+    assert_eq!(saved.body_html, ticked);
+    let reopened = cx.new(|cx| {
+        crate::app::note_session::NoteSession::open(
+            saved,
+            Arc::clone(&repository),
+            Arc::new(ManualSaveClock::default()),
+            cx,
+        )
+        .unwrap()
+    });
+    let reopened_html = reopened.read_with(cx, |session, app| {
+        crate::native_editor::codec::export_canonical(session.editor().read(app).document())
+            .unwrap()
+            .to_canonical_html()
+    });
+    assert_eq!(reopened_html.as_str(), ticked);
+
+    // Ticking again unticks.
+    cx.simulate_click(in_box, Modifiers::default());
+    redraw(cx);
+    assert_eq!(checked(cx), vec![false, false]);
+}
