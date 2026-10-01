@@ -9449,3 +9449,124 @@ fn quote_keys_keep_inline_images_and_leave_on_an_empty_last_line(cx: &mut gpui::
     editor.set_selection_for_test(Selection::caret(DocPoint::new(after_image, 0)));
     assert!(editor.quote_backspace_for_test().is_none());
 }
+
+#[gpui::test]
+fn image_insert_follows_evernote_resource_placement(cx: &mut gpui::TestAppContext) {
+    // common-editor resource/resource.ts insertResourceAtPosition / insert:
+    // an empty text block gives way to the media, the media goes before a
+    // block at its start and after it at its end, mid-text splits; the
+    // caret then rests at the start of the next text block, an empty
+    // paragraph existing for it only when no text block follows.
+    use super::fixtures::typical_image_payload;
+    let shape = |editor: &EditorCore| {
+        editor
+            .document()
+            .blocks()
+            .iter()
+            .map(|block| match &block.content {
+                BlockContent::Image { .. } => "[图]".to_owned(),
+                _ => format!("{:?}:{}", block.kind, block.content.as_text().unwrap_or("")),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for (html, block, offset, after_insert, after_typing) in [
+        (
+            "<p>甲乙</p>",
+            0,
+            0,
+            "[图] Paragraph:甲乙",
+            "[图] Paragraph:X甲乙",
+        ),
+        (
+            "<p>前</p><p><br></p><p>后</p>",
+            1,
+            0,
+            "Paragraph:前 [图] Paragraph:后",
+            "Paragraph:前 [图] Paragraph:X后",
+        ),
+        (
+            "<p>前</p><p><br></p>",
+            1,
+            0,
+            "Paragraph:前 [图] Paragraph:",
+            "Paragraph:前 [图] Paragraph:X",
+        ),
+        (
+            "<p>甲乙</p>",
+            0,
+            6,
+            "Paragraph:甲乙 [图] Paragraph:",
+            "Paragraph:甲乙 [图] Paragraph:X",
+        ),
+        (
+            "<p>甲乙</p>",
+            0,
+            3,
+            "Paragraph:甲 [图] Paragraph:乙",
+            "Paragraph:甲 [图] Paragraph:X乙",
+        ),
+        (
+            "<p>甲</p><h2>题</h2>",
+            0,
+            3,
+            "Paragraph:甲 [图] Heading { level: 2 }:题",
+            "Paragraph:甲 [图] Heading { level: 2 }:X题",
+        ),
+    ] {
+        let mut editor = EditorCore::from_document(
+            super::codec::import_canonical(
+                &app_lite_core::CanonicalDocument::parse_html(html).unwrap(),
+            )
+            .unwrap(),
+            cx,
+        );
+        let original = shape(&editor);
+        let id = editor.document().blocks()[block].id;
+        editor.set_selection_for_test(Selection::caret(DocPoint::new(id, offset)));
+        editor
+            .insert_image_payload(typical_image_payload(0))
+            .unwrap();
+        assert_eq!(shape(&editor), after_insert, "{html} @{offset}");
+        editor.insert_text("X").unwrap();
+        assert_eq!(shape(&editor), after_typing, "{html} @{offset} typing");
+        editor.undo().unwrap();
+        editor.undo().unwrap();
+        assert_eq!(shape(&editor), original, "{html} @{offset} undo");
+        editor.redo().unwrap();
+        assert_eq!(shape(&editor), after_insert, "{html} @{offset} redo");
+    }
+
+    // A selection across an image removes it with the text; the quote
+    // command does not take a standalone image (quoteblock content excludes
+    // Evernote's block image).
+    let mut editor = EditorCore::from_document(
+        super::codec::import_canonical(
+            &app_lite_core::CanonicalDocument::parse_html("<p>甲乙</p>").unwrap(),
+        )
+        .unwrap(),
+        cx,
+    );
+    let id = editor.document().blocks()[0].id;
+    editor.set_selection_for_test(Selection::caret(DocPoint::new(id, "甲".len())));
+    editor
+        .insert_image_payload(typical_image_payload(0))
+        .unwrap();
+    let blocks: Vec<_> = editor
+        .document()
+        .blocks()
+        .iter()
+        .map(|block| block.id)
+        .collect();
+    editor.set_selection_for_test(Selection::new(
+        DocPoint::new(blocks[0], 0),
+        DocPoint::new(blocks[2], "乙".len()),
+    ));
+    assert!(
+        !CommandCatalogue::new()
+            .state(EditorCommand::Quote, &editor)
+            .enabled
+    );
+    editor.backspace().unwrap();
+    assert_eq!(shape(&editor), "Paragraph:");
+}

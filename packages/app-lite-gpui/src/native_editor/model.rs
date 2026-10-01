@@ -4362,6 +4362,78 @@ impl Document {
         ))
     }
 
+    /// A top-level paragraph or heading the caret can rest in, as
+    /// ProseMirror's `nodeAfter.isTextblock` in Evernote's resource insert.
+    fn is_top_level_textblock(&self, index: usize) -> bool {
+        self.blocks.get(index).is_some_and(|block| {
+            matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading { .. })
+                && !block.quoted
+                && is_text_block(block)
+                && !self.is_inline_group_member(block.id)
+        })
+    }
+
+    /// Evernote's resource insert at a collapsed caret in a top-level
+    /// paragraph or heading (common-editor resource/resource.ts
+    /// insertResourceAtPosition and insert): at the block's start the media
+    /// goes before it; an empty block gives way to it; and the caret then
+    /// rests at the start of the next text block, an empty paragraph being
+    /// there for it only when no text block follows. The caret always ends in
+    /// a block that existed before, so a failed resource commit can undo the
+    /// insert and replay later typing. `None` leaves every other case
+    /// (mid-text, the end with nothing after, lists, quotes, groups, tables)
+    /// to the split, which already matches Evernote there.
+    #[allow(clippy::type_complexity)]
+    fn insert_beside_top_level_text(
+        &mut self,
+        index: usize,
+        offset: usize,
+        structural: &StructuralInsert,
+    ) -> Result<Option<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch)>, DocumentError> {
+        if matches!(structural, StructuralInsert::Table(_)) || !self.is_top_level_textblock(index) {
+            return Ok(None);
+        }
+        let block = self.blocks[index].clone();
+        let len = block.content.as_text().map_or(0, str::len);
+        let next_is_text = self.is_top_level_textblock(index + 1);
+        let at_start = offset == 0;
+        let at_end = offset == len;
+        let rest_in = |id| Selection::caret(DocPoint::with_affinity(id, 0, Affinity::Before));
+        let (media_index, removed, caret) = if len == 0 && next_is_text {
+            // The empty block gives way; the caret goes on to the next one.
+            (
+                index,
+                vec![block.clone()],
+                rest_in(self.blocks[index + 1].id),
+            )
+        } else if at_start {
+            // Before the block (an empty one stays for the caret).
+            (index, Vec::new(), rest_in(block.id))
+        } else if at_end && next_is_text {
+            (index + 1, Vec::new(), rest_in(self.blocks[index + 1].id))
+        } else {
+            return Ok(None);
+        };
+        let media = structural.block(self.new_node_id()?, TextAlignment::Left, 0);
+        let mut changed_nodes = SmallVec::new();
+        push_unique(&mut changed_nodes, media.id);
+        if removed.is_empty() {
+            self.blocks.insert(media_index, media);
+        } else {
+            push_unique(&mut changed_nodes, block.id);
+            self.blocks.replace(media_index, media);
+        }
+        Ok(Some((
+            caret,
+            changed_nodes,
+            TransactionBatch(vec![Transaction::RestoreBlocks {
+                index: media_index,
+                remove_count: 1,
+                blocks: removed,
+            }]),
+        )))
+    }
+
     fn apply_insert_structural(
         &mut self,
         selection: Selection,
@@ -4465,6 +4537,13 @@ impl Document {
                     blocks: vec![original],
                 }]),
             ));
+        }
+
+        if selection.is_caret()
+            && let Some(outcome) =
+                self.insert_beside_top_level_text(start_index, start_offset, &structural)?
+        {
+            return Ok(outcome);
         }
 
         let originals = self

@@ -1220,6 +1220,22 @@ async fn mounted_resource_commit_failure_at_default_right_caret_retries_without_
     view.update(cx, |shell, shell_cx| {
         shell.fail_next_resource_commit_for_test("默认右侧段资源提交失败", shell_cx);
     });
+    // Evernote's resource insert (resource.ts) leaves the caret in an
+    // existing block where it can, which rolls back safely. Text with
+    // nothing after it still splits off a new right paragraph: the unsafe
+    // rollback this test needs.
+    let body = view
+        .read_with(cx, |shell, app| {
+            shell.image_flow_probe_for_test(app).text_block_bounds
+        })
+        .expect("a new note has a body paragraph");
+    cx.simulate_click(
+        gpui::point(body.left() + gpui::px(4.0), body.center().y),
+        gpui::Modifiers::default(),
+    );
+    redraw(cx);
+    cx.simulate_input("前文");
+    redraw(cx);
 
     cx.update(|window, app| {
         view.update(app, |shell, shell_cx| {
@@ -1358,6 +1374,22 @@ async fn mounted_removed_failed_resource_manual_sync_releases_the_lifecycle_barr
     view.update(cx, |shell, shell_cx| {
         shell.fail_next_resource_commit_for_test("删除后的资源提交失败", shell_cx);
     });
+    // Evernote's resource insert (resource.ts) leaves the caret in an
+    // existing block where it can, which rolls back safely. Text with
+    // nothing after it still splits off a new right paragraph: the unsafe
+    // rollback this test needs.
+    let body = view
+        .read_with(cx, |shell, app| {
+            shell.image_flow_probe_for_test(app).text_block_bounds
+        })
+        .expect("a new note has a body paragraph");
+    cx.simulate_click(
+        gpui::point(body.left() + gpui::px(4.0), body.center().y),
+        gpui::Modifiers::default(),
+    );
+    redraw(cx);
+    cx.simulate_input("前文");
+    redraw(cx);
     cx.update(|window, app| {
         view.update(app, |shell, shell_cx| {
             shell
@@ -2032,4 +2064,92 @@ async fn mounted_grouped_attachment_insert_saves_undoes_and_redoes(cx: &mut Test
     redraw(vcx);
     manual_save(&view, vcx);
     assert_eq!(body(&repository).body_html, inserted.body_html);
+}
+
+/// Evernote's resource insert at the end of a block whose next sibling is a
+/// text block (common-editor resource/resource.ts insertResourceAtPosition:
+/// insert after the block; then the caret goes to the next text block,
+/// `$caret.nodeAfter?.isTextblock`): no empty paragraph is added, and
+/// typing goes on at the start of that block.
+#[gpui::test]
+async fn mounted_image_at_a_paragraph_end_goes_on_into_the_next_text_block(
+    cx: &mut TestAppContext,
+) {
+    use app_lite_core::{CanonicalDocument, CreateNote};
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "插图".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html("<p>甲</p><h2>题</h2>").unwrap(),
+        })
+        .unwrap();
+    let (view, cx) = mount_on(cx, Arc::clone(&repository), &note.id);
+    let body = view
+        .read_with(cx, |shell, app| {
+            shell.image_flow_probe_for_test(app).text_block_bounds
+        })
+        .expect("first text block");
+    cx.simulate_click(
+        gpui::point(body.left() + gpui::px(4.0), body.center().y),
+        gpui::Modifiers::default(),
+    );
+    redraw(cx);
+    cx.simulate_keystrokes("end");
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell
+                .begin_resource_picker(shell_cx)
+                .expect("capture caret");
+            shell
+                .complete_resource_picker_path(picker_png(&profile), window, shell_cx)
+                .expect("schedule image insert");
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let probe = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert!(
+        probe.has_image_block && probe.cache_has_resource,
+        "the image shows at once"
+    );
+    let image = probe.image_resource_id.expect("image resource");
+    cx.simulate_input("续");
+    redraw(cx);
+    manual_save(&view, cx);
+    let expected = format!(
+        "<p>甲</p><img data-joplin-lite-block-image=\"true\" src=\":/{}\"",
+        image.as_str()
+    );
+    let saved = repository.load_note(&note.id).unwrap().unwrap().body_html;
+    assert!(saved.starts_with(&expected), "{saved}");
+    assert!(saved.ends_with("<h2>续题</h2>"), "{saved}");
+    assert!(
+        !saved.contains("<p><br></p>"),
+        "no extra empty paragraph: {saved}"
+    );
+
+    // Undo takes back the typing, then the image; redo restores both.
+    cx.simulate_keystrokes("cmd-z");
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert!(!view.read_with(cx, |shell, app| {
+        shell.image_flow_probe_for_test(app).has_image_block
+    }));
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    manual_save(&view, cx);
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().body_html,
+        saved
+    );
+
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    assert_eq!(
+        reopened.load_note(&note.id).unwrap().unwrap().body_html,
+        saved
+    );
 }
