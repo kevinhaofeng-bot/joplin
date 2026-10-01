@@ -130,15 +130,14 @@ impl LineLayout {
             }
         }
 
-        if self.len == 1 {
-            if x > self.width / 2. {
-                return 1;
-            } else {
-                return 0;
-            }
+        // Joplin Lite: past the last glyph's start, the line end is only
+        // nearer than that start when x is beyond the midpoint (ties stay
+        // left, as above). This also covers a one-glyph line of any length.
+        if self.width - x < x - prev_x {
+            self.len
+        } else {
+            prev_index
         }
-
-        self.len
     }
 
     /// The x position of the character at the given index

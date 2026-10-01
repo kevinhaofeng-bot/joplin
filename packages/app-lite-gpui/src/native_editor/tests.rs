@@ -10157,3 +10157,40 @@ fn list_media_inserts_publish_exact_splices_in_a_large_list() {
         );
     }
 }
+
+#[gpui::test]
+async fn cell_source_offset_inside_a_grapheme_maps_to_a_grapheme_boundary(
+    cx: &mut gpui::TestAppContext,
+) {
+    // A table hit is a glyph boundary, and a shaper may give a cluster more
+    // than one glyph. The cell editor's caret must still not split the
+    // cluster (é as e + COMBINING ACUTE, a ZWJ family, a flag).
+    let cx = cx.add_empty_window();
+    let text = "e\u{301}x👨\u{200d}👩\u{200d}👧🇨🇳";
+    let boundaries: Vec<usize> = text
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .chain([text.len()])
+        .collect();
+    let editor = EditorCore::from_document(Document::from_paragraph(text), cx);
+    let entity = cx.new(|_| editor);
+    let points: Vec<(usize, usize)> = entity.read_with(cx, |editor, _| {
+        (0..=text.len())
+            .filter(|offset| text.is_char_boundary(*offset))
+            .map(|offset| {
+                (
+                    offset,
+                    editor.cell_point_at_source_offset(offset).utf8_offset,
+                )
+            })
+            .collect()
+    });
+    let split: Vec<_> = points
+        .iter()
+        .filter(|(_, caret)| !boundaries.contains(caret))
+        .collect();
+    assert!(
+        split.is_empty(),
+        "carets inside a grapheme (offset, caret): {split:?}"
+    );
+}

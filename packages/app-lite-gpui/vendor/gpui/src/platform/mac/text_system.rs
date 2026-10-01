@@ -1025,4 +1025,197 @@ mod tests {
             }
         }
     }
+
+    // Real-CoreText caret hit tests: `closest_index_for_x` must return the
+    // character boundary nearest to x, including in the last glyph's left
+    // half. The expected boundary comes from the layout's own glyph starts
+    // plus the line end, so no font metric is hard-coded.
+
+    fn nearest_boundary(layout: &crate::LineLayout, x: crate::Pixels) -> usize {
+        let mut candidates = vec![(0, px(0.))];
+        for run in &layout.runs {
+            for glyph in &run.glyphs {
+                candidates.push((glyph.index, glyph.position.x));
+            }
+        }
+        candidates.push((layout.len, layout.width));
+        // Ties go to the earlier boundary; probes avoid exact midpoints.
+        candidates
+            .into_iter()
+            .min_by(|a, b| (a.1 - x).abs().partial_cmp(&(b.1 - x).abs()).unwrap())
+            .unwrap()
+            .0
+    }
+
+    /// x a quarter of the way into the last glyph (its left half).
+    fn last_glyph_left_quarter(layout: &crate::LineLayout) -> crate::Pixels {
+        let last = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .last()
+            .expect("a shaped glyph");
+        last.position.x + (layout.width - last.position.x) / 4.
+    }
+
+    fn shaped(text: &str, family: &'static str) -> crate::LineLayout {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font(family)).unwrap();
+        fonts.layout_line(
+            text,
+            px(16.),
+            &[FontRun {
+                font_id,
+                len: text.len(),
+                script: None,
+            }],
+        )
+    }
+
+    #[test]
+    fn test_closest_index_in_the_last_glyphs_left_half_is_its_start() {
+        let mut mismatches = Vec::new();
+        for (text, family) in [
+            ("ab", "Helvetica"),
+            ("丙", "PingFang SC"),
+            ("甲乙丙", "PingFang SC"),
+            ("ab ", "Helvetica"),
+            ("caf\u{e9}", "Helvetica"),
+            ("\u{e9}", "Helvetica"),
+            ("\u{1f44d}", "Helvetica"),
+            ("a\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", "Helvetica"),
+            ("\u{1f1e8}\u{1f1f3}", "Helvetica"),
+        ] {
+            let layout = shaped(text, family);
+            let x = last_glyph_left_quarter(&layout);
+            let (got, want) = (layout.closest_index_for_x(x), nearest_boundary(&layout, x));
+            let glyphs: Vec<_> = layout
+                .runs
+                .iter()
+                .flat_map(|run| {
+                    run.glyphs
+                        .iter()
+                        .map(|glyph| (glyph.index, glyph.position.x))
+                })
+                .collect();
+            let line = format!(
+                "{text:?} ({family}) len={} x={x:?} width={:?} glyphs={glyphs:?}: got {got}, nearest {want}",
+                layout.len, layout.width
+            );
+            eprintln!("{line}");
+            if got != want {
+                mismatches.push(line);
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[test]
+    fn test_closest_index_with_style_runs_and_combining_marks() {
+        let fonts = MacTextSystem::new();
+        let regular = fonts.font_id(&font("Helvetica")).unwrap();
+        let bold = fonts
+            .font_id(&crate::Font {
+                weight: crate::FontWeight::BOLD,
+                ..font("Helvetica")
+            })
+            .unwrap();
+        // "ab" regular, "cd" bold: the last glyph is in the second run.
+        let styled = fonts.layout_line(
+            "abcd",
+            px(16.),
+            &[
+                FontRun {
+                    font_id: regular,
+                    len: 2,
+                    script: None,
+                },
+                FontRun {
+                    font_id: bold,
+                    len: 2,
+                    script: None,
+                },
+            ],
+        );
+        // e + COMBINING ACUTE ACCENT, then x: and the same pair at the end.
+        let combining_inside = shaped("e\u{301}x", "Helvetica");
+        let combining_last = shaped("xe\u{301}", "Helvetica");
+        let mut mismatches = Vec::new();
+        for (name, layout) in [
+            ("bold run", styled),
+            ("combining inside", combining_inside),
+            ("combining last", combining_last),
+        ] {
+            // Every glyph's left and right quarter.
+            let starts: Vec<_> = layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.position.x))
+                .chain([layout.width])
+                .collect();
+            for pair in starts.windows(2) {
+                let span = pair[1] - pair[0];
+                for x in [pair[0] + span / 4., pair[1] - span / 4.] {
+                    let (got, want) = (layout.closest_index_for_x(x), nearest_boundary(&layout, x));
+                    let line = format!(
+                        "{name} len={} x={x:?} width={:?} starts={starts:?}: got {got}, nearest {want}",
+                        layout.len, layout.width
+                    );
+                    eprintln!("{line}");
+                    if got != want {
+                        mismatches.push(line);
+                    }
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[test]
+    fn test_closest_index_on_wrapped_rows() {
+        let layout = std::sync::Arc::new(shaped("甲乙丙丁", "PingFang SC"));
+        let glyphs: Vec<_> = layout.runs[0]
+            .glyphs
+            .iter()
+            .map(|glyph| (glyph.index, glyph.position.x))
+            .collect();
+        assert_eq!(glyphs.len(), 4, "{glyphs:?}");
+        // Wrapped before 丙: row 0 is 甲乙, row 1 is 丙丁.
+        let wrapped = crate::WrappedLineLayout {
+            unwrapped_layout: layout.clone(),
+            wrap_boundaries: smallvec::smallvec![crate::WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 2
+            }],
+            wrap_width: Some(glyphs[2].1),
+        };
+        let line_height = px(20.);
+        // Row 0, the left quarter of 乙 (not the line's last glyph): 乙's start.
+        let x = glyphs[1].1 + (glyphs[2].1 - glyphs[1].1) / 4.;
+        assert_eq!(
+            wrapped.closest_index_for_position(crate::point(x, line_height / 2.), line_height),
+            Ok(3),
+            "row 0"
+        );
+        // Row 1, the left quarter of 丁 (the line's last glyph), x relative
+        // to the row's start: 丁's start, not the line end.
+        let x = glyphs[3].1 + (layout.width - glyphs[3].1) / 4. - glyphs[2].1;
+        assert_eq!(
+            wrapped.closest_index_for_position(crate::point(x, line_height * 1.5), line_height),
+            Ok(9),
+            "row 1"
+        );
+    }
+
+    #[test]
+    fn test_closest_index_controls_that_already_hold() {
+        // Exactly on a boundary, past the end, and a one-byte line.
+        let layout = shaped("ab", "Helvetica");
+        let b = layout.runs[0].glyphs[1].position.x;
+        assert_eq!(layout.closest_index_for_x(b), 1);
+        assert_eq!(layout.closest_index_for_x(layout.width + px(5.)), 2);
+        let one = shaped("a", "Helvetica");
+        assert_eq!(one.closest_index_for_x(one.width / 4.), 0);
+        assert_eq!(one.closest_index_for_x(one.width * 3. / 4.), 1);
+    }
 }

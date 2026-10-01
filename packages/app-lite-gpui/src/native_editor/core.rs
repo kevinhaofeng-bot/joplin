@@ -1695,10 +1695,11 @@ impl EditorCore {
             match block.content.as_text() {
                 Some(text) => {
                     if offset <= source + text.len() {
-                        let mut at = offset.saturating_sub(source).min(text.len());
-                        while !text.is_char_boundary(at) {
-                            at -= 1;
-                        }
+                        let at = resolve_grapheme_offset(
+                            text,
+                            offset.saturating_sub(source),
+                            Affinity::Before,
+                        );
                         return DocPoint::new(block.id, at);
                     }
                     source += text.len();

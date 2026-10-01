@@ -38,3 +38,30 @@ Tests: `platform::mac::text_system::tests::test_layout_line_script_run_uses_its_
 and `..._adjacent_scripts_keep_their_own_script_per_glyph` (real CoreText);
 `text_system::line::script_decoration_tests` (line placement and where
 decoration runs break).
+
+## Nearest boundary in a line's last glyph
+
+`LineLayout::closest_index_for_x` (text_system/line_layout.rs) compared x
+only with glyph starts. Past the last glyph's start no glyph matched, so it
+returned the line end even in that glyph's left half (one single-byte
+character excepted). A click, an up/down move or a table drop in the left
+half of a line's last character put the caret after it.
+
+- Past the last glyph's start, it now compares the distance to that start
+  with the distance to the line end (`width`) and returns the nearer,
+  ties to the start, as the loop already does between glyphs. The
+  one-byte special case is covered by the same comparison and removed.
+- Evernote's editor resolves points with prosemirror-view `posAtCoords`
+  (`dragdrop/plugin.ts` uses it for drops). For a text node,
+  `findOffsetInText` (prosemirror-view `dist/index.js` in the extracted
+  common-editor) takes the character under the point and returns the
+  offset after it when x is at or past the middle of its rectangle, else
+  before it: the nearer boundary. At an exact midpoint prosemirror goes
+  right and GPUI stays left; that tie is unchanged here.
+
+Tests (real CoreText, `platform::mac::text_system::tests`):
+`test_closest_index_in_the_last_glyphs_left_half_is_its_start` (ASCII, one
+and several CJK glyphs, a trailing space, é, an emoji, a ZWJ family, a
+flag), `test_closest_index_with_style_runs_and_combining_marks`,
+`test_closest_index_on_wrapped_rows` (non-final and final row) and
+`test_closest_index_controls_that_already_hold`.
