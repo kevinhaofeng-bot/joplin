@@ -950,3 +950,97 @@ Evernote 的 ENML 用 `<en-codeblock>` 或 `--en-codeblock:true` 表示代码块
 - 旧格式中“段落内含图片”在原生编辑器里本来就拆成“文字块、块级图片、文字块”。在其中一个文字块上包裹时，只包裹该文字块；选区跨过这种独立的块级图片时命令禁用。Evernote 的图片始终在段落内。
 - 没有“引用”的快捷键和工具栏图标（Evernote 在 `typebehind.ts` 中有输入 `>` 触发的规则，也未实现）。
 - 视觉和实机验收仍需 Codex 完成。
+
+## 第十九批：相邻引用边界（`631c34500`）与引用按键（`2cfa9bbdb`）
+
+接续 evidence67 留下的未提交 core 改动（`BlockStyle.quote_start`），完成原生部分后，拆成两个独立提交。
+
+### 相邻引用边界（`631c34500`）
+
+**问题：** 两个相邻的 quoteblock 会合并成一段引用。Evernote 是树结构，两个 quoteblock 各自独立。
+
+**最小表示：**
+- canonical 用 `BlockStyle.quote_start`，原生用 `Block.quote_start`，含义是“此引用块开始一段新的引用，即使前一块也在引用中”；
+- 前一块不在引用中时，这个标志一律清除；
+- 不引入容器 ID，也不改动整体结构。
+
+**canonical：**
+- 一段连续的引用块在 `quote_start` 处拆成多个容器；
+- 有多个容器，或任一容器含标题、列表时，逐个写成 `<blockquote data-joplin-lite-quote-container>`；否则保持原来的逐段写法，旧笔记逐字节不变；
+- 旧的逐段写法仍视为一段引用（JEX 过去就是这样写多段落引用的）；
+- 列表在边界处拆开，也不会跨边界合并；
+- 每个容器元素、每个粘贴的 blockquote、每段 Markdown blockquote（CommonMark 中空行会结束 blockquote）都开始一段新引用。
+
+**原生：**
+- 标志随撤销、重做、粘贴传递；
+- 拆分出的右半块、插入图片后的后段文字不继承标志，所以在引用中输入或回车不会把引用切开；
+- 工具栏解开时只处理边界内的那一段；在已有引用旁包裹，会形成独立的一段，并让后面的引用保持独立；
+- 有序编号在边界处从 1 重新开始；
+- 新一段的竖线下移 4px，对应 ce.css 中 blockquote 的 `margin: var(--spacing-0-5) 0`。
+
+**测试：**
+- core：`adjacent_quote_containers_stay_apart`、`separate_markdown_quotes_stay_separate_quotes`；
+- gpui：`adjacent_quoted_lists_are_numbered_and_saved_apart`；
+- 挂载：`ui::tests::adjacent_quotes_stay_apart_through_toolbar_history_editing_and_save`，覆盖两段引用打开、解开其中一段、Cmd‑Z / Cmd‑Shift‑Z、在引用前后包裹、引用内回车、保存与重开。
+- 负控（`/tmp/joplin-claude-quote-boundary-negative-controls.{sh,log}`）：原生导入丢掉边界、解开越过边界、包裹后与前一段合并、编号不在边界重新开始，四种情况下对应测试都失败。
+
+**中间提交独立验证：** 该提交只经索引暂存。在导出的独立目录中运行：
+- App 1496 通过、0 失败、2 忽略（`/tmp/joplin-claude-boundary-intermediate-gpui.log`）；
+- core 368 通过（`/tmp/joplin-claude-boundary-intermediate-core.log`）。
+- 格式化后的暂存版本另行复测，结果相同。
+
+**迁移：** 只读审计 1598/69（`audit-boundary.log`）；新导入降级 69，blob 全部核对无误（`import-boundary.log`）；原生往返 1667 篇，`failure_categories={}`（`/tmp/joplin-claude-boundary-native-roundtrip.log`）。
+
+### 引用按键（`2cfa9bbdb`）
+
+**Evernote 对应**（common-editor `quoteblock/keymap.ts`）：
+
+| Evernote 处理函数 | 源码条件 | 本项目 |
+|---|---|---|
+| `handleBackspaceAtStartOfQuoteblock`（Backspace，第一顺位） | `$cursor.nodeBefore == null`；直接父节点是 quoteblock（`$cursor.node(-1)`，列表项的父节点是 li，不触发）；是第一个子节点（`$cursor.start(-1) === $cursor.before()`）→ 整段替换为其内容，光标在开头 | 引用段落或引用内标题的 offset 0，且是容器开头 → `SetQuote` 解开整段，光标不动 |
+| `handleBackspaceAfterQuoteblock`（第二顺位） | 光标在 `p`（不含标题、列表）开头，前一个兄弟节点是 quoteblock → 该 `p` 成为引用的最后一个子节点 | 不在引用内的普通段落 offset 0，前一块在引用中 → `SetBlockKind(Quote)` 并入，同时清除残留的边界标志 |
+| `removeEmptyLineAndSplitQuoteblock`（Enter，以及 Backspace 第三顺位） | 空 `p`；是 quoteblock 的直接子节点；下标不为 0；若是最后一个子节点则只保留前段，否则为“引用 + 空 p + 引用” | 空引用段落且不是容器开头 → `SplitQuoteAt`：变为普通段落；若后面还有引用块，下一块写入边界 |
+| `handleDelete` | `$cursor.pos === $cursor.end()`；`$cursor.after()` 处的兄弟节点是 quoteblock → 其第一个子节点并入当前块，其余保留 | 不在引用内的段落或标题在末尾，下一块是容器开头的引用段落或引用内标题 → `JoinQuoteHead` |
+
+**与 Evernote 的差异：**
+- 末尾空行：Evernote 会删除这一行，光标落到引用之后；这里改为把这一行变成引用后的空段落，看到的效果相同。
+- 引用的第一个子节点是列表时，Evernote 的 Delete 会把一个列表切片并入当前段落；这里不处理这种情况，交给原有的 Delete。
+- `Mod-Backspace` 没有单独绑定。
+
+**实现：**
+- 新增两个事务 `SplitQuoteAt` 和 `JoinQuoteHead`，各自只产生一步撤销，并更新结构计划、编号范围和替换范围；
+- 解开复用 `SetQuote`，并入复用 `SetBlockKind`；
+- 只在光标折叠、没有 IME 组合时处理；光标在图片分组中时保持默认行为。
+
+**测试：**
+- 挂载：`ui::tests::quote_keys_follow_evernote_quoteblock_keymap`，在 LibraryShell 中真实派发 Backspace、Enter、Delete，以及 Cmd‑Z / Cmd‑Shift‑Z，覆盖：
+  - 首块开头退格解开整段，标题与列表保持，光标位置正确；撤销和重做；非首块不解开；
+  - 引用后段落开头退格并入引用；撤销；
+  - 内部空行回车拆分，在空段输入后按 Home 再退格，又并回前一段，后一段保持独立；
+  - 内部空行退格同样拆分；
+  - 段末 Delete 把引用首块（标题）的文字并入当前段落，光标位置正确；保存后与数据库一致，重开后一致。
+- 原生：`quote_keys_keep_inline_images_and_leave_on_an_empty_last_line`：末尾空行回车离开引用；首块退格解开时，段落内的图片与列表保留，撤销后复原；光标在图片分组的后段时不触发引用规则。
+- 负控（`/tmp/joplin-claude-quote-keymap-negative-controls.{sh,log}`）：分别关掉四条规则，对应测试都失败。
+
+**全量（HEAD `2cfa9bbdb`，均 `--offline --locked`，退出码 0）：**
+- App：1498 通过、0 失败、2 忽略（`/tmp/joplin-claude-keymap-gpui-full.log`）；
+- core：33 组共 368 通过、0 失败、1 忽略（`/tmp/joplin-claude-keymap-core-full.log`）；
+- 迁移：新导入降级 69，blob 全部核对无误（`import-keymap.log`）；原生往返 1667 篇，`failure_categories={}`（`/tmp/joplin-claude-keymap-native-roundtrip.log`）；
+- 原 JEX 的 SHA256 仍为 `320f684f…c6cf`。
+
+### 单独列出：段落内图片的分组差异
+
+在 Evernote 中，图片始终是段落内的行内节点。本项目原生编辑器有两种表示：
+- 引用段落、代码块等用“行内分组”，一组成员属于同一段落，引用切换和按键都把整组作为一个段落处理；
+- 旧格式中的普通段落 `<p>文字<img>文字</p>`，打开时拆成“文字块、块级图片、文字块”三个独立的块（`codec.rs` 的 legacy flow，保存时可能写成块级图片）。
+
+因此有以下差异：
+- 在这种普通段落的文字处包裹引用时，只包裹那一个文字块；
+- 选区跨过其中的块级图片时，引用命令禁用（块级图片不属于 quoteblock 内容）；
+- 光标在分组的后段文字开头时，引用按键不触发，保持默认行为（Evernote 中那里不是段落开头）。
+
+要彻底消除这些差异，需要把旧格式普通段落也改为行内分组。这影响图片导入与编辑的通用路径，本批没有改动。
+
+### 边界
+
+没有安装，没有推送，没有改动原资料库和 Codex 的文档。实机验收仍由 Codex 进行。
