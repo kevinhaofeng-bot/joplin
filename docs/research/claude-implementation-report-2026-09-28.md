@@ -1138,3 +1138,63 @@ Evernote 的 ENML 用 `<en-codeblock>` 或 `--en-codeblock:true` 表示代码块
 - core：33 组共 368 通过、0 失败、1 忽略（`/tmp/joplin-claude-batch20-core-full.log`）。
 
 没有安装，没有推送，没有改动原资料库，也没有碰 Codex 正在使用的隔离候选包和资料库。
+
+## 第二十一批：列表项内插图（`685a05109`）
+
+### Evernote 对应
+
+源码根目录：`evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/`。
+
+- `resource/resource.ts` 389–398：`insert` 先用 `insertResourceAtPosition`（298–342）放置资源。如果 `inList($caret)` 为真（`list/list.ts` 153，向上查任一层是否为列表），就找到外层 `li`，在它之后调用 `createNewListItemAfterCurrent(tr, schema, liNode, insertPos, p.create())`，光标进入新段。
+- `list/li.ts` 166–181：新 li 用 `li.create(null, content)` 创建，属性全部取默认值。`liAttrs`（`list/schema.ts` 50–）中 `checked` 默认为 `null`，即未勾选。
+- `list/schema.ts` 413：`li.content = 'listblockcontent+'`。`resource/schema.ts` 886 中 image 的 group 含 `listblockcontent`，所以图片和拆开的两段都留在原 li 内。列表本身不属于 `listblockcontent`；`ul`/`ol`/`todolist` 的内容是 `(li | todolist | ol | ul)+`（359/377/395），嵌套列表是与 li 并列的兄弟节点，因此新 li 紧跟当前 li，排在它的嵌套子列表之前。
+
+### 实现
+
+在 `apply_insert_structural` 中：当插入点是普通顶层列表项（不是已有分组的成员）且插入的不是表格时，改走 `insert_into_list_item`：
+- 原项成为分组 `[左段, 图片, 右段?]`，右段为空时省略；
+- 紧随其后插入一个同类型、同缩进的空项（待办为 `checked: false`）；
+- 光标位于新项开头；
+- 逆操作批次为 `RestoreInlineGroups` 加 `RestoreBlocks`，撤销一步即可恢复原项。
+
+### 已核对一致的情形
+
+| 情形 | 保存的 HTML（`img` 为 `<img src=":/…" alt="">`，`空` 为空项标记） | 测试 |
+|---|---|---|
+| UL 项末尾 | `<ul><li>一{img}</li><li>{空}</li><li>二</li></ul>` | `list_item_takes_media_and_a_new_item_follows_like_evernote` |
+| OL 项中间 | `<ol><li>甲{img}乙</li><li>{空}</li></ol>` | 同上 |
+| 已勾选待办的开头 | `<li data-checked="true">{img}甲</li><li data-checked="false">{空}</li>` | 同上 |
+| 嵌套项 | 新项带同样的 `data-indent="1"` | 同上 |
+| 空项 | `<li>{img}</li><li>{空}</li>` | 同上 |
+| 选区“甲[乙]丙” | `<ol><li>甲{img}丙</li><li>{空}</li></ol>` | 同上 |
+
+每种情形都检查以下几点：
+- 重开后形状不变；
+- 接着输入的文字落在新项中；
+- 布局顺序与文档顺序一致；
+- 撤销两次恢复原文；
+- 重做恢复插入后的结果。
+
+挂载测试 `mounted_list_item_image_stays_in_its_item_and_rolls_back_safely`，用真实图片选择器插入，覆盖三种情况：
+1. **立即显示与持久化：** 图片立即显示（布局中有图片块，缓存中有资源）。输入“续”后保存为 `<ul><li>一<img src=":/{id}" alt=""></li><li>续</li><li>二</li></ul>`，用新的 `LibraryRepository` 重开结果相同。
+2. **提交失败、之后无输入：** 图片消失，保存后恢复为原列表。
+3. **提交失败、之前已在新项中输入：** 图片和文字都保留，显示“手动同步可重试”。原因是撤销插入后，在已不存在的新项上重放输入会失败，于是转入现有的 fail-closed 路径。这是有意保留的安全行为，并非静默丢失。
+
+### 负控
+
+在隔离副本中把分支条件改为 `false` 后，两项新测试都失败（`/tmp/joplin-claude-list-image-negative-control.{sh,log}`）。
+
+### 剩余差异（未改，不扩大范围）
+
+- **已含图片的列表项（分组项）不新建 li。** 实测在 `<li>一<img a>后</li>` 的“后”末尾插图，得到 `<li>一<img a>后<img b></li><li>二</li>`：图片仍在 li 内，但没有像 `createNewListItemAfterCurrent` 那样新建 li。这条走的是 evidence08 阶段 1 的兼容分组路径，本批没有改动。
+- **新项的属性。** Evernote 用 `li.create(null)` 和 `p.create()` 创建新项，对齐方式和 `checked` 都取默认值（`checked: null`，导出时不写该属性）。本项目的新项沿用右段的对齐和引用标记，待办导出为 `data-checked="false"`。视觉上，只有居中或右对齐的列表项才会有差别。
+- **`StructuralPlan` 计数（观察项）。** `InsertImage` 的 plan 固定假设插入 3 块，而列表分支插入 4 块（或者右段为空时插入 3 块且结构不同）。诊断确认重新整形后布局顺序正确，所以没有改。
+- **仍未对照的分支：** unsplittable 或资源祖先节点（resource.ts 343、365–375）、引用和标题内的插入、表格插入。
+- **沿用上一批的已知差异：** 引用中以列表开头时按 Delete 的行为、`Mod-Backspace`、待办文字居中时方框仍在左侧、输入法组合期间点击方框。
+
+### 全量（工作区等同 `685a05109`，均 `--offline --locked`，退出码 0）
+
+- App：1503 通过、0 失败、2 忽略（`/tmp/joplin-claude-list-image-gpui-full.log`）；
+- core：368 通过、0 失败（`/tmp/joplin-claude-list-image-core-full.log`）。
+
+rustfmt 只处理了本批新增的代码；与 HEAD 相比，格式差异为 0。没有安装，没有推送，没有改动原资料库，也没有碰 Codex 的证据文档和 `replica-delivery-status.md`。
