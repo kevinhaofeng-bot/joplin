@@ -1198,3 +1198,89 @@ Evernote 的 ENML 用 `<en-codeblock>` 或 `--en-codeblock:true` 表示代码块
 - core：368 通过、0 失败（`/tmp/joplin-claude-list-image-core-full.log`）。
 
 rustfmt 只处理了本批新增的代码；与 HEAD 相比，格式差异为 0。没有安装，没有推送，没有改动原资料库，也没有碰 Codex 的证据文档和 `replica-delivery-status.md`。
+
+## 第二十二批：已含图片的列表项再插图、新项默认属性、StructuralPlan 计数（`be5eafa99`）
+
+这一批处理第二十一批报告中的三项剩余差异。产品整体并未完成，见文末的剩余项。
+
+### Evernote 对应
+
+源码根目录：`evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/`。
+
+- `resource/resource.ts` 389–398：只要 `inList($caret)` 为真，就调用 `createNewListItemAfterCurrent`。是否执行不取决于 li 里是否已有资源，也不区分图片和文件。image 与 file 节点同属 `listblockcontent`（`resource/schema.ts` 886、1001、1046）。
+- `list/li.ts` 166–181：新 li 由 `li.create(null, p.create())` 创建，li 和 p 的属性都取默认值。`liAttrs.style` 与 `checked` 默认为 `null`（`list/schema.ts` 50–）。对齐方式存放在 p 的 `textAlign` 上（`paragraph/schema.ts` 233–237），新建的 p 没有对齐。
+- 新 li 插在整个当前 li 之后（`insertPos = $liNodePos.pos + liNode.nodeSize`），也就是本项目中整个分组的最后一个成员之后。
+
+### 实现
+
+- **分组项（`follow_media_with_list_item`）**：在分组更新包装层中，如果插入的是图片或附件，并且受影响的分组是列表项，就在包装层算出新的分组之后：
+  - 如果拆分在分组末尾留下了空的新文字段，并且光标就在这里，就把它移出分组，作为新项；
+  - 否则在分组最后一个成员之后插入一个新的空项，作为单独的拼接发布，并在逆操作批次的最前面加一条删除它的 `RestoreBlocks`；
+  - 光标移到新项开头。新项的 ID 在执行原始事务之前就预留好，原始事务执行后不会再因为分配失败而产生半完成状态。
+- **新项默认属性**：不论是普通项还是分组项，新项都为左对齐；待办为未勾选。引用容器内的列表保持 `quoted`，因为新 li 仍在同一个 quoteblock 里。
+- **StructuralPlan**：媒体插入不再固定按 3 块计算，改为按提交后的块数差值得出 `inserted_count`（`inserted_from_delta`）。开头说明中提到的“现有 atom 旁插入计 1”这条路径，实际只插入 1 块，所以保持不变。分组项额外插入的新项另外发布一条拼接 `(index, 0, 1)`。
+
+### 测试（先写，在实现前确认失败）
+
+| 测试 | 覆盖内容 |
+|---|---|
+| `grouped_list_item_takes_more_media_and_a_new_item_follows` | 8 个用例：<br>• UL 分组项末尾 → `<li>一{a}后{b}</li><li>{空}</li><li>二</li>`<br>• OL 分组项首段中间 → `<li>甲{b}乙{a}丙</li><li>{空}</li>`<br>• 已勾选待办中、光标在图片之后 → `…甲{a}{b}</li><li data-checked="false">{空}</li>`<br>• 嵌套分组项开头（新项 `data-indent="1"`，排在下一项“二”之前）<br>• 图片后的段首（第二图路径）→ `一{a}{b}后`<br>• 分组内选区替换<br>• 引用容器内的分组列表项<br>• 引用容器内的普通列表项<br>每个用例都检查：导出、重开、输入落到新项、布局顺序、有序编号、一步撤销、重做 |
+| `new_list_item_after_media_takes_default_alignment` | 居中的项（普通项末尾、普通项中间、分组项）插图后，新项不带 `data-align` |
+| `heading_and_quote_media_groups_keep_their_compatible_shape` | 断言式兼容回归，取代临时诊断：`<h2>` 和旧式引用块 `data-joplin-lite-block-quote` 中含图的分组插图后，图片仍留在分组内，块数只多 2（不新建项），撤销后原样恢复。改动前后都通过 |
+| `list_media_inserts_publish_exact_splices_in_a_large_list` | 详见下文“大列表” |
+| 挂载测试 `mounted_grouped_list_item_takes_another_image_and_fails_closed` | 通过真实图片选择器操作：<br>• 先插一张图并保存，使该项成为分组；再插第二张图，图片立即显示（`cache_has_resource`）；输入“再”后保存为 `<ul><li>一<img b><img a></li><li>再</li><li>续</li><li>二</li></ul>`，用新仓库重开结果相同；<br>• 提交失败且之后无输入：保存结果与插图前的分组 HTML 逐字相同，没有被拍平；<br>• 在新项中输入后提交失败：文字保留，显示“手动同步可重试” |
+| 已有测试 `attachment_inserted_inside_an_image_list_item_saves_in_place_and_undoes`（改了期望值，没有删除） | 按 resource.ts，附件同样会新建 li。期望值从“以 `后</li></ul>` 结尾”改为完整的精确 canonical：`<ul><li>图前<img …>图<a data-joplin-lite-inline-attachment…>合同.pdf</a>后</li><li>{空}</li></ul>`。图片、附件、文字都保留；重开和撤销的断言没有改动 |
+
+### 大列表：拼接计数与增量成本
+
+测试会依次执行以下步骤：
+1. 在普通项中插图；
+2. 在刚形成的分组项中间再插图；
+3. 撤销两次；
+4. 重做两次。
+
+每一步都做四项检查：
+- 把发布的拼接逐条重放到一份镜像 ID 序列上，结果必须与文档顺序完全一致，`removed` 也必须逐项对上；
+- 增量布局的总高度与全新布局一致；
+- 有序编号与参照实现一致；
+- 精确的拼接形状：普通项为 `[(m, 1, 4)]`，分组项为 `[(m+2, 1, 3), (m+5, 0, 1)]`。
+
+实测的布局工作量（`/tmp/joplin-claude-batch22-large-list-counts.log`），取每一步中的最大值：
+
+| 列表 | 规模 | 高度索引 | 编号 |
+|---|---|---|---|
+| 无序 | 10k | 11 | 192 |
+| 无序 | 100k | 11 | 192 |
+| 有序 | 10k | 11 | 5078 |
+| 有序 | 100k | 11 | 50086 |
+| 有序，回车拆分基线 | 10k / 100k | — | 5073 / 50081 |
+
+如实说明：
+- **高度索引**和**无序列表的编号**不随规模增长。
+- **有序列表的编号**随规模线性增长。原因是在中间插入一项后，后面每一项的序号都会变，这是原有的重新编号行为。普通回车拆分的成本完全相同（每种规模下只差 5）。断言只要求插图不超过同规模回车基线加 64，**不声称**整个操作是常数成本。
+- 原有测试 `ordered_tail_edit_has_bounded_numbering_scratch_and_keeps_marker` 只覆盖尾部编辑。
+
+### 负控（隔离副本，`/tmp/joplin-claude-batch22-negative-controls.{sh,log}`）
+
+- **A：去掉分组项的新 li。** 分组、默认对齐、大列表、挂载四项测试失败；兼容测试仍通过。
+- **B：恢复固定计数 3。** 大列表测试在第一步就失败（重放拼接无法还原文档顺序）；分组项测试也失败。
+- **C：新项继承居中。** 默认对齐测试失败。
+
+### 全量（工作区等同 `be5eafa99`，均 `--offline --locked`，退出码 0）
+
+- App：1508 通过、0 失败、2 忽略（`/tmp/joplin-claude-batch22-gpui-full.log`）；
+- core：368 通过、0 失败（`/tmp/joplin-claude-batch22-core-full.log`）。
+
+rustfmt 只处理了本批改动；与 HEAD 相比，格式差异为 0。
+
+### 剩余差异（未改动，不扩大范围）
+
+- **新待办的 checked 属性**：Evernote 新 li 的 `checked` 为 `null`，导出时不写该属性；本模型只能用布尔值表示，所以导出为 `data-checked="false"`。显示效果相同。
+- **标题和旧式引用块中的插图**：保留兼容分组形状。Evernote 中 image 不能放进 h 或 p，会在拟合时被移出；这里不改，以免对现有 canonical 笔记做破坏性转换。
+- **跨多个分组的选区替换**：会在含新媒体的第一个列表分组之后新建项，没有单独与 Evernote 对照。
+- **列表新项上的失败回滚**：仍依赖 fail-closed 的“手动同步可重试”路径，不会悄悄丢失内容，但也不会自动重放。
+- **仍未对照的分支**：unsplittable 或资源祖先节点（resource.ts 343、365–375）、表格插入（下一份合同 evidence 72 处理表格单元格内插图）。
+- **沿用之前的差异**：引用中以列表开头时的 Delete、`Mod-Backspace`、待办居中时方框位置、输入法组合期间点击方框。
+- 产品整体尚未完成：迁移视觉验收、多模态、NAS 常驻、内存峰值、最终安装包等关卡都还没有进行。
+
+没有安装，没有推送，没有改动原资料库，也没有碰 Codex 的证据文档和 `replica-delivery-status.md`。
