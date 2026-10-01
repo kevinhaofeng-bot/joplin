@@ -1044,3 +1044,97 @@ Evernote 的 ENML 用 `<en-codeblock>` 或 `--en-codeblock:true` 表示代码块
 ### 边界
 
 没有安装，没有推送，没有改动原资料库和 Codex 的文档。实机验收仍由 Codex 进行。
+
+## 第二十批：图片插入位置（`e6ce2aaf1`）、待办勾选（`a52e4c4d3`）与两处更正
+
+### 更正 1：第十九批中关于 Evernote 图片的说法有误
+
+第十九批“单独列出”一节写了“在 Evernote 中，图片始终是段落内的行内节点”。这与源码相反：
+
+- `paragraph/schema.ts` 213：`p.content = 'inline*'`；
+- `resource/schema.ts` 992–1001 与 1037–1046：`image` 和 `file` 节点都是 `group: 'section tablecontent listblockcontent'`、`atom: true`，属于**块级**节点，不能放在 `p` 里；
+- `list/schema.ts` 413：`li.content = 'listblockcontent+'`，列表项可以包含块级图片。
+
+因此，普通段落中的“文字块、块级图片、文字块”与 Evernote 一致，并不是差异。标题和引用中的图片分组是 evidence 08 阶段 1 记录的**兼容扩展**：真实 Joplin 迁移数据中有标题内图片 5 篇、引用内图片 2 篇，以分组原位保留，并非 Evernote 的结构。
+
+本轮我一度修改 codec 去掉这些分组，用户和 Codex 指出后，已用 `git checkout HEAD -- codec.rs` 撤回，没有提交，也没有留在差异中。这些分组保持不变。
+
+### 更正 2：`e6ce2aaf1` 的提交说明过度声称
+
+提交说明中写到“段中、末尾无后续、列表、引用、分组、表格沿用原有拆分，在这些情况下与 Evernote 一致或属于兼容路径”。其中列表、引用、选区替换和表格**没有逐项核对**，不能据此判定与 Evernote 一致。下表以本节为准。提交已被 Codex 冻结，所以不改写历史。
+
+### 图片插入位置（`e6ce2aaf1`）
+
+**依据：** Evernote 运行时代码 `resource/resource.ts` 298–412（`insertResourceAtPosition`、`insert`），不只是 schema。在顶层段落或标题中、光标折叠时：
+- 空块：资源替换该块（`replaceRangeWith`）；
+- 块首：资源插在块之前（`tr.insert($pos.before())`）；
+- 块尾：资源插在块之后；
+- 块中间：拆开；
+- 插入后，光标进入下一个文本块的开头（`!$caret.parent.isTextblock` 分支）；后面没有文本块时才插入一个空段落。
+
+**修复前的缺陷**（用临时诊断测试实测，诊断代码未提交）：
+- 段首插图，图片上方多出一个空段落；
+- 在空段落中插图，多出两个空段落；
+- 段末插图且下一块是标题，多出一个空段落。
+
+**实现：** `insert_beside_top_level_text`。只处理以下条件：图片或附件（不含表格），光标折叠，所在块是不在引用内、不在列表中、不属于分组的顶层段落或标题。光标总是落在插入前就已存在的块中，所以资源提交失败时仍能撤销插入并重放之后的输入。
+
+**已核对一致的情形：**
+
+| 情形 | 测试 |
+|---|---|
+| 段首 → 图在前，光标留在原段开头，接着输入的文字落在原段 | `image_insert_follows_evernote_resource_placement` |
+| 空段后接文本 → 图替换空段，光标进入下一块 | 同上 |
+| 空段在最后 → 图在前，保留空段供光标停留（视觉上等同 Evernote 的“替换后补空段”） | 同上 |
+| 段末无后续 → 图在后，补一个空段 | 同上（沿用原有拆分，实测与 Evernote 一致） |
+| 段中 → 拆开，光标在右段开头 | 同上（沿用原有拆分，实测与 Evernote 一致） |
+| 段末后接标题 → 图在后，光标进入标题开头，不补空段 | 同上，以及挂载测试 `mounted_image_at_a_paragraph_end_goes_on_into_the_next_text_block`（真实图片选择器插入、立即显示、续输入、Cmd‑Z 两次 / Cmd‑Shift‑Z 两次、保存、以新仓库重开） |
+| 每种情形：撤销、重做 | 同上 |
+| 选区跨过图片时删除，图片随文字一起删除 | 同上 |
+| 选区含独立块级图片时，引用命令禁用（quoteblock 内容不含 image） | 同上 |
+
+**尚未核对或已知不一致：**
+- **列表项内插图：不一致。** Evernote 会把图片放进当前 li，然后调用 `createNewListItemAfterCurrent` 新建一个空 li，光标进入新 li。实测本项目的图片成了两个列表项之间的独立块，不属于任何列表项，保存时列表会被拆成两段。尚未修复。
+- **unsplittable 或资源祖先节点**（例如表格单元格、展开的音频等）的分支：未对照。
+- **引用内、标题内插入：** 本项目把它们拆成两段并夹着图片；Evernote 的 `tr.insert` 在这些位置的实际拟合结果未核实，不声称一致。
+- **非空选区替换：** 实测结果是用图片替换选区，与 `replaceSelectionWith` 的方向一致；但 `insertParagraphIfNeeded` 的细节未逐项对照。
+- **表格插入：** 不在本次范围内，未对照。
+- **测试调整：** 两项资源提交失败测试依赖“插图后光标在新建右段中”的旧行为。我改为先输入一段文字，在段末插图，使它们仍然覆盖不安全回滚的兜底路径，没有放宽任何断言。
+- **负控：** 关掉新分支后，两项新测试都失败（`/tmp/joplin-claude-image-insert-negative-control.{sh,log}`）。
+
+### 待办勾选（`a52e4c4d3`，evidence 69）
+
+**问题：** 在原生编辑器中点击待办方框只会移动光标，数据库里 `checked` 仍为 false。只有旧编辑器（`editor/events.rs` 2097）有取反逻辑。
+
+**Evernote 对应：** `list/plugin.ts` 中的 `handleTodoListMouseEvent`（约 860–890）和 `handleViewModeClickOn`（约 380–400）。点击落在 `.list-bullet-todo-container` 上时执行 `setNodeMarkup` 翻转 `checked`，保留选区；点击文字照常放置光标。
+
+**实现：**
+- `EditorCore::check_marker_at`：判断点击是否落在可见待办项（不含分组后续段）第一行的列表标记区域内，这正是 render.rs 绘制方框的位置；
+- Surface 在放置光标之前先处理这次左键点击；
+- `Transaction::ToggleCheck` 只产生一步撤销，保留选区，并加入分组更新，使带图片的待办项也能导出新状态。
+
+**测试：** `ui::tests::clicking_a_checklist_box_ticks_it_undoably_and_saves`，在挂载的 Library 中依次验证：
+- 点方框勾选，光标不动；
+- 点文字不勾选；
+- Cmd‑Z / Cmd‑Shift‑Z；
+- 保存后数据库为 `data-checked="true"`；
+- 重开后仍为勾选；
+- 再点一次取消勾选。
+
+**负控：** 去掉点击处理后，测试失败的表现正是 evidence 69 的症状：`[false, false]`（`/tmp/joplin-claude-checklist-negative-control.{sh,log}`）。
+
+**仍需复核（不扩大范围）：**
+- 待办文字居中或右对齐时，方框仍画在左侧；这需要对照 Evernote 的视觉规范，留作保真复核项；
+- 输入法组合进行中点击方框：Evernote 对此有专门处理（PESO‑2349），这里没有单独实现。
+
+### 保留的已知差异（重申）
+
+- 引用的第一块是列表时按 Delete：Evernote 会把列表切片并入当前段，本项目交给普通 Delete 处理；
+- `Mod-Backspace` 没有单独绑定 quoteblock 的处理函数。
+
+### 全量（HEAD `a52e4c4d3`，均 `--offline --locked`，退出码 0）
+
+- App：1501 通过、0 失败、2 忽略（`/tmp/joplin-claude-batch20-gpui-full.log`）；
+- core：33 组共 368 通过、0 失败、1 忽略（`/tmp/joplin-claude-batch20-core-full.log`）。
+
+没有安装，没有推送，没有改动原资料库，也没有碰 Codex 正在使用的隔离候选包和资料库。
