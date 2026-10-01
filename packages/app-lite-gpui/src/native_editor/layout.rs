@@ -188,6 +188,9 @@ fn list_depth(kind: &BlockKind) -> Option<u8> {
 pub(crate) const QUOTE_BAR_WIDTH: f32 = 2.0;
 pub(crate) const QUOTE_INSET: f32 = QUOTE_BAR_WIDTH + 16.0;
 pub(crate) const QUOTE_BAR_COLOR: u32 = 0x4e4d4cff;
+/// ce.css blockquote `margin: var(--spacing-0-5) 0` (4px): adjacent quotes
+/// show apart.
+pub(crate) const QUOTE_GAP: f32 = 4.0;
 
 /// A quote paragraph, or a heading or list item inside a quote container.
 pub(crate) fn is_quote_block(block: &super::model::Block) -> bool {
@@ -652,7 +655,7 @@ fn crosses_quote_boundary(document: &Document, block: &super::model::Block) -> b
         .find(|previous| !document.is_inline_group_continuation(previous.id))
         .is_some_and(|previous| {
             !matches!(numbering_kind(&previous.kind), NumberingKind::Boundary)
-                && previous.quoted != block.quoted
+                && (previous.quoted != block.quoted || (block.quoted && block.quote_start))
         })
 }
 

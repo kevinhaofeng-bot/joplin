@@ -207,6 +207,10 @@ pub struct BlockStyle {
     /// quoteblock holds `( p | todolist | ol | ul | h )+` (common-editor
     /// quoteblock/schema.ts 14). A quoted paragraph is a [`Block::Quote`].
     pub quoted: bool,
+    /// This quote block begins a new quote container although the block
+    /// before it is also quoted: Evernote keeps adjacent quoteblocks apart.
+    /// Cleared wherever the block before is not a quote block.
+    pub quote_start: bool,
 }
 
 impl Default for BlockStyle {
@@ -215,6 +219,7 @@ impl Default for BlockStyle {
             alignment: Alignment::Left,
             indent: 0,
             quoted: false,
+            quote_start: false,
         }
     }
 }
@@ -530,12 +535,20 @@ fn serialize_html(document: &CanonicalDocument) -> String {
             .iter()
             .take_while(|block| quote_member(block).is_some())
             .count();
-        if blocks[index..index + run]
-            .iter()
-            .any(|block| quote_member(block) == Some(true))
+        let members = &blocks[index..index + run];
+        let several = members.iter().skip(1).any(quote_start);
+        if several
+            || members
+                .iter()
+                .any(|block| quote_member(block) == Some(true))
         {
-            output.push_str("<blockquote data-joplin-lite-quote-container=\"true\">");
-            for block in &blocks[index..index + run] {
+            for (position, block) in members.iter().enumerate() {
+                if position == 0 || quote_start(block) {
+                    if position > 0 {
+                        output.push_str("</blockquote>");
+                    }
+                    output.push_str("<blockquote data-joplin-lite-quote-container=\"true\">");
+                }
                 serialize_top_block(block, true, &mut output);
             }
             output.push_str("</blockquote>");
@@ -999,6 +1012,7 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 && previous_kind == kind
                 && previous_items.first().map(|item| item.style.quoted)
                     == items.first().map(|item| item.style.quoted)
+                && !items.first().is_some_and(|item| item.style.quote_start)
             {
                 previous_items.extend(items.clone());
             } else {
@@ -1006,6 +1020,40 @@ fn normalize_blocks(blocks: Vec<Block>) -> Vec<Block> {
             }
             normalized
         })
+        .into_iter()
+        .fold(Vec::new(), |mut normalized: Vec<Block>, mut block| {
+            let after_quote = normalized
+                .last()
+                .is_some_and(|last| quote_member(last).is_some());
+            if !after_quote || quote_member(&block).is_none() {
+                set_quote_start(&mut block, false);
+            }
+            normalized.push(block);
+            normalized
+        })
+}
+
+fn quote_start(block: &Block) -> bool {
+    match block {
+        Block::Quote { style, .. } | Block::Heading { style, .. } => style.quote_start,
+        Block::List { items, .. } => items.first().is_some_and(|item| item.style.quote_start),
+        _ => false,
+    }
+}
+
+pub(crate) fn set_quote_start(block: &mut Block, value: bool) {
+    match block {
+        Block::Paragraph { style, .. }
+        | Block::Heading { style, .. }
+        | Block::Quote { style, .. }
+        | Block::Code { style, .. } => style.quote_start = value,
+        Block::List { items, .. } => {
+            for (index, item) in items.iter_mut().enumerate() {
+                item.style.quote_start = value && index == 0;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A list is inside or outside a quote as a whole, like Evernote's `ol`/`ul`
@@ -1018,7 +1066,8 @@ fn split_list_at_quote_boundaries(block: Block) -> Vec<Block> {
     for item in items {
         match lists.last_mut() {
             Some(Block::List { items: run, .. })
-                if run.last().map(|last| last.style.quoted) == Some(item.style.quoted) =>
+                if run.last().map(|last| last.style.quoted) == Some(item.style.quoted)
+                    && !item.style.quote_start =>
             {
                 run.push(item)
             }
@@ -1904,6 +1953,9 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
             ProjectionFrame::FinishListItem => projection.finish_list_item(),
             ProjectionFrame::QuoteContainer { blocks_before } => {
                 projection.flush();
+                if let Some(first) = projection.document.blocks.get_mut(blocks_before) {
+                    set_quote_start(first, true);
+                }
                 for block in &mut projection.document.blocks[blocks_before..] {
                     match block {
                         Block::Paragraph { style, .. }
@@ -2159,18 +2211,10 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         projection.block_divider();
                         continue;
                     }
-                    // A pasted blockquote holding blocks is Evernote's quoteblock
-                    // (quoteblock/schema.ts parseClipboard: its p/ol/ul/h content
-                    // is parsed as such); one holding only inline text stays a
-                    // single quote paragraph.
-                    let pasted_quote_container =
-                        pasted && tag == "blockquote" && children.iter().any(|child| {
-                            matches!(&child.data, DomData::Element { name, .. }
-                            if matches!(
-                                name.local.to_string().to_ascii_lowercase().as_str(),
-                                "p" | "div" | "ul" | "ol" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                            ))
-                        });
+                    // A pasted blockquote is Evernote's quoteblock (quoteblock/schema.ts
+                    // parseClipboard: its p/ol/ul/h content is parsed as such), each
+                    // its own quote even next to another.
+                    let pasted_quote_container = pasted && tag == "blockquote";
                     if projection.list_contexts.is_empty()
                         && (pasted_quote_container
                             || (!pasted
@@ -3099,6 +3143,7 @@ fn block_style(attrs: &[Attribute], default_indent: u8) -> BlockStyle {
         alignment,
         indent,
         quoted: false,
+        quote_start: false,
     }
 }
 
@@ -3554,6 +3599,7 @@ mod tests {
                     alignment: Alignment::Center,
                     indent: 2,
                     quoted: false,
+                    quote_start: false,
                 },
                 inlines: vec![Inline::Text {
                     text: "标题".into(),
@@ -3882,6 +3928,7 @@ mod tests {
                     alignment: Alignment::Center,
                     indent: 2,
                     quoted: false,
+                    quote_start: false,
                 },
                 inlines: Vec::new(),
             },
@@ -3890,6 +3937,7 @@ mod tests {
                     alignment: Alignment::Right,
                     indent: 1,
                     quoted: false,
+                    quote_start: false,
                 },
                 inlines: Vec::new(),
             },
@@ -4105,6 +4153,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
                         alignment: Alignment::Right,
                         indent: 9,
                         quoted: false,
+                        quote_start: false,
                     },
                     inlines: vec![Inline::Text {
                         text: "bullet".into(),

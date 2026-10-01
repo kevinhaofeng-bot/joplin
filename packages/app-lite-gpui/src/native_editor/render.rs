@@ -36,6 +36,7 @@ struct RenderBlock {
     line_height: Option<Pixels>,
     marker: Option<String>,
     quote: bool,
+    quote_start: bool,
     image_resource: Option<Resource>,
     image_resource_id: Option<String>,
     image_natural_max_edge: Option<u32>,
@@ -399,6 +400,7 @@ fn snapshot_with_image_viewport(
                 .then(|| list_marker(&kind, layout.ordered_number(block.node_id)))
                 .flatten(),
                 quote: model_block.is_some_and(super::layout::is_quote_block),
+                quote_start: model_block.is_some_and(|block| block.quote_start),
                 image_resource,
                 image_resource_id,
                 image_natural_max_edge,
@@ -810,15 +812,21 @@ fn paint_snapshot(
             line_top += line.size(line_height).height;
         }
         if block.quote {
-            // Consecutive quote blocks draw one continuous bar.
+            // One quote draws one continuous bar; the next quote's bar
+            // starts after a gap.
+            let gap = if block.quote_start {
+                px(super::layout::QUOTE_GAP)
+            } else {
+                px(0.0)
+            };
             let bar = Bounds::new(
                 point(
                     block.layout.bounds.left() - px(super::layout::QUOTE_INSET),
-                    block.layout.bounds.top(),
+                    block.layout.bounds.top() + gap,
                 ),
                 gpui::size(
                     px(super::layout::QUOTE_BAR_WIDTH),
-                    block.layout.bounds.size.height,
+                    block.layout.bounds.size.height - gap,
                 ),
             );
             window.paint_quad(fill(bar, rgba(super::layout::QUOTE_BAR_COLOR)));
@@ -1438,6 +1446,7 @@ mod tests {
             line_height: None,
             marker: None,
             quote: false,
+            quote_start: false,
             image_resource: None,
             image_resource_id: None,
             image_natural_max_edge: None,

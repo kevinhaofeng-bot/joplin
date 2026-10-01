@@ -298,6 +298,9 @@ pub struct Block {
     /// common-editor quoteblock/schema.ts 14). A quoted paragraph is a
     /// [`BlockKind::Quote`] and keeps this false.
     pub quoted: bool,
+    /// This quote block begins a new quote container although the block
+    /// before it is in a quote too: Evernote keeps adjacent quoteblocks apart.
+    pub quote_start: bool,
     pub revision: u64,
 }
 
@@ -309,6 +312,7 @@ impl Block {
             content: BlockContent::text(text),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         }
     }
@@ -573,6 +577,7 @@ impl StructuralInsert {
             content,
             alignment,
             quoted: false,
+            quote_start: false,
             revision,
         }
     }
@@ -1575,6 +1580,7 @@ impl Document {
                     },
                     alignment,
                     quoted,
+                    quote_start: target.quote_start,
                     revision: target.revision,
                 });
                 continue;
@@ -1589,6 +1595,7 @@ impl Document {
                     },
                     alignment: target.alignment,
                     quoted: target.quoted,
+                    quote_start: target.quote_start,
                     revision: target.revision,
                 });
             }
@@ -1625,6 +1632,7 @@ impl Document {
                 },
                 alignment: target.alignment,
                 quoted: target.quoted,
+                quote_start: false,
                 revision: target.revision,
             });
             DocPoint::with_affinity(id, 0, Affinity::Before)
@@ -3495,6 +3503,7 @@ impl Document {
                 TextAlignment::Left
             },
             quoted: start_is_text && start_block.quoted,
+            quote_start: start_is_text && start_block.quote_start,
             revision: start_block.revision,
         };
         self.blocks
@@ -3521,6 +3530,7 @@ impl Document {
             },
             alignment: original.alignment,
             quoted: original.quoted,
+            quote_start: original.quote_start,
             revision: original.revision,
         };
         let right = Block {
@@ -3532,6 +3542,7 @@ impl Document {
             },
             alignment: original.alignment,
             quoted: original.quoted,
+            quote_start: false,
             revision: original.revision,
         };
         self.blocks
@@ -3638,8 +3649,12 @@ impl Document {
             }
             let (next_kind, next_quoted) = quote_aware_kind(block, &kind);
             if block.kind != next_kind || block.quoted != next_quoted {
+                let was_quote = block.quoted || block.kind == BlockKind::Quote;
                 block.kind = next_kind;
                 block.quoted = next_quoted;
+                if !was_quote {
+                    block.quote_start = false;
+                }
                 push_unique(&mut changed_nodes, block.id);
             }
         }
@@ -3716,26 +3731,55 @@ impl Document {
                 "a quote holds only paragraphs, headings and lists".into(),
             ));
         }
+        let wrap_after_quote = quote && start > 0 && self.block_in_quote(start - 1);
         if !quote {
-            // The whole quote goes, not just the selected part of it.
+            // The whole quote goes, not just the selected part of it; a
+            // neighbouring quote of its own stays.
             if self.block_in_quote(start) {
-                while start > 0 && self.block_in_quote(start - 1) {
+                while start > 0 && !self.blocks[start].quote_start && self.block_in_quote(start - 1)
+                {
                     start -= 1;
                 }
             }
             if self.block_in_quote(end) {
-                while end + 1 < self.blocks.len() && self.block_in_quote(end + 1) {
+                while end + 1 < self.blocks.len()
+                    && self.block_in_quote(end + 1)
+                    && !self.blocks[end + 1].quote_start
+                {
                     end += 1;
                 }
             }
+        }
+        // The wrapped blocks are a quote of their own: a quote right after
+        // them now starts its own container.
+        let wrapped_end = end;
+        if quote
+            && end + 1 < self.blocks.len()
+            && self.block_in_quote(end + 1)
+            && !self.blocks[end + 1].quote_start
+        {
+            end += 1;
         }
         let originals = self.blocks.collect_range(start..end.saturating_add(1));
         let mut replacements = originals.clone();
         let mut changed_nodes = SmallVec::new();
         let mut first_changed = None;
-        for block in &mut replacements {
+        let mut first_text = true;
+        for (offset, block) in replacements.iter_mut().enumerate() {
             if !is_text_block(block) {
                 continue;
+            }
+            if quote && start + offset > wrapped_end {
+                block.quote_start = true;
+                push_unique(&mut changed_nodes, block.id);
+                continue;
+            }
+            let quote_start = quote && first_text && wrap_after_quote;
+            first_text = false;
+            if block.quote_start != quote_start {
+                block.quote_start = quote_start;
+                first_changed.get_or_insert(block.id);
+                push_unique(&mut changed_nodes, block.id);
             }
             let (kind, quoted) = match (&block.kind, quote) {
                 (BlockKind::Paragraph, true) => (BlockKind::Quote, false),
@@ -3759,7 +3803,7 @@ impl Document {
         // unwrapping at a caret puts it at the start of what was the quote.
         let selection = if quote {
             let first = self.blocks[start].id;
-            let last = &self.blocks[end];
+            let last = &self.blocks[wrapped_end];
             let last_offset = last.content.as_text().map_or(0, str::len);
             Selection::new(
                 DocPoint::with_affinity(first, 0, Affinity::After),
@@ -4336,6 +4380,7 @@ impl Document {
             },
             alignment: original_block.alignment,
             quoted: original_block.quoted,
+            quote_start: original_block.quote_start,
             revision: original_block.revision,
         };
         let image = structural.block(image_id, TextAlignment::Left, 0);
@@ -4348,6 +4393,7 @@ impl Document {
             },
             alignment: original_block.alignment,
             quoted: original_block.quoted,
+            quote_start: false,
             revision: original_block.revision,
         };
         self.blocks.splice(

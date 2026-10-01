@@ -807,6 +807,9 @@ impl<'a> Converter<'a> {
                             "Quote contains non-paragraph structure",
                         );
                     }
+                    // Each Markdown blockquote is its own quote, even right
+                    // after another one.
+                    let first_child = blocks.len();
                     for child in children {
                         blocks.push(match child {
                             quote @ Block::Quote { .. } if !in_quote => quote,
@@ -841,6 +844,9 @@ impl<'a> Converter<'a> {
                                 );
                             }
                         });
+                    }
+                    if let Some(first) = blocks.get_mut(first_child) {
+                        crate::document::set_quote_start(first, true);
                     }
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {

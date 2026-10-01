@@ -663,3 +663,55 @@ fn pasted_blockquote_with_lists_and_headings_becomes_a_quote_container() {
         "<blockquote data-joplin-lite-quote-container=\"true\"><h3>要点</h3><p>说明</p><ol><li>一</li><li>二</li></ol></blockquote><p>外</p><blockquote data-joplin-lite-block-quote=\"true\">只有文字</blockquote>"
     );
 }
+
+#[test]
+fn adjacent_quote_containers_stay_apart() {
+    // Evernote keeps two quoteblocks next to each other as two quotes.
+    for stored in [
+        "<blockquote data-joplin-lite-quote-container=\"true\"><p>甲</p></blockquote><blockquote data-joplin-lite-quote-container=\"true\"><p>乙</p><p>丙</p></blockquote>",
+        "<blockquote data-joplin-lite-quote-container=\"true\"><ul><li>一</li></ul></blockquote><blockquote data-joplin-lite-quote-container=\"true\"><ul><li>二</li></ul><h2>题</h2></blockquote><p>外</p>",
+    ] {
+        let document = CanonicalDocument::parse_html(stored).unwrap();
+        assert_eq!(document.to_canonical_html().as_str(), stored, "{stored}");
+    }
+    // The existing per-paragraph form stays one quote, as JEX wrote it.
+    let legacy = "<blockquote data-joplin-lite-block-quote=\"true\">一</blockquote><blockquote data-joplin-lite-block-quote=\"true\">二</blockquote>";
+    assert_eq!(
+        CanonicalDocument::parse_html(legacy)
+            .unwrap()
+            .to_canonical_html()
+            .as_str(),
+        legacy
+    );
+    // Two pasted blockquotes are two quotes.
+    let pasted = CanonicalDocument::parse_pasted_html(
+        "<blockquote>一</blockquote><blockquote>二</blockquote>",
+    )
+    .unwrap()
+    .document;
+    assert_eq!(
+        pasted.to_canonical_html().as_str(),
+        "<blockquote data-joplin-lite-quote-container=\"true\"><p>一</p></blockquote><blockquote data-joplin-lite-quote-container=\"true\"><p>二</p></blockquote>"
+    );
+    // A container start with no quote before it is meaningless and dropped.
+    let alone = CanonicalDocument::from_blocks(vec![Block::Quote {
+        style: BlockStyle {
+            quote_start: true,
+            ..BlockStyle::default()
+        },
+        inlines: vec![Inline::Text {
+            text: "独".into(),
+            marks: Marks::default(),
+        }],
+    }]);
+    assert!(matches!(
+        alone.blocks(),
+        [Block::Quote {
+            style: BlockStyle {
+                quote_start: false,
+                ..
+            },
+            ..
+        }]
+    ));
+}

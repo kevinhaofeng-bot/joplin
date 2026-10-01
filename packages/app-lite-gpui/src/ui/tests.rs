@@ -12825,3 +12825,135 @@ async fn pasted_blockquote_with_a_list_lands_as_a_quote_container_and_saves(
         "<p>前</p><blockquote data-joplin-lite-quote-container=\"true\"><h3>要点</h3><ul><li>一</li><li>二</li></ul></blockquote><p>后</p>"
     );
 }
+
+#[gpui::test]
+async fn adjacent_quotes_stay_apart_through_toolbar_history_editing_and_save(
+    cx: &mut TestAppContext,
+) {
+    // Evernote keeps neighbouring quoteblocks as separate quotes; toggling
+    // (quoteblock.ts insertQuoteblockAtSelection) acts on one of them.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let container = |inner: &str| {
+        format!("<blockquote data-joplin-lite-quote-container=\"true\">{inner}</blockquote>")
+    };
+    let stored = format!(
+        "{}{}<p>外</p>",
+        container("<p>甲</p>"),
+        container("<ol><li>一</li></ol>")
+    );
+    let note = repository
+        .create_note(CreateNote {
+            title: "相邻引用".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html(&stored).unwrap(),
+        })
+        .expect("create note");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    let html = |cx: &mut VisualTestContext| {
+        cx.update(|_, app| {
+            crate::native_editor::codec::export_canonical(editor.read(app).document())
+                .unwrap()
+                .to_canonical_html()
+                .as_str()
+                .to_owned()
+        })
+    };
+    let ids = cx.update(|_, app| {
+        editor
+            .read(app)
+            .document()
+            .blocks()
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>()
+    });
+    let caret = |cx: &mut VisualTestContext, id, offset| {
+        cx.update(|_, app| {
+            editor.update(app, |editor, editor_cx| {
+                editor.set_selection_for_test(Selection::caret(DocPoint::new(id, offset)));
+                editor_cx.notify();
+            })
+        });
+        redraw(cx);
+    };
+    assert_eq!(html(cx), stored);
+
+    // Unwrapping the first quote leaves the second one alone.
+    caret(cx, ids[0], 0);
+    click_library_more_command(cx, "Quote");
+    let first_unwrapped = format!("<p>甲</p>{}<p>外</p>", container("<ol><li>一</li></ol>"));
+    assert_eq!(html(cx), first_unwrapped);
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert_eq!(html(cx), stored);
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    assert_eq!(html(cx), first_unwrapped);
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+
+    // Wrapping right after a quote, or right before one, makes a quote of
+    // its own.
+    caret(cx, ids[2], 0);
+    click_library_more_command(cx, "Quote");
+    let three = format!(
+        "{}{}{}",
+        container("<p>甲</p>"),
+        container("<ol><li>一</li></ol>"),
+        container("<p>外</p>")
+    );
+    assert_eq!(html(cx), three);
+
+    // Enter inside a quote keeps one quote; the new item numbers on.
+    caret(cx, ids[1], "一".len());
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("二");
+    redraw(cx);
+    let edited = format!(
+        "{}{}{}",
+        container("<p>甲</p>"),
+        container("<ol><li>一</li><li>二</li></ol>"),
+        container("<p>外</p>")
+    );
+    assert_eq!(html(cx), edited);
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx)
+        })
+    });
+    cx.run_until_parked();
+    let saved = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(saved.body_html, edited);
+    let reopened = cx.new(|cx| {
+        crate::app::note_session::NoteSession::open(
+            saved,
+            Arc::clone(&repository),
+            Arc::new(ManualSaveClock::default()),
+            cx,
+        )
+        .unwrap()
+    });
+    let reopened_html = reopened.read_with(cx, |session, app| {
+        crate::native_editor::codec::export_canonical(session.editor().read(app).document())
+            .unwrap()
+            .to_canonical_html()
+    });
+    assert_eq!(reopened_html.as_str(), edited);
+}

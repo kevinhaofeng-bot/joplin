@@ -229,6 +229,7 @@ fn readable_page_applies_canonical_alignment_indent_and_image_display_width() {
                         alignment: Alignment::Center,
                         indent: 2,
                         quoted: false,
+                        quote_start: false,
                     },
                     inlines: vec![Inline::Text {
                         text: "Centered".into(),
@@ -243,6 +244,7 @@ fn readable_page_applies_canonical_alignment_indent_and_image_display_width() {
                             alignment: Alignment::Right,
                             indent: 8,
                             quoted: false,
+                            quote_start: false,
                         },
                         inlines: vec![Inline::Text {
                             text: "Right".into(),

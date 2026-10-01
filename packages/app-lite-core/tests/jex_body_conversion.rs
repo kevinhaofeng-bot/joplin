@@ -1066,3 +1066,20 @@ fn quote_with_lists_and_headings_becomes_one_quote_container() {
         "<blockquote data-joplin-lite-block-quote=\"true\">一</blockquote><blockquote data-joplin-lite-block-quote=\"true\">二</blockquote>"
     );
 }
+
+#[test]
+fn separate_markdown_quotes_stay_separate_quotes() {
+    // A blank line ends a CommonMark blockquote: two quotes, as Evernote
+    // keeps two quoteblocks.
+    let converted =
+        convert_jex_note_body(NOTE, "quote.md", 1, "> 甲\n\n> 乙\n>\n> 丙", &resources())
+            .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(
+        converted.canonical_html,
+        "<blockquote data-joplin-lite-quote-container=\"true\"><p>甲</p></blockquote><blockquote data-joplin-lite-quote-container=\"true\"><p>乙</p><p>丙</p></blockquote>"
+    );
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        converted.document
+    );
+}

@@ -863,6 +863,7 @@ fn apply_list_command(command: EditorCommand, editor: &mut EditorCore) -> Result
                     content: BlockContent::text(""),
                     alignment: TextAlignment::Left,
                     quoted: false,
+                    quote_start: false,
                     revision: 0,
                 }],
             });

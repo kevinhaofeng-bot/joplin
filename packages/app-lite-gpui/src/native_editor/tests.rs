@@ -148,6 +148,7 @@ fn ordered_fixture(count: usize) -> Vec<Block> {
             content: BlockContent::text(format!("item-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         })
         .collect()
@@ -665,6 +666,7 @@ fn ordered_tail_edit_has_bounded_numbering_scratch_and_keeps_marker() {
             content: BlockContent::text(format!("ordered-item-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         })
         .collect();
@@ -717,6 +719,7 @@ fn ordered_tail_kind_depth_change_recomputes_locally_and_keeps_numbers_correct()
             content: BlockContent::text(format!("ordered-item-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         })
         .collect();
@@ -771,6 +774,7 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
             content: BlockContent::text(format!("paragraph-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         })
         .collect();
@@ -985,6 +989,7 @@ fn batched_splices_and_restore_blocks_replay_in_order_through_history() {
         content: BlockContent::text("restored"),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     };
     let restore = Transaction::RestoreBlocks {
@@ -1080,6 +1085,7 @@ fn restore_blocks_rejects_zero_and_internal_duplicate_ids_atomically() {
         content: BlockContent::text("zero"),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     };
     let result = document.apply(Transaction::RestoreBlocks {
@@ -1196,6 +1202,7 @@ fn block_sequence_range_edges_use_right_boundary() {
         content: BlockContent::text(text),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     };
     assert!(blocks.iter_range(0..0).next().is_none());
@@ -1455,6 +1462,7 @@ fn non_monotonic_node_ids_keep_selection_geometry_in_document_order() {
             },
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         })
         .collect();
@@ -1482,6 +1490,7 @@ fn capacity_exhaustion_does_not_copy_a_100k_block_order_buffer() {
             content: BlockContent::text(format!("paragraph-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         })
         .collect();
@@ -1552,6 +1561,7 @@ fn run_mixed_sum_tree_fixture(block_count: usize) -> (usize, usize) {
             content: BlockContent::text(format!("row-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         })
         .collect::<Vec<_>>();
@@ -1897,6 +1907,7 @@ fn max_node_id_cannot_be_allocated_again() {
         content: BlockContent::text("max"),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     };
     let mut document = Document::from_blocks(vec![block.clone()]).expect("max id is readable");
@@ -1919,6 +1930,7 @@ fn max_node_id_cannot_be_allocated_again() {
         content: BlockContent::text("before"),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     };
     let mut document = Document::from_blocks(vec![paragraph_block]).expect("near-max id is valid");
@@ -1946,6 +1958,7 @@ fn same_id_restore_reports_non_structural_metadata() {
         content: BlockContent::text("after"),
         alignment: original.alignment,
         quoted: original.quoted,
+        quote_start: original.quote_start,
         revision: original.revision,
     };
     let outcome = document
@@ -2042,6 +2055,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             content: BlockContent::text(format!("prefix-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         });
     }
@@ -2052,6 +2066,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             content: BlockContent::text(format!("middle-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         });
     }
@@ -2062,6 +2077,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             content: BlockContent::text(format!("suffix-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         });
     }
@@ -2601,6 +2617,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
             content: BlockContent::text(format!("left-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         });
     }
@@ -2610,6 +2627,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
         content: BlockContent::text("boundary"),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     });
     for index in 0..64 {
@@ -2619,6 +2637,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
             content: BlockContent::text(format!("right-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         });
     }
@@ -2628,6 +2647,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
         content: BlockContent::text(format!("distant-suffix-{index}")),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     }));
     let mut document = Document::from_blocks(blocks).expect("ordered sequence fixture");
@@ -2675,6 +2695,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
             content: BlockContent::text(format!("item-{index}")),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         })
         .collect::<Vec<_>>();
@@ -2684,6 +2705,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
         content: BlockContent::text("boundary"),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     });
     blocks.extend((0..20_000).map(|index| Block {
@@ -2692,6 +2714,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
         content: BlockContent::text(format!("suffix-{index}")),
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     }));
     let mut document = Document::from_blocks(blocks).expect("checkpoint fixture");
@@ -3014,6 +3037,7 @@ fn validate_styles_scans_graphemes_once_per_text_on_transactions() {
             content: BlockContent::Text { text, styles },
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         };
         let mut doc = Document::from_blocks(vec![block]).unwrap();
@@ -5102,6 +5126,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             content: BlockContent::text("nine"),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         },
         Block {
@@ -5117,6 +5142,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             },
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         },
         Block {
@@ -5125,6 +5151,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             content: BlockContent::Empty,
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         },
         Block {
@@ -5133,6 +5160,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             content: BlockContent::text("three"),
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         },
         Block {
@@ -5148,6 +5176,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             },
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         },
     ];
@@ -8204,6 +8233,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
         },
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     };
     let source_document = Document::from_blocks(vec![
@@ -8227,6 +8257,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
             },
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         },
         Block {
@@ -8239,6 +8270,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
             },
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         },
         text_block(
@@ -8598,6 +8630,7 @@ fn a_run_never_keeps_both_script_marks() {
             },
             alignment: TextAlignment::Left,
             quoted: false,
+            quote_start: false,
             revision: 0,
         }])
     };
@@ -8805,6 +8838,7 @@ fn an_atom_only_document_starts_on_an_existing_block_and_edits_with_history(
         content,
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     };
     let image = BlockContent::Image {
@@ -9329,6 +9363,31 @@ fn quote_toggle_takes_only_quoteblock_content_and_restarts_numbering(
     let numbers = super::layout::ordered_number_summary(editor.document());
     assert_eq!(
         ids.iter().map(|id| numbers[id]).collect::<Vec<_>>(),
+        vec![1, 2, 1]
+    );
+}
+
+#[test]
+fn adjacent_quoted_lists_are_numbered_and_saved_apart() {
+    let stored = "<blockquote data-joplin-lite-quote-container=\"true\"><ol><li>一</li><li>二</li></ol></blockquote><blockquote data-joplin-lite-quote-container=\"true\"><ol><li>甲</li></ol></blockquote>";
+    let document = super::codec::import_canonical(
+        &app_lite_core::CanonicalDocument::parse_html(stored).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        super::codec::export_canonical(&document)
+            .unwrap()
+            .to_canonical_html()
+            .as_str(),
+        stored
+    );
+    let numbers = super::layout::ordered_number_summary(&document);
+    assert_eq!(
+        document
+            .blocks()
+            .iter()
+            .map(|block| numbers[&block.id])
+            .collect::<Vec<_>>(),
         vec![1, 2, 1]
     );
 }

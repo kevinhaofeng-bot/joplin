@@ -193,6 +193,7 @@ pub fn import_canonical_with_resources(
                                     Alignment::Right => TextAlignment::Right,
                                 },
                                 quoted: false,
+                                quote_start: false,
                                 revision: 0,
                             });
                         } else if let Inline::Attachment {
@@ -382,6 +383,7 @@ pub fn import_canonical_with_resources(
                     },
                     alignment: TextAlignment::Left,
                     quoted: false,
+                    quote_start: false,
                     revision: 0,
                 });
             }
@@ -401,6 +403,7 @@ pub fn import_canonical_with_resources(
                     },
                     alignment: TextAlignment::Left,
                     quoted: false,
+                    quote_start: false,
                     revision: 0,
                 });
             }
@@ -428,6 +431,7 @@ pub fn import_canonical_with_resources(
                     })),
                     alignment: TextAlignment::Left,
                     quoted: false,
+                    quote_start: false,
                     revision: 0,
                 });
             }
@@ -437,6 +441,7 @@ pub fn import_canonical_with_resources(
                 content: BlockContent::Empty,
                 alignment: TextAlignment::Left,
                 quoted: false,
+                quote_start: false,
                 revision: 0,
             }),
         }
@@ -481,6 +486,7 @@ fn attachment_block(
         },
         alignment: TextAlignment::Left,
         quoted: false,
+        quote_start: false,
         revision: 0,
     }
 }
@@ -525,6 +531,7 @@ fn push_inline_group(
                     },
                     alignment: TextAlignment::Left,
                     quoted: false,
+                    quote_start: false,
                     revision: 0,
                 });
             }
@@ -906,6 +913,7 @@ fn export_text_block(
             },
             indent: 0,
             quoted: block.quoted,
+            quote_start: block.quote_start,
         },
         export_inlines(text, styles, block_index)?,
     ))
@@ -1047,6 +1055,7 @@ fn text_block(
     };
     let (text, styles) = import_inlines(inlines, block_index)?;
     let quoted = style.quoted && is_quotable_kind(&kind);
+    let kind_is_quote = kind == BlockKind::Quote;
     Ok(Block {
         id,
         kind,
@@ -1057,6 +1066,7 @@ fn text_block(
             Alignment::Right => TextAlignment::Right,
         },
         quoted,
+        quote_start: style.quote_start && (quoted || kind_is_quote),
         revision: 0,
     })
 }
@@ -1155,6 +1165,7 @@ mod tests {
                     alignment: Alignment::Center,
                     indent: 0,
                     quoted: false,
+                    quote_start: false,
                 },
                 inlines: vec![
                     Inline::Text {
@@ -1194,6 +1205,7 @@ mod tests {
                         alignment: Alignment::Right,
                         indent: 0,
                         quoted: false,
+                        quote_start: false,
                     },
                     inlines: vec![Inline::Text {
                         text: "完成".into(),
@@ -1318,6 +1330,7 @@ mod tests {
                 alignment: Alignment::Left,
                 indent: 1,
                 quoted: false,
+                quote_start: false,
             },
             inlines: vec![Inline::Text {
                 text: "不能丢失缩进".into(),
@@ -2088,6 +2101,7 @@ mod tests {
                     alignment: Alignment::Center,
                     indent: 0,
                     quoted: false,
+                    quote_start: false,
                 },
                 inlines: vec![marked("标题")],
             },
