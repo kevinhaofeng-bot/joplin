@@ -580,6 +580,9 @@ pub struct LibraryShell {
     queued_resource_inserts: VecDeque<QueuedResourceInsert>,
     resource_queue_completion_scheduled: bool,
     pending_drop_intent: Option<InsertIntent>,
+    // Why the last drag position takes no drop (a table whose cell is not
+    // open); the drop is then refused instead of going to the body caret.
+    pending_drop_refusal: Option<String>,
     resource_notice: Option<String>,
     unsupported_document: Option<String>,
     save_error: Option<ShellSaveError>,
@@ -1130,6 +1133,7 @@ impl LibraryShell {
             queued_resource_inserts: VecDeque::new(),
             resource_queue_completion_scheduled: false,
             pending_drop_intent: None,
+            pending_drop_refusal: None,
             resource_notice: None,
             unsupported_document: None,
             save_error: None,
@@ -2463,6 +2467,7 @@ impl LibraryShell {
         self.unsupported_document = None;
         self.pending_resource_insert = None;
         self.pending_drop_intent = None;
+        self.pending_drop_refusal = None;
         self.discard_queued_resource_inserts();
         self.resource_notice = None;
 
@@ -2692,12 +2697,20 @@ impl LibraryShell {
         let Some(session) = self.note_session.clone() else {
             return Err("请先选择一篇笔记再插入资源".to_owned());
         };
+        // The chooser inserts where the caret was: in the open cell when it
+        // had the focus, else in the body.
+        let intent = if self.focused_table_cell() {
+            self.capture_cell_resource_insert_intent(None, cx)
+                .unwrap_or_else(|| Err("单元格已关闭".to_owned()))?
+        } else {
+            Self::capture_resource_insert_intent(&session, None, cx)?
+        };
+        if let Some(previous) = self.pending_resource_insert.take() {
+            Self::discard_resource_insert_intent(&session, previous.intent, cx);
+        }
         let token = ResourcePickerToken(self.next_resource_picker_token);
         self.next_resource_picker_token = self.next_resource_picker_token.wrapping_add(1);
-        self.pending_resource_insert = Some(PendingResourcePicker {
-            token,
-            intent: Self::capture_resource_insert_intent(&session, None, cx)?,
-        });
+        self.pending_resource_insert = Some(PendingResourcePicker { token, intent });
         self.resource_notice = None;
         cx.notify();
         Ok(token)
@@ -3323,25 +3336,83 @@ impl LibraryShell {
         if self.active_session_is_read_only(cx) {
             return;
         }
+        self.record_drop_position(event.event.position, cx);
+    }
+
+    pub(crate) fn record_drop_position(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.note_session.clone() else {
             return;
         };
-        let editor = session.read_with(cx, |session, _| session.editor().clone());
-        let point = editor.update(cx, |editor, _| {
-            editor.point_from_layout(event.event.position)
-        });
         if let Some(intent) = self.pending_drop_intent.take() {
             Self::discard_resource_insert_intent(&session, intent, cx);
         }
-        self.pending_drop_intent =
-            match Self::capture_resource_insert_intent(&session, point.map(Selection::caret), cx) {
-                Ok(intent) => Some(intent),
-                Err(error) => {
-                    self.resource_notice = Some(format!("无法记录拖放位置：{error}"));
-                    cx.notify();
-                    None
-                }
-            };
+        self.pending_drop_refusal = None;
+        self.pending_drop_intent = match self.capture_drop_intent_at(position, cx) {
+            Ok(intent) => intent,
+            Err(error) => {
+                self.pending_drop_refusal = Some(error);
+                None
+            }
+        };
+    }
+
+    /// The intent a drop now uses: where the drag last was, refused where
+    /// that takes no drop, else the body caret (a drop without a move).
+    pub(crate) fn take_drop_intent(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<InsertIntent, String> {
+        if let Some(refusal) = self.pending_drop_refusal.take() {
+            return Err(refusal);
+        }
+        match self.pending_drop_intent.take() {
+            Some(intent) => Ok(intent),
+            None => self
+                .note_session
+                .as_ref()
+                .ok_or_else(|| "请先选择一篇笔记再拖入资源".to_owned())
+                .and_then(|session| Self::capture_resource_insert_intent(session, None, cx)),
+        }
+    }
+
+    /// The insert point a drop at `position` would use.
+    pub(crate) fn capture_drop_intent_at(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<InsertIntent>, String> {
+        let Some(session) = self.note_session.clone() else {
+            return Ok(None);
+        };
+        // dragdrop/plugin.ts: the drop coordinate decides. In the open cell
+        // it is the cell's point under it.
+        if let Some(point) = self.table_cell_drop_point(position, cx) {
+            return self
+                .capture_cell_resource_insert_intent(point.map(Selection::caret), cx)
+                .transpose();
+        }
+        let editor = session.read_with(cx, |session, _| session.editor().clone());
+        let on_table = editor.read_with(cx, |editor, _| {
+            editor
+                .layout()
+                .atomic_block_at(position)
+                .and_then(|node| editor.document().block(node))
+                .is_some_and(|block| {
+                    matches!(
+                        block.content,
+                        crate::native_editor::model::BlockContent::Table(_)
+                    )
+                })
+        });
+        if on_table {
+            return Err("要把文件放进表格，请先双击打开该单元格，再拖到单元格编辑框中".to_owned());
+        }
+        let point = editor.update(cx, |editor, _| editor.point_from_layout(position));
+        Self::capture_resource_insert_intent(&session, point.map(Selection::caret), cx).map(Some)
     }
 
     fn on_external_paths_drop(
@@ -3355,14 +3426,7 @@ impl LibraryShell {
             cx.notify();
             return;
         }
-        let intent = match self.pending_drop_intent.take() {
-            Some(intent) => Ok(intent),
-            None => self
-                .note_session
-                .as_ref()
-                .ok_or_else(|| "请先选择一篇笔记再拖入资源".to_owned())
-                .and_then(|session| Self::capture_resource_insert_intent(session, None, cx)),
-        };
+        let intent = self.take_drop_intent(cx);
         let intent = match intent {
             Ok(intent) => intent,
             Err(error) => {

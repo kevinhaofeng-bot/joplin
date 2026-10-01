@@ -1189,3 +1189,398 @@ async fn fragment_image_from_this_library_pastes_into_a_cell(cx: &mut TestAppCon
     );
     assert!(!body.contains(&foreign), "{body}");
 }
+
+fn png_bytes() -> Vec<u8> {
+    crate::native_editor::images::ClipboardPayload::fixture_with_png_and_text("")
+        .images
+        .into_iter()
+        .next()
+        .unwrap()
+        .bytes
+}
+
+fn png_file(root: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let path = root.path().join(name);
+    std::fs::write(&path, png_bytes()).unwrap();
+    path
+}
+
+fn draw(cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    cx.update(|window, app| window.draw(app).clear());
+    cx.run_until_parked();
+}
+
+// The image button and menu open the chooser for whichever editor has the
+// caret: with a cell focused, its caret is captured (resource.ts insert
+// replaces that selection), never the body's older caret.
+#[gpui::test]
+async fn picker_from_a_focused_cell_inserts_into_that_cell(cx: &mut TestAppContext) {
+    let (root, repository, note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    draw(cx);
+    // Cancelled: nothing changes.
+    let token = view
+        .update(cx, |shell, shell_cx| shell.begin_resource_picker(shell_cx))
+        .unwrap();
+    view.update(cx, |shell, shell_cx| {
+        shell.cancel_resource_picker_for_test(token, shell_cx)
+    });
+    draw(cx);
+    assert!(
+        editor
+            .read_with(cx, |editor, _| cell_image_ids(editor))
+            .is_empty()
+    );
+    // Opened twice: only the latest chooser may complete.
+    let stale = view
+        .update(cx, |shell, shell_cx| shell.begin_resource_picker(shell_cx))
+        .unwrap();
+    let token = view
+        .update(cx, |shell, shell_cx| shell.begin_resource_picker(shell_cx))
+        .unwrap();
+    let path = png_file(&root, "chosen.png");
+    let stale_result = cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_resource_picker_path_for_token_for_test(
+                stale,
+                path.clone(),
+                window,
+                shell_cx,
+            )
+        })
+    });
+    assert!(stale_result.is_err());
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_resource_picker_path_for_token_for_test(
+                token,
+                path.clone(),
+                window,
+                shell_cx,
+            )
+        })
+    })
+    .unwrap();
+    draw(cx);
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("in the cell");
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(
+        body.contains(&format!(
+            "<td>一<br><img src=\":/{image}\" alt=\"\"><br></td>"
+        )),
+        "{body}"
+    );
+    assert!(body.starts_with("<p>前</p><table"), "{body}");
+    assert_eq!(body.matches("<img").count(), 1, "{body}");
+}
+
+#[gpui::test]
+async fn picker_completing_after_its_cell_closed_is_refused(cx: &mut TestAppContext) {
+    let (root, repository, note, view, cx) = mount(cx);
+    open_cell_at_end(&view, cx, 1, 1);
+    draw(cx);
+    let token = view
+        .update(cx, |shell, shell_cx| shell.begin_resource_picker(shell_cx))
+        .unwrap();
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    let path = png_file(&root, "late.png");
+    let _ = cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_resource_picker_path_for_token_for_test(token, path, window, shell_cx)
+        })
+    });
+    draw(cx);
+    assert!(!notice(&view, cx).is_empty(), "refused visibly");
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(
+        !body.contains("<img"),
+        "neither the cell nor the body: {body}"
+    );
+}
+
+// Identical (empty) cells: equal content at the same coordinates is not the
+// same cell once a row was added or removed above it.
+#[gpui::test]
+async fn cell_insert_refuses_a_structural_change_between_identical_cells(cx: &mut TestAppContext) {
+    let table = "<table data-joplin-lite-table=\"true\"><tbody><tr><th>名</th><th>值</th></tr><tr><td></td><td></td></tr><tr><td></td><td></td></tr><tr><td></td><td></td></tr></tbody></table>";
+    let (_root, repository, note, view, cx) =
+        mount_body(cx, Arc::new(ManualSaveClock::default()), table);
+    let (node, _) = table_node(&view, cx);
+    let main = main_editor(&view, cx);
+    for change in ["insert above", "delete above"] {
+        let editor = open_cell_at_end(&view, cx, 2, 1);
+        let release = view.update(cx, |shell, shell_cx| {
+            shell.stall_next_resource_import_for_test(shell_cx)
+        });
+        paste_png(cx);
+        cx.run_until_parked();
+        cx.update(|_, app| {
+            main.update(app, |editor, _| match change {
+                "insert above" => editor.insert_table_row(node, 1).unwrap(),
+                _ => editor.delete_table_row(node, 1).unwrap(),
+            })
+        });
+        release.send(()).unwrap();
+        draw(cx);
+        assert!(
+            editor
+                .read_with(cx, |editor, _| cell_image_ids(editor))
+                .is_empty(),
+            "{change}"
+        );
+        assert!(
+            notice(&view, cx).contains("单元格已移动或改变"),
+            "{change}: {}",
+            notice(&view, cx)
+        );
+        assert!(!main.read_with(cx, |editor, _| editor.document().blocks().iter().any(|block| matches!(&block.content, BlockContent::Table(table) if crate::native_editor::table_layout::table_image_ids(table).next().is_some()))), "{change}");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+    }
+    // Typing in the cell meanwhile is that cell's own change: still inserted.
+    let editor = open_cell_at_end(&view, cx, 2, 1);
+    let release = view.update(cx, |shell, shell_cx| {
+        shell.stall_next_resource_import_for_test(shell_cx)
+    });
+    paste_png(cx);
+    cx.run_until_parked();
+    cx.simulate_input("字");
+    cx.run_until_parked();
+    release.send(()).unwrap();
+    draw(cx);
+    assert_eq!(
+        editor
+            .read_with(cx, |editor, _| cell_image_ids(editor))
+            .len(),
+        1
+    );
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    let body = saved_body(&view, cx, &repository, &note);
+    assert_eq!(body.matches("<img").count(), 1, "{body}");
+}
+
+// Evernote dragdrop/plugin.ts takes the drop coordinate (posAtCoords): in
+// an open cell it is that cell's point; on a table whose cell is not open
+// there is no editable cell point here, so the drop is refused visibly.
+#[gpui::test]
+async fn drop_into_the_open_cell_goes_there_and_on_a_closed_cell_is_refused(
+    cx: &mut TestAppContext,
+) {
+    let (root, repository, note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    draw(cx);
+    // Where the cell's editing area is painted in the window.
+    let inside = view
+        .read_with(cx, |shell, _| {
+            shell.table_cell_editor.as_ref().unwrap().bounds.get()
+        })
+        .expect("painted")
+        .center();
+    let intent = view.update(cx, |shell, shell_cx| {
+        shell.capture_drop_intent_at(inside, shell_cx)
+    });
+    let intent = intent.expect("a cell point").expect("an intent");
+    let path = png_file(&root, "dropped.png");
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.complete_resource_drop_paths(vec![path.clone()], intent, window, shell_cx)
+        })
+    })
+    .unwrap();
+    draw(cx);
+    assert_eq!(
+        editor
+            .read_with(cx, |editor, _| cell_image_ids(editor))
+            .len(),
+        1
+    );
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    draw(cx);
+    let (_, bounds) = table_node(&view, cx);
+    // Dragged over the table, then dropped: refused, not put at the body
+    // caret.
+    view.update(cx, |shell, shell_cx| {
+        shell.record_drop_position(bounds.center(), shell_cx)
+    });
+    let on_table = view.update(cx, |shell, shell_cx| shell.take_drop_intent(shell_cx));
+    assert!(on_table.is_err(), "a closed cell is no drop target");
+    let body = saved_body(&view, cx, &repository, &note);
+    assert_eq!(body.matches("<img").count(), 1, "{body}");
+    assert!(body.starts_with("<p>前</p><table"), "{body}");
+}
+
+#[gpui::test]
+async fn encoded_image_and_foreign_fragment_with_its_file_paste_into_a_cell(
+    cx: &mut TestAppContext,
+) {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let (root, repository, note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 0);
+    let html = format!(
+        "<img src=\"data:image/png;base64,{}\">",
+        base64::engine::general_purpose::STANDARD.encode(png_bytes())
+    );
+    let intent = crate::native_editor::images::classify_clipboard(
+        crate::native_editor::images::ClipboardPayload {
+            html: Some(html),
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        intent,
+        crate::native_editor::images::PasteIntent::EncodedImage { .. }
+    ));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.paste_into_table_cell(intent, window, shell_cx)
+        })
+    });
+    draw(cx);
+    assert_eq!(
+        editor
+            .read_with(cx, |editor, _| cell_image_ids(editor))
+            .len(),
+        1,
+        "{}",
+        notice(&view, cx)
+    );
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    draw(cx);
+
+    // From another library, with the file its copy exported.
+    let bytes = png_bytes();
+    let foreign = "e".repeat(32);
+    let fragment = crate::native_editor::images::ClipboardFragment {
+        version: crate::native_editor::images::CLIPBOARD_FRAGMENT_VERSION,
+        html: format!("<p><img src=\":/{foreign}\" alt=\"\"></p>"),
+        plain: String::new(),
+        resources: vec![crate::native_editor::images::FragmentResource {
+            id: foreign.clone(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            title: "外库.png".into(),
+            mime: "image/png".into(),
+            file_extension: "png".into(),
+            size: bytes.len() as u64,
+            file: Some(png_file(&root, "exported.png")),
+        }],
+        open_start: true,
+        open_end: true,
+    };
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string_with_json_metadata(
+        String::new(),
+        fragment,
+    ));
+    cx.simulate_keystrokes("cmd-v");
+    draw(cx);
+    let imported = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("imported");
+    assert_ne!(imported, foreign, "imported under an id of this library");
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(!body.contains(&foreign), "{body}");
+    assert_eq!(body.matches("<img").count(), 2, "{body}");
+    assert!(
+        repository
+            .resource_metadata(&app_lite_core::ResourceId::new(imported.as_str()).unwrap())
+            .unwrap()
+            .is_some()
+    );
+}
+
+// Closed with "完成" while the commit runs: the image is then in the table
+// only, so a failed commit keeps it staged for the manual retry.
+#[gpui::test]
+async fn failed_commit_after_the_cell_closed_keeps_the_table_image_for_retry(
+    cx: &mut TestAppContext,
+) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    open_cell_at_end(&view, cx, 1, 1);
+    let release = view.update(cx, |shell, shell_cx| {
+        shell.stall_next_resource_commit_for_test(shell_cx)
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.fail_next_resource_commit_for_test("关闭后提交失败", shell_cx)
+    });
+    paste_png(cx);
+    cx.run_until_parked();
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    assert_eq!(open_cell(&view, cx), None);
+    release.send(()).unwrap();
+    draw(cx);
+    assert!(
+        notice(&view, cx).contains("手动同步可重试"),
+        "{}",
+        notice(&view, cx)
+    );
+    let in_table = main_cell_text(&view, cx, 1, 1);
+    let image = in_table
+        .iter()
+        .find_map(|inline| match inline {
+            app_lite_core::document::Inline::Image { resource_id, .. } => {
+                Some(resource_id.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .expect("still in the table");
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(
+        body.contains(&format!("<img src=\":/{image}\"")),
+        "the retry stores it: {body}"
+    );
+    assert!(
+        repository
+            .resource_metadata(&app_lite_core::ResourceId::new(image.as_str()).unwrap())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[gpui::test]
+async fn cell_text_is_not_written_into_a_cell_that_moved_under_it(cx: &mut TestAppContext) {
+    let table = "<table data-joplin-lite-table=\"true\"><tbody><tr><th>名</th><th>值</th></tr><tr><td></td><td></td></tr><tr><td></td><td></td></tr></tbody></table>";
+    let (_root, repository, note, view, cx) =
+        mount_body(cx, Arc::new(ManualSaveClock::default()), table);
+    let (node, _) = table_node(&view, cx);
+    let main = main_editor(&view, cx);
+    open_cell_at_end(&view, cx, 2, 1);
+    cx.update(|_, app| main.update(app, |editor, _| editor.insert_table_row(node, 1).unwrap()));
+    cx.simulate_input("字");
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |shell, _| shell
+            .table_cell_editor
+            .as_ref()
+            .unwrap()
+            .error
+            .clone())
+            .is_some_and(|error| error.contains("表格已在别处改变")),
+        "the cell says why its text was not written"
+    );
+    assert!(!main.read_with(cx, |editor, _| editor.document().blocks().iter().any(|block| matches!(&block.content, BlockContent::Table(table) if table.rows.iter().flatten().any(|text| text.contains("字"))))));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(!body.contains("字"), "{body}");
+}

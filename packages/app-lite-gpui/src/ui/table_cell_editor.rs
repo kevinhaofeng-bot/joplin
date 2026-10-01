@@ -36,9 +36,17 @@ pub(crate) struct TableCellEditor {
     original_inlines: Vec<Inline>,
     _observation: Subscription,
     needs_focus: bool,
-    error: Option<String>,
+    pub(crate) error: Option<String>,
     // Cleared when this cell closes, for resource inserts still in flight.
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Revision of the note's table block as this cell last wrote or read it:
+    // any other change to the table (rows added or removed) moves it on.
+    table_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    // Whether the cell had the keyboard focus at its last paint, which is
+    // where an image button or menu action means to insert.
+    focused: bool,
+    // Where the cell's editing area was painted, for drops.
+    pub(crate) bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
 }
 
 impl Drop for TableCellEditor {
@@ -48,6 +56,57 @@ impl Drop for TableCellEditor {
 }
 
 impl LibraryShell {
+    /// The open cell's caret (or `selection` in it) as a resource insert
+    /// target; None without an open cell.
+    pub(super) fn capture_cell_resource_insert_intent(
+        &mut self,
+        selection: Option<crate::native_editor::model::Selection>,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<InsertIntent, String>> {
+        let cell = self.table_cell_editor.as_ref()?;
+        let editor = cell.editor.clone();
+        let target = crate::app::note_session::CellTargetParts {
+            open: cell.open.clone(),
+            table_revision: cell.table_revision.clone(),
+            place: (cell.node_id, cell.row, cell.column),
+        };
+        let session = self.note_session.clone()?;
+        Some(
+            session
+                .update(cx, |session, session_cx| {
+                    session.capture_table_cell_resource_insert_intent(
+                        &editor, selection, target, session_cx,
+                    )
+                })
+                .map_err(|error| error.to_string()),
+        )
+    }
+
+    /// The open cell, if it had the keyboard focus at its last paint.
+    pub(super) fn focused_table_cell(&self) -> bool {
+        self.table_cell_editor
+            .as_ref()
+            .is_some_and(|cell| cell.focused)
+    }
+
+    /// The open cell's point under `position`, if the drop lands in it.
+    pub(super) fn table_cell_drop_point(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<Option<crate::native_editor::model::DocPoint>> {
+        let cell = self.table_cell_editor.as_ref()?;
+        if !cell
+            .bounds
+            .get()
+            .is_some_and(|bounds| bounds.contains(&position))
+        {
+            return None;
+        }
+        let editor = cell.editor.clone();
+        Some(editor.update(cx, |editor, _| editor.point_from_layout(position)))
+    }
+
     pub(super) fn table_cell_has_pending_input(&self, cx: &App) -> bool {
         self.table_cell_editor.as_ref().is_some_and(|cell| {
             cell.editor.read(cx).marked_text().is_some() || cell.error.is_some()
@@ -73,16 +132,30 @@ impl LibraryShell {
                 .and_then(|document| table_cell_inlines(&document))
         })?;
         let (node_id, row, column) = (cell.node_id, cell.row, cell.column);
+        let table_revision = cell.table_revision.clone();
         let session = self.note_session.as_ref().ok_or("单元格所属笔记已经关闭")?;
         let main = session.read(cx).editor().clone();
         main.update(cx, |editor, editor_cx| {
-            let current = editor.document().block(node_id).and_then(|block| match &block.content {
+            let block = editor.document().block(node_id);
+            let current = block.and_then(|block| match &block.content {
                 BlockContent::Table(table) => table.cell_inlines(row, column),
                 _ => None,
             });
             if current == Some(inlines.as_slice()) { return Ok(()); }
+            // Rows added or removed elsewhere: these coordinates may name
+            // another cell now, so this cell's text is not written there.
+            if block.map(|block| block.revision)
+                != Some(table_revision.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return Err(
+                    "表格已在别处改变，单元格内容未写入；请按 Esc 放弃后重新打开".to_owned(),
+                );
+            }
             editor.set_table_cell(node_id, row, column, inlines)
                 .map_err(|error| error.to_string())?;
+            if let Some(block) = editor.document().block(node_id) {
+                table_revision.store(block.revision, std::sync::atomic::Ordering::Release);
+            }
             editor_cx.notify();
             Ok(())
         })
@@ -104,13 +177,11 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((editor, open, place)) = self.table_cell_editor.as_ref().map(|cell| {
-            (
-                cell.editor.clone(),
-                cell.open.clone(),
-                (cell.node_id, cell.row, cell.column),
-            )
-        }) else {
+        let Some(editor) = self
+            .table_cell_editor
+            .as_ref()
+            .map(|cell| cell.editor.clone())
+        else {
             return;
         };
         let (request, temporary_paths) = match intent {
@@ -136,20 +207,17 @@ impl LibraryShell {
                 return;
             }
         };
-        let Some(session) = self.note_session.clone() else {
-            cleanup_owned_temporary_paths(&temporary_paths);
-            return;
-        };
-        let captured = session.update(cx, |session, session_cx| {
-            session.capture_table_cell_resource_insert_intent(&editor, open, place, session_cx)
-        });
+        let captured = self
+            .capture_cell_resource_insert_intent(None, cx)
+            .ok_or_else(|| "单元格已关闭".to_owned())
+            .and_then(|captured| captured);
         let result = match captured {
             Ok(intent) => {
                 self.complete_resource_request(request, intent, temporary_paths, window, cx)
             }
             Err(error) => {
                 cleanup_owned_temporary_paths(&temporary_paths);
-                Err(error.to_string())
+                Err(error)
             }
         };
         if let Err(error) = result {
@@ -267,14 +335,15 @@ impl LibraryShell {
         };
         let main = session.read(cx).editor().clone();
         let inlines = main.read_with(cx, |editor, _| {
-            match &editor.document().block(node_id)?.content {
-                BlockContent::Table(table) => {
-                    table.cell_inlines(row, column).map(<[Inline]>::to_vec)
-                }
+            let block = editor.document().block(node_id)?;
+            match &block.content {
+                BlockContent::Table(table) => table
+                    .cell_inlines(row, column)
+                    .map(|inlines| (inlines.to_vec(), block.revision)),
                 _ => None,
             }
         });
-        let Some(inlines) = inlines else {
+        let Some((inlines, revision)) = inlines else {
             return;
         };
         let original_inlines = inlines.clone();
@@ -335,6 +404,9 @@ impl LibraryShell {
             needs_focus: true,
             error: None,
             open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            table_revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision)),
+            focused: false,
+            bounds: Default::default(),
         });
         cx.notify();
     }
@@ -510,6 +582,8 @@ impl LibraryShell {
             cell.needs_focus = false;
             crate::native_editor::surface::focus_editor(&cell.editor, window, cx);
         }
+        cell.focused = cell.editor.read(cx).focus_handle().is_focused(window);
+        let bounds = cell.bounds.clone();
         let title = format!(
             "编辑单元格（第 {} 行，第 {} 列）",
             cell.row + 1,
@@ -553,7 +627,19 @@ impl LibraryShell {
                         .text_color(rgba(0x536f59ff))
                         .child(title),
                 )
-                .child(div().h(px(160.0)).w_full().child(surface))
+                .can_drop(|dragged, _window, _cx| dragged.is::<ExternalPaths>())
+                .on_drag_move::<ExternalPaths>(cx.listener(Self::on_external_paths_drag_move))
+                .on_drop::<ExternalPaths>(cx.listener(Self::on_external_paths_drop))
+                .child(
+                    div().h(px(160.0)).w_full().relative().child(surface).child(
+                        gpui::canvas(
+                            move |area, _window, _cx| bounds.set(Some(area)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    ),
+                )
                 .children(error.map(|message| {
                     div()
                         .text_size(px(11.0))

@@ -295,6 +295,7 @@ pub(crate) struct InsertIntent {
 pub(crate) struct CellInsertTarget {
     editor: gpui::WeakEntity<EditorCore>,
     open: Arc<std::sync::atomic::AtomicBool>,
+    table_revision: Arc<std::sync::atomic::AtomicU64>,
     node_id: NodeId,
     row: usize,
     column: usize,
@@ -304,13 +305,38 @@ impl PartialEq for CellInsertTarget {
     fn eq(&self, other: &Self) -> bool {
         self.editor == other.editor
             && Arc::ptr_eq(&self.open, &other.open)
+            && Arc::ptr_eq(&self.table_revision, &other.table_revision)
             && (self.node_id, self.row, self.column) == (other.node_id, other.row, other.column)
     }
 }
 
 impl Eq for CellInsertTarget {}
 
+/// What the shell's open cell lends a resource insert: its open token, its
+/// table revision and its place.
+pub(crate) struct CellTargetParts {
+    pub(crate) open: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) table_revision: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) place: (NodeId, usize, usize),
+}
+
 impl CellInsertTarget {
+    /// The table changed since the cell last wrote or read it.
+    fn table_moved(&self, document: &Document) -> bool {
+        document.block(self.node_id).map(|block| block.revision)
+            != Some(
+                self.table_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+    }
+
+    fn sync_table_revision(&self, document: &Document) {
+        if let Some(block) = document.block(self.node_id) {
+            self.table_revision
+                .store(block.revision, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     fn live_editor(&self) -> Option<Entity<EditorCore>> {
         self.open
             .load(std::sync::atomic::Ordering::Acquire)
@@ -2427,19 +2453,24 @@ impl NoteSession {
     pub(crate) fn capture_table_cell_resource_insert_intent(
         &mut self,
         cell_editor: &Entity<EditorCore>,
-        open: Arc<std::sync::atomic::AtomicBool>,
-        (node_id, row, column): (NodeId, usize, usize),
+        selection: Option<Selection>,
+        CellTargetParts {
+            open,
+            table_revision,
+            place: (node_id, row, column),
+        }: CellTargetParts,
         cx: &mut Context<Self>,
     ) -> Result<InsertIntent, SaveError> {
         let anchor = cell_editor
             .update(cx, |editor, _| {
-                editor.capture_resource_insert_anchor(editor.selection())
+                editor.capture_resource_insert_anchor(selection.unwrap_or(editor.selection()))
             })
             .map_err(|error| SaveError::new(error.to_string()))?;
         let mut intent = InsertIntent::new(self.note_id.clone(), anchor);
         intent.cell = Some(CellInsertTarget {
             editor: cell_editor.downgrade(),
             open,
+            table_revision,
             node_id,
             row,
             column,
@@ -2693,6 +2724,7 @@ impl NoteSession {
                 .map_err(|error| SaveError::new(error.to_string()))?
         };
         self.resource_commit_cell = intent.cell;
+        let cell_target = self.resource_commit_cell.clone();
         // Apply the validated structural transaction *before* the worker
         // leaves the UI thread.  This deliberately gives normal typing the
         // live, post-resource document to mutate while SQLite is busy.  The
@@ -2717,6 +2749,11 @@ impl NoteSession {
         let staged_size = staged.staged.size() as u64;
         let initial_presentation_warning = self.editor.update(cx, |editor, editor_cx| {
             editor.install_prepared_durable_commit(prepared_editor_commit);
+            // The table now holds the cell's new content: that is this
+            // cell's own change, not a move.
+            if let Some(target) = cell_target.as_ref() {
+                target.sync_table_revision(editor.document());
+            }
             let registration = match kind {
                 ResourceKind::Image { natural_size, .. } => {
                     // The source will be streamed into the session-private
@@ -2778,9 +2815,13 @@ impl NoteSession {
         let Some(cell_editor) = target.live_editor() else {
             return Err(SaveError::new("单元格已关闭，图片未插入"));
         };
-        // The note's cell at these coordinates must still be this editor's
-        // cell: a row removed above it keeps the coordinates valid but
-        // points them at another cell.
+        // The table must not have changed but through this cell: a row added
+        // or removed above it keeps the coordinates valid (and an identical
+        // cell may sit there) while they name another cell.
+        if target.table_moved(self.editor.read(cx).document()) {
+            return Err(SaveError::new("单元格已移动或改变，图片未插入"));
+        }
+        // And the note's cell holds what the cell editor shows.
         let current = cell_editor
             .read(cx)
             .table_cell_inlines(&self.resource_ids)
@@ -2885,11 +2926,13 @@ impl NoteSession {
             return false;
         };
         self.editor.update(cx, |editor, editor_cx| {
-            let synced = editor
-                .set_table_cell(target.node_id, target.row, target.column, inlines)
-                .is_ok();
+            let synced = !target.table_moved(editor.document())
+                && editor
+                    .set_table_cell(target.node_id, target.row, target.column, inlines)
+                    .is_ok();
             if synced {
                 editor.forget_table_resource(resource_id.as_str());
+                target.sync_table_revision(editor.document());
             }
             editor_cx.notify();
             synced
