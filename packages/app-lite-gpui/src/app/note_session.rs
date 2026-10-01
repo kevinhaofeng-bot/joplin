@@ -284,6 +284,39 @@ pub(crate) struct InsertIntent {
     note_id: NoteId,
     anchor: ResourceInsertAnchor,
     editor_revision: u64,
+    // Set when the anchor is in an open table cell's editor, not the body.
+    cell: Option<CellInsertTarget>,
+}
+
+/// The cell a resource was asked for: its editor, whether that editor is
+/// still the shell's open cell (cleared when the cell closes, even if the
+/// entity lives on), and its place in the note's table.
+#[derive(Clone, Debug)]
+pub(crate) struct CellInsertTarget {
+    editor: gpui::WeakEntity<EditorCore>,
+    open: Arc<std::sync::atomic::AtomicBool>,
+    node_id: NodeId,
+    row: usize,
+    column: usize,
+}
+
+impl PartialEq for CellInsertTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.editor == other.editor
+            && Arc::ptr_eq(&self.open, &other.open)
+            && (self.node_id, self.row, self.column) == (other.node_id, other.row, other.column)
+    }
+}
+
+impl Eq for CellInsertTarget {}
+
+impl CellInsertTarget {
+    fn live_editor(&self) -> Option<Entity<EditorCore>> {
+        self.open
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| self.editor.upgrade())
+            .flatten()
+    }
 }
 
 impl InsertIntent {
@@ -292,6 +325,7 @@ impl InsertIntent {
             note_id,
             editor_revision: anchor.captured_revision(),
             anchor,
+            cell: None,
         }
     }
 
@@ -1826,6 +1860,10 @@ pub(crate) struct NoteSession {
     /// weak callbacks without ever retaining a stale window.
     _resource_stage_task: Option<Task<()>>,
     _resource_commit_task: Option<Task<()>>,
+    // The cell editor the resource in flight was inserted into, if any.
+    resource_commit_cell: Option<CellInsertTarget>,
+    // The resource whose note snapshot is being written.
+    committing_resource: Option<ResourceId>,
     /// Exactly one verified persisted-image materialization runs at a time.
     /// Requests originate from `EditorCore`'s visible/prefetch queue, never
     /// from note preparation or list projection.
@@ -2149,6 +2187,8 @@ impl NoteSession {
             _save_task: None,
             _resource_stage_task: None,
             _resource_commit_task: None,
+            resource_commit_cell: None,
+            committing_resource: None,
             _image_hydration_task: None,
             persisted_image_hydration,
             pending_image_hydration: VecDeque::new(),
@@ -2378,12 +2418,49 @@ impl NoteSession {
         Ok(InsertIntent::new(self.note_id.clone(), anchor))
     }
 
+    pub(crate) fn resource_allowlist(&self) -> &[ResourceId] {
+        &self.resource_ids
+    }
+
+    /// Capture the caret of an open table cell editor for a resource that
+    /// is still to be read and staged.
+    pub(crate) fn capture_table_cell_resource_insert_intent(
+        &mut self,
+        cell_editor: &Entity<EditorCore>,
+        open: Arc<std::sync::atomic::AtomicBool>,
+        (node_id, row, column): (NodeId, usize, usize),
+        cx: &mut Context<Self>,
+    ) -> Result<InsertIntent, SaveError> {
+        let anchor = cell_editor
+            .update(cx, |editor, _| {
+                editor.capture_resource_insert_anchor(editor.selection())
+            })
+            .map_err(|error| SaveError::new(error.to_string()))?;
+        let mut intent = InsertIntent::new(self.note_id.clone(), anchor);
+        intent.cell = Some(CellInsertTarget {
+            editor: cell_editor.downgrade(),
+            open,
+            node_id,
+            row,
+            column,
+        });
+        Ok(intent)
+    }
+
     pub(crate) fn discard_resource_insert_intent(
         &mut self,
         intent: InsertIntent,
         cx: &mut Context<Self>,
     ) {
         if !intent.belongs_to(&self.note_id) {
+            return;
+        }
+        if let Some(target) = intent.cell {
+            if let Some(cell_editor) = target.live_editor() {
+                cell_editor.update(cx, |editor, _| {
+                    editor.discard_resource_insert_anchor(intent.anchor);
+                });
+            }
             return;
         }
         self.editor.update(cx, |editor, _| {
@@ -2568,8 +2645,14 @@ impl NoteSession {
                 "资源插入意图不属于当前笔记；请重新选择插入位置",
             ));
         }
+        let cell_composing = intent
+            .cell
+            .as_ref()
+            .and_then(CellInsertTarget::live_editor)
+            .is_some_and(|cell_editor| cell_editor.read(cx).marked_text().is_some());
         if self.title.read(cx).marked_range().is_some()
             || self.editor.read(cx).marked_text().is_some()
+            || cell_composing
         {
             return Err(SaveError::new("输入法组合文本尚未确认，无法插入资源"));
         }
@@ -2582,30 +2665,34 @@ impl NoteSession {
         }
 
         let resource_id = staged.staged.resource_id().clone();
-        let selection = self
-            .editor
-            .update(cx, |editor, _| {
-                editor.resolve_resource_insert_anchor(intent.anchor)
-            })
-            .map_err(|error| SaveError::new(error.to_string()))?;
-        let transaction = match staged.kind {
-            ResourceKind::Image { natural_size, .. } => Transaction::InsertImage {
-                selection,
-                resource_id: resource_id.as_str().to_owned(),
-                natural_size,
-            },
-            ResourceKind::Attachment => Transaction::InsertAttachment {
-                selection,
-                resource_id: resource_id.as_str().to_owned(),
-                filename: staged.staged.title().to_owned(),
-                media_type: staged.staged.mime().to_owned(),
-            },
+        let prepared_editor_commit = if let Some(target) = intent.cell.clone() {
+            self.prepare_cell_resource_insert(&staged, intent.anchor, &target, cx)?
+        } else {
+            let selection = self
+                .editor
+                .update(cx, |editor, _| {
+                    editor.resolve_resource_insert_anchor(intent.anchor)
+                })
+                .map_err(|error| SaveError::new(error.to_string()))?;
+            let transaction = match staged.kind {
+                ResourceKind::Image { natural_size, .. } => Transaction::InsertImage {
+                    selection,
+                    resource_id: resource_id.as_str().to_owned(),
+                    natural_size,
+                },
+                ResourceKind::Attachment => Transaction::InsertAttachment {
+                    selection,
+                    resource_id: resource_id.as_str().to_owned(),
+                    filename: staged.staged.title().to_owned(),
+                    media_type: staged.staged.mime().to_owned(),
+                },
+            };
+            self.editor
+                .read(cx)
+                .prepare_durable_transaction(transaction)
+                .map_err(|error| SaveError::new(error.to_string()))?
         };
-        let prepared_editor_commit = self
-            .editor
-            .read(cx)
-            .prepare_durable_transaction(transaction)
-            .map_err(|error| SaveError::new(error.to_string()))?;
+        self.resource_commit_cell = intent.cell;
         // Apply the validated structural transaction *before* the worker
         // leaves the UI thread.  This deliberately gives normal typing the
         // live, post-resource document to mutate while SQLite is busy.  The
@@ -2674,7 +2761,143 @@ impl NoteSession {
         Ok(())
     }
 
+    /// resource.ts insertResourceAtPosition for a table cell: the image goes
+    /// into the open cell's editor at its tracked caret (one undo step there),
+    /// and the note's table takes the cell's new content in the prepared
+    /// body commit that the resource snapshot carries.
+    fn prepare_cell_resource_insert(
+        &mut self,
+        staged: &StagedResourceInsert,
+        anchor: ResourceInsertAnchor,
+        target: &CellInsertTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<crate::native_editor::core::PreparedEditorCommit, SaveError> {
+        let ResourceKind::Image { natural_size, .. } = staged.kind else {
+            return Err(SaveError::new("单元格中只能插入图片；附件请插入正文"));
+        };
+        let Some(cell_editor) = target.live_editor() else {
+            return Err(SaveError::new("单元格已关闭，图片未插入"));
+        };
+        // The note's cell at these coordinates must still be this editor's
+        // cell: a row removed above it keeps the coordinates valid but
+        // points them at another cell.
+        let current = cell_editor
+            .read(cx)
+            .table_cell_inlines(&self.resource_ids)
+            .map_err(SaveError::new)?;
+        let in_note = self
+            .editor
+            .read(cx)
+            .document()
+            .block(target.node_id)
+            .and_then(|block| match &block.content {
+                BlockContent::Table(table) => table
+                    .cell_inlines(target.row, target.column)
+                    .map(<[Inline]>::to_vec),
+                _ => None,
+            });
+        if in_note.as_ref() != Some(&current) {
+            return Err(SaveError::new("单元格已移动或改变，图片未插入"));
+        }
+        let resource_id = staged.staged.resource_id().as_str().to_owned();
+        // Published before the cell changes: the shell's observer persists
+        // the cell draft with this allowlist.
+        let previous_allowlist = self.resource_ids.clone();
+        extend_resource_allowlist(
+            &mut self.resource_ids,
+            std::slice::from_ref(staged.staged.resource_id()),
+        );
+        let allowed = self.resource_ids.clone();
+        let inserted = cell_editor.update(cx, |editor, editor_cx| {
+            let selection = editor.resolve_resource_insert_anchor(anchor)?;
+            let prepared = editor.prepare_durable_transaction(Transaction::InsertImage {
+                selection,
+                resource_id: resource_id.clone(),
+                natural_size,
+            })?;
+            editor.install_prepared_durable_commit(prepared);
+            let _ = editor.register_unavailable_image(&resource_id, natural_size);
+            editor_cx.notify();
+            Ok::<_, crate::native_editor::model::DocumentError>(())
+        });
+        if let Err(error) = inserted {
+            self.resource_ids = previous_allowlist;
+            return Err(SaveError::new(error.to_string()));
+        }
+        let table = cell_editor
+            .read(cx)
+            .table_cell_inlines(&allowed)
+            .and_then(|inlines| {
+                self.editor.read(cx).table_with_cell(
+                    target.node_id,
+                    target.row,
+                    target.column,
+                    inlines,
+                )
+            });
+        let prepared = table.and_then(|table| {
+            self.editor
+                .read(cx)
+                .prepare_durable_transaction(Transaction::ReplaceTable {
+                    node_id: target.node_id,
+                    table: Arc::new(table),
+                })
+                .map_err(|error| error.to_string())
+        });
+        prepared.map_err(|error| {
+            cell_editor.update(cx, |editor, editor_cx| {
+                let _ = editor.rollback_failed_optimistic_resource(&resource_id);
+                editor_cx.notify();
+            });
+            self.resource_ids = previous_allowlist;
+            SaveError::new(format!("图片未插入单元格：{error}"))
+        })
+    }
+
+    /// Takes a failed image out of the cell it went into, keeping what was
+    /// typed after it, and gives the note's table the same cell content with
+    /// its history forgetting the image. A cell closed meanwhile is left to
+    /// the body's fail-closed retry: its image is then in the table only.
+    fn rollback_cell_resource(
+        &mut self,
+        target: &CellInsertTarget,
+        resource_id: &ResourceId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(cell_editor) = target.live_editor() else {
+            return false;
+        };
+        let rolled_back = cell_editor.update(cx, |editor, editor_cx| {
+            let result = editor.rollback_failed_optimistic_resource(resource_id.as_str());
+            editor_cx.notify();
+            result
+        });
+        if !matches!(rolled_back, Ok(true)) {
+            return false;
+        }
+        let allowed: Vec<_> = self
+            .resource_ids
+            .iter()
+            .filter(|id| *id != resource_id)
+            .cloned()
+            .collect();
+        let Ok(inlines) = cell_editor.read(cx).table_cell_inlines(&allowed) else {
+            return false;
+        };
+        self.editor.update(cx, |editor, editor_cx| {
+            let synced = editor
+                .set_table_cell(target.node_id, target.row, target.column, inlines)
+                .is_ok();
+            if synced {
+                editor.forget_table_resource(resource_id.as_str());
+            }
+            editor_cx.notify();
+            synced
+        })
+    }
+
     fn spawn_resource_commit(&mut self, job: ResourceCommitJob, cx: &mut Context<Self>) {
+        self.committing_resource = Some(job.staged.staged.resource_id().clone());
         let task = cx
             .background_executor()
             .spawn(async move { Self::perform_resource_commit_on_worker(job).await });
@@ -2797,6 +3020,7 @@ impl NoteSession {
     }
 
     fn finish_resource_commit(&mut self, result: ResourceCommitCompletion, cx: &mut Context<Self>) {
+        self.committing_resource = None;
         let outcome = match result {
             ResourceCommitCompletion::Success(success) => {
                 let ResourceCommitSuccess {
@@ -2810,6 +3034,30 @@ impl NoteSession {
                 } = success;
                 let note = committed.note;
                 let selected_thumbnail_id = committed.selected_thumbnail_id;
+                if let (
+                    Some(cell_editor),
+                    ResourceKind::Image {
+                        format,
+                        natural_size,
+                    },
+                    Ok(Some(source)),
+                ) = (
+                    self.resource_commit_cell
+                        .take()
+                        .and_then(|target| target.live_editor()),
+                    kind,
+                    materialized_image_source.as_ref(),
+                ) {
+                    cell_editor.update(cx, |editor, editor_cx| {
+                        let _ = editor.register_materialized_durable_image(
+                            resource_id.as_str(),
+                            natural_size,
+                            source.clone(),
+                            format,
+                        );
+                        editor_cx.notify();
+                    });
+                }
                 let presentation_warning = self.editor.update(cx, |editor, editor_cx| {
                     let registration = match kind {
                         ResourceKind::Image {
@@ -2907,6 +3155,13 @@ impl NoteSession {
             }
             ResourceCommitCompletion::Failure { staged, error } => {
                 let resource_id = staged.staged.resource_id().clone();
+                if let Some(target) = self.resource_commit_cell.take()
+                    && !self.rollback_cell_resource(&target, &resource_id, cx)
+                {
+                    // Kept for the retry, which then shows the image in the
+                    // cell as well as in the note's table.
+                    self.resource_commit_cell = Some(target);
+                }
                 let rollback = self
                     .editor
                     .update(cx, |editor, editor_cx| {
@@ -2980,18 +3235,9 @@ impl NoteSession {
         let resource_is_live = self
             .editor
             .read(cx)
-            .document()
-            .blocks()
-            .iter()
-            .any(|block| {
-                matches!(
-                    &block.content,
-                    BlockContent::Image { resource_id: id, .. }
-                        | BlockContent::Attachment { resource_id: id, .. }
-                        if id == resource_id.as_str()
-                )
-            });
+            .references_resource(resource_id.as_str());
         if !resource_is_live {
+            self.resource_commit_cell = None;
             // The user explicitly removed the optimistic node before retrying.
             // Do not write its staged metadata or leave a phantom relation in
             // a later ordinary snapshot. Transfer the lifecycle request to an
@@ -3522,6 +3768,25 @@ impl NoteSession {
         cx: &mut Context<Self>,
     ) -> Result<PasteOutcome, SaveError> {
         self.ensure_pasteable(cx)?;
+        let (html, available, unavailable) = self.fragment_resources(fragment)?;
+        self.paste_canonical_html(
+            &html,
+            available,
+            unavailable,
+            &[],
+            (fragment.open_start, fragment.open_end),
+            cx,
+        )
+    }
+
+    /// A copied fragment's resources as this library has them: the same
+    /// verified bytes are used as they are, others are imported from the
+    /// file the copy exported, and the rest are unavailable (an id alone
+    /// is never taken over). Returns the HTML pointing at the ids here.
+    pub(crate) fn fragment_resources(
+        &mut self,
+        fragment: &ClipboardFragment,
+    ) -> Result<(String, Vec<ResourceId>, Vec<ResourceId>), SaveError> {
         let mut html = fragment.html.clone();
         let mut available = Vec::new();
         let mut unavailable = Vec::new();
@@ -3550,14 +3815,13 @@ impl NoteSession {
                 None => unavailable.push(id),
             }
         }
-        self.paste_canonical_html(
-            &html,
-            available,
-            unavailable,
-            &[],
-            (fragment.open_start, fragment.open_end),
-            cx,
-        )
+        Ok((html, available, unavailable))
+    }
+
+    /// Publish resources a cell paste is about to reference, before the
+    /// cell changes and its draft is persisted.
+    pub(crate) fn allow_resources(&mut self, ids: &[ResourceId]) {
+        extend_resource_allowlist(&mut self.resource_ids, ids);
     }
 
     /// HTML from another app lands at the caret now, in one undo step.
@@ -4010,6 +4274,14 @@ impl NoteSession {
             } else if let Some(id) = ResourceId::new(&resource_id)
                 .ok()
                 .filter(|id| self.resource_ids.contains(id))
+                // A cell image still being stored is not in the library yet.
+                .filter(|id| {
+                    self.committing_resource.as_ref() != Some(id)
+                        && self
+                            .pending_failed_resource_commit
+                            .as_ref()
+                            .is_none_or(|staged| staged.staged.resource_id() != id)
+                })
                 .filter(|id| {
                     // Only tables need descriptor discovery here. A normal
                     // image may still be an optimistic, uncommitted import;

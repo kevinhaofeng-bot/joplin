@@ -569,6 +569,82 @@ pub fn export_canonical(document: &Document) -> Result<CanonicalDocument, Canoni
     export_canonical_with_resources(document, None)
 }
 
+/// Cell content is inline only: paragraphs join with line breaks, images
+/// stay images, anything block-shaped is refused rather than flattened.
+pub(crate) fn table_cell_inlines(document: &CanonicalDocument) -> Result<Vec<Inline>, String> {
+    let mut out = Vec::new();
+    for block in document.blocks() {
+        let inlines = match block {
+            CanonicalBlock::Paragraph { inlines, .. }
+            | CanonicalBlock::Heading { inlines, .. }
+            | CanonicalBlock::Quote { inlines, .. }
+            | CanonicalBlock::Code { inlines, .. } => inlines.clone(),
+            CanonicalBlock::Image {
+                resource_id,
+                alt,
+                presentation,
+                link,
+            } => vec![Inline::Image {
+                resource_id: resource_id.clone(),
+                alt: alt.clone(),
+                display_width: presentation.display_width,
+                link: link.clone(),
+            }],
+            _ => return Err("单元格只能包含文字、链接和图片。".into()),
+        };
+        if !out.is_empty() {
+            out.push(Inline::SoftBreak);
+        }
+        out.extend(inlines);
+    }
+    Ok(out)
+}
+
+/// The inverse of [`table_cell_inlines`], so that opening a cell and saving
+/// it again changes nothing: line-separated parts, where a part that is just
+/// one image is that image's block (as an image inserted into the cell is)
+/// and the other parts stay paragraphs.
+pub(crate) fn table_cell_blocks(inlines: &[Inline]) -> Vec<CanonicalBlock> {
+    let paragraph = |inlines: Vec<Inline>| CanonicalBlock::Paragraph {
+        style: BlockStyle::default(),
+        inlines,
+    };
+    let mut blocks = Vec::new();
+    let mut text: Option<Vec<Inline>> = None;
+    for part in inlines.split(|inline| matches!(inline, Inline::SoftBreak)) {
+        if let [
+            Inline::Image {
+                resource_id,
+                alt,
+                display_width,
+                link,
+            },
+        ] = part
+        {
+            blocks.extend(text.take().map(paragraph));
+            blocks.push(CanonicalBlock::Image {
+                resource_id: resource_id.clone(),
+                alt: alt.clone(),
+                presentation: ImagePresentation {
+                    natural_size: None,
+                    display_width: *display_width,
+                },
+                link: link.clone(),
+            });
+        } else if let Some(line) = text.as_mut() {
+            line.push(Inline::SoftBreak);
+            line.extend(part.iter().cloned());
+        } else {
+            text = Some(part.to_vec());
+        }
+    }
+    blocks.extend(text.map(paragraph));
+    if blocks.is_empty() {
+        blocks.push(paragraph(Vec::new()));
+    }
+    blocks
+}
+
 /// Strict exporter used by a note session.  `None` keeps the pure codec
 /// useful to native-editor tests; a real session always supplies its durable
 /// note-resource relation and therefore fails closed before SQLite writes.

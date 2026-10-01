@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use super::model::{Document, DocumentError, Selection};
+use super::model::{BlockContent, Document, DocumentError, Selection};
 use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
 
 #[derive(Clone, Debug)]
@@ -391,6 +391,36 @@ impl History {
     /// redo is preferable to later recreating an undurable resource atom.
     pub(crate) fn discard_redo(&mut self) {
         self.clear_redo();
+    }
+
+    /// Every table step is a whole-table snapshot; dropping a resource from
+    /// all of them leaves undo and redo as if it had never been inserted.
+    pub(crate) fn forget_table_resource(&mut self, resource_id: &str) {
+        let transactions = self
+            .undo
+            .iter_mut()
+            .chain(self.redo.iter_mut())
+            .flat_map(|entry| entry.inverse.0.iter_mut().chain(entry.forward.0.iter_mut()));
+        for transaction in transactions {
+            match transaction {
+                Transaction::ReplaceTable { table, .. } => {
+                    if let Some(stripped) = table.without_resource(resource_id) {
+                        *table = std::sync::Arc::new(stripped);
+                    }
+                }
+                // A table step's inverse restores the whole table block.
+                Transaction::RestoreBlocks { blocks, .. } => {
+                    for block in blocks {
+                        if let BlockContent::Table(table) = &mut block.content
+                            && let Some(stripped) = table.without_resource(resource_id)
+                        {
+                            *table = std::sync::Arc::new(stripped);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn len(&self) -> usize {

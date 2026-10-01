@@ -1635,6 +1635,56 @@ impl EditorCore {
 
     /// Whether an image of the note shows `resource_id`: an image block or
     /// an image in a table cell.
+    /// Whether the document holds `resource_id` anywhere: an image or file
+    /// block, or an image in a table cell.
+    pub(crate) fn references_resource(&self, resource_id: &str) -> bool {
+        self.shows_image(resource_id)
+            || self.document.blocks().iter().any(|block| {
+                matches!(
+                    &block.content,
+                    BlockContent::Attachment { resource_id: id, .. } if id == resource_id
+                )
+            })
+    }
+
+    /// This (cell) editor's content as table cell inlines.
+    pub(crate) fn table_cell_inlines(
+        &self,
+        allowed: &[app_lite_core::ResourceId],
+    ) -> Result<Vec<app_lite_core::document::Inline>, String> {
+        super::codec::export_canonical_with_resources(&self.document, Some(allowed))
+            .map_err(|error| error.to_string())
+            .and_then(|document| super::codec::table_cell_inlines(&document))
+    }
+
+    /// The table `node_id` with one cell's content replaced.
+    pub(crate) fn table_with_cell(
+        &self,
+        node_id: NodeId,
+        row: usize,
+        column: usize,
+        inlines: Vec<app_lite_core::document::Inline>,
+    ) -> Result<super::model::TableContent, String> {
+        let Some(BlockContent::Table(table)) =
+            self.document.block(node_id).map(|block| &block.content)
+        else {
+            return Err("表格已不在笔记中".into());
+        };
+        table
+            .edited(|rows| {
+                let Some(cell) = rows.get_mut(row).and_then(|row| row.cells.get_mut(column)) else {
+                    return false;
+                };
+                cell.inlines = inlines;
+                true
+            })
+            .ok_or_else(|| "单元格已不在表格中".into())
+    }
+
+    pub(crate) fn forget_table_resource(&mut self, resource_id: &str) {
+        self.history.forget_table_resource(resource_id);
+    }
+
     pub(crate) fn shows_image(&self, resource_id: &str) -> bool {
         self.document
             .blocks()
@@ -3087,14 +3137,9 @@ impl EditorCore {
         resource_id: &str,
     ) -> Result<bool, DocumentError> {
         self.ensure_editable()?;
-        let resource_is_live = self.document.blocks().iter().any(|block| {
-            matches!(
-                &block.content,
-                BlockContent::Image { resource_id: id, .. }
-                    | BlockContent::Attachment { resource_id: id, .. }
-                    if id == resource_id
-            )
-        });
+        // A table cell image has no InsertImage entry to undo here; it is
+        // live all the same and must not be reported as already removed.
+        let resource_is_live = self.references_resource(resource_id);
         if !resource_is_live {
             // A person may already have undone/deleted the atom before its
             // background worker reports. Never leave its redo entry capable

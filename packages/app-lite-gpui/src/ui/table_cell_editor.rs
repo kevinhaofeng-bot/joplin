@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::native_editor::codec::{
-    export_canonical_with_resources, import_canonical_with_resources,
+    export_canonical_with_resources, import_canonical_with_resources, table_cell_inlines,
 };
 use crate::native_editor::core::EditorCore;
 use crate::native_editor::model::BlockContent;
@@ -24,6 +24,8 @@ pub(crate) enum TableStructureChange {
     DeleteColumn,
 }
 
+const CELL_IMAGE_CACHE_BUDGET: usize = 16 * 1024 * 1024;
+
 pub(crate) struct TableCellEditor {
     pub(crate) node_id: crate::native_editor::model::NodeId,
     pub(crate) row: usize,
@@ -35,37 +37,14 @@ pub(crate) struct TableCellEditor {
     _observation: Subscription,
     needs_focus: bool,
     error: Option<String>,
+    // Cleared when this cell closes, for resource inserts still in flight.
+    open: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Cell content is inline only: paragraphs join with line breaks, images
-/// stay images, anything block-shaped is refused rather than flattened.
-fn cell_inlines(document: &CanonicalDocument) -> Result<Vec<Inline>, String> {
-    let mut out = Vec::new();
-    for block in document.blocks() {
-        let inlines = match block {
-            CanonicalBlock::Paragraph { inlines, .. }
-            | CanonicalBlock::Heading { inlines, .. }
-            | CanonicalBlock::Quote { inlines, .. }
-            | CanonicalBlock::Code { inlines, .. } => inlines.clone(),
-            CanonicalBlock::Image {
-                resource_id,
-                alt,
-                presentation,
-                link,
-            } => vec![Inline::Image {
-                resource_id: resource_id.clone(),
-                alt: alt.clone(),
-                display_width: presentation.display_width,
-                link: link.clone(),
-            }],
-            _ => return Err("单元格只能包含文字、链接和图片。".into()),
-        };
-        if !out.is_empty() {
-            out.push(Inline::SoftBreak);
-        }
-        out.extend(inlines);
+impl Drop for TableCellEditor {
+    fn drop(&mut self) {
+        self.open.store(false, std::sync::atomic::Ordering::Release);
     }
-    Ok(out)
 }
 
 impl LibraryShell {
@@ -79,13 +58,19 @@ impl LibraryShell {
     /// without closing the cell or stealing its keyboard focus.
     pub(super) fn persist_table_cell_draft(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let Some(cell) = self.table_cell_editor.as_ref() else { return Ok(()); };
+        // The note's allowlist carries resources the cell gained since it
+        // opened (a pasted image), published before the cell changed.
+        let mut allowed = cell.resources.clone();
+        if let Some(session) = self.note_session.as_ref() {
+            allowed.extend(session.read(cx).resource_allowlist().iter().cloned());
+        }
         let inlines = cell.editor.read_with(cx, |editor, _| {
             if editor.marked_text().is_some() {
                 return Err("单元格中仍有未确认的输入法组合文本，请先确认或取消输入".into());
             }
-            export_canonical_with_resources(editor.document(), Some(&cell.resources))
+            export_canonical_with_resources(editor.document(), Some(&allowed))
                 .map_err(|error| error.to_string())
-                .and_then(|document| cell_inlines(&document))
+                .and_then(|document| table_cell_inlines(&document))
         })?;
         let (node_id, row, column) = (cell.node_id, cell.row, cell.column);
         let session = self.note_session.as_ref().ok_or("单元格所属笔记已经关闭")?;
@@ -109,23 +94,105 @@ impl LibraryShell {
             .is_some_and(|cell| cell.editor.read(cx).focus_handle().is_focused(window))
     }
 
-    /// Paste into the focused cell. A cell holds text, marks and links; an
-    /// image or file here is refused instead of landing in the note body.
+    /// Paste into the focused cell. Images go through the note's resource
+    /// chain into this cell's caret (table/schema.ts 219: a cell holds
+    /// tablecontent, which includes image); text, marks, links and images
+    /// already in this library paste directly.
     pub(super) fn paste_into_table_cell(
         &mut self,
         intent: PasteIntent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self.table_cell_editor.as_ref().map(|cell| cell.editor.clone()) else {
+        let Some((editor, open, place)) = self.table_cell_editor.as_ref().map(|cell| {
+            (
+                cell.editor.clone(),
+                cell.open.clone(),
+                (cell.node_id, cell.row, cell.column),
+            )
+        }) else {
             return;
         };
+        let (request, temporary_paths) = match intent {
+            PasteIntent::Image { payload } => (ResourceImportRequest::Image(payload), Vec::new()),
+            PasteIntent::ImageCandidates { candidates } => (
+                ResourceImportRequest::ImageCandidates(candidates),
+                Vec::new(),
+            ),
+            PasteIntent::EncodedImage { payload } => {
+                (ResourceImportRequest::EncodedImage(payload), Vec::new())
+            }
+            PasteIntent::File { path, cleanup } => (
+                ResourceImportRequest::Path(path.clone()),
+                cleanup.then_some(path).into_iter().collect(),
+            ),
+            PasteIntent::FileCandidates {
+                paths,
+                cleanup_paths,
+            } => (ResourceImportRequest::Paths(paths), cleanup_paths),
+            intent => {
+                self.paste_content_into_table_cell(intent, &editor, cx);
+                crate::native_editor::surface::focus_editor(&editor, window, cx);
+                return;
+            }
+        };
+        let Some(session) = self.note_session.clone() else {
+            cleanup_owned_temporary_paths(&temporary_paths);
+            return;
+        };
+        let captured = session.update(cx, |session, session_cx| {
+            session.capture_table_cell_resource_insert_intent(&editor, open, place, session_cx)
+        });
+        let result = match captured {
+            Ok(intent) => {
+                self.complete_resource_request(request, intent, temporary_paths, window, cx)
+            }
+            Err(error) => {
+                cleanup_owned_temporary_paths(&temporary_paths);
+                Err(error.to_string())
+            }
+        };
+        if let Err(error) = result {
+            self.resource_notice = Some(format!("粘贴未完成：{error}"));
+            cx.notify();
+        }
+        crate::native_editor::surface::focus_editor(&editor, window, cx);
+    }
+
+    fn paste_content_into_table_cell(
+        &mut self,
+        intent: PasteIntent,
+        editor: &Entity<EditorCore>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut available = Vec::new();
+        let mut unavailable = Vec::new();
         let (formatted, plain) = match intent {
             PasteIntent::Text { text } => (None, Some(text)),
             PasteIntent::Fragment { fragment } if fragment.resources.is_empty() => (
                 CanonicalDocument::parse_html(&fragment.html).ok(),
                 Some(fragment.plain),
             ),
+            PasteIntent::Fragment { fragment } => {
+                let Some(session) = self.note_session.clone() else {
+                    return;
+                };
+                match session.update(cx, |session, _| session.fragment_resources(&fragment)) {
+                    Ok((html, here, missing)) => {
+                        available = here;
+                        unavailable = missing;
+                        (
+                            CanonicalDocument::parse_html(&html).ok(),
+                            Some(fragment.plain),
+                        )
+                    }
+                    Err(error) => {
+                        self.resource_notice = Some(format!("粘贴未完成：{error}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
             PasteIntent::Html { html, text } => {
                 match CanonicalDocument::parse_pasted_html(&html) {
                     Ok(pasted) if pasted.images.is_empty() => (Some(pasted.document), text),
@@ -133,34 +200,34 @@ impl LibraryShell {
                     Err(_) => (None, text),
                 }
             }
-            PasteIntent::File { path, cleanup } => {
-                if cleanup {
-                    let _ = std::fs::remove_file(path);
-                }
-                (None, None)
-            }
-            PasteIntent::FileCandidates { cleanup_paths, .. } => {
-                for path in cleanup_paths {
-                    let _ = std::fs::remove_file(path);
-                }
-                (None, None)
-            }
             _ => (None, None),
         };
         let blocks = formatted
-            .and_then(|document| cell_inlines(&document).ok())
-            .map(|inlines| {
+            .and_then(|document| table_cell_inlines(&document).ok())
+            .map(|mut inlines| {
+                inlines.retain(|inline| {
+                    !matches!(
+                        inline,
+                        Inline::Image { resource_id, .. } if unavailable.contains(resource_id)
+                    )
+                });
                 CanonicalDocument::from_blocks(vec![CanonicalBlock::Paragraph {
                     style: BlockStyle::default(),
                     inlines,
                 }])
             })
-            .and_then(|document| import_canonical_with_resources(&document, &[]).ok())
+            .and_then(|document| import_canonical_with_resources(&document, &available).ok())
             .map(|document| document.blocks().iter().cloned().collect::<Vec<_>>());
         if blocks.is_none() && plain.is_none() {
-            self.resource_notice = Some("单元格只能粘贴文字和链接；图片或文件请粘贴到正文".into());
+            self.resource_notice =
+                Some("单元格暂不能粘贴网页中的图片；请复制图片本身后再粘贴".into());
             cx.notify();
             return;
+        }
+        if !available.is_empty() {
+            if let Some(session) = self.note_session.as_ref() {
+                session.update(cx, |session, _| session.allow_resources(&available));
+            }
         }
         let result = editor.update(cx, |editor, editor_cx| {
             let result = match (blocks, plain) {
@@ -179,9 +246,13 @@ impl LibraryShell {
         });
         if let Err(error) = result {
             self.resource_notice = Some(format!("粘贴未完成：{error}"));
-            cx.notify();
+        } else if !unavailable.is_empty() {
+            self.resource_notice = Some(format!(
+                "{} 个图片或附件未粘贴：本资料库中没有，复制时也未能导出其文件",
+                unavailable.len()
+            ));
         }
-        crate::native_editor::surface::focus_editor(&editor, window, cx);
+        cx.notify();
     }
 
     pub(super) fn open_table_cell_editor(
@@ -207,10 +278,9 @@ impl LibraryShell {
             return;
         };
         let original_inlines = inlines.clone();
-        let canonical = CanonicalDocument::from_blocks(vec![CanonicalBlock::Paragraph {
-            style: BlockStyle::default(),
-            inlines,
-        }]);
+        let canonical = CanonicalDocument::from_blocks(
+            crate::native_editor::codec::table_cell_blocks(&inlines),
+        );
         let resources = canonical.resource_ids();
         let document = match import_canonical_with_resources(&canonical, &resources) {
             Ok(document) => document,
@@ -236,7 +306,14 @@ impl LibraryShell {
                 }
             }
         });
-        let image_cache = self.image_cache.clone();
+        // Its own cache: the note's surface replaces the shared cache's
+        // visible set and requested edges on every paint, so a cell image
+        // the note's table also shows would be evicted and reloaded by each
+        // surface in turn without end.
+        let image_cache = crate::native_editor::images::BudgetedImageCache::new_entity_in_context(
+            cx,
+            CELL_IMAGE_CACHE_BUDGET,
+        );
         let surface_editor = editor.clone();
         let surface = cx.new(move |cx| {
             EditorSurface::new(
@@ -257,6 +334,7 @@ impl LibraryShell {
             _observation: observation,
             needs_focus: true,
             error: None,
+            open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         });
         cx.notify();
     }

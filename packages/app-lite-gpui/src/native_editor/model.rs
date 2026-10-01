@@ -262,6 +262,25 @@ impl TableContent {
     pub fn column_count(&self) -> usize {
         self.rows.iter().map(Vec::len).max().unwrap_or(0)
     }
+
+    /// The table without any image of `resource_id`; None when it has none.
+    pub(crate) fn without_resource(&self, resource_id: &str) -> Option<Self> {
+        self.edited(|rows| {
+            let mut removed = false;
+            for cell in rows.iter_mut().flat_map(|row| row.cells.iter_mut()) {
+                cell.inlines.retain(|inline| {
+                    let keep = !matches!(
+                        inline,
+                        app_lite_core::document::Inline::Image { resource_id: id, .. }
+                            if id.as_str() == resource_id
+                    );
+                    removed |= !keep;
+                    keep
+                });
+            }
+            removed
+        })
+    }
 }
 
 impl BlockContent {
