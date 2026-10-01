@@ -12957,3 +12957,211 @@ async fn adjacent_quotes_stay_apart_through_toolbar_history_editing_and_save(
     });
     assert_eq!(reopened_html.as_str(), edited);
 }
+
+#[gpui::test]
+async fn quote_keys_follow_evernote_quoteblock_keymap(cx: &mut TestAppContext) {
+    // common-editor quoteblock/keymap.ts, dispatched as real key presses.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let container = |inner: &str| {
+        format!("<blockquote data-joplin-lite-quote-container=\"true\">{inner}</blockquote>")
+    };
+    let quote = container("<h2>题</h2><p>甲</p><ul><li>一</li></ul>");
+    let start = format!("<p>前</p>{quote}<p>后</p>");
+    let mut notes = Vec::new();
+    for title in ["开头", "之后", "拆分", "末行", "删除"] {
+        notes.push(
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: None,
+                    document: CanonicalDocument::parse_html(&start).unwrap(),
+                })
+                .expect("create note"),
+        );
+    }
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    let open = |cx: &mut VisualTestContext, note: &app_lite_core::Note| {
+        // Save the previous note's edits, as switching notes does.
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(AppAction::ManualSync, window, shell_cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+            })
+        });
+        redraw(cx);
+        let selected = view.read_with(cx, |shell, app| {
+            shell
+                .model
+                .read(app)
+                .navigation()
+                .selected_note_id()
+                .cloned()
+        });
+        assert_eq!(selected, Some(note.id.clone()));
+        view.read_with(cx, |shell, app| {
+            shell
+                .note_session
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .editor()
+                .clone()
+        })
+    };
+    let html = |cx: &mut VisualTestContext, editor: &Entity<EditorCore>| {
+        cx.update(|_, app| {
+            crate::native_editor::codec::export_canonical(editor.read(app).document())
+                .unwrap()
+                .to_canonical_html()
+                .as_str()
+                .to_owned()
+        })
+    };
+    let ids = |cx: &mut VisualTestContext, editor: &Entity<EditorCore>| {
+        cx.update(|_, app| {
+            editor
+                .read(app)
+                .document()
+                .blocks()
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>()
+        })
+    };
+    let caret = |cx: &mut VisualTestContext, editor: &Entity<EditorCore>, id, offset| {
+        cx.update(|window, app| {
+            editor.update(app, |editor, editor_cx| {
+                editor.set_selection_for_test(Selection::caret(DocPoint::new(id, offset)));
+                editor.focus_handle().focus(window);
+                editor_cx.notify();
+            })
+        });
+        redraw(cx);
+    };
+    let head = |cx: &mut VisualTestContext, editor: &Entity<EditorCore>| {
+        cx.update(|_, app| {
+            let point = editor.read(app).selection().head;
+            (point.node_id, point.utf8_offset)
+        })
+    };
+    let press = |cx: &mut VisualTestContext, keys: &str| {
+        cx.simulate_keystrokes(keys);
+        redraw(cx);
+    };
+
+    // handleBackspaceAtStartOfQuoteblock: the quote's first child, whole
+    // quote unwrapped, its heading and list kept; undo and redo.
+    let editor = open(cx, &notes[0]);
+    let b = ids(cx, &editor);
+    caret(cx, &editor, b[1], 0);
+    press(cx, "backspace");
+    let unwrapped = "<p>前</p><h2>题</h2><p>甲</p><ul><li>一</li></ul><p>后</p>";
+    assert_eq!(html(cx, &editor), unwrapped);
+    assert_eq!(head(cx, &editor), (b[1], 0));
+    press(cx, "cmd-z");
+    assert_eq!(html(cx, &editor), start);
+    press(cx, "cmd-shift-z");
+    assert_eq!(html(cx, &editor), unwrapped);
+    // Not the first child: no unwrap (the ordinary Backspace applies).
+    press(cx, "cmd-z");
+    caret(cx, &editor, b[2], 0);
+    press(cx, "backspace");
+    assert!(html(cx, &editor).starts_with("<p>前</p><blockquote"));
+
+    // handleBackspaceAfterQuoteblock: the paragraph after the quote joins it.
+    let editor = open(cx, &notes[1]);
+    let b = ids(cx, &editor);
+    caret(cx, &editor, b[4], 0);
+    press(cx, "backspace");
+    let joined = format!(
+        "<p>前</p>{}",
+        container("<h2>题</h2><p>甲</p><ul><li>一</li></ul><p>后</p>")
+    );
+    assert_eq!(html(cx, &editor), joined);
+    assert_eq!(head(cx, &editor), (b[4], 0));
+    press(cx, "cmd-z");
+    assert_eq!(html(cx, &editor), start);
+
+    // removeEmptyLineAndSplitQuoteblock on Enter: an empty inner paragraph
+    // splits the quote; Backspace after the first quote then joins it.
+    let editor = open(cx, &notes[2]);
+    let b = ids(cx, &editor);
+    caret(cx, &editor, b[2], "甲".len());
+    press(cx, "enter");
+    press(cx, "enter");
+    let split = format!(
+        "<p>前</p>{}<p><br></p>{}<p>后</p>",
+        container("<h2>题</h2><p>甲</p>"),
+        container("<ul><li>一</li></ul>")
+    );
+    assert_eq!(html(cx, &editor), split);
+    cx.simulate_input("中");
+    redraw(cx);
+    press(cx, "home");
+    press(cx, "backspace");
+    let rejoined = format!(
+        "<p>前</p>{}{}<p>后</p>",
+        container("<h2>题</h2><p>甲</p><p>中</p>"),
+        container("<ul><li>一</li></ul>")
+    );
+    assert_eq!(html(cx, &editor), rejoined);
+
+    // removeEmptyLineAndSplitQuoteblock is Backspace's third rule too.
+    let editor = open(cx, &notes[3]);
+    let b = ids(cx, &editor);
+    caret(cx, &editor, b[2], "甲".len());
+    press(cx, "enter");
+    press(cx, "backspace");
+    let middle = html(cx, &editor);
+    assert_eq!(
+        middle,
+        format!(
+            "<p>前</p>{}<p><br></p>{}<p>后</p>",
+            container("<h2>题</h2><p>甲</p>"),
+            container("<ul><li>一</li></ul>")
+        ),
+        "Backspace on an empty inner line splits as Enter does"
+    );
+
+    // handleDelete: the quote's first child joins the block before it.
+    let editor = open(cx, &notes[4]);
+    let b = ids(cx, &editor);
+    caret(cx, &editor, b[0], "前".len());
+    press(cx, "delete");
+    let deleted = format!(
+        "<p>前题</p>{}<p>后</p>",
+        container("<p>甲</p><ul><li>一</li></ul>")
+    );
+    assert_eq!(html(cx, &editor), deleted);
+    assert_eq!(head(cx, &editor), (b[0], "前".len()));
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx)
+        })
+    });
+    cx.run_until_parked();
+    let saved = repository.load_note(&notes[4].id).unwrap().unwrap();
+    assert_eq!(saved.body_html, deleted);
+    let reopened = cx.new(|cx| {
+        crate::app::note_session::NoteSession::open(
+            saved,
+            Arc::clone(&repository),
+            Arc::new(ManualSaveClock::default()),
+            cx,
+        )
+        .unwrap()
+    });
+    let reopened_html = reopened.read_with(cx, |session, app| {
+        crate::native_editor::codec::export_canonical(session.editor().read(app).document())
+            .unwrap()
+            .to_canonical_html()
+    });
+    assert_eq!(reopened_html.as_str(), deleted);
+}

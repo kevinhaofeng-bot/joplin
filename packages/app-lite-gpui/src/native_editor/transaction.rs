@@ -64,6 +64,16 @@ pub enum Transaction {
         selection: Selection,
         quote: bool,
     },
+    /// quoteblock/keymap.ts removeEmptyLineAndSplitQuoteblock: the empty
+    /// quote paragraph `node` leaves its quote, splitting it if more follows.
+    SplitQuoteAt {
+        node: NodeId,
+    },
+    /// quoteblock/keymap.ts handleDelete: the first block of the quote after
+    /// `left` joins `left`'s text; the rest of the quote stays.
+    JoinQuoteHead {
+        left: NodeId,
+    },
     IndentList {
         selection: Selection,
     },
@@ -147,6 +157,8 @@ impl Transaction {
             | Self::EnsureParagraph { selection } => Some(*selection),
             Self::SplitBlock { at } => Some(Selection::caret(*at)),
             Self::MergeBlocks { .. }
+            | Self::SplitQuoteAt { .. }
+            | Self::JoinQuoteHead { .. }
             | Self::RemoveNode { .. }
             | Self::SetImageDisplayWidth { .. }
             | Self::ReplaceTable { .. }

@@ -804,6 +804,11 @@ impl EditorCore {
                     ))?;
                 Some(left_end..right_start)
             }
+            // Like MergeBlocks with the quote's first block.
+            Transaction::JoinQuoteHead { left } => {
+                let index = self.document.node_index(*left).ok()?;
+                Some(self.block_end_offset(index)?..self.block_boundary_offset(index + 1)?)
+            }
             Transaction::RemoveNode { node_id } => {
                 let index = self.document.node_index(*node_id).ok()?;
                 let (start, end) = if index + 1 < self.document.block_count() {
@@ -844,6 +849,7 @@ impl EditorCore {
             | Transaction::SetTextColor { .. }
             | Transaction::SetAlignment { .. }
             | Transaction::SetQuote { .. }
+            | Transaction::SplitQuoteAt { .. }
             | Transaction::IndentList { .. }
             | Transaction::OutdentList { .. }
             | Transaction::SetImageDisplayWidth { .. }
@@ -2797,6 +2803,9 @@ impl EditorCore {
 
     pub fn insert_paragraph_break(&mut self) -> Result<(), DocumentError> {
         self.ensure_editable()?;
+        if let Some(node) = self.quote_empty_line() {
+            return self.apply_quote_key(Transaction::SplitQuoteAt { node });
+        }
         let selection = self.selection;
         // Evernote list/keymap.ts handleEnter: an empty item outdents, and a
         // top-level empty item leaves the list, instead of adding another.
@@ -3193,10 +3202,108 @@ impl EditorCore {
             })
     }
 
+    fn apply_quote_key(&mut self, transaction: Transaction) -> Result<(), DocumentError> {
+        let outcome = self.apply_with_selection(transaction)?;
+        self.set_selection(outcome.selection);
+        self.clear_composition();
+        Ok(())
+    }
+
+    /// The caret's block index when the caret is collapsed outside IME
+    /// composition and not in a paragraph split by inline media.
+    fn quote_key_caret(&self) -> Option<(usize, DocPoint)> {
+        if !self.selection.is_caret() || self.marked.is_some() {
+            return None;
+        }
+        let point = self.selection.head;
+        let index = self.block_index(point.node_id)?;
+        (!self.document.is_inline_group_member(point.node_id)).then_some((index, point))
+    }
+
+    /// quoteblock/keymap.ts removeEmptyLineAndSplitQuoteblock: the caret in
+    /// an empty paragraph of a quote that is not its first child.
+    fn quote_empty_line(&self) -> Option<NodeId> {
+        let (index, point) = self.quote_key_caret()?;
+        let block = &self.document.blocks()[index];
+        (block.kind == BlockKind::Quote
+            && block.content.as_text() == Some("")
+            && !self.document.quote_container_start(index))
+        .then_some(point.node_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quote_backspace_for_test(&self) -> Option<Transaction> {
+        self.quote_backspace()
+    }
+
+    /// quoteblock/keymap.ts handleBackspace, in its order.
+    fn quote_backspace(&self) -> Option<Transaction> {
+        let (index, point) = self.quote_key_caret()?;
+        if point.utf8_offset != 0 {
+            return None;
+        }
+        let document = &self.document;
+        let block = &document.blocks()[index];
+        // handleBackspaceAtStartOfQuoteblock: the start of a quote's first
+        // child, a paragraph or heading directly in it (a list item's parent
+        // is its list), unwraps the whole quote.
+        let direct_child = block.kind == BlockKind::Quote
+            || (block.quoted && matches!(block.kind, BlockKind::Heading { .. }));
+        if direct_child && document.quote_container_start(index) {
+            return Some(Transaction::SetQuote {
+                selection: self.selection,
+                quote: false,
+            });
+        }
+        // handleBackspaceAfterQuoteblock: a paragraph right after a quote
+        // moves into it as its last child.
+        if block.kind == BlockKind::Paragraph
+            && index > 0
+            && !document.block_in_quote(index)
+            && document.block_in_quote(index - 1)
+        {
+            return Some(Transaction::SetBlockKind {
+                selection: self.selection,
+                kind: BlockKind::Quote,
+            });
+        }
+        self.quote_empty_line()
+            .map(|node| Transaction::SplitQuoteAt { node })
+    }
+
+    /// quoteblock/keymap.ts handleDelete: at the end of a block whose next
+    /// sibling is a quote, the quote's first child joins it. A first child
+    /// that is a list is left to the ordinary Delete.
+    fn quote_delete(&self) -> Option<Transaction> {
+        let (index, point) = self.quote_key_caret()?;
+        let document = &self.document;
+        let block = &document.blocks()[index];
+        let next = document.blocks().get(index + 1)?;
+        let at_end = block
+            .content
+            .as_text()
+            .is_some_and(|text| point.utf8_offset == text.len());
+        let outside_quote = matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading { .. })
+            && !document.block_in_quote(index);
+        let text_head = next.kind == BlockKind::Quote
+            || (next.quoted && matches!(next.kind, BlockKind::Heading { .. }));
+        (at_end
+            && outside_quote
+            && text_head
+            && document.quote_container_start(index + 1)
+            && !document.is_inline_group_member(next.id))
+        .then_some(Transaction::JoinQuoteHead {
+            left: point.node_id,
+        })
+    }
+
     pub fn backspace(&mut self) -> Result<(), DocumentError> {
         self.ensure_editable()?;
         if !self.selection.is_caret() {
             return self.delete_selection();
+        }
+        if let Some(transaction) = self.quote_backspace() {
+            return self.apply_quote_key(transaction);
         }
         let point = self.selection.head;
         let Some(index) = self.block_index(point.node_id) else {
@@ -3342,6 +3449,9 @@ impl EditorCore {
         self.ensure_editable()?;
         if !self.selection.is_caret() {
             return self.delete_selection();
+        }
+        if let Some(transaction) = self.quote_delete() {
+            return self.apply_quote_key(transaction);
         }
         let point = self.selection.head;
         let Some(index) = self.block_index(point.node_id) else {

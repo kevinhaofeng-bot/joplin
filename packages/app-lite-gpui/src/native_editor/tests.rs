@@ -9391,3 +9391,61 @@ fn adjacent_quoted_lists_are_numbered_and_saved_apart() {
         vec![1, 2, 1]
     );
 }
+
+#[gpui::test]
+fn quote_keys_keep_inline_images_and_leave_on_an_empty_last_line(cx: &mut gpui::TestAppContext) {
+    let open = |html: &str, cx: &mut gpui::TestAppContext| {
+        EditorCore::from_document(
+            super::codec::import_canonical_with_resources(
+                &app_lite_core::CanonicalDocument::parse_html(html).unwrap(),
+                &[app_lite_core::ResourceId::new("a".repeat(32)).unwrap()],
+            )
+            .unwrap(),
+            cx,
+        )
+    };
+    let export = |editor: &EditorCore| {
+        super::codec::export_canonical(editor.document())
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned()
+    };
+    // removeEmptyLineAndSplitQuoteblock on the quote's last child: the empty
+    // line leaves the quote (Evernote drops it, the caret going past it).
+    let mut editor = open(
+        "<blockquote data-joplin-lite-block-quote=\"true\">甲</blockquote>",
+        cx,
+    );
+    editor.set_caret_utf8("甲".len());
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_paragraph_break().unwrap();
+    assert_eq!(
+        export(&editor),
+        "<blockquote data-joplin-lite-block-quote=\"true\">甲</blockquote><p><br></p>"
+    );
+    // Unwrapping from the first child keeps a paragraph's inline image and a
+    // list in place.
+    let quoted = "<blockquote data-joplin-lite-quote-container=\"true\"><h2>题</h2><p>图<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">后</p><ul><li>一</li></ul></blockquote>";
+    let mut editor = open(quoted, cx);
+    let heading = editor.document().blocks()[0].id;
+    editor.set_selection_for_test(Selection::caret(DocPoint::new(heading, 0)));
+    editor.backspace().unwrap();
+    assert_eq!(
+        export(&editor),
+        "<h2>题</h2><p>图<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">后</p><ul><li>一</li></ul>"
+    );
+    editor.undo().unwrap();
+    assert_eq!(export(&editor), quoted);
+    // In a paragraph split by its image the keys keep their ordinary
+    // meaning (the image grouping difference is reported separately).
+    let after_image = editor
+        .document()
+        .blocks()
+        .iter()
+        .find(|block| block.content.as_text() == Some("后"))
+        .unwrap()
+        .id;
+    editor.set_selection_for_test(Selection::caret(DocPoint::new(after_image, 0)));
+    assert!(editor.quote_backspace_for_test().is_none());
+}

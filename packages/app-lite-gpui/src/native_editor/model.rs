@@ -2255,6 +2255,14 @@ impl Document {
                 plan.inserted_count = 1;
                 Some(plan)
             }
+            Transaction::JoinQuoteHead { left } => {
+                let index = self.node_index(*left).ok()?;
+                let right = self.blocks.get(index + 1)?.id;
+                plan.start_index = index;
+                plan.removed.extend([*left, right]);
+                plan.inserted_count = 1;
+                Some(plan)
+            }
             Transaction::InsertText { selection, .. } => {
                 if let Some(index) = self.adjacent_structural_seam(*selection).ok()? {
                     plan.start_index = index;
@@ -2395,6 +2403,10 @@ impl Document {
 
     fn numbering_range_for(&self, transaction: &Transaction) -> Option<Range<usize>> {
         match transaction {
+            Transaction::SplitQuoteAt { node: id } | Transaction::JoinQuoteHead { left: id } => {
+                let index = self.node_index(*id).ok()?;
+                Some(index..index.saturating_add(2).min(self.blocks.len()))
+            }
             Transaction::SetBlockKind { selection, .. }
             | Transaction::SetQuote { selection, .. }
             | Transaction::IndentList { selection }
@@ -2768,6 +2780,14 @@ impl Document {
             }
             Transaction::SetQuote { selection, quote } => {
                 let (selection, changed_nodes, inverse) = self.apply_set_quote(selection, quote)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::SplitQuoteAt { node } => {
+                let (selection, changed_nodes, inverse) = self.apply_split_quote_at(node)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::JoinQuoteHead { left } => {
+                let (selection, changed_nodes, inverse) = self.apply_join_quote_head(left)?;
                 (selection, changed_nodes, inverse, None)
             }
             Transaction::ToggleMark { selection, mark } => {
@@ -3694,6 +3714,102 @@ impl Document {
             })
     }
 
+    /// Whether block `index` begins a quote container.
+    pub(crate) fn quote_container_start(&self, index: usize) -> bool {
+        self.block_in_quote(index)
+            && (index == 0 || !self.block_in_quote(index - 1) || self.blocks[index].quote_start)
+    }
+
+    fn apply_split_quote_at(
+        &mut self,
+        node: NodeId,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        let index = self.node_index(node)?;
+        let block = &self.blocks[index];
+        if block.kind != BlockKind::Quote
+            || block.content.as_text() != Some("")
+            || self.quote_container_start(index)
+        {
+            return Err(DocumentError::InvalidOperation(
+                "only an empty quote paragraph after the quote's first block splits it".into(),
+            ));
+        }
+        let continues = index + 1 < self.blocks.len()
+            && self.block_in_quote(index + 1)
+            && !self.blocks[index + 1].quote_start;
+        let end = if continues { index + 1 } else { index };
+        let originals = self.blocks.collect_range(index..end + 1);
+        let mut replacements = originals.clone();
+        replacements[0].kind = BlockKind::Paragraph;
+        replacements[0].quote_start = false;
+        let mut changed_nodes = SmallVec::new();
+        push_unique(&mut changed_nodes, node);
+        if continues {
+            replacements[1].quote_start = true;
+            push_unique(&mut changed_nodes, replacements[1].id);
+        }
+        self.blocks.splice(index..end + 1, replacements);
+        let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
+            index,
+            remove_count: end - index + 1,
+            blocks: originals,
+        }]);
+        Ok((
+            Selection::caret(DocPoint::with_affinity(node, 0, Affinity::After)),
+            changed_nodes,
+            inverse,
+        ))
+    }
+
+    fn apply_join_quote_head(
+        &mut self,
+        left: NodeId,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        let index = self.node_index(left)?;
+        let right_index = index + 1;
+        if self.block_in_quote(index)
+            || !self.quote_container_start(right_index)
+            || !is_text_block(&self.blocks[index])
+            || !is_text_block(&self.blocks[right_index])
+        {
+            return Err(DocumentError::InvalidOperation(
+                "only a block right before a quote takes its first block".into(),
+            ));
+        }
+        let left_original = self.blocks[index].clone();
+        let right_original = self.blocks[right_index].clone();
+        let (left_text, left_styles) = text_parts(&left_original.content)?;
+        let (right_text, right_styles) = text_parts(&right_original.content)?;
+        let left_len = left_text.len();
+        let mut text = String::with_capacity(left_len + right_text.len());
+        text.push_str(left_text);
+        text.push_str(right_text);
+        let mut styles: SmallVec<[StyledRun; 4]> = left_styles.iter().cloned().collect();
+        styles.extend(clip_styles(
+            right_styles,
+            0,
+            right_text.len(),
+            left_len as isize,
+        ));
+        normalize_styles_for_text(&text, &mut styles);
+        let mut joined = left_original.clone();
+        joined.content = BlockContent::Text { text, styles };
+        self.blocks.splice(index..right_index + 1, [joined]);
+        let mut changed_nodes = SmallVec::new();
+        push_unique(&mut changed_nodes, left);
+        push_unique(&mut changed_nodes, right_original.id);
+        let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
+            index,
+            remove_count: 1,
+            blocks: vec![left_original, right_original],
+        }]);
+        Ok((
+            Selection::caret(DocPoint::with_affinity(left, left_len, Affinity::After)),
+            changed_nodes,
+            inverse,
+        ))
+    }
+
     /// Whether the selected blocks may all be wrapped in a quote: Evernote's
     /// quoteblock holds `( p | todolist | ol | ul | h )+` (quoteblock/schema.ts
     /// 14); media inline in a paragraph goes with it.
@@ -3712,7 +3828,7 @@ impl Document {
         })
     }
 
-    fn is_inline_group_member(&self, id: NodeId) -> bool {
+    pub(crate) fn is_inline_group_member(&self, id: NodeId) -> bool {
         self.inline_groups
             .iter()
             .any(|group| group.members.contains(&id))
