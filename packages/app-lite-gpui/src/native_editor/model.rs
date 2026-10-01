@@ -4471,6 +4471,82 @@ impl Document {
         )))
     }
 
+    /// A list item takes media as Evernote's resource insert does (common-
+    /// editor resource/resource.ts insert, then list/li.ts
+    /// createNewListItemAfterCurrent): the media and any text after it stay
+    /// in the item, here an inline group shaped as the codec opens a saved
+    /// `<li>` holding media; a new empty item of the same list and depth (a
+    /// checklist item unticked, like `li.create(null)`) follows, and the
+    /// caret goes there. One undo step restores the blocks and drops the
+    /// group.
+    fn insert_into_list_item(
+        &mut self,
+        index: usize,
+        [left, media, right]: [Block; 3],
+        new_item_id: NodeId,
+        original_ids: Vec<NodeId>,
+        originals: Vec<Block>,
+    ) -> (Selection, SmallVec<[NodeId; 4]>, TransactionBatch) {
+        let new_kind = match left.kind {
+            BlockKind::CheckItem { depth, .. } => BlockKind::CheckItem {
+                depth,
+                checked: false,
+            },
+            ref kind => kind.clone(),
+        };
+        let group_kind = left.kind.clone();
+        let mut members = vec![left.id, media.id];
+        let mut blocks = vec![left, media];
+        let caret_id = if right.content.as_text() == Some("") {
+            // Nothing after the media: the right part is the new item.
+            let mut item = right;
+            item.kind = new_kind;
+            let id = item.id;
+            blocks.push(item);
+            id
+        } else {
+            members.push(right.id);
+            let mut item = Block::text(new_item_id, new_kind, String::new());
+            item.alignment = right.alignment;
+            item.quoted = right.quoted;
+            blocks.push(right);
+            blocks.push(item);
+            new_item_id
+        };
+        let inserted = blocks.len();
+        let mut changed_nodes = SmallVec::new();
+        for node_id in original_ids {
+            push_unique(&mut changed_nodes, node_id);
+        }
+        for block in &blocks {
+            push_unique(&mut changed_nodes, block.id);
+        }
+        let first = members[0];
+        self.blocks.splice(index..index.saturating_add(1), blocks);
+        self.replace_inline_groups(
+            &[],
+            vec![InlineGroup {
+                kind: group_kind,
+                members,
+            }],
+        );
+        (
+            Selection::caret(DocPoint::with_affinity(caret_id, 0, Affinity::Before)),
+            changed_nodes,
+            TransactionBatch(vec![
+                Transaction::RestoreInlineGroups {
+                    remove: vec![first],
+                    groups: Vec::new(),
+                },
+                Transaction::RestoreBlocks {
+                    index,
+                    remove_count: inserted,
+                    blocks: originals,
+                },
+            ]),
+        )
+    }
+
     fn apply_insert_structural(
         &mut self,
         selection: Selection,
@@ -4593,6 +4669,22 @@ impl Document {
         // the document unchanged rather than publishing a partial deletion.
         let image_id = self.new_node_id()?;
         let right_id = self.new_node_id()?;
+        // resource.ts insert: in a list the resource joins the current li,
+        // then createNewListItemAfterCurrent (list/li.ts) adds an empty li
+        // after it for the caret. An item already holding media keeps the
+        // existing group path.
+        let list_item = matches!(
+            self.blocks[start_index].kind,
+            BlockKind::BulletItem { .. }
+                | BlockKind::OrderedItem { .. }
+                | BlockKind::CheckItem { .. }
+        ) && !matches!(structural, StructuralInsert::Table(_))
+            && !self.is_inline_group_member(self.blocks[start_index].id);
+        let new_item_id = if list_item {
+            Some(self.new_node_id()?)
+        } else {
+            None
+        };
         let insertion_offset = if !is_empty {
             self.delete_range_mut(start_index, start_offset, end_index, end_offset, true)?
         } else {
@@ -4628,6 +4720,15 @@ impl Document {
             quote_start: false,
             revision: original_block.revision,
         };
+        if let Some(new_item_id) = new_item_id {
+            return Ok(self.insert_into_list_item(
+                start_index,
+                [left, image, right],
+                new_item_id,
+                original_ids,
+                originals,
+            ));
+        }
         self.blocks.splice(
             start_index..start_index.saturating_add(1),
             [left, image, right],

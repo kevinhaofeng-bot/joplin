@@ -2153,3 +2153,142 @@ async fn mounted_image_at_a_paragraph_end_goes_on_into_the_next_text_block(
         saved
     );
 }
+
+/// resource.ts insert in a list (insertResourceAtPosition, then
+/// list/li.ts createNewListItemAfterCurrent) through the real picker: the
+/// image shows at once inside the item, typing goes into the new item, the
+/// saved list keeps its items; a failed commit rolls the insert back whole,
+/// or, after typing in the new item, keeps it as a retryable stage.
+#[gpui::test]
+async fn mounted_list_item_image_stays_in_its_item_and_rolls_back_safely(cx: &mut TestAppContext) {
+    use app_lite_core::{CanonicalDocument, CreateNote};
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let list = "<ul><li>一</li><li>二</li></ul>";
+    let mut notes = Vec::new();
+    for title in ["列表插图", "失败回滚", "失败重试"] {
+        notes.push(
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: None,
+                    document: CanonicalDocument::parse_html(list).unwrap(),
+                })
+                .unwrap(),
+        );
+    }
+    let (view, cx) = mount_on(cx, Arc::clone(&repository), &notes[0].id);
+    let pick = |view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        let body = view
+            .read_with(cx, |shell, app| {
+                shell.image_flow_probe_for_test(app).text_block_bounds
+            })
+            .expect("first list item");
+        cx.simulate_click(
+            gpui::point(body.left() + gpui::px(30.0), body.center().y),
+            gpui::Modifiers::default(),
+        );
+        redraw(cx);
+        cx.simulate_keystrokes("end");
+        redraw(cx);
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell
+                    .begin_resource_picker(shell_cx)
+                    .expect("capture caret");
+                shell
+                    .complete_resource_picker_path(picker_png(&profile), window, shell_cx)
+                    .expect("schedule image insert");
+            });
+        });
+    };
+
+    pick(&view, cx);
+    cx.run_until_parked();
+    redraw(cx);
+    let probe = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert!(
+        probe.has_image_block && probe.cache_has_resource,
+        "the image shows at once"
+    );
+    let image = probe.image_resource_id.expect("image resource");
+    cx.simulate_input("续");
+    redraw(cx);
+    manual_save(&view, cx);
+    let saved = repository
+        .load_note(&notes[0].id)
+        .unwrap()
+        .unwrap()
+        .body_html;
+    assert_eq!(
+        saved,
+        format!(
+            "<ul><li>一<img src=\":/{}\" alt=\"\"></li><li>续</li><li>二</li></ul>",
+            image.as_str()
+        )
+    );
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    assert_eq!(
+        reopened.load_note(&notes[0].id).unwrap().unwrap().body_html,
+        saved
+    );
+
+    // A failed commit with nothing typed since: the whole insert goes.
+    select(&view, cx, &notes[1].id);
+    let release = view.update(cx, |shell, shell_cx| {
+        shell.stall_next_resource_commit_for_test(shell_cx)
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.fail_next_resource_commit_for_test("列表插图提交失败", shell_cx);
+    });
+    pick(&view, cx);
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, app| {
+        shell.image_flow_probe_for_test(app).has_image_block
+    }));
+    release.send(()).expect("release failed worker");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(!view.read_with(cx, |shell, app| {
+        shell.image_flow_probe_for_test(app).has_image_block
+    }));
+    manual_save(&view, cx);
+    assert_eq!(
+        repository
+            .load_note(&notes[1].id)
+            .unwrap()
+            .unwrap()
+            .body_html,
+        list
+    );
+
+    // Typing in the new item before the failure: that item did not exist
+    // before the insert, so the fail-closed retry keeps image and text.
+    select(&view, cx, &notes[2].id);
+    let release = view.update(cx, |shell, shell_cx| {
+        shell.stall_next_resource_commit_for_test(shell_cx)
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.fail_next_resource_commit_for_test("列表插图后输入再失败", shell_cx);
+    });
+    pick(&view, cx);
+    cx.run_until_parked();
+    redraw(cx);
+    cx.simulate_input("新项文字");
+    redraw(cx);
+    release.send(()).expect("release failed worker");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, app| {
+        shell.image_flow_probe_for_test(app).has_image_block
+    }));
+    assert!(
+        view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app))
+            .contains("新项文字")
+    );
+    assert!(
+        view.read_with(cx, |shell, _| shell.resource_notice_for_test())
+            .is_some_and(|notice| notice.contains("手动同步可重试"))
+    );
+}

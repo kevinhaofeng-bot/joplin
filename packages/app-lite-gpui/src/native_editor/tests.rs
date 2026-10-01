@@ -9570,3 +9570,141 @@ fn image_insert_follows_evernote_resource_placement(cx: &mut gpui::TestAppContex
     editor.backspace().unwrap();
     assert_eq!(shape(&editor), "Paragraph:");
 }
+
+#[gpui::test]
+async fn list_item_takes_media_and_a_new_item_follows_like_evernote(cx: &mut gpui::TestAppContext) {
+    // common-editor resource/resource.ts insert: insertResourceAtPosition
+    // puts the resource in the current li (li content listblockcontent+),
+    // then, as `inList($caret)`, list/li.ts createNewListItemAfterCurrent
+    // adds `li.create(null, p)` after it and the caret goes into that p.
+    let resources = [app_lite_core::ResourceId::new("a".repeat(32)).unwrap()];
+    let img = "<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">";
+    let empty = "<br data-joplin-lite-empty-item=\"true\">";
+    let mut cx = cx.add_empty_window();
+    for (html, block, start, end, inserted) in [
+        (
+            "<ul><li>一</li><li>二</li></ul>".to_owned(),
+            0usize,
+            "一".len(),
+            "一".len(),
+            format!("<ul><li>一{img}</li><li>{empty}</li><li>二</li></ul>"),
+        ),
+        (
+            "<ol><li>甲乙</li></ol>".to_owned(),
+            0,
+            "甲".len(),
+            "甲".len(),
+            format!("<ol><li>甲{img}乙</li><li>{empty}</li></ol>"),
+        ),
+        (
+            "<ul data-type=\"checklist\"><li data-checked=\"true\">甲</li></ul>".to_owned(),
+            0,
+            0,
+            0,
+            format!(
+                "<ul data-type=\"checklist\"><li data-checked=\"true\">{img}甲</li><li data-checked=\"false\">{empty}</li></ul>"
+            ),
+        ),
+        (
+            "<ul><li>一</li><li data-indent=\"1\">子</li></ul>".to_owned(),
+            1,
+            "子".len(),
+            "子".len(),
+            format!(
+                "<ul><li>一</li><li data-indent=\"1\">子{img}</li><li data-indent=\"1\">{empty}</li></ul>"
+            ),
+        ),
+        (
+            format!("<ul><li>一</li><li>{empty}</li></ul>"),
+            1,
+            0,
+            0,
+            format!("<ul><li>一</li><li>{img}</li><li>{empty}</li></ul>"),
+        ),
+        (
+            "<ol><li>甲乙丙</li></ol>".to_owned(),
+            0,
+            "甲".len(),
+            "甲乙".len(),
+            format!("<ol><li>甲{img}丙</li><li>{empty}</li></ol>"),
+        ),
+    ] {
+        let document = super::codec::import_canonical_with_resources(
+            &app_lite_core::CanonicalDocument::parse_html(&html).unwrap(),
+            &resources,
+        )
+        .unwrap();
+        let editor = EditorCore::from_document(document, &mut cx);
+        let entity = cx.new(|_| editor);
+        cx.update(|window, cx| {
+            entity.update(cx, |editor, _| {
+                let export = |editor: &EditorCore| {
+                    super::codec::export_canonical_with_resources(
+                        editor.document(),
+                        Some(&resources),
+                    )
+                    .unwrap()
+                    .to_canonical_html()
+                    .as_str()
+                    .to_owned()
+                };
+                let original = export(editor);
+                let id = editor.document().blocks()[block].id;
+                let selection = Selection::new(DocPoint::new(id, start), DocPoint::new(id, end));
+                editor.set_selection_for_test(selection);
+                editor
+                    .apply(Transaction::InsertImage {
+                        selection,
+                        resource_id: "a".repeat(32),
+                        natural_size: (4, 2),
+                    })
+                    .unwrap();
+                assert_eq!(export(editor), inserted, "{html}");
+                // Reopening what was saved keeps the same shape.
+                let reopened = super::codec::import_canonical_with_resources(
+                    &app_lite_core::CanonicalDocument::parse_html(&inserted).unwrap(),
+                    &resources,
+                )
+                .unwrap();
+                assert_eq!(
+                    super::codec::export_canonical_with_resources(&reopened, Some(&resources))
+                        .unwrap()
+                        .to_canonical_html()
+                        .as_str(),
+                    inserted
+                );
+                // The caret is in the new item: typing lands there.
+                editor.insert_text("X").unwrap();
+                assert_eq!(
+                    export(editor),
+                    inserted.replacen(&format!("{empty}</li>"), "X</li>", 1),
+                    "{html} typing"
+                );
+                // Layout follows the document order.
+                let doc = editor.document().clone();
+                editor
+                    .layout
+                    .shape_visible_with_window(&doc, 0.0, 640.0, 680.0, window);
+                assert_eq!(
+                    editor
+                        .layout
+                        .visible()
+                        .iter()
+                        .map(|block| block.node_id)
+                        .collect::<Vec<_>>(),
+                    editor
+                        .document()
+                        .blocks()
+                        .iter()
+                        .map(|block| block.id)
+                        .collect::<Vec<_>>()
+                );
+                editor.undo().unwrap();
+                editor.undo().unwrap();
+                assert_eq!(export(editor), original, "{html} undo");
+                editor.redo().unwrap();
+                assert_eq!(export(editor), inserted, "{html} redo");
+            })
+        });
+    }
+}
