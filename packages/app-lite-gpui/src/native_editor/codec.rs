@@ -1758,14 +1758,11 @@ mod tests {
             .expect("attachments may live inside a grouped list item");
         let exported = super::export_canonical(&document).expect("storable");
         let html = exported.to_canonical_html();
-        assert!(
-            html.as_str().starts_with("<ul><li>图前<img")
-                && html
-                    .as_str()
-                    .contains("图<a data-joplin-lite-inline-attachment=\"true\"")
-                && html.as_str().ends_with("后</li></ul>"),
-            "{}",
-            html.as_str()
+        // resource.ts insert treats a file like an image: inList, so
+        // createNewListItemAfterCurrent adds an empty li after the item.
+        assert_eq!(
+            html.as_str(),
+            "<ul><li>图前<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">图<a data-joplin-lite-inline-attachment=\"true\" href=\":/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" data-filename=\"合同.pdf\" data-media-type=\"application/pdf\">合同.pdf</a>后</li><li><br data-joplin-lite-empty-item=\"true\"></li></ul>"
         );
         let reopened = import_canonical(&exported).unwrap();
         assert_eq!(super::export_canonical(&reopened).unwrap(), exported);

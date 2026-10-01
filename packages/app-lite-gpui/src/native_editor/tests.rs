@@ -9708,3 +9708,452 @@ async fn list_item_takes_media_and_a_new_item_follows_like_evernote(cx: &mut gpu
         });
     }
 }
+
+const LIST_MEDIA_A: &str = "<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"\">";
+const LIST_MEDIA_B: &str = "<img src=\":/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" alt=\"\">";
+const LIST_EMPTY_ITEM: &str = "<br data-joplin-lite-empty-item=\"true\">";
+
+// Inserts resource b at `target` (a text block, or the first image with the
+// caret after it) and checks export, reopen, typing, layout order, numbering,
+// one-step undo and redo.
+fn assert_list_media_insert(
+    cx: &mut gpui::VisualTestContext,
+    html: &str,
+    target: Option<&str>,
+    start: usize,
+    end: usize,
+    inserted: &str,
+) {
+    let resources = [
+        app_lite_core::ResourceId::new("a".repeat(32)).unwrap(),
+        app_lite_core::ResourceId::new("b".repeat(32)).unwrap(),
+    ];
+    let export = |document: &Document| {
+        super::codec::export_canonical_with_resources(document, Some(&resources))
+            .unwrap()
+            .to_canonical_html()
+            .as_str()
+            .to_owned()
+    };
+    let document = super::codec::import_canonical_with_resources(
+        &app_lite_core::CanonicalDocument::parse_html(html).unwrap(),
+        &resources,
+    )
+    .unwrap();
+    let editor = EditorCore::from_document(document, cx);
+    let entity = cx.new(|_| editor);
+    cx.update(|window, cx| {
+        entity.update(cx, |editor, _| {
+            let original = export(editor.document());
+            let selection = match target {
+                Some(text) => {
+                    let id = editor
+                        .document()
+                        .blocks()
+                        .iter()
+                        .find(|block| block.content.as_text() == Some(text))
+                        .expect("target text")
+                        .id;
+                    Selection::new(DocPoint::new(id, start), DocPoint::new(id, end))
+                }
+                None => {
+                    let id = editor
+                        .document()
+                        .blocks()
+                        .iter()
+                        .find(|block| block.kind == BlockKind::Image)
+                        .expect("target image")
+                        .id;
+                    Selection::caret(DocPoint::with_affinity(id, 0, Affinity::After))
+                }
+            };
+            editor.set_selection_for_test(selection);
+            editor
+                .apply(Transaction::InsertImage {
+                    selection,
+                    resource_id: "b".repeat(32),
+                    natural_size: (4, 2),
+                })
+                .unwrap();
+            assert_eq!(export(editor.document()), inserted, "{html}");
+            let reopened = super::codec::import_canonical_with_resources(
+                &app_lite_core::CanonicalDocument::parse_html(inserted).unwrap(),
+                &resources,
+            )
+            .unwrap();
+            assert_eq!(export(&reopened), inserted, "{html} reopen");
+            editor.insert_text("X").unwrap();
+            assert_eq!(
+                export(editor.document()),
+                inserted.replacen(&format!("{LIST_EMPTY_ITEM}</li>"), "X</li>", 1),
+                "{html} typing"
+            );
+            let doc = editor.document().clone();
+            editor
+                .layout
+                .shape_visible_with_window(&doc, 0.0, 640.0, 680.0, window);
+            assert_eq!(
+                editor
+                    .layout
+                    .visible()
+                    .iter()
+                    .map(|block| block.node_id)
+                    .collect::<Vec<_>>(),
+                doc.blocks()
+                    .iter()
+                    .map(|block| block.id)
+                    .collect::<Vec<_>>(),
+                "{html} layout order"
+            );
+            assert_ordered_numbers_match(&doc, &editor.layout, html);
+            editor.undo().unwrap();
+            editor.undo().unwrap();
+            assert_eq!(export(editor.document()), original, "{html} undo");
+            editor.redo().unwrap();
+            assert_eq!(export(editor.document()), inserted, "{html} redo");
+        })
+    });
+}
+
+#[gpui::test]
+async fn grouped_list_item_takes_more_media_and_a_new_item_follows(cx: &mut gpui::TestAppContext) {
+    // The li already holds media (opened as an inline group). Evernote's
+    // resource.ts insert does not care: the resource joins the li and, as
+    // inList($caret), createNewListItemAfterCurrent adds `li.create(null, p)`
+    // after the whole li with the caret in it.
+    let (a, b, empty) = (LIST_MEDIA_A, LIST_MEDIA_B, LIST_EMPTY_ITEM);
+    let cx = cx.add_empty_window();
+    for (html, target, start, end, inserted) in [
+        (
+            format!("<ul><li>一{a}后</li><li>二</li></ul>"),
+            Some("后"),
+            "后".len(),
+            "后".len(),
+            format!("<ul><li>一{a}后{b}</li><li>{empty}</li><li>二</li></ul>"),
+        ),
+        (
+            format!("<ol><li>甲乙{a}丙</li></ol>"),
+            Some("甲乙"),
+            "甲".len(),
+            "甲".len(),
+            format!("<ol><li>甲{b}乙{a}丙</li><li>{empty}</li></ol>"),
+        ),
+        (
+            format!("<ul data-type=\"checklist\"><li data-checked=\"true\">甲{a}</li></ul>"),
+            None,
+            0,
+            0,
+            format!(
+                "<ul data-type=\"checklist\"><li data-checked=\"true\">甲{a}{b}</li><li data-checked=\"false\">{empty}</li></ul>"
+            ),
+        ),
+        (
+            format!("<ul><li>一</li><li data-indent=\"1\">子{a}</li><li>二</li></ul>"),
+            Some("子"),
+            0,
+            0,
+            format!(
+                "<ul><li>一</li><li data-indent=\"1\">{b}子{a}</li><li data-indent=\"1\">{empty}</li><li>二</li></ul>"
+            ),
+        ),
+        (
+            format!("<ul><li>一{a}后</li></ul>"),
+            Some("后"),
+            0,
+            0,
+            format!("<ul><li>一{a}{b}后</li><li>{empty}</li></ul>"),
+        ),
+        (
+            format!("<ol><li>甲乙丙{a}</li><li>丁</li></ol>"),
+            Some("甲乙丙"),
+            "甲".len(),
+            "甲乙".len(),
+            format!("<ol><li>甲{b}丙{a}</li><li>{empty}</li><li>丁</li></ol>"),
+        ),
+        (
+            format!(
+                "<blockquote data-joplin-lite-quote-container=\"true\"><ul><li>项{a}后</li></ul></blockquote>"
+            ),
+            Some("后"),
+            "后".len(),
+            "后".len(),
+            format!(
+                "<blockquote data-joplin-lite-quote-container=\"true\"><ul><li>项{a}后{b}</li><li>{empty}</li></ul></blockquote>"
+            ),
+        ),
+        (
+            "<blockquote data-joplin-lite-quote-container=\"true\"><ul><li>项后</li></ul></blockquote>"
+                .to_owned(),
+            Some("项后"),
+            "项".len(),
+            "项".len(),
+            format!(
+                "<blockquote data-joplin-lite-quote-container=\"true\"><ul><li>项{b}后</li><li>{empty}</li></ul></blockquote>"
+            ),
+        ),
+    ] {
+        assert_list_media_insert(cx, &html, target, start, end, &inserted);
+    }
+}
+
+#[gpui::test]
+async fn new_list_item_after_media_takes_default_alignment(cx: &mut gpui::TestAppContext) {
+    // li.create(null, schema.nodes.p.create()): the new item and its
+    // paragraph carry default attrs, so a centred item is not inherited.
+    let (a, b, empty) = (LIST_MEDIA_A, LIST_MEDIA_B, LIST_EMPTY_ITEM);
+    let cx = cx.add_empty_window();
+    for (html, inserted) in [
+        (
+            "<ul><li data-align=\"center\">一</li></ul>".to_owned(),
+            format!("<ul><li data-align=\"center\">一{b}</li><li>{empty}</li></ul>"),
+        ),
+        (
+            "<ul><li data-align=\"center\">一二</li></ul>".to_owned(),
+            format!("<ul><li data-align=\"center\">一{b}二</li><li>{empty}</li></ul>"),
+        ),
+        (
+            format!("<ul><li data-align=\"center\">一二{a}</li></ul>"),
+            format!("<ul><li data-align=\"center\">一{b}二{a}</li><li>{empty}</li></ul>"),
+        ),
+    ] {
+        assert_list_media_insert(
+            cx,
+            &html,
+            Some(if html.contains("一二") {
+                "一二"
+            } else {
+                "一"
+            }),
+            "一".len(),
+            "一".len(),
+            &inserted,
+        );
+    }
+}
+
+#[test]
+fn heading_and_quote_media_groups_keep_their_compatible_shape() {
+    // evidence08 stage 1: a heading or quote block holding media opens as an
+    // inline group. Only list items gain a new item; these keep the media in
+    // the group and add no block.
+    let resources = [
+        app_lite_core::ResourceId::new("a".repeat(32)).unwrap(),
+        app_lite_core::ResourceId::new("b".repeat(32)).unwrap(),
+    ];
+    let (a, b) = (LIST_MEDIA_A, LIST_MEDIA_B);
+    let quote = "<blockquote data-joplin-lite-block-quote=\"true\">";
+    for (html, text, at, inserted) in [
+        (
+            format!("<h2>标{a}后</h2>"),
+            "后",
+            "后".len(),
+            format!("<h2>标{a}后{b}</h2>"),
+        ),
+        (
+            format!("<h2>标题{a}</h2>"),
+            "标题",
+            "标".len(),
+            format!("<h2>标{b}题{a}</h2>"),
+        ),
+        (
+            format!("{quote}引{a}后</blockquote>"),
+            "后",
+            "后".len(),
+            format!("{quote}引{a}后{b}</blockquote>"),
+        ),
+        (
+            format!("{quote}引用{a}</blockquote>"),
+            "引用",
+            "引".len(),
+            format!("{quote}引{b}用{a}</blockquote>"),
+        ),
+    ] {
+        let export = |document: &Document| {
+            super::codec::export_canonical_with_resources(document, Some(&resources))
+                .unwrap()
+                .to_canonical_html()
+                .as_str()
+                .to_owned()
+        };
+        let mut document = super::codec::import_canonical_with_resources(
+            &app_lite_core::CanonicalDocument::parse_html(&html).unwrap(),
+            &resources,
+        )
+        .unwrap();
+        let block_count = document.block_count();
+        let id = document
+            .blocks()
+            .iter()
+            .find(|block| block.content.as_text() == Some(text))
+            .unwrap()
+            .id;
+        let mut history = History::new(16, 1024 * 1024);
+        history
+            .apply(
+                &mut document,
+                Transaction::InsertImage {
+                    selection: Selection::caret(DocPoint::new(id, at)),
+                    resource_id: "b".repeat(32),
+                    natural_size: (4, 2),
+                },
+            )
+            .unwrap();
+        assert_eq!(export(&document), inserted, "{html}");
+        assert_eq!(document.block_count(), block_count + 2, "{html}");
+        history.undo_with_outcome(&mut document).unwrap();
+        assert_eq!(export(&document), html, "{html} undo");
+    }
+}
+
+#[test]
+fn list_media_inserts_publish_exact_splices_in_a_large_list() {
+    // Layout replays structural splices instead of rereading the order, so
+    // a splice that undercounts the new list item leaves it out of the
+    // height and numbering indexes.
+    fn replay(ids: &mut Vec<NodeId>, outcome: &ApplyOutcome, document: &Document, step: &str) {
+        for splice in &outcome.structural_splices {
+            let end = splice.start_index + splice.removed.len();
+            assert_eq!(
+                &ids[splice.start_index..end],
+                &splice.removed[..],
+                "{step}: removed"
+            );
+            ids.splice(splice.start_index..end, splice.inserted.iter().copied());
+        }
+        assert!(
+            ids.iter()
+                .copied()
+                .eq(document.blocks().iter().map(|block| block.id)),
+            "{step}: splices do not rebuild the document order"
+        );
+    }
+    fn list(count: usize, ordered: bool) -> Document {
+        let mut blocks = ordered_fixture(count);
+        if !ordered {
+            for block in &mut blocks {
+                block.kind = BlockKind::BulletItem { depth: 0 };
+            }
+        }
+        Document::from_blocks(blocks).unwrap()
+    }
+    // Most (height, numbering) layout work over insert, undo and redo.
+    fn measure(count: usize, ordered: bool) -> (usize, usize) {
+        let mut document = list(count, ordered);
+        let mut ids = document.blocks().iter().map(|block| block.id).collect();
+        let mut history = History::new(16, 4 * 1024 * 1024);
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        let middle = document.blocks()[count / 2].id;
+        let mut most_work = (0, 0);
+        for step in ["plain item", "grouped item", "undo", "undo", "redo", "redo"] {
+            let outcome = match step {
+                "undo" => history.undo_with_outcome(&mut document).unwrap(),
+                "redo" => history.redo_with_outcome(&mut document).unwrap(),
+                _ => {
+                    let selection = if step == "plain item" {
+                        Selection::caret(DocPoint::new(middle, 2))
+                    } else {
+                        // Inside the text after the first media, in the group.
+                        Selection::caret(DocPoint::new(document.blocks()[count / 2 + 2].id, 1))
+                    };
+                    history
+                        .apply(
+                            &mut document,
+                            Transaction::InsertImage {
+                                selection,
+                                resource_id: "a".repeat(32),
+                                natural_size: (4, 2),
+                            },
+                        )
+                        .unwrap()
+                }
+            };
+            replay(&mut ids, &outcome, &document, step);
+            let shape = outcome
+                .structural_splices
+                .iter()
+                .map(|splice| {
+                    (
+                        splice.start_index,
+                        splice.removed.len(),
+                        splice.inserted.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let middle = count / 2;
+            match step {
+                // left, media, right, new item replace the item.
+                "plain item" => assert_eq!(shape, [(middle, 1, 4)]),
+                // The group text splits around the media; a new item follows
+                // the whole group (left, media, right, media, right).
+                "grouped item" => assert_eq!(shape, [(middle + 2, 1, 3), (middle + 5, 0, 1)]),
+                _ => {}
+            }
+            let work_before = (
+                layout.height_index_work_count(),
+                layout.ordered_number_work_count(),
+            );
+            layout.invalidate_nodes_with_delta(
+                &document,
+                &outcome.changed_nodes,
+                outcome.structural,
+                &outcome.structural_splices,
+                &outcome.numbering_ranges,
+            );
+            layout.layout_document(&document, 0.0, 240.0, 680.0);
+            most_work.0 = most_work
+                .0
+                .max(layout.height_index_work_count() - work_before.0);
+            most_work.1 = most_work
+                .1
+                .max(layout.ordered_number_work_count() - work_before.1);
+            let mut fresh = LayoutRegistry::new();
+            fresh.layout_document(&document, 0.0, 240.0, 680.0);
+            assert_eq!(layout.total_height(), fresh.total_height(), "{step}");
+            assert_ordered_numbers_match(&document, &layout, step);
+        }
+        assert_eq!(document.block_count(), count + 6);
+        most_work
+    }
+    // Renumbering after a new item mid ordered list is the same work Enter
+    // does there; the media insert must not add to it.
+    fn split_numbering(count: usize) -> usize {
+        let mut document = list(count, true);
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        let at = DocPoint::new(document.blocks()[count / 2].id, 2);
+        let outcome = document.apply(Transaction::SplitBlock { at }).unwrap();
+        let before = layout.ordered_number_work_count();
+        layout.invalidate_nodes_with_delta(
+            &document,
+            &outcome.changed_nodes,
+            outcome.structural,
+            &outcome.structural_splices,
+            &outcome.numbering_ranges,
+        );
+        layout.layout_document(&document, 0.0, 240.0, 680.0);
+        layout.ordered_number_work_count() - before
+    }
+    let bullet = [measure(10_000, false), measure(100_000, false)];
+    let ordered = [measure(10_000, true), measure(100_000, true)];
+    let split = [split_numbering(10_000), split_numbering(100_000)];
+    println!(
+        "list media insert (height, numbering): bullet={bullet:?} ordered={ordered:?} split={split:?}"
+    );
+    for [small, large] in [bullet, ordered] {
+        assert!(
+            large.0 <= small.0 + 16,
+            "height work scaled: {small:?} {large:?}"
+        );
+    }
+    assert!(
+        bullet[1].1 <= bullet[0].1 + 64,
+        "bullet numbering work scaled: {bullet:?}"
+    );
+    for (work, split) in ordered.iter().zip(split) {
+        assert!(
+            work.1 <= split + 64,
+            "ordered: {work:?} beyond Enter's {split}"
+        );
+    }
+}

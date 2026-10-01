@@ -2292,3 +2292,143 @@ async fn mounted_list_item_image_stays_in_its_item_and_rolls_back_safely(cx: &mu
             .is_some_and(|notice| notice.contains("手动同步可重试"))
     );
 }
+
+#[gpui::test]
+async fn mounted_grouped_list_item_takes_another_image_and_fails_closed(cx: &mut TestAppContext) {
+    use app_lite_core::{CanonicalDocument, CreateNote};
+    cx.update(|app| crate::components::init(app));
+    let (profile, repository) = repository();
+    let list = "<ul><li>一</li><li>二</li></ul>";
+    let mut notes = Vec::new();
+    for title in ["再插一图", "再插失败", "再插后输入失败"] {
+        notes.push(
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: None,
+                    document: CanonicalDocument::parse_html(list).unwrap(),
+                })
+                .unwrap(),
+        );
+    }
+    let (view, cx) = mount_on(cx, Arc::clone(&repository), &notes[0].id);
+    let pick = |view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        let body = view
+            .read_with(cx, |shell, app| {
+                shell.image_flow_probe_for_test(app).text_block_bounds
+            })
+            .expect("first list item");
+        cx.simulate_click(
+            gpui::point(body.left() + gpui::px(30.0), body.center().y),
+            gpui::Modifiers::default(),
+        );
+        redraw(cx);
+        cx.simulate_keystrokes("end");
+        redraw(cx);
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell
+                    .begin_resource_picker(shell_cx)
+                    .expect("capture caret");
+                shell
+                    .complete_resource_picker_path(picker_png(&profile), window, shell_cx)
+                    .expect("schedule image insert");
+            });
+        });
+    };
+    let body = |note: usize| {
+        repository
+            .load_note(&notes[note].id)
+            .unwrap()
+            .unwrap()
+            .body_html
+    };
+    // The first image turns the item into a group holding media.
+    let grouped = |view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        pick(view, cx);
+        cx.run_until_parked();
+        redraw(cx);
+        cx.simulate_input("续");
+        redraw(cx);
+        manual_save(view, cx);
+        view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app))
+            .image_resource_id
+            .expect("first image")
+    };
+
+    let first = grouped(&view, cx);
+    assert_eq!(
+        body(0),
+        format!(
+            "<ul><li>一<img src=\":/{}\" alt=\"\"></li><li>续</li><li>二</li></ul>",
+            first.as_str()
+        )
+    );
+    pick(&view, cx);
+    cx.run_until_parked();
+    redraw(cx);
+    let probe = view.read_with(cx, |shell, app| shell.image_flow_probe_for_test(app));
+    assert!(probe.cache_has_resource, "the second image shows at once");
+    let second = probe.image_resource_id.expect("second image");
+    cx.simulate_input("再");
+    redraw(cx);
+    manual_save(&view, cx);
+    let saved = format!(
+        "<ul><li>一<img src=\":/{}\" alt=\"\"><img src=\":/{}\" alt=\"\"></li><li>再</li><li>续</li><li>二</li></ul>",
+        second.as_str(),
+        first.as_str()
+    );
+    assert_eq!(body(0), saved);
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    assert_eq!(
+        reopened.load_note(&notes[0].id).unwrap().unwrap().body_html,
+        saved
+    );
+
+    // A failed commit with nothing typed since: the grouped item comes back
+    // exactly, media and all, not flattened.
+    select(&view, cx, &notes[1].id);
+    grouped(&view, cx);
+    let before = body(1);
+    let release = view.update(cx, |shell, shell_cx| {
+        shell.stall_next_resource_commit_for_test(shell_cx)
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.fail_next_resource_commit_for_test("分组项插图提交失败", shell_cx);
+    });
+    pick(&view, cx);
+    cx.run_until_parked();
+    redraw(cx);
+    release.send(()).expect("release failed worker");
+    cx.run_until_parked();
+    redraw(cx);
+    manual_save(&view, cx);
+    assert_eq!(body(1), before);
+
+    // Typing in the new item before the failure keeps image and text and
+    // offers the manual retry.
+    select(&view, cx, &notes[2].id);
+    grouped(&view, cx);
+    let release = view.update(cx, |shell, shell_cx| {
+        shell.stall_next_resource_commit_for_test(shell_cx)
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.fail_next_resource_commit_for_test("分组项插图后输入再失败", shell_cx);
+    });
+    pick(&view, cx);
+    cx.run_until_parked();
+    redraw(cx);
+    cx.simulate_input("新项文字");
+    redraw(cx);
+    release.send(()).expect("release failed worker");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app))
+            .contains("新项文字")
+    );
+    assert!(
+        view.read_with(cx, |shell, _| shell.resource_notice_for_test())
+            .is_some_and(|notice| notice.contains("手动同步可重试"))
+    );
+}

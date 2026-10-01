@@ -1349,6 +1349,9 @@ struct StructuralPlan {
     start_index: usize,
     removed: SmallVec<[NodeId; 4]>,
     inserted_count: usize,
+    // Media inserts take several shapes (beside text, split, list item plus
+    // a new item); the committed block delta gives the replacement length.
+    inserted_from_delta: bool,
 }
 
 impl StructuralPlan {
@@ -2339,7 +2342,7 @@ impl Document {
                         .iter_range(bounds.start_index..bounds.end_index.saturating_add(1))
                         .map(|block| block.id),
                 );
-                plan.inserted_count = 3;
+                plan.inserted_from_delta = true;
                 Some(plan)
             }
             Transaction::EnsureParagraph { selection } => {
@@ -2570,6 +2573,15 @@ impl Document {
             None
         };
         let allocation_start = self.next_id;
+        let media_into_list = matches!(
+            &transaction,
+            Transaction::InsertImage { .. } | Transaction::InsertAttachment { .. }
+        ) && before.iter().any(|group| is_list_item_kind(&group.kind));
+        let new_item_id = if media_into_list {
+            Some(self.new_node_id()?)
+        } else {
+            None
+        };
         let parent_alignments: Vec<_> = before
             .iter()
             .map(|group| {
@@ -2719,6 +2731,14 @@ impl Document {
                 blocks: originals,
             }]);
         }
+        if let Some(new_item_id) = new_item_id {
+            self.follow_media_with_list_item(
+                &mut after,
+                &mut outcome,
+                allocation_start,
+                new_item_id,
+            );
+        }
         let remove = before
             .iter()
             .filter_map(|group| group.members.first().copied())
@@ -2753,7 +2773,7 @@ impl Document {
         let original_revision = self.revision;
         let original_next_id = self.next_id;
         let block_count_before = self.blocks.len();
-        let structural_plan = self.structural_plan_for(&transaction);
+        let mut structural_plan = self.structural_plan_for(&transaction);
         let numbering_range = self.numbering_range_for(&transaction);
         let (selection, changed_nodes, inverse, inserted_span) = match transaction {
             Transaction::RestoreInlineGroups { .. } => {
@@ -2912,6 +2932,13 @@ impl Document {
         // this transaction's committed revision. Each batch splice remains
         // local and explicit; layout replays it against its intermediate
         // order rather than reading final-document ordinals.
+        if let Some(plan) = structural_plan
+            .as_mut()
+            .filter(|plan| plan.inserted_from_delta)
+        {
+            plan.inserted_count =
+                (plan.removed.len() + self.blocks.len()).saturating_sub(block_count_before);
+        }
         let mut structural_splices = SmallVec::new();
         if let Some(splice) = structural_plan.and_then(|plan| plan.finish(&self.blocks)) {
             structural_splices.push(splice);
@@ -4501,13 +4528,13 @@ impl Document {
             // Nothing after the media: the right part is the new item.
             let mut item = right;
             item.kind = new_kind;
+            item.alignment = TextAlignment::Left;
             let id = item.id;
             blocks.push(item);
             id
         } else {
             members.push(right.id);
             let mut item = Block::text(new_item_id, new_kind, String::new());
-            item.alignment = right.alignment;
             item.quoted = right.quoted;
             blocks.push(right);
             blocks.push(item);
@@ -4545,6 +4572,79 @@ impl Document {
                 },
             ]),
         )
+    }
+
+    /// The grouped-item side of resource.ts insert: after media lands in an
+    /// li that already holds media, createNewListItemAfterCurrent still
+    /// adds a default li after the whole item and the caret goes there. An
+    /// empty text part the split left at the end of the group becomes that
+    /// item; otherwise a new one is inserted.
+    fn follow_media_with_list_item(
+        &mut self,
+        after: &mut [InlineGroup],
+        outcome: &mut ApplyOutcome,
+        allocation_start: u64,
+        new_item_id: NodeId,
+    ) {
+        let Some(group) = after.iter_mut().find(|group| {
+            is_list_item_kind(&group.kind)
+                && group.members.iter().any(|id| {
+                    id.raw() >= allocation_start
+                        && self.block(*id).is_some_and(|block| !is_text_block(block))
+                })
+        }) else {
+            return;
+        };
+        let new_kind = match group.kind {
+            BlockKind::CheckItem { depth, .. } => BlockKind::CheckItem {
+                depth,
+                checked: false,
+            },
+            ref kind => kind.clone(),
+        };
+        let last = *group.members.last().expect("non-empty group");
+        let quoted = self.block(last).is_some_and(|block| block.quoted);
+        let trailing_empty = last.raw() >= allocation_start
+            && group.members.len() > 1
+            && outcome.selection.head.node_id == last
+            && self
+                .block(last)
+                .is_some_and(|block| block.content.as_text() == Some(""));
+        let (index, item_id) = if trailing_empty {
+            group.members.pop();
+            let index = self.blocks.index_of_node(last).expect("live member");
+            let mut item = self.blocks[index].clone();
+            item.kind = new_kind;
+            item.alignment = TextAlignment::Left;
+            item.revision = self.revision;
+            self.blocks.replace(index, item);
+            (index, last)
+        } else {
+            let index = self.blocks.index_of_node(last).expect("live member") + 1;
+            let mut item = Block::text(new_item_id, new_kind, String::new());
+            item.quoted = quoted;
+            item.revision = self.revision;
+            self.blocks.insert(index, item);
+            outcome.structural_splices.push(StructuralSplice {
+                start_index: index,
+                removed: SmallVec::new(),
+                inserted: smallvec::smallvec![new_item_id],
+                inserted_revisions: smallvec::smallvec![self.revision],
+            });
+            outcome.structural = true;
+            outcome.inverse.0.insert(
+                0,
+                Transaction::RestoreBlocks {
+                    index,
+                    remove_count: 1,
+                    blocks: Vec::new(),
+                },
+            );
+            (index, new_item_id)
+        };
+        push_unique(&mut outcome.changed_nodes, item_id);
+        outcome.numbering_ranges.push(index..index + 1);
+        outcome.selection = Selection::caret(DocPoint::with_affinity(item_id, 0, Affinity::Before));
     }
 
     fn apply_insert_structural(
@@ -4671,14 +4771,10 @@ impl Document {
         let right_id = self.new_node_id()?;
         // resource.ts insert: in a list the resource joins the current li,
         // then createNewListItemAfterCurrent (list/li.ts) adds an empty li
-        // after it for the caret. An item already holding media keeps the
-        // existing group path.
-        let list_item = matches!(
-            self.blocks[start_index].kind,
-            BlockKind::BulletItem { .. }
-                | BlockKind::OrderedItem { .. }
-                | BlockKind::CheckItem { .. }
-        ) && !matches!(structural, StructuralInsert::Table(_))
+        // after it for the caret. An item already holding media goes through
+        // the group path (follow_media_with_list_item).
+        let list_item = is_list_item_kind(&self.blocks[start_index].kind)
+            && !matches!(structural, StructuralInsert::Table(_))
             && !self.is_inline_group_member(self.blocks[start_index].id);
         let new_item_id = if list_item {
             Some(self.new_node_id()?)
@@ -5007,6 +5103,13 @@ fn quote_aware_kind(block: &Block, kind: &BlockKind) -> (BlockKind, bool) {
         kind if super::codec::is_quotable_kind(kind) => (kind.clone(), true),
         kind => (kind.clone(), false),
     }
+}
+
+fn is_list_item_kind(kind: &BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::BulletItem { .. } | BlockKind::OrderedItem { .. } | BlockKind::CheckItem { .. }
+    )
 }
 
 fn is_text_block(block: &Block) -> bool {
