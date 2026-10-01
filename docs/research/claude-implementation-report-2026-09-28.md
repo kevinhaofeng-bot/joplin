@@ -1387,3 +1387,87 @@ rustfmt 只处理了本批改动；与 HEAD 相比，格式差异为 0。
 - **实机验收**：尚未进行。Codex 报告的 CUA Transport closed 问题仍然存在。
 
 没有安装，没有推送，没有改动原资料库、服务器或已安装的 App，也没有碰 Codex 的证据文档和 `replica-delivery-status.md`。
+
+## 第二十四批：选择器与拖放路由到单元格、单元格血统（evidence 76，`5891fe44b`）
+
+本批实现 evidence 76 的第 1–4 项。第 5 项“原生选择器能否真正显示”是独立关卡，本批只做了只读诊断，**不声称选择器原生通过**。
+
+### Evernote 对应
+
+源码根目录：`evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/`。
+
+- `resource/resource.ts` 345–387：
+  - 有坐标时（`caretLocationPluginKey` 的 coords，经 `posAtCoords` 换算），在坐标处插入；
+  - 否则用当前选区；
+  - 多单元格选区和不可分割节点另有分支（365–375，本项目没有对应路径）。
+- `dragdrop/plugin.ts`：
+  - 444–447：落点由 `posAtCoords(eventCoords(event))` 决定；
+  - 518–521：落在表格内时，节点直接 `replaceRangeWith` 进该单元格。
+- `resource/schema.ts` 992–1004 和 `table/schema.ts` 219–226：见第二十三批。
+
+### 实现与对应
+
+| 入口 | Evernote 行为 | 本项目实现 | 测试 |
+|---|---|---|---|
+| 图片按钮、菜单、选择器 | 在当前选区处插入 | `begin_resource_picker`：单元格在上次绘制时持有键盘焦点，就捕获单元格光标；否则捕获正文光标。再次打开选择器时，丢弃先前未用的锚点。原先的锚点被覆盖后会遗留在登记表中 | `picker_from_a_focused_cell_inserts_into_that_cell`（取消后无变化；打开两次时旧令牌失效、新令牌插入单元格；保存后表格之前的正文不变，全文只有 1 张图） |
+| 选择器完成前单元格已关闭 | — | 沿用 open 标志拒绝，提示可见 | `picker_completing_after_its_cell_closed_is_refused` |
+| 拖放到已打开的单元格 | 以坐标为准，放进该格 | 记录单元格编辑区的绘制边界（不建 hitbox 的 prepaint canvas）。落点在边界内时，取单元格编辑器在该点的位置；面板本身也接收拖放 | `drop_into_the_open_cell_goes_there_and_on_a_closed_cell_is_refused` |
+| 拖放到未打开的单元格 | 放进该格 | 本项目必须先打开单元格才能编辑其内容，所以拖到正文表格上时记录拒绝原因，松手时拒绝并提示“请先双击打开该单元格”。**修复前**，松手会退回正文光标插入，属于静默降级 | 同上（`record_drop_position` 后 `take_drop_intent` 为错误） |
+| 其他拖放 | 坐标处 | 沿用正文的落点逻辑 | 原有正文拖放测试 |
+
+**单元格血统**（evidence 74、76 第 3 项）：
+- **旧做法的反例**：原先用“同一坐标下单元格内容相等”作为血统。在全是空单元格的表格中，于目标上方插入一行，坐标 (2,1) 指向了另一个同样为空的格，图片因此被插进错误的行。这是红灯阶段 `cell_image_…identical_cells` 实测到的情况。
+- **新做法**：`TableCellEditor` 持有 `table_revision`，即表格块上次由本单元格写入或读取时的修订号。插入前比较正文表格块当前的修订号，不一致就拒绝，提示“单元格已移动或改变”。内容相等的检查保留，但只作为一致性校验，不再当作血统。
+- **修订号会前进的三种情况**都是本单元格自己的修改：本单元格的同步（`persist_table_cell_draft`）、插图安装后的正文表格、失败回滚后的同步。所以单元格内的普通输入不会导致误拒（测试中在暂存期间输入“字”，图片照常插入）。
+- **同一规则也用于单元格文字的同步**：表格已在别处改变时，单元格文字不写入可能已错位的格，单元格显示错误，用户按 Esc 放弃后重新打开即可（`cell_text_is_not_written_into_a_cell_that_moved_under_it`）。
+
+**合同第 4 项的明确测试**：
+- `encoded_image_and_foreign_fragment_with_its_file_paste_into_a_cell`：
+  - data URI 图片经 `classify_clipboard` 成为 `EncodedImage`，进入单元格；
+  - 外库 fragment 附带导出的文件，sha256 和大小都匹配，以本库的新 ID 导入单元格，原外库 ID 不出现在正文中，资源元数据存在。
+- `failed_commit_after_the_cell_closed_keeps_the_table_image_for_retry`：点“完成”关闭单元格后提交失败。图片只留在正文表格中，提示“手动同步可重试”；重试后图片保存进正文，资源元数据存在。
+
+### 红灯与负控
+
+**红灯**（实现前，`/tmp/joplin-claude-batch24-red/`）：
+- 失败的四项：选择器插入单元格、单元格关闭后的选择器、内容相同的结构变动、拖放进单元格。
+- 实现前已通过的三项：编码图像、外库带文件的 fragment、单元格关闭后提交失败。这三项记录的是现有行为，作为明确回归保留。
+
+**负控**（隔离副本，每个用例 60 秒闹钟）：
+
+| 控制 | 改动 | 结果 |
+|---|---|---|
+| A | 选择器忽略单元格焦点 | 两项选择器测试失败 |
+| B | 去掉修订号血统 | 内容相同的结构变动测试失败 |
+| C | 拖放不识别单元格边界 | 拖放测试失败 |
+| D | 拖到表格不拒绝 | 拖放测试失败 |
+| E | 单元格同步不校验修订号 | 错位单元格写入测试失败 |
+| F | 松手时忽略拒绝原因 | 拖放测试失败 |
+
+日志：A–E 在 `/tmp/joplin-claude-batch24-negative-controls.{sh,log}`，F 在 `/tmp/joplin-claude-batch24-negative-control-F.{sh,log}`。
+
+### 全量（工作区等同 `5891fe44b`，`--offline --locked`，20 分钟上限，退出码 0）
+
+- App：1523 通过、0 失败、2 忽略，15 秒（`/tmp/joplin-claude-batch24-gpui-full.log`）；
+- core：368 通过、0 失败（`/tmp/joplin-claude-batch24-core-full.log`；本批没有改动 core）。
+
+改动的文件中没有新增警告（与第二十三批日志对比）。rustfmt 只应用与本批改动行相交的格式块。
+
+### 原生选择器：只读诊断（不是修复，也不是通过）
+
+- **产品分派已到达 AppKit**：PID 42086 在 23:40:26 的断言调用栈中，`+[NSSavePanel _createPanel]` → `-[NSOpenPanel init…]` → `-[NSSavePanel _initBridgeAndStuff]`，发起帧是 joplin-lite 主队列任务，也就是 GPUI `prompt_for_paths` 在前台执行器中调用 `NSOpenPanel::openPanel`，再 `beginWithCompletionHandler`。因此按钮分派并没有缺失。
+- **断言前的系统日志**：面板服务 `com.apple.appkit.xpc.openAndSavePanelService` 在 23:40:24 记录了 `_LSBundleCreateNode … returned -43`（找不到文件）；之后客户端记录 “Advance to configuration phase semaphore timed out”，接着才是断言。
+- **LaunchServices 登记**（`lsregister -dump`，只读）：临时验收身份 `com.arielkevin.joplinlite.acceptance.oct1` 和 `…acceptance.media1001` 都带有 `in-temp-dir` 标志。打包脚本没有沙盒 entitlements，签名是 ad-hoc。
+- **推测，尚待 Codex 实机区分**：面板服务需要通过 LaunchServices 找到客户端 bundle。直接执行 `Contents/MacOS/joplin-lite`、bundle 位于临时目录、或者改过身份后重签，都可能让这一步查找失败。Codex 正在验证经 LaunchServices 启动的情形；最新签名包直接执行时同样会断言。
+- 没有修改 GPUI 或打包脚本。cfg(test) 的选择器接缝不能证明 NSOpenPanel 能显示。
+
+### 剩余合同（明确未完成）
+
+- **原生选择器**：未通过，根因待实机区分（见上）。
+- **拖放到未打开的单元格**：会拒绝并提示，而 Evernote 会直接放进该格。本项目要先打开单元格，并且需要拿到落点在单元格文字中的偏移，才能做到，尚未实现。
+- **落在已打开单元格内的文字偏移**：取自单元格编辑器的 `point_from_layout`。测试中，单元格编辑器布局块的 y 坐标（约 174）与面板实际绘制位置（约 320–480）不一致，所以光标的精确落点尚未单独核实；只核实了图片进入了该单元格。这种坐标差异也可能影响单元格内的点击定位，需要单独排查。
+- **焦点判断**：取自单元格上一次绘制时的焦点状态。焦点变化后如果尚未重绘就触发菜单，可能按旧焦点路由。
+- **表格在别处改变后**：单元格只给出错误、拒绝写入，不会自动重新定位到原来的格。
+- **沿用之前的缺项**：多单元格选区、表格附件、复杂单元格块、网页图片粘贴到单元格、解码缓存的实机测量。
+
+没有安装，没有推送，没有改动原资料库、服务器、默认 profile 或已安装的 App，也没有碰 Codex 的 evidence 74–76 和 `replica-delivery-status.md`。
