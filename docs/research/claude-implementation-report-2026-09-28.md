@@ -1284,3 +1284,106 @@ rustfmt 只处理了本批改动；与 HEAD 相比，格式差异为 0。
 - 产品整体尚未完成：迁移视觉验收、多模态、NAS 常驻、内存峰值、最终安装包等关卡都还没有进行。
 
 没有安装，没有推送，没有改动原资料库，也没有碰 Codex 的证据文档和 `replica-delivery-status.md`。
+
+## 第二十三批：表格单元格粘贴图片（evidence 72，`d98fb960c`）
+
+本批实现 evidence 72 中“聚焦单元格粘贴图片”这一项，**不是完整的表格资源复刻**。剩余合同见文末。
+
+### Evernote 对应
+
+源码根目录：`evernote-11.32.5/common-editor-sourcemap/@evernote/common-editor/src/apps/peso/modules/`。
+
+- `table/schema.ts` 219–226：th/td 的内容为 `tablecontent+`，并且是 isolating、unsplittable。
+- `resource/schema.ts` 992–1004：image 是 atom，group 含 `tablecontent`，所以单元格可以直接容纳图片。
+- `resource/resource.ts`：
+  - 295–296：`validResourceInsertPos` 只要求父节点能容纳资源（td 能容纳 image），unsplittable 不影响单元格内的 p。
+  - 298–341：`insertResourceAtPosition` 的分支照常适用于单元格内的 p：空段替换、段首插在前、段尾插在后、段中拆分。
+  - 377–387：选区非空时用 `replaceSelectionWith` 替换选区。
+  - 400–406：插入后光标进入下一个文本块，没有时补一个空 p。
+  - 365–375：多单元格选区（CellSelection）、unsplittable 祖先节点的分支，**本批未实现**，见剩余项。
+
+结论：单元格内插图后，td 的内容是 `[p一, image, p后]`。本项目单元格 canonical 用 `<br>` 分隔段落（`table_cell_inlines`），所以保存为 `<td>一<br><img …><br>后</td>`；在段尾插图时，用于放置光标的空 p 保存为结尾的 `<br>`。
+
+### 实现（沿用原有资源链，不改粘为正文）
+
+**意图捕获**（`paste_into_table_cell`）：图像、候选图像、编码图像、单个文件、多个候选文件，都在单元格编辑器中捕获锚点，生成 `InsertIntent { cell: CellInsertTarget }`，然后交给原有的 `complete_resource_request`。所以写入方栅栏、排队、暂存 worker、只读检查都与正文相同。
+
+**单元格身份**（Codex 审查后补充）：
+- `CellInsertTarget` 同时持有三样东西：编辑器的弱引用；一个 `open` 标志，在 `TableCellEditor` 被丢弃时清零，所以即使有人仍持有旧的实体也能识别；表格位置（节点、行、列）。
+- 在写入任何内容之前，先校验正文中该单元格的 inline 与单元格编辑器的导出一致。这可以拦住“上方插入或删除了行，坐标仍然有效，但指向了另一格”的情况。
+
+**插入**（`prepare_cell_resource_insert`）：
+1. 先把资源加入会话的允许列表，再修改单元格。这样壳层观察者同步单元格草稿时，已经允许这个资源。
+2. 单元格编辑器执行 `InsertImage`，在单元格历史中只占一步撤销，并以 `register_unavailable_image` 立即显示占位。
+3. 用新的单元格内容构造正文的 `ReplaceTable` 预备提交，资源快照携带的就是这份正文。
+4. 任一步失败，都回滚单元格并恢复允许列表。
+
+**成功后**：正文和单元格编辑器都注册已物化的图片。
+
+**失败时**（`rollback_cell_resource`）：
+- 先对单元格执行原有的乐观回滚，会重放之后的输入。
+- 回滚成功后，同步回正文表格，并调用 `forget_table_resource`，从正文历史中**所有**表格快照里剔除这张图。快照有两种形式：`ReplaceTable` 本身，以及它的逆操作——携带整个表格块的 `RestoreBlocks`。这样正文中逐步撤销或重做，都不会把未入库的图片带回来。
+- 如果之后的输入无法重放（输入发生在插入时新建的段里），就保留暂存的资源和单元格目标，显示“手动同步可重试”。重试成功后，正文和单元格都会显示这张图。
+
+**其他**：
+- 正文回滚和重试判断资源是否仍在文档中时，改用 `references_resource`，会检查表格单元格。原先只看块级内容，会把表格中的图片误判为“已删除”。
+- **同库 fragment**：沿用正文的同库校验，同库资源按 sha256 和已校验文件确认，跨库资源用导出的文件导入。抽取为 `fragment_resources`。既不在本库、复制时也没有导出文件的资源不会粘贴（不会只复制 ID），并给出提示。
+- **单元格打开**：`table_cell_blocks` 是 `table_cell_inlines` 的精确反函数：独占一段的图片还原为图片块，其余部分还原为段落。这样打开再保存不会改变内容。修复前，重开后换行会翻倍。
+- **单元格图片缓存**：改为单元格独有，预算 16 MiB。
+- **表格持久化加载**：跳过正在提交，以及已失败、等待重试的资源。
+
+### 挂起问题（Codex 采样 `/tmp/joplin-cell-test-spin-oct1.sample.txt`）
+
+- **现象**：第一次运行单元格测试时，测试进程空转，CPU 约 395%，持续 7 分钟以上。该次运行由我在后台启动，管道过滤后只留下 `/tmp/joplin-claude-cell-image-spin-run1.log`，里面没有测试输出，这是我的失误。之后改为保留完整日志，并给每个用例加 60 秒闹钟。在单元格仍共用缓存的版本上，`image_pasted_into_…` 和原有的 `cmd_v_in_a_clicked_cell_…` 两项都以 `exit=142`（闹钟）终止，挂起复现。
+- **根因**：正文和单元格编辑器的表面共用一个 `BudgetedImageCache`。每次绘制，`set_visible_resources` 会**整体替换**可见集合，并按各自的尺寸请求解码边长；随后 `evict_offscreen` 逐出“对自己不可见”的条目。同一张图在正文表格和单元格中同时显示时，两个表面轮流逐出对方的条目、轮流改边长，于是不停地重新加载、notify、重绘。
+- **修复**：单元格编辑器使用独立的缓存实体。负控 E（改回共享缓存）在 60 秒时再次被闹钟终止（`exit=142`）。
+
+### 测试（`ui/table_cell_editor_tests.rs`，挂载测试，真实 Cmd‑V 剪贴板）
+
+| 测试 | 覆盖内容 |
+|---|---|
+| `image_pasted_into_a_cell_is_stored_and_shows_in_that_cell` | 不进入正文队列；图片在单元格编辑器中，也在正文表格中；接着输入“后”，按 Tab 换格；正文表格绘制出已加载像素的这张图；保存为 `<td>一<br><img …><br>后</td>`；全文只有 1 张图，表格之前的正文不变；资源元数据和已校验文件都存在；用新仓库和 `NoteSession::prepare` 能重开；再次打开并提交单元格，内容逐字不变 |
+| `cmd_v_in_a_clicked_cell_pastes_into_that_cell_not_the_body`（原有测试，改了期望值，未删除） | 原测试断言拒绝图片，现在改为断言图片插入该单元格：`一粘贴丙<strong>粗</strong><br><img …><br>`；文字、fragment 粘贴和 Tab 换格的断言保持不变 |
+| `failed_cell_image_commit_takes_the_image_out_of_cell_table_and_history` | 提交失败，之后没有输入：单元格和正文表格都恢复为“一”；失败提示可见；正文中**每一步**撤销和重做都不会引用这张图；保存结果中没有图片 |
+| `failed_cell_image_commit_after_typing_keeps_both_and_retries` | 插图后输入“后”再失败：单元格和表格中的内容一致，都保留图片和“后”；提示“手动同步可重试”；手动同步后保存为 `<td>一<br><img …><br>后</td>`；单元格编辑器中这张图已物化 |
+| `cell_image_undo_redo_and_exact_selection` | 选中“甲乙丙”中的“乙”后粘贴，图片替换选区；之后输入；Cmd‑Z 两次，单元格和表格都回到“甲乙丙”；Cmd‑Shift‑Z 两次后保存为 `<td>甲<br><img …><br>后丙</td>` |
+| `cell_image_arriving_after_the_cell_closed_lands_nowhere` | 暂存期间按 Escape 关闭单元格，测试**继续持有旧实体**，然后用新实体重开同一格；图片完成后，新旧两个实体都没有图片，提示可见，正文没有图片 |
+| `cell_image_refuses_a_moved_cell_a_switched_note_and_open_composition` | 三个场景：<br>• 单元格保持打开时在上方插入一行：拒绝，提示“单元格已移动或改变”；<br>• 回调到达时单元格中有未确认的输入法组合：拒绝，提示“输入法组合文本尚未确认”；<br>• 暂存期间切换笔记：切换会等待进行中的资源（与正文相同），图片落在原笔记的原单元格，另一篇笔记不受影响 |
+| `tiff_pasted_into_a_cell_is_stored_as_an_image` | TIFF 剪贴板图像保存为图片 |
+| `fragment_image_from_this_library_pastes_into_a_cell` | 同库 fragment 的图片进入单元格，保存为 `甲图<br><img …>`；只有 ID、没有文件的外库资源不粘贴，提示“1 个图片或附件未粘贴” |
+
+### 负控（隔离副本，`/tmp/joplin-claude-batch23-negative-controls.{sh,log}`，每个用例有 60 秒闹钟）
+
+| 控制 | 改动 | 结果 |
+|---|---|---|
+| A | 拒绝单元格插图 | 插图、TIFF、撤销与选区三项失败 |
+| B | 忽略 open 标志 | 持有旧实体的迟到测试失败 |
+| C | 去掉血统校验 | 移动单元格测试失败 |
+| D | 不跳过正在提交的资源 | 两项失败测试的提示被持久化加载警告覆盖，失败 |
+| E | 共享图片缓存 | 闹钟终止，挂起 |
+| F | 单元格按单个段落打开 | 重开后换行翻倍，失败 |
+| G | 历史不剔除资源 | 第一次运行时测试没有抓到（只检查了撤销到底和重做到底两个端点）。改为逐步检查后，测试抓到了一个**真实残留**：`ReplaceTable` 的逆操作 `RestoreBlocks` 中仍带着这张图，记录为 `[false, true, false]`。修复后单独重跑控制 G，失败（`/tmp/joplin-claude-batch23-negative-control-G.log`） |
+
+### 全量（工作区等同 `d98fb960c`，均 `--offline --locked`，App 加 20 分钟上限，退出码 0）
+
+- App：1516 通过、0 失败、2 忽略，16 秒（`/tmp/joplin-claude-batch23-gpui-full.log`）；
+- core：368 通过、0 失败（`/tmp/joplin-claude-batch23-core-full.log`）。
+
+改动的文件中没有新增编译警告（与第二十二批日志逐条对比）。rustfmt 只处理了本批的格式块：`core.rs` 在 HEAD 没有格式差异，所以整文件格式化；其余三个文件只应用与本批改动行相交的格式块。
+
+### 剩余合同（明确未完成，不称完整表格复刻）
+
+- **多单元格选区**（resource.ts 365–375，`isCellSelection` 多格）：本项目的单元格编辑器只编辑一格，没有对应路径。
+- **表格附件块**：单元格中粘贴非图片文件，会明确拒绝并提示“单元格中只能插入图片；附件请插入正文”，已暂存的字节不入库。单元格内的附件卡片尚未实现。
+- **列表、引用等复杂单元格结构**：未实现。
+- **网页 HTML 中的图片粘贴到单元格**：仍明确拒绝，提示“单元格暂不能粘贴网页中的图片”。正文的远程图片抓取链没有接到单元格。
+- **工具栏或菜单“插入图片”、Finder 拖放到单元格**：仍走正文意图，没有接到单元格。单元格打开时用工具栏插图，图片会进入正文的光标位置。这条需要单独处理。
+- **`PasteIntent::EncodedImage`**：与其他图像共用同一个分派分支，但没有单独的挂载测试。TIFF 测试经由 gpui 剪贴板，走的是 Image 路径。
+- **跨库但带导出文件的 fragment**：沿用正文的导入，单元格中未单独测试。
+- **单元格已关闭时提交失败**：此时图片只在正文表格里，按正文的 fail-closed 规则保留暂存，可手动重试。这条路径没有单独测试。
+- **重开同一格得到新实体时**：迟到的图片按设计拒绝，不写入新实体。这是保守选择，需要用户重新粘贴。
+- **保存形状**：单元格中的段落用 `<br>` 表示，没有使用 Evernote ENML 的 `<div>`/`<en-media>` 结构。这沿用现有的单元格 canonical 约定，没有改变。
+- **单元格图片缓存**：每个打开的单元格额外占用最多 16 MiB 解码预算，单元格关闭时释放。
+- **实机验收**：尚未进行。Codex 报告的 CUA Transport closed 问题仍然存在。
+
+没有安装，没有推送，没有改动原资料库、服务器或已安装的 App，也没有碰 Codex 的证据文档和 `replica-delivery-status.md`。
