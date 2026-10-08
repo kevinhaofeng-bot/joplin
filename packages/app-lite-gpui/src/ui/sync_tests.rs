@@ -719,6 +719,56 @@ async fn an_unsaved_edit_overtaken_by_a_sync_is_kept_as_a_conflict_copy(cx: &mut
 }
 
 #[gpui::test]
+async fn long_conflict_titles_keep_open_and_settle_controls_inside_the_visible_panel(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture();
+    let original = fixture.repository.create_note(CreateNote {
+        title: "同步292：共享图文以及较长的中文笔记标题，两个版本都必须保留".into(),
+        notebook_id: None,
+        document: text("远端版本"),
+    }).unwrap();
+    let copy = fixture.repository.save_overtaken_edit_as_conflict_copy(
+        &original.id,
+        original.revision,
+        &original.title,
+        &text("需要打开查看的本地冲突版本"),
+    ).unwrap();
+    let other = fixture.repository.create_note(CreateNote {
+        title: "当前打开的另一篇".into(),
+        notebook_id: None,
+        document: text("不应被冲突操作覆盖"),
+    }).unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::SelectNote(other.id.clone()), window, shell_cx);
+    }));
+    cx.dispatch_action(crate::app::ShowSyncFailures);
+    redraw(cx);
+    let panel = cx.debug_bounds("sync-failures").unwrap();
+    for selector in ["sync-conflict-open-0", "sync-conflict-settle-0"] {
+        let button = cx.debug_bounds(selector).unwrap();
+        assert!(
+            button.left() >= panel.left() && button.right() <= panel.right()
+                && button.top() >= panel.top() && button.bottom() <= panel.bottom(),
+            "{selector} must remain wholly visible/clickable with a long title: panel={panel:?}, button={button:?}",
+        );
+    }
+    click("sync-conflict-open-0", cx);
+    let selected = view.read_with(cx, |shell, app| {
+        shell.model.read(app).navigation().selected_note_id().cloned()
+    });
+    assert_eq!(selected, Some(copy.id.clone()), "actual click opens the conflict copy");
+    let before = fixture.repository.load_note(&copy.id).unwrap().unwrap();
+    click("sync-conflict-settle-0", cx);
+    assert!(fixture.repository.sync_conflicts().unwrap().is_empty());
+    let after = fixture.repository.load_note(&copy.id).unwrap().unwrap();
+    assert_eq!((after.title, after.body_html, after.revision),
+               (before.title, before.body_html, before.revision),
+               "settling is not deleting or editing the copy");
+}
+
+#[gpui::test]
 async fn a_sync_that_leaves_the_open_note_alone_keeps_its_unsaved_edit(cx: &mut TestAppContext) {
     let fixture = fixture();
     fixture.configure(TOKEN);

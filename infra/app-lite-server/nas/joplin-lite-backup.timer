@@ -1,0 +1,11 @@
+[Unit]
+Description=Joplin Lite hourly encrypted backup schedule
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+Unit=joplin-lite-backup.service
+
+[Install]
+WantedBy=timers.target

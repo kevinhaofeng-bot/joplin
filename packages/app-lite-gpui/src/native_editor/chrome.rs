@@ -546,6 +546,8 @@ fn toolbar_width_cost(command: EditorCommand) -> f32 {
     match command {
         EditorCommand::Paragraph => 78.0,
         EditorCommand::InsertImage | EditorCommand::Link => 58.0,
+        // 32px main button + 4px gap + 16px dropdown; retain 2px breathing room.
+        EditorCommand::Highlight => 54.0,
         EditorCommand::AlignLeft | EditorCommand::AlignCenter | EditorCommand::AlignRight => 62.0,
         _ => 50.0,
     }

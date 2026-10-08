@@ -1,0 +1,18 @@
+[Unit]
+Description=Joplin Lite checked online snapshot to encrypted restic
+Requires=joplin-lite-sync.service
+After=joplin-lite-sync.service
+RequiresMountsFor=/volume1/Projects/joplin-lite-runtime
+
+[Service]
+Type=oneshot
+EnvironmentFile=/volume1/Projects/joplin-lite-runtime/secrets/backup.env
+ExecStart=/bin/bash /volume1/Projects/joplin-lite-runtime/bin/scheduled-backup.sh /volume1/Projects/joplin-lite-runtime/data /volume1/Projects/joplin-lite-runtime/backup-work /volume1/Projects/joplin-lite-runtime/bin/backup.sh
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/volume1/Projects/joplin-lite-runtime/backups /volume1/Projects/joplin-lite-runtime/backup-work

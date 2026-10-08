@@ -1,10 +1,7 @@
 // Scalar is the fallback on x86/x86_64 (when no SIMD detected) and is used
 // as the reference implementation in cross_validate_backends tests on all
 // architectures.
-#[cfg(any(
-    not(target_arch = "aarch64"),
-    test,
-))]
+#[cfg(any(not(target_arch = "aarch64"), test,))]
 pub mod scalar;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -219,8 +216,10 @@ mod tests {
         let scalar = scalar::transpose_64(&data);
 
         for bit in 0..8 {
-            assert_eq!(bp.planes[bit], scalar.planes[bit],
-                "select_transpose() result differs from scalar at plane {bit}");
+            assert_eq!(
+                bp.planes[bit], scalar.planes[bit],
+                "select_transpose() result differs from scalar at plane {bit}"
+            );
         }
     }
 }

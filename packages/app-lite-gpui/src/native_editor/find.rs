@@ -8,9 +8,11 @@ use std::{
     ops::Range,
 };
 
+use app_lite_core::document::Inline;
 use regex::RegexBuilder;
 
-use super::model::{Document, NodeId};
+use super::model::{BlockContent, Document, NodeId};
+use super::table_layout::{MEDIA_SOURCE_LEN, cell_inlines};
 
 /// Bound the query before regex compilation. Find is intentionally literal,
 /// and a longer string is not useful as an interactive in-note query; the
@@ -36,10 +38,21 @@ impl std::fmt::Display for FindError {
 
 impl std::error::Error for FindError {}
 
+/// A cell of a table block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TableCellRef {
+    pub row: usize,
+    pub column: usize,
+}
+
+/// One literal match. In a text block `utf8_range` is in the block's text;
+/// in a table (`cell` set) it is in that cell's source offsets, the same
+/// coordinates its measured layout uses (see `table_layout::MEDIA_SOURCE_LEN`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FindMatch {
     pub node_id: NodeId,
     pub utf8_range: Range<usize>,
+    pub cell: Option<TableCellRef>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,15 +145,15 @@ impl FindState {
             self.text_order = document
                 .blocks()
                 .iter()
-                .filter(|block| block.content.as_text().is_some())
+                .filter(|block| is_searchable(&block.content))
                 .map(|block| block.id)
                 .collect();
         }
 
         for block in document.blocks() {
-            let Some(text) = block.content.as_text() else {
+            if !is_searchable(&block.content) {
                 continue;
-            };
+            }
             if self
                 .blocks
                 .get(&block.id)
@@ -160,13 +173,7 @@ impl FindState {
                 .matcher
                 .as_ref()
                 .expect("non-empty find query always owns a compiled matcher");
-            let matches = matcher
-                .find_iter(text)
-                .map(|matched| FindMatch {
-                    node_id: block.id,
-                    utf8_range: matched.start()..matched.end(),
-                })
-                .collect::<Vec<_>>();
+            let matches = block_matches(block.id, &block.content, matcher);
             self.total = self
                 .total
                 .saturating_sub(old_count)
@@ -310,6 +317,24 @@ impl FindState {
             })
     }
 
+    /// Every match in one block (a table's, cell by cell), each with whether
+    /// it is the primary.
+    pub fn matches_for_node(&self, node_id: NodeId) -> impl Iterator<Item = (&FindMatch, bool)> {
+        let primary = self.primary;
+        self.blocks
+            .get(&node_id)
+            .into_iter()
+            .flat_map(move |cached| {
+                cached
+                    .matches
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, found)| {
+                        (found, primary == Some(FindCursor { node_id, index }))
+                    })
+            })
+    }
+
     fn first_cursor(&self) -> Option<FindCursor> {
         self.text_order.iter().find_map(|node_id| {
             self.blocks.get(node_id).and_then(|cached| {
@@ -355,10 +380,10 @@ impl FindState {
             .iter()
             .position(|current| current == previous)
             .or_else(|| {
-                cached
-                    .matches
-                    .iter()
-                    .position(|current| current.utf8_range.start >= previous.utf8_range.start)
+                cached.matches.iter().position(|current| {
+                    (current.cell, current.utf8_range.start)
+                        >= (previous.cell, previous.utf8_range.start)
+                })
             })
             .or_else(|| cached.matches.len().checked_sub(1))
             .map(|index| FindCursor {
@@ -386,11 +411,82 @@ impl FindState {
 fn same_text_order(document: &Document, previous: &[NodeId]) -> bool {
     let mut previous = previous.iter().copied();
     for block in document.blocks() {
-        if block.content.as_text().is_some() && previous.next() != Some(block.id) {
+        if is_searchable(&block.content) && previous.next() != Some(block.id) {
             return false;
         }
     }
     previous.next().is_none()
+}
+
+/// Text blocks, and tables for the text their cells show.
+fn is_searchable(content: &BlockContent) -> bool {
+    content.as_text().is_some() || matches!(content, BlockContent::Table(_))
+}
+
+fn block_matches(
+    node_id: NodeId,
+    content: &BlockContent,
+    matcher: &regex::Regex,
+) -> Vec<FindMatch> {
+    if let Some(text) = content.as_text() {
+        return matcher
+            .find_iter(text)
+            .map(|matched| FindMatch {
+                node_id,
+                utf8_range: matched.start()..matched.end(),
+                cell: None,
+            })
+            .collect();
+    }
+    let BlockContent::Table(table) = content else {
+        return Vec::new();
+    };
+    // Each cell's text in reading order, as Evernote's find walks into
+    // table cells (utils/model.ts getTextRangesFromRanges): adjacent text
+    // joins across marks, while a line break, an image or an attachment
+    // ends a run, and no run continues into another cell.
+    let mut matches = Vec::new();
+    for row in 0..table.rows.len() {
+        for column in 0..table.column_count() {
+            let cell = TableCellRef { row, column };
+            for (start, text) in cell_text_runs(&cell_inlines(table, row, column)) {
+                matches.extend(matcher.find_iter(&text).map(|matched| FindMatch {
+                    node_id,
+                    utf8_range: start + matched.start()..start + matched.end(),
+                    cell: Some(cell),
+                }));
+            }
+        }
+    }
+    matches
+}
+
+/// A cell's searchable runs and where each starts in its source offsets.
+fn cell_text_runs(inlines: &[Inline]) -> Vec<(usize, String)> {
+    let mut runs = Vec::new();
+    let mut source = 0;
+    let mut start = 0;
+    let mut text = String::new();
+    for inline in inlines {
+        let skip = match inline {
+            Inline::Text { text: run, .. } => {
+                text.push_str(run);
+                source += run.len();
+                continue;
+            }
+            Inline::SoftBreak => 1,
+            Inline::Image { .. } | Inline::Attachment { .. } => MEDIA_SOURCE_LEN,
+        };
+        if !text.is_empty() {
+            runs.push((start, std::mem::take(&mut text)));
+        }
+        source += skip;
+        start = source;
+    }
+    if !text.is_empty() {
+        runs.push((start, text));
+    }
+    runs
 }
 
 fn literal_matcher(query: &str, case_sensitive: bool) -> Result<regex::Regex, FindError> {

@@ -16,6 +16,7 @@ use tar::{Archive, EntryType};
 use thiserror::Error;
 
 mod enex;
+mod cancellable_read;
 pub use enex::*;
 mod enml;
 pub use enml::*;
@@ -35,6 +36,10 @@ mod import_commit;
 pub use import_commit::*;
 mod library_backup;
 pub use library_backup::*;
+mod restore_staging;
+pub use restore_staging::cleanup_abandoned_restore_staging;
+mod import_staging;
+pub use import_staging::cleanup_abandoned_import_staging;
 mod library_readable_export;
 pub use library_readable_export::*;
 
@@ -50,6 +55,8 @@ const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum JexScanError {
+    #[error("JEX scan cancelled")]
+    Cancelled,
     #[error("cannot read JEX archive: {0}")]
     Io(#[from] io::Error),
     #[error("unsafe archive path: {0}")]
@@ -232,8 +239,27 @@ struct PhysicalResource {
 /// Metadata files are bounded at [`MAX_JEX_ITEM_BYTES`]. Resource files are
 /// hashed in fixed-size chunks and bounded at [`MAX_JEX_RESOURCE_BYTES`].
 pub fn scan_jex_archive(path: impl AsRef<Path>) -> Result<JexScanReport, JexScanError> {
+    scan_jex_archive_with_cancel(path, None)
+}
+
+fn scan_jex_archive_with_cancel(
+    path: impl AsRef<Path>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<JexScanReport, JexScanError> {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    if cancelled() {
+        return Err(JexScanError::Cancelled);
+    }
+    let result = scan_jex_archive_inner(path, cancel);
+    if cancelled() { Err(JexScanError::Cancelled) } else { result }
+}
+
+fn scan_jex_archive_inner(
+    path: impl AsRef<Path>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<JexScanReport, JexScanError> {
     let file = File::open(path)?;
-    let mut archive = Archive::new(file);
+    let mut archive = Archive::new(cancellable_read::CancellableRead::new(file, cancel));
     let mut report = JexScanReport::default();
     let mut seen_paths = BTreeSet::new();
     let mut seen_ids = BTreeSet::new();

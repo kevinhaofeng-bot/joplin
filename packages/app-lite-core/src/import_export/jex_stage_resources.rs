@@ -241,6 +241,7 @@ pub(super) fn import_one(
     source: &JexScannedResource,
     repo: &LibraryRepository,
     audit: &Connection,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(JexStagedResource, JexVerifiedResource, Vec<&'static str>), JexStageError> {
     let raw = prepared.raw_item(&source.source_id)?.ok_or_else(|| {
         JexStageError::Verification("verified resource metadata disappeared".into())
@@ -260,8 +261,15 @@ pub(super) fn import_one(
     let (fields, changes) = normalize_metadata(&raw, source.byte_count, &prefix)?;
     let size = usize::try_from(source.byte_count)
         .map_err(|_| unsupported(&source.source_id, "resource exceeds addressable size"))?;
-    let destination_id =
-        repo.import_resource_reader(file, size, &fields.title, &fields.mime, &fields.extension)?;
+    let imported = repo.import_resource_reader(
+        super::super::cancellable_read::CancellableRead::new(file, cancel),
+        size,
+        &fields.title,
+        &fields.mime,
+        &fields.extension,
+    );
+    super::check_cancel(cancel)?;
+    let destination_id = imported?;
     let stored = repo
         .resource_metadata(&destination_id)?
         .ok_or_else(|| JexStageError::Verification("stored resource metadata missing".into()))?;

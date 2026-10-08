@@ -37,6 +37,179 @@ fn mount_shell<'a>(
     cx.add_window_view(move |window, cx| LibraryShell::new(model, None, window, cx))
 }
 
+async fn navigate_between_two_notebooks_from_user_entry(
+    use_keyboard: bool,
+    cx: &mut TestAppContext,
+) {
+    // Catches the existing reducer being unreachable from the product, or a
+    // UI callback choosing SelectNote rather than the complete history entry.
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let first_book = repository.create_notebook("前一容器", None).unwrap();
+    let second_book = repository.create_notebook("后一容器", None).unwrap();
+    let first = repository.create_note(CreateNote {
+        title: "前一篇".into(), notebook_id: Some(first_book.id.clone()),
+        document: document("前一篇完整正文"),
+    }).unwrap();
+    let second = repository.create_note(CreateNote {
+        title: "后一篇".into(), notebook_id: Some(second_book.id.clone()),
+        document: document("后一篇完整正文"),
+    }).unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(760.0)));
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        for (book, note) in [(&first_book.id, &first.id), (&second_book.id, &second.id)] {
+            shell.apply_action(AppAction::NavigateTo {
+                route: LibraryRoute::Notebook(book.clone()), selected_note_id: Some(note.clone()),
+            }, window, shell_cx);
+        }
+    }));
+    redraw(cx);
+    if use_keyboard {
+        cx.simulate_keystrokes("cmd-[");
+    } else {
+        let bounds = cx.debug_bounds("library-navigate-back").expect("visible history Back button");
+        cx.simulate_click(bounds.center(), Modifiers::default());
+    }
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(model.navigation().route(), &LibraryRoute::Notebook(first_book.id.clone()));
+        assert_eq!(model.navigation().selected_note_id(), Some(&first.id));
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&first.id));
+        assert_eq!(shell.note_session.as_ref().unwrap().read(app).editor().read(app).copy_all_plain_text(), "前一篇完整正文");
+    });
+    if use_keyboard {
+        cx.simulate_keystrokes("cmd-]");
+    } else {
+        let bounds = cx.debug_bounds("library-navigate-forward").expect("visible history Forward button");
+        cx.simulate_click(bounds.center(), Modifiers::default());
+    }
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(model.navigation().route(), &LibraryRoute::Notebook(second_book.id.clone()));
+        assert_eq!(model.navigation().selected_note_id(), Some(&second.id));
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&second.id));
+        assert_eq!(shell.note_session.as_ref().unwrap().read(app).editor().read(app).copy_all_plain_text(), "后一篇完整正文");
+    });
+    assert_eq!(repository.load_note(&first.id).unwrap().unwrap().revision, first.revision);
+    assert_eq!(repository.load_note(&second.id).unwrap().unwrap().revision, second.revision);
+}
+
+#[gpui::test]
+async fn mounted_user_history_buttons_restore_notebook_and_note(cx: &mut TestAppContext) {
+    navigate_between_two_notebooks_from_user_entry(false, cx).await;
+}
+
+#[gpui::test]
+async fn mounted_user_history_shortcuts_restore_notebook_and_note(cx: &mut TestAppContext) {
+    navigate_between_two_notebooks_from_user_entry(true, cx).await;
+}
+
+#[gpui::test]
+async fn mounted_user_history_back_accepts_typing_without_reclicking_editor(cx: &mut TestAppContext) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let first_book = repository.create_notebook("焦点前容器", None).unwrap();
+    let second_book = repository.create_notebook("焦点后容器", None).unwrap();
+    let first = repository.create_note(CreateNote {
+        title: "前一篇焦点".into(), notebook_id: Some(first_book.id.clone()), document: document("firstbody"),
+    }).unwrap();
+    let second = repository.create_note(CreateNote {
+        title: "后一篇焦点".into(), notebook_id: Some(second_book.id.clone()), document: document("secondbody"),
+    }).unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(760.0)));
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        // Ordinary card selection replaces the current history entry. Use
+        // two real container destinations, as the native Back scenario does.
+        for (book, note) in [(&first_book.id, &first.id), (&second_book.id, &second.id)] {
+            shell.apply_action(AppAction::NavigateTo {
+                route: LibraryRoute::Notebook(book.clone()), selected_note_id: Some(note.clone()),
+            }, window, shell_cx);
+        }
+    }));
+    redraw(cx);
+    let back = cx.debug_bounds("library-navigate-back").unwrap();
+    cx.simulate_click(back.center(), Modifiers::default());
+    redraw(cx);
+    // The user's next keystroke is sent to the window, not injected into an
+    // editor entity. A correct note ID without input focus is not usable.
+    cx.simulate_input("nav294typed");
+    redraw(cx);
+    cx.update(|window, app| view.read_with(app, |shell, app| {
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&first.id));
+        let editor = shell.note_session.as_ref().unwrap().read(app).editor().read(app);
+        assert!(editor.copy_all_plain_text().contains("nav294typed"), "Back must accept the immediate next input without an editor click");
+        assert!(editor.focus_handle().is_focused(window));
+    }));
+    assert_eq!(repository.load_note(&second.id).unwrap().unwrap(), second, "navigation/input must not write into the departed note");
+}
+
+#[gpui::test]
+async fn mounted_user_history_forward_search_mounts_matching_body_and_focus(cx: &mut TestAppContext) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let first = repository.create_note(CreateNote {
+        title: "搜索前的A".into(), notebook_id: None, document: document("firstordinarybody"),
+    }).unwrap();
+    let second = repository.create_note(CreateNote {
+        title: "搜索命中B".into(), notebook_id: None, document: document("uniquesearch294body"),
+    }).unwrap();
+    repository.process_search_jobs().unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(760.0)));
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::SelectNote(first.id.clone()), window, shell_cx);
+    }));
+    redraw(cx);
+    view.update(cx, |shell, shell_cx| shell.model.update(shell_cx, |model, model_cx| {
+        let query_text = "uniquesearch294body";
+        let mut query = SearchQuery::parse(query_text);
+        query.set_page(0, SearchQuery::MAX_PAGE_SIZE).unwrap();
+        let generation = model.begin_search(query_text);
+        assert!(model.commit_search_results(generation, query_text.into(), repository.search(query).unwrap(), Some(second.id.clone())).unwrap());
+        model_cx.notify();
+    }));
+    redraw(cx);
+    let back = cx.debug_bounds("library-navigate-back").unwrap();
+    cx.simulate_click(back.center(), Modifiers::default());
+    redraw(cx);
+    view.read_with(cx, |shell, _| assert_eq!(shell.surface_note_id.as_ref(), Some(&first.id)));
+    let (read_sender, read_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = futures::channel::oneshot::channel();
+    view.update(cx, |shell, _| shell.install_search_completion_gate_for_test(SearchCompletionGate {
+        read: read_sender, release: release_receiver,
+    }));
+    let forward = cx.debug_bounds("library-navigate-forward").unwrap();
+    cx.simulate_click(forward.center(), Modifiers::default());
+    cx.run_until_parked();
+    read_receiver.recv_timeout(Duration::from_secs(2)).expect("actual history worker read bounded Search packet");
+    view.read_with(cx, |shell, _| assert_eq!(shell.surface_note_id.as_ref(), Some(&first.id), "old session stays coherent while search is pending"));
+    release_sender.send(()).unwrap();
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let model = shell.model.read(app);
+        assert_eq!(model.navigation().search_query(), Some("uniquesearch294body"));
+        assert_eq!(model.navigation().selected_note_id(), Some(&second.id));
+        assert_eq!(model.projections().len(), 1);
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&second.id), "selected card and mounted note must agree after asynchronous Forward");
+        let session = shell.note_session.as_ref().unwrap().read(app);
+        assert_eq!(session.title().read(app).text(), "搜索命中B");
+        assert_eq!(session.editor().read(app).copy_all_plain_text(), "uniquesearch294body");
+    });
+    cx.simulate_input("forward294typed");
+    redraw(cx);
+    cx.update(|window, app| view.read_with(app, |shell, app| {
+        let editor = shell.note_session.as_ref().unwrap().read(app).editor().read(app);
+        assert!(editor.copy_all_plain_text().contains("forward294typed"));
+        assert!(editor.focus_handle().is_focused(window));
+    }));
+    assert_eq!(repository.load_note(&first.id).unwrap().unwrap(), first, "Forward must not edit the old A");
+}
+
 #[gpui::test]
 async fn mounted_sidebar_route_keeps_a_valid_selected_note_and_live_session(
     cx: &mut TestAppContext,

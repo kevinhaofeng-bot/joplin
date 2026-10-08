@@ -116,7 +116,13 @@ pub enum Mark {
     Underline,
     Strike,
     Highlight,
+    /// An explicit background colour, distinct from the legacy default mark.
+    HighlightColor(app_lite_core::TextColor),
     Link(String),
+    /// Non-visual tooltip metadata paired with Link; never inherited alone.
+    /// Titles are immutable. A compact owned slice avoids enlarging every
+    /// inline mark (and every paragraph's nested SmallVec) for this metadata.
+    LinkTitle(Box<str>),
     InlineCode,
     Superscript,
     Subscript,
@@ -125,6 +131,9 @@ pub enum Mark {
 }
 
 impl Mark {
+    pub(crate) fn is_highlight(&self) -> bool {
+        matches!(self, Self::Highlight | Self::HighlightColor(_))
+    }
     /// Evernote's superscript and subscript marks exclude each other
     /// (common-editor textformatter/schema.ts `excludes`).
     pub(crate) fn excluded(&self) -> Option<Mark> {
@@ -139,6 +148,7 @@ impl Mark {
         std::mem::size_of::<Self>()
             + match self {
                 Self::Link(url) => url.len(),
+                Self::LinkTitle(title) => title.len(),
                 _ => 0,
             }
     }
@@ -313,6 +323,8 @@ pub struct Block {
     pub kind: BlockKind,
     pub content: BlockContent,
     pub alignment: TextAlignment,
+    /// Paragraph padding in 30px steps; list nesting remains in BlockKind.
+    pub indent: u8,
     /// A heading or list item inside a quote container (Evernote quoteblock,
     /// common-editor quoteblock/schema.ts 14). A quoted paragraph is a
     /// [`BlockKind::Quote`] and keeps this false.
@@ -330,6 +342,7 @@ impl Block {
             kind,
             content: BlockContent::text(text),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -351,6 +364,7 @@ impl Block {
                                         std::mem::size_of::<Mark>()
                                             + match mark {
                                                 Mark::Link(url) => url.len(),
+                                                Mark::LinkTitle(title) => title.len(),
                                                 _ => 0,
                                             }
                                     })
@@ -595,6 +609,7 @@ impl StructuralInsert {
             kind,
             content,
             alignment,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision,
@@ -1601,6 +1616,7 @@ impl Document {
                         styles: merged_styles,
                     },
                     alignment,
+                    indent: if left_text.is_empty() { block.indent } else { target.indent },
                     quoted,
                     quote_start: target.quote_start,
                     revision: target.revision,
@@ -1616,6 +1632,7 @@ impl Document {
                         styles: left_styles.clone(),
                     },
                     alignment: target.alignment,
+                    indent: target.indent,
                     quoted: target.quoted,
                     quote_start: target.quote_start,
                     revision: target.revision,
@@ -1653,6 +1670,7 @@ impl Document {
                     styles: right_styles,
                 },
                 alignment: target.alignment,
+                indent: target.indent,
                 quoted: target.quoted,
                 quote_start: false,
                 revision: target.revision,
@@ -2335,7 +2353,8 @@ impl Document {
                 Some(plan)
             }
             Transaction::InsertImage { selection, .. }
-            | Transaction::InsertAttachment { selection, .. } => {
+            | Transaction::InsertAttachment { selection, .. }
+            | Transaction::InsertTable { selection, .. } => {
                 if let Some(index) = self.adjacent_structural_seam(*selection).ok()? {
                     plan.start_index = index;
                     plan.inserted_count = 1;
@@ -2840,6 +2859,11 @@ impl Document {
                     self.apply_toggle_mark(selection, mark)?;
                 (selection, changed_nodes, inverse, None)
             }
+            Transaction::ClearFormatting { selection } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_clear_formatting(selection)?;
+                (selection, changed_nodes, inverse, None)
+            }
             Transaction::SetLink { selection, url } => {
                 let (selection, changed_nodes, inverse) = self.apply_set_link(selection, url)?;
                 (selection, changed_nodes, inverse, None)
@@ -2847,6 +2871,11 @@ impl Document {
             Transaction::SetTextColor { selection, color } => {
                 let (selection, changed_nodes, inverse) =
                     self.apply_set_text_color(selection, color)?;
+                (selection, changed_nodes, inverse, None)
+            }
+            Transaction::SetHighlightColor { selection, color } => {
+                let (selection, changed_nodes, inverse) =
+                    self.apply_set_highlight_color(selection, color)?;
                 (selection, changed_nodes, inverse, None)
             }
             Transaction::SetAlignment {
@@ -3087,6 +3116,48 @@ impl Document {
                 end_affinity: selection.anchor.affinity,
             }),
         }
+    }
+
+    /// Indentation follows visually selected content, not text blocks merely
+    /// touched at their start/end. Mirrors Peso trimRange's endpoint trimming
+    /// without changing the selection used by history or other commands.
+    pub(crate) fn indent_block_range(
+        &self,
+        selection: Selection,
+    ) -> Result<Option<(usize, usize)>, DocumentError> {
+        let bounds = self.selection_bounds_with_affinity(selection)?;
+        if bounds.start_index == bounds.end_index {
+            return Ok(Some(self.semantic_parent_range(bounds.start_index, bounds.end_index)));
+        }
+        let mut start = bounds.start_index;
+        let mut end = bounds.end_index;
+        let mut offset = bounds.start_offset;
+        let mut affinity = bounds.start_affinity;
+        loop {
+            let excluded = self.blocks[start].content.as_text().map_or(
+                affinity == Affinity::After,
+                |text| offset == text.len(),
+            );
+            if !excluded { break; }
+            if start == end { return Ok(None); }
+            start += 1;
+            offset = 0;
+            affinity = Affinity::Before;
+        }
+        offset = bounds.end_offset;
+        affinity = bounds.end_affinity;
+        loop {
+            let excluded = self.blocks[end].content.as_text().map_or(
+                affinity == Affinity::Before,
+                |_| offset == 0,
+            );
+            if !excluded { break; }
+            if start == end { return Ok(None); }
+            end -= 1;
+            offset = self.blocks[end].content.as_text().map_or(0, str::len);
+            affinity = Affinity::After;
+        }
+        Ok(Some(self.semantic_parent_range(start, end)))
     }
 
     fn editable_selection_bounds(
@@ -3574,6 +3645,7 @@ impl Document {
             } else {
                 TextAlignment::Left
             },
+            indent: if start_is_text { start_block.indent } else { 0 },
             quoted: start_is_text && start_block.quoted,
             quote_start: start_is_text && start_block.quote_start,
             revision: start_block.revision,
@@ -3601,6 +3673,7 @@ impl Document {
                 styles: left_styles,
             },
             alignment: original.alignment,
+            indent: original.indent,
             quoted: original.quoted,
             quote_start: original.quote_start,
             revision: original.revision,
@@ -3613,6 +3686,7 @@ impl Document {
                 styles: right_styles,
             },
             alignment: original.alignment,
+            indent: original.indent,
             quoted: original.quoted,
             quote_start: false,
             revision: original.revision,
@@ -3719,10 +3793,23 @@ impl Document {
             if !is_text_block(block) {
                 continue;
             }
-            let (next_kind, next_quoted) = quote_aware_kind(block, &kind);
-            if block.kind != next_kind || block.quoted != next_quoted {
+            let (mut next_kind, next_quoted) = quote_aware_kind(block, &kind);
+            let next_indent = match &mut next_kind {
+                BlockKind::BulletItem { depth }
+                | BlockKind::OrderedItem { depth }
+                | BlockKind::CheckItem { depth, .. } => {
+                    // Canonical lists have one indentation field. Transfer
+                    // paragraph padding to nesting rather than discard it on save.
+                    *depth = (*depth).max(block.indent);
+                    0
+                }
+                BlockKind::Code => 0,
+                _ => block.indent,
+            };
+            if block.kind != next_kind || block.quoted != next_quoted || block.indent != next_indent {
                 let was_quote = block.quoted || block.kind == BlockKind::Quote;
                 block.kind = next_kind;
+                block.indent = next_indent;
                 block.quoted = next_quoted;
                 if !was_quote {
                     block.quote_start = false;
@@ -4063,6 +4150,23 @@ impl Document {
         mark: Mark,
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         self.validate_selection(selection)?;
+        if mark == Mark::Highlight {
+            let has_highlight = if selection.is_caret() {
+                self.caret_marks(selection).iter().any(Mark::is_highlight)
+            } else {
+                let (start, start_offset, end, end_offset) = self.selection_bounds(selection)?;
+                (start..=end).any(|index| {
+                    self.text_range_for_block(index, start, start_offset, end, end_offset)
+                        .is_some_and(|(from, to)| self.blocks[index].content.styles().is_some_and(|styles| {
+                            styles.iter().any(|run| run.range.start < to && from < run.range.end
+                                && run.marks.iter().any(Mark::is_highlight))
+                        }))
+                })
+            };
+            if has_highlight {
+                return self.apply_set_highlight_color(selection, None);
+            }
+        }
         let (start_index, start_offset, end_index, end_offset) =
             self.selection_bounds(selection)?;
         if start_index == end_index && start_offset == end_offset {
@@ -4171,6 +4275,27 @@ impl Document {
         self.apply_set_value_mark(selection, is_color, mark)
     }
 
+    /// `highlight.ts`: one value for a selected range, or pending marks at
+    /// the caret. Clear removes both legacy and explicit highlight marks.
+    fn apply_set_highlight_color(
+        &mut self,
+        selection: Selection,
+        color: Option<app_lite_core::TextColor>,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        self.validate_selection(selection)?;
+        let mark = color.map(|color| Mark::HighlightColor(color.with_simple_inversion(false)));
+        let (start, offset, end, _) = self.selection_bounds(selection)?;
+        if selection.is_caret() && start == end && is_text_block(&self.blocks[start]) {
+            let mut marks = self.caret_marks(selection);
+            marks.retain(|mark| !mark.is_highlight());
+            marks.extend(mark);
+            normalize_marks(&mut marks);
+            self.pending_marks = PendingMarks(Some((selection.head.node_id, offset, marks)));
+            return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+        }
+        self.apply_set_value_mark(selection, Mark::is_highlight, mark)
+    }
+
     fn apply_set_link(
         &mut self,
         selection: Selection,
@@ -4178,9 +4303,65 @@ impl Document {
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         self.apply_set_value_mark(
             selection,
-            |mark| matches!(mark, Mark::Link(_)),
+            |mark| matches!(mark, Mark::Link(_) | Mark::LinkTitle(_)),
             url.map(Mark::Link),
         )
+    }
+
+    fn apply_clear_formatting(
+        &mut self,
+        selection: Selection,
+    ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
+        self.validate_selection(selection)?;
+        if selection.is_caret() {
+            return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+        }
+        let (text_start, start_offset, text_end, end_offset) = self.selection_bounds(selection)?;
+        let Some((start, end)) = self.indent_block_range(selection)? else {
+            return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+        };
+        let originals = self.blocks.collect_range(start..end + 1);
+        let mut replacements = originals.clone();
+        let mut changed_nodes = SmallVec::new();
+        for (offset, block) in replacements.iter_mut().enumerate() {
+            // Media atoms, quote metadata, list nesting and checked state
+            // are structural, not text formatting. Keep them untouched.
+            if !is_text_block(block) {
+                continue;
+            }
+            let before = block.clone();
+            let index = start + offset;
+            if let Some((from, to)) = self.text_range_for_block(
+                index, text_start, start_offset, text_end, end_offset,
+            ) {
+                let (text, styles) = text_parts(&block.content)?;
+                if from < to {
+                    let updated = set_value_mark_range(
+                        text, styles, from, to,
+                        |mark| !matches!(mark, Mark::Link(_) | Mark::LinkTitle(_)), None,
+                    );
+                    if updated.as_slice() != styles {
+                        block.content = BlockContent::Text { text: text.to_owned(), styles: updated };
+                    }
+                }
+            }
+            // An inline-media paragraph is projected to several native text
+            // rows. Its paragraph style must stay consistent across those
+            // rows, while marks are removed only in the selected text span.
+            block.alignment = TextAlignment::Left;
+            block.indent = 0;
+            if *block != before {
+                push_unique(&mut changed_nodes, block.id);
+            }
+        }
+        if changed_nodes.is_empty() {
+            return Ok((selection, changed_nodes, TransactionBatch::default()));
+        }
+        self.blocks.splice(start..end + 1, replacements);
+        let inverse = TransactionBatch(vec![Transaction::RestoreBlocks {
+            index: start, remove_count: end - start + 1, blocks: originals,
+        }]);
+        Ok((selection, changed_nodes, inverse))
     }
 
     fn apply_set_value_mark(
@@ -4289,13 +4470,19 @@ impl Document {
         indent: bool,
     ) -> Result<(Selection, SmallVec<[NodeId; 4]>, TransactionBatch), DocumentError> {
         self.validate_selection(selection)?;
-        let (start_index, _, end_index, _) = self.selection_bounds(selection)?;
-        let (start_index, end_index) = self.semantic_parent_range(start_index, end_index);
+        let Some((start_index, end_index)) = self.indent_block_range(selection)? else {
+            return Ok((selection, SmallVec::new(), TransactionBatch::default()));
+        };
         if indent {
             for block in self
                 .blocks
                 .iter_range(start_index..end_index.saturating_add(1))
             {
+                if matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::Quote)
+                    && block.indent >= MAX_LIST_DEPTH
+                {
+                    return Err(DocumentError::InvalidListDepth(block.indent.saturating_add(1)));
+                }
                 match block.kind {
                     BlockKind::BulletItem { depth }
                     | BlockKind::OrderedItem { depth }
@@ -4318,6 +4505,7 @@ impl Document {
                 BlockKind::BulletItem { depth }
                 | BlockKind::OrderedItem { depth }
                 | BlockKind::CheckItem { depth, .. } => depth,
+                BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::Quote => &mut block.indent,
                 _ => continue,
             };
             if indent {
@@ -4818,6 +5006,7 @@ impl Document {
                 styles: left_styles,
             },
             alignment: original_block.alignment,
+            indent: original_block.indent,
             quoted: original_block.quoted,
             quote_start: original_block.quote_start,
             revision: original_block.revision,
@@ -4831,6 +5020,7 @@ impl Document {
                 styles: right_styles,
             },
             alignment: original_block.alignment,
+            indent: original_block.indent,
             quoted: original_block.quoted,
             quote_start: false,
             revision: original_block.revision,
@@ -5162,6 +5352,14 @@ fn is_structural_block(block: &Block) -> bool {
 
 fn validate_block_invariants(block: &Block) -> Result<(), DocumentError> {
     validate_kind(&block.kind)?;
+    if block.indent > MAX_LIST_DEPTH {
+        return Err(DocumentError::InvalidListDepth(block.indent));
+    }
+    if block.indent != 0
+        && !matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::Quote)
+    {
+        return Err(DocumentError::InvalidBlockContent(block.id));
+    }
     if block.quoted && !super::codec::is_quotable_kind(&block.kind) {
         return Err(DocumentError::InvalidBlockContent(block.id));
     }
@@ -5594,7 +5792,13 @@ pub(crate) fn insertion_marks(styles: &[StyledRun], offset: usize) -> SmallVec<[
         Some(before) => (covering(before), after),
         None => (after, SmallVec::new()),
     };
-    main.retain(|mark| !matches!(mark, Mark::Link(_) | Mark::InlineCode) || other.contains(mark));
+    let same_title = main.iter().find(|mark| matches!(mark, Mark::LinkTitle(_)))
+        == other.iter().find(|mark| matches!(mark, Mark::LinkTitle(_)));
+    main.retain(|mark| match mark {
+        Mark::Link(_) | Mark::LinkTitle(_) => same_title && other.contains(mark),
+        Mark::InlineCode => other.contains(mark),
+        _ => true,
+    });
     main
 }
 
@@ -5708,7 +5912,10 @@ fn set_value_mark_range(
         .collect::<Vec<_>>();
     for (segment_start, segment_end) in segments {
         let mut marks = marks_for_segment(styles, segment_start, segment_end);
-        marks.retain(|existing| !is_kind(existing));
+        // Reapplying the identical URL isn't a link replacement. Preserve
+        // its title; replacing/removing the URL clears the companion metadata.
+        let same_link = mark.as_ref().is_some_and(|mark| matches!(mark, Mark::Link(_)) && marks.contains(mark));
+        marks.retain(|existing| !is_kind(existing) || (same_link && matches!(existing, Mark::LinkTitle(_))));
         if let Some(mark) = &mark {
             marks.push(mark.clone());
         }
@@ -5765,8 +5972,37 @@ fn marks_for_segment(styles: &[StyledRun], start: usize, end: usize) -> SmallVec
 /// A run never holds both script marks; a pair that arrives from elsewhere
 /// keeps the superscript deterministically.
 fn normalize_marks(marks: &mut SmallVec<[Mark; 4]>) {
+    for mark in marks.iter_mut() {
+        if let Mark::HighlightColor(color) = mark {
+            *color = color.with_simple_inversion(false);
+        }
+    }
     marks.sort();
     marks.dedup();
+    let has_link = marks.iter().any(|mark| matches!(mark, Mark::Link(_)));
+    let mut has_title = false;
+    marks.retain(|mark| {
+        if let Mark::LinkTitle(title) = mark {
+            let keep = has_link && !has_title && app_lite_core::document::valid_link_title(title);
+            has_title |= keep;
+            keep
+        } else {
+            true
+        }
+    });
+    let mut has_highlight_color = false;
+    marks.retain(|mark| {
+        if matches!(mark, Mark::HighlightColor(_)) {
+            let keep = !has_highlight_color;
+            has_highlight_color = true;
+            keep
+        } else {
+            true
+        }
+    });
+    if has_highlight_color {
+        marks.retain(|mark| *mark != Mark::Highlight);
+    }
     if marks.contains(&Mark::Superscript) {
         marks.retain(|mark| *mark != Mark::Subscript);
     }

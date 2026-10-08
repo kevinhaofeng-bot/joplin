@@ -16,6 +16,7 @@ use app_lite_core::{
 
 const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_PLAIN_TEXT_BYTES: usize = MAX_OUTPUT_BYTES;
 const MAX_PAGES: usize = 500;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_IMAGE_EDGE: u32 = 2048;
@@ -65,6 +66,11 @@ pub enum DerivedTextWorkKind {
 pub fn next_derived_text_work_kind(
     repository: &LibraryRepository,
 ) -> Result<Option<DerivedTextWorkKind>, LibraryError> {
+    // This probe runs on the shell's retained background worker, before its
+    // normal image startup/interaction pacing. A durable one-MIME marker
+    // avoids a global extractor-version bump and repeated retry loops.
+    #[cfg(target_os = "macos")]
+    repository.requeue_unsupported_derived_text_for_capability("image/tiff", "image-tiff-v1")?;
     let Some(job) = repository.take_derived_text_jobs(1)?.pop() else {
         return Ok(None);
     };
@@ -72,7 +78,7 @@ pub fn next_derived_text_work_kind(
         .resource_metadata(&job.resource_id)?
         .map(|resource| match resource.mime.as_str() {
             "application/pdf" => DerivedTextWorkKind::Pdf,
-            "image/png" | "image/jpeg" => DerivedTextWorkKind::Image,
+            "image/png" | "image/jpeg" | "image/tiff" => DerivedTextWorkKind::Image,
             _ => DerivedTextWorkKind::Other,
         })
         .unwrap_or(DerivedTextWorkKind::Other);
@@ -184,15 +190,17 @@ pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
     if expected.sha256 != job.sha256 {
         return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id));
     }
-    if !is_extractable_mime(&expected.mime) {
+    let Some(mime) = extraction_mime(&expected.mime, &expected.file_extension, &expected.title)
+    else {
         return record_derived_failure_or_cancel(
             repository,
             job,
             DerivedTextFailure::Unsupported,
             cancelled,
         );
-    }
-    if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected.size) {
+    };
+    let input_limit = input_limit_for_mime(mime);
+    if !(0..=(input_limit as i64)).contains(&expected.size) {
         return record_derived_failure_or_cancel(
             repository,
             job,
@@ -204,7 +212,7 @@ pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
         return Ok(DerivedTextCoordinatorOutcome::Cancelled);
     }
     let (resource, file) =
-        match repository.open_verified_resource_file_with_limit(&resource_id, MAX_INPUT_BYTES) {
+        match repository.open_verified_resource_file_with_limit(&resource_id, input_limit) {
             Ok(Some(value)) => value,
             Ok(None) => return Ok(DerivedTextCoordinatorOutcome::Stale(resource_id)),
             Err(LibraryError::Resource(ResourceError::SizeLimitExceeded)) => {
@@ -226,6 +234,8 @@ pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
         };
     if resource.sha256 != expected.sha256
         || resource.mime != expected.mime
+        || resource.file_extension != expected.file_extension
+        || resource.title != expected.title
         || resource.size != expected.size
         || resource.sha256 != job.sha256
     {
@@ -234,7 +244,7 @@ pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
     match run_resource_child_for_verified_file_with_exe_and_cancellation(
         file,
         resource.size,
-        &resource.mime,
+        mime,
         exe,
         cancelled,
     ) {
@@ -258,8 +268,36 @@ pub fn run_derived_text_pdf_job_with_exe_and_cancellation(
     }
 }
 
-fn is_extractable_mime(mime: &str) -> bool {
-    matches!(mime, "application/pdf" | "image/png" | "image/jpeg")
+/// Evernote's file-type consumer prefers known MIME, then filename fallback.
+/// Only generic MIME may fall back to TXT: a ZIP named .txt is not text.
+/// This changes neither durable MIME nor the content-addressed resource.
+fn extraction_mime(mime: &str, extension: &str, title: &str) -> Option<&'static str> {
+    match mime {
+        "application/pdf" => Some("application/pdf"),
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/tiff" => Some("image/tiff"),
+        _ if mime.trim().eq_ignore_ascii_case("text/plain") => Some("text/plain"),
+        _ if ["application/octet-stream", "unknown", ""]
+            .iter()
+            .any(|generic| mime.trim().eq_ignore_ascii_case(generic))
+            && (extension.eq_ignore_ascii_case("txt")
+                || title.rsplit_once('.').is_some_and(|(stem, suffix)| {
+                    !stem.is_empty() && suffix.eq_ignore_ascii_case("txt")
+                })) =>
+        {
+            Some("text/plain")
+        }
+        _ => None,
+    }
+}
+
+fn input_limit_for_mime(mime: &str) -> usize {
+    if mime == "text/plain" {
+        MAX_PLAIN_TEXT_BYTES
+    } else {
+        MAX_INPUT_BYTES
+    }
 }
 
 fn record_derived_failure(
@@ -342,7 +380,7 @@ pub fn run_pdf_child_for_verified_file_with_exe_and_cancellation(
 }
 
 /// Descriptor-safe bridge for any child-supported resource MIME. The
-/// coordinator passes the MIME returned by the hash-verified core descriptor;
+/// coordinator passes the type classified from the hash-verified descriptor;
 /// this function does not resolve a path or trust caller-supplied metadata.
 pub fn run_resource_child_for_verified_file_with_exe_and_cancellation(
     mut file: File,
@@ -354,7 +392,7 @@ pub fn run_resource_child_for_verified_file_with_exe_and_cancellation(
     if cancelled.load(Ordering::Acquire) {
         return Err(PdfChildError::Cancelled);
     }
-    if !(0..=(MAX_INPUT_BYTES as i64)).contains(&expected_size) {
+    if !(0..=(input_limit_for_mime(mime) as i64)).contains(&expected_size) {
         return Err(PdfChildError::TooLarge);
     }
     if file.metadata().map_err(|_| PdfChildError::Io)?.len() != expected_size as u64 {
@@ -471,6 +509,7 @@ fn classify_child_failure(stderr: &[u8]) -> PdfChildError {
         Some("image-limit") => PdfChildError::TooLarge,
         Some("vision-unavailable") => PdfChildError::Io,
         Some("image-no-text") => PdfChildError::NoSelectableText,
+        Some("text-invalid-utf8") | Some("text-binary-input") => PdfChildError::Parse,
         Some("vision-failed") => PdfChildError::Failed,
         Some("unsupported-mime") => PdfChildError::Unsupported,
         Some("input-too-large") | Some("output-limit") => PdfChildError::OutputTooLarge,
@@ -533,47 +572,72 @@ pub fn run_child(args: &[String]) -> i32 {
     }
     if !matches!(
         mime,
-        Some("application/pdf") | Some("image/png") | Some("image/jpeg")
+        Some("application/pdf")
+            | Some("image/png")
+            | Some("image/jpeg")
+            | Some("image/tiff")
+            | Some("text/plain")
     ) {
         return fail("unsupported-mime");
     }
     let mut input = Vec::new();
+    let input_limit = input_limit_for_mime(mime.unwrap());
     if std::io::stdin()
-        .take((MAX_INPUT_BYTES + 1) as u64)
+        .take((input_limit + 1) as u64)
         .read_to_end(&mut input)
         .is_err()
         || input.is_empty()
     {
         return fail("input-read-failed");
     }
-    if input.len() > MAX_INPUT_BYTES {
+    if input.len() > input_limit {
         return fail("input-too-large");
     }
-    #[cfg(target_os = "macos")]
-    {
-        let result = match mime {
-            Some("application/pdf") => pdf_text(&input),
-            Some("image/png") | Some("image/jpeg") => image_text(&input, mime.unwrap()),
-            _ => Err("unsupported-mime"),
-        };
-        match result.and_then(|text| {
-            match std::io::stdout()
-                .write_all(text.as_bytes())
-                .and_then(|_| std::io::stdout().flush())
-            {
-                Ok(()) => Ok(()),
-                Err(_) => Err("output-write-failed"),
+    let result = if mime == Some("text/plain") {
+        plain_text(&input)
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            match mime {
+                Some("application/pdf") => pdf_text(&input),
+                Some("image/png") | Some("image/jpeg") | Some("image/tiff") => {
+                    image_text(&input, mime.unwrap())
+                }
+                _ => Err("unsupported-mime"),
             }
-        }) {
-            Ok(()) => 0,
-            Err(kind) => fail(kind),
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("platform-unsupported")
+        }
+    };
+    match result.and_then(|text| {
+        match std::io::stdout()
+            .write_all(text.as_bytes())
+            .and_then(|_| std::io::stdout().flush())
+        {
+            Ok(()) => Ok(()),
+            Err(_) => Err("output-write-failed"),
+        }
+    }) {
+        Ok(()) => 0,
+        Err(kind) => fail(kind),
     }
-    #[cfg(not(target_os = "macos"))]
+}
+
+fn plain_text(bytes: &[u8]) -> Result<String, &'static str> {
+    if bytes.len() > MAX_PLAIN_TEXT_BYTES {
+        return Err("input-too-large");
+    }
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let text = std::str::from_utf8(bytes).map_err(|_| "text-invalid-utf8")?;
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\r' | '\n'))
     {
-        let _ = input;
-        fail("platform-unsupported")
+        return Err("text-binary-input");
     }
+    Ok(text.to_owned())
 }
 
 #[cfg(target_os = "macos")]
@@ -607,6 +671,7 @@ fn image_text(bytes: &[u8], mime: &str) -> Result<String, &'static str> {
         let expected_type = match mime {
             "image/png" => "public.png",
             "image/jpeg" => "public.jpeg",
+            "image/tiff" => "public.tiff",
             _ => return Err("unsupported-mime"),
         };
         if image_type.as_deref() != Some(expected_type) {

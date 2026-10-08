@@ -285,7 +285,12 @@ fn prompt_for_readable_export_path(window: WindowHandle<LibraryShell>, token: u6
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     // A stable, content-free name avoids leaking a note title to OS dialog
     // history, logs, and accidentally invalid filesystem path components.
-    let prompt = cx.prompt_for_new_path(&default_dir, Some("Joplin-Lite-当前笔记导出"));
+    let prompt = crate::file_picker::prompt_for_new_path(cx, &default_dir, Some("Joplin-Lite-当前笔记导出"));
+    let prompt = crate::file_picker::bind_to_request(cx, window.into(), prompt, move |app| {
+        window.read_with(app, |shell, _| shell.pending_readable_export.as_ref().is_some_and(
+            |pending| pending.token == token,
+        )).unwrap_or(false)
+    });
     cx.spawn(async move |cx| {
         let selection = match prompt.await {
             Ok(Ok(path)) => Ok(path),

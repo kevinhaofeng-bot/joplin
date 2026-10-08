@@ -1,5 +1,5 @@
-use xml_syntax_reader::{ErrorKind, ParseError, QName, Span, Visitor};
 use xml_syntax_reader::Reader;
+use xml_syntax_reader::{ErrorKind, ParseError, QName, Span, Visitor};
 
 /// A recording visitor that logs all events as strings for test assertions.
 #[derive(Debug, Default)]
@@ -43,7 +43,8 @@ impl Visitor for Recorder {
     }
 
     fn attribute_end(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("AttrEnd({}..{})", span.start, span.end));
+        self.events
+            .push(format!("AttrEnd({}..{})", span.start, span.end));
         Ok(())
     }
 
@@ -257,38 +258,47 @@ impl Visitor for Recorder {
     fn element_decl_start(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "ElementDeclStart({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
     fn element_decl_empty(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("ElementDeclEmpty({}..{})", span.start, span.end));
+        self.events
+            .push(format!("ElementDeclEmpty({}..{})", span.start, span.end));
         Ok(())
     }
 
     fn element_decl_any(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("ElementDeclAny({}..{})", span.start, span.end));
+        self.events
+            .push(format!("ElementDeclAny({}..{})", span.start, span.end));
         Ok(())
     }
 
     fn element_decl_content_spec(&mut self, content: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "ElementDeclContentSpec({}, {}..{})",
-            String::from_utf8_lossy(content), span.start, span.end,
+            String::from_utf8_lossy(content),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
     fn element_decl_end(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("ElementDeclEnd({}..{})", span.start, span.end));
+        self.events
+            .push(format!("ElementDeclEnd({}..{})", span.start, span.end));
         Ok(())
     }
 
     fn attlist_decl_start(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "AttlistDeclStart({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -296,7 +306,9 @@ impl Visitor for Recorder {
     fn attlist_attr_name(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "AttlistAttrName({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -304,64 +316,97 @@ impl Visitor for Recorder {
     fn attlist_attr_type(&mut self, content: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "AttlistAttrType({}, {}..{})",
-            String::from_utf8_lossy(content), span.start, span.end,
+            String::from_utf8_lossy(content),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
     fn attlist_attr_required(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("AttlistAttrRequired({}..{})", span.start, span.end));
+        self.events
+            .push(format!("AttlistAttrRequired({}..{})", span.start, span.end));
         Ok(())
     }
 
     fn attlist_attr_implied(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("AttlistAttrImplied({}..{})", span.start, span.end));
+        self.events
+            .push(format!("AttlistAttrImplied({}..{})", span.start, span.end));
         Ok(())
     }
 
     fn attlist_attr_default_start(&mut self, fixed: bool, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("AttlistAttrDefaultStart(fixed={}, {}..{})", fixed, span.start, span.end));
+        self.events.push(format!(
+            "AttlistAttrDefaultStart(fixed={}, {}..{})",
+            fixed, span.start, span.end
+        ));
         Ok(())
     }
 
     fn attlist_attr_default_value(&mut self, value: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "AttlistAttrDefaultValue({}, {}..{})",
-            String::from_utf8_lossy(value), span.start, span.end,
+            String::from_utf8_lossy(value),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
-    fn attlist_attr_default_entity_ref(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
+    fn attlist_attr_default_entity_ref(
+        &mut self,
+        name: &[u8],
+        span: Span,
+    ) -> Result<(), Self::Error> {
         self.events.push(format!(
             "AttlistAttrDefaultEntityRef({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
-    fn attlist_attr_default_char_ref(&mut self, value: &[u8], span: Span) -> Result<(), Self::Error> {
+    fn attlist_attr_default_char_ref(
+        &mut self,
+        value: &[u8],
+        span: Span,
+    ) -> Result<(), Self::Error> {
         self.events.push(format!(
             "AttlistAttrDefaultCharRef({}, {}..{})",
-            String::from_utf8_lossy(value), span.start, span.end,
+            String::from_utf8_lossy(value),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
     fn attlist_attr_default_end(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("AttlistAttrDefaultEnd({}..{})", span.start, span.end));
+        self.events.push(format!(
+            "AttlistAttrDefaultEnd({}..{})",
+            span.start, span.end
+        ));
         Ok(())
     }
 
     fn attlist_decl_end(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("AttlistDeclEnd({}..{})", span.start, span.end));
+        self.events
+            .push(format!("AttlistDeclEnd({}..{})", span.start, span.end));
         Ok(())
     }
 
-    fn entity_decl_start(&mut self, name: &[u8], kind: xml_syntax_reader::EntityKind, span: Span) -> Result<(), Self::Error> {
+    fn entity_decl_start(
+        &mut self,
+        name: &[u8],
+        kind: xml_syntax_reader::EntityKind,
+        span: Span,
+    ) -> Result<(), Self::Error> {
         self.events.push(format!(
             "EntityDeclStart({}, pe={}, {}..{})",
-            String::from_utf8_lossy(name), kind == xml_syntax_reader::EntityKind::Parameter, span.start, span.end,
+            String::from_utf8_lossy(name),
+            kind == xml_syntax_reader::EntityKind::Parameter,
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -369,7 +414,9 @@ impl Visitor for Recorder {
     fn entity_decl_value(&mut self, value: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "EntityDeclValue({}, {}..{})",
-            String::from_utf8_lossy(value), span.start, span.end,
+            String::from_utf8_lossy(value),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -377,7 +424,9 @@ impl Visitor for Recorder {
     fn entity_decl_entity_ref(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "EntityDeclEntityRef({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -385,7 +434,9 @@ impl Visitor for Recorder {
     fn entity_decl_char_ref(&mut self, value: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "EntityDeclCharRef({}, {}..{})",
-            String::from_utf8_lossy(value), span.start, span.end,
+            String::from_utf8_lossy(value),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -393,20 +444,25 @@ impl Visitor for Recorder {
     fn entity_decl_pe_ref(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "EntityDeclPeRef({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
     fn entity_decl_value_end(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("EntityDeclValueEnd({}..{})", span.start, span.end));
+        self.events
+            .push(format!("EntityDeclValueEnd({}..{})", span.start, span.end));
         Ok(())
     }
 
     fn entity_decl_ndata(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "EntityDeclNdata({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -414,7 +470,9 @@ impl Visitor for Recorder {
     fn entity_decl_system_id(&mut self, literal: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "EntityDeclSystemId({}, {}..{})",
-            String::from_utf8_lossy(literal), span.start, span.end,
+            String::from_utf8_lossy(literal),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -422,20 +480,25 @@ impl Visitor for Recorder {
     fn entity_decl_public_id(&mut self, literal: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "EntityDeclPublicId({}, {}..{})",
-            String::from_utf8_lossy(literal), span.start, span.end,
+            String::from_utf8_lossy(literal),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
     fn entity_decl_end(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("EntityDeclEnd({}..{})", span.start, span.end));
+        self.events
+            .push(format!("EntityDeclEnd({}..{})", span.start, span.end));
         Ok(())
     }
 
     fn notation_decl_start(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "NotationDeclStart({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -443,7 +506,9 @@ impl Visitor for Recorder {
     fn notation_decl_system_id(&mut self, literal: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "NotationDeclSystemId({}, {}..{})",
-            String::from_utf8_lossy(literal), span.start, span.end,
+            String::from_utf8_lossy(literal),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -451,20 +516,25 @@ impl Visitor for Recorder {
     fn notation_decl_public_id(&mut self, literal: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "NotationDeclPublicId({}, {}..{})",
-            String::from_utf8_lossy(literal), span.start, span.end,
+            String::from_utf8_lossy(literal),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
 
     fn notation_decl_end(&mut self, span: Span) -> Result<(), Self::Error> {
-        self.events.push(format!("NotationDeclEnd({}..{})", span.start, span.end));
+        self.events
+            .push(format!("NotationDeclEnd({}..{})", span.start, span.end));
         Ok(())
     }
 
     fn dtd_pe_reference(&mut self, name: &[u8], span: Span) -> Result<(), Self::Error> {
         self.events.push(format!(
             "DtdPeRef({}, {}..{})",
-            String::from_utf8_lossy(name), span.start, span.end,
+            String::from_utf8_lossy(name),
+            span.start,
+            span.end,
         ));
         Ok(())
     }
@@ -577,9 +647,10 @@ fn coalesce_content_events(events: &[String]) -> Vec<String> {
         if let Some(prev) = result.last() {
             for &prefix in PREFIXES {
                 if event.starts_with(prefix) && prev.starts_with(prefix) {
-                    if let (Some(prev_parts), Some(cur_parts)) =
-                        (parse_content_event(prev, prefix), parse_content_event(event, prefix))
-                    {
+                    if let (Some(prev_parts), Some(cur_parts)) = (
+                        parse_content_event(prev, prefix),
+                        parse_content_event(event, prefix),
+                    ) {
                         if prev_parts.2 == cur_parts.1 {
                             let tag = &prefix[..prefix.len() - 1]; // strip trailing '('
                             let m = format!(
@@ -611,7 +682,8 @@ fn verify_all_splits(input: &[u8]) {
         let actual = parse_chunked(input, chunk_size);
         let coalesced = coalesce_content_events(&actual);
         assert_eq!(
-            coalesced, expected,
+            coalesced,
+            expected,
             "Event mismatch with chunk_size={chunk_size} for input {:?}\nRaw events: {:?}",
             String::from_utf8_lossy(input),
             actual,
@@ -963,13 +1035,7 @@ fn empty_comment() {
     // < ! - - - - >
     // 0 1 2 3 4 5 6
     let events = parse_full(b"<!---->");
-    assert_eq!(
-        events,
-        vec![
-            "CommentStart(0..4)",
-            "CommentEnd(4..7)",
-        ]
-    );
+    assert_eq!(events, vec!["CommentStart(0..4)", "CommentEnd(4..7)",]);
 }
 
 #[test]
@@ -1017,11 +1083,7 @@ fn simple_pi() {
     let events = parse_full(b"<?pi data?>");
     assert_eq!(
         events,
-        vec![
-            "PIStart(pi, 2..4)",
-            "PIContent(data, 5..9)",
-            "PIEnd(9..11)",
-        ]
+        vec!["PIStart(pi, 2..4)", "PIContent(data, 5..9)", "PIEnd(9..11)",]
     );
 }
 
@@ -1030,13 +1092,7 @@ fn pi_no_content() {
     // < ? x ?  >
     // 0 1 2 3 4
     let events = parse_full(b"<?x?>");
-    assert_eq!(
-        events,
-        vec![
-            "PIStart(x, 2..3)",
-            "PIEnd(3..5)",
-        ]
-    );
+    assert_eq!(events, vec!["PIStart(x, 2..3)", "PIEnd(3..5)",]);
 }
 
 #[test]
@@ -1082,10 +1138,7 @@ fn xml_decl_version_only() {
     // < ? x m l   v e r s i  o  n  =  "  1  .  0  "  ?  >
     // 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20
     let events = parse_full(b"<?xml version=\"1.0\"?>");
-    assert_eq!(
-        events,
-        vec!["XmlDeclaration(1.0, None, None, 0..21)"]
-    );
+    assert_eq!(events, vec!["XmlDeclaration(1.0, None, None, 0..21)"]);
 }
 
 #[test]
@@ -1094,7 +1147,10 @@ fn xml_decl_version_and_encoding() {
     let events = parse_full(input);
     assert_eq!(
         events,
-        vec![format!("XmlDeclaration(1.0, Some(UTF-8), None, 0..{})", input.len())]
+        vec![format!(
+            "XmlDeclaration(1.0, Some(UTF-8), None, 0..{})",
+            input.len()
+        )]
     );
 }
 
@@ -1104,7 +1160,10 @@ fn xml_decl_full() {
     let events = parse_full(input);
     assert_eq!(
         events,
-        vec![format!("XmlDeclaration(1.0, Some(UTF-8), Some(true), 0..{})", input.len())]
+        vec![format!(
+            "XmlDeclaration(1.0, Some(UTF-8), Some(true), 0..{})",
+            input.len()
+        )]
     );
 }
 
@@ -1114,7 +1173,10 @@ fn xml_decl_standalone_no() {
     let events = parse_full(input);
     assert_eq!(
         events,
-        vec![format!("XmlDeclaration(1.0, None, Some(false), 0..{})", input.len())]
+        vec![format!(
+            "XmlDeclaration(1.0, None, Some(false), 0..{})",
+            input.len()
+        )]
     );
 }
 
@@ -1124,7 +1186,10 @@ fn xml_decl_single_quotes() {
     let events = parse_full(input);
     assert_eq!(
         events,
-        vec![format!("XmlDeclaration(1.0, None, None, 0..{})", input.len())]
+        vec![format!(
+            "XmlDeclaration(1.0, None, None, 0..{})",
+            input.len()
+        )]
     );
 }
 
@@ -1134,7 +1199,10 @@ fn xml_decl_spaces_around_equals() {
     let events = parse_full(input);
     assert_eq!(
         events,
-        vec![format!("XmlDeclaration(1.0, None, None, 0..{})", input.len())]
+        vec![format!(
+            "XmlDeclaration(1.0, None, None, 0..{})",
+            input.len()
+        )]
     );
 }
 
@@ -1220,13 +1288,7 @@ fn simple_cdata() {
 #[test]
 fn empty_cdata() {
     let events = parse_full(b"<![CDATA[]]>");
-    assert_eq!(
-        events,
-        vec![
-            "CdataStart(0..9)",
-            "CdataEnd(9..12)",
-        ]
-    );
+    assert_eq!(events, vec!["CdataStart(0..9)", "CdataEnd(9..12)",]);
 }
 
 #[test]
@@ -1269,10 +1331,7 @@ fn simple_doctype() {
     let events = parse_full(b"<!DOCTYPE html>");
     assert_eq!(
         events,
-        vec![
-            "DoctypeStart(html, 10..14)",
-            "DoctypeEnd(14..15)",
-        ]
+        vec!["DoctypeStart(html, 10..14)", "DoctypeEnd(14..15)",]
     );
 }
 
@@ -1693,7 +1752,9 @@ fn long_attr_value() {
     doc.extend_from_slice(b"\"/>");
     let mut reader = Reader::new();
     let mut rec = Recorder::default();
-    reader.parse(&doc, 0, true, &mut rec).expect("parse should succeed");
+    reader
+        .parse(&doc, 0, true, &mut rec)
+        .expect("parse should succeed");
     assert!(rec.events.iter().any(|e| e.starts_with("AttrValue(")));
 }
 
@@ -1712,7 +1773,7 @@ fn split_full_document() {
 // Encoding probe tests (integration)
 // ========================================================================
 
-use xml_syntax_reader::{probe_encoding, Encoding};
+use xml_syntax_reader::{Encoding, probe_encoding};
 
 #[test]
 fn probe_utf8_no_bom() {
@@ -1770,8 +1831,7 @@ fn expect_xml_error_all_splits(input: &[u8]) {
         loop {
             let to_copy = (input.len() - input_pos).min(chunk_size);
             if to_copy > 0 {
-                buf[valid..valid + to_copy]
-                    .copy_from_slice(&input[input_pos..input_pos + to_copy]);
+                buf[valid..valid + to_copy].copy_from_slice(&input[input_pos..input_pos + to_copy]);
                 valid += to_copy;
                 input_pos += to_copy;
             }
@@ -1794,7 +1854,8 @@ fn expect_xml_error_all_splits(input: &[u8]) {
                 }
                 Err(ParseError::Xml(e)) => {
                     assert_eq!(
-                        e.kind, kind,
+                        e.kind,
+                        kind,
                         "chunk_size={chunk_size}: expected {kind:?}, got {:?} for {:?}",
                         e.kind,
                         String::from_utf8_lossy(input),
@@ -1969,18 +2030,12 @@ fn split_error_entity_ref_starts_with_digit() {
 
 #[test]
 fn error_empty_char_ref() {
-    assert_eq!(
-        expect_xml_error(b"<r>&#;</r>"),
-        ErrorKind::InvalidCharRef,
-    );
+    assert_eq!(expect_xml_error(b"<r>&#;</r>"), ErrorKind::InvalidCharRef,);
 }
 
 #[test]
 fn error_empty_hex_char_ref() {
-    assert_eq!(
-        expect_xml_error(b"<r>&#x;</r>"),
-        ErrorKind::InvalidCharRef,
-    );
+    assert_eq!(expect_xml_error(b"<r>&#x;</r>"), ErrorKind::InvalidCharRef,);
 }
 
 #[test]
@@ -2214,7 +2269,11 @@ fn utf8_is_final_trailing_incomplete_no_rewind() {
     // Should succeed (is_final - no rewind, just flush as-is)
     assert!(result.is_ok(), "is_final parse should succeed: {result:?}");
     // The characters event should contain all bytes including the incomplete one
-    let all_text: Vec<&String> = rec.events.iter().filter(|e| e.starts_with("Characters(")).collect();
+    let all_text: Vec<&String> = rec
+        .events
+        .iter()
+        .filter(|e| e.starts_with("Characters("))
+        .collect();
     assert!(!all_text.is_empty(), "should have characters events");
 }
 
@@ -2226,7 +2285,12 @@ fn utf8_invalid_trailing_continuation_bytes() {
     let buf = b"<r>\x80\x80\x80";
     match reader.parse(&buf[..], 0, false, &mut rec) {
         Err(ParseError::Xml(e)) => {
-            assert_eq!(e.kind, ErrorKind::InvalidUtf8, "expected InvalidUtf8, got {:?}", e.kind);
+            assert_eq!(
+                e.kind,
+                ErrorKind::InvalidUtf8,
+                "expected InvalidUtf8, got {:?}",
+                e.kind
+            );
         }
         Ok(_) => panic!("expected InvalidUtf8 error but parse succeeded"),
         Err(ParseError::Visitor(_)) => unreachable!(),
@@ -2294,7 +2358,6 @@ fn error_end_tag_name_too_long() {
     doc.push(b'>');
     assert_eq!(expect_xml_error(&doc), ErrorKind::NameTooLong);
 }
-
 
 #[test]
 fn error_pi_target_too_long() {
@@ -2392,10 +2455,7 @@ fn parse_slice_simple() {
     let mut reader = Reader::new();
     let mut rec = Recorder::default();
     reader.parse_slice(input, &mut rec).unwrap();
-    assert_eq!(
-        rec.events,
-        parse_full(input),
-    );
+    assert_eq!(rec.events, parse_full(input),);
 }
 
 #[test]
@@ -2452,7 +2512,9 @@ fn parse_read_xml_error() {
     let input = b"<root>]]></root>";
     let mut rec = Recorder::default();
     let err = xml_syntax_reader::parse_read(&input[..], &mut rec);
-    assert!(matches!(err, Err(xml_syntax_reader::ReadError::Xml(e)) if e.kind == ErrorKind::CdataEndInContent));
+    assert!(
+        matches!(err, Err(xml_syntax_reader::ReadError::Xml(e)) if e.kind == ErrorKind::CdataEndInContent)
+    );
 }
 
 // ── DTD feature tests ──────────────────────────────────────────────────────
@@ -2543,7 +2605,9 @@ mod dtd_tests {
 
     #[test]
     fn dtd_entity_public() {
-        let events = parse_full(b"<!DOCTYPE r [<!ENTITY logo PUBLIC \"-//Ex//Logo\" \"logo.gif\" NDATA gif>]><r/>");
+        let events = parse_full(
+            b"<!DOCTYPE r [<!ENTITY logo PUBLIC \"-//Ex//Logo\" \"logo.gif\" NDATA gif>]><r/>",
+        );
         assert_eq!(events[2], "EntityDeclStart(logo, pe=false, 22..26)");
         assert_eq!(events[3], "EntityDeclPublicId(-//Ex//Logo, 35..46)");
         assert_eq!(events[4], "EntityDeclSystemId(logo.gif, 49..57)");
@@ -2553,7 +2617,9 @@ mod dtd_tests {
 
     #[test]
     fn split_dtd_entity_public() {
-        verify_all_splits(b"<!DOCTYPE r [<!ENTITY logo PUBLIC \"-//Ex//Logo\" \"logo.gif\" NDATA gif>]><r/>");
+        verify_all_splits(
+            b"<!DOCTYPE r [<!ENTITY logo PUBLIC \"-//Ex//Logo\" \"logo.gif\" NDATA gif>]><r/>",
+        );
     }
 
     #[test]
@@ -2626,7 +2692,8 @@ mod dtd_tests {
 
     #[test]
     fn dtd_notation_public() {
-        let events = parse_full(b"<!DOCTYPE r [<!NOTATION gif PUBLIC \"-//Ex//Gif\" \"image/gif\">]><r/>");
+        let events =
+            parse_full(b"<!DOCTYPE r [<!NOTATION gif PUBLIC \"-//Ex//Gif\" \"image/gif\">]><r/>");
         assert_eq!(events[2], "NotationDeclStart(gif, 24..27)");
         assert_eq!(events[3], "NotationDeclPublicId(-//Ex//Gif, 36..46)");
         assert_eq!(events[4], "NotationDeclSystemId(image/gif, 49..58)");
@@ -2635,7 +2702,9 @@ mod dtd_tests {
 
     #[test]
     fn split_dtd_notation_public() {
-        verify_all_splits(b"<!DOCTYPE r [<!NOTATION gif PUBLIC \"-//Ex//Gif\" \"image/gif\">]><r/>");
+        verify_all_splits(
+            b"<!DOCTYPE r [<!NOTATION gif PUBLIC \"-//Ex//Gif\" \"image/gif\">]><r/>",
+        );
     }
 
     // ── ATTLIST declaration ─────────────────────────────────────────────
@@ -2719,7 +2788,8 @@ mod dtd_tests {
 
     #[test]
     fn dtd_attlist_multiple_attrs() {
-        let events = parse_full(b"<!DOCTYPE r [<!ATTLIST x a CDATA #REQUIRED b CDATA #IMPLIED>]><r/>");
+        let events =
+            parse_full(b"<!DOCTYPE r [<!ATTLIST x a CDATA #REQUIRED b CDATA #IMPLIED>]><r/>");
         assert_eq!(events[3], "AttlistAttrName(a, 25..26)");
         assert_eq!(events[4], "AttlistAttrType(CDATA, 27..32)");
         assert_eq!(events[5], "AttlistAttrRequired(33..42)");
@@ -2857,11 +2927,15 @@ mod dtd_tests {
               <!ELEMENT p ANY>\n\
               <!ENTITY foo \"bar\">\n\
               <!NOTATION gif SYSTEM \"image/gif\">\n\
-              ]><r/>"
+              ]><r/>",
         );
         assert!(events.iter().any(|e| e.starts_with("ElementDeclStart(p,")));
         assert!(events.iter().any(|e| e.starts_with("EntityDeclStart(foo,")));
-        assert!(events.iter().any(|e| e.starts_with("NotationDeclStart(gif,")));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("NotationDeclStart(gif,"))
+        );
         assert!(events.iter().any(|e| e.starts_with("SubsetEnd(")));
     }
 
@@ -2872,7 +2946,7 @@ mod dtd_tests {
               <!ELEMENT p ANY>\n\
               <!ENTITY foo \"bar\">\n\
               <!NOTATION gif SYSTEM \"image/gif\">\n\
-              ]><r/>"
+              ]><r/>",
         );
     }
 

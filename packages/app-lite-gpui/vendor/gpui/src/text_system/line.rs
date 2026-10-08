@@ -470,10 +470,12 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    // Joplin Lite: aligned rows sit anywhere within the alignment width, so
+    // the layer spans it rather than only the unaligned text width.
     let line_bounds = Bounds::new(
         origin,
         size(
-            layout.width,
+            align_width.unwrap_or(layout.width).max(layout.width),
             line_height * (wrap_boundaries.len() as f32 + 1.),
         ),
     );
@@ -516,8 +518,6 @@ fn paint_line_background(
                             },
                             *background_color,
                         ));
-                        background_origin.x = origin.x;
-                        background_origin.y += line_height;
                     }
 
                     glyph_origin.x = aligned_origin_x(
@@ -529,6 +529,12 @@ fn paint_line_background(
                         wraps.peek(),
                     );
                     glyph_origin.y += line_height;
+                    // Joplin Lite: a highlight continuing onto the next row
+                    // starts where that row's aligned glyphs do.
+                    if let Some((background_origin, _)) = current_background.as_mut() {
+                        background_origin.x = glyph_origin.x;
+                        background_origin.y += line_height;
+                    }
                 }
                 prev_glyph_position = glyph.position;
 
@@ -580,12 +586,20 @@ fn paint_line_background(
             }
         }
 
-        let mut last_line_end_x = origin.x + layout.width;
-        if let Some(boundary) = wrap_boundaries.last() {
-            let run = &layout.runs[boundary.run_ix];
-            let glyph = &run.glyphs[boundary.glyph_ix];
-            last_line_end_x -= glyph.position.x;
-        }
+        // Joplin Lite: the last row ends at its own aligned start plus its
+        // width, not at the unaligned origin.
+        let last_row_source_x = wrap_boundaries.last().map_or(px(0.), |boundary| {
+            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x
+        });
+        let last_row_origin_x = aligned_origin_x(
+            origin,
+            align_width.unwrap_or(layout.width),
+            last_row_source_x,
+            &align,
+            layout,
+            None,
+        );
+        let last_line_end_x = last_row_origin_x + layout.width - last_row_source_x;
 
         if let Some((mut background_origin, background_color)) = current_background.take() {
             if last_line_end_x == background_origin.x {
@@ -698,5 +712,319 @@ mod script_decoration_tests {
                 vec![(1, None), (2, Some(SUPERSCRIPT)), (1, None)]
             );
         });
+    }
+}
+
+// Joplin Lite acceptance 137: native highlight must cover the aligned text,
+// not merely report a successful background-paint call.
+#[cfg(test)]
+mod aligned_background_acceptance_tests {
+    use crate as gpui;
+    use crate::{
+        App, Bounds, Context, Render, Styled, TestAppContext, TextAlign, TextRun,
+        Window, canvas, font, point, px, rgba, size,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct HighlightView {
+        align: TextAlign,
+        text_width: Rc<Cell<f32>>,
+    }
+
+    impl Render for HighlightView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl crate::IntoElement {
+            let align = self.align;
+            let text_width = self.text_width.clone();
+            canvas(
+                move |_bounds, window, _cx| {
+                    let text: crate::SharedString = "第一段：工具栏真实多段验收".into();
+                    let lines = window.text_system().shape_text(
+                        text.clone(),
+                        px(20.),
+                        &[TextRun {
+                            len: text.len(),
+                            font: font("Helvetica"),
+                            color: crate::black(),
+                            background_color: Some(rgba(0xffd84d66).into()),
+                            underline: None,
+                            strikethrough: None,
+                            script: None,
+                        }],
+                        Some(px(600.)),
+                        None,
+                    ).unwrap();
+                    assert_eq!(lines.len(), 1);
+                    assert!(lines[0].wrap_boundaries.is_empty());
+                    text_width.set(f32::from(lines[0].width()));
+                    lines
+                },
+                move |_bounds, lines, window, cx: &mut App| {
+                    let bounds = Bounds::new(point(px(20.), px(20.)), size(px(600.), px(40.)));
+                    lines[0].paint_background(bounds.origin, px(40.), align, Some(bounds), window, cx).unwrap();
+                },
+            ).w(px(640.)).h(px(100.))
+        }
+    }
+
+    fn assert_highlight_covers_aligned_text(cx: &mut TestAppContext, align: TextAlign) {
+        let text_width = Rc::new(Cell::new(0.));
+        let width_for_view = text_width.clone();
+        let (_view, cx) = cx.add_window_view(move |_window, _cx| HighlightView {
+            align,
+            text_width: width_for_view,
+        });
+        let (quads, scale) = cx.update(|window, app| {
+            window.draw(app).clear();
+            (
+                window.rendered_frame.scene.quads.iter().map(|quad| quad.bounds).collect::<Vec<_>>(),
+                window.scale_factor(),
+            )
+        });
+        let width = text_width.get();
+        assert!(width > 0. && width < 600., "fixture must have alignment room: {width}");
+        // Literal viewport/origin; expected placement is independent of
+        // aligned_origin_x and paint_line_background's endpoint logic.
+        let left = match align {
+            TextAlign::Left => 20.,
+            TextAlign::Center => 20. + (600. - width) / 2.,
+            TextAlign::Right => 620. - width,
+        };
+        assert_eq!(quads.len(), 1, "{align:?}: one complete highlighted row must reach the scene; {quads:?}");
+        let actual = quads[0];
+        assert!((f64::from(actual.left()) / f64::from(scale) - f64::from(left)).abs() < 0.5,
+            "{align:?}: highlight starts with the glyphs: {actual:?}, expected left {left}");
+        assert!((f64::from(actual.right()) / f64::from(scale) - f64::from(left + width)).abs() < 0.5,
+            "{align:?}: highlight ends with the last glyph: {actual:?}, expected right {}", left + width);
+    }
+
+    #[crate::test]
+    fn left_highlight_covers_the_complete_cjk_row(cx: &mut TestAppContext) {
+        assert_highlight_covers_aligned_text(cx, TextAlign::Left);
+    }
+
+    #[crate::test]
+    fn centered_highlight_covers_the_complete_cjk_row(cx: &mut TestAppContext) {
+        assert_highlight_covers_aligned_text(cx, TextAlign::Center);
+    }
+
+    #[crate::test]
+    fn right_highlight_covers_the_complete_cjk_row(cx: &mut TestAppContext) {
+        assert_highlight_covers_aligned_text(cx, TextAlign::Right);
+    }
+}
+
+// Acceptance 149: inspect actual scene output for partial ranges and wrapped
+// rows. This is deliberately independent of aligned_origin_x/background paint.
+#[cfg(test)]
+mod highlight_range_acceptance_tests {
+    use crate as gpui;
+    use crate::{
+        App, Bounds, Context, Hsla, Render, Styled, TestAppContext, TextAlign, TextRun,
+        Window, WrappedLine, canvas, font, point, px, rgba, size,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Clone, Debug)]
+    struct ExpectedBackground {
+        rect: [f32; 4],
+        color: Hsla,
+    }
+
+    struct RangeView {
+        text: &'static str,
+        spans: Vec<(usize, Option<u32>)>,
+        width: f32,
+        align: TextAlign,
+        must_wrap: bool,
+        native_shaping: bool,
+        expected: Rc<RefCell<Vec<ExpectedBackground>>>,
+    }
+
+    // The oracle uses only shaping metrics and literal style ranges. It does
+    // not call the background painter or its alignment/endpoint helpers.
+    fn expected_backgrounds(
+        line: &WrappedLine,
+        spans: &[(usize, Option<u32>)],
+        width: f32,
+        align: TextAlign,
+    ) -> Vec<ExpectedBackground> {
+        let layout = &line.layout.unwrapped_layout;
+        let x_at = |index: usize| -> f32 {
+            if index == layout.len {
+                return f32::from(layout.width);
+            }
+            f32::from(layout.runs.iter().flat_map(|run| &run.glyphs)
+                .find(|glyph| glyph.index == index)
+                .expect("fixture style boundary must coincide with a complete glyph").position.x)
+        };
+        let mut cuts = vec![0];
+        cuts.extend(line.wrap_boundaries.iter().map(|boundary| {
+            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+        }));
+        cuts.push(layout.len);
+        let mut expected = Vec::new();
+        for (row, pair) in cuts.windows(2).enumerate() {
+            let row_width = x_at(pair[1]) - x_at(pair[0]);
+            let row_left = 20. + match align {
+                TextAlign::Left => 0.,
+                TextAlign::Center => (width - row_width) / 2.,
+                TextAlign::Right => width - row_width,
+            };
+            let mut start = 0;
+            for &(len, color) in spans {
+                let end = start + len;
+                let lo = start.max(pair[0]);
+                let hi = end.min(pair[1]);
+                if lo < hi && let Some(color) = color {
+                    expected.push(ExpectedBackground {
+                        rect: [row_left + x_at(lo) - x_at(pair[0]),
+                            20. + row as f32 * 40., x_at(hi) - x_at(lo), 40.],
+                        color: rgba(color).into(),
+                    });
+                }
+                start = end;
+            }
+        }
+        expected
+    }
+
+    impl Render for RangeView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl crate::IntoElement {
+            let text = self.text;
+            let spans = self.spans.clone();
+            let width = self.width;
+            let align = self.align;
+            let must_wrap = self.must_wrap;
+            let native_shaping = self.native_shaping;
+            let expected = self.expected.clone();
+            canvas(
+                move |_bounds, window, _cx| {
+                    assert_eq!(spans.iter().map(|span| span.0).sum::<usize>(), text.len());
+                    let runs = spans.iter().map(|&(len, color)| TextRun {
+                        len,
+                        font: font("Helvetica"),
+                        color: crate::black(),
+                        background_color: color.map(|color| rgba(color).into()),
+                        underline: None,
+                        strikethrough: None,
+                        script: None,
+                    }).collect::<Vec<_>>();
+                    // TestAppContext normally supplies NoopTextSystem. On macOS
+                    // also shape with the actual CoreText backend, without
+                    // changing the app/test-platform implementation. These
+                    // are background-scene checks, not physical glyph pixels.
+                    #[cfg(target_os = "macos")]
+                    let native_text_system = native_shaping.then(|| crate::WindowTextSystem::new(
+                        std::sync::Arc::new(crate::TextSystem::new(
+                            std::sync::Arc::new(crate::MacTextSystem::new()),
+                        )),
+                    ));
+                    #[cfg(target_os = "macos")]
+                    let text_system = native_text_system.as_ref().unwrap_or(window.text_system());
+                    #[cfg(not(target_os = "macos"))]
+                    let text_system = window.text_system();
+                    let lines = text_system.shape_text(
+                        text.into(), px(20.), &runs, Some(px(width)), None,
+                    ).unwrap();
+                    assert_eq!(lines.len(), 1);
+                    assert_eq!(!lines[0].wrap_boundaries.is_empty(), must_wrap,
+                        "fixture must exercise its advertised wrapping condition: {text}");
+                    *expected.borrow_mut() = expected_backgrounds(&lines[0], &spans, width, align);
+                    eprintln!("range acceptance: native={native_shaping}, text={text:?}, align={align:?}, width={:?}, rows={}",
+                        lines[0].layout.unwrapped_layout.width, lines[0].wrap_boundaries.len() + 1);
+                    lines
+                },
+                move |_bounds, lines, window, cx: &mut App| {
+                    let bounds = Bounds::new(point(px(20.), px(20.)), size(px(width), px(400.)));
+                    lines[0].paint_background(bounds.origin, px(40.), align, Some(bounds), window, cx).unwrap();
+                },
+            ).w(px(640.)).h(px(440.))
+        }
+    }
+
+    fn check_ranges(
+        cx: &mut TestAppContext,
+        text: &'static str,
+        spans: Vec<(usize, Option<u32>)>,
+        width: f32,
+        must_wrap: bool,
+    ) {
+        #[cfg(target_os = "macos")]
+        let shapers = [false, true];
+        #[cfg(not(target_os = "macos"))]
+        let shapers = [false];
+        for native_shaping in shapers {
+        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            let expected = Rc::new(RefCell::new(Vec::<ExpectedBackground>::new()));
+            let for_view = expected.clone();
+            let spans_for_view = spans.clone();
+            let (_view, window_cx) = cx.add_window_view(move |_window, _cx| RangeView {
+                text, spans: spans_for_view, width, align, must_wrap, native_shaping, expected: for_view,
+            });
+            let mut actual = window_cx.update(|window, app| {
+                window.draw(app).clear();
+                let scale = f64::from(window.scale_factor());
+                window.rendered_frame.scene.quads.iter().map(|quad| ExpectedBackground {
+                    rect: [
+                        (f64::from(quad.bounds.left()) / scale) as f32,
+                        (f64::from(quad.bounds.top()) / scale) as f32,
+                        (f64::from(quad.bounds.size.width) / scale) as f32,
+                        (f64::from(quad.bounds.size.height) / scale) as f32,
+                    ],
+                    color: quad.background.solid,
+                }).collect::<Vec<_>>()
+            });
+            let mut expected = expected.borrow().clone();
+            let order = |a: &ExpectedBackground, b: &ExpectedBackground| {
+                a.rect[1].total_cmp(&b.rect[1]).then(a.rect[0].total_cmp(&b.rect[0]))
+            };
+            actual.sort_by(order);
+            expected.sort_by(order);
+            assert_eq!(actual.len(), expected.len(),
+                "native={native_shaping}/{text:?}/{align:?}: no omitted marked row or invented background; actual {actual:?}, expected {expected:?}");
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(actual.color, expected.color, "{text:?}/{align:?}: adjacent marks must retain their colors");
+                assert!(actual.rect[2] > 0., "background must have positive width: {actual:?}");
+                for axis in 0..4 {
+                    assert!((actual.rect[axis] - expected.rect[axis]).abs() < 0.5,
+                        "native={native_shaping}/{text:?}/{align:?}: exact marked range on axis {axis}; actual {actual:?}, expected {expected:?}");
+                }
+            }
+        }
+        }
+    }
+
+    #[crate::test]
+    fn partial_cjk_mark_does_not_cover_unmarked_prefix_or_suffix(cx: &mut TestAppContext) {
+        check_ranges(cx, "甲乙丙丁", vec![(3, None), (6, Some(0xffd84d66)), (3, None)], 600., false);
+    }
+
+    #[crate::test]
+    fn adjacent_cjk_marks_retain_distinct_colors(cx: &mut TestAppContext) {
+        check_ranges(cx, "甲乙丙丁", vec![(6, Some(0xffd84d66)), (6, Some(0x509cff66))], 600., false);
+    }
+
+    #[crate::test]
+    fn wrapped_full_mark_aligns_each_row_including_short_last_row(cx: &mut TestAppContext) {
+        let text = "第一段中文换行与最后短行甲乙丙丁";
+        check_ranges(cx, text, vec![(text.len(), Some(0xffd84d66))], 120., true);
+    }
+
+    #[crate::test]
+    fn wrapped_partial_mark_preserves_unmarked_ends(cx: &mut TestAppContext) {
+        let text = "第一段中文换行与最后短行甲乙丙丁";
+        check_ranges(cx, text, vec![(3, None), (text.len() - 6, Some(0xffd84d66)), (3, None)], 120., true);
+    }
+
+    #[crate::test]
+    fn mixed_cjk_latin_emoji_full_mark_matches_shaped_extent(cx: &mut TestAppContext) {
+        let text = "中文 Latin 😀";
+        check_ranges(cx, text, vec![(text.len(), Some(0xffd84d66))], 600., false);
+    }
+
+    #[crate::test]
+    fn no_mark_produces_no_background_quad(cx: &mut TestAppContext) {
+        let text = "无高亮";
+        check_ranges(cx, text, vec![(text.len(), None)], 600., false);
     }
 }

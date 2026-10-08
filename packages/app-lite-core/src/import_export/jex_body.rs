@@ -222,10 +222,10 @@ impl<'a> Converter<'a> {
                 Event::Start(Tag::Link {
                     dest_url, title, ..
                 }) => {
-                    if !title.is_empty() {
+                    if !crate::document::valid_link_title(&title) {
                         return self.blocked(
                             JexBodyBlockerKind::UnsupportedAttribute,
-                            "Markdown link title has no canonical representation",
+                            "Markdown link title exceeds the text metadata budget",
                         );
                     }
                     if in_link {
@@ -235,6 +235,12 @@ impl<'a> Converter<'a> {
                         );
                     }
                     if dest_url.starts_with(":/") {
+                        if !title.is_empty() {
+                            return self.blocked(
+                                JexBodyBlockerKind::UnsupportedAttribute,
+                                "Resource link title has no canonical atom representation",
+                            );
+                        }
                         self.url(&dest_url)?;
                         let Some(resource) = self.resource(&dest_url).cloned() else {
                             return self.blocked(
@@ -253,17 +259,33 @@ impl<'a> Converter<'a> {
                     // An empty or in-note fragment target points nowhere the
                     // product can represent; the link text is the content.
                     if dest_url.is_empty() || dest_url.starts_with('#') {
+                        if !title.is_empty() {
+                            return self.blocked(
+                                JexBodyBlockerKind::UnsupportedAttribute,
+                                "Fragment link title has no canonical link target",
+                            );
+                        }
                         out.extend(self.inlines(TagEnd::Link, marks.clone(), true)?);
                         continue;
                     }
                     let url = self.external_link(&dest_url)?;
                     let mut nested = marks.clone();
                     nested.link = Some(url);
+                    if !title.is_empty() {
+                        self.url(&title)?;
+                        nested.link_title = Some(title.into_string());
+                    }
                     out.extend(self.inlines(TagEnd::Link, nested, true)?);
                 }
                 Event::Start(Tag::Image {
                     dest_url, title, ..
                 }) => {
+                    if marks.link_title.is_some() {
+                        return self.blocked(
+                            JexBodyBlockerKind::UnsupportedAttribute,
+                            "Image link title has no canonical atom representation",
+                        );
+                    }
                     // Only an external link survives as the image's own link;
                     // a resource or fragment target has no image representation.
                     if in_link && marks.link.is_none() {

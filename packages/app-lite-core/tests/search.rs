@@ -976,6 +976,177 @@ fn restored_resource_repopulates_filename_fts() {
 }
 
 #[test]
+fn derived_attachment_search_shows_the_matching_tail_not_the_unrelated_note_prefix() {
+    // Returning only the note prefix/filename (or slicing the extracted text
+    // from its beginning) must fail this consumer-visible contract.
+    let (_profile, repo) = repository();
+    let resource = repo
+        .import_resource(b"synthetic extractor input", "evidence.pdf", "application/pdf", "pdf")
+        .unwrap();
+    let note = create(&repo, "neutral title", "unrelated note prefix");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "evidence.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+            resource_ids: vec![resource.clone()],
+            selected_thumbnail_id: None,
+        },
+    })
+    .unwrap();
+    let job = repo.take_derived_text_jobs(1).unwrap().pop().unwrap();
+    let text = format!(
+        "{}\n\n甲乙丙独有词\nquick brown fox\nCAFÉ résumé\n{}",
+        "irrelevant ".repeat(1000),
+        "trailing ".repeat(1000)
+    );
+    assert!(repo.publish_derived_text(&job, &text).unwrap());
+    for (query, expected_match) in [
+        ("甲", "甲"),
+        ("甲乙", "甲乙"),
+        ("甲乙丙独有词", "甲乙丙独有词"),
+        ("\"quick brown\"", "quick brown"),
+        ("cafe", "CAFÉ"),
+    ] {
+        let reads = repo.observe_next_search_query();
+        let blobs = repo.observe_resource_reads();
+        let hits = repo.search(SearchQuery::parse(query)).unwrap();
+        assert_eq!(hits.len(), 1, "{query}");
+        assert_eq!(hits[0].matched_resource, Some(resource.clone()));
+        assert!(
+            hits[0].snippet.contains(expected_match),
+            "{query}: result must show actual extracted match, got {:?}",
+            hits[0].snippet
+        );
+        assert!(hits[0].snippet.ends_with("匹配附件：evidence.pdf"));
+        assert_eq!(hits[0].note.snippet, hits[0].snippet);
+        assert!(hits[0].snippet.chars().count() <= 160);
+        assert!(!hits[0].snippet.contains("\n\n"));
+        assert!(blobs.try_recv().is_err());
+        assert!(!reads.recv().unwrap().iter().any(|field| matches!(
+            field.as_str(), "notes.body_html" | "notes.body_text" | "resource_blobs.bytes"
+        )));
+    }
+}
+
+#[test]
+fn derived_image_search_uses_the_matched_image_without_replacing_the_saved_cover() {
+    let (_profile, repo) = repository();
+    let cover = repo.import_resource(b"cover image", "cover.png", "image/png", "png").unwrap();
+    let matched = repo.import_resource(b"matched image", "scan.png", "image/png", "png").unwrap();
+    let note = create(&repo, "neutral title", "neutral body");
+    repo.associate_resource(AssociateResource {
+        snapshot: SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: note.title,
+            document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![cover.clone(), matched.clone()].into_iter().map(|resource_id| Inline::Image {
+                    resource_id, alt: String::new(), display_width: None, link: None,
+                }).collect(),
+            }]),
+            resource_ids: vec![cover.clone(), matched.clone()],
+            selected_thumbnail_id: Some(cover.clone()),
+        },
+    }).unwrap();
+    for job in repo.take_derived_text_jobs(2).unwrap() {
+        let text = if job.resource_id == matched { "needle251 in second image" } else { "unrelated cover text" };
+        assert!(repo.publish_derived_text(&job, text).unwrap());
+    }
+    let hits = repo.search(SearchQuery::parse("needle251")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_resource, Some(matched.clone()));
+    assert_eq!(hits[0].note.selected_thumbnail_id, Some(matched));
+    assert_eq!(repo.list_notes(ListQuery::default()).unwrap()[0].selected_thumbnail_id, Some(cover));
+}
+
+#[test]
+fn tiff_ocr_search_uses_the_matched_second_image_without_replacing_the_saved_cover() {
+    let (profile, repo) = repository();
+    // Core verifies immutable bytes and identities, not the OCR engine here.
+    let cover = repo.import_image(b"cover271", "cover.png", "image/png", "png").unwrap();
+    let scan = repo.import_image(b"scan271", "scan.tiff", "image/tiff", "tiff").unwrap();
+    let note = repo.create_note(CreateNote {
+        title: "neutral record271".into(), notebook_id: None,
+        document: CanonicalDocument::from_blocks(vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: [cover.clone(), scan.clone()].into_iter().map(|resource_id| Inline::Image {
+                resource_id, alt: String::new(), display_width: None, link: None,
+            }).collect(),
+        }]),
+    }).unwrap();
+    assert_eq!(repo.list_notes(ListQuery::default()).unwrap()[0].selected_thumbnail_id, Some(cover.clone()));
+    for job in repo.take_derived_text_jobs(100).unwrap() {
+        let text = if job.resource_id == scan { "SecondTiffEvidence271" } else { "unrelated cover" };
+        assert!(repo.publish_derived_text(&job, text).unwrap());
+    }
+    repo.process_search_jobs().unwrap();
+    let before = repo.load_note(&note.id).unwrap().unwrap();
+    let reads = repo.observe_next_search_query();
+    let blobs = repo.observe_resource_reads();
+    let hits = repo.search(SearchQuery::parse("SecondTiff")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_resource, Some(scan.clone()));
+    assert!(hits[0].snippet.contains("SecondTiffEvidence271"));
+    assert!(hits[0].snippet.ends_with("匹配附件：scan.tiff"));
+    assert_eq!(hits[0].note.selected_thumbnail_id, Some(scan.clone()), "the result image must represent the matching TIFF, not the saved PNG cover");
+    assert!(blobs.try_recv().is_err());
+    assert!(!reads.recv().unwrap().iter().any(|field| matches!(field.as_str(), "notes.body_html" | "notes.body_text" | "resource_blobs.bytes")));
+    assert_eq!(repo.load_note(&note.id).unwrap().unwrap(), before);
+    assert_eq!(repo.list_notes(ListQuery::default()).unwrap()[0].selected_thumbnail_id, Some(cover.clone()));
+    drop(repo);
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    assert_eq!(reopened.search(SearchQuery::parse("SecondTiff")).unwrap()[0].note.selected_thumbnail_id, Some(scan));
+    assert_eq!(reopened.list_notes(ListQuery::default()).unwrap()[0].selected_thumbnail_id, Some(cover));
+    assert_eq!(reopened.load_note(&note.id).unwrap().unwrap(), before);
+}
+
+#[test]
+fn filename_search_uses_matching_image_formats_and_preserves_nonimage_cover_fallback() {
+    let (_profile, repo) = repository();
+    let cover = repo.import_image(b"kept-cover271", "cover.png", "image/png", "png").unwrap();
+    let cases = [
+        ("image/png", "png", true), ("image/jpeg", "jpg", true),
+        ("image/tiff", "tiff", true), ("image/gif", "gif", true),
+        ("image/webp", "webp", true), ("image/bmp", "bmp", true),
+        ("image/svg+xml", "svg", true), ("application/pdf", "pdf", false),
+        ("text/plain", "txt", false),
+    ];
+    let mut mismatches = Vec::new();
+    for (mime, extension, is_image) in cases {
+        let filename = format!("second271.{extension}");
+        let resource = repo.import_resource(filename.as_bytes(), &filename, mime, extension).unwrap();
+        let note = repo.create_note(CreateNote {
+            title: format!("case271 {extension}"), notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                Block::Attachment { resource_id: cover.clone(), filename: "cover.png".into(), media_type: "image/png".into() },
+                Block::Attachment { resource_id: resource.clone(), filename: filename.clone(), media_type: mime.into() },
+            ]),
+        }).unwrap();
+        let before = repo.load_note(&note.id).unwrap().unwrap();
+        let blobs = repo.observe_resource_reads();
+        let hits = repo.search(SearchQuery::parse(&format!("filename:{filename}"))).unwrap();
+        assert_eq!(hits.len(), 1, "{mime}");
+        assert_eq!(hits[0].note.id, note.id);
+        assert_eq!(hits[0].matched_resource, Some(resource.clone()));
+        let expected = if is_image { resource } else { cover.clone() };
+        if hits[0].note.selected_thumbnail_id != Some(expected.clone()) {
+            mismatches.push((mime, hits[0].note.selected_thumbnail_id.clone(), expected));
+        }
+        assert!(blobs.try_recv().is_err());
+        assert_eq!(repo.load_note(&note.id).unwrap().unwrap(), before);
+        assert_eq!(repo.list_notes(ListQuery::default()).unwrap().into_iter().find(|item| item.id == note.id).unwrap().selected_thumbnail_id, Some(cover.clone()));
+    }
+    assert!(mismatches.is_empty(), "matching images must not use the unrelated cover, while PDF/TXT retain it: {mismatches:?}");
+}
+
+#[test]
 fn parser_keeps_unknown_operators_as_text_and_supports_escaped_quotes() {
     let parsed = SearchQuery::parse("unknown:value \"a \\\"quoted\\\" phrase\" tag:red tag:blue");
     assert!(
@@ -1059,10 +1230,10 @@ fn unsupported_negative_filters_never_make_search_fail() {
 }
 
 #[test]
-fn latin_tokens_and_phrases_do_not_use_substring_matching() {
+fn title_substrings_follow_trigram_while_body_phrases_keep_word_boundaries() {
     let (_profile, repo) = repository();
     let exact = create(&repo, "cat", "quick brown fox");
-    create(&repo, "education", "quick brownish fox");
+    let title_substring = create(&repo, "education", "quick brownish fox");
     repo.process_search_jobs().unwrap();
     assert_eq!(
         repo.search(SearchQuery::parse("cat"))
@@ -1070,7 +1241,7 @@ fn latin_tokens_and_phrases_do_not_use_substring_matching() {
             .iter()
             .map(|hit| hit.note.id.clone())
             .collect::<Vec<_>>(),
-        vec![exact.id.clone()]
+        vec![title_substring.id, exact.id.clone()]
     );
     assert_eq!(
         repo.search(SearchQuery::parse("\"quick brown\""))
@@ -1080,6 +1251,90 @@ fn latin_tokens_and_phrases_do_not_use_substring_matching() {
             .collect::<Vec<_>>(),
         vec![exact.id]
     );
+}
+
+#[test]
+fn evernote_title_fragments_find_numbers_and_latin_inside_mixed_titles_without_body_substrings() {
+    let (profile, repo) = repository();
+    let mixed = create(&repo, "验收268 TIFF识别", "unrelated body");
+    let middle = create(&repo, "Education report", "nothing relevant");
+    create(&repo, "ordinary", "education X268Y preTIFF识别");
+    repo.process_search_jobs().unwrap();
+    for (query, id) in [("268", mixed.id.clone()), ("TIFF", mixed.id.clone()),
+        ("\"TIFF\"", mixed.id.clone()), ("cat", middle.id.clone())] {
+        let columns = repo.observe_next_search_query();
+        let blobs = repo.observe_resource_reads();
+        let hits = repo.search(SearchQuery::parse(query)).unwrap();
+        assert_eq!(hits.len(), 1, "{query}");
+        assert_eq!(hits[0].note.id, id, "{query}");
+        assert!(blobs.try_recv().is_err());
+        assert!(!columns.recv().unwrap().iter().any(|field| matches!(field.as_str(),
+            "notes.body_html" | "notes.body_text" | "resource_blobs.bytes")));
+    }
+    assert_eq!(repo.search(SearchQuery::parse("-268")).unwrap().len(), 2);
+    drop(repo);
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    assert_eq!(reopened.search(SearchQuery::parse("268")).unwrap()[0].note.id, mixed.id);
+}
+
+#[test]
+fn evernote_unquoted_body_terms_are_prefixes_but_quoted_phrases_and_negations_remain_exact() {
+    let (_profile, repo) = repository();
+    let exact = create(&repo, "one", "quick brown fox");
+    let prefix = create(&repo, "two", "quick brownish fox");
+    let middle = create(&repo, "three", "quick eyebrowns fox");
+    repo.process_search_jobs().unwrap();
+    let hits = repo.search(SearchQuery::parse("quick bro")).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().any(|hit| hit.note.id == exact.id));
+    assert!(hits.iter().any(|hit| hit.note.id == prefix.id));
+    assert!(repo.search(SearchQuery::parse("rown")).unwrap().is_empty());
+    let phrase = repo.search(SearchQuery::parse("\"quick brown\"")).unwrap();
+    assert_eq!(phrase.len(), 1);
+    assert_eq!(phrase[0].note.id, exact.id);
+    assert!(repo.search(SearchQuery::parse("\"quick bro\"")).unwrap().is_empty());
+    let negative = repo.search(SearchQuery::parse("quick -bro")).unwrap();
+    assert_eq!(negative.len(), 1);
+    assert_eq!(negative[0].note.id, middle.id);
+}
+
+#[test]
+fn evernote_attachment_prefix_keeps_exact_provenance_excerpt_cover_and_live_identity() {
+    let (profile, repo) = repository();
+    let cover = repo.import_image(b"cover", "cover.png", "image/png", "png").unwrap();
+    let scan = repo.import_image(b"scan", "scan.png", "image/png", "png").unwrap();
+    let note = repo.create_note(CreateNote { title: "neutral record".into(), notebook_id: None,
+        document: CanonicalDocument::from_blocks(vec![Block::Attachment { resource_id: cover.clone(), filename: "cover.png".into(), media_type: "image/png".into() },
+            Block::Attachment { resource_id: scan.clone(), filename: "scan.png".into(), media_type: "image/png".into() }]) }).unwrap();
+    for job in repo.take_derived_text_jobs(100).unwrap() {
+        let text = if job.resource_id == scan { format!("{} ColourfulEvidence270 token", "irrelevant ".repeat(1000)) }
+            else { "unrelated recognition".into() };
+        assert!(repo.publish_derived_text(&job, &text).unwrap());
+    }
+    repo.process_search_jobs().unwrap();
+    let before = repo.load_note(&note.id).unwrap().unwrap();
+    let blobs = repo.observe_resource_reads();
+    let hits = repo.search(SearchQuery::parse("Colou")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].note.id, note.id);
+    assert_eq!(hits[0].matched_resource, Some(scan.clone()));
+    assert_eq!(hits[0].note.selected_thumbnail_id, Some(scan.clone()));
+    assert!(hits[0].snippet.contains("ColourfulEvidence270"), "actual snippet: {:?}", hits[0].snippet);
+    assert!(hits[0].snippet.ends_with("匹配附件：scan.png"));
+    assert!(hits[0].snippet.chars().count() <= 160);
+    assert!(blobs.try_recv().is_err());
+    assert_eq!(repo.load_note(&note.id).unwrap().unwrap(), before);
+    assert!(repo.search(SearchQuery::parse("\"Colou\"")).unwrap().is_empty());
+    assert!(repo.search(SearchQuery::parse("neutral -Colou")).unwrap().is_empty());
+    let changed = repo.save_note(SaveNote { id: note.id.clone(), expected_revision: note.revision,
+        title: note.title, document: CanonicalDocument::from_blocks(vec![Block::Attachment { resource_id: cover.clone(), filename: "cover.png".into(), media_type: "image/png".into() }]),
+        resource_ids: vec![cover], selected_thumbnail_id: None }).unwrap();
+    repo.process_search_jobs().unwrap();
+    assert!(repo.search(SearchQuery::parse("Colou")).unwrap().is_empty());
+    drop(repo);
+    let again = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    assert_eq!(again.load_note(&changed.id).unwrap().unwrap().revision, changed.revision);
+    assert!(again.search(SearchQuery::parse("Colou")).unwrap().is_empty());
 }
 
 #[test]

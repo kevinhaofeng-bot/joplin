@@ -295,11 +295,16 @@ fn is_cancelled(error: &ImportLibraryError) -> bool {
 
 #[cfg(not(test))]
 fn prompt_for_import_source(window: WindowHandle<LibraryShell>, token: u64, cx: &mut App) {
-    let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+    let prompt = crate::file_picker::prompt_for_paths(cx, gpui::PathPromptOptions {
         files: true,
         directories: false,
         multiple: false,
         prompt: Some("导入".into()),
+    });
+    let prompt = crate::file_picker::bind_to_request(cx, window.into(), prompt, move |app| {
+        window.read_with(app, |shell, _| shell.pending_library_import.as_ref().is_some_and(
+            |pending| pending.token == token && !pending.cancel.load(Ordering::Relaxed),
+        )).unwrap_or(false)
     });
     cx.spawn(async move |cx| {
         let selection = match prompt.await {

@@ -39,6 +39,236 @@ fn redraw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+fn failed_attachment_fixture(repository: &LibraryRepository) -> (Note, ResourceId) {
+    let resource = repository
+        .import_resource(b"unsupported image source", "失败附件.gif", "image/gif", "gif")
+        .expect("persist an owned unsupported attachment");
+    let note = repository.create_note(CreateNote {
+        title: "失败不应丢失正文".into(),
+        notebook_id: None,
+        document: CanonicalDocument::from_blocks(vec![
+            Block::Paragraph {
+                style: Default::default(),
+                inlines: vec![app_lite_core::document::Inline::Text {
+                    text: "已保存的正文必须保持完整".into(),
+                    marks: Default::default(),
+                }],
+            },
+            Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "失败附件.gif".into(),
+                media_type: "image/gif".into(),
+            },
+        ]),
+    }).expect("associate attachment with owned note");
+    let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+    assert!(repository.fail_derived_text(&job, DerivedTextFailure::Unsupported).unwrap());
+    (note, resource)
+}
+
+fn derived_selector(kind: &str, resource: &ResourceId) -> &'static str {
+    // GPUI's test-only debug_bounds accepts a static selector. Keep this
+    // tiny test harness allocation out of the product and retain exact IDs.
+    Box::leak(format!("library-derived-resource-{kind}-{}", resource.as_str()).into_boxed_str())
+}
+
+fn many_failed_322(repository: &LibraryRepository) -> (Note, Vec<ResourceId>) {
+    let mut blocks = vec![Block::Paragraph {
+        style: Default::default(),
+        inlines: vec![app_lite_core::document::Inline::Text {
+            text: "附件检索失败也不能影响这段已保存正文".into(),
+            marks: Default::default(),
+        }],
+    }];
+    let mut resources = Vec::new();
+    for index in 0..8 {
+        let filename = format!("验收322-{index}-{}-附件.gif", "很长的原始文件名称".repeat(6));
+        let resource = repository.import_resource(
+            format!("owned unsupported source {index}").as_bytes(),
+            &filename, "image/gif", "gif",
+        ).unwrap();
+        blocks.push(Block::Attachment {
+            resource_id: resource.clone(), filename, media_type: "image/gif".into(),
+        });
+        resources.push(resource);
+    }
+    let note = repository.create_note(CreateNote {
+        title: "多个附件失败时仍能写作和恢复".into(), notebook_id: None,
+        document: CanonicalDocument::from_blocks(blocks),
+    }).unwrap();
+    let jobs = repository.take_derived_text_jobs(20).unwrap();
+    assert_eq!(jobs.len(), 8);
+    for job in jobs { assert!(repository.fail_derived_text(&job, DerivedTextFailure::Unsupported).unwrap()); }
+    (repository.load_note(&note.id).unwrap().unwrap(), resources)
+}
+
+#[gpui::test]
+async fn diagnostics_322_many_failures_do_not_push_restore_action_below_the_window(cx: &mut TestAppContext) {
+    // Catches unconditional expansion of every failed attachment: the rail
+    // must remain compact and its recovery action visible without scrolling.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let (note, resources) = many_failed_322(&repository);
+    let (shell, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    cx.update(|window, app| shell.update(app, |shell, cx| {
+        shell.apply_action(AppAction::SelectNote(note.id.clone()), window, cx);
+    }));
+    redraw(cx);
+    cx.update(|_window, app| shell.update(app, |shell, cx| {
+        shell.library_import_notice = Some(readable_export::ExportNotice::Status(
+            "恢复完成；当前资料库未改动。".into()));
+        shell.imported_library_ready = Some(PathBuf::from("/synthetic/restore-322"));
+        cx.notify();
+    }));
+    redraw(cx);
+    let rail = cx.debug_bounds("library-status-rail").unwrap();
+    assert!(rail.size.height <= px(128.0), "eight failures must not consume the writing area: {rail:?}");
+    let open = cx.debug_bounds("library-import-open").unwrap();
+    assert!(open.top() >= rail.top() && open.bottom() <= rail.bottom(),
+        "restore action must be visible without scrolling past attachment warnings: {open:?}, {rail:?}");
+    assert_eq!(repository.load_note(&note.id).unwrap().unwrap(), note);
+    for (index, resource) in resources.iter().enumerate() {
+        assert_eq!(repository.read_resource_bytes(resource).unwrap().unwrap(),
+            format!("owned unsupported source {index}").as_bytes());
+        assert_eq!(repository.derived_text_status(resource).unwrap(),
+            Some(DerivedTextStatus::Failed { failure: DerivedTextFailure::Unsupported, attempts: 1 }));
+    }
+}
+
+#[gpui::test]
+async fn diagnostics_322_expanded_details_keep_scroll_and_actual_retry(cx: &mut TestAppContext) {
+    // Compact presentation must not discard failure details or the existing
+    // real retry action, and scrolling it must not move the document viewport.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let (note, resources) = many_failed_322(&repository);
+    let (shell, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    cx.update(|window, app| shell.update(app, |shell, cx| {
+        shell.apply_action(AppAction::SelectNote(note.id.clone()), window, cx);
+    }));
+    redraw(cx);
+    let toggle = cx.debug_bounds("library-derived-resource-details-toggle").expect("all failures must have reachable details");
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    redraw(cx);
+    let pane = cx.debug_bounds("library-native-editor-pane").unwrap();
+    let details = cx.debug_bounds("library-derived-resource-details").unwrap();
+    assert!(details.size.height <= px(96.0));
+    let mut last = None;
+    for resource in &resources {
+        let row = cx.debug_bounds(derived_selector("failure", resource)).unwrap();
+        assert!(row.size.height >= px(16.0), "a wrapped warning needs its own measured space");
+        if let Some(previous) = last { assert!(row.top() >= previous, "wrapped warnings overlap"); }
+        last = Some(row.bottom());
+    }
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: details.center(), delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-4000.0))),
+        ..Default::default()
+    });
+    redraw(cx);
+    let tail = cx.debug_bounds(derived_selector("retry", resources.last().unwrap())).unwrap();
+    assert!(tail.top() >= details.top() && tail.bottom() <= details.bottom(), "last retry must be reachable by wheel scrolling");
+    assert_eq!(cx.debug_bounds("library-native-editor-pane").unwrap(), pane);
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: details.center(), delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(4000.0))),
+        ..Default::default()
+    });
+    redraw(cx);
+    let retry = cx.debug_bounds(derived_selector("retry", &resources[0])).unwrap();
+    cx.simulate_click(retry.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(800));
+    redraw(cx);
+    assert_eq!(repository.derived_text_status(&resources[0]).unwrap(),
+        Some(DerivedTextStatus::Failed { failure: DerivedTextFailure::Unsupported, attempts: 2 }));
+    assert_eq!(repository.load_note(&note.id).unwrap().unwrap(), note);
+    let toggle = cx.debug_bounds("library-derived-resource-details-toggle").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    redraw(cx);
+    assert!(cx.debug_bounds("library-status-rail").unwrap().size.height <= px(128.0));
+}
+
+#[gpui::test]
+async fn derived_failure_is_visible_without_becoming_a_note_save_error(cx: &mut TestAppContext) {
+    // Missing failure presentation used to leave an unindexed attachment
+    // indistinguishable from content with no matches. This is a real durable
+    // classified failure, not a mocked shell notice.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let (note, resource) = failed_attachment_fixture(&repository);
+    let before = repository.load_note(&note.id).unwrap().unwrap();
+    let original = repository.read_resource_bytes(&resource).unwrap().unwrap();
+    let (shell, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| shell.update(app, |shell, cx| {
+        shell.apply_action(AppAction::SelectNote(note.id.clone()), window, cx);
+    }));
+    redraw(cx);
+    let warning = cx.debug_bounds(derived_selector("failure", &resource))
+        .expect("the failed attachment must have a visible diagnostic, not a false no-content state");
+    assert!(cx.debug_bounds(derived_selector("retry", &resource)).is_some());
+    assert!(cx.debug_bounds("library-save-error").is_none(), "extraction failure is not save failure");
+    let body = cx.debug_bounds("library-native-editor-pane").unwrap();
+    assert!(warning.top() >= body.bottom(), "the recovery notice must not cover the document");
+    assert_eq!(repository.load_note(&note.id).unwrap().unwrap(), before);
+    assert_eq!(repository.read_resource_bytes(&resource).unwrap().unwrap(), original);
+}
+
+#[gpui::test]
+async fn derived_failure_retry_button_wakes_the_retained_worker_without_editing_note(cx: &mut TestAppContext) {
+    // A durable pending transition alone is insufficient: the mounted worker
+    // previously remained idle after retry_derived_text. This real button
+    // must wake it without requiring a save, switch, or application restart.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let (note, resource) = failed_attachment_fixture(&repository);
+    let before = repository.load_note(&note.id).unwrap().unwrap();
+    let original = repository.read_resource_bytes(&resource).unwrap().unwrap();
+    let (shell, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| shell.update(app, |shell, cx| {
+        shell.apply_action(AppAction::SelectNote(note.id.clone()), window, cx);
+    }));
+    redraw(cx);
+    let retry = cx.debug_bounds(derived_selector("retry", &resource))
+        .expect("an explicit retry must be reachable for a saved failed attachment");
+    cx.simulate_click(retry.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(800));
+    redraw(cx);
+    assert_eq!(repository.derived_text_status(&resource).unwrap(), Some(DerivedTextStatus::Failed {
+        failure: DerivedTextFailure::Unsupported,
+        attempts: 2,
+    }), "the worker must actually retry once; unsupported input must not be falsely reported indexed");
+    assert!(cx.debug_bounds(derived_selector("failure", &resource)).is_some());
+    assert_eq!(repository.load_note(&note.id).unwrap().unwrap(), before);
+    assert_eq!(repository.read_resource_bytes(&resource).unwrap().unwrap(), original);
+}
+
+#[gpui::test]
+async fn derived_failure_from_previous_note_does_not_leak_into_next_note(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let (failed, resource) = failed_attachment_fixture(&repository);
+    let clean = repository.create_note(CreateNote {
+        title: "没有附件的新笔记".into(), notebook_id: None,
+        document: CanonicalDocument::default(),
+    }).unwrap();
+    let (shell, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| shell.update(app, |shell, cx| {
+        shell.apply_action(AppAction::SelectNote(failed.id.clone()), window, cx);
+    }));
+    redraw(cx);
+    assert!(cx.debug_bounds(derived_selector("failure", &resource)).is_some());
+    cx.update(|window, app| shell.update(app, |shell, cx| {
+        shell.apply_action(AppAction::SelectNote(clean.id.clone()), window, cx);
+    }));
+    redraw(cx);
+    assert!(cx.debug_bounds(derived_selector("failure", &resource)).is_none(),
+        "a previous note's extraction error cannot be presented as the new note's failure");
+    assert_eq!(repository.load_note(&failed.id).unwrap().unwrap(), failed);
+    assert_eq!(repository.load_note(&clean.id).unwrap().unwrap(), clean);
+}
+
 #[gpui::test]
 async fn mounted_open_drains_existing_search_work_without_opening_search(cx: &mut TestAppContext) {
     // This is deliberately a mounted library path: Stage B1 must not depend
@@ -442,8 +672,8 @@ async fn mounted_indexing_pending_and_failure_are_visible_without_covering_resou
         .debug_bounds("library-resource-notice")
         .expect("resource notice remains visible");
     assert!(
-        resource.bottom() < indexing.top(),
-        "separate bottom slots must not overlap"
+        resource.bottom() < indexing.top() || indexing.bottom() < resource.top(),
+        "index and resource messages must not overlap: {indexing:?}, {resource:?}"
     );
 }
 

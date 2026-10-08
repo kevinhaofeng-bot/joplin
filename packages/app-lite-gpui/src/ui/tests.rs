@@ -24,6 +24,857 @@ fn redraw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+// Test-platform accessibility input, not a second animation implementation.
+// Other mounted tests deliberately use reduced motion unless they opt in.
+pub(super) struct PaneMotionPreferenceForTest(pub bool);
+impl gpui::Global for PaneMotionPreferenceForTest {}
+
+#[gpui::test]
+async fn pane_motion_217_collapse_has_intermediate_geometry_and_keeps_the_session(
+    cx: &mut TestAppContext,
+) {
+    // Catches the current instantaneous visible->zero branch, restarting a
+    // transition on every paint, and remounting/reloading the editable note.
+    cx.update(|app| app.set_global(PaneMotionPreferenceForTest(false)));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "动画期间仍是同一篇".into(),
+            notebook_id: None,
+            document: rich_document("动画不得重新加载正文"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        })
+    });
+    redraw(cx);
+    let initial = cx.debug_bounds("library-main-editor-shell").unwrap().left();
+    let session = view.read_with(cx, |shell, _| {
+        shell.note_session.as_ref().unwrap().entity_id()
+    });
+    let loads = repository.observe_note_loads();
+    let reads = repository.observe_resource_reads();
+    let persisted_before = repository.read_library_shell_state().unwrap();
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ToggleSidebar, window, shell_cx);
+        })
+    });
+    redraw(cx);
+    let first = cx.debug_bounds("library-main-editor-shell").unwrap().left();
+    assert_eq!(
+        first, initial,
+        "collapse must begin at the displayed position, not jump to its target"
+    );
+    cx.executor().advance_clock(Duration::from_millis(100));
+    redraw(cx);
+    let middle = cx.debug_bounds("library-main-editor-shell").unwrap().left();
+    assert!(
+        middle < initial && middle > px(360.0),
+        "a real intermediate frame is required: {middle:?}"
+    );
+    cx.executor().advance_clock(Duration::from_millis(100));
+    redraw(cx);
+    assert_eq!(
+        cx.debug_bounds("library-main-editor-shell").unwrap().left(),
+        px(360.0)
+    );
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.note_session.as_ref().unwrap().entity_id(), session);
+        assert_eq!(
+            shell.model.read(app).navigation().selected_note_id(),
+            Some(&note.id)
+        );
+    });
+    let persisted_after = repository.read_library_shell_state().unwrap();
+    assert!(!persisted_after.sidebar_visible);
+    assert_eq!(
+        persisted_after.sidebar_width,
+        persisted_before.sidebar_width
+    );
+    assert_eq!(persisted_after.list_width, persisted_before.list_width);
+    assert_eq!(loads.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(reads.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[gpui::test]
+async fn pane_motion_217_reversal_continues_from_the_visible_frame(cx: &mut TestAppContext) {
+    cx.update(|app| app.set_global(PaneMotionPreferenceForTest(false)));
+    let (_profile, repository) = repository();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ToggleSidebar, window, shell_cx);
+        })
+    });
+    redraw(cx);
+    cx.executor().advance_clock(Duration::from_millis(80));
+    redraw(cx);
+    let before_reverse = cx.debug_bounds("library-main-editor-shell").unwrap().left();
+    assert!(before_reverse > px(360.0) && before_reverse < px(580.0));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ToggleSidebar, window, shell_cx);
+        })
+    });
+    redraw(cx);
+    assert_eq!(
+        cx.debug_bounds("library-main-editor-shell").unwrap().left(),
+        before_reverse,
+        "a rapid reversal must not jump to either old endpoint"
+    );
+    cx.executor().advance_clock(Duration::from_millis(100));
+    redraw(cx);
+    let returning = cx.debug_bounds("library-main-editor-shell").unwrap().left();
+    assert!(returning > before_reverse && returning < px(580.0));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    redraw(cx);
+    assert_eq!(
+        cx.debug_bounds("library-main-editor-shell").unwrap().left(),
+        px(580.0)
+    );
+    assert!(
+        repository
+            .read_library_shell_state()
+            .unwrap()
+            .sidebar_visible
+    );
+}
+
+#[gpui::test]
+async fn pane_motion_217_reduced_motion_snaps_and_preserves_final_preferences(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| app.set_global(PaneMotionPreferenceForTest(true)));
+    let (_profile, repository) = repository();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    for (action, left) in [
+        (AppAction::ToggleSidebar, 360.0),
+        (AppAction::ToggleNoteList, 0.0),
+        (AppAction::ToggleNoteList, 360.0),
+        (AppAction::ToggleSidebar, 580.0),
+    ] {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(action, window, shell_cx);
+            })
+        });
+        redraw(cx);
+        assert_eq!(
+            cx.debug_bounds("library-main-editor-shell").unwrap().left(),
+            px(left)
+        );
+        let durable = repository.read_library_shell_state().unwrap();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        redraw(cx);
+        assert_eq!(
+            repository.read_library_shell_state().unwrap(),
+            durable,
+            "presentation frames may not persist intermediate widths"
+        );
+    }
+    // Changing the accessibility preference during an active animation must
+    // stop it, not finish the old large motion before honoring the user.
+    cx.update(|_window, app| app.set_global(PaneMotionPreferenceForTest(false)));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ToggleNoteList, window, shell_cx);
+        })
+    });
+    redraw(cx);
+    cx.executor().advance_clock(Duration::from_millis(50));
+    redraw(cx);
+    cx.update(|_window, app| app.set_global(PaneMotionPreferenceForTest(true)));
+    redraw(cx);
+    assert_eq!(
+        cx.debug_bounds("library-main-editor-shell").unwrap().left(),
+        px(220.0)
+    );
+}
+
+#[gpui::test]
+async fn mounted_status_182_messages_do_not_cover_the_document(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "状态与正文分离".into(),
+            notebook_id: None,
+            document: rich_document("正文必须保持可见和可编辑"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+            shell.library_import_notice = Some(readable_export::ExportNotice::Status(
+                "恢复完成：新资料库已生成；当前资料库未改动。".into(),
+            ));
+            shell.imported_library_ready = Some(PathBuf::from("/synthetic/restored-library"));
+            shell.readable_export_notice = Some(readable_export::ExportNotice::Error(
+                "导出未完成：目标目录没有写入权限，请选择其他位置。".into(),
+            ));
+            shell.sync_status = sync::ShellSyncStatus::Failed("离线；修改已保存在本机。".into());
+            shell_cx.notify();
+        })
+    });
+    redraw(cx);
+    let pane = cx.debug_bounds("library-native-editor-pane").unwrap();
+    for selector in [
+        "library-import-status",
+        "library-readable-export-status",
+        "library-sync-status",
+    ] {
+        let notice = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing status: {selector}"));
+        assert!(
+            notice.top() >= pane.bottom(),
+            "{selector} overlaps the editable document: {notice:?}, {pane:?}"
+        );
+    }
+    let open = cx.debug_bounds("library-import-open").unwrap();
+    assert!(
+        open.bottom() <= px(820.0),
+        "restore action must remain reachable"
+    );
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(note.id)
+    );
+}
+
+#[gpui::test]
+async fn mounted_status_182_long_notices_keep_a_bounded_scrollable_footer(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "窄窗提示".into(),
+            notebook_id: None,
+            document: rich_document("正文仍然可编辑"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+            shell.apply_action(AppAction::ToggleSidebar, window, shell_cx);
+            shell.apply_action(AppAction::ToggleNoteList, window, shell_cx);
+        })
+    });
+    // Selecting a note remounts through the model observer and intentionally
+    // clears the previous note's resource notice. Finish that real lifecycle
+    // and startup indexing before installing the layout-only failure states.
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(note.id)
+    );
+    cx.update(|_window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.library_import_notice = Some(readable_export::ExportNotice::Error(
+                "恢复失败：内容校验不一致，当前资料库未改动。🙂".repeat(8),
+            ));
+            shell.readable_export_notice = Some(readable_export::ExportNotice::Error(
+                "导出失败：目标路径非常长，请选择可写位置。".repeat(8),
+            ));
+            shell.resource_notice = Some("附件尚未加载，稍后重试。".into());
+            shell.save_error = Some(ShellSaveError::Lifecycle {
+                message: "磁盘已满，笔记尚未成功保存。".into(),
+            });
+            shell.indexing_status = IndexingStatus::Failed("搜索索引暂停；正文仍可读取。".into());
+            shell.sync_status = sync::ShellSyncStatus::Failed("当前离线，请稍后同步。".into());
+            shell.history_search_notice = Some("搜索上下文已变化，请重试。".into());
+            shell_cx.notify();
+        })
+    });
+    cx.simulate_resize(gpui::size(px(500.0), px(520.0)));
+    redraw(cx);
+    let pane = cx.debug_bounds("library-native-editor-pane").unwrap();
+    for selector in [
+        "library-save-error",
+        "library-indexing-status",
+        "library-resource-notice",
+        "library-import-status",
+        "library-readable-export-status",
+        "library-sync-status",
+    ] {
+        let notice = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing status: {selector}"));
+        assert!(
+            notice.top() >= pane.bottom(),
+            "{selector} overlaps narrow-window document"
+        );
+        assert!(
+            notice.left() >= px(0.0) && notice.right() <= px(500.0),
+            "{selector} escapes narrow window: {notice:?}"
+        );
+    }
+    let footer = cx
+        .debug_bounds("library-status-rail")
+        .expect("scroll owner for concurrent messages");
+    assert!(footer.size.height <= px(200.0));
+    assert!(
+        pane.size.height >= px(150.0),
+        "long notices must not consume the writing surface"
+    );
+    assert!(footer.bottom() <= px(520.0));
+    let tail_before = cx
+        .debug_bounds("library-history-search-status")
+        .unwrap_or_else(|| panic!("history notice must be rendered in the status rail"));
+    assert!(
+        tail_before.bottom() > footer.bottom(),
+        "fixture must overflow the rail"
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: footer.center(),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-2000.0))),
+        ..Default::default()
+    });
+    redraw(cx);
+    let tail_after = cx.debug_bounds("library-history-search-status").unwrap();
+    assert!(
+        tail_after.top() >= footer.top() && tail_after.bottom() <= footer.bottom(),
+        "the final message must be reachable by real wheel scrolling: {tail_after:?}, {footer:?}"
+    );
+    assert_eq!(
+        cx.debug_bounds("library-native-editor-pane").unwrap(),
+        pane,
+        "scrolling notices must not move the document viewport"
+    );
+}
+
+#[gpui::test]
+async fn mounted_body_command_arrows_reach_line_edges_and_keep_title(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "导航178".into(),
+            notebook_id: None,
+            document: rich_document("甲🙂e\u{301}乙"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let (title, editor) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().unwrap().read(app);
+        (session.title().clone(), session.editor().clone())
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    editor.update(cx, |editor, editor_cx| {
+        editor.select_document_range(3, 3);
+        editor_cx.notify();
+    });
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-right");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.selection().head.utf8_offset),
+        13,
+        "Command-Right must reach the line end, not stay at the clicked caret"
+    );
+    cx.simulate_input("!");
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-left");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.selection().head.utf8_offset),
+        0
+    );
+    cx.simulate_input("前");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.copy_all_plain_text()),
+        "前甲🙂e\u{301}乙!"
+    );
+    assert_eq!(
+        title.read_with(cx, |title, _| title.text().to_owned()),
+        "导航178"
+    );
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.copy_all_plain_text()),
+        "甲🙂e\u{301}乙!"
+    );
+}
+
+#[gpui::test]
+async fn mounted_body_command_shift_arrows_preserve_anchor(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "扩选178".into(),
+            notebook_id: None,
+            document: rich_document("甲🙂e\u{301}乙"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    editor.update(cx, |editor, editor_cx| {
+        editor.select_document_range(3, 3);
+        editor_cx.notify();
+    });
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-shift-right");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().anchor.utf8_offset, 3);
+        assert_eq!(editor.selection().head.utf8_offset, 13);
+        assert_eq!(editor.copy_plain_text(), "🙂e\u{301}乙");
+    });
+    cx.simulate_keystrokes("cmd-shift-left");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().anchor.utf8_offset, 3);
+        assert_eq!(editor.selection().head.utf8_offset, 0);
+        assert_eq!(editor.copy_plain_text(), "甲");
+        assert_eq!(editor.copy_all_plain_text(), "甲🙂e\u{301}乙");
+    });
+}
+
+#[gpui::test]
+async fn mounted_body_command_shift_vertical_reaches_document_edges(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let paragraph = |text: &str| Block::Paragraph {
+        style: BlockStyle::default(),
+        inlines: vec![Inline::Text {
+            text: text.into(),
+            marks: Marks::default(),
+        }],
+    };
+    let note = repository
+        .create_note(CreateNote {
+            title: "文档扩选178".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                paragraph("alpha"),
+                paragraph("beta"),
+                paragraph("gamma"),
+            ]),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    cx.simulate_keystrokes("cmd-down");
+    redraw(cx);
+    let anchor = editor.read_with(cx, |editor, _| editor.selection().anchor);
+    cx.simulate_keystrokes("cmd-shift-up");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().anchor, anchor);
+        assert_eq!(
+            editor.selection().head.node_id,
+            editor.document().blocks()[0].id,
+            "Command-Shift-Up must extend to document start, not just the previous visual row"
+        );
+        assert_eq!(editor.selection().head.utf8_offset, 0);
+        assert_eq!(editor.copy_plain_text(), "alpha\nbeta\ngamma");
+    });
+    cx.simulate_keystrokes("cmd-shift-down");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().anchor, anchor);
+        assert!(editor.selection().is_caret());
+    });
+    cx.simulate_keystrokes("shift-up");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().anchor, anchor);
+        assert_eq!(
+            editor.selection().head.node_id,
+            editor.document().blocks()[1].id,
+            "plain Shift-Up must retain the existing one-row selection behavior"
+        );
+        assert_eq!(editor.copy_all_plain_text(), "alpha\nbeta\ngamma");
+    });
+}
+
+#[gpui::test]
+async fn mounted_title_tab_routes_first_input_and_undo_to_body(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "标题Tab165".into(),
+            notebook_id: None,
+            document: rich_document("正文原文"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let (title, editor) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().unwrap().read(app);
+        (session.title().clone(), session.editor().clone())
+    });
+    let title_bounds = cx.debug_bounds("library-note-title").unwrap();
+    cx.simulate_click(title_bounds.center(), Modifiers::default());
+    cx.simulate_keystrokes("tab");
+    redraw(cx);
+    cx.update(|window, app| {
+        assert!(
+            editor.read(app).focus_handle().is_focused(window),
+            "Tab from the mounted title must focus the retained body"
+        )
+    });
+    // One input event: simulate_input emits one transaction per character.
+    cx.simulate_input("X");
+    redraw(cx);
+    assert_eq!(
+        title.read_with(cx, |title, _| title.text().to_owned()),
+        "标题Tab165"
+    );
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.copy_all_plain_text()),
+        "X正文原文"
+    );
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.copy_all_plain_text()),
+        "正文原文"
+    );
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.copy_all_plain_text()),
+        "X正文原文"
+    );
+}
+
+#[gpui::test]
+async fn mounted_title_tab_starts_body_but_shift_tab_does_not_take_body_focus(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "标题边界".into(),
+            notebook_id: None,
+            document: rich_document("既有正文"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let (title, editor) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().unwrap().read(app);
+        (session.title().clone(), session.editor().clone())
+    });
+    editor.update(cx, |editor, editor_cx| {
+        let end = editor.document_len();
+        editor.select_document_range(end, end);
+        editor_cx.notify();
+    });
+    let old_selection = editor.read_with(cx, |editor, _| editor.selection());
+    let title_bounds = cx.debug_bounds("library-note-title").unwrap();
+    cx.simulate_click(title_bounds.center(), Modifiers::default());
+    cx.simulate_keystrokes("shift-tab");
+    redraw(cx);
+    cx.update(|window, app| {
+        assert!(
+            !editor.read(app).focus_handle().is_focused(window),
+            "Shift-Tab is not the prototype's forward-to-body command"
+        )
+    });
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.selection()),
+        old_selection
+    );
+    cx.simulate_click(title_bounds.center(), Modifiers::default());
+    cx.simulate_keystrokes("tab");
+    redraw(cx);
+    cx.simulate_input("开头");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.copy_all_plain_text()),
+        "开头既有正文",
+        "Tab must enter at the body start, not resume its old end caret"
+    );
+    assert_eq!(
+        title.read_with(cx, |title, _| title.text().to_owned()),
+        "标题边界"
+    );
+}
+
+#[gpui::test]
+async fn mounted_title_command_arrows_move_to_title_edges(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "甲🙂e\u{301}乙".into(),
+            notebook_id: None,
+            document: rich_document("正文不变"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let (title, editor) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().unwrap().read(app);
+        (session.title().clone(), session.editor().clone())
+    });
+    cx.update(|window, app| title.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let body_before = editor.read_with(cx, |editor, _| editor.document().clone());
+    cx.simulate_keystrokes("home");
+    cx.simulate_keystrokes("cmd-right");
+    assert_eq!(
+        title.read_with(cx, |title, _| title.selection().clone()),
+        13..13,
+        "Command-Right must reach the title end, not one grapheme"
+    );
+    cx.simulate_keystrokes("cmd-left");
+    assert_eq!(
+        title.read_with(cx, |title, _| title.selection().clone()),
+        0..0
+    );
+    // Plain arrows must keep the existing grapheme-aware behavior.
+    cx.simulate_keystrokes("right");
+    assert_eq!(
+        title.read_with(cx, |title, _| title.selection().clone()),
+        3..3
+    );
+    cx.simulate_keystrokes("right");
+    assert_eq!(
+        title.read_with(cx, |title, _| title.selection().clone()),
+        7..7
+    );
+    cx.simulate_keystrokes("right");
+    assert_eq!(
+        title.read_with(cx, |title, _| title.selection().clone()),
+        10..10
+    );
+    assert_eq!(
+        title.read_with(cx, |title, _| title.text().to_owned()),
+        "甲🙂e\u{301}乙"
+    );
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.document().clone()),
+        body_before
+    );
+    cx.update(|window, app| assert!(title.read(app).focus_handle().is_focused(window)));
+}
+
+#[gpui::test]
+async fn mounted_title_command_shift_arrows_extend_from_same_anchor(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "甲🙂e\u{301}乙".into(),
+            notebook_id: None,
+            document: rich_document("正文不变"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let title = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .title()
+            .clone()
+    });
+    cx.update(|window, app| title.read(app).focus_handle().focus(window));
+    redraw(cx);
+    cx.simulate_keystrokes("home");
+    cx.simulate_keystrokes("right");
+    cx.simulate_keystrokes("right");
+    cx.simulate_keystrokes("cmd-shift-right");
+    assert_eq!(
+        title.read_with(cx, |title, _| title.selected_text().to_owned()),
+        "e\u{301}乙",
+        "Command-Shift-Right must select through the end"
+    );
+    cx.simulate_keystrokes("cmd-shift-left");
+    assert_eq!(
+        title.read_with(cx, |title, _| title.selected_text().to_owned()),
+        "甲🙂",
+        "reversing direction must preserve the original anchor"
+    );
+    assert_eq!(title.read_with(cx, |title, _| title.selection_head()), 0);
+    assert_eq!(
+        title.read_with(cx, |title, _| title.text().to_owned()),
+        "甲🙂e\u{301}乙"
+    );
+}
+
+#[gpui::test]
+async fn pane_button_keeps_body_focus_and_immediate_keyboard_undo(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    cx.update(|app| app.set_global(PaneMotionPreferenceForTest(false)));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "pane body focus".into(),
+            notebook_id: None,
+            document: rich_document("正文"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let (session_id, editor) = view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().unwrap();
+        (session.entity_id(), session.read(app).editor().clone())
+    });
+    let surface = cx.debug_bounds("native-editor-surface").unwrap();
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input("x");
+    redraw(cx);
+    let before = editor.read_with(cx, |editor, _| editor.document().clone());
+    for selector in [
+        "library-toggle-sidebar",
+        "library-toggle-list",
+        "library-toggle-list",
+        "library-toggle-sidebar",
+    ] {
+        let button = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(button.center(), Modifiers::default());
+        redraw(cx);
+        cx.update(|window, app| {
+            assert!(
+                editor.read(app).focus_handle().is_focused(window),
+                "{selector} stole body keyboard focus"
+            );
+        });
+        assert_eq!(
+            view.read_with(cx, |shell, _| shell
+                .note_session
+                .as_ref()
+                .unwrap()
+                .entity_id()),
+            session_id
+        );
+    }
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert_ne!(
+        editor.read_with(cx, |editor, _| editor.document().clone()),
+        before,
+        "first Cmd-Z after pane button must reach the retained editor history"
+    );
+}
+
+#[gpui::test]
+async fn pane_button_keeps_title_focus_and_first_input_owner(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "pane title".into(),
+            notebook_id: None,
+            document: rich_document("正文"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let title = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .title()
+            .clone()
+    });
+    cx.update(|window, app| title.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let button = cx.debug_bounds("library-toggle-sidebar").unwrap();
+    cx.simulate_click(button.center(), Modifiers::default());
+    redraw(cx);
+    cx.update(|window, app| {
+        assert!(
+            title.read(app).focus_handle().is_focused(window),
+            "pane button may not redirect title input to body or shell"
+        );
+    });
+    cx.simulate_input("x");
+    redraw(cx);
+    assert!(title.read_with(cx, |title, _| title.text().contains('x')));
+}
+
 fn repository() -> (tempfile::TempDir, Arc<LibraryRepository>) {
     let profile = tempfile::tempdir().expect("temporary profile");
     let repository = Arc::new(
@@ -78,6 +929,7 @@ fn scale_document(index: usize, resource_ids: &[ResourceId]) -> CanonicalDocumen
                 presentation: ImagePresentation {
                     natural_size: Some((16, 12)),
                     display_width: Some(16),
+                    alignment: None,
                 },
                 link: None,
             }),
@@ -965,6 +1817,58 @@ async fn mounted_readable_export_cancels_picker_after_resource_staging_failure(
 }
 
 #[gpui::test]
+async fn clicking_find_query_does_not_edit_the_note_title(cx: &mut TestAppContext) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "查找不能改标题".into(),
+            notebook_id: None,
+            document: rich_document("查找正文"),
+        })
+        .expect("create find pointer fixture");
+    let original_html = note.body_html.clone();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-f");
+    redraw(cx);
+    let query = cx
+        .debug_bounds("library-find-in-note-input")
+        .expect("find query is mounted");
+    let title = cx.debug_bounds("library-note-title").expect("note title");
+    let point = query.center();
+    assert!(
+        point.x >= title.left()
+            && point.x <= title.right()
+            && point.y >= title.top()
+            && point.y <= title.bottom(),
+        "fixture must exercise the query over the retained title"
+    );
+    // A real pointer gesture, not direct focus injection: the overlay must
+    // own this input even when an editable title is underneath it.
+    cx.simulate_click(point, Modifiers::default());
+    cx.simulate_input("q");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        let session = shell.note_session.as_ref().expect("retained session");
+        assert_eq!(
+            session.read(app).title().read(app).text(),
+            "查找不能改标题",
+            "typing into Find must never overwrite the underlying title"
+        );
+        assert_eq!(shell.find_input.read(app).text(), "q");
+    });
+    let stored = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(stored.title, "查找不能改标题");
+    assert_eq!(stored.body_html, original_html);
+}
+
+#[gpui::test]
 async fn mounted_cmd_f_opens_a_retained_cjk_find_panel(cx: &mut TestAppContext) {
     cx.update(bind_library_keybindings);
     let (_profile, repository) = repository();
@@ -1363,6 +2267,59 @@ async fn cmd_k_palette_mounts_above_the_retained_editor_without_changing_session
 }
 
 #[gpui::test]
+async fn clicking_search_toolbar_keeps_query_focus_for_the_first_keystroke(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "搜索按钮焦点验收".into(),
+            notebook_id: None,
+            document: rich_document("不可误写正文"),
+        })
+        .expect("create note");
+    let original_html = note.body_html.clone();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let button = cx
+        .debug_bounds("library-open-search")
+        .expect("search button");
+    cx.simulate_click(button.center(), Modifiers::default());
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, _| shell.search_palette_open));
+    assert!(
+        cx.update(|window, app| {
+            view.read(app)
+                .search_input
+                .read(app)
+                .focus_handle()
+                .is_focused(window)
+        }),
+        "pointer release must not take focus back from the query"
+    );
+    cx.simulate_input("q");
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell
+            .search_input
+            .read(app)
+            .text()
+            .to_owned()),
+        "q"
+    );
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().body_html,
+        original_html
+    );
+}
+
+#[gpui::test]
 async fn search_palette_escape_and_backdrop_restore_the_original_focus_and_session(
     cx: &mut TestAppContext,
 ) {
@@ -1652,7 +2609,350 @@ async fn mounted_cmd_k_search_ignores_marked_enter_and_opens_the_thirteenth_resu
         let model = shell.model.read(app);
         assert_eq!(model.navigation().search_query(), Some("needle"));
         assert_eq!(model.navigation().selected_note_id(), Some(&expected));
+        assert_eq!(
+            shell.surface_note_id.as_ref(),
+            Some(&expected),
+            "opening a search result must switch the mounted editor, not just the selected card"
+        );
+        let session = shell.note_session.as_ref().expect("opened result session");
+        assert_ne!(
+            session.entity_id(),
+            session_before,
+            "the previous note's retained session must not remain editable under the search result"
+        );
+        assert_eq!(
+            session.read(app).editor().read(app).copy_all_plain_text(),
+            "needle local body",
+            "the opened result's body must be visible without another card click"
+        );
     });
+}
+
+// Opening a search result (Enter or a click on its row) saves the dirty
+// note, mounts the result's editor and focuses it: typing right away goes
+// into the result, not the previous note.
+fn open_search_result_then_type(click: bool, cx: &mut TestAppContext) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let previous = repository
+        .create_note(CreateNote {
+            title: "先前笔记".into(),
+            notebook_id: None,
+            document: rich_document("先前正文"),
+        })
+        .expect("create previous note");
+    for index in 0..2 {
+        repository
+            .create_note(CreateNote {
+                title: format!("needle 结果 {index}"),
+                notebook_id: None,
+                document: rich_document("needle 结果正文"),
+            })
+            .expect("create searchable note");
+    }
+    repository
+        .process_search_jobs()
+        .expect("index fixtures before mounted search");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(previous.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let surface = cx
+        .debug_bounds("native-editor-surface")
+        .expect("mounted editable surface");
+    cx.simulate_click(surface.center(), Modifiers::default());
+    cx.simulate_input("改动");
+    redraw(cx);
+
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    redraw(cx);
+    let open = |cx: &mut VisualTestContext| {
+        if click {
+            let row = cx
+                .debug_bounds("library-search-result-0")
+                .expect("the first result row");
+            cx.simulate_click(row.center(), Modifiers::default());
+        } else {
+            cx.simulate_keystrokes("enter");
+        }
+    };
+    // The dirty note's save fence holds the first attempt while it saves.
+    open(cx);
+    view.read_with(cx, |shell, _| {
+        assert!(shell.search_palette_open, "held while the edit saves");
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&previous.id));
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let expected = view.read_with(cx, |shell, _| {
+        shell.search_palette_results[0].note.id.clone()
+    });
+    open(cx);
+    redraw(cx);
+    cx.simulate_input("新字");
+    redraw(cx);
+
+    let opened = view.read_with(cx, |shell, app| {
+        assert!(!shell.search_palette_open);
+        assert_eq!(
+            shell.model.read(app).navigation().selected_note_id(),
+            Some(&expected)
+        );
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&expected));
+        shell
+            .note_session
+            .as_ref()
+            .expect("opened result session")
+            .read(app)
+            .editor()
+            .read(app)
+            .copy_all_plain_text()
+    });
+    assert!(
+        opened.contains("新字") && opened.contains("needle 结果正文"),
+        "typing right after opening goes into the result: {opened}"
+    );
+    let saved = repository
+        .load_note(&previous.id)
+        .unwrap()
+        .unwrap()
+        .body_html;
+    assert!(
+        saved.contains("改动") && !saved.contains("新字"),
+        "the previous note keeps its own edit and nothing typed later: {saved}"
+    );
+}
+
+#[gpui::test]
+async fn search_result_opened_with_enter_takes_typing_at_once(cx: &mut TestAppContext) {
+    open_search_result_then_type(false, cx);
+}
+
+#[gpui::test]
+async fn search_result_opened_with_a_click_takes_typing_at_once(cx: &mut TestAppContext) {
+    open_search_result_then_type(true, cx);
+}
+
+// A palette packet made stale by a newer request mounts nothing; a fresh one
+// opens its result, and Back returns the editor to the previous note.
+#[gpui::test]
+async fn stale_search_result_mounts_nothing_and_back_restores_the_previous_editor(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let previous = repository
+        .create_note(CreateNote {
+            title: "先前笔记".into(),
+            notebook_id: None,
+            document: rich_document("先前正文"),
+        })
+        .expect("create previous note");
+    repository
+        .create_note(CreateNote {
+            title: "needle 结果".into(),
+            notebook_id: None,
+            document: rich_document("needle 结果正文"),
+        })
+        .expect("create searchable note");
+    repository
+        .process_search_jobs()
+        .expect("index fixtures before mounted search");
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(previous.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let session_before = view.read_with(cx, |shell, _| {
+        shell
+            .note_session
+            .as_ref()
+            .expect("previous session")
+            .entity_id()
+    });
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    redraw(cx);
+
+    view.update(cx, |shell, shell_cx| {
+        shell.model.update(shell_cx, |model, _| {
+            model.begin_search("needle");
+        });
+    });
+    cx.simulate_keystrokes("enter");
+    redraw(cx);
+    view.read_with(cx, |shell, _| {
+        assert!(
+            shell.search_palette_open,
+            "a stale packet keeps the palette"
+        );
+        assert!(matches!(
+            shell.search_palette_status,
+            SearchPaletteStatus::Error(_)
+        ));
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&previous.id));
+        assert_eq!(
+            shell.note_session.as_ref().unwrap().entity_id(),
+            session_before,
+            "a stale result must not remount the editor"
+        );
+    });
+
+    let input = view.read_with(cx, |shell, _| shell.search_input.clone());
+    cx.update(|window, app| {
+        input.update(app, |input, input_cx| {
+            input.select_all();
+            <TitleInput as EntityInputHandler>::replace_text_in_range(
+                input, None, "needle", window, input_cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let expected = view.read_with(cx, |shell, _| {
+        shell.search_palette_results[0].note.id.clone()
+    });
+    cx.simulate_keystrokes("enter");
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(expected)
+    );
+
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::NavigateBack, window, shell_cx);
+        });
+    });
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&previous.id));
+        assert_eq!(
+            shell
+                .note_session
+                .as_ref()
+                .expect("previous note remounted")
+                .read(app)
+                .editor()
+                .read(app)
+                .copy_all_plain_text(),
+            "先前正文"
+        );
+    });
+}
+
+#[gpui::test]
+async fn mounted_search_multiline_preview_keeps_its_title_and_two_shaped_lines_inside_the_row(
+    cx: &mut TestAppContext,
+) {
+    // Catches hard newlines bypassing GPUI's soft-wrap line clamp and
+    // vertically centering an over-height text column above its clipped row.
+    let (probe, _scope) = super::note_card::observe_card_text_paints_for_test();
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let document = CanonicalDocument::from_blocks(
+        ["资料前段", "图片前的段落", "图片后的段落", "extractor-fixture.pdf",
+         "attachment-250.txt", "tone-250.wav", "clip-250.mp4", "资料末段"]
+            .into_iter().map(|text| Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text { text: text.into(), marks: Default::default() }],
+            }).collect(),
+    );
+    let note = repository.create_note(CreateNote {
+        title: "预览252 长段落和附件名不能把搜索标题挤出可见行".into(),
+        notebook_id: None,
+        document,
+    }).unwrap();
+    repository.process_search_jobs().unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(789.0)));
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_input("预览252");
+    cx.run_until_parked();
+    for _ in 0..4 { redraw(cx); }
+    view.read_with(cx, |shell, _| {
+        assert!(shell.search_palette_open);
+        assert_eq!(shell.search_palette_results.len(), 1);
+        assert_eq!(shell.search_palette_results[0].note.id, note.id);
+        assert!(shell.search_palette_results[0].snippet.lines().count() >= 6,
+            "the real repository projection must retain this multiline fixture");
+    });
+    cx.update(|window, app| assert!(view.read(app).search_input.read(app)
+        .focus_handle().is_focused(window)));
+    let row = cx.debug_bounds("library-search-result-0").unwrap();
+    let paints = probe.borrow();
+    let title = paints.get("library-search-result-title-0").expect("actual title paint");
+    let snippet = paints.get("library-search-result-snippet-0").expect("actual snippet paint");
+    assert_eq!(title.painted_line_count, 1);
+    assert!(title.painted_text.starts_with("预览252"));
+    assert!(title.bounds.top() >= row.top() && title.bounds.bottom() <= row.bottom(),
+        "title glyphs must be inside the visible result, not cropped above it: {title:?}, row={row:?}");
+    assert!(snippet.painted_line_count <= 2 && snippet.painted_line_count > 0,
+        "multiline paragraphs must paint at most two preview lines: {snippet:?}");
+    assert!(snippet.painted_text.starts_with("资料前段"));
+    assert!(title.bounds.bottom() <= snippet.bounds.top());
+    assert!(snippet.bounds.top() >= row.top() && snippet.bounds.bottom() <= row.bottom());
+    assert_eq!(repository.load_note(&note.id).unwrap().unwrap().body_text, note.body_text,
+        "display normalization must not rewrite saved content");
+    assert!(repository.list_recent_searches("", 8).unwrap().is_empty(),
+        "painting a preview must never commit a search");
+}
+
+#[gpui::test]
+async fn mounted_attachment_search_paints_its_thumbnail_inside_the_search_result(
+    cx: &mut TestAppContext,
+) {
+    // A thumbnail behind the modal in the ordinary note list cannot satisfy
+    // this check: only the search row's own painted region is accepted.
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let resource = repository.import_resource(
+        &structural_png(16, 12), "search-scan.png", "image/png", "png"
+    ).unwrap();
+    repository.create_note(CreateNote {
+        title: "attachment-only match".into(),
+        notebook_id: None,
+        document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+            resource_id: resource.clone(),
+            filename: "search-scan.png".into(),
+            media_type: "image/png".into(),
+        }]),
+    }).unwrap();
+    let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+    assert!(repository.publish_derived_text(&job, "独有检索词251").unwrap());
+    let (view, cx) = mount_shell(repository, cx);
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    cx.simulate_input("独有检索词251");
+    cx.run_until_parked();
+    for _ in 0..6 { redraw(cx); }
+    view.read_with(cx, |shell, _| {
+        assert!(shell.search_palette_open);
+        assert_eq!(shell.search_palette_results.len(), 1);
+        assert_eq!(shell.search_palette_results[0].matched_resource, Some(resource));
+        assert!(shell.search_palette_results[0].snippet.contains("独有检索词251"));
+    });
+    let row = cx.debug_bounds("library-search-result-0").unwrap();
+    let thumbnail = cx.debug_bounds("library-search-result-thumbnail-0")
+        .expect("matched image must paint inside the search modal, not only behind it");
+    assert!(thumbnail.left() >= row.left() && thumbnail.right() <= row.right());
+    assert!(thumbnail.top() >= row.top() && thumbnail.bottom() <= row.bottom());
+    assert!(thumbnail.size.width >= px(48.0) && thumbnail.size.height >= px(48.0));
 }
 
 #[gpui::test]
@@ -1703,8 +3003,9 @@ async fn mounted_attachment_text_search_shows_its_attachment_in_palette_and_sear
         let hit = &shell.search_palette_results[0];
         assert_eq!(hit.note.id, note.id);
         assert_eq!(hit.matched_resource, Some(resource.clone()));
-        assert_eq!(hit.snippet, "匹配附件：invoice-scan.png");
-        assert_eq!(hit.note.snippet, "匹配附件：invoice-scan.png");
+        assert!(hit.snippet.contains("image-only searchable token"));
+        assert!(hit.snippet.ends_with("匹配附件：invoice-scan.png"));
+        assert_eq!(hit.note.snippet, hit.snippet);
     });
 
     cx.simulate_keystrokes("enter");
@@ -1714,7 +3015,8 @@ async fn mounted_attachment_text_search_shows_its_attachment_in_palette_and_sear
         assert_eq!(model.navigation().search_query(), Some("searchable"));
         assert_eq!(model.projections().len(), 1);
         assert_eq!(model.projections()[0].id, note.id);
-        assert_eq!(model.projections()[0].snippet, "匹配附件：invoice-scan.png");
+        assert!(model.projections()[0].snippet.contains("image-only searchable token"));
+        assert!(model.projections()[0].snippet.ends_with("匹配附件：invoice-scan.png"));
     });
 }
 
@@ -2318,6 +3620,96 @@ async fn mounted_empty_cta_uses_the_shell_action_reducer(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn mounted_trash_253_remount_keeps_keyboard_search_without_a_pointer_rescue(
+    cx: &mut TestAppContext,
+) {
+    // A remounted session must not leave keyboard dispatch attached to the
+    // removed editor's focus handle. No post-delete pointer/focus rescue here.
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let survivor = repository.create_note(CreateNote {
+        title: "未删除253".into(), notebook_id: None,
+        document: rich_document("保留正文253"),
+    }).unwrap();
+    let removed = repository.create_note(CreateNote {
+        title: "待删除253".into(), notebook_id: None,
+        document: rich_document("删除正文253"),
+    }).unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::SelectNote(removed.id.clone()), window, shell_cx);
+    }));
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell.note_session.as_ref().unwrap().read(app).editor().clone()
+    });
+    cx.update(|window, app| crate::native_editor::surface::focus_editor(&editor, window, app));
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-shift-backspace");
+    redraw(cx);
+    assert!(repository.load_note(&removed.id).unwrap().unwrap().deleted_time.is_some(),
+        "the actual shortcut must soft-delete the original selected note");
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&survivor.id));
+        let session = shell.note_session.as_ref().unwrap().read(app);
+        assert_eq!(session.title().read(app).text(), "未删除253");
+        assert_eq!(session.editor().read(app).copy_all_plain_text(), "保留正文253");
+    });
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, _| shell.search_palette_open),
+        "Cmd-K must still dispatch after deletion remounts the editor, without a mouse click");
+    cx.simulate_input("未删除253");
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.search_input.read(app).text(), "未删除253");
+        assert_eq!(shell.search_palette_results.len(), 1);
+        assert_eq!(shell.search_palette_results[0].note.id, survivor.id);
+    });
+    assert_eq!(repository.load_note(&survivor.id).unwrap().unwrap().body_text, "保留正文253");
+    assert!(repository.list_recent_searches("", 8).unwrap().is_empty());
+}
+
+#[gpui::test]
+async fn mounted_trash_253_last_note_keeps_keyboard_search_without_a_pointer_rescue(
+    cx: &mut TestAppContext,
+) {
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let note = repository.create_note(CreateNote {
+        title: "最后一篇253".into(), notebook_id: None,
+        document: rich_document("空列表仍能使用快捷键"),
+    }).unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+    }));
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell.note_session.as_ref().unwrap().read(app).editor().clone()
+    });
+    cx.update(|window, app| crate::native_editor::surface::focus_editor(&editor, window, app));
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-shift-backspace");
+    redraw(cx);
+    assert!(repository.load_note(&note.id).unwrap().unwrap().deleted_time.is_some());
+    assert!(view.read_with(cx, |shell, _| shell.note_session.is_none()));
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, _| shell.search_palette_open),
+        "removing the last editable session must leave shell shortcuts usable");
+    cx.simulate_input("is:trash");
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.search_input.read(app).text(), "is:trash");
+        assert_eq!(shell.search_palette_results.len(), 1);
+        assert_eq!(shell.search_palette_results[0].note.id, note.id);
+    });
+}
+
+#[gpui::test]
 async fn mounted_keyboard_actions_use_the_same_shell_reducer(cx: &mut TestAppContext) {
     cx.update(bind_library_keybindings);
     let (_profile, repository) = repository();
@@ -2469,6 +3861,618 @@ async fn mounted_card_click_reaches_the_same_shell_action_reducer(cx: &mut TestA
         );
         assert!(view.editor_surface.is_some());
     });
+}
+
+#[gpui::test]
+async fn mounted_card_click_switches_between_distinct_notes(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "卡片197第一篇".into(),
+            notebook_id: None,
+            document: rich_document("第一篇独有正文"),
+        })
+        .unwrap();
+    let second = repository
+        .create_note(CreateNote {
+            title: "卡片197第二篇".into(),
+            notebook_id: None,
+            document: rich_document("第二篇独有正文"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(first.id.clone()), window, shell_cx);
+        })
+    });
+    redraw(cx);
+    for (note, body) in [(&second, "第二篇独有正文"), (&first, "第一篇独有正文")] {
+        assert_ne!(
+            view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+            Some(note.id.clone())
+        );
+        let selector: &'static str =
+            Box::leak(format!("library-note-card-title-{}", note.id.as_str()).into_boxed_str());
+        let title = cx
+            .debug_bounds(selector)
+            .expect("other note's visible card title");
+        cx.simulate_click(title.center(), Modifiers::default());
+        redraw(cx);
+        view.read_with(cx, |shell, app| {
+            assert_eq!(
+                shell.model.read(app).navigation().selected_note_id(),
+                Some(&note.id)
+            );
+            assert_eq!(
+                shell.surface_note_id.as_ref(),
+                Some(&note.id),
+                "card must remount the requested note"
+            );
+            let session = shell.note_session.as_ref().expect("requested session");
+            assert_eq!(
+                session.read(app).editor().read(app).copy_all_plain_text(),
+                body
+            );
+        });
+    }
+}
+
+// Mutation-sensitive: removing the successful card-selection focus handoff
+// drops input after the old focused editor is unmounted. Do not click the
+// new body or focus it from the test: that hid native failure 204.
+#[gpui::test]
+async fn mounted_card_204_switch_accepts_input_without_a_second_body_click(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "204 first".into(),
+            notebook_id: None,
+            document: rich_document("旧篇正文"),
+        })
+        .unwrap();
+    let second = repository
+        .create_note(CreateNote {
+            title: "204 second".into(),
+            notebook_id: None,
+            document: rich_document("新篇正文"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &first.id, cx);
+    let old_editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    // Establish the real pre-switch owner, not a possibly clipped canvas
+    // center. The new editor must receive focus only from production code.
+    cx.update(|window, app| old_editor.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let selector: &'static str =
+        Box::leak(format!("library-note-card-title-{}", second.id.as_str()).into_boxed_str());
+    let card = cx.debug_bounds(selector).unwrap();
+    cx.simulate_click(card.center(), Modifiers::default());
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(second.id.clone())
+    );
+    cx.simulate_input("切篇首字🙂");
+    redraw(cx);
+    let new_body = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .read(app)
+            .copy_all_plain_text()
+    });
+    assert!(
+        new_body.contains("切篇首字🙂") && new_body.contains("新篇正文"),
+        "card selection must hand typing to the mounted new editor: {new_body}"
+    );
+    assert_eq!(
+        old_editor.read_with(cx, |editor, _| editor.copy_all_plain_text()),
+        "旧篇正文"
+    );
+    assert_eq!(
+        repository.load_note(&first.id).unwrap().unwrap().body_html,
+        "<p>旧篇正文</p>"
+    );
+}
+
+#[gpui::test]
+async fn mounted_card_204_command_multiselect_keeps_the_active_input_owner(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "204 active".into(),
+            notebook_id: None,
+            document: rich_document("活动正文"),
+        })
+        .unwrap();
+    let second = repository
+        .create_note(CreateNote {
+            title: "204 batch".into(),
+            notebook_id: None,
+            document: rich_document("仅批量选择"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &first.id, cx);
+    let active_editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| active_editor.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let selector: &'static str =
+        Box::leak(format!("library-note-card-title-{}", second.id.as_str()).into_boxed_str());
+    let card = cx.debug_bounds(selector).unwrap();
+    cx.simulate_click(
+        card.center(),
+        Modifiers {
+            platform: true,
+            ..Default::default()
+        },
+    );
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(first.id.clone())
+    );
+    cx.simulate_input("仍写活动篇");
+    redraw(cx);
+    let body = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .read(app)
+            .copy_all_plain_text()
+    });
+    assert!(body.contains("仍写活动篇") && body.contains("活动正文"));
+    assert_eq!(
+        repository.load_note(&second.id).unwrap().unwrap().body_html,
+        "<p>仅批量选择</p>"
+    );
+}
+
+// Regression 207: returning false from the save fence must not discard a
+// normal card click. A second click or direct focus of B would hide the bug.
+#[gpui::test]
+async fn mounted_card_207_dirty_single_click_resumes_after_save(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "207 A".into(),
+            notebook_id: None,
+            document: rich_document("旧正文"),
+        })
+        .unwrap();
+    let second = repository
+        .create_note(CreateNote {
+            title: "207 B".into(),
+            notebook_id: None,
+            document: rich_document("新正文"),
+        })
+        .unwrap();
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), clock, cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &first.id, cx);
+    let old = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| old.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    let release = session.update(cx, |session, _| {
+        session.stall_next_background_save_for_test()
+    });
+    let selector: &'static str =
+        Box::leak(format!("library-note-card-title-{}", second.id.as_str()).into_boxed_str());
+    let card = cx.debug_bounds(selector).unwrap();
+    cx.simulate_input("待保存207");
+    cx.simulate_click(card.center(), Modifiers::default());
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(first.id.clone()),
+        "do not unmount the dirty session before its snapshot confirms"
+    );
+    assert_eq!(
+        repository.load_note(&first.id).unwrap().unwrap().body_text,
+        "旧正文"
+    );
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(second.id.clone()),
+        "one card click must finish after save, without a second click"
+    );
+    assert!(
+        repository
+            .load_note(&first.id)
+            .unwrap()
+            .unwrap()
+            .body_text
+            .contains("待保存207")
+    );
+    cx.simulate_input("新篇首键207");
+    redraw(cx);
+    let body = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .read(app)
+            .copy_all_plain_text()
+    });
+    assert!(
+        body.contains("新篇首键207") && body.contains("新正文"),
+        "focus must follow deferred selection: {body}"
+    );
+    assert!(
+        !old.read_with(cx, |editor, _| editor.copy_all_plain_text())
+            .contains("新篇首键207")
+    );
+}
+
+#[gpui::test]
+async fn mounted_card_207_latest_click_wins_while_save_is_pending(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let mut notes = Vec::new();
+    for title in ["207 source", "207 superseded", "207 latest"] {
+        notes.push(
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: None,
+                    document: rich_document(title),
+                })
+                .unwrap(),
+        );
+    }
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), clock, cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &notes[0].id, cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    let release = session.update(cx, |session, _| {
+        session.stall_next_background_save_for_test()
+    });
+    let cards: Vec<_> = notes[1..]
+        .iter()
+        .map(|note| {
+            let selector: &'static str =
+                Box::leak(format!("library-note-card-title-{}", note.id.as_str()).into_boxed_str());
+            cx.debug_bounds(selector).unwrap().center()
+        })
+        .collect();
+    cx.simulate_input("待保存");
+    for position in cards {
+        cx.simulate_click(position, Modifiers::default());
+    }
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(notes[0].id.clone())
+    );
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(notes[2].id.clone()),
+        "deferred navigation must honor the latest stable NoteId, not replay the first click"
+    );
+    assert!(
+        repository
+            .load_note(&notes[0].id)
+            .unwrap()
+            .unwrap()
+            .body_text
+            .contains("待保存")
+    );
+    assert_eq!(
+        repository
+            .load_note(&notes[1].id)
+            .unwrap()
+            .unwrap()
+            .body_text,
+        "207 superseded"
+    );
+}
+
+#[gpui::test]
+async fn mounted_card_207_same_card_and_command_click_cancel_pending_selection(
+    cx: &mut TestAppContext,
+) {
+    for multiselect in [false, true] {
+        let (_profile, repository) = repository();
+        let first = repository
+            .create_note(CreateNote {
+                title: "207 retained".into(),
+                notebook_id: None,
+                document: rich_document("原正文"),
+            })
+            .unwrap();
+        let second = repository
+            .create_note(CreateNote {
+                title: "207 cancelled".into(),
+                notebook_id: None,
+                document: rich_document("目标正文"),
+            })
+            .unwrap();
+        let (view, cx) = mount_shell_with_save_clock(
+            Arc::clone(&repository),
+            Arc::new(ManualSaveClock::default()),
+            cx,
+        );
+        cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+        open_note_body(&view, &first.id, cx);
+        let editor = view.read_with(cx, |shell, app| {
+            shell
+                .note_session
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .editor()
+                .clone()
+        });
+        cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+        redraw(cx);
+        let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+        let release = session.update(cx, |session, _| {
+            session.stall_next_background_save_for_test()
+        });
+        let positions: Vec<_> = [&first, &second]
+            .iter()
+            .map(|note| {
+                let selector: &'static str = Box::leak(
+                    format!("library-note-card-title-{}", note.id.as_str()).into_boxed_str(),
+                );
+                cx.debug_bounds(selector).unwrap().center()
+            })
+            .collect();
+        cx.simulate_input("待保存");
+        cx.simulate_click(positions[1], Modifiers::default());
+        cx.simulate_click(
+            positions[if multiselect { 1 } else { 0 }],
+            Modifiers {
+                platform: multiselect,
+                ..Default::default()
+            },
+        );
+        release.send(()).unwrap();
+        cx.run_until_parked();
+        redraw(cx);
+        assert_eq!(
+            view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+            Some(first.id.clone()),
+            "a newer same-card or multi-selection click must cancel deferred navigation"
+        );
+        assert!(
+            repository
+                .load_note(&first.id)
+                .unwrap()
+                .unwrap()
+                .body_text
+                .contains("待保存")
+        );
+        cx.simulate_input("仍写原篇");
+        let body = editor.read_with(cx, |editor, _| editor.copy_all_plain_text());
+        assert!(
+            body.contains("仍写原篇"),
+            "cancelling pending selection must preserve its input owner: {body}"
+        );
+        assert_eq!(
+            repository.load_note(&second.id).unwrap().unwrap().body_text,
+            "目标正文"
+        );
+    }
+}
+
+#[gpui::test]
+async fn mounted_card_207_ime_rejection_never_replays_after_commit(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "207 IME source".into(),
+            notebook_id: None,
+            document: rich_document("原文"),
+        })
+        .unwrap();
+    let second = repository
+        .create_note(CreateNote {
+            title: "207 IME target".into(),
+            notebook_id: None,
+            document: rich_document("未动目标"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell_with_save_clock(
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &first.id, cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let selector: &'static str =
+        Box::leak(format!("library-note-card-title-{}", second.id.as_str()).into_boxed_str());
+    let position = cx.debug_bounds(selector).unwrap().center();
+    let end = editor.read_with(cx, |editor, _| editor.document().flat_utf16_len());
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            <EditorCore as EntityInputHandler>::replace_and_mark_text_in_range(
+                editor,
+                Some(end..end),
+                "候选",
+                Some((end + 2)..(end + 2)),
+                window,
+                editor_cx,
+            );
+        })
+    });
+    cx.simulate_click(position, Modifiers::default());
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(first.id.clone())
+    );
+    assert_eq!(
+        repository.load_note(&first.id).unwrap().unwrap().body_text,
+        "原文",
+        "a platform-owned candidate is not durable content"
+    );
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            <EditorCore as EntityInputHandler>::unmark_text(editor, window, editor_cx)
+        })
+    });
+    view.update(cx, |shell, shell_cx| {
+        shell.flush_active_session(FlushReason::ManualSync, shell_cx);
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(first.id.clone()),
+        "a rejected click must not unexpectedly replay after confirming the IME candidate"
+    );
+    assert!(
+        repository
+            .load_note(&first.id)
+            .unwrap()
+            .unwrap()
+            .body_text
+            .contains("候选")
+    );
+    assert_eq!(
+        repository.load_note(&second.id).unwrap().unwrap().body_text,
+        "未动目标"
+    );
+}
+
+#[gpui::test]
+async fn mounted_card_207_failed_save_keeps_source_and_error(cx: &mut TestAppContext) {
+    let (profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "207 failure source".into(),
+            notebook_id: None,
+            document: rich_document("未改原文"),
+        })
+        .unwrap();
+    let second = repository
+        .create_note(CreateNote {
+            title: "207 failure target".into(),
+            notebook_id: None,
+            document: rich_document("未改目标"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell_with_save_clock(
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &first.id, cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let selector: &'static str =
+        Box::leak(format!("library-note-card-title-{}", second.id.as_str()).into_boxed_str());
+    let position = cx.debug_bounds(selector).unwrap().center();
+    let connection = Connection::open(profile.path().join("library.sqlite")).unwrap();
+    connection.execute_batch("CREATE TRIGGER reject_207_save BEFORE UPDATE ON notes BEGIN SELECT RAISE(ABORT, '207 write rejected'); END;").unwrap();
+    cx.simulate_input("待保存失败");
+    cx.simulate_click(position, Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(first.id.clone())
+    );
+    assert!(
+        cx.debug_bounds("library-save-error").is_some(),
+        "a failed snapshot must remain visible rather than navigating away"
+    );
+    assert_eq!(
+        repository.load_note(&first.id).unwrap().unwrap().body_text,
+        "未改原文"
+    );
+    assert!(
+        editor
+            .read_with(cx, |editor, _| editor.copy_all_plain_text())
+            .contains("待保存失败")
+    );
+    assert_eq!(
+        repository.load_note(&second.id).unwrap().unwrap().body_text,
+        "未改目标"
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_207_save;")
+        .unwrap();
 }
 
 #[gpui::test]
@@ -3845,6 +5849,13 @@ async fn mounted_organization_panel_renames_and_deletes_the_active_notebook_by_i
     let confirm = cx
         .debug_bounds("library-organization-confirm-destructive")
         .expect("second destructive click reopens a typed confirmation");
+    let panel = cx
+        .debug_bounds("library-organization-panel")
+        .expect("organization panel remains visible during confirmation");
+    assert!(
+        panel.contains(&confirm.center()),
+        "destructive confirmation must be reachable inside its scroll viewport: panel={panel:?}, confirm={confirm:?}"
+    );
     cx.simulate_click(confirm.center(), Modifiers::default());
     redraw(cx);
     // Evernote: "Any notes in the notebook will be moved to Trash."
@@ -4059,6 +6070,84 @@ async fn mounted_tag_delete_waits_for_confirmation_and_targets_the_durable_id(
             .all(|candidate| candidate.id != tag.id),
         "confirmation must dispatch DeleteTag for the exact stable ID"
     );
+}
+
+#[gpui::test]
+async fn mounted_search_trash_254_can_restore_without_changing_routes(
+    cx: &mut TestAppContext,
+) {
+    // The actual durable note state, not only the sidebar route, owns note
+    // commands. A Trash result found through search needs a recovery path
+    // without rendering Move/Tag actions the repository correctly rejects.
+    let (paint_probe, _paint_scope) = super::note_card::observe_card_text_paints_for_test();
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "searchtrash254".into(),
+            notebook_id: None,
+            document: rich_document("恢复后保留正文254"),
+        })
+        .unwrap();
+    repository.trash_note(&note.id).unwrap();
+    repository.process_search_jobs().unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    let search = cx.debug_bounds("library-open-search").unwrap();
+    cx.simulate_click(search.center(), Modifiers::default());
+    redraw(cx);
+    cx.simulate_input("searchtrash254 is:trash");
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.search_palette_results.len(), 1);
+        assert_eq!(shell.search_palette_results[0].note.id, note.id);
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert!(!shell.search_palette_open);
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&note.id));
+        assert_ne!(shell.model.read(app).navigation().route(), &LibraryRoute::Trash);
+        assert!(shell.active_session_is_durable_read_only(app));
+    });
+    let organization = cx.debug_bounds("library-toggle-organization").unwrap();
+    cx.simulate_click(organization.center(), Modifiers::default());
+    redraw(cx);
+    let restore = cx.debug_bounds("library-organization-restore-selected")
+        .expect("a read-only Trash search result must offer recovery without sidebar navigation");
+    assert_eq!(paint_probe.borrow().get("library-restore-label-paint")
+        .expect("the recovery label must actually paint before it is clicked").painted_text,
+        "恢复当前笔记");
+    assert!(cx.debug_bounds("library-organization-move-targets").is_none());
+    assert!(cx.debug_bounds("library-organization-tag-targets").is_none());
+    assert!(cx.debug_bounds("library-organization-shortcut-notes").is_none(),
+        "our repository rejects creating a shortcut to a Trash note");
+    assert!(cx.debug_bounds("library-organization-purge-selected").is_none(),
+        "permanent deletion must retain the existing explicit Trash-route fence");
+    cx.simulate_click(restore.center(), Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    let restored = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(restored.deleted_time, None);
+    assert_eq!(restored.title, "searchtrash254");
+    assert_eq!(restored.body_text, "恢复后保留正文254");
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&note.id));
+        assert!(!shell.active_session_is_durable_read_only(app),
+            "the restored note remains open and editable even after leaving the Trash-only results");
+    });
+    // Frame::clear never clears debug_bounds: a removed selector remains in
+    // that historical map. Clear only our test observation, redraw the real
+    // controls, and inspect actual glyph painting instead of stale bounds.
+    paint_probe.borrow_mut().clear();
+    cx.refresh().unwrap();
+    redraw(cx);
+    assert!(!paint_probe.borrow().contains_key("library-restore-label-paint"),
+        "the restored live note must not paint a dead Restore button");
+    assert!(cx.debug_bounds("library-organization-move-targets").is_some());
+    assert!(cx.debug_bounds("library-organization-tag-targets").is_some());
 }
 
 #[gpui::test]
@@ -4854,6 +6943,95 @@ async fn mounted_default_route_mounts_the_shared_editor_command_chrome(cx: &mut 
 }
 
 #[gpui::test]
+async fn mounted_library_highlight_palette_keeps_session_selection_and_focus(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "实际资料库颜色".into(),
+            notebook_id: None,
+            document: rich_document("甲乙丙"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    redraw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(cx);
+    let (session_id, editor, selection) = view.update(cx, |shell, shell_cx| {
+        let session = shell.note_session.as_ref().unwrap();
+        let id = session.entity_id();
+        let editor = session.read(shell_cx).editor().clone();
+        let selection = editor.update(shell_cx, |editor, editor_cx| {
+            let node = editor.document().first_node_id().unwrap();
+            let selection =
+                Selection::new(DocPoint::new(node, 0), DocPoint::new(node, "甲乙".len()));
+            editor.set_selection_for_test(selection);
+            editor_cx.notify();
+            selection
+        });
+        (id, editor, selection)
+    });
+    redraw(cx);
+    for (entry, hex) in [
+        ("highlight-color-#ffe2d5", "#ffe2d5"),
+        ("highlight-color-#ddf8e1", "#ddf8e1"),
+    ] {
+        let trigger = cx.debug_bounds("highlight-color-trigger").unwrap();
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        redraw(cx);
+        let swatch = cx.debug_bounds(entry).unwrap();
+        cx.simulate_click(swatch.center(), Modifiers::default());
+        redraw(cx);
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(editor.selection(), selection);
+            let html = crate::native_editor::codec::export_canonical(editor.document())
+                .unwrap()
+                .to_canonical_html();
+            assert_eq!(
+                html.as_str(),
+                format!("<p><mark style=\"background-color: {hex}\">甲乙</mark>丙</p>")
+            );
+        });
+        assert!(
+            cx.debug_bounds("highlight-current-color").is_some(),
+            "actual selection color indicator"
+        );
+    }
+    // Opening then dismissing the shared overlay cannot replace the session,
+    // steal the document caret, or consume the first subsequent body key.
+    let trigger = cx.debug_bounds("highlight-color-trigger").unwrap();
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    redraw(cx);
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.note_session.as_ref().unwrap().entity_id(), session_id);
+        assert!(
+            !shell
+                .command_chrome
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .has_open_overlay()
+        );
+        assert_eq!(editor.read(app).selection(), selection);
+    });
+    cx.simulate_input("新");
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        let doc = crate::native_editor::codec::export_canonical(editor.document()).unwrap();
+        assert_eq!(doc.search_text().as_str(), "新丙");
+    });
+}
+
+#[gpui::test]
 async fn mounted_library_shared_chrome_clicks_bold_and_list_with_one_history_entry(
     cx: &mut TestAppContext,
 ) {
@@ -5442,6 +7620,246 @@ async fn body_pinyin_composition_survives_autosave_and_commits_once(cx: &mut Tes
     );
     let saved = repository.load_note(&note.id).unwrap().unwrap();
     assert!(!saved.body_html.contains("zai"), "{}", saved.body_html);
+}
+
+#[gpui::test]
+async fn input_trace_247_toolbar_undo_records_real_history_transition(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "撤销诊断".into(),
+            notebook_id: None,
+            document: rich_document("前"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    cx.simulate_keystrokes("cmd-end");
+    cx.simulate_input("尾");
+    redraw(cx);
+    assert_eq!(editor.read_with(cx, |editor, _| editor.undo_depth()), 1);
+    crate::native_editor::input_trace::capture_for_test();
+    let undo_point = cx
+        .debug_bounds("Undo")
+        .expect("actual Undo button")
+        .center();
+    cx.simulate_click(undo_point, Modifiers::default());
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app)),
+        "前"
+    );
+    let lines: Vec<serde_json::Value> = crate::native_editor::input_trace::take_for_test()
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let command = lines
+        .iter()
+        .find(|line| line["target"] == "toolbar" && line["event"] == "command_finished")
+        .unwrap_or_else(|| panic!("missing actual command/history boundary: {lines:#?}"));
+    assert_eq!(command["detail"]["command"], "Undo");
+    assert_eq!(command["detail"]["undo_before"], 1);
+    assert_eq!(command["detail"]["undo_after"], 0);
+    assert_eq!(command["detail"]["redo_after"], 1);
+    assert_eq!(command["detail"]["ok"], true);
+}
+
+#[gpui::test]
+async fn input_trace_247_search_open_close_records_focus_without_document_change(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    cx.update(bind_library_keybindings);
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "搜索诊断".into(),
+            notebook_id: None,
+            document: rich_document("正文保持"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        })
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    crate::native_editor::input_trace::capture_for_test();
+    cx.simulate_keystrokes("cmd-k");
+    redraw(cx);
+    assert!(view.read_with(cx, |shell, _| shell.search_palette_open));
+    cx.simulate_keystrokes("escape");
+    redraw(cx);
+    assert!(!view.read_with(cx, |shell, _| shell.search_palette_open));
+    let lines: Vec<serde_json::Value> = crate::native_editor::input_trace::take_for_test()
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let transitions: Vec<_> = lines
+        .iter()
+        .filter(|line| line["target"] == "search" && line["event"] == "visibility_changed")
+        .collect();
+    assert_eq!(
+        transitions.len(),
+        2,
+        "actual open/close must be observable: {lines:#?}"
+    );
+    assert_eq!(transitions[0]["detail"]["open"], true);
+    assert_eq!(transitions[0]["detail"]["input_focused"], true);
+    assert_eq!(transitions[1]["detail"]["open"], false);
+    assert_eq!(
+        view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app)),
+        "正文保持"
+    );
+}
+
+#[gpui::test]
+async fn toolbar_undo_248_reveals_restored_tail_image_without_manual_scroll(
+    cx: &mut TestAppContext,
+) {
+    // Catches a restored atomic selection being omitted from the retained
+    // surface's reveal route. Delete clamps the shorter document's scroll;
+    // toolbar Undo must reveal the restored image, not just restore its bytes.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_resource(&structural_png(320, 320), "tail.png", "image/png", "png")
+        .unwrap();
+    let mut blocks: Vec<_> = (0..50)
+        .map(|index| Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![Inline::Text {
+                text: format!("第{index}段，图片撤销必须回到可见位置。"),
+                marks: Marks::default(),
+            }],
+        })
+        .collect();
+    blocks.push(Block::Image {
+        resource_id: image,
+        alt: "待恢复的末图".into(),
+        presentation: ImagePresentation {
+            natural_size: Some((320, 320)),
+            display_width: Some(320),
+            alignment: None,
+        },
+        link: None,
+    });
+    blocks.push(Block::Paragraph {
+        style: BlockStyle::default(),
+        inlines: vec![Inline::Text {
+            text: "末段".into(),
+            marks: Marks::default(),
+        }],
+    });
+    let note = repository
+        .create_note(CreateNote {
+            title: "撤销图片定位".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(blocks),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(repository, cx);
+    cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        });
+    });
+    redraw(cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| focus_editor(&editor, window, app));
+    cx.simulate_keystrokes("cmd-down");
+    for _ in 0..8 {
+        redraw(cx);
+    }
+    let (image_node, before) = editor.read_with(cx, |editor, _| {
+        let block = &editor.document().blocks()[50];
+        (
+            block.id,
+            editor.layout().block_layout(block.id).unwrap().bounds,
+        )
+    });
+    let viewport = view.read_with(cx, |shell, app| {
+        shell
+            .editor_surface
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .scroll_viewport_for_test()
+    });
+    assert!(before.top() >= viewport.top() && before.bottom() <= viewport.bottom());
+    cx.simulate_click(before.center(), Modifiers::default());
+    redraw(cx);
+    editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().head.node_id, image_node);
+        assert!(!editor.selection().is_caret());
+    });
+    cx.simulate_keystrokes("backspace");
+    for _ in 0..4 {
+        redraw(cx);
+    }
+    assert!(editor.read_with(cx, |editor, _| {
+        editor.document().block(image_node).is_none()
+    }));
+    let undo_point = cx.debug_bounds("Undo").unwrap().center();
+    cx.simulate_click(undo_point, Modifiers::default());
+    for _ in 0..8 {
+        redraw(cx);
+    }
+    let restored = editor.read_with(cx, |editor, _| {
+        assert_eq!(editor.selection().head.node_id, image_node);
+        assert!(!editor.selection().is_caret());
+        assert_eq!(editor.undo_depth(), 0);
+        editor.layout().block_layout(image_node).unwrap().bounds
+    });
+    let viewport = view.read_with(cx, |shell, app| {
+        shell
+            .editor_surface
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .scroll_viewport_for_test()
+    });
+    assert!(
+        restored.top() >= viewport.top() - px(0.5)
+            && restored.bottom() <= viewport.bottom() + px(0.5),
+        "restored image must be visible without a wheel event: image={restored:?}, viewport={viewport:?}"
+    );
 }
 
 /// The opt-in input trace records what the input method asked of the body
@@ -6154,7 +8572,7 @@ async fn mounted_library_insert_resource_button_presents_and_cancel_discards_its
             document: rich_document("正文"),
         })
         .expect("create note");
-    let (view, cx) = mount_shell(repository, cx);
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
     cx.simulate_resize(gpui::size(px(1400.0), px(820.0)));
     redraw(cx);
     cx.update(|window, app| {
@@ -6223,6 +8641,41 @@ async fn mounted_library_insert_resource_button_presents_and_cancel_discards_its
             Some("资源未插入：面板不可用")
         );
     });
+    let session_id = view.read_with(cx, |shell, _| {
+        shell.note_session.as_ref().unwrap().entity_id()
+    });
+    cx.simulate_click(button.center(), Modifiers::default());
+    redraw(cx);
+    let retry_token = view.read_with(cx, |shell, _| {
+        shell.pending_resource_insert.as_ref().unwrap().token
+    });
+    assert_ne!(retry_token, failed_token);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            for stale in [
+                ResourcePickerCompletion::Failed("迟到错误".into()),
+                ResourcePickerCompletion::Selected(PathBuf::from("/must-not-be-opened.png")),
+            ] {
+                shell.finish_resource_picker_prompt(failed_token, stale, window, shell_cx);
+                assert_eq!(
+                    shell.pending_resource_insert.as_ref().unwrap().token,
+                    retry_token
+                );
+            }
+            shell.finish_resource_picker_prompt(
+                retry_token,
+                ResourcePickerCompletion::Cancelled,
+                window,
+                shell_cx,
+            );
+            assert!(shell.pending_resource_insert.is_none());
+            assert_eq!(shell.note_session.as_ref().unwrap().entity_id(), session_id);
+        })
+    });
+    let after = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(after.revision, note.revision);
+    assert_eq!(after.title, note.title);
+    assert!(after.resource_ids.is_empty());
 }
 
 #[gpui::test]
@@ -6955,6 +9408,7 @@ async fn persisted_pane_widths_and_visibility_control_real_rendered_bounds(
             sidebar_visible: true,
             list_visible: true,
             selected_note_id: None,
+            location: Default::default(),
         })
         .expect("persist panes");
     let (view, cx) = mount_shell(Arc::clone(&repository), cx);
@@ -10791,6 +13245,14 @@ async fn mounted_restore_selected_restores_every_selected_note(cx: &mut TestAppC
             .map(|row| row.id.clone())
             .collect::<Vec<_>>()
     };
+    assert_eq!(reopened_model.navigation().route(), &LibraryRoute::Trash);
+    assert_eq!(ids(&reopened_model), vec![listed[1].clone()]);
+    reopened_model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::AllNotes,
+            selected_note_id: None,
+        })
+        .unwrap();
     let all_notes = ids(&reopened_model);
     assert!(
         all_notes.contains(&listed[0]) && all_notes.contains(&listed[2]),
@@ -10907,6 +13369,400 @@ fn click_selector(selector: &'static str, cx: &mut VisualTestContext) {
         .unwrap_or_else(|| panic!("{selector}"));
     cx.simulate_click(bounds.center(), Modifiers::default());
     redraw(cx);
+}
+
+#[gpui::test]
+async fn mounted_shortcut_225_click_flushes_current_draft_and_opens_exact_target(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let first = repository
+        .create_note(CreateNote {
+            title: "225 draft".into(),
+            notebook_id: None,
+            document: rich_document("原文"),
+        })
+        .unwrap();
+    let target = repository
+        .create_note(CreateNote {
+            title: "225 target".into(),
+            notebook_id: None,
+            document: rich_document("目标内容"),
+        })
+        .unwrap();
+    repository
+        .add_shortcuts(&[app_lite_core::ShortcutTarget::Note(target.id.clone())])
+        .unwrap();
+    let shortcut = repository.list_shortcuts().unwrap().remove(0);
+    let (view, cx) = mount_shell_with_save_clock(
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &first.id, cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    redraw(cx);
+    cx.simulate_input("未保存输入");
+    let selector: &'static str =
+        Box::leak(format!("library-sidebar-shortcut-{}", shortcut.id).into_boxed_str());
+    if let Some(bounds) = cx.debug_bounds(selector) {
+        cx.simulate_click(bounds.center(), Modifiers::default());
+    }
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(target.id.clone()),
+        "the actual shortcut row must navigate, not remain on the source or open a copy"
+    );
+    assert!(
+        repository
+            .load_note(&first.id)
+            .unwrap()
+            .unwrap()
+            .body_text
+            .contains("未保存输入"),
+        "shortcut navigation must cross the retained save barrier"
+    );
+    assert_eq!(
+        repository.load_note(&target.id).unwrap().unwrap().body_text,
+        "目标内容"
+    );
+}
+
+#[gpui::test]
+async fn mounted_shortcut_225_toggle_adds_and_removes_membership_without_deleting_note(
+    cx: &mut TestAppContext,
+) {
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "225 toggle".into(),
+            notebook_id: None,
+            document: rich_document("必须保留"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    open_note_body(&view, &note.id, cx);
+    click_selector("library-toggle-organization", cx);
+    if let Some(bounds) = cx.debug_bounds("library-organization-shortcut-notes") {
+        cx.simulate_click(bounds.center(), Modifiers::default());
+    }
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        repository.list_shortcuts().unwrap().len(),
+        1,
+        "the real organization control must add durable membership"
+    );
+    click_selector("library-organization-shortcut-notes", cx);
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(repository.list_shortcuts().unwrap().is_empty());
+    assert_eq!(
+        repository.load_note(&note.id).unwrap().unwrap().body_text,
+        "必须保留"
+    );
+}
+
+#[gpui::test]
+async fn mounted_shortcut_226_title_autosave_refreshes_sidebar_without_remount(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "226 original".into(),
+            notebook_id: None,
+            document: rich_document("正文与撤销所有者保持"),
+        })
+        .unwrap();
+    repository
+        .add_shortcuts(&[app_lite_core::ShortcutTarget::Note(note.id.clone())])
+        .unwrap();
+    let clock = Arc::new(ManualSaveClock::default());
+    let (view, cx) = mount_shell_with_save_clock(Arc::clone(&repository), Arc::clone(&clock), cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &note.id, cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    session.update(cx, |session, _| session.enable_deadline_tasks_for_test());
+    let editor = session.read_with(cx, |session, _| session.editor().clone());
+    let surface = view.read_with(cx, |shell, _| {
+        shell.editor_surface.as_ref().unwrap().entity_id()
+    });
+    let title_bounds = cx.debug_bounds("library-note-title").unwrap();
+    cx.simulate_click(title_bounds.center(), Modifiers::default());
+    redraw(cx);
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input("226 renamed 🙂");
+    redraw(cx);
+    assert_eq!(
+        session.read_with(cx, |session, app| session
+            .title()
+            .read(app)
+            .text()
+            .to_owned()),
+        "226 renamed 🙂",
+        "input must reach the actual title before testing its save outcome"
+    );
+    cx.simulate_keystrokes("tab");
+    redraw(cx);
+    clock.advance(Duration::from_millis(100));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    clock.advance(Duration::from_millis(400));
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    redraw(cx);
+    let saved = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(
+        saved.title, "226 renamed 🙂",
+        "real title input must be durably autosaved first"
+    );
+    assert_eq!(saved.body_text, "正文与撤销所有者保持");
+    view.read_with(cx, |shell, app| {
+        assert_eq!(
+            shell.note_session.as_ref().unwrap().entity_id(),
+            session.entity_id()
+        );
+        assert_eq!(shell.editor_surface.as_ref().unwrap().entity_id(), surface);
+        assert_eq!(
+            shell
+                .note_session
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .editor()
+                .entity_id(),
+            editor.entity_id()
+        );
+        assert_eq!(
+            shell.model.read(app).navigation_index().shortcuts[0].title,
+            "226 renamed 🙂",
+            "the actual sidebar row's metadata must change without switching notes"
+        );
+    });
+    cx.simulate_input("X");
+    redraw(cx);
+    assert!(
+        editor
+            .read_with(cx, |editor, _| editor.copy_all_plain_text())
+            .contains('X')
+    );
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.copy_all_plain_text()),
+        "正文与撤销所有者保持"
+    );
+}
+
+// A real stalled snapshot, not a second click after saving, protects the
+// retained-session continuation from replaying a superseded shortcut.
+#[gpui::test]
+async fn mounted_shortcut_225_latest_click_wins_after_retained_save(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let mut notes = Vec::new();
+    for title in ["225 source", "225 superseded", "225 latest"] {
+        notes.push(
+            repository
+                .create_note(CreateNote {
+                    title: title.into(),
+                    notebook_id: None,
+                    document: rich_document(title),
+                })
+                .unwrap(),
+        );
+    }
+    repository
+        .add_shortcuts(
+            &notes[1..]
+                .iter()
+                .map(|note| app_lite_core::ShortcutTarget::Note(note.id.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let shortcuts = repository.list_shortcuts().unwrap();
+    let (view, cx) = mount_shell_with_save_clock(
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &notes[0].id, cx);
+    let source = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| source.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    let release = session.update(cx, |session, _| {
+        session.stall_next_background_save_for_test()
+    });
+    cx.simulate_input("未保存的最新点击");
+    for shortcut in shortcuts {
+        let selector: &'static str =
+            Box::leak(format!("library-sidebar-shortcut-{}", shortcut.id).into_boxed_str());
+        let position = cx
+            .debug_bounds(selector)
+            .expect("visible typed shortcut")
+            .center();
+        cx.simulate_click(position, Modifiers::default());
+    }
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(notes[0].id.clone())
+    );
+    assert_eq!(
+        repository
+            .load_note(&notes[0].id)
+            .unwrap()
+            .unwrap()
+            .body_text,
+        "225 source"
+    );
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.surface_note_id.clone()),
+        Some(notes[2].id.clone()),
+        "only the most recent shortcut may open after the original snapshot confirms"
+    );
+    assert!(
+        repository
+            .load_note(&notes[0].id)
+            .unwrap()
+            .unwrap()
+            .body_text
+            .contains("未保存的最新点击")
+    );
+    assert_eq!(
+        repository
+            .load_note(&notes[1].id)
+            .unwrap()
+            .unwrap()
+            .body_text,
+        "225 superseded"
+    );
+    cx.simulate_input("新篇第一笔");
+    redraw(cx);
+    let body = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .read(app)
+            .copy_all_plain_text()
+    });
+    assert!(
+        body.contains("新篇第一笔") && body.contains("225 latest"),
+        "deferred shortcut must transfer the input owner: {body}"
+    );
+    assert!(
+        !source
+            .read_with(cx, |editor, _| editor.copy_all_plain_text())
+            .contains("新篇第一笔")
+    );
+}
+
+#[gpui::test]
+async fn mounted_shortcut_225_target_trashed_during_save_never_opens(cx: &mut TestAppContext) {
+    let (_profile, repository) = repository();
+    let source = repository
+        .create_note(CreateNote {
+            title: "225 retained source".into(),
+            notebook_id: None,
+            document: rich_document("保留正文"),
+        })
+        .unwrap();
+    let target = repository
+        .create_note(CreateNote {
+            title: "225 invalidated target".into(),
+            notebook_id: None,
+            document: rich_document("目标原文"),
+        })
+        .unwrap();
+    repository
+        .add_shortcuts(&[app_lite_core::ShortcutTarget::Note(target.id.clone())])
+        .unwrap();
+    let shortcut = repository.list_shortcuts().unwrap().remove(0);
+    let (view, cx) = mount_shell_with_save_clock(
+        Arc::clone(&repository),
+        Arc::new(ManualSaveClock::default()),
+        cx,
+    );
+    cx.simulate_resize(gpui::size(px(1160.0), px(790.0)));
+    open_note_body(&view, &source.id, cx);
+    let editor = view.read_with(cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| editor.read(app).focus_handle().focus(window));
+    redraw(cx);
+    let session = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().clone());
+    let release = session.update(cx, |session, _| {
+        session.stall_next_background_save_for_test()
+    });
+    cx.simulate_input("失效目标不能吞字");
+    let selector: &'static str =
+        Box::leak(format!("library-sidebar-shortcut-{}", shortcut.id).into_boxed_str());
+    let position = cx
+        .debug_bounds(selector)
+        .expect("shortcut before deletion")
+        .center();
+    cx.simulate_click(position, Modifiers::default());
+    repository.trash_note(&target.id).unwrap();
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    redraw(cx);
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.surface_note_id.as_ref(), Some(&source.id));
+        assert_eq!(
+            shell.model.read(app).navigation().selected_note_id(),
+            Some(&source.id)
+        );
+        assert_eq!(
+            shell.note_session.as_ref().unwrap().entity_id(),
+            session.entity_id(),
+            "an invalid target must not replace the retained source session"
+        );
+    });
+    assert!(
+        repository
+            .load_note(&source.id)
+            .unwrap()
+            .unwrap()
+            .body_text
+            .contains("失效目标不能吞字")
+    );
+    let trashed = repository.load_note(&target.id).unwrap().unwrap();
+    assert!(trashed.deleted_time.is_some());
+    assert_eq!(trashed.body_text, "目标原文");
 }
 
 /// Permanent Delete on a Trash multi-selection names the exact count, and
@@ -11328,6 +14184,154 @@ fn png_fixture() -> Vec<u8> {
 /// Evernote copies and cuts the selection's full HTML (marks, headings,
 /// resources) and reparses it on paste; cut deletes the selection after
 /// copying (common-editor `clipboard/commands/copy.ts`).
+// Cmd-C then Cmd-V of a note's image (alone, or with formatted text) as on
+// macOS: the copy sits in this app's native fragment type, and GPUI reads
+// only the plain text beside it, with no metadata.
+fn native_copy_paste_into_another_note(with_text: bool, cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let image = repository
+        .import_resource(&png_fixture(), "photo.png", "image/png", "png")
+        .unwrap();
+    let mut blocks = Vec::new();
+    if with_text {
+        blocks.push(Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![
+                Inline::Text {
+                    text: "普通".into(),
+                    marks: Marks::default(),
+                },
+                Inline::Text {
+                    text: "粗体".into(),
+                    marks: Marks {
+                        bold: true,
+                        ..Marks::default()
+                    },
+                },
+            ],
+        });
+    }
+    blocks.push(Block::Image {
+        resource_id: image.clone(),
+        alt: "photo".into(),
+        presentation: ImagePresentation {
+            natural_size: Some((1, 1)),
+            ..Default::default()
+        },
+        link: None,
+    });
+    let source = repository
+        .create_note(CreateNote {
+            title: "来源".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(blocks),
+        })
+        .unwrap();
+    let target = repository
+        .create_note(CreateNote {
+            title: "目标".into(),
+            notebook_id: None,
+            document: rich_document("前"),
+        })
+        .unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    redraw(cx);
+    open_note_body(&view, &source.id, cx);
+    cx.dispatch_action(SelectAll);
+    cx.dispatch_action(Copy);
+    let fragment = cx
+        .read_from_clipboard()
+        .map(crate::native_editor::images::ClipboardPayload::from_gpui)
+        .and_then(|payload| payload.fragment)
+        .expect("the copied fragment");
+    // What the macOS writer puts in the fragment type, and what GPUI then
+    // reads from the general pasteboard: the plain string alone.
+    let native = crate::native_editor::images::native_fragment_payload(
+        &serde_json::to_string(&fragment).unwrap(),
+    )
+    .expect("native fragment");
+    cx.write_to_clipboard(ClipboardItem::new_string(fragment.plain.clone()));
+
+    open_note_body(&view, &target.id, cx);
+    let source_body = repository.load_note(&source.id).unwrap().unwrap().body_html;
+    cx.simulate_keystrokes("cmd-end");
+    crate::native_editor::images::set_next_native_pasteboard_for_test(native);
+    cx.dispatch_action(Paste);
+    redraw(cx);
+    let images = |view: &Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| {
+            let editor = shell
+                .note_session
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .editor()
+                .read(app);
+            editor
+                .document()
+                .blocks()
+                .iter()
+                .filter_map(|block| match &block.content {
+                    BlockContent::Image { resource_id, .. } => Some(resource_id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let body = |view: &Entity<LibraryShell>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app))
+    };
+    assert_eq!(images(&view, cx), vec![image.as_str().to_owned()]);
+    assert_eq!(body(&view, cx).contains("普通粗体"), with_text);
+
+    cx.simulate_keystrokes("cmd-z");
+    redraw(cx);
+    assert!(images(&view, cx).is_empty(), "one Undo removes the paste");
+    assert!(!body(&view, cx).contains("粗体"));
+    cx.simulate_keystrokes("cmd-shift-z");
+    redraw(cx);
+    assert_eq!(images(&view, cx), vec![image.as_str().to_owned()]);
+
+    cx.dispatch_action(crate::app::SyncCurrent);
+    redraw(cx);
+    let stored = repository.load_note(&target.id).unwrap().unwrap();
+    assert_eq!(
+        stored.resource_ids,
+        vec![image.clone()],
+        "{}",
+        stored.body_html
+    );
+    assert!(
+        stored
+            .body_html
+            .contains(&format!("src=\":/{}\"", image.as_str())),
+        "{}",
+        stored.body_html
+    );
+    assert_eq!(
+        stored.body_html.contains("<strong>粗体</strong>"),
+        with_text,
+        "{}",
+        stored.body_html
+    );
+    assert_eq!(
+        repository.load_note(&source.id).unwrap().unwrap().body_html,
+        source_body,
+        "the source note is untouched"
+    );
+}
+
+#[gpui::test]
+async fn mounted_native_copy_of_an_image_pastes_it(cx: &mut TestAppContext) {
+    native_copy_paste_into_another_note(false, cx);
+}
+
+#[gpui::test]
+async fn mounted_native_copy_of_formatted_text_and_image_pastes_both(cx: &mut TestAppContext) {
+    native_copy_paste_into_another_note(true, cx);
+}
+
 #[gpui::test]
 async fn mounted_cut_and_paste_keep_headings_marks_and_images(cx: &mut TestAppContext) {
     cx.update(|app| crate::components::init(app));
@@ -12373,6 +15377,25 @@ async fn mounted_paste_leaves_out_an_unobtainable_image_and_says_so(cx: &mut Tes
     let body = view.read_with(cx, |shell, app| shell.resource_flow_body_text_for_test(app));
     assert!(body.contains("文字"), "{body}");
     assert!(!body.contains('\u{fffc}'), "{body:?}");
+}
+
+#[test]
+fn notebook_empty_copy_points_to_the_actual_create_action() {
+    assert_eq!(
+        RouteEmptyState::Notebook.detail(),
+        "点击“新建笔记”，开始记录。"
+    );
+    assert_eq!(RouteEmptyState::Notebook.create_label(), Some("新建笔记"));
+    assert!(!RouteEmptyState::Notebook.detail().contains("侧边栏"));
+}
+
+#[test]
+fn stack_empty_copy_does_not_offer_a_nonexistent_create_button() {
+    assert_eq!(
+        RouteEmptyState::Stack.detail(),
+        "先在分组中添加或选择笔记本，再新建笔记。"
+    );
+    assert_eq!(RouteEmptyState::Stack.create_label(), None);
 }
 
 #[gpui::test]

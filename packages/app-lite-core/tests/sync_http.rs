@@ -179,23 +179,52 @@ fn selected_image_cover_survives_sync_to_a_fresh_client() {
     let server = Server::start();
     let (a_root, b_root) = (tempdir().unwrap(), tempdir().unwrap());
     let a = open(&a_root);
-    let first = a.import_resource(b"image-one", "one.png", "image/png", "png").unwrap();
-    let second = a.import_resource(b"image-two", "two.png", "image/png", "png").unwrap();
+    let first = a
+        .import_resource(b"image-one", "one.png", "image/png", "png")
+        .unwrap();
+    let second = a
+        .import_resource(b"image-two", "two.png", "image/png", "png")
+        .unwrap();
     let document = CanonicalDocument::from_blocks(vec![Block::Paragraph {
         style: BlockStyle::default(),
-        inlines: vec![first.clone(), second.clone()].into_iter().map(|resource_id| Inline::Image {
-            resource_id, alt: String::new(), display_width: None, link: None,
-        }).collect(),
+        inlines: vec![first.clone(), second.clone()]
+            .into_iter()
+            .map(|resource_id| Inline::Image {
+                resource_id,
+                alt: String::new(),
+                display_width: None,
+                link: None,
+            })
+            .collect(),
     }]);
-    let note = a.create_note(CreateNote { title: "封面选择".into(), notebook_id: None, document: document.clone() }).unwrap();
+    let note = a
+        .create_note(CreateNote {
+            title: "封面选择".into(),
+            notebook_id: None,
+            document: document.clone(),
+        })
+        .unwrap();
     a.save_note(SaveNote {
-        id: note.id.clone(), expected_revision: note.revision, title: note.title,
-        document, resource_ids: vec![first, second.clone()], selected_thumbnail_id: Some(second.clone()),
-    }).unwrap();
+        id: note.id.clone(),
+        expected_revision: note.revision,
+        title: note.title,
+        document,
+        resource_ids: vec![first, second.clone()],
+        selected_thumbnail_id: Some(second.clone()),
+    })
+    .unwrap();
     sync::sync_once(&a, &server.transport()).unwrap();
     let b = open(&b_root);
     sync::sync_once(&b, &server.transport()).unwrap();
-    assert_eq!(b.list_notes(Default::default()).unwrap().into_iter().find(|n| n.id == note.id).unwrap().selected_thumbnail_id, Some(second));
+    assert_eq!(
+        b.list_notes(Default::default())
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == note.id)
+            .unwrap()
+            .selected_thumbnail_id,
+        Some(second)
+    );
 }
 
 #[test]
@@ -203,30 +232,64 @@ fn divergent_cover_choices_survive_as_conflict_copies() {
     let server = Server::start();
     let (a_root, b_root) = (tempdir().unwrap(), tempdir().unwrap());
     let a = open(&a_root);
-    let images: Vec<_> = (0..3).map(|i| a.import_resource(&[i], "cover.png", "image/png", "png").unwrap()).collect();
+    let images: Vec<_> = (0..3)
+        .map(|i| {
+            a.import_resource(&[i], "cover.png", "image/png", "png")
+                .unwrap()
+        })
+        .collect();
     let document = CanonicalDocument::from_blocks(vec![Block::Paragraph {
         style: BlockStyle::default(),
-        inlines: images.iter().cloned().map(|resource_id| Inline::Image {
-            resource_id, alt: String::new(), display_width: None, link: None,
-        }).collect(),
+        inlines: images
+            .iter()
+            .cloned()
+            .map(|resource_id| Inline::Image {
+                resource_id,
+                alt: String::new(),
+                display_width: None,
+                link: None,
+            })
+            .collect(),
     }]);
-    let note = a.create_note(CreateNote { title: "封面冲突".into(), notebook_id: None, document: document.clone() }).unwrap();
+    let note = a
+        .create_note(CreateNote {
+            title: "封面冲突".into(),
+            notebook_id: None,
+            document: document.clone(),
+        })
+        .unwrap();
     sync::sync_once(&a, &server.transport()).unwrap();
     let b = open(&b_root);
     sync::sync_once(&b, &server.transport()).unwrap();
     for (repo, cover) in [(&a, &images[1]), (&b, &images[2])] {
         let current = repo.load_note(&note.id).unwrap().unwrap();
         repo.save_note(SaveNote {
-            id: note.id.clone(), expected_revision: current.revision, title: current.title,
-            document: document.clone(), resource_ids: images.clone(), selected_thumbnail_id: Some(cover.clone()),
-        }).unwrap();
+            id: note.id.clone(),
+            expected_revision: current.revision,
+            title: current.title,
+            document: document.clone(),
+            resource_ids: images.clone(),
+            selected_thumbnail_id: Some(cover.clone()),
+        })
+        .unwrap();
     }
     sync::sync_once(&a, &server.transport()).unwrap();
     sync::sync_once(&b, &server.transport()).unwrap();
     sync::sync_once(&a, &server.transport()).unwrap();
     for repo in [&a, &b] {
-        let covers: Vec<_> = repo.list_notes(Default::default()).unwrap().into_iter().filter_map(|note| note.selected_thumbnail_id).collect();
-        assert!(covers.contains(&images[1]), "first device's cover lost: {covers:?}");
-        assert!(covers.contains(&images[2]), "conflict copy lost the second device's cover: {covers:?}");
+        let covers: Vec<_> = repo
+            .list_notes(Default::default())
+            .unwrap()
+            .into_iter()
+            .filter_map(|note| note.selected_thumbnail_id)
+            .collect();
+        assert!(
+            covers.contains(&images[1]),
+            "first device's cover lost: {covers:?}"
+        );
+        assert!(
+            covers.contains(&images[2]),
+            "conflict copy lost the second device's cover: {covers:?}"
+        );
     }
 }

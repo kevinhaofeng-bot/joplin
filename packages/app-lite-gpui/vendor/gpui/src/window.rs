@@ -116,6 +116,12 @@ impl WindowInvalidator {
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
         inner.dirty_views.insert(entity);
+        #[cfg(target_os = "macos")]
+        crate::platform::trace_window_frame("view_invalidate", || serde_json::json!({
+            "entity": format!("{entity:?}"),
+            "phase_none": inner.draw_phase == DrawPhase::None,
+            "was_dirty": inner.dirty,
+        }));
         if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
@@ -1023,6 +1029,14 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
             move |request_frame_options| {
+                #[cfg(target_os = "macos")]
+                crate::platform::trace_window_frame("frame_request", || serde_json::json!({
+                    "window": handle.window_id().as_u64(),
+                    "dirty": invalidator.is_dirty(),
+                    "force_render": request_frame_options.force_render,
+                    "require_presentation": request_frame_options.require_presentation,
+                    "active": active.get(),
+                }));
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
                     handle
@@ -1912,6 +1926,11 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        #[cfg(target_os = "macos")]
+        crate::platform::trace_window_frame("frame_draw", || serde_json::json!({
+            "window": self.handle.window_id().as_u64(),
+            "dirty": self.invalidator.is_dirty(),
+        }));
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2005,6 +2024,10 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
+        #[cfg(target_os = "macos")]
+        crate::platform::trace_window_frame("frame_present", || serde_json::json!({
+            "window": self.handle.window_id().as_u64(),
+        }));
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();

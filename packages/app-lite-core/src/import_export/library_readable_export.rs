@@ -13,9 +13,9 @@
 use super::readable_export::{
     COPY_BUFFER_BYTES, MAX_BUNDLE_NOTES, MAX_BUNDLE_RESOURCES, MAX_NOTE_HTML_BYTES,
     MAX_NOTE_REVISIONS, ReadableExportError, copy_and_hash, ensure_existing_empty_directory,
-    hash_regular_file_bounded, open_bundle_root, open_child_directory, open_child_regular,
-    read_regular_file_bounded, safe_display_name, sha256_hex, snippet, write_html_escaped,
-    write_readable_page, write_synced,
+    hash_regular_file_bounded, history_search_text_matches, open_bundle_root, open_child_directory,
+    open_child_regular, read_regular_file_bounded, safe_display_name, sha256_hex, snippet,
+    write_html_escaped, write_readable_page, write_synced,
 };
 use crate::{
     BlobHash, CanonicalDocument, LibraryRepository, NoteId, NotebookId, ResourceId, StackId, TagId,
@@ -95,6 +95,10 @@ struct Revision {
     revision: i64,
     title: String,
     body_html: String,
+    // Optional v1 extension: keep the old empty-draft derived field verbatim.
+    // Ordinary histories and older bundles need no redundant text field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_empty_body_text: Option<String>,
     created_time: i64,
 }
 
@@ -356,6 +360,11 @@ fn read_snapshot(connection: &Connection) -> Result<Snapshot, ReadableExportErro
                         revision: row.get(0)?,
                         title: row.get(1)?,
                         body_html: row.get(2)?,
+                        legacy_empty_body_text: {
+                            let html: String = row.get(2)?;
+                            let text: String = row.get(3)?;
+                            (html.is_empty() && !text.is_empty()).then_some(text)
+                        },
                         created_time: row.get(4)?,
                     },
                     row.get::<_, String>(3)?,
@@ -369,7 +378,7 @@ fn read_snapshot(connection: &Connection) -> Result<Snapshot, ReadableExportErro
             let document = CanonicalDocument::parse_html(&revision.body_html)
                 .map_err(|_| invalid("revision HTML invalid"))?;
             if document.to_canonical_html().as_str() != revision.body_html
-                || document.search_text().as_str() != text
+                || !history_search_text_matches(&document, &revision.body_html, text)
             {
                 return Err(invalid("revision HTML is not canonical"));
             }
@@ -652,6 +661,14 @@ fn validate(bundle: &Path) -> Result<Validated, ReadableExportError> {
             if revision.revision < 1
                 || index > 0 && revision.revision <= history[index - 1].revision
                 || document.to_canonical_html().as_str() != revision.body_html
+                || revision
+                    .legacy_empty_body_text
+                    .as_ref()
+                    .is_some_and(|text| {
+                        !revision.body_html.is_empty()
+                            || text.is_empty()
+                            || !history_search_text_matches(&document, &revision.body_html, text)
+                    })
                 || document
                     .resource_ids()
                     .iter()
@@ -804,7 +821,9 @@ fn rebuild(validated: &Validated, database: &Path) -> Result<(), ReadableExportE
         for revision in &validated.histories[&note.id] {
             tx.execute(
                 "INSERT INTO note_revisions(note_id,revision,title,body_html,body_text,created_time) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![note.id, revision.revision, revision.title, revision.body_html, search_text(&revision.body_html)?, revision.created_time],
+                params![note.id, revision.revision, revision.title, revision.body_html,
+                    revision.legacy_empty_body_text.clone().unwrap_or(search_text(&revision.body_html)?),
+                    revision.created_time],
             )?;
         }
         tx.execute(

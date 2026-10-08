@@ -649,17 +649,23 @@ impl LibraryShell {
     fn import_sync_certificate(
         &mut self,
         _: &MouseDownEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(generation) = self.begin_sync_certificate_pick() else {
             return;
         };
-        let prompt = cx.prompt_for_paths(PathPromptOptions {
+        let prompt = crate::file_picker::prompt_for_paths(cx, PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some("选择 PEM 服务器证书".into()),
+        });
+        let owner = cx.entity().downgrade();
+        let prompt = crate::file_picker::bind_to_request(cx, window.window_handle(), prompt, move |app| {
+            owner.read_with(app, |shell, _| shell.sync_settings.as_ref().is_some_and(
+                |settings| settings.picker_generation == generation,
+            )).unwrap_or(false)
         });
         cx.spawn(async move |this, cx| {
             let result = match prompt.await {
@@ -1290,6 +1296,7 @@ impl LibraryShell {
             .id("sync-failures")
             .debug_selector(|| "sync-failures".to_owned())
             .absolute()
+            .occlude()
             .bottom(px(130.0))
             .right(px(14.0))
             .w(px(460.0))
@@ -1380,6 +1387,7 @@ impl LibraryShell {
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
                             .text_color(rgba(0x8d6a27ff))
                             .child(format!("“{}”（{original}）", conflict.copy_title)),
                     )
@@ -1387,6 +1395,7 @@ impl LibraryShell {
                         div()
                             .id(("sync-conflict-open", index))
                             .debug_selector(move || format!("sync-conflict-open-{index}"))
+                            .flex_none()
                             .px(px(10.0))
                             .py(px(3.0))
                             .rounded(px(4.0))
@@ -1408,6 +1417,7 @@ impl LibraryShell {
                         div()
                             .id(("sync-conflict-settle", index))
                             .debug_selector(move || format!("sync-conflict-settle-{index}"))
+                            .flex_none()
                             .px(px(10.0))
                             .py(px(3.0))
                             .rounded(px(4.0))
@@ -1436,6 +1446,7 @@ impl LibraryShell {
             let row = div().flex().gap(px(8.0)).items_start().child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .text_color(rgba(0xa34838ff))
                     .child(failure_row_text(&failure)),
             );
@@ -1444,6 +1455,7 @@ impl LibraryShell {
                     div()
                         .id(("sync-failure-retry", index))
                         .debug_selector(move || format!("sync-failure-retry-{index}"))
+                        .flex_none()
                         .px(px(10.0))
                         .py(px(3.0))
                         .rounded(px(4.0))

@@ -24,11 +24,8 @@ pub unsafe fn transpose_64(data: &[u8; 64]) -> BitPlanes {
     let v3 = unsafe { vld1q_u8(ptr.add(48)) };
 
     // Bit extraction powers: [1, 2, 4, 8, 16, 32, 64, 128] repeated for high lane
-    let bit_select: uint8x16_t = unsafe {
-        vld1q_u8(
-            [1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr(),
-        )
-    };
+    let bit_select: uint8x16_t =
+        unsafe { vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr()) };
 
     let mut planes = [0u64; 8];
 

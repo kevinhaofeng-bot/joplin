@@ -31,7 +31,11 @@ impl<'a> QName<'a> {
     /// and byte span in the input stream.
     #[inline]
     pub fn new(raw: &'a [u8], colon_pos: Option<u16>, span: Span) -> Self {
-        Self { raw, colon_pos, span }
+        Self {
+            raw,
+            colon_pos,
+            span,
+        }
     }
 
     /// The full raw name as it appears in the source (e.g. `b"svg:rect"` or `b"div"`).
@@ -57,7 +61,8 @@ impl<'a> QName<'a> {
     /// The byte span of the prefix in the input stream, if present.
     #[inline]
     pub fn prefix_span(&self) -> Option<Span> {
-        self.colon_pos.map(|pos| Span::new(self.span.start, self.span.start + pos as u64))
+        self.colon_pos
+            .map(|pos| Span::new(self.span.start, self.span.start + pos as u64))
     }
 
     /// The local name after the prefix and colon.

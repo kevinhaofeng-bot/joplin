@@ -59,9 +59,12 @@ impl PlatformAtlas for MetalAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
-        let Some(id) = lock.tiles_by_key.get(key).map(|v| v.texture_id) else {
+        // Remove the key even when another tile keeps the texture alive. This
+        // also makes repeated drops harmless and allows a later upload to rebuild.
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
+        let id = tile.texture_id;
 
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
@@ -77,11 +80,11 @@ impl PlatformAtlas for MetalAtlas {
         };
 
         if let Some(mut texture) = texture_slot.take() {
+            texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
 
             if texture.is_unreferenced() {
                 textures.free_list.push(id.index as usize);
-                lock.tiles_by_key.remove(key);
             } else {
                 *texture_slot = Some(texture);
             }
@@ -279,3 +282,97 @@ impl From<etagere::Rectangle> for Bounds<DevicePixels> {
 struct AssertSend<T>(T);
 
 unsafe impl<T> Send for AssertSend<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ImageId, RenderImageParams};
+
+    fn image_key(id: usize) -> AtlasKey {
+        AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(id),
+            frame_index: 0,
+        })
+    }
+
+    fn atlas() -> MetalAtlas {
+        MetalAtlas::new(Device::system_default().expect("real Metal device required"))
+    }
+
+    fn insert(atlas: &MetalAtlas, key: &AtlasKey, side: i32, bgra: [u8; 4]) -> AtlasTile {
+        let bytes = bgra.repeat((side * side) as usize);
+        atlas
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((
+                    Size {
+                        width: DevicePixels(side),
+                        height: DevicePixels(side),
+                    },
+                    Cow::Borrowed(&bytes),
+                )))
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    fn pixel(atlas: &MetalAtlas, tile: &AtlasTile) -> [u8; 4] {
+        let texture = atlas.metal_texture(tile.texture_id);
+        let mut bytes = [0u8; 4];
+        texture.get_bytes(
+            bytes.as_mut_ptr().cast(),
+            4,
+            metal::MTLRegion::new_2d(
+                tile.bounds.origin.x.into(),
+                tile.bounds.origin.y.into(),
+                1,
+                1,
+            ),
+            0,
+        );
+        bytes
+    }
+
+    #[test]
+    fn removed_shared_image_is_rebuilt_with_new_pixels() {
+        let atlas = atlas();
+        let a = image_key(1);
+        let b = image_key(2);
+        let first = insert(&atlas, &a, 32, [11, 22, 33, 255]);
+        let sibling = insert(&atlas, &b, 32, [44, 55, 66, 255]);
+        assert_eq!(first.texture_id, sibling.texture_id);
+        assert_eq!(pixel(&atlas, &first), [11, 22, 33, 255]);
+        atlas.remove(&a);
+        let replacement = insert(&atlas, &a, 32, [77, 88, 99, 255]);
+        assert_eq!(pixel(&atlas, &replacement), [77, 88, 99, 255]);
+        assert_eq!(pixel(&atlas, &sibling), [44, 55, 66, 255]);
+    }
+
+    #[test]
+    fn removing_same_image_twice_keeps_sibling_texture_alive() {
+        let atlas = atlas();
+        let a = image_key(1);
+        let first = insert(&atlas, &a, 32, [11, 22, 33, 255]);
+        let sibling = insert(&atlas, &image_key(2), 32, [44, 55, 66, 255]);
+        assert_eq!(first.texture_id, sibling.texture_id);
+        atlas.remove(&a);
+        atlas.remove(&a);
+        assert_eq!(pixel(&atlas, &sibling), [44, 55, 66, 255]);
+    }
+
+    #[test]
+    fn removed_image_space_is_reused_while_sibling_remains_live() {
+        let atlas = atlas();
+        let anchor = insert(&atlas, &image_key(1), 4, [11, 22, 33, 255]);
+        for id in 2..14 {
+            let key = image_key(id);
+            let temporary = insert(&atlas, &key, 512, [44, 55, 66, 255]);
+            assert_eq!(
+                temporary.texture_id, anchor.texture_id,
+                "released space should be reused instead of growing the atlas at image {id}"
+            );
+            assert_eq!(pixel(&atlas, &temporary), [44, 55, 66, 255]);
+            atlas.remove(&key);
+            assert_eq!(pixel(&atlas, &anchor), [11, 22, 33, 255]);
+        }
+    }
+}

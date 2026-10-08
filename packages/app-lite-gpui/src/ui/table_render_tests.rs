@@ -286,6 +286,31 @@ async fn table_cells_paint_their_marks_line_breaks_images_and_attachments(cx: &m
     assert!(header.runs.iter().all(|run| run.bold), "{header:#?}");
 }
 
+#[gpui::test]
+async fn mounted_table_paints_two_distinct_highlight_colors(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let root = tempfile::tempdir().unwrap();
+    let repository = Arc::new(LibraryRepository::open(root.path().join("library.sqlite")).unwrap());
+    let source = CanonicalDocument::parse_pasted_html(
+        "<table><tr><td><span style=\"background-color:#ffe2d5\">红中文</span>普通</td><td><span style=\"background-color:#ddf8e1\">绿😀</span></td></tr></table>",
+    ).unwrap().document;
+    let note = repository.create_note(CreateNote { title: "表格六色".into(), notebook_id: None, document: source }).unwrap();
+    let model = cx.new(move |_| AppModel::open(repository).unwrap());
+    let (view, cx) = cx.add_window_view(move |window, cx| LibraryShell::new(model, None, window, cx));
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+    }));
+    cx.run_until_parked();
+    let paints = paint(cx);
+    for (column, text, color) in [(0, "红中文", "#ffe2d5"), (1, "绿😀", "#ddf8e1")] {
+        let painted = cell(&paints, 0, column);
+        let run = painted.runs.iter().find(|run| run.text == text).unwrap();
+        assert_eq!(run.highlight_color, app_lite_core::TextColor::parse(color));
+        assert!(run.highlight);
+    }
+    assert_eq!(cell(&paints, 0, 0).runs.iter().find(|run| run.text == "普通").unwrap().highlight_color, None);
+}
+
 /// Rows are measured from the shaped content: bold wide letters, CJK,
 /// emoji, a long unbroken link, narrow columns, and an image before and
 /// after it loads. Nothing spills past its row, no row is padded with blank
@@ -509,4 +534,144 @@ async fn table_attachment_double_click_opens_verified_bytes(cx: &mut TestAppCont
     });
     cx.run_until_parked();
     assert_eq!(*opened.lock().unwrap(), vec![b"%PDF-1.4 fixture".to_vec()]);
+}
+
+// 105: a table JPEG beside a small PNG stayed a grey placeholder for the
+// rest of a session (switching notes, opening another cell) and showed only
+// after a restart. Its real paint, not a source path, is what counts.
+#[gpui::test]
+async fn table_jpegs_keep_painting_through_one_session(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let root = tempfile::tempdir().unwrap();
+    let repository = Arc::new(LibraryRepository::open(root.path().join("library.sqlite")).unwrap());
+    let mut jpeg = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(3600, 1400, |x, y| {
+        image::Rgb([(x % 251) as u8, (y % 241) as u8, 90])
+    }))
+    .write_to(
+        &mut std::io::Cursor::new(&mut jpeg),
+        image::ImageFormat::Jpeg,
+    )
+    .unwrap();
+    let small = repository
+        .import_image(&png(64, 48), "mouse", "image/png", "png")
+        .unwrap();
+    let large = repository
+        .import_image(&jpeg, "ocr-english", "image/jpeg", "jpg")
+        .unwrap();
+    // The same bytes under another resource id (same blob hash).
+    let twin = repository
+        .import_image(&jpeg, "ocr-english-copy", "image/jpeg", "jpg")
+        .unwrap();
+    let html = format!(
+        "<p>前</p><table data-joplin-lite-table=\"true\"><tbody><tr><td>相同内容<br><img src=\":/{small}\" alt=\"\"><br><img src=\":/{large}\" alt=\"\"></td><td><img src=\":/{twin}\" alt=\"\"></td></tr><tr><td>甲</td><td>乙</td></tr></tbody></table><p>后</p>",
+        small = small.as_str(),
+        large = large.as_str(),
+        twin = twin.as_str()
+    );
+    let note = repository
+        .create_note(CreateNote {
+            title: "表格图片".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(Vec::new()),
+        })
+        .unwrap();
+    repository
+        .save_note(SaveNote {
+            id: note.id.clone(),
+            expected_revision: note.revision,
+            title: "表格图片".into(),
+            document: CanonicalDocument::parse_html(&html).unwrap(),
+            resource_ids: vec![small.clone(), large.clone(), twin.clone()],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    let other = repository
+        .create_note(CreateNote {
+            title: "别处".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html("<p>别处</p>").unwrap(),
+        })
+        .unwrap();
+    let model_repository = Arc::clone(&repository);
+    let model = cx.new(move |_| AppModel::open(model_repository).unwrap());
+    let (view, cx) =
+        cx.add_window_view(move |window, cx| LibraryShell::new(model, None, window, cx));
+    cx.simulate_resize(size(px(1160.0), px(789.0)));
+    let select = |id: &app_lite_core::NoteId, cx: &mut VisualTestContext| {
+        let id = id.clone();
+        for _ in 0..50 {
+            let switched = cx.update(|window, app| {
+                view.update(app, |shell, shell_cx| {
+                    shell.apply_action_with_result(
+                        AppAction::SelectNote(id.clone()),
+                        window,
+                        shell_cx,
+                    )
+                })
+            });
+            if switched {
+                break;
+            }
+            cx.run_until_parked();
+        }
+        cx.run_until_parked();
+    };
+    let painted = |cx: &mut VisualTestContext| {
+        let mut last = Vec::new();
+        for _ in 0..12 {
+            let paints = paint(cx);
+            last = paints
+                .iter()
+                .flat_map(|paint| paint.images.iter())
+                .map(|(id, _, loaded)| (id.clone(), *loaded))
+                .collect::<Vec<_>>();
+            if last.len() == 3 && last.iter().all(|(_, loaded)| *loaded) {
+                return last;
+            }
+        }
+        last
+    };
+    let all =
+        |state: &[(String, bool)]| state.len() == 3 && state.iter().all(|(_, loaded)| *loaded);
+
+    select(&note.id, cx);
+    let first = painted(cx);
+    assert!(all(&first), "first open: {first:?}");
+
+    // Open and close a cell editor on the other image cell.
+    let node = view.read_with(cx, |shell, app| {
+        let editor = shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .read(app);
+        editor
+            .document()
+            .blocks()
+            .iter()
+            .find(|block| matches!(block.content, BlockContent::Table(_)))
+            .unwrap()
+            .id
+    });
+    cx.update(|_, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.open_table_cell_editor(node, 0, 1, shell_cx)
+        })
+    });
+    paint(cx);
+    paint(cx);
+    cx.simulate_keystrokes("escape");
+    let after_cell = painted(cx);
+    assert!(all(&after_cell), "after a cell editor: {after_cell:?}");
+
+    for round in 0..3 {
+        select(&other.id, cx);
+        paint(cx);
+        select(&note.id, cx);
+        let back = painted(cx);
+        assert!(all(&back), "after switching back ({round}): {back:?}");
+    }
 }

@@ -7,6 +7,10 @@ pub mod diagnostics;
 pub mod find;
 pub mod fixtures;
 pub mod history;
+#[cfg(target_os = "macos")]
+pub(crate) mod image_pixels;
+#[cfg(target_os = "macos")]
+pub(crate) mod png_proxy;
 pub mod images;
 pub mod input;
 pub(crate) mod input_trace;

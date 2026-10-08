@@ -11,6 +11,35 @@ use std::sync::Arc;
 
 const ENEX: &str = "<en-export><note><title>导入一</title><content><![CDATA[<en-note><div>正文一</div></en-note>]]></content><tag>甲</tag></note><note><title>导入二</title><content><![CDATA[<en-note><div>正文二</div></en-note>]]></content></note></en-export>";
 
+#[gpui::test]
+async fn mounted_restore_picker_failure_retry_and_stale_result_preserve_library_session(cx: &mut TestAppContext) {
+    let fixture = fixture();
+    let (view, cx) = mount(&fixture, cx);
+    cx.dispatch_action(crate::app::CreateNote);
+    cx.run_until_parked();
+    let before = library_counts(&fixture.base).unwrap();
+    let session_id = view.read_with(cx, |shell, _| shell.note_session.as_ref().unwrap().entity_id());
+    cx.dispatch_action(crate::app::RestoreLibrary);
+    let old = view.read_with(cx, |shell, _| shell.pending_library_import.as_ref().unwrap().token);
+    view.update(cx, |shell, shell_cx| shell.complete_library_restore_picker(old, Err("worker unavailable".into()), shell_cx));
+    assert!(view.read_with(cx, |shell, _| shell.pending_library_import.is_none()));
+    cx.dispatch_action(crate::app::RestoreLibrary);
+    let new = view.read_with(cx, |shell, _| shell.pending_library_import.as_ref().unwrap().token);
+    assert_ne!(old, new);
+    view.update(cx, |shell, shell_cx| {
+        for stale in [Err("old error".into()), Ok(Some(PathBuf::from("/must-not-be-restored")))] {
+            shell.complete_library_restore_picker(old, stale, shell_cx);
+            assert_eq!(shell.pending_library_import.as_ref().unwrap().token, new);
+        }
+        shell.complete_library_restore_picker(new, Ok(None), shell_cx);
+        assert!(shell.pending_library_import.is_none());
+        assert_eq!(shell.note_session.as_ref().unwrap().entity_id(), session_id);
+    });
+    cx.run_until_parked();
+    assert_eq!(library_counts(&fixture.base).unwrap(), before);
+    assert!(!fixture.base.parent().unwrap().join("imported-libraries").exists());
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     base: PathBuf,
@@ -64,6 +93,65 @@ fn pick(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext, source: &
 fn notice(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) -> String {
     view.read_with(cx, |shell, _| shell.library_import_notice_for_test())
         .unwrap_or_default()
+}
+
+#[gpui::test]
+async fn mounted_large_degradation_report_scrolls_under_the_pointer_to_its_open_button(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{MouseButton, MouseDownEvent, ScrollDelta, ScrollWheelEvent, point, px, size};
+    let fixture = fixture();
+    // Real importer and publication: the report grows from unsupported content,
+    // not a synthetic ready flag or a mocked import result.
+    let mut source = String::from("<en-export>");
+    for index in 0..67 {
+        source.push_str(&format!(
+            "<note><title>降级报告测试{index}</title><content><![CDATA[<en-note><table><tr><td>原始内容{index}</td></tr></table></en-note>]]></content></note>"
+        ));
+    }
+    source.push_str("</en-export>");
+    std::fs::write(&fixture.source, source).unwrap();
+    let (view, cx) = mount(&fixture, cx);
+    pick(&view, cx, &fixture.source);
+    cx.run_until_parked();
+    let complete_message = notice(&view, cx);
+    assert!(complete_message.contains("67 篇含暂不支持的格式"), "{complete_message}");
+    assert!(complete_message.contains("第 67 篇"), "the final diagnostic is retained");
+    let ready = view.read_with(cx, |shell, _| shell.imported_library_ready_for_test()).unwrap();
+    assert_eq!(library_counts(&ready).unwrap().notes, 67);
+    cx.simulate_resize(size(px(1160.0), px(789.0)));
+    cx.update(|window, app| window.draw(app).clear());
+    cx.run_until_parked();
+    let rail = cx.debug_bounds("library-status-rail").unwrap();
+    let report = cx.debug_bounds("library-import-status").unwrap();
+    let before = cx.debug_bounds("library-import-open").unwrap();
+    assert!(before.bottom() > rail.bottom(), "fixture must require reading a scrollable report");
+    let pointer = point(report.right() - px(20.0), rail.top() + px(50.0));
+    assert!(rail.contains(&pointer) && report.contains(&pointer));
+    // Catch BlockMouse on the report: a wheel over an empty part of the rail
+    // bypasses that hitbox and would miss the actual native failure.
+    cx.simulate_event(ScrollWheelEvent {
+        position: pointer,
+        delta: ScrollDelta::Pixels(point(px(0.0), px(-100000.0))),
+        ..Default::default()
+    });
+    cx.update(|window, app| window.draw(app).clear());
+    cx.run_until_parked();
+    let open = cx.debug_bounds("library-import-open").unwrap();
+    assert!(open.top() >= rail.top() && open.bottom() <= rail.bottom(),
+            "wheel over the report must expose its real Open button: rail={rail:?}, button={open:?}");
+    assert_eq!(notice(&view, cx), complete_message, "scrolling must not truncate diagnostics");
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: open.center(),
+        click_count: 1,
+        ..Default::default()
+    });
+    let app: &mut TestAppContext = cx;
+    app.run_until_parked();
+    assert_eq!(crate::library_profile::resolve_active(&fixture.base), ready);
+    assert_eq!(library_counts(&fixture.base).unwrap().notes, 0);
+    assert_eq!(app.update(|app| app.windows()).len(), 1);
 }
 
 #[gpui::test]

@@ -276,3 +276,86 @@ fn import_library_file_rejects_unknown_extension_without_creating_a_library() {
                 .all(|e| e.unwrap().file_name() == ".staging")
     );
 }
+
+#[test]
+fn cancelled_jex_309_does_not_even_read_a_broken_archive() {
+    // Break caught: checking the cancel flag only after JEX staging.
+    let root = tempdir().unwrap();
+    let source = root.path().join("broken.jex");
+    fs::write(&source, b"not a tar archive").unwrap();
+    let imports = root.path().join("imports");
+    let result = app_lite_core::import_library_file(
+        &source, &imports, &std::sync::Arc::new(AtomicBool::new(true)),
+    );
+    assert!(matches!(result, Err(app_lite_core::ImportLibraryError::Publish(PublishError::Cancelled))), "{result:?}");
+    assert!(!imports.exists(), "a cancelled job must not begin spooling");
+    assert_eq!(fs::read(&source).unwrap(), b"not a tar archive");
+}
+
+#[test]
+fn cancelled_jex_309_stops_during_spool_without_building_a_repository() {
+    // Break caught: losing the shared GUI cancellation flag in the JEX branch.
+    // Real tar, files, worker and TempDir cleanup; no importer mocks or hooks.
+    use std::sync::{Arc, atomic::Ordering};
+    use std::time::{Duration, Instant};
+    let root = tempdir().unwrap();
+    let active = active_profile(root.path());
+    let active_before = tree_hashes(&active);
+    let source = root.path().join("cancel-working.jex");
+    let mut builder = tar::Builder::new(fs::File::create(&source).unwrap());
+    let mut append = |name: &str, bytes: &[u8]| {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o600);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        builder.append_data(&mut header, name, std::io::Cursor::new(bytes)).unwrap();
+    };
+    let resource_id = "33333333333333333333333333333333";
+    append(&format!("resources/{resource_id}.bin"), &vec![0x71; 32 * 1024 * 1024]);
+    append(&format!("{resource_id}.md"), format!("fixture.bin\n\nid: {resource_id}\ntype_: 4\nmime: application/octet-stream\nfile_extension: bin\n").as_bytes());
+    for index in 1..=32 {
+        let id = format!("{index:032x}");
+        append(&format!("{id}.md"), format!("cancel fixture {index}\n\n正文 [file](:/{resource_id})\n\nid: {id}\ntype_: 1\nparent_id: \nmarkup_language: 1\ncreated_time: 2026-09-13T01:02:03.000Z\nupdated_time: 2026-09-13T01:02:03.000Z\nuser_created_time: 2026-09-13T01:02:03.000Z\nuser_updated_time: 2026-09-13T01:02:03.000Z\n").as_bytes());
+    }
+    builder.finish().unwrap();
+    drop(builder);
+    let source_before = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
+    let imports = root.path().join("imports");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_source = source.clone();
+    let worker_imports = imports.clone();
+    let worker_cancel = cancel.clone();
+    let worker = std::thread::spawn(move || app_lite_core::import_library_file(
+        &worker_source, &worker_imports, &worker_cancel,
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut cancelled_during_spool = false;
+    let mut built_repository_after_cancel = false;
+    while !worker.is_finished() && Instant::now() < deadline {
+        if let Ok(entries) = fs::read_dir(imports.join(".staging")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !cancelled_during_spool && name.starts_with("jex-source-") {
+                    let resources = entry.path().join("resources");
+                    if fs::read_dir(resources).is_ok_and(|mut files| files.next().is_some()) {
+                        cancel.store(true, Ordering::Relaxed);
+                        cancelled_during_spool = true;
+                    }
+                }
+                if cancelled_during_spool && name.starts_with("jex-stage-") {
+                    built_repository_after_cancel = true;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    cancel.store(true, Ordering::Relaxed);
+    let result = worker.join().unwrap();
+    assert!(cancelled_during_spool, "must exercise real work, not pre-cancellation: {result:?}");
+    assert!(!built_repository_after_cancel, "JEX continued into repository creation after cancellation");
+    assert!(matches!(result, Err(app_lite_core::ImportLibraryError::Publish(PublishError::Cancelled))), "{result:?}");
+    assert!(fs::read_dir(imports.join(".staging")).unwrap().next().is_none(), "owned temporary spool removed");
+    assert!(fs::read_dir(&imports).unwrap().all(|e| e.unwrap().file_name() == ".staging"), "nothing published");
+    assert_eq!(tree_hashes(&active), active_before);
+    assert_eq!(format!("{:x}", Sha256::digest(fs::read(&source).unwrap())), source_before);
+}

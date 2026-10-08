@@ -660,6 +660,31 @@ fn cell_image_ids(editor: &crate::native_editor::core::EditorCore) -> Vec<String
         .collect()
 }
 
+fn assert_cell_image_source_decodes(
+    editor: &gpui::Entity<crate::native_editor::core::EditorCore>,
+    resource_id: &str,
+    cx: &mut VisualTestContext,
+) {
+    let (source, root) = editor.read_with(cx, |editor, _| {
+        (
+            editor
+                .image_source_path(resource_id)
+                .map(std::path::Path::to_path_buf),
+            editor.image_materialization_root(),
+        )
+    });
+    let source = source.expect("the open cell needs its own image source");
+    assert!(
+        source.is_file(),
+        "the open cell's source must exist, not be an unavailable placeholder: {source:?}"
+    );
+    assert!(
+        source.starts_with(root),
+        "the source must belong to the open cell editor"
+    );
+    image::open(&source).expect("the open cell's persisted image source must decode");
+}
+
 fn main_cell_text(
     view: &gpui::Entity<LibraryShell>,
     cx: &mut VisualTestContext,
@@ -690,6 +715,28 @@ fn main_cell_text(
 // (resource/schema.ts 1001), so resource.ts insertResourceAtPosition puts a
 // pasted image into the cell's own content at the caret.
 #[gpui::test]
+async fn reopened_cell_image_has_a_decodable_editor_owned_source(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    paste_png(cx);
+    cx.run_until_parked();
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("inserted cell image");
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(body.contains(&format!("<img src=\":/{image}\"")));
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    cx.run_until_parked();
+    let reopened_cell = open_cell_at_end(&view, cx, 1, 1);
+    cx.run_until_parked();
+    assert_ne!(editor.entity_id(), reopened_cell.entity_id());
+    assert_cell_image_source_decodes(&reopened_cell, &image, cx);
+}
+
+#[gpui::test]
 async fn image_pasted_into_a_cell_is_stored_and_shows_in_that_cell(cx: &mut TestAppContext) {
     let (root, repository, note, view, cx) = mount(cx);
     let editor = open_cell_at_end(&view, cx, 1, 1);
@@ -700,6 +747,7 @@ async fn image_pasted_into_a_cell_is_stored_and_shows_in_that_cell(cx: &mut Test
     let images = editor.read_with(cx, |editor, _| cell_image_ids(editor));
     assert_eq!(images.len(), 1, "the image is in the open cell");
     let image = images[0].clone();
+    assert_cell_image_source_decodes(&editor, &image, cx);
     assert!(
         main_cell_text(&view, cx, 1, 1).iter().any(|inline| matches!(
             inline,
@@ -735,7 +783,9 @@ async fn image_pasted_into_a_cell_is_stored_and_shows_in_that_cell(cx: &mut Test
     let expected = format!("<td>一<br><img src=\":/{image}\" alt=\"\"><br>后</td>");
     assert!(body.contains(&expected), "{body}");
     // Opening and closing the cell again changes nothing.
-    open_cell_at_end(&view, cx, 1, 1);
+    let reopened_cell = open_cell_at_end(&view, cx, 1, 1);
+    cx.run_until_parked();
+    assert_cell_image_source_decodes(&reopened_cell, &image, cx);
     view.update(cx, |shell, shell_cx| {
         shell.commit_table_cell_editor(false, shell_cx)
     });
@@ -890,10 +940,109 @@ async fn failed_cell_image_commit_after_typing_keeps_both_and_retries(cx: &mut T
         )),
         "the retry stores it: {body}"
     );
+    assert_cell_paints_image(&view, &editor, &image, cx);
+}
+
+/// The open cell's own surface painted the image's pixels: its private
+/// decode cache (not the note's) holds the cell editor's source as loaded,
+/// and the renderer recorded a paint_image of that image by this very cell
+/// editor (the note's table paints its images on another path).
+fn assert_cell_paints_image(
+    view: &gpui::Entity<LibraryShell>,
+    editor: &gpui::Entity<crate::native_editor::core::EditorCore>,
+    resource_id: &str,
+    cx: &mut VisualTestContext,
+) {
+    assert_cell_image_source_decodes(editor, resource_id, cx);
+    let source = editor.read_with(cx, |editor, _| {
+        editor
+            .image_source_path(resource_id)
+            .map(std::path::Path::to_path_buf)
+            .expect("the cell's source")
+    });
+    let cache = view.read_with(cx, |shell, _| {
+        let cell = shell.table_cell_editor.as_ref().expect("an open cell");
+        assert_eq!(cell.editor.entity_id(), editor.entity_id(), "the open cell");
+        cell.image_cache.clone()
+    });
+    let resource = gpui::Resource::from(source);
+    let cell = editor.entity_id();
+    crate::native_editor::render::take_test_image_paints();
+    let painted = (0..5).any(|_| {
+        draw(cx);
+        let loaded = cache.read_with(cx, |cache, _| cache.loaded_success_for_test(&resource));
+        let drawn = crate::native_editor::render::take_test_image_paints()
+            .iter()
+            .any(|paint| {
+                paint.editor == cell
+                    && paint.resource_id == resource_id
+                    && paint.bounds.size.width > px(0.0)
+                    && paint.bounds.size.height > px(0.0)
+            });
+        loaded && drawn
+    });
     assert!(
-        editor.read_with(cx, |editor, _| editor.image_source_path(&image).is_some()),
-        "the cell shows the stored image"
+        painted,
+        "the cell's own editor must paint the image's pixels"
     );
+}
+
+#[gpui::test]
+async fn cell_image_paints_in_the_cell_now_and_after_reopening(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    paste_png(cx);
+    draw(cx);
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("inserted cell image");
+    assert_cell_paints_image(&view, &editor, &image, cx);
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    saved_body(&view, cx, &repository, &note);
+    let reopened = open_cell_at_end(&view, cx, 1, 1);
+    assert_ne!(editor.entity_id(), reopened.entity_id());
+    assert_cell_paints_image(&view, &reopened, &image, cx);
+}
+
+// While the cell's copy is in flight its placeholder keeps being painted;
+// that must not ask for the image again on every frame.
+#[gpui::test]
+async fn cell_image_in_flight_does_not_repaint_in_a_loop(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    paste_png(cx);
+    draw(cx);
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("inserted cell image");
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    saved_body(&view, cx, &repository, &note);
+    let release = view.update(cx, |shell, shell_cx| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .update(shell_cx, |session, _| {
+                session.stall_next_cell_image_hydration_for_test()
+            })
+    });
+    let reopened = open_cell_at_end(&view, cx, 1, 1);
+    for _ in 0..5 {
+        draw(cx);
+    }
+    assert!(
+        !has_cell_source(&reopened, &image, cx),
+        "no source while the copy is held"
+    );
+    release.send(()).unwrap();
+    draw(cx);
+    assert_cell_paints_image(&view, &reopened, &image, cx);
 }
 
 #[gpui::test]
@@ -1171,6 +1320,8 @@ async fn fragment_image_from_this_library_pastes_into_a_cell(cx: &mut TestAppCon
         editor.read_with(cx, |editor, _| cell_image_ids(editor)),
         [image.clone()]
     );
+    // A pasted image of this library shows in the cell from its own source.
+    assert_cell_paints_image(&view, &editor, &image, cx);
     assert!(
         notice(&view, cx).contains("1 个图片或附件未粘贴"),
         "{}",
@@ -1861,4 +2012,1174 @@ async fn drop_on_a_cell_whose_table_changed_since_the_drag_is_refused(cx: &mut T
     );
     let body = saved_body(&view, cx, &repository, &note);
     assert!(!body.contains("<img"), "{body}");
+}
+
+/// Inserts one image into cell (1,1), saves and closes the cell.
+fn stored_cell_image(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+    repository: &LibraryRepository,
+    note: &app_lite_core::NoteId,
+) -> String {
+    let editor = open_cell_at_end(view, cx, 1, 1);
+    paste_png(cx);
+    draw(cx);
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("inserted cell image");
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    saved_body(view, cx, repository, note);
+    image
+}
+
+fn stall_cell_image_hydration(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+) -> futures::channel::oneshot::Sender<()> {
+    view.update(cx, |shell, shell_cx| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .update(shell_cx, |session, _| {
+                session.stall_next_cell_image_hydration_for_test()
+            })
+    })
+}
+
+fn has_cell_source(
+    editor: &gpui::Entity<crate::native_editor::core::EditorCore>,
+    image: &str,
+    cx: &mut VisualTestContext,
+) -> bool {
+    editor
+        .read_with(cx, |editor, _| {
+            editor
+                .image_source_path(image)
+                .map(std::path::Path::to_path_buf)
+        })
+        .is_some_and(|source| source.is_file())
+}
+
+// A durable image's copy is still in flight when its cell closes, another
+// cell opens, or the note is switched: the late result goes nowhere.
+#[gpui::test]
+async fn delayed_cell_image_hydration_lands_nowhere_after_close_or_switch(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let image = stored_cell_image(&view, cx, &repository, &note);
+
+    // Closed, with another cell open, when the copy lands.
+    let release = stall_cell_image_hydration(&view, cx);
+    let closed = open_cell_at_end(&view, cx, 1, 1);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(open_cell(&view, cx), None);
+    let other = open_cell_at_end(&view, cx, 1, 0);
+    release.send(()).unwrap();
+    draw(cx);
+    assert!(
+        !has_cell_source(&closed, &image, cx),
+        "not into the closed cell"
+    );
+    assert!(
+        !has_cell_source(&other, &image, cx),
+        "not into another cell"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Switched to another note while the copy is held.
+    let other_note = repository
+        .create_note(CreateNote {
+            title: "另一篇".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html("<p>别处</p>").unwrap(),
+        })
+        .unwrap();
+    let release = stall_cell_image_hydration(&view, cx);
+    let left = open_cell_at_end(&view, cx, 1, 1);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(
+                AppAction::SelectNote(other_note.id.clone()),
+                window,
+                shell_cx,
+            );
+        })
+    });
+    cx.run_until_parked();
+    let _ = release.send(());
+    draw(cx);
+    assert!(
+        !has_cell_source(&left, &image, cx),
+        "not into the left note's cell"
+    );
+
+    // Back to the note: the same cell still shows its image.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.clone()), window, shell_cx);
+        })
+    });
+    draw(cx);
+    let reopened = open_cell_at_end(&view, cx, 1, 1);
+    assert_cell_paints_image(&view, &reopened, &image, cx);
+}
+
+// The stored bytes are missing when a cell opens: the failure is visible
+// and the cell keeps its placeholder; once the bytes are back, reopening the
+// cell shows the image.
+#[gpui::test]
+async fn cell_image_load_failure_is_visible_and_recovers_on_reopening(cx: &mut TestAppContext) {
+    let (root, repository, note, view, cx) = mount(cx);
+    let image = stored_cell_image(&view, cx, &repository, &note);
+    let sha256 = repository
+        .resource_metadata(&app_lite_core::ResourceId::new(image.as_str()).unwrap())
+        .unwrap()
+        .unwrap()
+        .sha256;
+    let blob = root.path().join("resources/blobs").join(sha256.as_str());
+    let aside = root.path().join("blob-aside");
+    std::fs::rename(&blob, &aside).expect("the stored blob");
+
+    let failed = open_cell_at_end(&view, cx, 1, 1);
+    for _ in 0..3 {
+        draw(cx);
+    }
+    assert!(!has_cell_source(&failed, &image, cx));
+    assert!(
+        notice(&view, cx).contains("单元格图片") && notice(&view, cx).contains("暂不可用"),
+        "the failure is shown: {}",
+        notice(&view, cx)
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    std::fs::rename(&aside, &blob).unwrap();
+    let recovered = open_cell_at_end(&view, cx, 1, 1);
+    assert_cell_paints_image(&view, &recovered, &image, cx);
+}
+
+// The cell paints its placeholder while the resource is still being stored;
+// when the commit lands the cell takes the image without being reopened.
+#[gpui::test]
+async fn cell_image_painted_during_its_commit_shows_once_stored(cx: &mut TestAppContext) {
+    let (_root, _repository, _note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    let release = view.update(cx, |shell, shell_cx| {
+        shell.stall_next_resource_commit_for_test(shell_cx)
+    });
+    paste_png(cx);
+    for _ in 0..3 {
+        draw(cx);
+    }
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("inserted cell image");
+    assert!(!has_cell_source(&editor, &image, cx), "not stored yet");
+    release.send(()).unwrap();
+    draw(cx);
+    assert_cell_paints_image(&view, &editor, &image, cx);
+}
+
+// The worker's copy cannot be moved into the cell's own directory: the
+// failure is shown without a repaint loop, and reopening the cell (a fresh
+// store) shows the image.
+#[gpui::test]
+async fn cell_image_adoption_failure_is_visible_and_retryable(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let image = stored_cell_image(&view, cx, &repository, &note);
+    let release = stall_cell_image_hydration(&view, cx);
+    let cell = open_cell_at_end(&view, cx, 1, 1);
+    draw(cx);
+    let cell_root = cell.read_with(cx, |editor, _| editor.image_materialization_root());
+    let _ = std::fs::remove_dir_all(&cell_root);
+    std::fs::write(&cell_root, b"not a directory").unwrap();
+    release.send(()).unwrap();
+    for _ in 0..3 {
+        draw(cx);
+    }
+    assert!(!has_cell_source(&cell, &image, cx));
+    assert!(
+        notice(&view, cx).contains("无法放入单元格缓存"),
+        "the failure is shown: {}",
+        notice(&view, cx)
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let reopened = open_cell_at_end(&view, cx, 1, 1);
+    assert_cell_paints_image(&view, &reopened, &image, cx);
+    std::fs::remove_file(&cell_root).unwrap();
+}
+
+// Native acceptance reproduced Done selecting the note card underneath the
+// floating cell editor. Calling commit_table_cell_editor directly misses the
+// actual mouse propagation path: exercise the visible control over another row.
+#[gpui::test]
+async fn cell_done_mouse_click_does_not_select_the_underlying_note(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    cx.simulate_resize(gpui::size(px(1160.0), px(789.0)));
+    draw(cx);
+    for _ in 0..7 {
+        cx.update(|window, app| view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::CreateNote, window, shell_cx);
+        }));
+        draw(cx);
+    }
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::SelectNote(note.clone()), window, shell_cx);
+    }));
+    draw(cx);
+    let session_id = view.read_with(cx, |shell, _| {
+        shell.note_session.as_ref().unwrap().entity_id()
+    });
+    let _cell = open_cell_at_end(&view, cx, 1, 1);
+    cx.simulate_input("完成按钮验收");
+    draw(cx);
+    assert!(saved_body(&view, cx, &repository, &note).contains("完成按钮验收"));
+    draw(cx);
+    let popup = cx.debug_bounds("table-cell-editor").expect("visible cell popup");
+    let cell_bounds = view.read_with(cx, |shell, _| {
+        shell.table_cell_editor.as_ref().unwrap().bounds.get().unwrap()
+    });
+    // Done is the first control immediately below the editing surface. Its
+    // real geometry is derived from that surface, not a direct handler call.
+    let position = point(popup.left() + px(35.0), cell_bounds.bottom() + px(18.0));
+    assert!(popup.contains(&position), "click must land inside the popup");
+    assert!([
+        "library-note-card-0", "library-note-card-1", "library-note-card-2",
+        "library-note-card-3", "library-note-card-4", "library-note-card-5",
+        "library-note-card-6", "library-note-card-7",
+    ].into_iter().any(|selector| {
+        cx.debug_bounds(selector)
+            .is_some_and(|bounds| bounds.contains(&position))
+    }), "fixture must put a different note card underneath Done: {position:?}");
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position, pressed_button: None, modifiers: Modifiers::default(),
+    });
+    draw(cx);
+    cx.simulate_event(MouseDownEvent {
+        position, button: MouseButton::Left, click_count: 1,
+        first_mouse: false, modifiers: Modifiers::default(),
+    });
+    draw(cx);
+    cx.simulate_event(MouseUpEvent {
+        position, button: MouseButton::Left, click_count: 1,
+        modifiers: Modifiers::default(),
+    });
+    cx.executor().advance_clock(std::time::Duration::from_millis(300));
+    draw(cx);
+    assert_eq!(open_cell(&view, cx), None, "real Done click must close the cell");
+    view.read_with(cx, |shell, app| {
+        assert_eq!(shell.model.read(app).navigation().selected_note_id(), Some(&note),
+            "Done must not select a note underneath the floating editor");
+        assert_eq!(shell.note_session.as_ref().unwrap().entity_id(), session_id,
+            "Done must not replace the active note session");
+    });
+    assert!(saved_body(&view, cx, &repository, &note).contains("完成按钮验收"),
+        "Done must preserve the edited cell in its own note");
+}
+
+/// Seven more notes so that note cards lie under the floating cell editor.
+fn notes_under_the_popup(
+    view: &gpui::Entity<LibraryShell>,
+    note: &app_lite_core::NoteId,
+    cx: &mut VisualTestContext,
+) {
+    cx.simulate_resize(gpui::size(px(1160.0), px(789.0)));
+    draw(cx);
+    for _ in 0..7 {
+        cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action(AppAction::CreateNote, window, shell_cx);
+            })
+        });
+        draw(cx);
+    }
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.clone()), window, shell_cx);
+        })
+    });
+    draw(cx);
+}
+
+fn card_under(cx: &mut VisualTestContext, position: gpui::Point<gpui::Pixels>) -> bool {
+    [
+        "library-note-card-0",
+        "library-note-card-1",
+        "library-note-card-2",
+        "library-note-card-3",
+        "library-note-card-4",
+        "library-note-card-5",
+        "library-note-card-6",
+        "library-note-card-7",
+    ]
+    .into_iter()
+    .any(|selector| {
+        cx.debug_bounds(selector)
+            .is_some_and(|bounds| bounds.contains(&position))
+    })
+}
+
+/// A real press and release: move, down, frame, (move to `to`), up.
+fn pointer_press(
+    cx: &mut VisualTestContext,
+    from: gpui::Point<gpui::Pixels>,
+    to: gpui::Point<gpui::Pixels>,
+) {
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position: from,
+        pressed_button: None,
+        modifiers: Modifiers::default(),
+    });
+    draw(cx);
+    cx.simulate_event(MouseDownEvent {
+        position: from,
+        button: MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+        modifiers: Modifiers::default(),
+    });
+    draw(cx);
+    if to != from {
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: to,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        draw(cx);
+    }
+    cx.simulate_event(MouseUpEvent {
+        position: to,
+        button: MouseButton::Left,
+        click_count: 1,
+        modifiers: Modifiers::default(),
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(300));
+    draw(cx);
+}
+
+// Every part of the floating cell editor keeps its pointer events: its
+// buttons (saved or unsaved draft) and a drag in its editing area never
+// select the note card, or move the body caret, underneath it.
+#[gpui::test]
+async fn cell_popup_controls_and_editing_area_do_not_click_through(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    notes_under_the_popup(&view, &note, cx);
+    let session = view.read_with(cx, |shell, _| {
+        shell.note_session.as_ref().unwrap().entity_id()
+    });
+    // (target, typed, saved): a clean Cancel changes nothing, so no save
+    // fence can hide a click that reaches the card underneath.
+    for (target, typed, saved) in [
+        ("table-cell-editor-done", true, false),
+        ("table-cell-editor-cancel", false, true),
+        ("table-insert-row", true, true),
+        ("editing area", true, true),
+    ] {
+        let _cell = open_cell_at_end(&view, cx, 1, 1);
+        if typed {
+            cx.simulate_input("穿透");
+            draw(cx);
+        }
+        if saved {
+            saved_body(&view, cx, &repository, &note);
+            draw(cx);
+        }
+        let body_selection = main_editor(&view, cx).read_with(cx, |editor, _| editor.selection());
+        let (from, to) = if target == "editing area" {
+            let area = view.read_with(cx, |shell, _| {
+                shell
+                    .table_cell_editor
+                    .as_ref()
+                    .unwrap()
+                    .bounds
+                    .get()
+                    .unwrap()
+            });
+            let y = area.top() + px(20.0);
+            (
+                point(area.left() + px(20.0), y),
+                point(area.left() + px(60.0), y),
+            )
+        } else {
+            let center = cx
+                .debug_bounds(target)
+                .unwrap_or_else(|| panic!("{target} is mounted"))
+                .center();
+            (center, center)
+        };
+        assert!(
+            card_under(cx, from),
+            "{target}: fixture must put a note card underneath {from:?}"
+        );
+        pointer_press(cx, from, to);
+        view.read_with(cx, |shell, app| {
+            assert_eq!(
+                shell.model.read(app).navigation().selected_note_id(),
+                Some(&note),
+                "{target} must not select the note underneath"
+            );
+            assert_eq!(
+                shell.note_session.as_ref().unwrap().entity_id(),
+                session,
+                "{target} must not replace the note session"
+            );
+            // A card reached through a dirty draft is refused by the save
+            // fence, but its switch attempt still shows here.
+            let save_error = format!("{:?}", shell.save_error);
+            assert!(
+                !save_error.contains("NoteSwitch"),
+                "{target} must not reach a note card: {save_error}"
+            );
+        });
+        assert_eq!(
+            main_editor(&view, cx).read_with(cx, |editor, _| editor.selection()),
+            body_selection,
+            "{target} must not move the body caret underneath"
+        );
+        if open_cell(&view, cx).is_some() {
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+        }
+    }
+    // Closed, the list takes clicks again (one of the first two cards is
+    // another note).
+    saved_body(&view, cx, &repository, &note);
+    draw(cx);
+    let switched = ["library-note-card-0", "library-note-card-1"]
+        .into_iter()
+        .any(|selector| {
+            let card = cx.debug_bounds(selector).expect("note card");
+            pointer_press(cx, card.center(), card.center());
+            view.read_with(cx, |shell, app| {
+                shell.model.read(app).navigation().selected_note_id() != Some(&note)
+            })
+        });
+    assert!(
+        switched,
+        "with the popup closed a card click selects its note"
+    );
+}
+
+// Done or Tab during an IME composition never stores the provisional text;
+// the popup stays open with its notice.
+#[gpui::test]
+async fn cell_done_or_tab_during_composition_keeps_the_popup_open(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+    let (_root, repository, note, view, cx) = mount(cx);
+    notes_under_the_popup(&view, &note, cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    draw(cx);
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            editor.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, editor_cx);
+        })
+    });
+    draw(cx);
+    assert!(editor.read_with(cx, |editor, _| editor.marked_text().is_some()));
+    let done = cx
+        .debug_bounds("table-cell-editor-done")
+        .expect("Done")
+        .center();
+    pointer_press(cx, done, done);
+    assert_eq!(open_cell(&view, cx), Some((1, 1)), "Done keeps the popup");
+    cx.simulate_keystrokes("tab");
+    draw(cx);
+    assert_eq!(open_cell(&view, cx), Some((1, 1)), "Tab keeps the popup");
+    view.read_with(cx, |shell, app| {
+        assert_eq!(
+            shell.model.read(app).navigation().selected_note_id(),
+            Some(&note)
+        );
+        assert!(
+            shell
+                .table_cell_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("输入法")),
+            "the reason is shown"
+        );
+    });
+    assert!(!saved_body(&view, cx, &repository, &note).contains("ni"));
+}
+
+/// A cell holding only a pasted (and stored) image; returns its editor and
+/// the image's resource id.
+fn cell_with_only_an_image(
+    view: &gpui::Entity<LibraryShell>,
+    cx: &mut VisualTestContext,
+) -> (gpui::Entity<crate::native_editor::core::EditorCore>, String) {
+    let editor = open_cell_at_end(view, cx, 1, 1);
+    // The pasted image replaces the selected text.
+    cx.update(|_, app| editor.update(app, |editor, _| editor.select_all()));
+    paste_png(cx);
+    draw(cx);
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("pasted cell image");
+    (editor, image)
+}
+
+/// What macOS gives the next paste after this app's copy: the fragment in
+/// this app's native type, and only the plain string to GPUI.
+fn as_native_copy(cx: &mut VisualTestContext) -> crate::native_editor::images::ClipboardFragment {
+    let fragment = cx
+        .read_from_clipboard()
+        .map(crate::native_editor::images::ClipboardPayload::from_gpui)
+        .and_then(|payload| payload.fragment)
+        .expect("a structured copy");
+    offer_native_copy(&fragment, cx);
+    fragment
+}
+
+/// The same copy offered again for another paste.
+fn offer_native_copy(
+    fragment: &crate::native_editor::images::ClipboardFragment,
+    cx: &mut VisualTestContext,
+) {
+    let native = crate::native_editor::images::native_fragment_payload(
+        &serde_json::to_string(fragment).unwrap(),
+    )
+    .expect("native fragment");
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(fragment.plain.clone()));
+    crate::native_editor::images::set_next_native_pasteboard_for_test(native);
+}
+
+// 110: Cmd-C of an image in the cell editor put only U+FFFC on the
+// clipboard. The cell's own Copy exports its selection with structure and
+// the resource file, and it pastes back as the image, in the cell and in
+// the body.
+#[gpui::test]
+async fn cell_copy_of_an_image_exports_it_and_pastes_it_back(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let (editor, image) = cell_with_only_an_image(&view, cx);
+    cx.update(|_, app| editor.update(app, |editor, _| editor.select_all()));
+    cx.dispatch_action(crate::components::Copy);
+    draw(cx);
+
+    let export = crate::ui::clipboard::last_clipboard_export_for_test().expect("a cell copy");
+    assert!(!export.plain.contains('\u{fffc}'), "{:?}", export.plain);
+    assert!(export.resource_only, "an image alone");
+    assert_eq!(export.files.len(), 1);
+    assert_eq!(
+        std::fs::read(&export.files[0]).unwrap(),
+        repository
+            .open_verified_resource_file(&app_lite_core::ResourceId::new(image.as_str()).unwrap())
+            .unwrap()
+            .map(|(_, mut file)| {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+                bytes
+            })
+            .unwrap(),
+        "the exported file is the stored image"
+    );
+    let fragment = as_native_copy(cx);
+    assert!(
+        fragment.html.contains(&format!(":/{image}")),
+        "{}",
+        fragment.html
+    );
+    assert_eq!(
+        fragment
+            .resources
+            .iter()
+            .map(|resource| resource.id.as_str())
+            .collect::<Vec<_>>(),
+        [image.as_str()]
+    );
+
+    // Back into the same cell, after the image.
+    cx.update(|_, app| {
+        editor.update(app, |editor, _| {
+            use crate::native_editor::model::{DocPoint, Selection};
+            let block = editor.document().blocks().last().unwrap().clone();
+            let end = block.content.as_text().map_or(1, |text| text.len());
+            editor.set_selection_for_test(Selection::caret(DocPoint::new(block.id, end)));
+        })
+    });
+    cx.dispatch_action(crate::components::Paste);
+    draw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| cell_image_ids(editor)),
+        [image.clone(), image.clone()]
+    );
+    let body = saved_body(&view, cx, &repository, &note);
+    assert_eq!(body.matches(&format!(":/{image}")).count(), 2, "{body}");
+
+    // And into the body, out of the closed cell.
+    offer_native_copy(&fragment, cx);
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    let main = main_editor(&view, cx);
+    let images_in_body =
+        |cx: &mut VisualTestContext| main.read_with(cx, |editor, _| cell_image_ids(editor)).len();
+    let before = images_in_body(cx);
+    cx.update(|window, app| {
+        main.update(app, |editor, _| editor.select_all());
+        crate::native_editor::surface::focus_editor(&main, window, app);
+    });
+    cx.simulate_keystrokes("right");
+    cx.dispatch_action(crate::components::Paste);
+    draw(cx);
+    assert_eq!(
+        images_in_body(cx),
+        before + 1,
+        "the image lands in the body"
+    );
+}
+
+// Cut copies the selected structure first, then deletes it from the open
+// cell only; one Undo brings it back. A composition in progress refuses the
+// cut and deletes nothing.
+#[gpui::test]
+async fn cell_cut_moves_only_the_cell_selection_and_undoes_in_one_step(cx: &mut TestAppContext) {
+    let (_root, repository, note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    paste_png(cx);
+    draw(cx);
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("pasted cell image");
+    let other_cell = main_cell_text(&view, cx, 1, 0);
+
+    // Refused while composing, with the IME's selection over the composed
+    // text: nothing deleted, nothing exported.
+    let composing = cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            use gpui::EntityInputHandler;
+            editor.replace_and_mark_text_in_range(None, "ni", Some(0..2), window, editor_cx);
+            editor.marked_text().is_some() && !editor.selection().is_caret()
+        })
+    });
+    if composing {
+        cx.dispatch_action(crate::components::Cut);
+        draw(cx);
+        assert!(crate::ui::clipboard::last_clipboard_export_for_test().is_none());
+        assert_eq!(
+            editor.read_with(cx, |editor, _| cell_image_ids(editor)),
+            [image.clone()],
+            "a cut during composition deletes nothing"
+        );
+    }
+    assert!(composing, "the fixture must cut during a real composition");
+    // End the composition and take its text back out.
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            use gpui::EntityInputHandler;
+            editor.unmark_text(window, editor_cx);
+            editor.undo().unwrap();
+        })
+    });
+    draw(cx);
+    let has_text = |cx: &mut VisualTestContext, needle: &str| {
+        editor.read_with(cx, |editor, _| {
+            editor.document().blocks().iter().any(|block| {
+                block
+                    .content
+                    .as_text()
+                    .is_some_and(|text| text.contains(needle))
+            })
+        })
+    };
+    assert!(!has_text(cx, "ni"), "the composition is gone");
+    assert_eq!(
+        editor.read_with(cx, |editor, _| cell_image_ids(editor)),
+        [image.clone()]
+    );
+
+    cx.update(|_, app| editor.update(app, |editor, _| editor.select_all()));
+    let contents = |cx: &mut VisualTestContext| {
+        editor.read_with(cx, |editor, _| {
+            editor
+                .document()
+                .blocks()
+                .iter()
+                .map(|block| block.content.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let before = contents(cx);
+    cx.dispatch_action(crate::components::Cut);
+    draw(cx);
+    let export = crate::ui::clipboard::last_clipboard_export_for_test().expect("cut copies first");
+    assert!(!export.plain.contains('\u{fffc}'), "{:?}", export.plain);
+    let fragment = as_native_copy(cx);
+    assert!(
+        fragment.html.contains(&format!(":/{image}")),
+        "{}",
+        fragment.html
+    );
+    assert!(
+        editor
+            .read_with(cx, |editor, _| cell_image_ids(editor))
+            .is_empty(),
+        "the cell's selection is gone"
+    );
+    assert_eq!(
+        main_cell_text(&view, cx, 1, 0),
+        other_cell,
+        "other cells untouched"
+    );
+
+    cx.simulate_keystrokes("cmd-z");
+    draw(cx);
+    assert_eq!(contents(cx), before, "one Undo restores the cut");
+    cx.simulate_keystrokes("cmd-shift-z");
+    draw(cx);
+    assert!(
+        editor
+            .read_with(cx, |editor, _| cell_image_ids(editor))
+            .is_empty()
+    );
+
+    // The cut image pastes into another cell and is saved with the note.
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    let target = open_cell_at_end(&view, cx, 1, 0);
+    // The first native offer deliberately replaced GPUI metadata with
+    // plain text. Reoffer the fragment exported by the actual Cut rather
+    // than trying to recover that removed metadata from GPUI again.
+    offer_native_copy(&fragment, cx);
+    cx.dispatch_action(crate::components::Paste);
+    draw(cx);
+    assert_eq!(
+        target.read_with(cx, |editor, _| cell_image_ids(editor)),
+        [image.clone()]
+    );
+    let body = saved_body(&view, cx, &repository, &note);
+    assert!(body.contains(&format!(":/{image}")), "{body}");
+}
+
+// A Clipboard event from a closed cell's surface reaches nothing: not the
+// cell open now, not the body.
+#[gpui::test]
+async fn closed_cell_surface_clipboard_events_reach_nothing(cx: &mut TestAppContext) {
+    let (_root, _repository, _note, view, cx) = mount(cx);
+    let _first = open_cell_at_end(&view, cx, 1, 1);
+    let old_surface = view.read_with(cx, |shell, _| {
+        shell.table_cell_editor.as_ref().unwrap().surface_for_test()
+    });
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    let second = open_cell_at_end(&view, cx, 1, 0);
+    cx.update(|_, app| second.update(app, |editor, _| editor.select_all()));
+    let body_before = main_editor(&view, cx).read_with(cx, |editor, _| editor.document().clone());
+    let cell_before = second.read_with(cx, |editor, _| editor.document().clone());
+    cx.update(|_, app| {
+        old_surface.update(app, |_, surface_cx| {
+            surface_cx
+                .emit(crate::native_editor::surface::EditorSurfaceEvent::Clipboard { cut: true })
+        })
+    });
+    draw(cx);
+    assert!(crate::ui::clipboard::last_clipboard_export_for_test().is_none());
+    assert_eq!(
+        second.read_with(cx, |editor, _| editor.document().clone()),
+        cell_before
+    );
+    assert_eq!(
+        main_editor(&view, cx).read_with(cx, |editor, _| editor.document().clone()),
+        body_before
+    );
+}
+
+// A cut deletes only once its copy is on the clipboard: if the pasteboard
+// refuses the write, or a resource file cannot be exported, the selection
+// stays, in the cell and in the body, and the failure is shown.
+#[gpui::test]
+async fn cut_deletes_nothing_when_its_copy_does_not_reach_the_clipboard(cx: &mut TestAppContext) {
+    let (_root, _repository, _note, view, cx) = mount(cx);
+    let (editor, image) = cell_with_only_an_image(&view, cx);
+    let fail_write = || crate::ui::clipboard::fail_next_clipboard_write_for_test();
+    let fail_export = || crate::app::note_session::fail_next_clipboard_file_export_for_test();
+    for (name, fail) in [
+        ("pasteboard write", &fail_write as &dyn Fn()),
+        ("resource file export", &fail_export as &dyn Fn()),
+    ] {
+        view.update(cx, |shell, _| shell.resource_notice = None);
+        cx.update(|_, app| editor.update(app, |editor, _| editor.select_all()));
+        fail();
+        cx.dispatch_action(crate::components::Cut);
+        draw(cx);
+        assert_eq!(
+            editor.read_with(cx, |editor, _| cell_image_ids(editor)),
+            [image.clone()],
+            "{name}: the cell keeps its selection"
+        );
+        assert!(
+            notice(&view, cx).contains("未完成"),
+            "{name}: the failure is shown: {}",
+            notice(&view, cx)
+        );
+    }
+
+    // The body's cut keeps the same rule (the image stays in the body's
+    // table, so its copy has a resource file to export).
+    view.update(cx, |shell, shell_cx| {
+        shell.commit_table_cell_editor(false, shell_cx)
+    });
+    draw(cx);
+    let main = main_editor(&view, cx);
+    let blocks = |cx: &mut VisualTestContext| {
+        main.read_with(cx, |editor, _| {
+            editor
+                .document()
+                .blocks()
+                .iter()
+                .map(|block| block.content.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let before = blocks(cx);
+    for (name, fail) in [
+        ("pasteboard write", &fail_write as &dyn Fn()),
+        ("resource file export", &fail_export as &dyn Fn()),
+    ] {
+        view.update(cx, |shell, _| shell.resource_notice = None);
+        cx.update(|window, app| {
+            main.update(app, |editor, _| editor.select_all());
+            crate::native_editor::surface::focus_editor(&main, window, app);
+        });
+        fail();
+        cx.dispatch_action(crate::components::Cut);
+        draw(cx);
+        assert_eq!(blocks(cx), before, "{name}: the body keeps its selection");
+        assert!(
+            notice(&view, cx).contains("未完成"),
+            "{name}: the failure is shown: {}",
+            notice(&view, cx)
+        );
+    }
+}
+
+// While the note is read-only a cell cut deletes nothing; copying is still
+// allowed (Evernote's copy is active when uneditable).
+#[gpui::test]
+async fn cell_cut_is_refused_while_the_note_is_read_only(cx: &mut TestAppContext) {
+    let (_root, _repository, _note, view, cx) = mount(cx);
+    let (editor, image) = cell_with_only_an_image(&view, cx);
+    view.update(cx, |shell, shell_cx| {
+        let session = shell.note_session.clone().unwrap();
+        session.update(shell_cx, |session, session_cx| {
+            session.set_reconciliation_locked(true, session_cx)
+        });
+    });
+    cx.update(|_, app| editor.update(app, |editor, _| editor.select_all()));
+    cx.dispatch_action(crate::components::Cut);
+    draw(cx);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| cell_image_ids(editor)),
+        [image.clone()]
+    );
+    assert!(!notice(&view, cx).is_empty(), "the refusal is shown");
+    cx.dispatch_action(crate::components::Copy);
+    draw(cx);
+    let fragment = as_native_copy(cx);
+    assert!(
+        fragment.html.contains(&format!(":/{image}")),
+        "{}",
+        fragment.html
+    );
+}
+
+// A cell's bold text and image copy together and paste into another note
+// with the mark and the resource.
+#[gpui::test]
+async fn cell_copy_of_formatted_text_and_image_pastes_into_another_note(cx: &mut TestAppContext) {
+    use crate::native_editor::commands::{CommandArgument, CommandCatalogue, EditorCommand};
+    let (_root, repository, _note, view, cx) = mount(cx);
+    let editor = open_cell_at_end(&view, cx, 1, 1);
+    // Bold the cell's text as a user would: the edit notifies, so the cell's
+    // draft is saved before the image goes in.
+    cx.update(|_, app| {
+        editor.update(app, |editor, editor_cx| {
+            editor.select_all();
+            CommandCatalogue::new()
+                .execute(EditorCommand::Bold, CommandArgument::None, editor)
+                .unwrap();
+            let block = editor.document().blocks().last().unwrap().clone();
+            let end = block.content.as_text().unwrap().len();
+            editor.set_selection_for_test(crate::native_editor::model::Selection::caret(
+                crate::native_editor::model::DocPoint::new(block.id, end),
+            ));
+            editor_cx.notify();
+        })
+    });
+    draw(cx);
+    paste_png(cx);
+    draw(cx);
+    let image = editor
+        .read_with(cx, |editor, _| cell_image_ids(editor))
+        .pop()
+        .expect("pasted cell image");
+    cx.update(|_, app| editor.update(app, |editor, _| editor.select_all()));
+    cx.dispatch_action(crate::components::Copy);
+    draw(cx);
+    let fragment = as_native_copy(cx);
+    assert!(
+        fragment.html.contains("<strong>一</strong>"),
+        "{}",
+        fragment.html
+    );
+    assert!(
+        fragment.html.contains(&format!(":/{image}")),
+        "{}",
+        fragment.html
+    );
+
+    let other = repository
+        .create_note(CreateNote {
+            title: "另一篇".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html("<p>乙</p>").unwrap(),
+        })
+        .unwrap();
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    for _ in 0..50 {
+        let switched = cx.update(|window, app| {
+            view.update(app, |shell, shell_cx| {
+                shell.apply_action_with_result(
+                    AppAction::SelectNote(other.id.clone()),
+                    window,
+                    shell_cx,
+                )
+            })
+        });
+        if switched {
+            break;
+        }
+        cx.run_until_parked();
+    }
+    draw(cx);
+    let main = main_editor(&view, cx);
+    cx.update(|window, app| {
+        main.update(app, |editor, _| editor.select_all());
+        crate::native_editor::surface::focus_editor(&main, window, app);
+    });
+    cx.simulate_keystrokes("right");
+    offer_native_copy(&fragment, cx);
+    cx.dispatch_action(crate::components::Paste);
+    draw(cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx);
+        })
+    });
+    cx.run_until_parked();
+    let stored = repository.load_note(&other.id).unwrap().unwrap();
+    assert!(
+        stored.body_html.contains("<strong>一</strong>"),
+        "{}",
+        stored.body_html
+    );
+    assert!(
+        stored.body_html.contains(&format!(":/{image}")),
+        "{}",
+        stored.body_html
+    );
+    assert_eq!(
+        stored.resource_ids,
+        vec![app_lite_core::ResourceId::new(image.as_str()).unwrap()]
+    );
+}
+
+// Copied in one library's cell, pasted in another library: the image comes
+// from the copy's exported file and is stored there with the same bytes.
+#[gpui::test]
+async fn cell_copy_pastes_its_image_into_another_library(cx: &mut TestAppContext) {
+    let (_root, repository, _note, view, cx) = mount(cx);
+    let (editor, image) = cell_with_only_an_image(&view, cx);
+    let bytes = repository
+        .read_resource_bytes(&app_lite_core::ResourceId::new(image.as_str()).unwrap())
+        .unwrap()
+        .unwrap();
+    cx.update(|_, app| editor.update(app, |editor, _| editor.select_all()));
+    cx.dispatch_action(crate::components::Copy);
+    draw(cx);
+    let fragment = as_native_copy(cx);
+    assert!(
+        fragment.resources[0]
+            .file
+            .as_ref()
+            .is_some_and(|file| std::fs::read(file).unwrap() == bytes),
+        "the copy carries the image's bytes"
+    );
+
+    let second_root = tempfile::tempdir().unwrap();
+    let second =
+        Arc::new(LibraryRepository::open(second_root.path().join("library.sqlite")).unwrap());
+    let target = second
+        .create_note(CreateNote {
+            title: "资料库乙".into(),
+            notebook_id: None,
+            document: CanonicalDocument::parse_html("<p>乙</p>").unwrap(),
+        })
+        .unwrap();
+    let second_model = cx.new(|_| AppModel::open(Arc::clone(&second)).unwrap());
+    let mut app = cx.cx.clone();
+    let (second_view, second_cx) =
+        app.add_window_view(move |window, app| LibraryShell::new(second_model, None, window, app));
+    draw(second_cx);
+    second_cx.update(|window, app| {
+        second_view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(target.id.clone()), window, shell_cx);
+        })
+    });
+    draw(second_cx);
+    let main = main_editor(&second_view, second_cx);
+    second_cx.update(|window, app| {
+        main.update(app, |editor, _| editor.select_all());
+        crate::native_editor::surface::focus_editor(&main, window, app);
+    });
+    second_cx.simulate_keystrokes("right");
+    offer_native_copy(&fragment, second_cx);
+    second_cx.dispatch_action(crate::components::Paste);
+    draw(second_cx);
+    draw(second_cx);
+    second_cx.update(|window, app| {
+        second_view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::ManualSync, window, shell_cx);
+        })
+    });
+    second_cx.run_until_parked();
+    let stored = second.load_note(&target.id).unwrap().unwrap();
+    assert_eq!(stored.resource_ids.len(), 1, "{}", stored.body_html);
+    assert_eq!(
+        second
+            .read_resource_bytes(&stored.resource_ids[0])
+            .unwrap()
+            .unwrap(),
+        bytes,
+        "the same image, now stored in the other library"
+    );
+}
+
+fn table_rows(view: &gpui::Entity<LibraryShell>, cx: &mut VisualTestContext) -> usize {
+    main_editor(view, cx).read_with(cx, |editor, _| {
+        editor
+            .document()
+            .blocks()
+            .iter()
+            .find_map(|block| match &block.content {
+                BlockContent::Table(table) => Some(table.rows.len()),
+                _ => None,
+            })
+            .expect("the note's table")
+    })
+}
+
+// 114: after a structure button and Done (both real presses), the very next
+// Cmd-Z belongs to the body and undoes that change; Cmd-Shift-Z redoes it.
+// While the cell is open, Cmd-Z still undoes the cell's own typing.
+#[gpui::test]
+async fn closing_the_cell_by_mouse_returns_the_keyboard_to_the_body(cx: &mut TestAppContext) {
+    let (_root, _repository, _note, view, cx) = mount(cx);
+    let rows = table_rows(&view, cx);
+
+    let cell = open_cell_at_end(&view, cx, 1, 1);
+    draw(cx);
+    cx.simulate_input("格");
+    draw(cx);
+    cx.simulate_keystrokes("cmd-z");
+    draw(cx);
+    assert!(
+        !cell.read_with(cx, |editor, _| editor.copy_plain_text().contains('格')
+            || editor.document().blocks().iter().any(|block| block
+                .content
+                .as_text()
+                .is_some_and(|text| text.contains('格')))),
+        "with the cell open, Cmd-Z undoes the cell's typing"
+    );
+
+    let insert = cx
+        .debug_bounds("table-insert-row")
+        .expect("insert row button")
+        .center();
+    pointer_press(cx, insert, insert);
+    assert_eq!(table_rows(&view, cx), rows + 1, "the row was inserted");
+    let done = cx
+        .debug_bounds("table-cell-editor-done")
+        .expect("Done")
+        .center();
+    pointer_press(cx, done, done);
+    assert_eq!(open_cell(&view, cx), None);
+
+    cx.simulate_keystrokes("cmd-z");
+    draw(cx);
+    assert_eq!(
+        table_rows(&view, cx),
+        rows,
+        "Cmd-Z after Done undoes the insert"
+    );
+    cx.simulate_keystrokes("cmd-shift-z");
+    draw(cx);
+    assert_eq!(table_rows(&view, cx), rows + 1, "Cmd-Shift-Z redoes it");
+
+    // Cancel hands the keyboard back the same way.
+    let _cell = open_cell_at_end(&view, cx, 1, 1);
+    draw(cx);
+    let cancel = cx
+        .debug_bounds("table-cell-editor-cancel")
+        .expect("Cancel")
+        .center();
+    pointer_press(cx, cancel, cancel);
+    assert_eq!(open_cell(&view, cx), None);
+    cx.simulate_keystrokes("cmd-z");
+    draw(cx);
+    assert_eq!(
+        table_rows(&view, cx),
+        rows,
+        "Cmd-Z after Cancel reaches the body"
+    );
+}
+
+// The body's Cut during an IME composition (the IME's selection over the
+// composed text) exports and deletes nothing, as in a cell.
+#[gpui::test]
+async fn body_cut_during_composition_exports_and_deletes_nothing(cx: &mut TestAppContext) {
+    let (_root, _repository, _note, view, cx) = mount(cx);
+    let main = main_editor(&view, cx);
+    let composing = cx.update(|window, app| {
+        crate::native_editor::surface::focus_editor(&main, window, app);
+        main.update(app, |editor, editor_cx| {
+            use gpui::EntityInputHandler;
+            editor.replace_and_mark_text_in_range(None, "ni", Some(0..2), window, editor_cx);
+            editor.marked_text().is_some() && !editor.selection().is_caret()
+        })
+    });
+    assert!(composing, "the fixture must cut during a real composition");
+    draw(cx);
+    cx.dispatch_action(crate::components::Cut);
+    draw(cx);
+    assert!(
+        crate::ui::clipboard::last_clipboard_export_for_test().is_none(),
+        "nothing is exported"
+    );
+    assert!(
+        main.read_with(cx, |editor, _| editor.marked_text().is_some()),
+        "the composition is still there"
+    );
+    assert!(
+        main.read_with(cx, |editor, _| editor.document().blocks().iter().any(
+            |block| block
+                .content
+                .as_text()
+                .is_some_and(|text| text.contains("ni"))
+        )),
+        "nothing was deleted"
+    );
 }

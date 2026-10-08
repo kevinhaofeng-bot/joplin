@@ -15,7 +15,7 @@ rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
 echo "==> Build Release binary."
-cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" --release
+bash "$PROJECT_ROOT/scripts/cargo-notes.sh" build --release
 
 # Worktrees share Cargo's target directory through the repository-level
 # `.cargo/config.toml`. Do not assume `$PROJECT_ROOT/target`: when an old local

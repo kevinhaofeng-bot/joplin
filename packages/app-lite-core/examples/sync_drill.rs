@@ -111,7 +111,10 @@ fn main() {
     }
     println!("notes.content_digest {:x}", digest.finalize());
     if !converged || pending != 0 || !failures.is_empty() || mismatched != 0 {
-        eprintln!("sync verification failed: converged={converged} pending={pending} failures={} mismatched={mismatched}", failures.len());
+        eprintln!(
+            "sync verification failed: converged={converged} pending={pending} failures={} mismatched={mismatched}",
+            failures.len()
+        );
         std::process::exit(1);
     }
 }

@@ -18,6 +18,27 @@ fn archive(xml: &str) -> NamedTempFile {
     file
 }
 
+#[test]
+fn enml_highlight_palette_survives_staging_and_database_reopen() {
+    let source = archive(
+        "<en-export><note><title>颜色导入</title><content><![CDATA[<en-note><div><span style=\"background-color:#fec1d0\">红</span><span style=\"background-color:#e0f7fd\">蓝</span>普通</div></en-note>]]></content></note></en-export>",
+    );
+    let parent = tempdir().unwrap();
+    let stage = stage_enex_file(source.path(), parent.path()).unwrap();
+    let repository = LibraryRepository::open(stage.profile_path().join("library.sqlite")).unwrap();
+    let notes = repository
+        .list_notes(app_lite_core::ListQuery::default())
+        .unwrap();
+    let note = repository.load_note(&notes[0].id).unwrap().unwrap();
+    let expected = app_lite_core::CanonicalDocument::parse_pasted_html(
+        "<p><span style=\"background-color:#ffe2d5\">红</span><span style=\"background-color:#e0f7fd\">蓝</span>普通</p>",
+    ).unwrap().document;
+    assert_eq!(
+        app_lite_core::CanonicalDocument::parse_html(note.body_html.as_str()).unwrap(),
+        expected
+    );
+}
+
 fn resource(bytes: &[u8], mime: &str, filename: &str) -> String {
     format!(
         "<resource><data encoding=\"base64\">{}</data><mime>{mime}</mime><resource-attributes><file-name>{filename}</file-name></resource-attributes></resource>",

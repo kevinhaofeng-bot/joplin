@@ -277,14 +277,14 @@ const SHORTCUT_DEFINITIONS: &[ShortcutDefinition] = &[
         command: ShortcutCommand::Home,
         id: "home",
         category: ShortcutCategory::Navigation,
-        default_keys: &["home"],
+        default_keys: &["home", "cmd-left"],
         context: BLOCK_CONTEXT,
     },
     ShortcutDefinition {
         command: ShortcutCommand::End,
         id: "end",
         category: ShortcutCategory::Navigation,
-        default_keys: &["end"],
+        default_keys: &["end", "cmd-right"],
         context: BLOCK_CONTEXT,
     },
     ShortcutDefinition {
@@ -364,14 +364,14 @@ const SHORTCUT_DEFINITIONS: &[ShortcutDefinition] = &[
         command: ShortcutCommand::SelectHome,
         id: "select_home",
         category: ShortcutCategory::Navigation,
-        default_keys: &["shift-home"],
+        default_keys: &["shift-home", "cmd-shift-left"],
         context: BLOCK_CONTEXT,
     },
     ShortcutDefinition {
         command: ShortcutCommand::SelectEnd,
         id: "select_end",
         category: ShortcutCategory::Navigation,
-        default_keys: &["shift-end"],
+        default_keys: &["shift-end", "cmd-shift-right"],
         context: BLOCK_CONTEXT,
     },
     ShortcutDefinition {

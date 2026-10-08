@@ -580,6 +580,13 @@ fn navigation_index_authorizer_rejects_body_blob_reads_and_soft_deleted_organiza
         "tags.title",
         "tags.revision",
         "tags.deleted_time",
+        "shortcuts.id",
+        "shortcuts.entity_type",
+        "shortcuts.entity_id",
+        "shortcuts.position",
+        "notes.id",
+        "notes.title",
+        "notes.deleted_time",
     ]);
     assert!(
         !reads.is_empty(),

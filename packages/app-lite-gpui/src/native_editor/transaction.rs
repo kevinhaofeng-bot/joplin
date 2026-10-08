@@ -43,6 +43,12 @@ pub enum Transaction {
         selection: Selection,
         mark: Mark,
     },
+    /// Peso removeformat: keep links and document structure, remove selected
+    /// text's presentation marks and reset its semantic paragraph attributes.
+    /// One transaction, with one local inverse, rather than mark toggles.
+    ClearFormatting {
+        selection: Selection,
+    },
     SetLink {
         selection: Selection,
         url: Option<String>,
@@ -50,6 +56,10 @@ pub enum Transaction {
     /// Evernote forecolor: sets the colour of the selected text, or with
     /// `None` returns it to the default (textformatter/commands/forecolor.ts).
     SetTextColor {
+        selection: Selection,
+        color: Option<app_lite_core::TextColor>,
+    },
+    SetHighlightColor {
         selection: Selection,
         color: Option<app_lite_core::TextColor>,
     },
@@ -152,8 +162,10 @@ impl Transaction {
             | Self::DeleteRange { selection }
             | Self::SetBlockKind { selection, .. }
             | Self::ToggleMark { selection, .. }
+            | Self::ClearFormatting { selection }
             | Self::SetLink { selection, .. }
             | Self::SetTextColor { selection, .. }
+            | Self::SetHighlightColor { selection, .. }
             | Self::SetAlignment { selection, .. }
             | Self::SetQuote { selection, .. }
             | Self::ToggleCheck { selection, .. }

@@ -144,6 +144,23 @@ pub fn import_canonical_with_resources(
     for (block_index, block) in document.blocks().iter().enumerate() {
         match block {
             CanonicalBlock::Paragraph { style, inlines } => {
+                let has_text = inlines.iter().any(|inline| match inline {
+                    Inline::Text { text, .. } => !text.is_empty(),
+                    Inline::SoftBreak => true,
+                    _ => false,
+                });
+                if style.indent == 0 && has_text
+                    && inlines.iter().any(|inline| matches!(inline, Inline::Image { .. }))
+                {
+                    // Retain a genuine mixed paragraph without giving a lone
+                    // resource a synthetic text target for style commands.
+                    push_inline_group(
+                        &mut native, &mut inline_groups, &mut next_id,
+                        BlockKind::Paragraph, style, inlines,
+                        available_resources, block_index,
+                    )?;
+                    continue;
+                }
                 if has_inline_atom(inlines) {
                     // The native document has image atoms at block boundaries.
                     // Split only this legacy flow, preserving text order/marks,
@@ -192,6 +209,7 @@ pub fn import_canonical_with_resources(
                                     Alignment::Center => TextAlignment::Center,
                                     Alignment::Right => TextAlignment::Right,
                                 },
+                                indent: 0,
                                 quoted: false,
                                 quote_start: false,
                                 revision: 0,
@@ -381,7 +399,12 @@ pub fn import_canonical_with_resources(
                         display_width: presentation.display_width,
                         link: link.clone(),
                     },
-                    alignment: TextAlignment::Left,
+                    alignment: match presentation.alignment {
+                        Some(Alignment::Center) => TextAlignment::Center,
+                        Some(Alignment::Right) => TextAlignment::Right,
+                        Some(Alignment::Left) | None => TextAlignment::Left,
+                    },
+                    indent: 0,
                     quoted: false,
                     quote_start: false,
                     revision: 0,
@@ -402,6 +425,7 @@ pub fn import_canonical_with_resources(
                         media_type: media_type.clone(),
                     },
                     alignment: TextAlignment::Left,
+                    indent: 0,
                     quoted: false,
                     quote_start: false,
                     revision: 0,
@@ -430,6 +454,7 @@ pub fn import_canonical_with_resources(
                         canonical: block.clone(),
                     })),
                     alignment: TextAlignment::Left,
+                    indent: 0,
                     quoted: false,
                     quote_start: false,
                     revision: 0,
@@ -440,6 +465,7 @@ pub fn import_canonical_with_resources(
                 kind: BlockKind::Divider,
                 content: BlockContent::Empty,
                 alignment: TextAlignment::Left,
+                indent: 0,
                 quoted: false,
                 quote_start: false,
                 revision: 0,
@@ -485,6 +511,7 @@ fn attachment_block(
             media_type: media_type.to_owned(),
         },
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -530,6 +557,7 @@ fn push_inline_group(
                         link: link.clone(),
                     },
                     alignment: TextAlignment::Left,
+                    indent: 0,
                     quoted: false,
                     quote_start: false,
                     revision: 0,
@@ -628,6 +656,7 @@ pub(crate) fn table_cell_blocks(inlines: &[Inline]) -> Vec<CanonicalBlock> {
                 presentation: ImagePresentation {
                     natural_size: None,
                     display_width: *display_width,
+                    alignment: None,
                 },
                 link: link.clone(),
             });
@@ -872,6 +901,11 @@ pub fn export_canonical_with_resources(
                     presentation: ImagePresentation {
                         natural_size: (*natural_size_known).then_some(*natural_size),
                         display_width: *display_width,
+                        alignment: match block.alignment {
+                            TextAlignment::Left => None,
+                            TextAlignment::Center => Some(Alignment::Center),
+                            TextAlignment::Right => Some(Alignment::Right),
+                        },
                     },
                     link: link.clone(),
                 });
@@ -987,7 +1021,7 @@ fn export_text_block(
                 TextAlignment::Center => Alignment::Center,
                 TextAlignment::Right => Alignment::Right,
             },
-            indent: 0,
+            indent: block.indent,
             quoted: block.quoted,
             quote_start: block.quote_start,
         },
@@ -1049,7 +1083,12 @@ fn canonical_marks(marks: &[Mark]) -> Marks {
             Mark::Underline => output.underline = true,
             Mark::Strike => output.strikethrough = true,
             Mark::Highlight => output.highlight = true,
+            Mark::HighlightColor(color) => {
+                output.highlight = true;
+                output.highlight_color = Some(*color);
+            }
             Mark::Link(url) => output.link = Some(url.clone()),
+            Mark::LinkTitle(title) => output.link_title = Some(title.to_string()),
             Mark::InlineCode => output.inline_code = true,
             Mark::Superscript => output.script = Some(app_lite_core::Script::Superscript),
             Mark::Subscript => output.script = Some(app_lite_core::Script::Subscript),
@@ -1121,7 +1160,7 @@ fn text_block(
             depth: style.indent,
             checked,
         },
-        _ if style.indent != 0 => {
+        BlockKind::Code if style.indent != 0 => {
             return Err(CanonicalImportError::UnsupportedIndent {
                 block_index,
                 indent: style.indent,
@@ -1132,6 +1171,7 @@ fn text_block(
     let (text, styles) = import_inlines(inlines, block_index)?;
     let quoted = style.quoted && is_quotable_kind(&kind);
     let kind_is_quote = kind == BlockKind::Quote;
+    let indent = if matches!(kind, BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::Quote) { style.indent } else { 0 };
     Ok(Block {
         id,
         kind,
@@ -1141,6 +1181,7 @@ fn text_block(
             Alignment::Center => TextAlignment::Center,
             Alignment::Right => TextAlignment::Right,
         },
+        indent,
         quoted,
         quote_start: style.quote_start && (quoted || kind_is_quote),
         revision: 0,
@@ -1198,11 +1239,16 @@ fn native_marks(marks: &Marks) -> SmallVec<[Mark; 4]> {
     if marks.strikethrough {
         output.push(Mark::Strike);
     }
-    if marks.highlight {
+    if let Some(color) = marks.highlight_color {
+        output.push(Mark::HighlightColor(color));
+    } else if marks.highlight {
         output.push(Mark::Highlight);
     }
     if let Some(link) = &marks.link {
         output.push(Mark::Link(link.clone()));
+        if let Some(title) = &marks.link_title {
+            output.push(Mark::LinkTitle(title.as_str().into()));
+        }
     }
     if marks.inline_code {
         output.push(Mark::InlineCode);
@@ -1220,6 +1266,97 @@ fn native_marks(marks: &Marks) -> SmallVec<[Mark; 4]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn imported_paragraph_images_310_round_trip_without_new_paragraph_boundaries() {
+        use super::*;
+        let source = CanonicalDocument::parse_html(
+            "<p>前<strong>中文</strong><img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"旧图\">后<br>下一行</p><p>再次<img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"重用\">之后</p><table><tr><td>单元格</td></tr></table><p>末尾</p>",
+        ).unwrap();
+        let native = import_canonical(&source).unwrap();
+        let exported = export_canonical(&native).unwrap();
+        assert_eq!(exported.resource_ids(), source.resource_ids());
+        assert_eq!(exported, source, "opening a migrated inline-image paragraph must not split its canonical boundaries");
+    }
+
+    #[test]
+    fn link_title_survives_native_typing_bold_and_undo_without_leaking_to_neighbors() {
+        use crate::native_editor::model::{DocPoint, Selection};
+        use crate::native_editor::transaction::Transaction;
+        const HTML: &str = "<p>前<a href=\"https://example.test\" title=\"中文 &amp; &quot;说明&quot;\">链接</a>后</p>";
+        let canonical = CanonicalDocument::parse_html(HTML).unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(), HTML);
+        let id = document.blocks()[0].id;
+        let selection = Selection::new(DocPoint::new(id, "前".len()), DocPoint::new(id, "前链接".len()));
+        let bold = document.apply(Transaction::ToggleMark { selection, mark: Mark::Bold }).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(),
+            "<p>前<a href=\"https://example.test\" title=\"中文 &amp; &quot;说明&quot;\"><strong>链接</strong></a>后</p>");
+        document.apply_batch(bold.inverse).unwrap();
+        let inserted = document.apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::new(id, "前链".len())), text: "新".into(),
+        }).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(),
+            "<p>前<a href=\"https://example.test\" title=\"中文 &amp; &quot;说明&quot;\">链新接</a>后</p>");
+        document.apply_batch(inserted.inverse).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(), HTML);
+        document.apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::new(id, "前链接".len())), text: "界外".into(),
+        }).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(),
+            "<p>前<a href=\"https://example.test\" title=\"中文 &amp; &quot;说明&quot;\">链接</a>界外后</p>");
+    }
+
+    #[test]
+    fn replacing_or_removing_link_clears_title_and_undo_restores_both() {
+        use crate::native_editor::model::{DocPoint, Selection};
+        use crate::native_editor::transaction::Transaction;
+        const HTML: &str = "<p><a href=\"https://example.test/old\" title=\"旧标题\">链接</a>外</p>";
+        for url in [None, Some("https://example.test/new".to_owned())] {
+            let canonical = CanonicalDocument::parse_html(HTML).unwrap();
+            let mut document = import_canonical(&canonical).unwrap();
+            let id = document.blocks()[0].id;
+            let selection = Selection::new(DocPoint::new(id, 0), DocPoint::new(id, "链接".len()));
+            let removed = document.apply(Transaction::SetLink { selection, url: url.clone() }).unwrap();
+            let expected = if url.is_some() { "<p><a href=\"https://example.test/new\">链接</a>外</p>" }
+                else { "<p>链接外</p>" };
+            assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(), expected);
+            document.apply_batch(removed.inverse).unwrap();
+            assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(), HTML);
+        }
+    }
+
+    #[test]
+    fn same_url_keeps_title_but_typing_between_differently_titled_links_is_not_linked() {
+        use crate::native_editor::model::{DocPoint, Selection};
+        use crate::native_editor::transaction::Transaction;
+        const HTML: &str = "<p><a href=\"https://example.test\" title=\"一\">甲</a><a href=\"https://example.test\" title=\"二\">乙</a></p>";
+        let canonical = CanonicalDocument::parse_html(HTML).unwrap();
+        let mut document = import_canonical(&canonical).unwrap();
+        let id = document.blocks()[0].id;
+        document.apply(Transaction::SetLink {
+            selection: Selection::new(DocPoint::new(id, 0), DocPoint::new(id, "甲乙".len())),
+            url: Some("https://example.test".into()),
+        }).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(), HTML);
+        document.apply(Transaction::InsertText {
+            selection: Selection::caret(DocPoint::new(id, "甲".len())), text: "外".into(),
+        }).unwrap();
+        assert_eq!(super::export_canonical(&document).unwrap().to_canonical_html().as_str(),
+            "<p><a href=\"https://example.test\" title=\"一\">甲</a>外<a href=\"https://example.test\" title=\"二\">乙</a></p>");
+    }
+
+    #[test]
+    fn native_codec_preserves_six_highlight_colors() {
+        for color in ["#fdf3d0", "#ffe2d5", "#ddf8e1", "#e0f7fd", "#edf0ff", "#feead4"] {
+            let source = app_lite_core::CanonicalDocument::parse_pasted_html(
+                &format!("<p><span style=\"background-color:{color}\">中文😀</span>普通</p>"),
+            ).unwrap().document;
+            let native = super::import_canonical(&source).unwrap();
+            let actual = super::export_canonical(&native).unwrap();
+            assert_eq!(actual, source, "native codec must retain {color}");
+        }
+    }
+
     use super::{
         CanonicalExportError, CanonicalImportError, export_canonical_with_resources,
         import_canonical, import_canonical_with_resources,
@@ -1413,7 +1550,8 @@ mod tests {
                 marks: Marks::default(),
             }],
         }]);
-        assert!(import_canonical(&indented).is_err());
+        let native = import_canonical(&indented).expect("paragraph indent is now supported");
+        assert_eq!(super::export_canonical(&native).unwrap(), indented);
 
         let image = CanonicalDocument::from_blocks(vec![CanonicalBlock::Paragraph {
             style: BlockStyle::default(),
@@ -1926,12 +2064,10 @@ mod tests {
     }
 
     #[test]
-    fn indented_paragraphs_remain_an_explicit_import_error() {
+    fn paragraph_indent_codec_round_trips() {
         let canonical = CanonicalDocument::parse_html("<p data-indent=\"1\">段落</p>").unwrap();
-        assert!(matches!(
-            import_canonical(&canonical),
-            Err(CanonicalImportError::UnsupportedIndent { indent: 1, .. })
-        ));
+        let native = import_canonical(&canonical).expect("paragraph indent is representable");
+        assert_eq!(super::export_canonical(&native).unwrap(), canonical);
     }
 
     #[test]
@@ -2147,8 +2283,10 @@ mod tests {
                 highlight: true,
                 inline_code: true,
                 link: Some("https://example.test/格式".into()),
+                link_title: None,
                 script: Some(app_lite_core::Script::Superscript),
                 color: Some(app_lite_core::TextColor::new([0xfc, 0x12, 0x33])),
+                highlight_color: None,
             },
         };
         let lowered = |text: &str| Inline::Text {
@@ -2271,6 +2409,7 @@ mod tests {
             presentation: ImagePresentation {
                 natural_size: Some((4032, 3024)),
                 display_width: Some(960),
+                alignment: None,
             },
             link: None,
         }]);

@@ -25,6 +25,9 @@ pub trait StagedLibrary: sealed::Sealed {
     fn profile_path(&self) -> &Path;
     #[doc(hidden)]
     fn into_directory(self) -> TempDir;
+    /// Restore keeps its existing lifecycle; only import producers carry this.
+    #[doc(hidden)]
+    fn take_import_lease(&mut self) -> Option<File> { None }
 }
 
 mod sealed {
@@ -35,6 +38,7 @@ mod sealed {
 }
 
 impl StagedLibrary for EnexStagedProfile {
+    fn take_import_lease(&mut self) -> Option<File> { self.take_import_lease() }
     fn profile_path(&self) -> &Path {
         EnexStagedProfile::profile_path(self)
     }
@@ -44,6 +48,7 @@ impl StagedLibrary for EnexStagedProfile {
 }
 
 impl StagedLibrary for JexStagedProfile {
+    fn take_import_lease(&mut self) -> Option<File> { self.take_import_lease() }
     fn profile_path(&self) -> &Path {
         JexStagedProfile::profile_path(self)
     }
@@ -104,12 +109,13 @@ pub fn publish_staged_library<S: StagedLibrary>(
 /// `before_rename` runs after verification and fsync, immediately before the
 /// publishing rename; it exists so callers and tests can inject failures.
 pub fn publish_staged_library_with_hook<S: StagedLibrary>(
-    staged: S,
+    mut staged: S,
     destination: &Path,
     cancel: &AtomicBool,
     before_rename: impl FnOnce() -> io::Result<()>,
 ) -> Result<PublishedLibrary, PublishError> {
     // Dropping `directory` on any early return removes the staging copy.
+    let import_lease = staged.take_import_lease();
     let directory = staged.into_directory();
     let source = directory.path();
     if fs::symlink_metadata(destination).is_ok() {
@@ -122,12 +128,13 @@ pub fn publish_staged_library_with_hook<S: StagedLibrary>(
     if cancel.load(Ordering::Relaxed) {
         return Err(PublishError::Cancelled);
     }
-    let counts = verify_profile(source)?;
-    sync_tree(source)?;
+    let counts = verify_profile(source, cancel)?;
+    sync_tree(source, cancel)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(PublishError::Cancelled);
     }
     before_rename()?;
+    check_cancel(cancel)?;
     let kept = directory.keep();
     // rename(2) refuses to replace a non-empty directory, and the existence
     // check above covers files; a racing creator makes this fail cleanly.
@@ -143,6 +150,8 @@ pub fn publish_staged_library_with_hook<S: StagedLibrary>(
     if library_counts(destination)? != counts {
         return Err(PublishError::CountsChanged);
     }
+    if import_lease.is_some() { super::import_staging::finish(destination); }
+    drop(import_lease);
     Ok(PublishedLibrary {
         path: destination.to_path_buf(),
         counts,
@@ -178,7 +187,16 @@ fn count(db: &Connection) -> Result<LibraryCounts, PublishError> {
     })
 }
 
-fn verify_profile(profile: &Path) -> Result<LibraryCounts, PublishError> {
+fn check_cancel(cancel: &AtomicBool) -> Result<(), PublishError> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(PublishError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_profile(profile: &Path, cancel: &AtomicBool) -> Result<LibraryCounts, PublishError> {
+    check_cancel(cancel)?;
     let db = open_read_only(profile)?;
     let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -197,6 +215,7 @@ fn verify_profile(profile: &Path) -> Result<LibraryCounts, PublishError> {
         .collect::<Result<_, _>>()?;
     let store = ResourceStore::new(profile)?;
     for (sha256, size) in blobs {
+        check_cancel(cancel)?;
         let mismatch = || PublishError::BlobMismatch {
             sha256: sha256.clone(),
         };
@@ -217,10 +236,12 @@ fn verify_profile(profile: &Path) -> Result<LibraryCounts, PublishError> {
 }
 
 /// fsync every file and directory so the rename publishes durable content.
-fn sync_tree(root: &Path) -> io::Result<()> {
+fn sync_tree(root: &Path, cancel: &AtomicBool) -> Result<(), PublishError> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        check_cancel(cancel)?;
         for entry in fs::read_dir(&dir)? {
+            check_cancel(cancel)?;
             let entry = entry?;
             let kind = entry.file_type()?;
             if kind.is_dir() {
@@ -263,6 +284,7 @@ pub fn import_library_file(
     imports_dir: &Path,
     cancel: &std::sync::Arc<AtomicBool>,
 ) -> Result<ImportLibraryOutcome, ImportLibraryError> {
+    check_cancel(cancel)?;
     let extension = source
         .extension()
         .and_then(|extension| extension.to_str())
@@ -274,6 +296,7 @@ pub fn import_library_file(
     };
     let staging = imports_dir.join(".staging");
     fs::create_dir_all(&staging)?;
+    super::cleanup_abandoned_import_staging(&staging)?;
     let destination = unique_library_destination(imports_dir, source)?;
     if is_enex {
         let staged = super::stage_enex_file_with_cancel(source, &staging, cancel.clone())?;
@@ -286,7 +309,15 @@ pub fn import_library_file(
         let library = publish_staged_library(staged, &destination, cancel)?;
         Ok(ImportLibraryOutcome { library, degraded })
     } else {
-        let staged = super::stage_jex_file(source, &staging).map_err(ImportLibraryError::Jex)?;
+        let staged = super::stage_jex_file_with_cancel(source, &staging, cancel.clone()).map_err(
+            |error| match error {
+                super::JexStageError::Cancelled
+                | super::JexStageError::Prepare(super::JexPrepareError::Cancelled) => {
+                    ImportLibraryError::Publish(PublishError::Cancelled)
+                }
+                error => ImportLibraryError::Jex(error),
+            },
+        )?;
         let degraded = staged
             .report()
             .degraded_notes

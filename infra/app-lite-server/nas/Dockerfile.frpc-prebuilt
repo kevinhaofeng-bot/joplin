@@ -1,0 +1,5 @@
+# Use the hash-verified Linux infrastructure binary, not a product dependency.
+FROM scratch
+COPY frpc /frpc
+USER 10001:10001
+ENTRYPOINT ["/frpc", "-c", "/etc/frpc.json"]

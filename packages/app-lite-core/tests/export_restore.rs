@@ -259,6 +259,7 @@ fn readable_page_applies_canonical_alignment_indent_and_image_display_width() {
                     presentation: ImagePresentation {
                         natural_size: Some((1000, 500)),
                         display_width: Some(320),
+                        alignment: None,
                     },
                     link: None,
                 },
@@ -278,6 +279,46 @@ fn readable_page_applies_canonical_alignment_indent_and_image_display_width() {
     assert!(page.contains(
         "data-joplin-lite-display-width=\"320\" style=\"width:320px;max-width:100%;height:auto\""
     ));
+}
+
+#[test]
+fn readable_image_alignment_applies_to_the_image_and_restores_the_node() {
+    // Catches a browser projection that retains the data attribute but never
+    // gives it a visual effect, and a restore that drops the image property.
+    let profile = tempdir().unwrap();
+    let source = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let image = source
+        .import_resource(b"image bytes", "image.png", "image/png", "png")
+        .unwrap();
+    for (alignment, margins) in [
+        ("center", "margin-left:auto;margin-right:auto"),
+        ("right", "margin-left:auto;margin-right:0"),
+    ] {
+        let html = format!(
+            "<p>前</p><img data-joplin-lite-block-image=\"true\" src=\":/{}\" alt=\"图\" data-joplin-lite-natural-width=\"400\" data-joplin-lite-natural-height=\"200\" data-joplin-lite-display-width=\"100\" data-joplin-lite-image-align=\"{alignment}\"><p>后</p>",
+            image.as_str()
+        );
+        let note = source
+            .create_note(CreateNote {
+                title: alignment.into(),
+                notebook_id: None,
+                document: CanonicalDocument::parse_html(&html).unwrap(),
+            })
+            .unwrap();
+        let bundle = profile.path().join(alignment);
+        export_readable_selection(&source, &[note.id.clone()], &bundle).unwrap();
+        let page =
+            fs::read_to_string(bundle.join(format!("readable/{}.html", note.id.as_str()))).unwrap();
+        assert!(page.contains(&format!("data-joplin-lite-image-align=\"{alignment}\" style=\"width:100px;max-width:100%;height:auto;{margins}\"")), "image alignment must affect the exported image, not a neighbour paragraph");
+        let restored_dir = profile.path().join(format!("restored-{alignment}"));
+        fs::create_dir(&restored_dir).unwrap();
+        restore_readable_export(&bundle, &restored_dir).unwrap();
+        let restored = LibraryRepository::open(restored_dir.join("library.sqlite")).unwrap();
+        assert_eq!(
+            restored.load_note(&note.id).unwrap().unwrap().body_html,
+            html
+        );
+    }
 }
 
 #[test]

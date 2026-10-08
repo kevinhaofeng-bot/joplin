@@ -16,6 +16,169 @@ fn repository() -> (tempfile::TempDir, Arc<LibraryRepository>) {
     (profile, repository)
 }
 
+#[test]
+fn recent_search_246_records_only_committed_nonempty_results_and_survives_reopen() {
+    // Missing durable history, recording preview/stale packets or recording
+    // an empty result must change these real database rows.
+    let (profile, repository) = repository();
+    let id = create(&repository, "会议246");
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    let hit = SearchHit {
+        note: model.projections()[0].clone(),
+        snippet: String::new(),
+        matched_resource: None,
+    };
+    let count = || {
+        let sql = rusqlite::Connection::open(profile.path().join("library.sqlite")).unwrap();
+        sql.query_row("SELECT count(*) FROM search_history", [], |r| r.get::<_, i64>(0)).unwrap()
+    };
+    let stale = model.begin_search("preview246");
+    assert_eq!(count(), 0, "preview must not record a query");
+    let generation = model.begin_search("会议246");
+    assert!(!model.commit_search_results(stale, "preview246".into(), vec![hit.clone()], None).unwrap());
+    assert_eq!(count(), 0, "stale packets must not record a query");
+    assert!(model.commit_search_results(generation, "会议246".into(), vec![hit.clone()], Some(id.clone())).unwrap());
+    assert_eq!(count(), 1, "successful committed search must be durable");
+    let generation = model.begin_search("会议246");
+    assert!(model.commit_search_results(generation, "会议246".into(), vec![hit], Some(id.clone())).unwrap());
+    let generation = model.begin_search("absent246");
+    assert!(model.commit_search_results(generation, "absent246".into(), vec![], None).unwrap());
+    drop(model);
+    drop(repository);
+    let reopened = LibraryRepository::open(profile.path().join("library.sqlite")).unwrap();
+    let sql = rusqlite::Connection::open(profile.path().join("library.sqlite")).unwrap();
+    let rows = sql.prepare("SELECT query,use_count FROM search_history ORDER BY query").unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(rows, vec![("会议246".into(), 2)]);
+    assert!(reopened.load_note(&id).unwrap().is_some());
+}
+
+#[test]
+fn recent_search_246_history_write_failure_warns_without_discarding_opened_note() {
+    let (profile, repository) = repository();
+    let id = create(&repository, "保留246");
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    let hit = SearchHit { note: model.projections()[0].clone(), snippet: String::new(), matched_resource: None };
+    let sql = rusqlite::Connection::open(profile.path().join("library.sqlite")).unwrap();
+    sql.execute_batch("CREATE TRIGGER refuse_history BEFORE INSERT ON search_history BEGIN SELECT RAISE(ABORT,'history unavailable'); END;").unwrap();
+    let generation = model.begin_search("保留246");
+    assert!(model.commit_search_results(generation, "保留246".into(), vec![hit], Some(id.clone())).unwrap());
+    assert_eq!(model.navigation().selected_note_id(), Some(&id));
+    assert_eq!(model.projections().len(), 1);
+    assert!(matches!(model.status(), AppStatus::Error(message) if message.contains("历史保存失败")));
+    assert_eq!(sql.query_row("SELECT count(*) FROM search_history", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn shortcut_225_actions_publish_membership_and_reopen_without_copying_targets() {
+    use app_lite_core::ShortcutTarget;
+    let (profile, repository) = repository();
+    let note_id = create(&repository, "快捷原篇");
+    let book = repository.create_notebook("快捷本", None).unwrap();
+    let targets = vec![ShortcutTarget::Note(note_id.clone()), ShortcutTarget::Notebook(book.id)];
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    model.dispatch(AppAction::AddShortcuts(targets.clone())).unwrap();
+    assert_eq!(model.navigation_index().shortcuts.len(), 2);
+    model.dispatch(AppAction::AddShortcuts(targets.clone())).unwrap();
+    drop(model);
+    let reopened = Arc::new(LibraryRepository::open(profile.path().join("library.sqlite")).unwrap());
+    let mut model = AppModel::open(reopened).unwrap();
+    assert_eq!(model.navigation_index().shortcuts.iter().map(|s| s.target.clone()).collect::<Vec<_>>(), targets);
+    model.dispatch(AppAction::RemoveShortcuts(vec![targets[0].clone()])).unwrap();
+    assert_eq!(model.navigation_index().shortcuts.len(), 1);
+    assert_eq!(repository.load_note(&note_id).unwrap().unwrap().title, "快捷原篇");
+    assert_eq!(repository.list_notes(Default::default()).unwrap().len(), 1);
+}
+
+#[test]
+fn shortcut_225_navigation_resolves_note_and_book_identity_and_rejects_trash() {
+    use app_lite_core::ShortcutTarget;
+    let (_profile, repository, book, all_note, book_note) = navigation_fixture();
+    let targets = vec![ShortcutTarget::Note(all_note.clone()), ShortcutTarget::Notebook(book.id.clone())];
+    repository.add_shortcuts(&targets).unwrap();
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    model.dispatch(AppAction::SelectNote(book_note.clone())).unwrap();
+    model.dispatch(AppAction::OpenShortcut(targets[1].clone())).unwrap();
+    assert_eq!(model.navigation().route(), &LibraryRoute::Notebook(book.id));
+    assert_eq!(model.navigation().selected_note_id(), Some(&book_note));
+    model.dispatch(AppAction::OpenShortcut(targets[0].clone())).unwrap();
+    assert_eq!(model.navigation().route(), &LibraryRoute::AllNotes);
+    assert_eq!(model.navigation().selected_note_id(), Some(&all_note));
+    repository.trash_note(&all_note).unwrap();
+    let before = navigation_commit_probe(&model);
+    assert!(model.dispatch(AppAction::OpenShortcut(targets[0].clone())).is_err());
+    assert_navigation_commit_unchanged(&model, &before);
+}
+
+#[test]
+fn shortcut_226_saved_title_updates_cached_row_without_reloading_the_session() {
+    use app_lite_core::ShortcutTarget;
+    let (_profile, repository) = repository();
+    let id = create(&repository, "226 original");
+    repository.add_shortcuts(&[ShortcutTarget::Note(id.clone())]).unwrap();
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    model.dispatch(AppAction::SelectNote(id.clone())).unwrap();
+    let original = repository.load_note(&id).unwrap().unwrap();
+    let membership = model.navigation_index().shortcuts[0].clone();
+    let saved = repository.save_note(SaveNote {
+        id: id.clone(), expected_revision: original.revision,
+        title: "226 renamed 🙂".into(), document: CanonicalDocument::default(),
+        resource_ids: original.resource_ids.clone(), selected_thumbnail_id: None,
+    }).unwrap();
+    let loads = repository.observe_note_loads();
+    model.apply_active_note_snapshot(saved.clone());
+    assert_eq!(model.active_note(), Some(&saved));
+    assert_eq!(model.navigation_index().shortcuts[0].id, membership.id);
+    assert_eq!(model.navigation_index().shortcuts[0].position, membership.position);
+    assert_eq!(model.navigation_index().shortcuts[0].title, "226 renamed 🙂",
+        "the same save outcome that updates the card must update the sidebar label");
+    assert_eq!(loads.try_recv(), Err(TryRecvError::Empty), "metadata publication must not rehydrate the body");
+}
+
+#[test]
+fn shortcut_226_projection_events_refresh_inactive_targets_even_during_search() {
+    use app_lite_core::ShortcutTarget;
+    for search in [false, true] {
+        let (_profile, repository) = repository();
+        let active = create(&repository, "226 active");
+        let target = create(&repository, "226 other");
+        repository.add_shortcuts(&[ShortcutTarget::Note(target.clone())]).unwrap();
+        let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+        model.dispatch(AppAction::SelectNote(active.clone())).unwrap();
+        if search {
+            repository.process_search_jobs().unwrap();
+            let hits = repository.search(app_lite_core::SearchQuery::parse("active")).unwrap();
+            assert_eq!(hits.len(), 1, "the search fixture must contain the retained active note");
+            let generation = model.begin_search("active");
+            model.commit_search_results(generation, "active".into(), hits, Some(active.clone())).unwrap();
+            assert_eq!(model.active_note().unwrap().id, active);
+        }
+        let retained = model.active_note().cloned();
+        let original = repository.load_note(&target).unwrap().unwrap();
+        let events = repository.subscribe();
+        repository.save_note(SaveNote {
+            id: target.clone(), expected_revision: original.revision,
+            title: "226 other renamed".into(), document: CanonicalDocument::default(),
+            resource_ids: original.resource_ids, selected_thumbnail_id: None,
+        }).unwrap();
+        let loads = repository.observe_note_loads();
+        model.refresh_projection_events(events.try_iter()).unwrap();
+        assert_eq!(model.navigation_index().shortcuts[0].title, "226 other renamed",
+            "a non-active shortcut must also follow repository changes; search={search}");
+        assert_eq!(model.active_note(), retained.as_ref());
+        assert_eq!(loads.try_recv(), Err(TryRecvError::Empty));
+        repository.trash_note(&target).unwrap();
+        model.refresh_projection_events(events.try_iter()).unwrap();
+        assert!(model.navigation_index().shortcuts.is_empty(), "trashed target must disappear; search={search}");
+        repository.restore_note(&target).unwrap();
+        model.refresh_projection_events(events.try_iter()).unwrap();
+        assert_eq!(model.navigation_index().shortcuts[0].title, "226 other renamed");
+        assert_eq!(model.active_note(), retained.as_ref());
+        assert_eq!(loads.try_recv(), Err(TryRecvError::Empty));
+    }
+}
+
 fn create(repository: &LibraryRepository, title: &str) -> NoteId {
     repository
         .create_note(CreateNote {
@@ -1907,6 +2070,136 @@ fn organization_actions_commit_route_projection_selection_and_session_together()
     assert!(model.navigation_index().tags.is_empty());
 }
 
+// An existing notebook joins and leaves stacks: the sidebar index, the Stack
+// route's cards and the mounted session change together; a refused change
+// commits nothing.
+#[test]
+fn organization_stack_membership_of_an_existing_notebook_commits_route_projection_and_session() {
+    let (_profile, repository) = repository();
+    let stack = repository.create_stack("组").expect("create stack");
+    let notebook = repository
+        .create_notebook("本", None)
+        .expect("create notebook");
+    let note = repository
+        .create_note(CreateNote {
+            title: "笔记".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: CanonicalDocument::default(),
+        })
+        .expect("create note");
+    let mut model = AppModel::open(Arc::clone(&repository)).expect("open model");
+    let stack_of = |model: &AppModel| {
+        model
+            .navigation_index()
+            .notebooks
+            .iter()
+            .find(|candidate| candidate.id == notebook.id)
+            .expect("the notebook keeps its ID")
+            .stack_id
+            .clone()
+    };
+
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Notebook(notebook.id.clone()),
+            selected_note_id: Some(note.id.clone()),
+        })
+        .expect("navigate notebook");
+    model
+        .dispatch(AppAction::SetNotebookStack {
+            id: notebook.id.clone(),
+            stack_id: Some(stack.id.clone()),
+        })
+        .expect("add to stack");
+    assert_eq!(stack_of(&model), Some(stack.id.clone()));
+    assert_eq!(
+        model.navigation().route(),
+        &LibraryRoute::Notebook(notebook.id.clone())
+    );
+    assert_eq!(model.active_session_note_id(), Some(&note.id));
+
+    model
+        .dispatch(AppAction::NavigateTo {
+            route: LibraryRoute::Stack(stack.id.clone()),
+            selected_note_id: Some(note.id.clone()),
+        })
+        .expect("navigate stack");
+    assert_eq!(
+        model.projections().len(),
+        1,
+        "the stack shows its notebook's note"
+    );
+    model
+        .dispatch(AppAction::SetNotebookStack {
+            id: notebook.id.clone(),
+            stack_id: None,
+        })
+        .expect("remove from stack");
+    assert_eq!(stack_of(&model), None);
+    assert_eq!(
+        model.navigation().route(),
+        &LibraryRoute::Stack(stack.id.clone())
+    );
+    assert!(
+        model.projections().is_empty(),
+        "the stack no longer shows it"
+    );
+    assert_eq!(model.navigation().selected_note_id(), None);
+    assert_eq!(model.active_session_note_id(), None);
+    assert!(
+        model
+            .navigation_index()
+            .stacks
+            .iter()
+            .any(|candidate| candidate.id == stack.id),
+        "removing the notebook keeps the stack"
+    );
+
+    model
+        .dispatch(AppAction::CreateStackForNotebook {
+            id: notebook.id.clone(),
+            title: "新组".into(),
+        })
+        .expect("add to a new stack");
+    let created = model
+        .navigation_index()
+        .stacks
+        .iter()
+        .find(|candidate| candidate.title == "新组")
+        .expect("the new stack")
+        .id
+        .clone();
+    assert_eq!(stack_of(&model), Some(created));
+
+    let before = navigation_commit_probe(&model);
+    let missing = app_lite_core::StackId::parse("f".repeat(32)).expect("opaque stack id");
+    assert!(
+        model
+            .dispatch(AppAction::SetNotebookStack {
+                id: notebook.id.clone(),
+                stack_id: Some(missing),
+            })
+            .is_err()
+    );
+    assert!(
+        model
+            .dispatch(AppAction::CreateStackForNotebook {
+                id: notebook.id.clone(),
+                title: "  ".into(),
+            })
+            .is_err()
+    );
+    assert_navigation_commit_unchanged(&model, &before);
+    assert_eq!(
+        repository
+            .load_note(&note.id)
+            .expect("load note")
+            .expect("note remains")
+            .notebook_id,
+        notebook.id
+    );
+}
+
 #[test]
 fn destroying_the_active_stack_falls_back_without_losing_the_selected_note() {
     // Destroying a Stack is not deleting its child notebooks or notes. When
@@ -3030,4 +3323,59 @@ fn titles_of(model: &AppModel) -> Vec<String> {
         .iter()
         .map(|projection| projection.title_prefix.clone())
         .collect()
+}
+
+#[test]
+fn editing_away_an_attachment_search_match_keeps_the_active_note_for_undo() {
+    // Refreshing cards must not close the editor solely because this local
+    // edit removed its match; closing also destroys the native undo session.
+    let (_profile, repository) = repository();
+    let resource = repository
+        .import_resource(b"synthetic PDF fixture", "attachment.pdf", "application/pdf", "pdf")
+        .expect("import test attachment");
+    let note = repository
+        .create_note(CreateNote {
+            title: "attachment owner".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Attachment {
+                resource_id: resource.clone(),
+                filename: "attachment.pdf".into(),
+                media_type: "application/pdf".into(),
+            }]),
+        })
+        .expect("create attachment owner");
+    let job = repository.take_derived_text_jobs(1).unwrap().pop().unwrap();
+    assert!(repository.publish_derived_text(&job, "uniquecontentneedle").unwrap());
+    repository.process_search_jobs().unwrap();
+    let mut model = AppModel::open(Arc::clone(&repository)).unwrap();
+    let hits = repository.search(app_lite_core::SearchQuery::parse("uniquecontentneedle")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_resource.as_ref(), Some(&resource));
+    let generation = model.begin_search("uniquecontentneedle");
+    assert!(model.commit_search_results(
+        generation, "uniquecontentneedle".into(), hits, Some(note.id.clone()),
+    ).unwrap());
+    assert_eq!(model.active_session_note_id(), Some(&note.id));
+
+    let detached = repository.save_note(SaveNote {
+        id: note.id.clone(),
+        expected_revision: note.revision,
+        title: note.title,
+        document: CanonicalDocument::default(),
+        resource_ids: vec![],
+        selected_thumbnail_id: None,
+    }).expect("save the local attachment deletion");
+    model.apply_active_note_snapshot(detached.clone());
+    model.refresh_projection_events([LibraryEvent::NoteProjectionChanged(note.id.clone())]).unwrap();
+    repository.process_search_jobs().unwrap();
+    let (query, snapshot, generation) = model.pending_search_refresh().unwrap();
+    let hits = repository.search(app_lite_core::SearchQuery::parse(&query)).unwrap();
+    assert!(hits.is_empty(), "a detached attachment must stop matching");
+    assert!(model.commit_search_refresh(&query, &snapshot, generation, hits).unwrap());
+    assert!(model.projections().is_empty(), "the result list must stay truthful");
+    assert_eq!(model.navigation().search_query(), Some("uniquecontentneedle"));
+    assert_eq!(model.active_session_note_id(), Some(&note.id),
+        "background search refresh must not discard the locally edited note and its undo owner");
+    assert_eq!(model.navigation().selected_note_id(), Some(&note.id));
+    assert_eq!(model.active_note(), Some(&detached));
 }

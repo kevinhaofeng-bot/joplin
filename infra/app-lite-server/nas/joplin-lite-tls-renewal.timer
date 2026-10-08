@@ -1,0 +1,14 @@
+[Unit]
+Description=Joplin Lite daily checked TLS renewal
+RequiresMountsFor=/volume1/Projects/joplin-lite-runtime
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=15min
+AccuracySec=1min
+Unit=joplin-lite-tls-renewal.service
+
+[Install]
+WantedBy=timers.target

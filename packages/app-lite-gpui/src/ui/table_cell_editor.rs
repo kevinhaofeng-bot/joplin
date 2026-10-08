@@ -35,6 +35,8 @@ pub(crate) struct TableCellEditor {
     resources: Vec<app_lite_core::ResourceId>,
     original_inlines: Vec<Inline>,
     _observation: Subscription,
+    // Copy and cut from this cell's surface; dropped with the cell.
+    _surface_events: Subscription,
     needs_focus: bool,
     pub(crate) error: Option<String>,
     // Cleared when this cell closes, for resource inserts still in flight.
@@ -44,6 +46,21 @@ pub(crate) struct TableCellEditor {
     table_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
     // Where the cell's editing area was painted, for drops.
     pub(crate) bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    // The cell surface's own decode cache, for tests that check what the
+    // cell itself painted.
+    #[cfg(test)]
+    pub(crate) image_cache: Entity<crate::native_editor::images::BudgetedImageCache>,
+}
+
+impl TableCellEditor {
+    pub(crate) fn surface_id(&self) -> gpui::EntityId {
+        self.surface.entity_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn surface_for_test(&self) -> Entity<EditorSurface> {
+        self.surface.clone()
+    }
 }
 
 impl Drop for TableCellEditor {
@@ -365,6 +382,19 @@ impl LibraryShell {
             if !current || changed.read(shell_cx).marked_text().is_some() {
                 return;
             }
+            // Images the cell painted without a source of its own come from
+            // the library through the session, into this editor's store.
+            if let (Some(session), Some(open)) = (
+                shell.note_session.clone(),
+                shell
+                    .table_cell_editor
+                    .as_ref()
+                    .map(|cell| cell.open.clone()),
+            ) {
+                session.update(shell_cx, |session, session_cx| {
+                    session.drain_cell_image_hydration_requests(&changed, &open, session_cx);
+                });
+            }
             let error = shell.persist_table_cell_draft(shell_cx).err();
             if let Some(cell) = shell.table_cell_editor.as_mut() {
                 if cell.error != error {
@@ -381,14 +411,25 @@ impl LibraryShell {
             cx,
             CELL_IMAGE_CACHE_BUDGET,
         );
+        #[cfg(test)]
+        let cell_image_cache = image_cache.clone();
         let surface_editor = editor.clone();
         let surface = cx.new(move |cx| {
-            EditorSurface::new(
+            let mut surface = EditorSurface::new(
                 surface_editor,
                 EditorSurfaceMode::Editable,
                 Some(image_cache),
                 cx,
-            )
+            );
+            // Its copy needs the note's resources: plain text alone would
+            // turn an image into U+FFFC.
+            surface.route_clipboard_to_owner();
+            surface
+        });
+        let surface_events = cx.subscribe(&surface, |shell, surface, event, shell_cx| {
+            if let EditorSurfaceEvent::Clipboard { cut } = event {
+                shell.copy_from_table_cell(surface.entity_id(), *cut, shell_cx);
+            }
         });
         self.table_cell_editor = Some(TableCellEditor {
             node_id,
@@ -399,11 +440,14 @@ impl LibraryShell {
             resources,
             original_inlines,
             _observation: observation,
+            _surface_events: surface_events,
             needs_focus: true,
             error: None,
             open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             table_revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision)),
             bounds: Default::default(),
+            #[cfg(test)]
+            image_cache: cell_image_cache,
         });
         cx.notify();
     }
@@ -449,9 +493,14 @@ impl LibraryShell {
         });
         match next {
             Ok(next) => {
-                self.table_cell_editor = None;
+                let closed = self
+                    .table_cell_editor
+                    .take()
+                    .map(|cell| cell.editor.read(cx).focus_handle().clone());
                 if let Some((row, column)) = next {
                     self.open_table_cell_editor(node_id, row, column, cx);
+                } else {
+                    self.focus_body_after_cell_close = closed;
                 }
             }
             Err(error) => {
@@ -564,7 +613,8 @@ impl LibraryShell {
                 }
             }
         }
-        if self.table_cell_editor.take().is_some() {
+        if let Some(cell) = self.table_cell_editor.take() {
+            self.focus_body_after_cell_close = Some(cell.editor.read(cx).focus_handle().clone());
             cx.notify();
         }
     }
@@ -601,6 +651,10 @@ impl LibraryShell {
                 .border_1()
                 .border_color(rgba(0xc9d3ccff))
                 .shadow_lg()
+                // The popup floats over the note list and body: none of its
+                // presses (Done, Cancel, structure buttons, the editing
+                // area) may also reach a card or the body beneath it.
+                .occlude()
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
@@ -652,6 +706,7 @@ impl LibraryShell {
                         .child(
                             div()
                                 .id("table-cell-editor-done")
+                                .debug_selector(|| "table-cell-editor-done".to_owned())
                                 .px(px(10.0))
                                 .py(px(4.0))
                                 .rounded(px(4.0))
@@ -670,6 +725,7 @@ impl LibraryShell {
                         .child(
                             div()
                                 .id("table-cell-editor-cancel")
+                                .debug_selector(|| "table-cell-editor-cancel".to_owned())
                                 .px(px(10.0))
                                 .py(px(4.0))
                                 .rounded(px(4.0))
@@ -719,6 +775,7 @@ impl LibraryShell {
                         .map(|(id, label, change)| {
                             div()
                                 .id(id)
+                                .debug_selector(move || id.to_owned())
                                 .px(px(8.0))
                                 .py(px(3.0))
                                 .rounded(px(4.0))

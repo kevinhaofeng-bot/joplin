@@ -5,6 +5,13 @@ mod display;
 mod display_link;
 mod events;
 mod keyboard;
+mod input_trace;
+
+// Reuse the existing opt-in private sink. The closure is never evaluated
+// during ordinary startup, and the observer does not schedule any frames.
+pub(crate) fn trace_window_frame(event: &str, detail: impl FnOnce() -> serde_json::Value) {
+    input_trace::record(event, detail);
+}
 
 #[cfg(feature = "screen-capture")]
 mod screen_capture;

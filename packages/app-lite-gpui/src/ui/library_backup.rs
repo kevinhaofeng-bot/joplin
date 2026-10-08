@@ -17,7 +17,7 @@ use app_lite_core::{
     backup_library, export_library_readable, restore_library_backup, restore_library_readable,
     unique_library_destination,
 };
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 impl LibraryShell {
     fn begin_library_job(&mut self, job: LibraryJob, cx: &mut Context<Self>) -> Option<u64> {
@@ -584,7 +584,12 @@ fn prompt_for_new_directory(
     let default_dir = directories::UserDirs::new()
         .and_then(|dirs| dirs.document_dir().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let prompt = cx.prompt_for_new_path(&default_dir, Some(suggested_name));
+    let prompt = crate::file_picker::prompt_for_new_path(cx, &default_dir, Some(suggested_name));
+    let prompt = crate::file_picker::bind_to_request(cx, window.into(), prompt, move |app| {
+        window.read_with(app, |shell, _| shell.pending_library_import.as_ref().is_some_and(
+            |pending| pending.token == token && !pending.cancel.load(Ordering::Relaxed),
+        )).unwrap_or(false)
+    });
     cx.spawn(async move |cx| {
         let selection = match prompt.await {
             Ok(Ok(path)) => Ok(path),
@@ -607,11 +612,16 @@ fn prompt_for_existing_directory(
     complete: PickerCompletion,
     cx: &mut App,
 ) {
-    let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+    let prompt = crate::file_picker::prompt_for_paths(cx, gpui::PathPromptOptions {
         files: false,
         directories: true,
         multiple: false,
         prompt: Some("恢复".into()),
+    });
+    let prompt = crate::file_picker::bind_to_request(cx, window.into(), prompt, move |app| {
+        window.read_with(app, |shell, _| shell.pending_library_import.as_ref().is_some_and(
+            |pending| pending.token == token && !pending.cancel.load(Ordering::Relaxed),
+        )).unwrap_or(false)
     });
     cx.spawn(async move |cx| {
         let selection = match prompt.await {

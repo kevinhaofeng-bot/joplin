@@ -1,0 +1,17 @@
+[Unit]
+Description=Joplin Lite private STCP access (no public notes port)
+Requires=joplin-lite-docker.service joplin-lite-sync.service
+PartOf=joplin-lite-sync.service
+After=joplin-lite-docker.service joplin-lite-sync.service network-online.target
+RequiresMountsFor=/volume1/Projects/joplin-lite-runtime
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/docker --host=unix:///run/joplin-lite-docker.sock run --rm --name joplin-lite-private-link --network host --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 64 --memory 64m --memory-swap 64m --cpus 1 --tmpfs /tmp:rw,noexec,nosuid,size=8m --mount type=bind,src=/volume1/Projects/joplin-lite-runtime/secrets/nas-frpc.json,dst=/etc/frpc.json,readonly joplin-lite-frpc:acceptance-229
+ExecStop=/usr/bin/docker --host=unix:///run/joplin-lite-docker.sock stop --time 10 joplin-lite-private-link
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -72,6 +72,7 @@ schemars = "1"
 futures = "0.3"
 libc = "0.2"
 image = "0.25.10"
+png = "0.18.1"
 resvg = "0.45.1"
 usvg = "0.45.1"
 semver = "1"
@@ -115,9 +116,10 @@ tree-sitter-toml = { package = "adot-tree-sitter-toml", version = "0.1", optiona
 # only for pasteboard extraction; editing remains entirely GPUI/Rust-owned.
 cocoa = "0.26"
 objc = "0.2.7"
+block = "0.1.6"
 raw-window-handle = "0.6"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFData", "CFDictionary", "CFNumber", "CFString", "CFURL", "objc2"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage", "objc2"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage", "objc2"] }
 objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "CGImageProperties", "objc2-core-graphics", "objc2"] }
 
 [dev-dependencies]

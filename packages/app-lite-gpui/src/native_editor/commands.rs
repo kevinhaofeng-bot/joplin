@@ -42,6 +42,7 @@ pub enum EditorCommand {
     AlignRight,
     IndentList,
     OutdentList,
+    ClearFormatting,
 }
 
 /// Optional data supplied when a command needs more than the current
@@ -54,6 +55,7 @@ pub enum CommandArgument {
     ImagePath(std::path::PathBuf),
     /// A colour for `TextColor`; `None` returns text to the default colour.
     TextColor(Option<app_lite_core::TextColor>),
+    HighlightColor(Option<app_lite_core::TextColor>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,6 +321,14 @@ const COMMANDS: &[CommandDescriptor] = &[
         group: 6,
         primary: false,
     },
+    CommandDescriptor {
+        command: EditorCommand::ClearFormatting,
+        label: "Clear formatting",
+        label_zh: "清除格式",
+        icon_path: None,
+        group: 6,
+        primary: false,
+    },
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -356,6 +366,13 @@ impl CommandCatalogue {
             return disabled();
         }
         match command {
+            // Peso removeformat rejects collapsed and atom-only selections.
+            // Unlike a mark toggle it must not alter pending typing styles.
+            EditorCommand::ClearFormatting => CommandState {
+                enabled: !editor.selection().is_caret()
+                    && !editor.selected_text_ranges().is_empty(),
+                toggle: ToggleState::Off,
+            },
             EditorCommand::InsertImage => CommandState {
                 enabled: editor.selected_block_indices().is_some(),
                 toggle: ToggleState::Off,
@@ -472,21 +489,23 @@ impl CommandCatalogue {
                     return disabled();
                 }
                 let expected = alignment_for_command(command);
-                let (count, text_only, matching) = editor
+                let (count, alignable, matching) = editor
                     .document()
                     .blocks()
                     .iter_range(start..end.saturating_add(1))
                     .fold(
                         (0usize, true, 0usize),
-                        |(count, text_only, matching), block| {
+                        |(count, alignable, matching), block| {
                             (
                                 count.saturating_add(1),
-                                text_only && block.content.as_text().is_some(),
+                                alignable && (block.content.as_text().is_some()
+                                    || (matches!(block.content, super::model::BlockContent::Image { .. })
+                                        && !editor.document().is_inline_group_member(block.id))),
                                 matching.saturating_add(usize::from(block.alignment == expected)),
                             )
                         },
                     );
-                if count == 0 || !text_only {
+                if count == 0 || !alignable {
                     return disabled();
                 }
                 return CommandState {
@@ -495,7 +514,7 @@ impl CommandCatalogue {
                 };
             }
             EditorCommand::IndentList | EditorCommand::OutdentList => {
-                let Some((start, end)) = editor.selected_block_indices() else {
+                let Ok(Some((start, end))) = editor.document().indent_block_range(editor.selection()) else {
                     return disabled();
                 };
                 if start > end {
@@ -511,7 +530,11 @@ impl CommandCatalogue {
                 // reporting enabled for only the applicable subset would make
                 // a toolbar click deterministically return a transaction error.
                 let enabled = blocks.all(|block| {
-                    list_depth(&block.kind).is_some_and(|depth| match command {
+                    let depth = list_depth(&block.kind).or_else(|| {
+                        matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::Quote)
+                            .then_some(block.indent)
+                    });
+                    depth.is_some_and(|depth| match command {
                         EditorCommand::IndentList => depth < super::model::MAX_LIST_DEPTH,
                         EditorCommand::OutdentList => depth > 0,
                         _ => false,
@@ -536,6 +559,13 @@ impl CommandCatalogue {
         let argument = validate_argument(command, argument)?;
         let selection = editor.selection();
         match command {
+            EditorCommand::ClearFormatting => {
+                // Direct callers must reach EditorCore's read-only rejection,
+                // just like other commands, rather than report false success.
+                if editor.is_read_only() || self.state(command, editor).enabled {
+                    editor.apply(Transaction::ClearFormatting { selection })?;
+                }
+            }
             EditorCommand::InsertImage => {
                 let CommandArgument::ImagePath(path) = argument else {
                     unreachable!("validate_argument checked InsertImage's argument");
@@ -566,7 +596,7 @@ impl CommandCatalogue {
             | EditorCommand::Strike
             | EditorCommand::Superscript
             | EditorCommand::Subscript
-            | EditorCommand::Highlight => {
+            => {
                 editor.apply(Transaction::ToggleMark {
                     selection,
                     mark: mark_for_command(command),
@@ -598,6 +628,13 @@ impl CommandCatalogue {
                     unreachable!("validate_argument checked TextColor's argument");
                 };
                 editor.apply(Transaction::SetTextColor { selection, color })?;
+            }
+            EditorCommand::Highlight => {
+                if let CommandArgument::HighlightColor(color) = argument {
+                    editor.apply(Transaction::SetHighlightColor { selection, color })?;
+                } else {
+                    editor.apply(Transaction::ToggleMark { selection, mark: Mark::Highlight })?;
+                }
             }
         }
         Ok(())
@@ -633,6 +670,9 @@ fn validate_argument(
         (EditorCommand::TextColor, CommandArgument::TextColor(color)) => {
             Ok(CommandArgument::TextColor(color))
         }
+        (EditorCommand::Highlight, CommandArgument::HighlightColor(color)) => {
+            Ok(CommandArgument::HighlightColor(color))
+        }
         (EditorCommand::TextColor, _) => Err(CommandError::ArgumentMismatch {
             command,
             expected: "CommandArgument::TextColor",
@@ -647,6 +687,10 @@ fn validate_argument(
             expected: "CommandArgument::None",
         }),
         (_, CommandArgument::TextColor(_)) => Err(CommandError::ArgumentMismatch {
+            command,
+            expected: "CommandArgument::None",
+        }),
+        (_, CommandArgument::HighlightColor(_)) => Err(CommandError::ArgumentMismatch {
             command,
             expected: "CommandArgument::None",
         }),
@@ -862,6 +906,7 @@ fn apply_list_command(command: EditorCommand, editor: &mut EditorCore) -> Result
                     kind: kind.clone(),
                     content: BlockContent::text(""),
                     alignment: TextAlignment::Left,
+                    indent: 0,
                     quoted: false,
                     quote_start: false,
                     revision: 0,
@@ -1133,6 +1178,37 @@ mod tests {
 
     const IMAGE: &str = r#"<img src=":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" alt="图">"#;
     const ATTACHMENT: &str = r#"<a data-joplin-lite-inline-attachment="true" href=":/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" data-filename="报告.pdf" data-media-type="application/pdf">报告.pdf</a>"#;
+
+    #[gpui::test]
+    fn image_alignment_command_preserves_resource_size_and_history(cx: &mut gpui::TestAppContext) {
+        // Catches the former text-only command gate and image-attribute loss
+        // at the durable bridge. Expectations are literal, not codec-derived.
+        let source = r#"<p>前</p><img data-joplin-lite-block-image="true" src=":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" alt="图" data-joplin-lite-natural-width="400" data-joplin-lite-natural-height="200" data-joplin-lite-display-width="100"><p>后</p>"#;
+        let mut editor = opened(source, cx);
+        let id = editor.document().blocks()[1].id;
+        editor.set_selection_for_test(crate::native_editor::model::Selection::new(
+            crate::native_editor::model::DocPoint::with_affinity(id, 0, crate::native_editor::model::Affinity::Before),
+            crate::native_editor::model::DocPoint::with_affinity(id, 0, crate::native_editor::model::Affinity::After),
+        ));
+        let catalogue = CommandCatalogue::new();
+        assert!(catalogue.state(EditorCommand::AlignCenter, &editor).enabled);
+        catalogue.execute(EditorCommand::AlignCenter, CommandArgument::None, &mut editor).unwrap();
+        let centered = saved(&editor);
+        assert!(centered.contains("data-joplin-lite-image-align=\"center\""));
+        assert!(centered.contains("data-joplin-lite-display-width=\"100\""));
+        assert!(centered.starts_with("<p>前</p><img "));
+        assert!(centered.ends_with("<p>后</p>"));
+        assert_eq!(saved(&opened(&centered, cx)), centered);
+        assert_eq!(catalogue.state(EditorCommand::AlignCenter, &editor).toggle, super::ToggleState::On);
+        editor.undo().unwrap();
+        assert_eq!(saved(&editor), source);
+        editor.redo().unwrap();
+        assert_eq!(saved(&editor), centered);
+        catalogue.execute(EditorCommand::AlignRight, CommandArgument::None, &mut editor).unwrap();
+        assert!(saved(&editor).contains("data-joplin-lite-image-align=\"right\""));
+        catalogue.execute(EditorCommand::AlignLeft, CommandArgument::None, &mut editor).unwrap();
+        assert_eq!(saved(&editor), source);
+    }
 
     fn canonical(html: &str) -> String {
         app_lite_core::document::CanonicalDocument::parse_html(html)

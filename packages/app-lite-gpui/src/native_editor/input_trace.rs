@@ -1,7 +1,8 @@
 //! Opt-in record of text input, for diagnosing input methods on a real
 //! machine. With `JOPLIN_LITE_INPUT_TRACE=/path/to/file` set when the app
 //! starts, every input-method call on the note body and title, and every key
-//! that reaches the body's own key handling, is appended to that file as one
+//! that reaches the body's own key handling, plus toolbar command/history,
+//! body pointer routes and search visibility/focus boundaries, is appended as one
 //! JSON line. Off (and free) otherwise; nothing turns it on for a regular
 //! profile. It records the typed text, so it is for test content only, and a
 //! new trace file is readable by its owner only.

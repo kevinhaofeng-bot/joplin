@@ -112,6 +112,8 @@ const FALLBACK_GLYPH_WIDTH: f32 = 8.0;
 const CARET_WIDTH: f32 = 1.0;
 const LIST_MARKER_WIDTH: f32 = 22.0;
 const LIST_DEPTH_INDENT: f32 = 20.0;
+/// Evernote paragraph/schema.ts uses DOM_INDENT_WIDTH from _variables.scss.
+const PARAGRAPH_INDENT: f32 = 30.0;
 const NUMBERING_CHECKPOINT_STRIDE: usize = 64;
 /// Find highlighting needs byte-to-y localization, but only while a query
 /// has matches. Keep a tiny sparse index with the retained shaped block
@@ -201,6 +203,7 @@ fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
     let left = list_depth(&block.kind)
         .map(|depth| depth as f32 * LIST_DEPTH_INDENT)
         .unwrap_or(0.0)
+        + block.indent as f32 * PARAGRAPH_INDENT
         + if is_quote_block(block) {
             QUOTE_INSET
         } else {
@@ -217,8 +220,20 @@ fn block_bounds(width: f32, block: &super::model::Block) -> Bounds<Pixels> {
         BlockContent::Table(table) => (available_width, table_height(table, available_width)),
         _ => (available_width, DEFAULT_TEXT_HEIGHT),
     };
+    // Evernote imageAlignment is an image-node property. Move the same box
+    // used by painting, hit testing and caret reveal; never pad neighbour text.
+    let image_offset = if matches!(block.content, BlockContent::Image { .. }) {
+        let slack = (available_width - block_width).max(0.0);
+        match block.alignment {
+            TextAlignment::Left => 0.0,
+            TextAlignment::Center => slack / 2.0,
+            TextAlignment::Right => slack,
+        }
+    } else {
+        0.0
+    };
     Bounds::new(
-        point(px(left), px(0.0)),
+        point(px(left + image_offset), px(0.0)),
         size(px(block_width), px(block_height)),
     )
 }
@@ -316,8 +331,11 @@ fn styled_text_runs(
             color,
             background_color: marks
                 .iter()
-                .any(|mark| matches!(mark, Mark::Highlight))
-                .then(|| Hsla::from(rgba(0xffd84d66))),
+                .find_map(|mark| match mark {
+                    Mark::HighlightColor(color) => Some(text_color(*color)),
+                    _ => None,
+                })
+                .or_else(|| marks.contains(&Mark::Highlight).then(|| Hsla::from(rgba(0xffd84d66)))),
             underline: underline.then_some(UnderlineStyle {
                 color: Some(color),
                 thickness: underline_thickness,
@@ -1517,6 +1535,55 @@ impl LayoutRegistry {
         None
     }
 
+    /// Where a find match is drawn: its text range in a text block, or its
+    /// glyphs in a measured table cell (scrolled with the table). A table
+    /// not yet measured has no exact target.
+    pub(crate) fn find_match_bounds(
+        &self,
+        found: &super::find::FindMatch,
+    ) -> Option<Bounds<Pixels>> {
+        let Some(cell) = found.cell else {
+            return self.range_bounds(found.node_id, found.utf8_range.clone());
+        };
+        let layout = self.table_layouts.get(&found.node_id)?;
+        let origin = self.cache.get(&found.node_id)?.layout.bounds.origin;
+        let scroll = self.table_scroll_offset(found.node_id);
+        layout
+            .find_range_bounds(cell.row, cell.column, found.utf8_range.clone())
+            .into_iter()
+            .map(|mut rect| {
+                rect.origin.x += origin.x - px(scroll);
+                rect.origin.y += origin.y;
+                rect
+            })
+            .reduce(union_bounds)
+    }
+
+    /// Bring a table column into its horizontal view (view-only, like
+    /// [`Self::scroll_table_at`]).
+    pub(crate) fn reveal_table_column(&mut self, node_id: NodeId, column: usize) {
+        let Some(layout) = self.table_layouts.get(&node_id) else {
+            return;
+        };
+        let width = layout.column_width * layout.cells.first().map_or(0, Vec::len) as f32;
+        let max = (width - layout.key.width).max(0.0);
+        if max <= 0.0 {
+            return;
+        }
+        let left = layout.column_width * column as f32;
+        let right = left + layout.column_width;
+        let offset = self.table_scroll_offset(node_id);
+        let next = if left < offset {
+            left
+        } else if right > offset + layout.key.width {
+            right - layout.key.width
+        } else {
+            offset
+        };
+        self.table_scroll_offsets
+            .insert(node_id, next.clamp(0.0, max));
+    }
+
     /// View-only horizontal motion; the document and undo history stay unchanged.
     pub(crate) fn scroll_table_at(&mut self, position: Point<Pixels>, delta: f32) -> bool {
         let Some(node_id) = self.atomic_block_at(position) else { return false; };
@@ -2407,7 +2474,9 @@ impl LayoutRegistry {
         let update = |block: &super::model::Block, this: &mut Self| {
             this.layout_scan_count = this.layout_scan_count.saturating_add(1);
             let height = match &block.content {
-                BlockContent::Text { text, .. } => estimate_text_height(text, width, &block.kind),
+                BlockContent::Text { text, .. } => estimate_text_height(
+                    text, (width - block.indent as f32 * PARAGRAPH_INDENT).max(1.0), &block.kind,
+                ),
                 BlockContent::Image {
                     natural_size,
                     display_width,
@@ -3665,6 +3734,22 @@ mod tests {
     use super::*;
     use crate::native_editor::model::{Affinity, DocPoint, Document, Selection, TextAlignment};
     use crate::native_editor::transaction::Transaction;
+
+    #[test]
+    fn six_highlight_colors_reach_distinct_paragraph_text_runs() {
+        for hex in ["#fdf3d0", "#ffe2d5", "#ddf8e1", "#e0f7fd", "#edf0ff", "#feead4"] {
+            let color = app_lite_core::TextColor::parse(hex).unwrap();
+            let text: SharedString = "中😀".into();
+            let source = app_lite_core::CanonicalDocument::parse_pasted_html(&format!(
+                "<p><span style=\"background-color:{hex}\">{text}</span></p>",
+            )).unwrap().document;
+            let document = crate::native_editor::codec::import_canonical(&source).unwrap();
+            let block = document.block(document.first_node_id().unwrap()).unwrap();
+            let runs = styled_text_runs(block, &text, &gpui::font("Helvetica"));
+            assert_eq!(runs[0].background_color, Some(text_color(color)));
+            assert_eq!(runs[0].len, text.len());
+        }
+    }
 
     #[test]
     fn long_document_layout_is_bounded() {

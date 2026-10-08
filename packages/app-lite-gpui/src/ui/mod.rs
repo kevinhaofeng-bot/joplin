@@ -1,13 +1,18 @@
 mod card_thumbnail;
 mod clipboard;
+mod derived_resource_status;
 mod library_backup;
 mod library_import;
 #[cfg(test)]
 mod library_import_tests;
 pub mod note_card;
 pub mod note_list;
+mod pane_motion;
 mod pasted_image_fetches;
 mod readable_export;
+mod recent_search;
+mod recent_notes;
+mod shortcuts;
 pub mod sidebar;
 mod sync;
 mod sync_events;
@@ -25,7 +30,7 @@ use crate::app::save_coordinator::{FlushReason, SaveState, SystemSaveClock};
 use crate::app::{
     AppAction, AppModel, AppStatus, CancelLibraryImport, CopyNote, CreateNote, CycleListViewMode,
     CycleSort, ExportCurrentNote, ListViewMode, NoteSort, OpenImportedLibrary, SyncCurrent,
-    ToggleNoteList, ToggleSidebar, TrashSelected,
+    ToggleNoteList, ToggleSidebar, TrashSelected, NavigateLibraryBack, NavigateLibraryForward,
 };
 use crate::components::Paste;
 use crate::native_editor::chrome::{EVERNOTE_GREEN, TitleInput};
@@ -52,17 +57,18 @@ use crate::native_editor::toolbar::{
 use app_lite_core::CanonicalDocument;
 use app_lite_core::{
     LibraryEvent, LibraryRepository, LibraryRoute, Note, NoteId, NoteProjection, NotebookId,
-    ResourceId, SearchHit, SearchQuery, StackId, TagId,
+    RecentSearch, ResourceId, SearchHit, SearchQuery, StackId, TagId,
 };
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent,
     ElementInputHandler, Entity, ExternalPaths, FocusHandle, FontWeight, InteractiveElement,
     IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle, ScrollStrategy,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TextRun,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage, StyledText, ObjectFit, Subscription, Task, TextRun,
     UniformListDecoration, UniformListScrollHandle, Window, WindowBounds, WindowHandle,
-    WindowOptions, canvas, div, point, px, rgba, size, uniform_list,
+    WindowOptions, canvas, div, img, point, px, rgba, size, uniform_list,
 };
+use gpui::prelude::FluentBuilder;
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -322,6 +328,15 @@ struct QueuedResourceInsert {
     window: WindowHandle<LibraryShell>,
 }
 
+/// Only a card selection may resume after its save fence. Keep one stable
+/// target, not a row index or another document/session allocation.
+struct PendingCardSelection {
+    target: NoteId,
+    source_session: gpui::EntityId,
+    route: LibraryRoute,
+    window: WindowHandle<LibraryShell>,
+}
+
 const MAX_QUEUED_RESOURCE_INSERTS: usize = 1;
 
 /// Evernote's exported `--color-background-fill-primary` and
@@ -487,6 +502,10 @@ impl UniformListDecoration for CardThumbnailViewportDecoration {
                     shell.rendered_note_range = Some(visible_range_for_test);
                 }
                 shell.reconcile_card_thumbnail_residency(resource_ids, window, shell_cx);
+                // Items were built before this prepaint decoration adopted the
+                // visible set. Notify after drawing so cold proxies get a real
+                // img next frame, without waiting for an unrelated input event.
+                shell_cx.defer_in(window, |_, _, cx| cx.notify());
             });
         }
         div().size_full().into_any_element()
@@ -505,6 +524,7 @@ impl ShellSaveError {
 /// which is also the only place that mutates the model from UI callbacks.
 pub struct LibraryShell {
     model: Entity<AppModel>,
+    pane_motion: pane_motion::PaneMotion,
     note_session: Option<Entity<NoteSession>>,
     pasted_image_fetches: Vec<pasted_image_fetches::PastedImageFetch>,
     next_pasted_image_fetch: u64,
@@ -537,6 +557,10 @@ pub struct LibraryShell {
     /// residency: scrolling the list must not evict or hydrate document
     /// images, and opening a document must not populate card textures.
     card_thumbnail_cache: Entity<BudgetedImageCache>,
+    /// Decode completion notifies a non-view cache entity. Forward it to the
+    /// retained view that paints the Cards list, otherwise its cached frame
+    /// can keep showing an empty tile until the next user input.
+    _card_thumbnail_cache_observation: Subscription,
     /// The exact card proxy sources last installed in `card_thumbnail_cache`.
     /// UniformList measures and paints a stable viewport more than once per
     /// frame; updating the cache for an unchanged source set would notify the
@@ -544,6 +568,11 @@ pub struct LibraryShell {
     card_thumbnail_cache_resources: HashSet<gpui::Resource>,
     card_thumbnails: CardThumbnailManager,
     card_thumbnail_viewport_state: Rc<RefCell<CardThumbnailViewportState>>,
+    // Both presentations share the existing bounded proxy/cache worker. Their
+    // independently painted viewport identities are combined, not all hits.
+    list_card_thumbnail_ids: HashSet<ResourceId>,
+    search_card_thumbnail_ids: HashSet<ResourceId>,
+    search_thumbnail_viewport_state: Rc<RefCell<CardThumbnailViewportState>>,
     _card_thumbnail_task: Option<Task<()>>,
     surface_note_id: Option<NoteId>,
     /// Organization commands may commit a new revision for the *same* NoteId
@@ -601,11 +630,19 @@ pub struct LibraryShell {
     /// successful boundary, whereas this transient blocker clears on the
     /// completion-confirmed Clean transition.
     save_pending: bool,
+    pending_card_selection: Option<PendingCardSelection>,
+    card_selection_completion_scheduled: bool,
+    pending_shortcut_action: Option<shortcuts::PendingShortcutAction>,
+    shortcut_action_completion_scheduled: bool,
     pending_readable_export: Option<PendingReadableExport>,
     next_readable_export_token: u64,
     readable_export_notice: Option<ExportNotice>,
     pending_library_import: Option<PendingLibraryImport>,
     focus_title_after_mount: bool,
+    // A closed cell editor took its keyboard focus with it: the body takes
+    // it back so the next shortcut (Cmd-Z after a structure change) has an
+    // owner. Holds the closed cell's own focus handle.
+    focus_body_after_cell_close: Option<FocusHandle>,
     next_library_import_token: u64,
     library_import_notice: Option<ExportNotice>,
     imported_library_ready: Option<PathBuf>,
@@ -627,6 +664,11 @@ pub struct LibraryShell {
     find_error: Option<String>,
     search_palette_open: bool,
     search_palette_results: Vec<SearchHit>,
+    recent_searches: Vec<RecentSearch>,
+    recent_notes: Vec<NoteProjection>,
+    recent_note_error: Option<String>,
+    recent_searches_expanded: bool,
+    recent_search_error: Option<String>,
     search_palette_status: SearchPaletteStatus,
     search_palette_generation: Option<u64>,
     search_palette_selected: usize,
@@ -638,6 +680,10 @@ pub struct LibraryShell {
     search_palette_return_organization_panel_open: bool,
     _search_task: Option<Task<()>>,
     _history_search_task: Option<Task<()>>,
+    /// Only an explicit history action may hand input to its resulting note.
+    /// Background refreshes do not steal focus; the exact target fences this
+    /// one-shot effect through an asynchronous search and its retries.
+    pending_history_focus: Option<(WindowHandle<LibraryShell>, crate::app::NavigationSnapshot)>,
     _search_route_refresh_task: Option<Task<()>>,
     #[cfg(test)]
     search_completion_gate: Option<SearchCompletionGate>,
@@ -663,6 +709,7 @@ pub struct LibraryShell {
     /// the restart-safe authority.
     _indexing_task: Task<()>,
     _derived_text_task: Task<()>,
+    derived_resource_status: Entity<derived_resource_status::DerivedResourceStatus>,
     indexing_status: IndexingStatus,
     #[cfg(test)]
     indexing_task_cancellation_receiver: Option<Receiver<()>>,
@@ -700,6 +747,28 @@ enum SearchPaletteStatus {
     Empty,
     Error(String),
     Ready,
+}
+
+// The test wrapper records the very same StyledText's post-paint layout;
+// it does not replace shaping or impose a separate test-only line budget.
+fn search_result_text(part: &'static str, index: usize, text: String) -> gpui::AnyElement {
+    // Search previews are inline summaries, not paragraph layouts. GPUI's
+    // line clamp bounds soft wrapping but still shapes every hard newline.
+    // Collapse display whitespace before shaping so a multiline note cannot
+    // push its title outside the fixed result row. The stored projection and
+    // the separately extracted attachment provenance remain untouched.
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    #[cfg(test)]
+    {
+        return note_card::observed_text_for_test(
+            format!("library-search-result-{part}-{index}"), text,
+        );
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (part, index);
+        StyledText::new(text).into_any_element()
+    }
 }
 
 #[cfg(test)]
@@ -881,6 +950,8 @@ fn bind_library_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-alt-o", CycleSort, Some("LibraryShell")),
         KeyBinding::new("cmd-s", SyncCurrent, Some("LibraryShell")),
         KeyBinding::new("cmd-k", ToggleSearchPalette, Some("LibraryShell")),
+        KeyBinding::new("cmd-[", NavigateLibraryBack, Some("LibraryShell")),
+        KeyBinding::new("cmd-]", NavigateLibraryForward, Some("LibraryShell")),
         KeyBinding::new("cmd-f", ToggleFindInNote, Some("LibraryShell")),
         KeyBinding::new("cmd-f", ToggleFindInNote, Some("LibrarySearchInput")),
         // Find remains mounted while Cmd-K's backdrop is on top. Its context
@@ -1011,11 +1082,14 @@ impl LibraryShell {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         let organization_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
-        let search_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
+        let restored_search_query = model.read(cx).navigation().search_query().unwrap_or_default().to_owned();
+        let search_input = cx.new(move |input_cx| TitleInput::new(restored_search_query, input_cx));
         let find_input = cx.new(|input_cx| TitleInput::new(String::new(), input_cx));
         let image_cache = BudgetedImageCache::new_entity_in_context(cx, DECODED_IMAGE_CACHE_BUDGET);
         let card_thumbnail_cache =
             BudgetedImageCache::new_entity_in_context(cx, CARD_THUMBNAIL_CACHE_BUDGET);
+        let card_thumbnail_cache_observation =
+            cx.observe(&card_thumbnail_cache, |_shell, _, cx| cx.notify());
         let card_thumbnails = CardThumbnailManager::new(model.read(cx).repository());
         let observation = cx.observe(&model, |shell, _, cx| {
             // A model transition can replace the current route, selection, or
@@ -1081,11 +1155,19 @@ impl LibraryShell {
             indexing_cancelled,
             cx,
         );
+        let derived_retry_requested = Arc::new(AtomicBool::new(false));
+        let derived_status_repository = model.read(cx).repository();
+        let derived_resource_status = cx.new(|_| {
+            derived_resource_status::DerivedResourceStatus::new(
+                derived_status_repository, Arc::clone(&derived_retry_requested),
+            )
+        });
         let derived_text_task = Self::spawn_derived_text_scheduler(
             model.read(cx).repository(),
             derived_text_receiver,
             derived_text_task_lifetime,
             derived_text_cancelled,
+            derived_retry_requested,
             cx,
         );
         let search_input_observation = cx.observe(&search_input, |shell, _, cx| {
@@ -1098,8 +1180,10 @@ impl LibraryShell {
                 shell.refresh_find_in_note(cx);
             }
         });
+        let pane_motion = pane_motion::PaneMotion::new(model.read(cx).panes());
         let mut shell = Self {
             model,
+            pane_motion,
             note_session: None,
             _note_session_observation: None,
             pasted_image_fetches: Vec::new(),
@@ -1116,9 +1200,15 @@ impl LibraryShell {
             _editor_surface_event_subscription: None,
             image_cache,
             card_thumbnail_cache,
+            _card_thumbnail_cache_observation: card_thumbnail_cache_observation,
             card_thumbnail_cache_resources: HashSet::new(),
             card_thumbnails,
             card_thumbnail_viewport_state: Rc::new(RefCell::new(
+                CardThumbnailViewportState::default(),
+            )),
+            list_card_thumbnail_ids: HashSet::new(),
+            search_card_thumbnail_ids: HashSet::new(),
+            search_thumbnail_viewport_state: Rc::new(RefCell::new(
                 CardThumbnailViewportState::default(),
             )),
             _card_thumbnail_task: None,
@@ -1149,11 +1239,16 @@ impl LibraryShell {
             unsupported_document: None,
             save_error: None,
             save_pending: false,
+            pending_card_selection: None,
+            card_selection_completion_scheduled: false,
+            pending_shortcut_action: None,
+            shortcut_action_completion_scheduled: false,
             pending_readable_export: None,
             next_readable_export_token: 0,
             readable_export_notice: None,
             pending_library_import: None,
             focus_title_after_mount: false,
+            focus_body_after_cell_close: None,
             next_library_import_token: 0,
             library_import_notice: None,
             imported_library_ready: None,
@@ -1171,6 +1266,11 @@ impl LibraryShell {
             find_error: None,
             search_palette_open: false,
             search_palette_results: Vec::new(),
+            recent_searches: Vec::new(),
+            recent_notes: Vec::new(),
+            recent_note_error: None,
+            recent_searches_expanded: false,
+            recent_search_error: None,
             search_palette_status: SearchPaletteStatus::Idle,
             search_palette_generation: None,
             search_palette_selected: 0,
@@ -1179,6 +1279,7 @@ impl LibraryShell {
             search_palette_return_organization_panel_open: false,
             _search_task: None,
             _history_search_task: None,
+            pending_history_focus: None,
             _search_route_refresh_task: None,
             #[cfg(test)]
             search_completion_gate: None,
@@ -1194,6 +1295,7 @@ impl LibraryShell {
             _event_task: event_task,
             _indexing_task: indexing_task,
             _derived_text_task: derived_text_task,
+            derived_resource_status,
             indexing_status: IndexingStatus::Pending,
             #[cfg(test)]
             indexing_task_cancellation_receiver: Some(indexing_task_cancellation_receiver),
@@ -1217,6 +1319,7 @@ impl LibraryShell {
             rendered_empty_state_for_test: None,
         };
         shell.sync_editor_surface(cx);
+        shell.schedule_active_search_refresh(cx);
         // Web images pasted before the last quit and not fetched yet.
         shell.resume_pasted_image_jobs(None, cx);
         shell.start_auto_sync(cx);
@@ -1436,6 +1539,7 @@ impl LibraryShell {
         receiver: Receiver<app_lite_core::LibraryEvent>,
         derived_text_task_lifetime: EventTaskLifetime,
         derived_text_cancelled: Arc<AtomicBool>,
+        derived_retry_requested: Arc<AtomicBool>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         // Resolved here, on the mounting thread, so a test's scheduler keeps
@@ -1447,6 +1551,11 @@ impl LibraryShell {
             let mut image_not_before = Instant::now() + DERIVED_IMAGE_STARTUP_DELAY;
             let mut deferred_image = false;
             loop {
+                if derived_retry_requested.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    scheduled = true;
+                    // An explicit user retry need not wait for startup pacing.
+                    image_not_before = Instant::now();
+                }
                 if scheduled {
                     scheduled = false;
                     deferred_image = false;
@@ -1494,10 +1603,16 @@ impl LibraryShell {
                                     )
                                     | None
                             );
-                            // Nothing on screen reflects a single job. With a
-                            // redraw per job, a 417-image backlog measured
-                            // 512MiB more graphics footprint until it drained.
-                            if this.update(cx, |_, _| {}).is_err() {
+                            // Update only the current-note diagnostics child.
+                            // Root redraws per job previously added 512MiB of
+                            // graphics footprint for a 417-image backlog.
+                            if this.update(cx, |shell, cx| {
+                                if let Some(crate::extractor::DerivedTextCoordinatorOutcome::Indexed(id)
+                                    | crate::extractor::DerivedTextCoordinatorOutcome::Failed(id, _)
+                                    | crate::extractor::DerivedTextCoordinatorOutcome::Stale(id)) = &outcome {
+                                    shell.derived_resource_status.update(cx, |view, cx| view.completed(id, cx));
+                                }
+                            }).is_err() {
                                 break;
                             }
                         }
@@ -1950,9 +2065,14 @@ impl LibraryShell {
     fn apply_action_with_result(
         &mut self,
         action: AppAction,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A newer explicit action supersedes the earlier card intent. A
+        // deferred card takes its intent before entering this same reducer.
+        self.pending_card_selection = None;
+        self.pending_shortcut_action = None;
+        self.pending_history_focus = None;
         // A committed repository mutation is waiting for one coherent
         // candidate. Do not let a same-card click, a second destructive menu
         // action, or a shortcut mutate the stale retained revision and clear
@@ -1965,6 +2085,25 @@ impl LibraryShell {
             cx.notify();
             return false;
         }
+        // Soft-deleting the focused note removes its input entity on the
+        // model observer's next turn. The old handle then has no LibraryShell
+        // dispatch path, so even Cmd-K/Cmd-N stop working until a pointer
+        // rescues focus. Retain only this actual input owner, not an unrelated
+        // search/organization field. The surviving shell owns shortcuts, not
+        // an automatic text insertion into the next note.
+        let deleting_active_note = match &action {
+            AppAction::TrashSelected => self.surface_note_id.is_some(),
+            AppAction::TrashNote(id) => self.surface_note_id.as_ref() == Some(id),
+            _ => false,
+        };
+        let focus_before_delete = deleting_active_note.then(|| window.focused(cx)).flatten();
+        let deleting_focused_input = deleting_active_note && self.note_session.as_ref()
+            .is_some_and(|session| {
+                let session = session.read(cx);
+                session.title().read(cx).focus_handle().is_focused(window)
+                    || session.editor().read(cx).focus_handle().is_focused(window)
+                    || self.table_cell_has_focus(window, cx)
+            });
         if let AppAction::NavigateBack | AppAction::NavigateForward = action {
             let forward = matches!(action, AppAction::NavigateForward);
             if self.model.read_with(cx, |model, _| {
@@ -2029,6 +2168,11 @@ impl LibraryShell {
             self.focus_title_after_mount = true;
             cx.notify();
         }
+        if result.is_ok() && deleting_focused_input
+            && window.focused(cx).is_none_or(|focus| Some(focus) == focus_before_delete)
+        {
+            self.focus_handle.focus(window);
+        }
         // The retained model observer owns surface synchronization, deferred
         // scrolling, and shell invalidation. Keeping this reducer to model
         // mutation plus notification makes every user and event route share
@@ -2051,6 +2195,7 @@ impl LibraryShell {
             AppAction::CreateNotebook { .. }
                 | AppAction::CreateStack { .. }
                 | AppAction::CreateTag { .. }
+                | AppAction::CreateStackForNotebook { .. }
         ));
         if self.apply_action_with_result(action, window, cx) {
             self.organization_input.update(cx, |input, input_cx| {
@@ -2167,6 +2312,10 @@ impl LibraryShell {
             AppAction::NavigateBack | AppAction::NavigateForward => {
                 active_id.map(|_| FlushReason::NoteSwitch)
             }
+            AppAction::OpenShortcut(_) | AppAction::OpenRecentNote(_) => active_id.map(|_| FlushReason::NoteSwitch),
+            AppAction::AddShortcuts(_) | AppAction::RemoveShortcuts(_) => {
+                active_id.map(|_| FlushReason::ManualSync)
+            }
             AppAction::TrashSelected => active_id.map(|_| FlushReason::Delete),
             AppAction::TrashNote(id) if active_id.as_ref() == Some(id) => Some(FlushReason::Delete),
             // The copy must contain the latest typed text.
@@ -2175,6 +2324,8 @@ impl LibraryShell {
             | AppAction::SetSelectedNoteTags(_)
             | AppAction::AddTagToSelectedNote(_)
             | AppAction::RemoveTagFromSelectedNote(_)
+            | AppAction::SetNotebookStack { .. }
+            | AppAction::CreateStackForNotebook { .. }
             | AppAction::DeleteStack(_)
             | AppAction::DeleteNotebook(_)
             | AppAction::DeleteTag(_) => active_id.map(|_| FlushReason::ManualSync),
@@ -2251,9 +2402,11 @@ impl LibraryShell {
     }
 
     fn active_session_has_unsaved_changes(&self, cx: &App) -> bool {
-        self.table_cell_has_pending_input(cx) || self.note_session
-            .as_ref()
-            .is_some_and(|session| !matches!(session.read(cx).save_state(), SaveState::Clean))
+        self.table_cell_has_pending_input(cx)
+            || self
+                .note_session
+                .as_ref()
+                .is_some_and(|session| !matches!(session.read(cx).save_state(), SaveState::Clean))
     }
 
     fn active_session_save_fence(&self, cx: &App) -> Option<(NoteId, i64, i64)> {
@@ -2295,12 +2448,24 @@ impl LibraryShell {
         self.apply_action(AppAction::CreateNote, window, cx);
     }
 
-    /// Names how many notes Restore acts on, since it restores them all.
+    /// Names the selection, and explains the fallback when its notebook is gone.
     fn restore_selected_label(&self, cx: &App) -> String {
-        match self.model.read(cx).selected_note_ids().len() {
-            count if count > 1 => format!("恢复 {count} 篇笔记"),
-            _ => "恢复当前笔记".to_owned(),
+        let model = self.model.read(cx);
+        let selected = model.selected_note_ids();
+        if selected.len() > 1 {
+            return format!("恢复 {} 篇笔记", selected.len());
         }
+        if let Some(note) = model.active_note().filter(|note| {
+            selected.first() == Some(&note.id) && note.deleted_time.is_some()
+        }) {
+            let notebooks = &model.navigation_index().notebooks;
+            if !notebooks.iter().any(|book| book.id == note.notebook_id) {
+                if let Some(default) = notebooks.iter().find(|book| book.is_default) {
+                    return format!("恢复到「{}」", default.title);
+                }
+            }
+        }
+        "恢复当前笔记".to_owned()
     }
 
     #[cfg(test)]
@@ -2427,6 +2592,7 @@ impl LibraryShell {
         let note = self
             .model
             .read_with(cx, |model, _| model.active_note().cloned());
+        self.derived_resource_status.update(cx, |view, cx| view.configure(note.as_ref(), cx));
         let reconciliation_pending = self
             .model
             .read_with(cx, |model, _| model.reconciliation_pending());
@@ -2595,6 +2761,8 @@ impl LibraryShell {
                         }
                         match session.read(cx).save_state() {
                             SaveState::Failed(error) => {
+                                shell.pending_card_selection = None;
+                                shell.pending_shortcut_action = None;
                                 let message = format!("自动保存失败：{error}");
                                 if shell.save_pending {
                                     shell.save_pending = false;
@@ -2628,6 +2796,8 @@ impl LibraryShell {
                         // retained-session notification. The queued intent is
                         // the original saved DocPoint, never the live caret.
                         shell.schedule_queued_resource_completion(cx);
+                        shell.schedule_pending_card_selection(cx);
+                        shell.schedule_pending_shortcut_action(cx);
                         shell.advance_readable_export_after_session_notification(cx);
                         // A native menu/Cmd-Q request may have started this
                         // session's exact background snapshot. Defer the
@@ -2970,7 +3140,7 @@ impl LibraryShell {
         match outcome {
             Ok(opened) => {
                 self.resource_notice = Some(format!(
-                    "已交给系统默认应用打开附件 {}",
+                    "已交给系统应用预览或打开附件 {}",
                     opened.resource_id.as_str()
                 ));
             }
@@ -3073,6 +3243,112 @@ impl LibraryShell {
         self.resource_notice = Some("正在保存刚才的编辑；资源会插入到原来的位置".to_owned());
         cx.notify();
         Ok(())
+    }
+
+    fn select_card(
+        &mut self,
+        target: NoteId,
+        multiselect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let action = if multiselect {
+            AppAction::ToggleNoteInSelection(target.clone())
+        } else {
+            AppAction::SelectNote(target.clone())
+        };
+        if self.apply_action_with_result(action, window, cx) {
+            if !multiselect {
+                self.sync_editor_surface(cx);
+                self.focus_active_editor_or_shell(window, cx);
+            }
+            return;
+        }
+        if multiselect || !self.save_pending || self.surface_note_id.as_ref() == Some(&target) {
+            return;
+        }
+        let Some(session) = self.note_session.as_ref() else {
+            return;
+        };
+        // A marked candidate is not a confirmed edit. Even if an earlier
+        // snapshot still owns a fence, it must not turn IME rejection into
+        // an automatic navigation after the candidate is committed later.
+        let source = session.read(cx);
+        if source.title().read(cx).marked_range().is_some()
+            || source.editor().read(cx).marked_text().is_some()
+            || matches!(source.save_state(), SaveState::Failed(_))
+            || self.model.read(cx).reconciliation_pending()
+        {
+            return;
+        }
+        let Some(window) = window.window_handle().downcast::<LibraryShell>() else {
+            return;
+        };
+        self.pending_card_selection = Some(PendingCardSelection {
+            target,
+            source_session: session.entity_id(),
+            route: self.model.read(cx).navigation().route().clone(),
+            window,
+        });
+    }
+
+    fn schedule_pending_card_selection(&mut self, cx: &mut Context<Self>) {
+        if self.card_selection_completion_scheduled {
+            return;
+        }
+        let Some(pending) = self.pending_card_selection.as_ref() else {
+            return;
+        };
+        let Some(session) = self.note_session.as_ref() else {
+            self.pending_card_selection = None;
+            return;
+        };
+        let model = self.model.read(cx);
+        if session.entity_id() != pending.source_session
+            || model.navigation().route() != &pending.route
+            || model.reconciliation_pending()
+            || !model
+                .projections()
+                .iter()
+                .any(|note| note.id == pending.target)
+            || matches!(session.read(cx).save_state(), SaveState::Failed(_))
+        {
+            self.pending_card_selection = None;
+            return;
+        }
+        if self.save_pending
+            || session.read(cx).flush_confirmation_pending()
+            || !matches!(session.read(cx).save_state(), SaveState::Clean)
+        {
+            return;
+        }
+        let window = pending.window.clone();
+        self.card_selection_completion_scheduled = true;
+        cx.defer(move |app| {
+            let _ = window.update(app, |shell, window, shell_cx| {
+                shell.card_selection_completion_scheduled = false;
+                let Some(pending) = shell.pending_card_selection.take() else {
+                    return;
+                };
+                // Recheck identity/route after the defer: another action or
+                // repository event may have replaced the mounted session.
+                if !shell
+                    .note_session
+                    .as_ref()
+                    .is_some_and(|session| session.entity_id() == pending.source_session)
+                    || shell.model.read(shell_cx).navigation().route() != &pending.route
+                    || !shell
+                        .model
+                        .read(shell_cx)
+                        .projections()
+                        .iter()
+                        .any(|note| note.id == pending.target)
+                {
+                    return;
+                }
+                shell.select_card(pending.target, false, window, shell_cx);
+            });
+        });
     }
 
     fn schedule_queued_resource_completion(&mut self, cx: &mut Context<Self>) {
@@ -3576,7 +3852,28 @@ impl LibraryShell {
                 .card_thumbnail_viewport_reconciliations
                 .saturating_add(1);
         }
-        self.card_thumbnails.reconcile_desired(resource_ids);
+        self.list_card_thumbnail_ids = resource_ids.into_iter().collect();
+        self.reconcile_shared_card_thumbnail_residency(window, cx);
+    }
+
+    fn reconcile_search_thumbnail_residency(
+        &mut self,
+        resource_ids: HashSet<ResourceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_card_thumbnail_ids = resource_ids;
+        self.reconcile_shared_card_thumbnail_residency(window, cx);
+    }
+
+    fn reconcile_shared_card_thumbnail_residency(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.card_thumbnails.reconcile_desired(
+            self.list_card_thumbnail_ids.union(&self.search_card_thumbnail_ids).cloned(),
+        );
         self.sync_card_thumbnail_cache_residency(window, cx);
         self.start_next_card_thumbnail_materialization(cx);
     }
@@ -3588,7 +3885,12 @@ impl LibraryShell {
     /// bounded source LRU for a nearby image card.
     fn leave_card_thumbnail_residency(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.card_thumbnail_viewport_state.borrow_mut().invalidate();
-        self.card_thumbnails.leave_cards();
+        self.list_card_thumbnail_ids.clear();
+        if self.search_card_thumbnail_ids.is_empty() {
+            self.card_thumbnails.leave_cards();
+        } else {
+            self.card_thumbnails.reconcile_desired(self.search_card_thumbnail_ids.iter().cloned());
+        }
         self.sync_card_thumbnail_cache_residency(window, cx);
     }
 
@@ -3647,6 +3949,7 @@ impl LibraryShell {
                     .card_thumbnail_viewport_state
                     .borrow_mut()
                     .invalidate();
+                shell.search_thumbnail_viewport_state.borrow_mut().invalidate();
                 shell.start_next_card_thumbnail_materialization(shell_cx);
                 // A successful source is adopted only in this live-shell
                 // callback. The next frame registers it with the card cache;
@@ -3744,14 +4047,20 @@ impl LibraryShell {
                                 .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                                     // Cmd-click extends the multi-selection
                                     // used by batch move/tag.
-                                    let action = if event.modifiers.platform {
-                                        AppAction::ToggleNoteInSelection(id.clone())
-                                    } else {
-                                        AppAction::SelectNote(id.clone())
-                                    };
                                     let _ = click_shell.update(cx, |shell, cx| {
-                                        shell.apply_action(action, window, cx);
+                                        shell.select_card(
+                                            id.clone(),
+                                            event.modifiers.platform,
+                                            window,
+                                            cx,
+                                        );
                                     });
+                                    // track_focus on the parent shell otherwise
+                                    // overwrites the new editor (or the retained
+                                    // owner on Cmd-click) later in this bubble.
+                                    // Failed/save-held selection also keeps its
+                                    // current input owner instead of losing it.
+                                    window.prevent_default();
                                 })
                                 .child(note_card::render(
                                     &projection,
@@ -3965,6 +4274,26 @@ impl LibraryShell {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let secondary = modifiers.secondary();
+        if key == "tab" {
+            // Evernote's title handler sends forward Tab to the body start,
+            // not to its previously retained caret. Shift-Tab must neither
+            // take the body focus nor fall through as a literal title tab.
+            if !modifiers.shift {
+                if let Some(surface) = self.editor_surface.as_ref() {
+                    surface.update(cx, |surface, surface_cx| {
+                        surface.focus_document_start(window, surface_cx);
+                    });
+                } else {
+                    editor.update(cx, |editor, editor_cx| {
+                        editor.select_document_range(0, 0);
+                        editor_cx.notify();
+                    });
+                    focus_editor(&editor, window, cx);
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
         if TitleInput::moves_focus_to_body_for(key) {
             focus_editor(&editor, window, cx);
             cx.stop_propagation();
@@ -3996,14 +4325,25 @@ impl LibraryShell {
             }
             "left" => {
                 title.update(cx, |title, title_cx| {
-                    title.move_horizontal(false, modifiers.shift);
+                    // The prototype uses a native textarea for its title.
+                    // On macOS Command-arrows retain its line-edge behavior;
+                    // plain arrows still move across complete graphemes.
+                    if cfg!(target_os = "macos") && modifiers.platform {
+                        title.move_to_edge(false, modifiers.shift);
+                    } else {
+                        title.move_horizontal(false, modifiers.shift);
+                    }
                     title_cx.notify();
                 });
                 true
             }
             "right" => {
                 title.update(cx, |title, title_cx| {
-                    title.move_horizontal(true, modifiers.shift);
+                    if cfg!(target_os = "macos") && modifiers.platform {
+                        title.move_to_edge(true, modifiers.shift);
+                    } else {
+                        title.move_horizontal(true, modifiers.shift);
+                    }
                     title_cx.notify();
                 });
                 true
@@ -4107,6 +4447,20 @@ impl LibraryShell {
         self.focus_handle.clone()
     }
 
+    fn trace_search_visibility(&self, reason: &str, window: &Window, cx: &Context<Self>) {
+        crate::native_editor::input_trace::record("search", "visibility_changed", || {
+            let input = self.search_input.read(cx);
+            serde_json::json!({
+                "reason": reason,
+                "open": self.search_palette_open,
+                "input_focused": input.focus_handle().is_focused(window),
+                "query_bytes": input.text().len(),
+                "has_return_focus": self.search_palette_return_focus.is_some(),
+                "focused": format!("{:?}", window.focused(cx)),
+            })
+        });
+    }
+
     fn toggle_search_palette_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_palette_open = !self.search_palette_open;
         if self.search_palette_open {
@@ -4135,6 +4489,11 @@ impl LibraryShell {
             self._search_task = None;
             self.search_palette_status = SearchPaletteStatus::Idle;
             self.search_palette_results.clear();
+            self.recent_searches.clear();
+            self.recent_notes.clear();
+            self.recent_note_error = None;
+            self.recent_searches_expanded = false;
+            self.recent_search_error = None;
             self.search_palette_selected = 0;
             self.organization_panel_open = self.search_palette_return_organization_panel_open;
             self.search_palette_return_organization_panel_open = false;
@@ -4149,6 +4508,7 @@ impl LibraryShell {
                 self.focus_active_editor_or_shell(window, cx);
             }
         }
+        self.trace_search_visibility("toggle", window, cx);
         cx.notify();
     }
 
@@ -4156,6 +4516,7 @@ impl LibraryShell {
         if self.note_session.is_none() || self.editor_surface.is_none() {
             return;
         }
+        let search_was_open = self.search_palette_open;
         if self.find_panel_open {
             if self.find_input.read(cx).marked_range().is_some() {
                 return;
@@ -4202,6 +4563,9 @@ impl LibraryShell {
                 });
             }
             self.find_input.read(cx).focus_handle().focus(window);
+        }
+        if search_was_open && !self.search_palette_open {
+            self.trace_search_visibility("find_takeover", window, cx);
         }
         cx.notify();
     }
@@ -4258,6 +4622,11 @@ impl LibraryShell {
             return;
         };
         let editor = session.read_with(cx, |session, _| session.editor().clone());
+        // Evernote's findnext/findprev do nothing (not even scroll) unless
+        // there is more than one result.
+        if editor.read(cx).find_summary().total <= 1 {
+            return;
+        }
         let _ = editor.update(cx, |editor, editor_cx| {
             if next {
                 editor.find_next();
@@ -4288,11 +4657,15 @@ impl LibraryShell {
 
     fn schedule_search_from_input(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).text().trim().to_owned();
+        self.reload_recent_searches(cx);
         self._search_task = None;
         self.search_palette_generation = None;
         self.search_palette_results.clear();
         self.search_palette_selected = 0;
+        self.recent_notes.clear();
+        self.recent_note_error = None;
         if query.is_empty() {
+            self.reload_recent_notes(cx);
             self.search_palette_status = SearchPaletteStatus::Idle;
             cx.notify();
             return;
@@ -4472,14 +4845,18 @@ impl LibraryShell {
                                 return;
                             }
                         }
-                        shell.model.update(shell_cx, |model, _| {
-                            model.commit_history_search_results(
+                        shell.model.update(shell_cx, |model, model_cx| {
+                            let committed = model.commit_history_search_results(
                                 forward,
                                 &query,
                                 &expected_current,
                                 &expected_target,
                                 hits,
-                            )
+                            );
+                            if matches!(committed, Ok(true)) {
+                                model_cx.notify();
+                            }
+                            committed
                         })
                     }
                     Ok(None) => {
@@ -4490,7 +4867,30 @@ impl LibraryShell {
                     Err(error) => Err(error),
                 };
                 shell.history_search_notice = match outcome {
-                    Ok(true) => None,
+                    Ok(true) => {
+                        // Use the same retained surface bridge as card and
+                        // palette result selection, not a second body loader.
+                        shell.sync_editor_surface(shell_cx);
+                        if let Some((handle, target)) = shell.pending_history_focus.take()
+                            && target == expected_target
+                        {
+                            let committed = shell.model.read(shell_cx).navigation().snapshot();
+                            shell_cx.defer(move |app| {
+                                let _ = handle.update(app, |shell, window, cx| {
+                                    // A newer route or auxiliary input opened
+                                    // while searching owns the user's focus.
+                                    if shell.model.read(cx).navigation().snapshot() == committed
+                                        && !shell.search_palette_open
+                                        && !shell.find_panel_open
+                                        && !shell.organization_panel_open
+                                    {
+                                        shell.focus_active_editor_or_shell(window, cx);
+                                    }
+                                });
+                            });
+                        }
+                        None
+                    },
                     Ok(false) => {
                         // This packet lost its exact history fence. Only ask
                         // the model for the currently pending target; never
@@ -4645,13 +5045,19 @@ impl LibraryShell {
                             return;
                         }
                     }
-                    let committed = shell.model.update(shell_cx, |model, _| {
-                        model.commit_search_refresh(
+                    let committed = shell.model.update(shell_cx, |model, model_cx| {
+                        let committed = model.commit_search_refresh(
                             &query,
                             &expected_snapshot,
                             expected_generation,
                             hits,
-                        )
+                        );
+                        // The mounted editor follows the committed packet (a
+                        // trashed note's editor closes) through the observer.
+                        if matches!(committed, Ok(true)) {
+                            model_cx.notify();
+                        }
+                        committed
                     });
                     if matches!(committed, Ok(true)) {
                         shell.history_search_notice = None;
@@ -4715,17 +5121,29 @@ impl LibraryShell {
             return;
         };
         let packet = self.search_palette_results.clone();
-        let committed = self.model.update(cx, |model, _| {
-            model.commit_search_results(generation, query, packet, Some(hit.note.id.clone()))
+        let committed = self.model.update(cx, |model, model_cx| {
+            let committed =
+                model.commit_search_results(generation, query, packet, Some(hit.note.id.clone()));
+            if matches!(committed, Ok(true)) {
+                model_cx.notify();
+            }
+            committed
         });
         match committed {
             Ok(true) => {
                 self.search_palette_open = false;
                 self.search_palette_results.clear();
+                self.recent_searches.clear();
+                self.recent_searches_expanded = false;
+                self.recent_search_error = None;
                 self.search_palette_selected = 0;
                 self.search_palette_status = SearchPaletteStatus::Idle;
                 self.search_palette_generation = None;
+                // The model observer runs after this turn; mount the result's
+                // editor now so focus (and the next keystroke) reach it.
+                self.sync_editor_surface(cx);
                 self.focus_active_editor_or_shell(window, cx);
+                self.trace_search_visibility("result_commit", window, cx);
             }
             Ok(false) => {
                 self.search_palette_status =
@@ -5070,6 +5488,57 @@ impl LibraryShell {
         cx.stop_propagation();
     }
 
+    // The Find query owns its caret and selection under the pointer, like
+    // Evernote's own <input> (find/ui/FindInNote.tsx), never the title or
+    // body beneath the panel.
+    fn on_find_input_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            cx.propagate();
+            return;
+        }
+        self.find_input.update(cx, |input, input_cx| {
+            input.begin_pointer_selection(event.position, event.modifiers.shift);
+            input.focus_handle().focus(window);
+            input_cx.notify();
+        });
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    fn on_find_input_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            cx.propagate();
+            return;
+        }
+        self.find_input.update(cx, |input, input_cx| {
+            if input.extend_pointer_selection(event.position).is_some() {
+                input_cx.notify();
+            }
+        });
+        cx.stop_propagation();
+    }
+
+    fn on_find_input_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_input
+            .update(cx, |input, _| input.end_pointer_selection());
+        cx.stop_propagation();
+    }
+
     fn on_organization_input_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -5189,21 +5658,44 @@ impl LibraryShell {
         if !self.organization_panel_open {
             return None;
         }
-        let (route, index, tag_counts, selected_count, has_selected_note) =
+        let (route, index, tag_counts, selected_ids, has_selected_note,
+            selected_notes_are_live, selected_notes_are_trashed) =
             self.model.read_with(cx, |model, _| {
+                let ids = model.selected_note_ids();
+                let has_selected_note = model.navigation().selected_note_id().is_some();
+                let ready = has_selected_note && !ids.is_empty() && !model.reconciliation_pending();
+                let (mut all_live, mut all_trashed) = (ready, ready);
+                // Evernote's notes-menu policy consumes inTrash from the
+                // selected notes even in SEARCH, not only the sidebar route.
+                // The retained note is authoritative during a Search packet's
+                // async refresh; extra selections need only card metadata.
+                // Unknown/mixed states offer neither mutation nor recovery.
+                for id in &ids {
+                    let deleted = model.active_note().filter(|note| &note.id == id)
+                        .map(|note| note.deleted_time.is_some())
+                        .or_else(|| model.projections().iter().find(|note| &note.id == id)
+                            .map(|note| note.deleted_time.is_some()));
+                    all_live &= deleted == Some(false);
+                    all_trashed &= deleted == Some(true);
+                }
                 (
                     model.navigation().route().clone(),
                     model.navigation_index().clone(),
                     model.selected_note_tag_counts(),
-                    model.selected_note_ids().len(),
-                    model.navigation().selected_note_id().is_some(),
+                    ids,
+                    has_selected_note,
+                    all_live,
+                    all_trashed,
                 )
             });
+        let selected_count = selected_ids.len();
         let stack_for_new_notebook = match &route {
             LibraryRoute::Stack(id) => Some(id.clone()),
             _ => None,
         };
         let is_trash_route = route == LibraryRoute::Trash;
+        let shortcut_controls = shortcuts::controls(&route, &index,
+            if selected_notes_are_live { selected_ids } else { Vec::new() }, cx);
         let input = self.render_organization_input(cx);
         let create_notebook_stack = stack_for_new_notebook.clone();
         let create_notebook = div()
@@ -5388,6 +5880,108 @@ impl LibraryShell {
             _ => None,
         };
 
+        // Evernote's notebook menu (renderer 9435.js 42535–42610): a notebook
+        // in a stack offers "remove from stack"; otherwise "add to new stack"
+        // and each existing stack.
+        let notebook_stack: Option<gpui::AnyElement> = match &route {
+            LibraryRoute::Notebook(id) => index
+                .notebooks
+                .iter()
+                .find(|notebook| &notebook.id == id)
+                .map(|notebook| {
+                    let id = notebook.id.clone();
+                    let mut section = div()
+                        .id("library-organization-notebook-stack")
+                        .debug_selector(|| "library-organization-notebook-stack".to_owned())
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(4.0));
+                    let current = notebook.stack_id.as_ref().and_then(|stack_id| {
+                        index.stacks.iter().find(|stack| &stack.id == stack_id)
+                    });
+                    if let Some(stack) = current {
+                        let remove = AppAction::SetNotebookStack { id, stack_id: None };
+                        section =
+                            section
+                                .child(div().text_color(rgba(0x718075ff)).child(format!(
+                                    "「{}」在组「{}」",
+                                    notebook.title, stack.title
+                                )))
+                                .child(library_action_button(
+                                    "library-organization-remove-from-stack",
+                                    "移出组".to_owned(),
+                                    remove,
+                                    cx,
+                                ));
+                    } else {
+                        section = section
+                            .child(
+                                div()
+                                    .text_color(rgba(0x718075ff))
+                                    .child(format!("「{}」加入组", notebook.title)),
+                            )
+                            .child(
+                                div()
+                                    .id("library-organization-add-to-new-stack")
+                                    .debug_selector(|| {
+                                        "library-organization-add-to-new-stack".to_owned()
+                                    })
+                                    .px(px(6.0))
+                                    .py(px(3.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgba(0xf1f4f1ff))
+                                    .text_size(px(10.0))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |shell, _event, window, cx| {
+                                            let title =
+                                                shell.organization_input.read(cx).text().to_owned();
+                                            shell.submit_organization_create(
+                                                AppAction::CreateStackForNotebook {
+                                                    id: id.clone(),
+                                                    title,
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .child("加入新组（用上方名称）"),
+                            );
+                        for stack in &index.stacks {
+                            let selector =
+                                format!("library-organization-add-to-stack-{}", stack.id.as_str());
+                            let add = AppAction::SetNotebookStack {
+                                id: notebook.id.clone(),
+                                stack_id: Some(stack.id.clone()),
+                            };
+                            section = section.child(
+                                div()
+                                    .id(SharedString::from(selector.clone()))
+                                    .debug_selector(move || selector.clone())
+                                    .px(px(6.0))
+                                    .py(px(3.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgba(0xf1f4f1ff))
+                                    .text_size(px(10.0))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |shell, _event, window, cx| {
+                                            shell.apply_action(add.clone(), window, cx)
+                                        }),
+                                    )
+                                    .child(format!("加入 {}", stack.title)),
+                            );
+                        }
+                    }
+                    section.into_any_element()
+                }),
+            _ => None,
+        };
+
         let mut move_targets = div()
             .id("library-organization-move-targets")
             .debug_selector(|| "library-organization-move-targets".to_owned())
@@ -5459,7 +6053,7 @@ impl LibraryShell {
         }
 
         let trash_controls: Option<gpui::AnyElement> =
-            (is_trash_route && has_selected_note).then(|| {
+            (selected_notes_are_trashed && has_selected_note).then(|| {
                 div()
                     .id("library-organization-trash-controls")
                     .debug_selector(|| "library-organization-trash-controls".to_owned())
@@ -5471,7 +6065,10 @@ impl LibraryShell {
                         AppAction::RestoreSelected,
                         cx,
                     ))
-                    .child(library_destructive_action_button(
+                    // Recovery is reachable from a Trash search result, but
+                    // permanent deletion keeps the existing Trash-route
+                    // confirmation fence. Do not widen that stable boundary.
+                    .children(is_trash_route.then(|| library_destructive_action_button(
                         "library-organization-purge-selected",
                         match self.model.read(cx).selected_note_ids().len() {
                             count if count > 1 => format!("永久删除 {count} 篇笔记"),
@@ -5489,7 +6086,7 @@ impl LibraryShell {
                                 ),
                             }),
                         cx,
-                    ))
+                    )))
                     .into_any_element()
             });
         let destructive_confirmation = self.render_destructive_confirmation(cx);
@@ -5512,6 +6109,11 @@ impl LibraryShell {
             .max_h(px(228.0))
             .overflow_y_scroll()
             .child(div().text_color(rgba(0x718075ff)).child("组织"))
+            // Confirmation must remain immediately reachable, independent of
+            // how many organization/shortcut controls precede the scrolled
+            // content. Do not leave its hit target below the clipped viewport.
+            .children(destructive_confirmation)
+            .child(shortcut_controls)
             .child(
                 div()
                     .flex()
@@ -5525,8 +6127,8 @@ impl LibraryShell {
             )
             .children(rename_current)
             .children(delete_current)
-            .children(destructive_confirmation);
-        if has_selected_note && !is_trash_route {
+            .children(notebook_stack);
+        if has_selected_note && selected_notes_are_live {
             panel = panel
                 .child(
                     div()
@@ -5570,6 +6172,15 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.search_palette_open {
+            crate::native_editor::input_trace::record("search", "shell_key_down", || {
+                serde_json::json!({
+                    "key": event.keystroke.key,
+                    "command": event.keystroke.modifiers.platform,
+                    "input_focused": self.search_input.read(cx).focus_handle().is_focused(window),
+                })
+            });
+        }
         if self.find_panel_open && matches!(event.keystroke.key.as_str(), "escape" | "esc") {
             self.close_find_in_note_visibility(window, cx);
             cx.stop_propagation();
@@ -5612,6 +6223,16 @@ impl LibraryShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        crate::native_editor::input_trace::record("search", "key_down", || {
+            serde_json::json!({
+                "key": event.keystroke.key,
+                "command": event.keystroke.modifiers.platform,
+                "shift": event.keystroke.modifiers.shift,
+                "open": self.search_palette_open,
+                "input_focused": self.search_input.read(cx).focus_handle().is_focused(window),
+                "query_bytes": self.search_input.read(cx).text().len(),
+            })
+        });
         let input = self.search_input.clone();
         let modifiers = event.keystroke.modifiers;
         let secondary = modifiers.secondary();
@@ -5629,14 +6250,15 @@ impl LibraryShell {
                 // owns marked CJK composition. It finalizes that composition,
                 // never opens a transient result underneath it.
                 if input.read(cx).marked_range().is_none() {
-                    self.commit_search_result(self.search_palette_selected, window, cx);
+                    self.activate_search_palette_selection(window, cx);
                 }
                 true
             }
             "down" => {
-                if !self.search_palette_results.is_empty() {
-                    self.search_palette_selected = (self.search_palette_selected + 1)
-                        .min(self.search_palette_results.len() - 1);
+                let count = self.search_palette_results.len() + self.recent_notes.len() + self.recent_searches.len();
+                if count > 0 {
+                    self.search_palette_selected =
+                        (self.search_palette_selected + 1).min(count - 1);
                     self.reveal_search_palette_selection();
                     cx.notify();
                 }
@@ -5703,6 +6325,15 @@ impl LibraryShell {
             }
             _ => false,
         };
+        crate::native_editor::input_trace::record("search", "key_finished", || {
+            serde_json::json!({
+                "key": event.keystroke.key,
+                "handled": handled,
+                "open": self.search_palette_open,
+                "input_focused": self.search_input.read(cx).focus_handle().is_focused(window),
+                "query_bytes": self.search_input.read(cx).text().len(),
+            })
+        });
         if handled {
             cx.stop_propagation();
         }
@@ -5711,8 +6342,14 @@ impl LibraryShell {
     fn reveal_search_palette_selection(&self) {
         // Search rows are direct tracked children, so GPUI can use their
         // painted bounds instead of inventing a fixed line height.
-        self.search_palette_scroll
-            .scroll_to_item(self.search_palette_selected);
+        let index = self.search_palette_selected;
+        let after_results = index >= self.search_palette_results.len();
+        let after_recent = index >= self.search_palette_results.len() + self.recent_notes.len();
+        self.search_palette_scroll.scroll_to_item(index
+            + usize::from(after_results && !self.recent_notes.is_empty())
+            + usize::from(after_results && self.recent_note_error.is_some())
+            + usize::from(after_recent && !self.recent_searches.is_empty())
+            + usize::from(after_recent && self.recent_search_error.is_some()));
     }
 
     fn render_search_palette(
@@ -5732,10 +6369,11 @@ impl LibraryShell {
                 canvas_input.clone()
             },
             move |bounds, entity, window, cx| {
-                let (text, selection, focus) = entity.read_with(cx, |input, _| {
+                let (text, selection, selection_head, focus) = entity.read_with(cx, |input, _| {
                     (
                         SharedString::from(input.text().to_owned()),
                         input.selection().clone(),
+                        input.selection_head(),
                         input.focus_handle().clone(),
                     )
                 });
@@ -5753,29 +6391,35 @@ impl LibraryShell {
                     }],
                     None,
                 );
-                entity.update(cx, |input, _| input.record_layout(bounds, line.clone()));
+                // Share the existing Find field's horizontal viewport rule:
+                // painting and the native input bridge must use one origin.
+                let caret_x = line.x_for_index(selection_head);
+                let scroll_x = (caret_x - bounds.size.width + px(4.0)).max(px(0.0));
+                let layout_bounds =
+                    Bounds::new(point(bounds.left() - scroll_x, bounds.top()), bounds.size);
+                entity.update(cx, |input, _| input.record_layout(layout_bounds, line.clone()));
                 if focus.is_focused(window) && !selection.is_empty() {
                     window.paint_quad(gpui::fill(
                         Bounds::from_corners(
                             point(
-                                bounds.left() + line.x_for_index(selection.start),
+                                layout_bounds.left() + line.x_for_index(selection.start),
                                 bounds.top(),
                             ),
                             point(
-                                bounds.left() + line.x_for_index(selection.end),
+                                layout_bounds.left() + line.x_for_index(selection.end),
                                 bounds.bottom(),
                             ),
                         ),
                         rgba(0x00a82d33),
                     ));
                 }
-                line.paint(bounds.origin, bounds.size.height, window, cx)
+                line.paint(layout_bounds.origin, bounds.size.height, window, cx)
                     .ok();
                 if focus.is_focused(window) && selection.is_empty() {
                     window.paint_quad(gpui::fill(
                         Bounds::new(
                             point(
-                                bounds.left() + line.x_for_index(selection.start),
+                                layout_bounds.left() + line.x_for_index(selection.start),
                                 bounds.top(),
                             ),
                             size(px(1.0), bounds.size.height),
@@ -5783,6 +6427,13 @@ impl LibraryShell {
                         rgba(EVERNOTE_GREEN),
                     ));
                 }
+                #[cfg(test)]
+                search_session_tests::record_search_input_paint(
+                    bounds,
+                    window.content_mask().bounds,
+                    layout_bounds.origin,
+                    layout_bounds.left() + caret_x,
+                );
                 if focus.is_focused(window) {
                     window.handle_input(
                         &focus,
@@ -5812,7 +6463,32 @@ impl LibraryShell {
             ),
             SearchPaletteStatus::Error(message) => format!("搜索失败：{message}"),
         };
+        let thumbnail_shell = cx.weak_entity();
+        let thumbnail_state = Rc::clone(&self.search_thumbnail_viewport_state);
+        let thumbnail_scroll = self.search_palette_scroll.clone();
+        let thumbnail_ids = self.search_palette_results.iter()
+            .map(|hit| hit.note.selected_thumbnail_id.clone()).collect::<Vec<_>>();
         let mut results_scroll = div()
+            .on_children_prepainted(move |_bounds, window, app| {
+                // Read the final tracked layout after scrolling/clamping and
+                // child prepaint. Construction of a 500-hit packet is not a
+                // request to read/decode 500 images.
+                let viewport = thumbnail_scroll.bounds();
+                let offset = thumbnail_scroll.offset();
+                let visible = thumbnail_ids.iter().enumerate().filter_map(|(index, id)| {
+                    let bounds = thumbnail_scroll.bounds_for_item(index)?;
+                    (bounds.bottom() + offset.y > viewport.top()
+                        && bounds.top() + offset.y < viewport.bottom())
+                        .then(|| id.clone()).flatten()
+                }).collect::<HashSet<_>>();
+                let changed = thumbnail_state.borrow_mut().take_if_changed(visible);
+                if let Some(visible) = changed {
+                    let _ = thumbnail_shell.update(app, |shell, cx| {
+                        shell.reconcile_search_thumbnail_residency(visible, window, cx);
+                        cx.defer_in(window, |_, _, cx| cx.notify());
+                    });
+                }
+            })
             .id("library-search-results-scroll")
             .flex()
             .flex_col()
@@ -5824,11 +6500,49 @@ impl LibraryShell {
         // keyboard navigation; no separate result authority is introduced.
         for (index, hit) in self.search_palette_results.iter().enumerate() {
             let title = hit.note.title_prefix.clone();
-            let snippet = hit.snippet.clone();
+            let (context, source) = hit.snippet.rsplit_once('\n')
+                .filter(|(_, source)| source.starts_with("匹配附件："))
+                .map_or((hit.snippet.as_str(), None), |(context, source)| (context, Some(source)));
+            let mut text = div().flex_1().min_w(px(0.0)).overflow_hidden()
+                .child(div().text_size(px(14.0)).line_height(px(18.0))
+                    .line_clamp(1).text_ellipsis().child(search_result_text("title", index, title)))
+                .child(div().text_size(px(11.0)).line_height(px(15.0))
+                    .line_clamp(2).text_color(rgba(0x718075ff))
+                    .child(search_result_text("snippet", index, context.to_owned())));
+            if let Some(source) = source {
+                text = text.child(div().text_size(px(10.0)).line_height(px(14.0))
+                    .line_clamp(1).text_ellipsis().text_color(rgba(0x718075ff))
+                    .child(search_result_text("source", index, source.to_owned())));
+            }
+            let thumbnail_id = hit.note.selected_thumbnail_id.as_ref();
+            let visible = self.search_thumbnail_viewport_state.borrow().contains(thumbnail_id);
+            let thumbnail = thumbnail_id.map(|id| {
+                let source = visible.then(|| self.card_thumbnails.source_for(Some(id))).flatten();
+                let failed = self.card_thumbnails.failed(Some(id));
+                let tile = div().w(px(52.0)).h(px(52.0)).flex_none()
+                    .rounded(px(5.0)).overflow_hidden().bg(rgba(0xf0f3f0ff));
+                match source {
+                    Some(source) => tile
+                        .debug_selector(move || format!("library-search-result-thumbnail-{index}"))
+                        .child(img(source).size_full().object_fit(ObjectFit::Cover)
+                            .image_cache(&self.card_thumbnail_cache)).into_any_element(),
+                    None => {
+                        let tile = tile.debug_selector(move || format!("library-search-result-thumbnail-pending-{index}"));
+                        if failed {
+                            tile.text_size(px(10.0)).child("缩略图不可用").into_any_element()
+                        } else {
+                            tile.into_any_element()
+                        }
+                    }
+                }
+            });
             results_scroll = results_scroll.child(
                 div()
                     .id(SharedString::from(format!("library-search-result-{index}")))
+                    .debug_selector(move || format!("library-search-result-{index}"))
                     .cursor_pointer()
+                    .flex().items_center().gap(px(10.0))
+                    .h(px(80.0)).flex_none().overflow_hidden()
                     .p(px(8.0))
                     .rounded(px(5.0))
                     .bg(if index == self.search_palette_selected {
@@ -5843,15 +6557,12 @@ impl LibraryShell {
                             shell.commit_search_result(index, window, cx)
                         }),
                     )
-                    .child(div().text_size(px(14.0)).child(title))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(rgba(0x718075ff))
-                            .child(snippet),
-                    ),
+                    .child(text)
+                    .children(thumbnail),
             );
         }
+        results_scroll = results_scroll.children(self.render_recent_note_rows(cx));
+        results_scroll = results_scroll.children(self.render_recent_search_rows(cx));
         let palette_width = (viewport_width - 16.0).max(1.0).min(620.0);
         let palette_left = (viewport_width - palette_width) / 2.0;
         Some(
@@ -5864,7 +6575,15 @@ impl LibraryShell {
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|shell, _event, window, cx| {
+                    cx.listener(|shell, event: &gpui::MouseDownEvent, window, cx| {
+                        crate::native_editor::input_trace::record("search", "backdrop_dismiss", || {
+                            serde_json::json!({
+                                "x": f32::from(event.position.x),
+                                "y": f32::from(event.position.y),
+                                "open": shell.search_palette_open,
+                                "input_focused": shell.search_input.read(cx).focus_handle().is_focused(window),
+                            })
+                        });
                         cx.stop_propagation();
                         shell.toggle_search_palette_visibility(window, cx)
                     }),
@@ -5890,6 +6609,8 @@ impl LibraryShell {
                         .child(
                             div()
                                 .id("library-search-input")
+                                .w_full()
+                                .overflow_hidden()
                                 .key_context("LibrarySearchInput")
                                 .on_action(cx.listener(Self::toggle_find_in_note))
                                 .border_b_1()
@@ -6022,6 +6743,10 @@ impl LibraryShell {
         };
         let summary_width = (summary_text.chars().count() as f32 * 7.0 + 8.0).clamp(42.0, 112.0);
         let input_width = (panel_width - 130.0 - summary_width).clamp(48.0, 128.0);
+        // Never narrower than its widest child (plus the 6px padding each
+        // side and border): a control drawn outside the panel would be
+        // outside its hit area, and a press there would reach what is beneath.
+        let panel_width = panel_width.max(summary_width.max(input_width) + 14.0);
         let canvas_input = input.clone();
         let paint_input = input.clone();
         let input_canvas = canvas(
@@ -6126,12 +6851,21 @@ impl LibraryShell {
                 .key_context("LibraryFindInNote")
                 .on_key_down(cx.listener(Self::on_find_in_note_key_down))
                 .track_focus(input.read(cx).focus_handle())
+                // Presses anywhere on the panel (its padding, the summary)
+                // never reach the title or body underneath.
+                .occlude()
                 .child(
                     div()
                         .id("library-find-in-note-input")
                         .debug_selector(|| "library-find-in-note-input".to_owned())
                         .w(px(input_width))
                         .overflow_hidden()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(Self::on_find_input_mouse_down),
+                        )
+                        .on_mouse_move(cx.listener(Self::on_find_input_mouse_move))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_find_input_mouse_up))
                         .child(
                             div()
                                 .id("library-find-in-note-input-canvas")
@@ -6364,6 +7098,75 @@ impl LibraryShell {
 }
 
 impl LibraryShell {
+    fn navigate_history_from_user(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let navigation = self.model.read(cx).navigation();
+        let available = if forward {
+            navigation.can_navigate_forward()
+        } else {
+            navigation.can_navigate_back()
+        };
+        if available {
+            // Keep the established flush barrier and asynchronous search-history
+            // coordinator as the single owner of a destination transition.
+            let search_target = self.model.read(cx).pending_history_search(forward)
+                .map(|(_, target)| target);
+            if !self.apply_action_with_result(if forward {
+                AppAction::NavigateForward
+            } else {
+                AppAction::NavigateBack
+            }, window, cx) {
+                return;
+            }
+            if let Some(target) = search_target {
+                self.pending_history_focus = window.window_handle().downcast::<LibraryShell>()
+                    .map(|handle| (handle, target));
+            } else {
+                self.sync_editor_surface(cx);
+                self.focus_active_editor_or_shell(window, cx);
+            }
+        }
+    }
+
+    fn render_history_navigation_button(
+        &self,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let navigation = self.model.read(cx).navigation();
+        let (id, label, available) = if forward {
+            ("library-navigate-forward", "›", navigation.can_navigate_forward())
+        } else {
+            ("library-navigate-back", "‹", navigation.can_navigate_back())
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .flex_shrink_0()
+            .w(px(24.0))
+            .py(px(3.0))
+            .rounded(px(5.0))
+            .bg(rgba(0xf1f4f1ff))
+            .text_size(px(18.0))
+            .text_center()
+            .text_color(rgba(0x36413aff))
+            .when(!available, |button| button.opacity(0.35))
+            .when(available, |button| button.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |shell, _event, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    shell.navigate_history_from_user(forward, window, cx);
+                }),
+            ))
+            .child(label)
+            .into_any_element()
+    }
+
     fn render_library_toolbar(
         &mut self,
         available_editor_width: f32,
@@ -6391,7 +7194,10 @@ impl LibraryShell {
             NoteSort::TitleAscending => "按标题 A-Z",
             NoteSort::TitleDescending => "按标题 Z-A",
         };
-        let mut actions = Vec::new();
+        let mut actions = vec![
+            self.render_history_navigation_button(false, cx),
+            self.render_history_navigation_button(true, cx),
+        ];
         if compact {
             actions.push(
                 library_primary_action_button(
@@ -6692,7 +7498,11 @@ impl LibraryShell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|shell, _event, window, cx| {
-                    shell.toggle_search_palette_visibility(window, cx)
+                    shell.toggle_search_palette_visibility(window, cx);
+                    // The palette took focus; the shell root's own
+                    // track_focus must not take it back on this press.
+                    window.prevent_default();
+                    cx.stop_propagation();
                 }),
             )
             .child("搜索 ⌘K")
@@ -6701,8 +7511,8 @@ impl LibraryShell {
 
 /// Ask the native platform for one file, then return to the exact library
 /// window which captured the insertion point. No picker task holds the shell
-/// strongly, so closing a window while the panel is open simply discards its
-/// eventual completion.
+/// strongly; window loss or an expired request cancels the worker, and stale
+/// completions cannot insert into a newer request.
 fn prompt_for_resource_path(prompt_request: ResourcePickerPrompt, cx: &mut App) {
     #[cfg(test)]
     {
@@ -6719,12 +7529,26 @@ fn prompt_for_resource_path(prompt_request: ResourcePickerPrompt, cx: &mut App) 
             window: window_handle,
             token,
         } = prompt_request;
-        let prompt = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("插入图片或附件".into()),
-        });
+        let prompt = crate::file_picker::prompt_for_paths(
+            cx,
+            PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("插入图片或附件".into()),
+            },
+        );
+        let prompt =
+            crate::file_picker::bind_to_request(cx, window_handle.into(), prompt, move |app| {
+                window_handle
+                    .read_with(app, |shell, _| {
+                        shell
+                            .pending_resource_insert
+                            .as_ref()
+                            .is_some_and(|pending| pending.token == token)
+                    })
+                    .unwrap_or(false)
+            });
         cx.spawn(async move |cx| {
             let completion = match prompt.await {
                 Ok(Ok(Some(paths))) => paths
@@ -6799,6 +7623,10 @@ fn cleanup_owned_temporary_paths(paths: &[PathBuf]) {
 
 impl Render for LibraryShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.search_palette_open && !self.search_card_thumbnail_ids.is_empty() {
+            self.search_thumbnail_viewport_state.borrow_mut().invalidate();
+            self.reconcile_search_thumbnail_residency(HashSet::new(), window, cx);
+        }
         let selected = self.model.read(cx).navigation().selected_note_id().cloned();
         if self.focus_title_after_mount
             && selected.is_some()
@@ -6808,6 +7636,18 @@ impl Render for LibraryShell {
             self.focus_title_after_mount = false;
             let title = session.read(cx).title().clone();
             title.read(cx).focus_handle().focus(window);
+        }
+        // Only when nothing else took the keyboard: it is still the closed
+        // cell's, the shell root's (from the closing press), or no one's.
+        if let Some(closed) = self.focus_body_after_cell_close.take()
+            && self.table_cell_editor.is_none()
+            && window
+                .focused(cx)
+                .is_none_or(|focused| focused == closed || focused == self.focus_handle)
+            && let Some(session) = self.note_session.as_ref()
+        {
+            let editor = session.read(cx).editor().clone();
+            crate::native_editor::surface::focus_editor(&editor, window, cx);
         }
         #[cfg(test)]
         {
@@ -6846,15 +7686,17 @@ impl Render for LibraryShell {
             AppStatus::Ready => None,
             AppStatus::Error(error) => Some(format!("资料库错误：{error}")),
         };
-        let editor_left_in_window = if panes.sidebar_visible {
-            f32::from(panes.sidebar_width)
-        } else {
-            0.0
-        } + if panes.list_visible {
-            f32::from(panes.list_width)
-        } else {
-            0.0
-        };
+        let pane_frame = self.pane_motion.frame(
+            panes,
+            cx.background_executor().now(),
+            pane_motion::reduced_motion(cx),
+        );
+        if pane_frame.animating {
+            // A display-linked, bounded transition, not a permanent polling
+            // timer or an occlusion/rendering workaround.
+            window.request_animation_frame();
+        }
+        let editor_left_in_window = pane_frame.sidebar + pane_frame.list;
         // `Window::bounds` can include platform chrome and does not follow a
         // test/runtime content-mask resize until the next platform pass. The
         // toolbar must adapt to the actual flex column that will be painted,
@@ -6867,8 +7709,11 @@ impl Render for LibraryShell {
             pane: editor_pane,
             overlays: editor_overlays,
         } = self.render_editor_panel(
-            items
-                .is_empty()
+            // An empty list replaces the editor only when no note is open: a
+            // search refresh can leave the note being edited outside the
+            // (truthfully empty) results, and it stays reachable with its
+            // undo history.
+            (items.is_empty() && active_note.is_none())
                 .then(|| RouteEmptyState::for_route(&route, searching)),
             active_note,
             available_editor_width,
@@ -6879,17 +7724,20 @@ impl Render for LibraryShell {
             items.clone(),
             selected,
             panes.list_width,
-            panes.list_visible,
+            panes.list_visible || pane_frame.list > 0.0,
             mode,
             window,
             cx,
         );
         let sidebar_shell = cx.weak_entity();
+        let shortcut_shell = cx.weak_entity();
+        let shortcut_selected_note = self.model.read(cx).navigation().selected_note_id().cloned();
         let sidebar = sidebar::render(
             panes.sidebar_width,
-            panes.sidebar_visible,
+            panes.sidebar_visible || pane_frame.sidebar > 0.0,
             &navigation_index,
             &route,
+            shortcut_selected_note.as_ref(),
             self.sidebar_scroll.clone(),
             cx,
             move |route, window, app| {
@@ -6916,6 +7764,11 @@ impl Render for LibraryShell {
                     );
                 });
             },
+            move |target, window, app| {
+                let _ = shortcut_shell.update(app, |shell, shell_cx| {
+                    shell.apply_shortcut_action(AppAction::OpenShortcut(target), window, shell_cx);
+                });
+            },
         );
         let LibraryToolbarRender {
             toolbar,
@@ -6937,7 +7790,9 @@ impl Render for LibraryShell {
         let mut root = div()
             .id("library-shell")
             .debug_selector(|| "library-shell".to_owned())
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.0))
             .relative()
             .flex()
             .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::Shell))
@@ -6948,6 +7803,12 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::toggle_note_list))
             .on_action(cx.listener(Self::cycle_list_view_mode))
             .on_action(cx.listener(Self::cycle_sort))
+            .on_action(cx.listener(|shell, _: &NavigateLibraryBack, window, cx| {
+                shell.navigate_history_from_user(false, window, cx);
+            }))
+            .on_action(cx.listener(|shell, _: &NavigateLibraryForward, window, cx| {
+                shell.navigate_history_from_user(true, window, cx);
+            }))
             .on_action(cx.listener(Self::sync_current))
             .on_action(cx.listener(Self::export_current_note))
             .on_action(cx.listener(Self::import_library))
@@ -6973,8 +7834,18 @@ impl Render for LibraryShell {
             .on_action(cx.listener(Self::open_library_resource_picker))
             .on_action(cx.listener(Self::paste_resource_or_text))
             .on_key_down(cx.listener(Self::on_shell_key_down))
-            .child(sidebar)
-            .child(note_list)
+            .child(pane_motion::reveal(
+                "library-sidebar-reveal",
+                pane_frame.sidebar,
+                panes.sidebar_width,
+                sidebar,
+            ))
+            .child(pane_motion::reveal(
+                "library-list-reveal",
+                pane_frame.list,
+                panes.list_width,
+                note_list,
+            ))
             .child(
                 div()
                     .id("library-main-editor-shell")
@@ -7010,260 +7881,273 @@ impl Render for LibraryShell {
         }
         let search_palette =
             self.render_search_palette(f32::from(window.viewport_size().width), cx);
-        root.children(status_message.map(|message| {
-            div()
-                .id("library-action-error")
-                .debug_selector(|| "library-action-error".to_owned())
-                .absolute()
-                .bottom(px(10.0))
-                .right(px(14.0))
-                .text_size(px(11.0))
-                .text_color(rgba(0xa34838ff))
-                .child(message)
-        }))
-        .children(self.save_error.as_ref().map(|error| {
-            div()
-                .id("library-save-error")
-                .debug_selector(|| "library-save-error".to_owned())
-                .absolute()
-                .bottom(px(34.0))
-                .right(px(14.0))
-                .max_w(px(520.0))
-                .text_size(px(11.0))
-                .text_color(rgba(0xa34838ff))
-                .child(error.message().to_owned())
-        }))
-        .children(match &self.indexing_status {
-            // Index status has its own stable presentation slot: it never
-            // reuses local-save semantics or overlaps resource notices.
-            IndexingStatus::Pending => Some(
+        let content = root
+            .children(self.startup_notice.as_ref().map(|notice| {
                 div()
-                    .id("library-indexing-status")
-                    .debug_selector(|| "library-indexing-status".to_owned())
+                    .id("library-startup-notice")
+                    .debug_selector(|| "library-startup-notice".to_owned())
                     .absolute()
-                    .bottom(px(58.0))
-                    .right(px(14.0))
-                    .max_w(px(520.0))
-                    .text_size(px(11.0))
-                    .text_color(rgba(0x536f59ff))
-                    .child("正在建立本地搜索索引…"),
-            ),
-            IndexingStatus::Failed(message) => Some(
-                div()
-                    .id("library-indexing-status")
-                    .debug_selector(|| "library-indexing-status".to_owned())
-                    .absolute()
-                    .bottom(px(58.0))
-                    .right(px(14.0))
-                    .max_w(px(520.0))
-                    .text_size(px(11.0))
-                    .text_color(rgba(0x8d6a27ff))
-                    .child(message.clone()),
-            ),
-            IndexingStatus::Idle => None,
-        })
-        .child(
-            // Always visible: local saving and server confirmation are
-            // different states and are never shown as one.
+                    .top(px(52.0))
+                    .right(px(16.0))
+                    .max_w(px(440.0))
+                    .p(px(12.0))
+                    .rounded(px(7.0))
+                    .bg(rgba(0xfff6dfff))
+                    .text_color(rgba(0x725c19ff))
+                    .child(notice.clone())
+            }))
+            .children(search_palette);
+        // Statuses are library UI, not document overlays. Reserve a bounded
+        // opaque footer so arbitrary images cannot hide messages, long notices
+        // cannot collide at fixed y offsets, and the writing surface keeps its
+        // own scroll owner and entity. Concurrent notices scroll in this rail.
+        div().size_full().flex().flex_col().child(content).child(
             div()
-                .id("library-sync-status")
-                .debug_selector(|| "library-sync-status".to_owned())
-                .absolute()
-                .bottom(px(106.0))
-                .right(px(14.0))
-                .max_w(px(560.0))
-                .text_size(px(11.0))
-                .text_color(
-                    if matches!(self.sync_status, sync::ShellSyncStatus::Failed(_)) {
-                        rgba(0xa34838ff)
-                    } else {
-                        rgba(0x536f59ff)
-                    },
-                )
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|shell, _event, _window, cx| shell.toggle_sync_failures(cx)),
-                )
-                .child(self.sync_status_text(cx)),
-        )
-        .children(self.resource_notice.as_ref().map(|notice| {
-            div()
-                .id("library-resource-notice")
-                .debug_selector(|| "library-resource-notice".to_owned())
-                .absolute()
-                .bottom(px(82.0))
-                .right(px(14.0))
-                .max_w(px(520.0))
-                .text_size(px(11.0))
-                .text_color(rgba(0xa34838ff))
-                .child(notice.clone())
-        }))
-        .children(self.library_import_notice.as_ref().map(|notice| {
-            let working = self.library_import_working();
-            let ready = self.imported_library_ready.is_some();
-            // Spans the window so it can never be wider than it; the status
-            // itself sits at the right, at most 560px wide, with its message
-            // wrapping and its buttons on their own row, so a long message
-            // cannot push them out of view.
-            div()
-                .absolute()
-                .bottom(px(154.0))
-                .left(px(14.0))
-                .right(px(14.0))
+                .id("library-status-rail")
+                .debug_selector(|| "library-status-rail".to_owned())
+                .w_full()
+                .flex_none()
+                .max_h(px(192.0))
+                .overflow_y_scroll()
+                .p(px(8.0))
                 .flex()
-                .justify_end()
-                .child(
+                .flex_col()
+                .items_end()
+                .gap(px(6.0))
+                .bg(self.evernote_primary_surface_fill(LibraryPrimarySurface::Shell))
+                .border_t_1()
+                .border_color(self.evernote_primary_stroke())
+                .children(status_message.map(|message| {
                     div()
-                        .id("library-import-status")
-                        .debug_selector(|| "library-import-status".to_owned())
-                        // The note under it must not take its clicks.
-                        .occlude()
+                        .id("library-action-error")
+                        .debug_selector(|| "library-action-error".to_owned())
+                        .w_full()
+                        .flex_none()
                         .max_w(px(560.0))
-                        .min_w(px(0.0))
+                        .text_size(px(11.0))
+                        .text_color(rgba(0xa34838ff))
+                        .child(message)
+                }))
+                .children(self.save_error.as_ref().map(|error| {
+                    div()
+                        .id("library-save-error")
+                        .debug_selector(|| "library-save-error".to_owned())
+                        .w_full()
+                        .flex_none()
+                        .max_w(px(520.0))
+                        .text_size(px(11.0))
+                        .text_color(rgba(0xa34838ff))
+                        .child(error.message().to_owned())
+                }))
+                .children(match &self.indexing_status {
+                    // Index status has its own stable presentation slot: it never
+                    // reuses local-save semantics or overlaps resource notices.
+                    IndexingStatus::Pending => Some(
+                        div()
+                            .id("library-indexing-status")
+                            .debug_selector(|| "library-indexing-status".to_owned())
+                            .w_full()
+                            .flex_none()
+                            .max_w(px(520.0))
+                            .text_size(px(11.0))
+                            .text_color(rgba(0x536f59ff))
+                            .child("正在建立本地搜索索引…"),
+                    ),
+                    IndexingStatus::Failed(message) => Some(
+                        div()
+                            .id("library-indexing-status")
+                            .debug_selector(|| "library-indexing-status".to_owned())
+                            .w_full()
+                            .flex_none()
+                            .max_w(px(520.0))
+                            .text_size(px(11.0))
+                            .text_color(rgba(0x8d6a27ff))
+                            .child(message.clone()),
+                    ),
+                    IndexingStatus::Idle => None,
+                })
+                .child(
+                    // Always visible: local saving and server confirmation are
+                    // different states and are never shown as one.
+                    div()
+                        .id("library-sync-status")
+                        .debug_selector(|| "library-sync-status".to_owned())
+                        .w_full()
+                        .flex_none()
+                        .max_w(px(560.0))
+                        .text_size(px(11.0))
+                        .text_color(
+                            if matches!(self.sync_status, sync::ShellSyncStatus::Failed(_)) {
+                                rgba(0xa34838ff)
+                            } else {
+                                rgba(0x536f59ff)
+                            },
+                        )
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event, _window, cx| {
+                                shell.toggle_sync_failures(cx)
+                            }),
+                        )
+                        .child(self.sync_status_text(cx)),
+                )
+                .children(self.resource_notice.as_ref().map(|notice| {
+                    div()
+                        .id("library-resource-notice")
+                        .debug_selector(|| "library-resource-notice".to_owned())
+                        .w_full()
+                        .flex_none()
+                        .max_w(px(520.0))
+                        .text_size(px(11.0))
+                        .text_color(rgba(0xa34838ff))
+                        .child(notice.clone())
+                }))
+                .children(self.library_import_notice.as_ref().map(|notice| {
+                    let working = self.library_import_working();
+                    let ready = self.imported_library_ready.is_some();
+                    // Messages wrap inside the footer; controls keep their own row.
+                    div().w_full().flex_none().flex().justify_end().child(
+                        div()
+                            .id("library-import-status")
+                            .debug_selector(|| "library-import-status".to_owned())
+                            // Block document clicks, but let the footer receive wheel events.
+                            .block_mouse_except_scroll()
+                            .w_full()
+                            .flex_none()
+                            .max_w(px(560.0))
+                            .min_w(px(0.0))
+                            .text_size(px(11.0))
+                            .text_color(if notice.is_error() {
+                                rgba(0xa34838ff)
+                            } else {
+                                rgba(0x536f59ff)
+                            })
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .gap(px(4.0))
+                            .child(div().min_w(px(0.0)).child(notice.message().to_owned()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .gap(px(8.0))
+                                    .children(working.then(|| {
+                                        div()
+                                            .id("library-import-cancel")
+                                            .cursor_pointer()
+                                            .px(px(6.0))
+                                            .py(px(3.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgba(0xa3483820))
+                                            .child("取消导入")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|shell, _event, window, cx| {
+                                                    shell.cancel_library_import(
+                                                        &CancelLibraryImport,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                    }))
+                                    .children(ready.then(|| {
+                                        div()
+                                            .id("library-import-open")
+                                            .debug_selector(|| "library-import-open".to_owned())
+                                            .cursor_pointer()
+                                            .px(px(6.0))
+                                            .py(px(3.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgba(0x00a82d20))
+                                            .text_color(rgba(EVERNOTE_GREEN))
+                                            .child("打开导入的资料库")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|shell, _event, window, cx| {
+                                                    shell.open_imported_library(
+                                                        &OpenImportedLibrary,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                    })),
+                            ),
+                    )
+                }))
+                .children(self.readable_export_notice.as_ref().map(|notice| {
+                    div()
+                        .id("library-readable-export-status")
+                        .debug_selector(|| "library-readable-export-status".to_owned())
+                        .w_full()
+                        .flex_none()
+                        .max_w(px(560.0))
                         .text_size(px(11.0))
                         .text_color(if notice.is_error() {
                             rgba(0xa34838ff)
                         } else {
                             rgba(0x536f59ff)
                         })
-                        .flex()
-                        .flex_col()
-                        .items_end()
-                        .gap(px(4.0))
-                        .child(div().min_w(px(0.0)).child(notice.message().to_owned()))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_none()
-                                .gap(px(8.0))
-                                .children(working.then(|| {
-                                    div()
-                                        .id("library-import-cancel")
-                                        .cursor_pointer()
-                                        .px(px(6.0))
-                                        .py(px(3.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgba(0xa3483820))
-                                        .child("取消导入")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|shell, _event, window, cx| {
-                                                shell.cancel_library_import(
-                                                    &CancelLibraryImport,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        )
-                                }))
-                                .children(ready.then(|| {
-                                    div()
-                                        .id("library-import-open")
-                                        .debug_selector(|| "library-import-open".to_owned())
-                                        .cursor_pointer()
-                                        .px(px(6.0))
-                                        .py(px(3.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgba(0x00a82d20))
-                                        .text_color(rgba(EVERNOTE_GREEN))
-                                        .child("打开导入的资料库")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|shell, _event, window, cx| {
-                                                shell.open_imported_library(
-                                                    &OpenImportedLibrary,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        )
-                                })),
-                        ),
-                )
-        }))
-        .children(self.readable_export_notice.as_ref().map(|notice| {
-            div()
-                .id("library-readable-export-status")
-                .debug_selector(|| "library-readable-export-status".to_owned())
-                .absolute()
-                .bottom(px(130.0))
-                .right(px(14.0))
-                .max_w(px(560.0))
-                .text_size(px(11.0))
-                .text_color(if notice.is_error() {
-                    rgba(0xa34838ff)
-                } else {
-                    rgba(0x536f59ff)
-                })
-                .child(notice.message().to_owned())
-        }))
-        .children(self.history_search_notice.as_ref().map(|notice| {
-            let retry_available = self.search_refresh_retry_available;
-            let retry_history = self.search_refresh_retry_history;
-            div()
-                .id("library-history-search-status")
-                .absolute()
-                .bottom(px(106.0))
-                .right(px(14.0))
-                .max_w(px(520.0))
-                .text_size(px(11.0))
-                .text_color(rgba(0x536f59ff))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .child(notice.clone())
-                .children(retry_available.then(|| {
-                    div()
-                        .id("library-search-refresh-retry")
-                        .debug_selector(|| "library-search-refresh-retry".to_owned())
-                        .cursor_pointer()
-                        .px(px(6.0))
-                        .py(px(3.0))
-                        .rounded(px(4.0))
-                        .bg(rgba(0x00a82d20))
-                        .text_color(rgba(EVERNOTE_GREEN))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |shell, _event, _window, cx| {
-                                let scheduled = if let Some(forward) = retry_history {
-                                    shell.schedule_history_search(forward, cx)
-                                } else if shell.model.read_with(cx, |model, _| {
-                                    model.pending_search_refresh().is_some()
-                                }) {
-                                    shell.schedule_active_search_refresh(cx);
-                                    true
-                                } else {
-                                    false
-                                };
-                                shell.search_refresh_retry_available = false;
-                                shell.search_refresh_retry_history = None;
-                                shell.history_search_notice = if scheduled {
-                                    Some("正在重试本地搜索更新…".into())
-                                } else {
-                                    Some("搜索上下文已变化，请重新打开搜索。".into())
-                                };
-                                cx.notify();
-                            }),
-                        )
-                        .child("重试")
+                        .child(notice.message().to_owned())
                 }))
-        }))
-        .children(self.startup_notice.as_ref().map(|notice| {
-            div()
-                .id("library-startup-notice")
-                .debug_selector(|| "library-startup-notice".to_owned())
-                .absolute()
-                .top(px(52.0))
-                .right(px(16.0))
-                .max_w(px(440.0))
-                .p(px(12.0))
-                .rounded(px(7.0))
-                .bg(rgba(0xfff6dfff))
-                .text_color(rgba(0x725c19ff))
-                .child(notice.clone())
-        }))
-        .children(search_palette)
+                // Library recovery/export actions precede optional attachment
+                // details, so a backlog cannot push those controls out of view.
+                .child(self.derived_resource_status.clone())
+                .children(self.history_search_notice.as_ref().map(|notice| {
+                    let retry_available = self.search_refresh_retry_available;
+                    let retry_history = self.search_refresh_retry_history;
+                    div()
+                        .id("library-history-search-status")
+                        .debug_selector(|| "library-history-search-status".to_owned())
+                        .w_full()
+                        .flex_none()
+                        .max_w(px(520.0))
+                        .text_size(px(11.0))
+                        .text_color(rgba(0x536f59ff))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(div().flex_1().min_w(px(0.0)).child(notice.clone()))
+                        .children(retry_available.then(|| {
+                            div()
+                                .id("library-search-refresh-retry")
+                                .debug_selector(|| "library-search-refresh-retry".to_owned())
+                                .cursor_pointer()
+                                .px(px(6.0))
+                                .py(px(3.0))
+                                .rounded(px(4.0))
+                                .bg(rgba(0x00a82d20))
+                                .text_color(rgba(EVERNOTE_GREEN))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |shell, _event, _window, cx| {
+                                        let scheduled = if let Some(forward) = retry_history {
+                                            shell.schedule_history_search(forward, cx)
+                                        } else if shell.model.read_with(cx, |model, _| {
+                                            model.pending_search_refresh().is_some()
+                                        }) {
+                                            shell.schedule_active_search_refresh(cx);
+                                            true
+                                        } else {
+                                            false
+                                        };
+                                        shell.search_refresh_retry_available = false;
+                                        shell.search_refresh_retry_history = None;
+                                        shell.history_search_notice = if scheduled {
+                                            Some("正在重试本地搜索更新…".into())
+                                        } else {
+                                            Some("搜索上下文已变化，请重新打开搜索。".into())
+                                        };
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("重试")
+                        }))
+                })),
+        )
     }
 }
 
@@ -7371,6 +8255,15 @@ fn library_action_button(
     action: AppAction,
     cx: &mut Context<LibraryShell>,
 ) -> gpui::Stateful<gpui::Div> {
+    // GPUI test debug_bounds retains removed selectors across frames. Observe
+    // the real Restore label's paint instead of inferring disappearance from
+    // that historical map; ordinary builds still use the unchanged String.
+    #[cfg(test)]
+    let label = if id == "library-organization-restore-selected" {
+        note_card::observed_text_for_test("library-restore-label-paint".into(), label)
+    } else {
+        label.into_any_element()
+    };
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
@@ -7385,6 +8278,14 @@ fn library_action_button(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |shell, _event, window, cx| {
+                if matches!(action, AppAction::ToggleSidebar | AppAction::ToggleNoteList) {
+                    // Layout controls do not own text input. Suppress GPUI's
+                    // parent track_focus mouse-down default instead of forcing
+                    // the body: the actual owner may be the title or Find.
+                    // Evernote focus.ts similarly retains the existing owner
+                    // before falling back to a body focus restoration.
+                    window.prevent_default();
+                }
                 shell.apply_action(action.clone(), window, cx)
             }),
         )
@@ -7529,6 +8430,8 @@ mod organization_input_tests;
 #[cfg(test)]
 mod quit_lifecycle_tests;
 #[cfg(test)]
+mod search_session_tests;
+#[cfg(test)]
 mod sync_tests;
 #[cfg(test)]
 mod table_cell_editor_tests;
@@ -7590,7 +8493,8 @@ impl RouteEmptyState {
     const fn detail(self) -> &'static str {
         match self {
             Self::Library => "资料库为空，所有内容都将保存在此设备。",
-            Self::Notebook | Self::Stack => "点击侧边栏中的+新建笔记按钮创建笔记。",
+            Self::Notebook => "点击“新建笔记”，开始记录。",
+            Self::Stack => "先在分组中添加或选择笔记本，再新建笔记。",
             Self::Tags | Self::Search => "尝试使用不同的关键词或筛选条件。",
             Self::Trash => "当废纸篓中有笔记时，可以在这里还原或删除它们。",
         }

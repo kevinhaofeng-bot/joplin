@@ -366,6 +366,11 @@ fn snippet_text(part: &'static str, note_id: &str, text: String) -> AnyElement {
 
 /// Test-only thin wrapper around the production `StyledText` element.
 #[cfg(test)]
+pub(super) fn observed_text_for_test(selector: String, text: String) -> AnyElement {
+    ObservedCardText::new(selector, text).into_any_element()
+}
+
+#[cfg(test)]
 struct ObservedCardText {
     text: StyledText,
     selector: String,

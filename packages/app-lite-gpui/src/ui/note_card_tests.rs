@@ -239,6 +239,7 @@ async fn mounted_snippets_budget_long_chinese_text_and_date_inside_adjacent_rows
                 sidebar_visible: true,
                 list_visible: true,
                 selected_note_id: Some(selected.id.clone()),
+                location: Default::default(),
             })
             .expect("persist narrow Snippets list width and selected note");
 
@@ -388,6 +389,7 @@ async fn mounted_cards_clamp_long_chinese_text_inside_adjacent_rows_at_narrow_wi
                 sidebar_visible: true,
                 list_visible: true,
                 selected_note_id: Some(selected.id.clone()),
+                location: Default::default(),
             })
             .expect("persist narrow Cards list width and selected note");
 
@@ -915,6 +917,51 @@ async fn mounted_cards_uniform_list_reuses_bounded_a_proxy_after_viewport_b_roun
 }
 
 #[gpui::test]
+async fn pane_motion_217_list_reversal_keeps_the_same_decoded_card_texture(cx: &mut TestAppContext) {
+    cx.update(|app| app.set_global(super::tests::PaneMotionPreferenceForTest(false)));
+    let (_profile, repository) = repository();
+    let thumbnail = repository.import_resource(&jpeg_thumbnail(), "motion.jpeg", "image/jpeg", "jpeg").unwrap();
+    repository.create_note(CreateNote {
+        title: "动画中的卡片".into(), notebook_id: None,
+        document: CanonicalDocument::from_blocks(vec![Block::Image {
+            resource_id: thumbnail.clone(), alt: "保留同一纹理".into(),
+            presentation: Default::default(), link: None,
+        }]),
+    }).unwrap();
+    let (view, cx) = mount_shell(Arc::clone(&repository), cx);
+    for _ in 0..4 { redraw(cx); }
+    let source = view.read_with(cx, |shell, _| shell.card_thumbnails.source_for(Some(&thumbnail)).unwrap());
+    let resource = Resource::from(source);
+    let texture = cx.update(|window, app| {
+        let cache = view.read(app).card_thumbnail_cache.clone();
+        cache.update(app, |cache, cache_cx| cache.load(&resource, window, cache_cx).unwrap().unwrap())
+    });
+    let verified_opens = repository.observe_verified_resource_opens();
+    let body_loads = repository.observe_note_loads();
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::ToggleNoteList, window, shell_cx);
+    }));
+    redraw(cx);
+    cx.executor().advance_clock(std::time::Duration::from_millis(80));
+    redraw(cx);
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::ToggleNoteList, window, shell_cx);
+    }));
+    redraw(cx);
+    for _ in 0..4 {
+        cx.executor().advance_clock(std::time::Duration::from_millis(50));
+        redraw(cx);
+        let current = cx.update(|window, app| {
+            let cache = view.read(app).card_thumbnail_cache.clone();
+            cache.update(app, |cache, cache_cx| cache.load(&resource, window, cache_cx).unwrap().unwrap())
+        });
+        assert!(Arc::ptr_eq(&current, &texture), "animation must reuse the actual decoded texture, not just a matching path");
+    }
+    assert_eq!(verified_opens.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(body_loads.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[gpui::test]
 async fn mounted_cards_stable_viewport_reaches_idle_without_reinstalling_thumbnail_cache(
     cx: &mut TestAppContext,
 ) {
@@ -984,6 +1031,137 @@ async fn mounted_cards_stable_viewport_reaches_idle_without_reinstalling_thumbna
         1,
         "stable redraws must not restart descriptor-safe card materialization"
     );
+}
+
+#[gpui::test]
+async fn cold_card_materialization_reaches_decoded_thumbnail_without_input_or_forced_draw(
+    cx: &mut TestAppContext,
+) {
+    // A materialization completion must not erase the actual visible set
+    // before UniformList constructs this frame's cards. Otherwise the card
+    // receives no img source; its later decoration installs residency but
+    // cannot itself turn that already-built placeholder into an image.
+    let (_profile, repository) = repository();
+    let resource_id = repository
+        .import_resource(&jpeg_thumbnail(), "冷帧封面.jpeg", "image/jpeg", "jpeg")
+        .expect("store cold-frame resource");
+    repository
+        .create_note(CreateNote {
+            title: "后台完成封面".into(),
+            notebook_id: None,
+            document: card_document("封面应自行显示", Some(resource_id.clone())),
+        })
+        .expect("create covered note");
+    let anchor = repository
+        .create_note(CreateNote {
+            title: "仅文字的输入锚点".into(),
+            notebook_id: None,
+            document: CanonicalDocument::default(),
+        })
+        .expect("create text anchor");
+    let mut model = AppModel::open(repository).expect("open cold-frame model");
+    model.dispatch(AppAction::SelectNote(anchor.id)).expect("select image-free editor");
+    let model = cx.new(|_| model);
+    let release = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let release_for_mount = std::rc::Rc::clone(&release);
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        let mut shell = LibraryShell::new(model, None, window, cx);
+        *release_for_mount.borrow_mut() =
+            Some(shell.stall_next_card_thumbnail_materialization_for_test());
+        shell
+    });
+    // Let unrelated mount work finish while the real verified-reader job is
+    // parked. Releasing it below is the only stimulus; never call redraw.
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("library-note-card-thumbnail-placeholder").is_some());
+    assert!(cx.debug_bounds("library-note-card-thumbnail").is_none(),
+        "no actual card image may paint while its source job is parked");
+    assert_eq!(view.read_with(cx, |shell, _| {
+        shell.card_thumbnails.ready_count_for_test()
+    }), 0);
+    release.borrow_mut().take().unwrap().send(()).unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |shell, app| {
+        let source = shell.card_thumbnails.source_for(Some(&resource_id))
+            .expect("the real background job completed successfully");
+        assert!(shell.card_thumbnail_cache.read(app)
+            .loaded_success_for_test(&Resource::from(source)),
+            "a cold visible card must start and complete decoding without a user click or forced redraw");
+    });
+    assert!(cx.debug_bounds("library-note-card-thumbnail").is_some(),
+        "the completed cold-frame source must be consumed by a real card img");
+    // GPUI Frame::clear does not clear debug_bounds: absence after a selector
+    // painted in an earlier frame cannot establish disappearance. The real
+    // decoder result and the image selector's absent -> painted transition
+    // above establish consumption without any test-triggered redraw.
+}
+
+#[gpui::test]
+async fn card_proxy_decode_completion_notifies_rendering_shell_without_user_input(
+    cx: &mut TestAppContext,
+) {
+    // The card cache is a non-view entity. Its completion must invalidate the
+    // shell that renders the card, not just the cache itself. Repeated forced
+    // draws in the other thumbnail tests hide this missing owner notification.
+    let (_profile, repository) = repository();
+    let resource_id = repository
+        .import_resource(&jpeg_thumbnail(), "冷启动封面.jpeg", "image/jpeg", "jpeg")
+        .expect("store covered note resource");
+    repository
+        .create_note(CreateNote {
+            title: "无需点击的封面".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![Block::Image {
+                resource_id: resource_id.clone(),
+                alt: "后台封面".into(),
+                presentation: Default::default(),
+                link: None,
+            }]),
+        })
+        .expect("create covered note");
+    let (view, cx) = mount_shell(repository, cx);
+    // Mounting itself can draw before the test resumes. Settle the real
+    // source/bitmap first, then invalidate only that bitmap so the test owns
+    // a precise decode-completion boundary, independent of initial draws.
+    for _ in 0..4 {
+        redraw(cx);
+    }
+    let source = view.read_with(cx, |shell, app| {
+        let source = shell.card_thumbnails.source_for(Some(&resource_id)).unwrap();
+        assert!(shell.card_thumbnail_cache.read(app)
+            .loaded_success_for_test(&Resource::from(source.clone())));
+        source
+    });
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.card_thumbnail_cache.update(shell_cx, |cache, cache_cx| {
+                cache.invalidate(&Resource::from(source.clone()), window, cache_cx);
+            });
+        });
+    });
+    let notifications = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = std::rc::Rc::clone(&notifications);
+    let _observation = cx.update(|_, app| {
+        app.observe(&view, move |_, _| counter.set(counter.get() + 1))
+    });
+    // Restart through the same cache.load boundary used by img. Only drain
+    // completions afterwards: no click, shell action, refresh_windows, or
+    // additional draw can manufacture this owner notification.
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.card_thumbnail_cache.update(shell_cx, |cache, cache_cx| {
+                assert!(cache.load(&Resource::from(source.clone()), window, cache_cx).is_none(),
+                    "the invalidated bitmap must start a fresh asynchronous decode");
+            });
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, app| {
+        assert!(shell.card_thumbnail_cache.read(app)
+            .loaded_success_for_test(&Resource::from(source)));
+    });
+    assert!(notifications.get() > 0,
+        "a completed card bitmap must invalidate the rendering shell without user input");
 }
 
 fn mount_shell<'a>(

@@ -475,6 +475,7 @@ impl MacWindowState {
 
     fn start_display_link(&mut self) {
         self.stop_display_link();
+        self.trace_frame_state("display_link_start_attempt");
         unsafe {
             if !self
                 .native_window
@@ -490,11 +491,28 @@ impl MacWindowState {
         {
             display_link.start().log_err();
             self.display_link = Some(display_link);
+            self.trace_frame_state("display_link_installed");
         }
     }
 
     fn stop_display_link(&mut self) {
+        self.trace_frame_state("display_link_stop");
         self.display_link = None;
+    }
+
+    // Diagnostic metadata only: no key or note content, no scheduling and no
+    // change to occlusion, activation, display-link or renderer behavior.
+    fn trace_frame_state(&self, event: &str) {
+        super::trace_window_frame(event, || unsafe {
+            serde_json::json!({
+                "view": self.native_view.as_ptr() as usize,
+                "occlusion": self.native_window.occlusionState().bits(),
+                "visible": self.native_window.isVisible() == YES,
+                "key": self.native_window.isKeyWindow() == YES,
+                "display_link_present": self.display_link.is_some(),
+                "frame_callback_present": self.request_frame_callback.is_some(),
+            })
+        });
     }
 
     fn is_maximized(&self) -> bool {
@@ -1718,10 +1736,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                     drop(lock);
                 }
 
-                let handled: BOOL = unsafe {
-                    let input_context: id = msg_send![this, inputContext];
-                    msg_send![input_context, handleEvent: native_event]
-                };
+                let handled = handle_input_context_event(this, native_event);
                 window_state.as_ref().lock().keystroke_for_do_command.take();
                 if let Some(handled) = window_state.as_ref().lock().do_command_handled.take() {
                     return handled as BOOL;
@@ -1759,10 +1774,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 return NO;
             }
 
-            unsafe {
-                let input_context: id = msg_send![this, inputContext];
-                msg_send![input_context, handleEvent: native_event]
-            }
+            handle_input_context_event(this, native_event)
         }
 
         PlatformInput::KeyUp(_) => {
@@ -1774,6 +1786,77 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     }
 }
 
+// The event routing order and return value remain unchanged. The optional
+// observer checks the *window's* input source, not the global defaults cache.
+fn handle_input_context_event(this: &Object, native_event: id) -> BOOL {
+    unsafe {
+        let input_context: id = msg_send![this, inputContext];
+        trace_input_context(this, input_context, native_event, "before_handle_event", None);
+        let handled: BOOL = msg_send![input_context, handleEvent: native_event];
+        trace_input_context(
+            this,
+            input_context,
+            native_event,
+            "after_handle_event",
+            Some(handled == YES),
+        );
+        handled
+    }
+}
+
+fn trace_input_context(
+    this: &Object,
+    input_context: id,
+    native_event: id,
+    phase: &str,
+    handled: Option<bool>,
+) {
+    super::input_trace::record(phase, || unsafe {
+        let source: id = if input_context == nil {
+            nil
+        } else {
+            msg_send![input_context, selectedKeyboardInputSource]
+        };
+        let source = if source == nil {
+            None
+        } else {
+            Some(source.to_str().to_owned())
+        };
+        let window: id = msg_send![this, window];
+        let (is_key, is_first_responder) = if window == nil {
+            (false, false)
+        } else {
+            let is_key: BOOL = msg_send![window, isKeyWindow];
+            let responder: id = msg_send![window, firstResponder];
+            (is_key == YES, responder == this as *const Object as id)
+        };
+        let key_code: u16 = msg_send![native_event, keyCode];
+        let app = NSApplication::sharedApplication(nil);
+        let is_app_active: BOOL = msg_send![app, isActive];
+        let current_event: id = msg_send![app, currentEvent];
+        let event_window: id = msg_send![native_event, window];
+        let modifier_flags: NSUInteger = msg_send![native_event, modifierFlags];
+        let current_context: id = msg_send![class!(NSTextInputContext), currentInputContext];
+        let input_handler_present = get_window_state(this).lock().input_handler.is_some();
+        serde_json::json!({
+            "input_source": source,
+            "input_context_present": input_context != nil,
+            "key_code": key_code,
+            "is_key_window": is_key,
+            "is_first_responder": is_first_responder,
+            "is_app_active": is_app_active == YES,
+            "event_window_matches": event_window == window,
+            "modifier_flags": modifier_flags,
+            "current_context_present": current_context != nil,
+            "current_context_matches": current_context == input_context,
+            "input_handler_present": input_handler_present,
+            "application_current_event_present": current_event != nil,
+            "application_current_event_matches": current_event == native_event,
+            "handled": handled,
+        })
+    });
+}
+
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
@@ -1782,6 +1865,9 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let event = unsafe { PlatformInput::from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        if matches!(event, PlatformInput::MouseDown(_) | PlatformInput::MouseUp(_)) {
+            lock.trace_frame_state("native_mouse_event");
+        }
         match &mut event {
             PlatformInput::MouseDown(
                 event @ MouseDownEvent {
@@ -1907,6 +1993,7 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let lock = &mut *window_state.lock();
+    lock.trace_frame_state("occlusion_changed");
     unsafe {
         if lock
             .native_window
@@ -1976,6 +2063,7 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
+    lock.trace_frame_state("key_status_changed");
     let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
 
     // When opening a pop-up while the application isn't active, Cocoa sends a spurious
@@ -2136,6 +2224,7 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
+    lock.trace_frame_state("display_layer");
     if let Some(mut callback) = lock.request_frame_callback.take() {
         #[cfg(not(feature = "macos-blade"))]
         lock.renderer.set_presents_with_transaction(true);
@@ -2155,6 +2244,7 @@ unsafe extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    lock.trace_frame_state("display_link_step");
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
@@ -2187,7 +2277,13 @@ extern "C" fn selected_range(this: &Object, _: Sel) -> NSRange {
     })
     .flatten();
 
-    selected_range_result.map_or(NSRange::invalid(), |selection| selection.range.into())
+    let range = selected_range_result.map_or(NSRange::invalid(), |selection| selection.range.into());
+    super::input_trace::record("selected_range", || serde_json::json!({
+        "location": range.location,
+        "length": range.length,
+        "valid": range.location != NSNotFound as u64,
+    }));
+    range
 }
 
 extern "C" fn first_rect_for_character_range(
@@ -2196,6 +2292,10 @@ extern "C" fn first_rect_for_character_range(
     range: NSRange,
     _: id,
 ) -> NSRect {
+    super::input_trace::record("first_rect_for_character_range", || serde_json::json!({
+        "location": range.location,
+        "length": range.length,
+    }));
     let frame = get_frame(this);
     with_input_handler(this, |input_handler| {
         input_handler.bounds_for_range(range.to_range()?)

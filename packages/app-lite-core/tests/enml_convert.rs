@@ -223,7 +223,7 @@ fn evernote_presentational_styles_map_to_marks_instead_of_blocking() {
     let result = convert_enml(enml, &resources()).unwrap();
     assert_eq!(
         result.html.as_str(),
-        "<p><span style=\"color: #000000\"><strong>粗</strong></span><em>斜</em><u>下</u><s>删</s><mark>亮</mark><span style=\"color: #333333\">字</span>普通<span style=\"color: #fc1233; --inversion-type-color: simple\">红</span></p>"
+        "<p><span style=\"color: #000000\"><strong>粗</strong></span><em>斜</em><u>下</u><s>删</s><mark style=\"background-color: #fdf3d0\">亮</mark><span style=\"color: #333333\">字</span>普通<span style=\"color: #fc1233; --inversion-type-color: simple\">红</span></p>"
     );
     // Other color-string forms keep their colour and alpha; a value that is
     // not a colour is dropped instead of reaching the stored CSS.
@@ -231,6 +231,30 @@ fn evernote_presentational_styles_map_to_marks_instead_of_blocking() {
     assert_eq!(
         convert_enml(forms, &resources()).unwrap().html.as_str(),
         "<p><span style=\"color: #008000\">绿</span><span style=\"color: #663399\">紫</span><span style=\"color: rgba(255, 0, 0, 0.502)\">半</span><span style=\"color: #0000ff\">蓝</span>当坏</p>"
+    );
+}
+
+#[test]
+fn enml_highlight_keys_and_explicit_clear_do_not_reintroduce_yellow() {
+    for (key, hex) in [
+        ("yellow", "#fdf3d0"),
+        ("red", "#ffe2d5"),
+        ("green", "#ddf8e1"),
+        ("blue", "#e0f7fd"),
+        ("purple", "#edf0ff"),
+        ("orange", "#feead4"),
+    ] {
+        let source =
+            format!("<en-note><div><span style=\"--en-highlight:{key}\">色</span></div></en-note>");
+        assert_eq!(
+            convert_enml(&source, &resources()).unwrap().html.as_str(),
+            format!("<p><mark style=\"background-color: {hex}\">色</mark></p>")
+        );
+    }
+    let source = "<en-note><div><span style=\"--en-highlight:red\">甲<span style=\"--en-highlight:yellow;background-color:transparent\">乙</span><span style=\"--en-highlight:false\">丙</span>丁</span></div></en-note>";
+    assert_eq!(
+        convert_enml(source, &resources()).unwrap().html.as_str(),
+        "<p><mark style=\"background-color: #ffe2d5\">甲</mark>乙丙<mark style=\"background-color: #ffe2d5\">丁</mark></p>"
     );
 }
 

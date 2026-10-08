@@ -316,7 +316,7 @@ fn blocks_unsupported_or_lossy_markdown_with_source_location() {
         ),
         ("[相对](../other.md)".into(), JexBodyBlockerKind::UnsafeLink),
         (
-            "[外链](https://example.com \"提示\")".into(),
+            format!("[外链](https://example.com \"{}\")", "x".repeat(4097)),
             JexBodyBlockerKind::UnsupportedAttribute,
         ),
         (
@@ -612,16 +612,36 @@ fn bare_html_wrapper_block_keeps_the_text_it_swallowed() {
         converted.document,
         CanonicalDocument::parse_html("<p>甲</p><p>乙</p>").unwrap()
     );
-    assert!(
-        convert_jex_note_body(
-            NOTE,
-            "mail.md",
-            1,
-            "<html>正文<font color=\"red\">红</font>",
-            &resources()
-        )
-        .is_err()
+    let converted = convert_jex_note_body(
+        NOTE,
+        "mail.md",
+        1,
+        "<html>正文<font color=\"red\">红</font>尾",
+        &resources(),
+    )
+    .unwrap();
+    let expected =
+        CanonicalDocument::parse_html("<p>正文<span style=\"color: #ff0000\">红</span>尾</p>")
+            .unwrap();
+    assert_eq!(converted.document, expected);
+    assert_eq!(converted.search_text, "正文红尾");
+    assert_eq!(
+        CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+        expected
     );
+    // Colour is now representable, but font size/family must not be discarded.
+    for attributes in ["color=\"red\" size=\"6\"", "color=\"red\" face=\"serif\""] {
+        assert!(
+            convert_jex_note_body(
+                NOTE,
+                "mail.md",
+                1,
+                &format!("<html>正文<font {attributes}>红</font>尾"),
+                &resources()
+            )
+            .is_err()
+        );
+    }
 }
 
 /// A resource image linked to itself carries no second target; the link is

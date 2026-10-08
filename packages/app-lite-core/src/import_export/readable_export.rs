@@ -156,6 +156,19 @@ struct BundleDirs {
     resources: File,
 }
 
+/// Validate retained-history text, including the old blank-draft representation.
+pub(super) fn history_search_text_matches(
+    document: &CanonicalDocument,
+    html: &str,
+    stored_text: &str,
+) -> bool {
+    // Only retained history may contain the old empty-HTML/newline-text pair.
+    // Never excuse meaningful text loss, and retain the byte-limit guard.
+    stored_text.len() <= MAX_NOTE_TEXT_BYTES
+        && (document.search_text().as_str() == stored_text
+            || (html.is_empty() && stored_text.bytes().all(|byte| byte == b'\n')))
+}
+
 /// Exports selected active, untagged notes from the default notebook into a
 /// newly-created bundle directory. The bundle path must not exist already.
 pub fn export_readable_selection(
@@ -299,7 +312,11 @@ fn export_readable_selection_with_hooks(
                         ReadableExportError::InvalidManifest("revision HTML is invalid".into())
                     })?;
                 if document.to_canonical_html().as_str() != revision.body_html
-                    || document.search_text().as_str() != revision.body_text
+                    || !history_search_text_matches(
+                        &document,
+                        &revision.body_html,
+                        &revision.body_text,
+                    )
                 {
                     return Err(ReadableExportError::InvalidManifest(
                         "revision HTML/resources differ".into(),
@@ -810,7 +827,7 @@ fn validate_manifest(bundle: &Path) -> Result<ValidatedBundle, ReadableExportErr
                 ReadableExportError::InvalidManifest("revision HTML is invalid".into())
             })?;
             if document.to_canonical_html().as_str() != revision.body_html
-                || document.search_text().as_str() != revision.body_text
+                || !history_search_text_matches(&document, &revision.body_html, &revision.body_text)
             {
                 return Err(ReadableExportError::InvalidManifest(
                     "revision HTML is not canonical".into(),
@@ -1154,6 +1171,7 @@ pub(super) fn write_readable_page(
     output.write_all(b"<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>")?;
     write_html_escaped(&mut output, title, true)?;
     output.write_all(b"</title><style>body{font:16px/1.65 system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem;color:#222}h1{line-height:1.3;overflow-wrap:anywhere}p,li{overflow-wrap:anywhere}img{max-width:100%;height:auto}img[data-joplin-lite-block-image=\"true\"]{display:block}a{overflow-wrap:anywhere}ul[data-type=checklist]{list-style:none;padding-left:1.5rem}ul[data-type=checklist]>li::before{content:'\xe2\x98\x90';margin-left:-1.5rem;margin-right:.5rem}ul[data-type=checklist]>li[data-checked=true]::before{content:'\xe2\x98\x91'}pre{white-space:pre-wrap;overflow-wrap:anywhere}[data-align=center]{text-align:center}[data-align=right]{text-align:right}")?;
+    output.write_all(b"table{border-collapse:collapse;width:100%;margin:1em 0;table-layout:fixed}td,th{border:1px solid #d9ded9;padding:.5em;vertical-align:top;overflow-wrap:anywhere}th{font-weight:600;background:#f3f6f3}td img,th img{max-width:100%;height:auto}")?;
     for indent in 1..=8 {
         write!(
             output,
@@ -1228,11 +1246,17 @@ fn write_projected_token<W: Write>(
         Token::CharacterTokens(text) => write_html_escaped(output, &text, false)?,
         Token::TagToken(tag) => {
             let name = tag.name.as_ref();
+            // Keep the browser projection in sync with the canonical schema:
+            // saved tables, colors, scripts and headings must remain readable.
+            // Input is the validated canonical snapshot, not arbitrary HTML.
             if !matches!(
                 name,
                 "p" | "h1"
                     | "h2"
                     | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
                     | "ul"
                     | "ol"
                     | "li"
@@ -1248,6 +1272,14 @@ fn write_projected_token<W: Write>(
                     | "s"
                     | "mark"
                     | "code"
+                    | "sup"
+                    | "sub"
+                    | "span"
+                    | "table"
+                    | "tbody"
+                    | "tr"
+                    | "td"
+                    | "th"
             ) {
                 return Err(ReadableExportError::InvalidManifest(
                     "unexpected canonical HTML tag".into(),
@@ -1275,6 +1307,22 @@ fn write_projected_token<W: Write>(
                                 })
                         })
                         .transpose()?
+                } else {
+                    None
+                };
+                // A data attribute alone has no browser layout effect. Keep
+                // the durable node property and project it onto this image.
+                let image_alignment = if name == "img" {
+                    tag.attrs.iter().find_map(|attribute| {
+                        if attribute.name.local.as_ref() != "data-joplin-lite-image-align" {
+                            return None;
+                        }
+                        match attribute.value.as_ref() {
+                            "center" => Some("margin-left:auto;margin-right:auto"),
+                            "right" => Some("margin-left:auto;margin-right:0"),
+                            _ => None,
+                        }
+                    })
                 } else {
                     None
                 };
@@ -1307,11 +1355,16 @@ fn write_projected_token<W: Write>(
                     write_html_escaped(output, resource_value.map_or(value, String::as_str), true)?;
                     output.write_all(b"\"")?;
                 }
-                if let Some(width) = display_width {
-                    write!(
-                        output,
-                        " style=\"width:{width}px;max-width:100%;height:auto\""
-                    )?;
+                if display_width.is_some() || image_alignment.is_some() {
+                    output.write_all(b" style=\"")?;
+                    if let Some(width) = display_width {
+                        write!(output, "width:{width}px;")?;
+                    }
+                    output.write_all(b"max-width:100%;height:auto")?;
+                    if let Some(margins) = image_alignment {
+                        write!(output, ";{margins}")?;
+                    }
+                    output.write_all(b"\"")?;
                 }
                 output.write_all(b">")?;
             }

@@ -45,7 +45,7 @@ mod tests {
         let data = [0x55u8; 64];
         let bp = transpose_64(&data);
         assert_eq!(bp.planes[0], u64::MAX); // bit 0 set in all bytes
-        assert_eq!(bp.planes[1], 0);        // bit 1 clear in all bytes
+        assert_eq!(bp.planes[1], 0); // bit 1 clear in all bytes
         assert_eq!(bp.planes[2], u64::MAX); // bit 2 set
         assert_eq!(bp.planes[3], 0);
         assert_eq!(bp.planes[4], u64::MAX);

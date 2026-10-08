@@ -401,6 +401,12 @@ impl Context<'_> {
             Node::Element(element) => element,
         };
         if element.tag == "img" {
+            if marks.link_title.is_some() {
+                return self.block(
+                    Kind::UnsupportedAttribute,
+                    "Image link title has no canonical atom representation",
+                );
+            }
             out.push(self.image(element, marks.link.as_ref(), in_link)?);
             return Ok(());
         }
@@ -432,7 +438,7 @@ impl Context<'_> {
                         "Nested HTML links are unsupported",
                     );
                 }
-                self.attrs(element, &["href"])?;
+                self.attrs(element, &["href", "title"])?;
                 let href = element.attrs.get("href").ok_or_else(|| {
                     blocked(
                         self.note_id,
@@ -454,6 +460,32 @@ impl Context<'_> {
                     );
                 }
                 nested.link = Some(self.external_url(href)?);
+                if let Some(title) = element.attrs.get("title") {
+                    if !crate::document::valid_link_title(title) {
+                        return self.block(
+                            Kind::UnsupportedAttribute,
+                            "HTML link title exceeds the text metadata budget",
+                        );
+                    }
+                    self.charge_url(title)?;
+                    nested.link_title = Some(title.clone());
+                }
+            }
+            // Evernote's parseForecolor also reads legacy <font color>.
+            // Size/face/style are not colour: reject rather than discard them.
+            "font" => {
+                self.attrs(element, &["color"])?;
+                let Some(color) = element
+                    .attrs
+                    .get("color")
+                    .and_then(|value| crate::document::TextColor::parse(value))
+                else {
+                    return self.block(
+                        Kind::UnsupportedAttribute,
+                        "HTML font without a readable text colour",
+                    );
+                };
+                nested.color = Some(color);
             }
             // Evernote's forecolor, written `<span style="color: …">`. Any
             // other style stays unsupported rather than silently dropped.
@@ -492,7 +524,7 @@ impl Context<'_> {
                 );
             }
         }
-        if element.tag != "a" && element.tag != "span" {
+        if !matches!(element.tag.as_str(), "a" | "span" | "font") {
             self.attrs(element, &[])?;
         }
         if element.children.is_empty() {

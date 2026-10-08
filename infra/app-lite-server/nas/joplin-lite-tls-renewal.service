@@ -1,0 +1,14 @@
+[Unit]
+Description=Joplin Lite checked same-CA TLS renewal
+# The hook restarts sync; Requires would stop this oneshot mid-renewal.
+Wants=joplin-lite-sync.service
+After=joplin-lite-sync.service
+RequiresMountsFor=/volume1/Projects/joplin-lite-runtime
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /volume1/Projects/joplin-lite-runtime/bin/renew-server-tls.sh /volume1/Projects/joplin-lite-runtime/tls-managed /volume1/Projects/joplin-lite-runtime/bin/sync-tls-service-hook.sh 30 365
+TimeoutStartSec=150
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

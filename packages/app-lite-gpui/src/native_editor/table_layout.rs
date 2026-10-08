@@ -24,6 +24,21 @@ pub(crate) const MIN_TABLE_COLUMN_WIDTH: f32 = 64.0;
 /// Size an image is laid out at until its real size is known.
 const IMAGE_PLACEHOLDER: (u32, u32) = (160, 90);
 
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+
+    #[test]
+    fn six_highlight_colors_reach_table_cell_text_runs() {
+        for hex in ["#fdf3d0", "#ffe2d5", "#ddf8e1", "#e0f7fd", "#edf0ff", "#feead4"] {
+            let color = app_lite_core::TextColor::parse(hex).unwrap();
+            let marks = run_marks(&Marks { highlight: true, highlight_color: Some(color), ..Marks::default() }, false);
+            let run = text_run("中😀".len(), marks, &gpui::font("Helvetica"));
+            assert_eq!(run.background_color, Some(super::super::layout::text_color(color)));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RunMarks {
     pub(crate) bold: bool,
@@ -31,6 +46,7 @@ pub(crate) struct RunMarks {
     pub(crate) underline: bool,
     pub(crate) strikethrough: bool,
     pub(crate) highlight: bool,
+    pub(crate) highlight_color: Option<app_lite_core::TextColor>,
     pub(crate) link: bool,
     pub(crate) code: bool,
     pub(crate) script: Option<app_lite_core::Script>,
@@ -184,6 +200,80 @@ impl TableLayout {
         Some((hit.row, hit.column, cell.source_len))
     }
 
+    /// Where the glyphs of a cell's source range are drawn, one rectangle
+    /// per visual line, relative to the table's origin. Mirrors
+    /// [`Self::source_offset_at`]'s walk of pieces, lines and bytes.
+    pub(crate) fn find_range_bounds(
+        &self,
+        row: usize,
+        column: usize,
+        range: std::ops::Range<usize>,
+    ) -> Vec<Bounds<Pixels>> {
+        let Some(cell) = self.cells.get(row).and_then(|cells| cells.get(column)) else {
+            return Vec::new();
+        };
+        let (left, top) = self.content_origin(row, column);
+        let line_height = px(TABLE_LINE_HEIGHT);
+        let mut rects = Vec::new();
+        for (piece, &source) in cell.pieces.iter().zip(&cell.sources) {
+            let CellPiece::Text {
+                top: piece_top,
+                lines,
+                ..
+            } = piece
+            else {
+                continue;
+            };
+            let mut line_top = px(top + piece_top);
+            let mut byte_start = source;
+            for line in lines {
+                let line_end = byte_start + line.len();
+                let start = range.start.max(byte_start);
+                let end = range.end.min(line_end);
+                if start < end {
+                    let local = start - byte_start..end - byte_start;
+                    let mut current: Option<Bounds<Pixels>> = None;
+                    for (offset, character) in line.text[local.clone()].char_indices() {
+                        let glyph_start = local.start + offset;
+                        let glyph_end = glyph_start + character.len_utf8();
+                        let (Some(before), Some(after)) = (
+                            line.position_for_index(glyph_start, line_height),
+                            line.position_for_index(glyph_end, line_height),
+                        ) else {
+                            continue;
+                        };
+                        // A glyph starting a wrapped row reports the end of
+                        // the row above as its start.
+                        let (x, y) = if before.y == after.y {
+                            (before.x, before.y)
+                        } else {
+                            (px(0.0), after.y)
+                        };
+                        let glyph = Bounds::new(
+                            gpui::point(px(left) + x, line_top + y),
+                            gpui::size(after.x - x, line_height),
+                        );
+                        current = match current {
+                            Some(run) if run.top() == glyph.top() => Some(Bounds::new(
+                                run.origin,
+                                gpui::size(glyph.right() - run.left(), line_height),
+                            )),
+                            Some(run) => {
+                                rects.push(run);
+                                Some(glyph)
+                            }
+                            None => Some(glyph),
+                        };
+                    }
+                    rects.extend(current);
+                }
+                line_top += line.size(line_height).height;
+                byte_start = line_end + 1;
+            }
+        }
+        rects
+    }
+
     pub(crate) fn height(&self) -> f32 {
         self.row_heights
             .iter()
@@ -269,7 +359,7 @@ impl TableLayout {
 
 /// The cell's content: its canonical inlines, or (for a table built without
 /// them) its display text.
-fn cell_inlines(table: &TableContent, row: usize, column: usize) -> Vec<Inline> {
+pub(crate) fn cell_inlines(table: &TableContent, row: usize, column: usize) -> Vec<Inline> {
     match table.cell_inlines(row, column) {
         Some(inlines) => inlines.to_vec(),
         None => {
@@ -303,6 +393,7 @@ fn run_marks(marks: &Marks, header: bool) -> RunMarks {
         underline: marks.underline,
         strikethrough: marks.strikethrough,
         highlight: marks.highlight,
+        highlight_color: marks.highlight_color,
         link: marks.link.is_some(),
         code: marks.inline_code,
         script: marks.script,
@@ -331,7 +422,9 @@ fn text_run(len: usize, marks: RunMarks, base: &Font) -> TextRun {
         len,
         font,
         color,
-        background_color: if marks.highlight {
+        background_color: if let Some(color) = marks.highlight_color {
+            Some(super::layout::text_color(color))
+        } else if marks.highlight {
             Some(rgba(0xffd84d66).into())
         } else if marks.code {
             Some(rgba(0xeef1f4ff).into())

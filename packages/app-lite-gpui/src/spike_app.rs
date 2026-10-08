@@ -3435,6 +3435,66 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn mounted_highlight_palette_preserves_selection_and_six_colors(cx: &mut TestAppContext) {
+        cx.update(|cx| components::init(cx));
+        let (view, cx) = cx.add_window_view(build_view);
+        redraw(cx);
+        let selection = view.update(cx, |view, cx| view.editor.update(cx, |editor, editor_cx| {
+            let node = editor.document().first_node_id().unwrap();
+            editor.set_selection_for_test(Selection::new(DocPoint::new(node, 1), DocPoint::new(node, 3)));
+            editor_cx.notify();
+            editor.selection()
+        }));
+        redraw(cx);
+        let pick = |entry: &'static str, cx: &mut VisualTestContext| {
+            if cx.debug_bounds("highlight-color-trigger").is_none() {
+                let more = cx.debug_bounds("evernote-native-spike-more-trigger").unwrap();
+                cx.simulate_click(more.center(), Modifiers::default());
+                redraw(cx);
+            }
+            let trigger = cx.debug_bounds("highlight-color-trigger").expect("highlighter dropdown");
+            cx.simulate_click(trigger.center(), Modifiers::default());
+            redraw(cx);
+            let entry = cx.debug_bounds(entry).expect("highlight palette entry");
+            cx.simulate_click(entry.center(), Modifiers::default());
+            redraw(cx);
+        };
+        for (hex, entry) in [
+            ("#fdf3d0", "highlight-color-#fdf3d0"),
+            ("#ffe2d5", "highlight-color-#ffe2d5"),
+            ("#ddf8e1", "highlight-color-#ddf8e1"),
+            ("#e0f7fd", "highlight-color-#e0f7fd"),
+            ("#edf0ff", "highlight-color-#edf0ff"),
+            ("#feead4", "highlight-color-#feead4"),
+        ] {
+            pick(entry, cx);
+            view.read_with(cx, |view, cx| {
+                let editor = view.editor.read(cx);
+                assert_eq!(editor.selection(), selection);
+                let block = editor.document().block(selection.head.node_id).unwrap();
+                assert_eq!(block.content.styles().unwrap()[0].marks.as_slice(),
+                    &[Mark::HighlightColor(app_lite_core::TextColor::parse(hex).unwrap())]);
+                assert!(!view.command_chrome.read(cx).has_open_overlay());
+            });
+        }
+        cx.simulate_keystrokes("cmd-z");
+        redraw(cx);
+        view.read_with(cx, |view, cx| {
+            let block = view.editor.read(cx).document().block(selection.head.node_id).unwrap();
+            assert!(block.content.styles().unwrap()[0].marks.contains(
+                &Mark::HighlightColor(app_lite_core::TextColor::parse("#edf0ff").unwrap())));
+        });
+        cx.simulate_keystrokes("cmd-shift-z");
+        redraw(cx);
+        pick("highlight-color-clear", cx);
+        view.read_with(cx, |view, cx| {
+            let editor = view.editor.read(cx);
+            assert_eq!(editor.selection(), selection);
+            assert!(editor.document().block(selection.head.node_id).unwrap().content.styles().unwrap().is_empty());
+        });
+    }
+
+    #[gpui::test]
     async fn editable_link_popover_uses_input_bridge_and_preserves_selection(
         cx: &mut TestAppContext,
     ) {

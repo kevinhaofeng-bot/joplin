@@ -46,6 +46,9 @@ struct RenderBlock {
     /// Each image in the table: its resource id and, once loaded, its file.
     table_images: Vec<(String, Option<Resource>)>,
     table_scroll_offset: f32,
+    /// Find matches in the table's cells, relative to its origin, and
+    /// whether each is the primary.
+    table_find: Vec<(Bounds<Pixels>, bool)>,
 }
 
 /// The card contains presentation metadata only. Resource bytes stay in the
@@ -118,6 +121,66 @@ struct TestRenderObservations {
     attachment_card_paints: usize,
     image_residency: Option<TestImageResidencyObservation>,
     table_cells: Vec<TestTableCellPaint>,
+    images: Vec<TestImagePaint>,
+    text_lines: Vec<TestTextPaint>,
+    record_text_lines: bool,
+}
+
+/// Text actually submitted to the glyph painter, with its frame's clip.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestTextPaint {
+    pub(crate) editor: gpui::EntityId,
+    pub(crate) text: String,
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) content_mask: Bounds<Pixels>,
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_text_paints() -> Vec<TestTextPaint> {
+    TEST_RENDER_OBSERVATIONS
+        .with(|observations| std::mem::take(&mut observations.borrow_mut().text_lines))
+}
+
+/// Opt in only for the diagnostic that consumes the lines. Other tests
+/// (including large-document workloads) must not retain every painted word.
+#[cfg(test)]
+pub(crate) struct TestTextPaintScope;
+
+#[cfg(test)]
+pub(crate) fn observe_test_text_paints() -> TestTextPaintScope {
+    TEST_RENDER_OBSERVATIONS.with(|observations| {
+        let mut observations = observations.borrow_mut();
+        observations.text_lines.clear();
+        observations.record_text_lines = true;
+    });
+    TestTextPaintScope
+}
+
+#[cfg(test)]
+impl Drop for TestTextPaintScope {
+    fn drop(&mut self) {
+        TEST_RENDER_OBSERVATIONS.with(|observations| {
+            let mut observations = observations.borrow_mut();
+            observations.record_text_lines = false;
+            observations.text_lines.clear();
+        });
+    }
+}
+
+/// One image block whose pixels were painted, by which editor and where.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestImagePaint {
+    pub(crate) editor: gpui::EntityId,
+    pub(crate) resource_id: String,
+    pub(crate) bounds: Bounds<Pixels>,
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_image_paints() -> Vec<TestImagePaint> {
+    TEST_RENDER_OBSERVATIONS
+        .with(|observations| std::mem::take(&mut observations.borrow_mut().images))
 }
 
 /// What one frame painted in one table cell, in window coordinates.
@@ -147,6 +210,7 @@ pub(crate) struct TestTableRun {
     pub(crate) underline: bool,
     pub(crate) strikethrough: bool,
     pub(crate) highlight: bool,
+    pub(crate) highlight_color: Option<app_lite_core::TextColor>,
     pub(crate) link: bool,
 }
 
@@ -405,6 +469,7 @@ fn snapshot_with_image_viewport(
                 image_resource_id,
                 image_natural_max_edge,
                 attachment,
+                table_find: table_find_rects(editor, block.node_id, table_layout.as_deref()),
                 table,
                 table_layout,
                 table_images,
@@ -457,9 +522,61 @@ fn snapshot_with_image_viewport(
     }
 }
 
+/// A visible table's find matches, by their cells' measured glyphs. Only
+/// tables in the snapshot (the visible ones) are asked; each match is read
+/// once from the editor's per-block results.
+fn table_find_rects(
+    editor: &EditorCore,
+    node_id: super::model::NodeId,
+    table_layout: Option<&super::table_layout::TableLayout>,
+) -> Vec<(Bounds<Pixels>, bool)> {
+    let Some(table_layout) = table_layout else {
+        return Vec::new();
+    };
+    if editor.find_summary().total == 0 || !editor.find_has_matches_for_node(node_id) {
+        return Vec::new();
+    }
+    editor
+        .find_matches_for_node(node_id)
+        .filter_map(|(found, primary)| found.cell.map(|cell| (found, cell, primary)))
+        .flat_map(|(found, cell, primary)| {
+            table_layout
+                .find_range_bounds(cell.row, cell.column, found.utf8_range.clone())
+                .into_iter()
+                .map(move |rect| (rect, primary))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn find_highlights_for_test(editor: &EditorCore) -> Vec<FindHighlightGeometry> {
     snapshot(editor).find_highlights
+}
+
+/// Table find highlights in window coordinates, as painted (scrolled with
+/// the table and clipped to its visible width).
+#[cfg(test)]
+pub(crate) fn table_find_highlights_for_test(editor: &EditorCore) -> Vec<FindHighlightGeometry> {
+    snapshot(editor)
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            let viewport = block.layout.bounds;
+            let origin = point(
+                viewport.left() - px(block.table_scroll_offset),
+                viewport.top(),
+            );
+            block.table_find.iter().filter_map(move |(rect, primary)| {
+                let bounds = Bounds::new(origin + rect.origin, rect.size).intersect(&viewport);
+                (bounds.size.width > px(0.0) && bounds.size.height > px(0.0)).then_some(
+                    FindHighlightGeometry {
+                        bounds,
+                        primary: *primary,
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 fn bounds_intersect(left: Bounds<Pixels>, right: Bounds<Pixels>) -> bool {
@@ -581,6 +698,21 @@ fn paint_snapshot(
             .collect::<Vec<_>>();
         cache.update(cx, |cache, cache_cx| {
             cache.set_visible_resources(resident_resources.iter().copied());
+            // One request per resource per frame. Two blocks showing the same
+            // image (pasted twice) may know different sizes; asking for each
+            // in turn would change its edge every frame, and every change
+            // retries a promotion whose completion paints the next frame.
+            let mut requests: Vec<(&Resource, u32, Option<u32>)> = Vec::new();
+            let mut request = |resource, edge, natural: Option<u32>| match requests
+                .iter_mut()
+                .find(|(known, ..)| *known == resource)
+            {
+                Some((_, known_edge, known_natural)) => {
+                    *known_edge = (*known_edge).max(edge);
+                    *known_natural = (*known_natural).max(natural);
+                }
+                None => requests.push((resource, edge, natural)),
+            };
             for index in resident_indices.iter().copied() {
                 let block = &snapshot.blocks[index];
                 if let Some(table_layout) = block.table_layout.as_ref() {
@@ -592,7 +724,7 @@ fn paint_snapshot(
                     );
                     for (_, resource) in &block.table_images {
                         if let Some(resource) = resource {
-                            cache.request_edge_with_natural_max(resource, edge, None);
+                            request(resource, edge, None);
                         }
                     }
                 }
@@ -605,12 +737,11 @@ fn paint_snapshot(
                         window.scale_factor(),
                         residency.is_visible(index),
                     );
-                    cache.request_edge_with_natural_max(
-                        resource,
-                        max_edge,
-                        block.image_natural_max_edge,
-                    );
+                    request(resource, max_edge, block.image_natural_max_edge);
                 }
+            }
+            for (resource, edge, natural) in requests {
+                cache.request_edge_with_natural_max(resource, edge, natural);
             }
             cache.evict_offscreen(window, cache_cx);
         });
@@ -687,6 +818,18 @@ fn paint_snapshot(
                     }
                 }
                 window.paint_image(block.layout.bounds, Corners::all(px(6.0)), image, 0, false)?;
+                #[cfg(test)]
+                if let (Some(editor), Some(resource_id)) =
+                    (editor.as_ref(), block.image_resource_id.as_deref())
+                {
+                    let paint = TestImagePaint {
+                        editor: editor.entity_id(),
+                        resource_id: resource_id.to_owned(),
+                        bounds: block.layout.bounds,
+                    };
+                    TEST_RENDER_OBSERVATIONS
+                        .with(|observations| observations.borrow_mut().images.push(paint));
+                }
             } else {
                 if let (Some(editor), Some(resource_id), Some(Err(_))) = (
                     editor.as_ref(),
@@ -743,15 +886,22 @@ fn paint_snapshot(
                     let viewport = block.layout.bounds;
                     let mut content_bounds = viewport;
                     content_bounds.origin.x -= px(block.table_scroll_offset);
-                    content_bounds.size.width = px(table_layout.column_width * table.column_count().max(1) as f32);
-                    window.with_content_mask(Some(gpui::ContentMask { bounds: viewport }), |window| paint_table_layout(
-                        table,
-                        table_layout,
-                        content_bounds,
-                        &loaded,
-                        window,
-                        cx,
-                    ))?;
+                    content_bounds.size.width =
+                        px(table_layout.column_width * table.column_count().max(1) as f32);
+                    window.with_content_mask(
+                        Some(gpui::ContentMask { bounds: viewport }),
+                        |window| {
+                            paint_table_layout(
+                                table,
+                                table_layout,
+                                content_bounds,
+                                &loaded,
+                                &block.table_find,
+                                window,
+                                cx,
+                            )
+                        },
+                    )?;
                 }
                 None => paint_table(table, block.layout.bounds, window, cx)?,
             }
@@ -799,14 +949,30 @@ fn paint_snapshot(
                         }
                         result?;
                     }
-                    TextPaintPass::Glyphs => line.paint(
-                        origin,
-                        line_height,
-                        block.layout.text_align,
-                        Some(text_bounds),
-                        window,
-                        cx,
-                    )?,
+                    TextPaintPass::Glyphs => {
+                        line.paint(
+                            origin,
+                            line_height,
+                            block.layout.text_align,
+                            Some(text_bounds),
+                            window,
+                            cx,
+                        )?;
+                        #[cfg(test)]
+                        if let Some(editor) = editor.as_ref() {
+                            TEST_RENDER_OBSERVATIONS.with(|observations| {
+                                let mut observations = observations.borrow_mut();
+                                if observations.record_text_lines {
+                                    observations.text_lines.push(TestTextPaint {
+                                        editor: editor.entity_id(),
+                                        text: line.text.to_string(),
+                                        bounds: Bounds::new(origin, line.size(line_height)),
+                                        content_mask,
+                                    });
+                                }
+                            });
+                        }
+                    }
                 }
             }
             line_top += line.size(line_height).height;
@@ -888,6 +1054,7 @@ fn paint_table_layout(
     table_layout: &super::table_layout::TableLayout,
     bounds: Bounds<Pixels>,
     loaded: &HashMap<String, std::sync::Arc<gpui::RenderImage>>,
+    find: &[(Bounds<Pixels>, bool)],
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Result<()> {
@@ -896,6 +1063,30 @@ fn paint_table_layout(
     let border = rgba(0xc9d3ccff);
     let column_width = px(table_layout.column_width);
     let line_height = px(TABLE_LINE_HEIGHT);
+    if table.header {
+        if let Some(header_height) = table_layout.row_heights.first() {
+            window.paint_quad(fill(
+                Bounds::new(
+                    bounds.origin,
+                    gpui::size(bounds.size.width, px(*header_height)),
+                ),
+                rgba(0xf1f5f2ff),
+            ));
+        }
+    }
+    // Find matches sit over the header fill and under the glyphs, as in
+    // text blocks; the caller's content mask clips them to the table.
+    for (rect, primary) in find {
+        let color = if *primary {
+            rgba(0xf59e0b80)
+        } else {
+            rgba(0xfde68a99)
+        };
+        window.paint_quad(fill(
+            Bounds::new(bounds.origin + rect.origin, rect.size),
+            color,
+        ));
+    }
     let mut top = bounds.top();
     for (row_index, (cells, height)) in table_layout
         .cells
@@ -904,15 +1095,6 @@ fn paint_table_layout(
         .enumerate()
     {
         let row_height = px(*height);
-        if table.header && row_index == 0 {
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(bounds.left(), top),
-                    gpui::size(bounds.size.width, row_height),
-                ),
-                rgba(0xf1f5f2ff),
-            ));
-        }
         for (column, cell_layout) in cells.iter().enumerate() {
             let cell = Bounds::new(
                 point(bounds.left() + column_width * column as f32, top),
@@ -933,7 +1115,9 @@ fn paint_table_layout(
             window.with_content_mask(Some(gpui::ContentMask { bounds: cell }), |window| {
                 for piece in &cell_layout.pieces {
                     match piece {
-                        CellPiece::Text { top, lines, runs, .. } => {
+                        CellPiece::Text {
+                            top, lines, runs, ..
+                        } => {
                             #[cfg(test)]
                             observed
                                 .runs
@@ -944,6 +1128,7 @@ fn paint_table_layout(
                                     underline: marks.underline,
                                     strikethrough: marks.strikethrough,
                                     highlight: marks.highlight,
+                                    highlight_color: marks.highlight_color,
                                     link: marks.link,
                                 }));
                             let _ = runs;
@@ -1455,6 +1640,7 @@ mod tests {
             table_layout: None,
             table_images: Vec::new(),
             table_scroll_offset: 0.0,
+            table_find: Vec::new(),
         }
     }
 

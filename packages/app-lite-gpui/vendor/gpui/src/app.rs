@@ -2038,6 +2038,12 @@ impl App {
                 .or_default(),
         );
 
+        #[cfg(target_os = "macos")]
+        crate::platform::trace_window_frame("entity_notify", || serde_json::json!({
+            "entity": format!("{entity_id:?}"),
+            "windows": window_invalidators.len(),
+        }));
+
         if window_invalidators.is_empty() {
             if self.pending_notifications.insert(entity_id) {
                 self.pending_effects

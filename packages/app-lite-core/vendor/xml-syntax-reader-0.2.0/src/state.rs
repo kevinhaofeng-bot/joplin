@@ -66,53 +66,86 @@ pub enum DtdPhase {
     /// Saw `<!-` — expecting second `-` for comment.
     AfterLtBangDash,
     /// Comment inside internal subset.
-    Comment { dash_count: u8 },
+    Comment {
+        dash_count: u8,
+    },
     /// Saw `<?` — reading PI target name.
-    PITarget { name_start: usize },
+    PITarget {
+        name_start: usize,
+    },
     /// PI content inside internal subset.
-    PIContent { saw_qmark: bool },
+    PIContent {
+        saw_qmark: bool,
+    },
 
     // --- Keyword matching after `<!` ---
     /// Matching keyword: `ELEMENT`, `ATTLIST`, `ENTITY`, `NOTATION`.
     /// `matched` is how many bytes of the keyword have matched so far.
-    MatchKeyword { kind: DtdDeclKind, matched: u8 },
+    MatchKeyword {
+        kind: DtdDeclKind,
+        matched: u8,
+    },
 
     // --- ELEMENT declaration ---
     ElementRequireWs,
     ElementBeforeName,
-    ElementName { name_start: usize },
+    ElementName {
+        name_start: usize,
+    },
     ElementAfterName,
-    ElementContentSpecKeyword { matched: u8 },
-    ElementContentModel { paren_depth: u32 },
+    ElementContentSpecKeyword {
+        matched: u8,
+    },
+    ElementContentModel {
+        paren_depth: u32,
+    },
     ElementAfterContentSpec,
 
     // --- ATTLIST declaration ---
     AttlistRequireWs,
     AttlistBeforeName,
-    AttlistName { name_start: usize },
+    AttlistName {
+        name_start: usize,
+    },
     /// Between attributes or before `>`.
     AttlistIdle,
-    AttlistAttrName { name_start: usize },
+    AttlistAttrName {
+        name_start: usize,
+    },
     AttlistBeforeType,
     /// Scanning type keyword or `(` for enumeration.
     AttlistTypeStart,
     /// Inside type keyword text.
-    AttlistTypeKeyword { start: usize },
+    AttlistTypeKeyword {
+        start: usize,
+    },
     /// Inside parenthesized type enumeration.
-    AttlistTypeEnum { paren_depth: u32 },
+    AttlistTypeEnum {
+        paren_depth: u32,
+    },
     /// After `NOTATION` keyword, before `(`.
     AttlistTypeNotationBeforeParen,
     AttlistBeforeDefault,
     /// Matching `#REQUIRED`, `#IMPLIED`, or `#FIXED`.
-    AttlistDefaultHash { start: usize },
+    AttlistDefaultHash {
+        start: usize,
+    },
     /// After `#FIXED`, before whitespace/quote.
     AttlistFixedBeforeValue,
     /// Inside default attribute value.
-    AttlistDefaultValue { quote: QuoteStyle },
+    AttlistDefaultValue {
+        quote: QuoteStyle,
+    },
     /// Entity ref inside default value.
-    AttlistDefaultEntityRef { name_start: usize, quote: QuoteStyle },
+    AttlistDefaultEntityRef {
+        name_start: usize,
+        quote: QuoteStyle,
+    },
     /// `&#` in default value.
-    AttlistDefaultCharRef { value_start: usize, quote: QuoteStyle },
+    AttlistDefaultCharRef {
+        value_start: usize,
+        quote: QuoteStyle,
+    },
 
     // --- ENTITY declaration ---
     EntityRequireWs,
@@ -120,30 +153,58 @@ pub enum DtdPhase {
     EntityCheckPercent,
     /// After `%`, requiring whitespace.
     EntityPercentRequireWs,
-    EntityBeforeName { kind: crate::types::EntityKind },
-    EntityName { name_start: usize, kind: crate::types::EntityKind },
+    EntityBeforeName {
+        kind: crate::types::EntityKind,
+    },
+    EntityName {
+        name_start: usize,
+        kind: crate::types::EntityKind,
+    },
     /// After entity name, before definition (need whitespace first).
-    EntityBeforeDef { kind: crate::types::EntityKind },
+    EntityBeforeDef {
+        kind: crate::types::EntityKind,
+    },
     /// After whitespace, determine entity value vs external ID.
-    EntityDefStart { kind: crate::types::EntityKind },
+    EntityDefStart {
+        kind: crate::types::EntityKind,
+    },
     /// Inside entity value.
-    EntityValue { quote: QuoteStyle },
-    EntityValueEntityRef { name_start: usize, quote: QuoteStyle },
-    EntityValueCharRef { value_start: usize, quote: QuoteStyle },
-    EntityValuePeRef { name_start: usize, quote: QuoteStyle },
+    EntityValue {
+        quote: QuoteStyle,
+    },
+    EntityValueEntityRef {
+        name_start: usize,
+        quote: QuoteStyle,
+    },
+    EntityValueCharRef {
+        value_start: usize,
+        quote: QuoteStyle,
+    },
+    EntityValuePeRef {
+        name_start: usize,
+        quote: QuoteStyle,
+    },
     /// After external ID, checking for NDATA or `>`.
-    EntityAfterExternalId { kind: crate::types::EntityKind },
+    EntityAfterExternalId {
+        kind: crate::types::EntityKind,
+    },
     /// Matching NDATA keyword.
-    EntityNdataKeyword { matched: u8 },
+    EntityNdataKeyword {
+        matched: u8,
+    },
     EntityNdataRequireWs,
-    EntityNdataName { name_start: usize },
+    EntityNdataName {
+        name_start: usize,
+    },
     /// After entity definition, expecting `>`.
     EntityBeforeClose,
 
     // --- NOTATION declaration ---
     NotationRequireWs,
     NotationBeforeName,
-    NotationName { name_start: usize },
+    NotationName {
+        name_start: usize,
+    },
     /// After name, before SYSTEM/PUBLIC.
     NotationBeforeDef,
     /// After external ID, before `>`.
@@ -151,22 +212,44 @@ pub enum DtdPhase {
 
     // --- Shared External ID scanning ---
     /// Matching `SYSTEM` keyword.
-    ExternalIdSystemKw { ctx: DtdDeclContext, matched: u8 },
+    ExternalIdSystemKw {
+        ctx: DtdDeclContext,
+        matched: u8,
+    },
     /// Matching `PUBLIC` keyword.
-    ExternalIdPublicKw { ctx: DtdDeclContext, matched: u8 },
+    ExternalIdPublicKw {
+        ctx: DtdDeclContext,
+        matched: u8,
+    },
     /// Before system literal quote.
-    ExternalIdBeforeSystemLit { ctx: DtdDeclContext },
+    ExternalIdBeforeSystemLit {
+        ctx: DtdDeclContext,
+    },
     /// Inside system literal.
-    ExternalIdSystemLit { ctx: DtdDeclContext, quote: QuoteStyle, literal_start: usize },
+    ExternalIdSystemLit {
+        ctx: DtdDeclContext,
+        quote: QuoteStyle,
+        literal_start: usize,
+    },
     /// Before public literal quote.
-    ExternalIdBeforePublicLit { ctx: DtdDeclContext },
+    ExternalIdBeforePublicLit {
+        ctx: DtdDeclContext,
+    },
     /// Inside public literal.
-    ExternalIdPublicLit { ctx: DtdDeclContext, quote: QuoteStyle, literal_start: usize },
+    ExternalIdPublicLit {
+        ctx: DtdDeclContext,
+        quote: QuoteStyle,
+        literal_start: usize,
+    },
     /// Between public and system literals.
-    ExternalIdBetweenLiterals { ctx: DtdDeclContext },
+    ExternalIdBetweenLiterals {
+        ctx: DtdDeclContext,
+    },
 
     // --- PE reference at internal subset level ---
-    PeRefName { name_start: usize },
+    PeRefName {
+        name_start: usize,
+    },
 }
 
 #[cfg(feature = "dtd")]
@@ -196,8 +279,9 @@ impl DtdPhase {
             DtdPhase::ExternalIdSystemLit { literal_start, .. }
             | DtdPhase::ExternalIdPublicLit { literal_start, .. } => *literal_start -= consumed,
 
-            DtdPhase::AttlistTypeKeyword { start }
-            | DtdPhase::AttlistDefaultHash { start } => *start -= consumed,
+            DtdPhase::AttlistTypeKeyword { start } | DtdPhase::AttlistDefaultHash { start } => {
+                *start -= consumed
+            }
 
             // All other variants have no buffer-relative positions.
             _ => {}
@@ -242,12 +326,18 @@ pub enum ParserState {
     /// Entity reference inside an attribute value: after `&`, scanning for `;`.
     /// `name_start` is the buffer position of the first character after `&`.
     /// `quote` records which AttrValue state to return to after `;`.
-    AttrEntityRef { name_start: usize, quote: QuoteStyle },
+    AttrEntityRef {
+        name_start: usize,
+        quote: QuoteStyle,
+    },
 
     /// Character reference inside an attribute value: after `&#`, scanning for `;`.
     /// `value_start` is the buffer position of the first character after `&#`.
     /// `quote` records which AttrValue state to return to after `;`.
-    AttrCharRef { value_start: usize, quote: QuoteStyle },
+    AttrCharRef {
+        value_start: usize,
+        quote: QuoteStyle,
+    },
 
     /// Inside `</`, reading the end tag name.
     /// `name_start` is the buffer position of the first name character.
@@ -261,7 +351,6 @@ pub enum ParserState {
     StartTagGotSlash,
 
     // --- Phase 2 states (comments, PIs, CDATA, DOCTYPE, references) ---
-
     /// After `<!`, need to determine comment, CDATA, or DOCTYPE.
     AfterLtBang,
 
@@ -294,7 +383,6 @@ pub enum ParserState {
     DoctypeContent { depth: u32, sub: DoctypeSubState },
 
     // --- DTD-specific ParserState variants (feature = "dtd") ---
-
     /// DTD internal subset tokenization. Actual phase in `Reader::dtd_phase`.
     #[cfg(feature = "dtd")]
     DtdInternalSubset,
@@ -330,7 +418,9 @@ impl ParserState {
             ParserState::AttrEntityRef { name_start, .. } => *name_start -= consumed,
             ParserState::AttrCharRef { value_start, .. } => *value_start -= consumed,
             ParserState::EndTagName { name_start } => *name_start -= consumed,
-            ParserState::DoctypeName { name_start } if *name_start < usize::MAX - 1 => *name_start -= consumed,
+            ParserState::DoctypeName { name_start } if *name_start < usize::MAX - 1 => {
+                *name_start -= consumed
+            }
             ParserState::PITarget { name_start } => *name_start -= consumed,
             ParserState::EntityRef { name_start } => *name_start -= consumed,
             ParserState::CharRef { value_start } => *value_start -= consumed,
@@ -353,8 +443,7 @@ impl ParserState {
             | ParserState::DoctypeContent { .. }
             | ParserState::PIContent { .. } => {}
             #[cfg(feature = "dtd")]
-            ParserState::DtdInternalSubset
-            | ParserState::DoctypeAfterSubset => {}
+            ParserState::DtdInternalSubset | ParserState::DoctypeAfterSubset => {}
         }
     }
 }

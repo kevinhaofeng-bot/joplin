@@ -1,0 +1,24 @@
+[Unit]
+Description=Joplin Lite isolated Docker runtime
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/volume1/Projects/joplin-lite-runtime
+ConditionPathExists=/volume1/Projects/joplin-lite-runtime/config/dockerd.json
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/dockerd --config-file=/volume1/Projects/joplin-lite-runtime/config/dockerd.json
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=60
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

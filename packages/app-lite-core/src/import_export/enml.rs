@@ -477,7 +477,7 @@ impl RenderContext<'_> {
                     tag
                 };
                 if tag == "a" {
-                    self.attrs(element, &["href"], path)?;
+                    self.attrs(element, &["href", "title"], path)?;
                     if element.children.iter().any(contains_media) {
                         return Err(blocked(
                             path,
@@ -502,7 +502,14 @@ impl RenderContext<'_> {
                     if runs == 0 {
                         return Err(blocked(path, "empty link cannot be represented"));
                     }
-                    let charge = href.len().saturating_mul(runs);
+                    let title = element.attrs.get("title");
+                    if title.is_some_and(|title| !crate::document::valid_link_title(title)) {
+                        return Err(blocked(path, "link title exceeds the text metadata budget"));
+                    }
+                    let charge = href
+                        .len()
+                        .saturating_add(title.map_or(0, |title| title.len()))
+                        .saturating_mul(runs);
                     self.conservative_link_bytes =
                         self.conservative_link_bytes.saturating_add(charge);
                     if self.conservative_link_bytes > MAX_RETAINED_LINK_BYTES {
@@ -510,6 +517,10 @@ impl RenderContext<'_> {
                     }
                     out.push_str("<a href=\"");
                     escape(href, out);
+                    if let Some(title) = title {
+                        out.push_str("\" title=\"");
+                        escape(title, out);
+                    }
                     out.push_str("\">");
                 } else if tag == "span" {
                     self.attrs(element, &["name"], path)?;
@@ -522,9 +533,21 @@ impl RenderContext<'_> {
                             .get("color")
                             .and_then(|value| crate::document::TextColor::parse(value))
                     });
-                    if let Some(color) = color {
+                    let background = style_background(style);
+                    if color.is_some() || background.is_some() {
                         out.push_str("<span style=\"");
-                        escape(&color.style(), out);
+                        if let Some(color) = color {
+                            escape(&color.style(), out);
+                            out.push_str("; ");
+                        }
+                        if let Some(background) = background {
+                            out.push_str("background-color: ");
+                            escape(
+                                &background
+                                    .map_or_else(|| "transparent".into(), |color| color.css()),
+                                out,
+                            );
+                        }
                         out.push_str("\">");
                     }
                     for mark in &marks {
@@ -540,7 +563,7 @@ impl RenderContext<'_> {
                         out.push_str(mark);
                         out.push('>');
                     }
-                    if color.is_some() {
+                    if color.is_some() || background.is_some() {
                         out.push_str("</span>");
                     }
                     return Ok(());
@@ -548,6 +571,17 @@ impl RenderContext<'_> {
                     self.attrs(element, &[], path)?;
                     out.push('<');
                     out.push_str(tag);
+                    if tag == "mark"
+                        && let Some(background) =
+                            style_background(element.attrs.get("style").map(String::as_str))
+                    {
+                        out.push_str(" style=\"background-color: ");
+                        escape(
+                            &background.map_or_else(|| "transparent".into(), |color| color.css()),
+                            out,
+                        );
+                        out.push('"');
+                    }
                     out.push('>');
                 }
                 if tag == "br" {
@@ -998,6 +1032,40 @@ fn style_color(style: Option<&str>) -> Option<crate::document::TextColor> {
     color.map(|color| color.with_simple_inversion(simple))
 }
 
+fn style_background(style: Option<&str>) -> Option<Option<crate::document::TextColor>> {
+    let mut background = None;
+    let mut semantic = None;
+    for declaration in style.unwrap_or_default().split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        if matches!(
+            property.trim().to_ascii_lowercase().as_str(),
+            "background" | "background-color"
+        ) && let Some(color) = crate::document::highlighting_background(value)
+        {
+            background = Some(color);
+        }
+        if matches!(
+            property.trim().to_ascii_lowercase().as_str(),
+            "--en-highlight" | "-en-highlight"
+        ) {
+            semantic = match value.trim().to_ascii_lowercase().as_str() {
+                "yellow" => crate::document::TextColor::parse("#fdf3d0").map(Some),
+                "red" => crate::document::TextColor::parse("#ffe2d5").map(Some),
+                "green" => crate::document::TextColor::parse("#ddf8e1").map(Some),
+                "blue" => crate::document::TextColor::parse("#e0f7fd").map(Some),
+                "purple" => crate::document::TextColor::parse("#edf0ff").map(Some),
+                "orange" => crate::document::TextColor::parse("#feead4").map(Some),
+                "false" | "none" | "null" => Some(None),
+                _ => semantic,
+            };
+        }
+    }
+    // Explicit safe background, including transparent, wins over the key.
+    background.or(semantic)
+}
+
 fn style_marks(style: Option<&str>) -> Vec<&'static str> {
     let mut marks = Vec::new();
     for declaration in style.unwrap_or_default().split(';') {
@@ -1019,7 +1087,6 @@ fn style_marks(style: Option<&str>) -> Vec<&'static str> {
             "text-decoration" | "text-decoration-line" if value.contains("line-through") => {
                 Some("s")
             }
-            "--en-highlight" => Some("mark"),
             "vertical-align" if value == "super" => Some("sup"),
             "vertical-align" if value == "sub" => Some("sub"),
             _ => None,

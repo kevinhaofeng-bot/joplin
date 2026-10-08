@@ -32,6 +32,7 @@ fn library_shell_state_is_typed_strict_and_clears_stale_selection_atomically() {
         sidebar_visible: false,
         list_visible: true,
         selected_note_id: Some(selected.clone()),
+        location: Default::default(),
     };
 
     repository.write_library_shell_state(&state).unwrap();

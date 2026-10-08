@@ -16,6 +16,16 @@ impl LibraryShell {
         let Some(session) = self.note_session.clone() else {
             return;
         };
+        // A provisional IME composition is neither copied nor cut away.
+        if cut
+            && session.read_with(cx, |session, app| {
+                session.editor().read(app).marked_text().is_some()
+            })
+        {
+            self.resource_notice = Some("剪切未完成：输入法组合文本尚未确认".to_owned());
+            cx.notify();
+            return;
+        }
         let export = match session.read_with(cx, |session, app| session.copy_selection(app)) {
             Ok(Some(export)) => export,
             Ok(None) => return,
@@ -25,7 +35,12 @@ impl LibraryShell {
                 return;
             }
         };
-        write_clipboard_export(&export, cx);
+        // A cut deletes only what is really on the clipboard.
+        if let Err(error) = write_clipboard_export(&export, cx) {
+            self.resource_notice = Some(format!("复制未完成：{error}"));
+            cx.notify();
+            return;
+        }
         if !cut {
             return;
         }
@@ -48,6 +63,69 @@ impl LibraryShell {
 }
 
 impl LibraryShell {
+    /// Copy and cut in the open table cell, with the same structured export
+    /// as the body. `surface` is the cell surface the action came from: a
+    /// closed or replaced cell's event does nothing.
+    pub(super) fn copy_from_table_cell(
+        &mut self,
+        surface: gpui::EntityId,
+        cut: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self
+            .table_cell_editor
+            .as_ref()
+            .filter(|cell| cell.surface_id() == surface)
+            .map(|cell| cell.editor.clone())
+        else {
+            return;
+        };
+        let Some(session) = self.note_session.clone() else {
+            return;
+        };
+        if cut {
+            // Nothing is copied or deleted that could not then be deleted.
+            if self.active_session_is_read_only(cx) {
+                self.resource_notice = Some(self.resource_mutation_block_message("剪切", cx));
+                cx.notify();
+                return;
+            }
+            if editor.read(cx).marked_text().is_some() {
+                self.resource_notice = Some("剪切未完成：输入法组合文本尚未确认".to_owned());
+                cx.notify();
+                return;
+            }
+        }
+        let export =
+            match session.read_with(cx, |session, app| session.copy_selection_of(&editor, app)) {
+                Ok(Some(export)) => export,
+                Ok(None) => return,
+                Err(error) => {
+                    self.resource_notice = Some(format!("复制未完成：{error}"));
+                    cx.notify();
+                    return;
+                }
+            };
+        // A cut deletes only what is really on the clipboard.
+        if let Err(error) = write_clipboard_export(&export, cx) {
+            self.resource_notice = Some(format!("复制未完成：{error}"));
+            cx.notify();
+            return;
+        }
+        if !cut {
+            return;
+        }
+        let deleted = editor.update(cx, |editor, editor_cx| {
+            let result = editor.delete_selection();
+            editor_cx.notify();
+            result
+        });
+        if let Err(error) = deleted {
+            self.resource_notice = Some(format!("剪切未完成：{error}"));
+            cx.notify();
+        }
+    }
+
     /// Formatted content from another app lands at the caret at once; its
     /// images load behind it and a failure is reported when it happens.
     pub(super) fn paste_external_html(
@@ -85,14 +163,19 @@ impl LibraryShell {
     }
 }
 
+/// Whether the pasteboard took every representation: a cut deletes only
+/// after its copy is really on the clipboard.
 #[cfg(all(target_os = "macos", not(test)))]
-fn write_clipboard_export(export: &ClipboardExport, _cx: &mut App) {
+fn write_clipboard_export(export: &ClipboardExport, _cx: &mut App) -> Result<(), String> {
     use cocoa::appkit::{NSFilenamesPboardType, NSPasteboard, NSPasteboardTypeString};
-    use cocoa::base::{id, nil};
+    use cocoa::base::{NO, id, nil};
+    // NSAutoreleasePool only for its `autorelease` method; the pool itself
+    // is the scoped one below.
     use cocoa::foundation::{NSArray, NSAutoreleasePool, NSString};
-    let fragment = serde_json::to_string(&export.fragment).expect("fragment serializes");
-    unsafe {
-        let _pool = NSAutoreleasePool::new(nil);
+    let fragment = serde_json::to_string(&export.fragment).map_err(|error| error.to_string())?;
+    // The pool is drained when this scope ends, on success and on failure
+    // alike (as in main.rs).
+    objc::rc::autoreleasepool(|| unsafe {
         let ns = |text: &str| -> id { NSString::alloc(nil).init_str(text).autorelease() };
         let pasteboard = NSPasteboard::generalPasteboard(nil);
         let html_type = ns("public.html");
@@ -104,27 +187,39 @@ fn write_clipboard_export(export: &ClipboardExport, _cx: &mut App) {
         }
         pasteboard.clearContents();
         pasteboard.declareTypes_owner(NSArray::arrayWithObjects(nil, &types), nil);
-        pasteboard.setString_forType(ns(&export.plain), NSPasteboardTypeString);
-        pasteboard.setString_forType(ns(&export.html), html_type);
-        pasteboard.setString_forType(ns(&fragment), fragment_type);
+        let mut written = [
+            pasteboard.setString_forType(ns(&export.plain), NSPasteboardTypeString),
+            pasteboard.setString_forType(ns(&export.html), html_type),
+            pasteboard.setString_forType(ns(&fragment), fragment_type),
+        ]
+        .to_vec();
         if offer_files {
             let paths: Vec<id> = export
                 .files
                 .iter()
                 .map(|path| ns(&path.to_string_lossy()))
                 .collect();
-            pasteboard.setPropertyList_forType(
+            written.push(pasteboard.setPropertyList_forType(
                 NSArray::arrayWithObjects(nil, &paths),
                 NSFilenamesPboardType,
-            );
+            ));
         }
-    }
+        if written.contains(&NO) {
+            return Err("系统剪贴板没有接受写入".to_owned());
+        }
+        Ok(())
+    })
 }
 
 /// Tests and other platforms: GPUI's clipboard, with the fragment as its
 /// JSON metadata; tests also see what the pasteboard would have held.
 #[cfg(any(test, not(target_os = "macos")))]
-fn write_clipboard_export(export: &ClipboardExport, cx: &mut App) {
+fn write_clipboard_export(export: &ClipboardExport, cx: &mut App) -> Result<(), String> {
+    // Stands in for the pasteboard refusing a representation.
+    #[cfg(test)]
+    if FAIL_NEXT_CLIPBOARD_WRITE.with(|fail| fail.replace(false)) {
+        return Err("系统剪贴板没有接受写入".to_owned());
+    }
     cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
         export.plain.clone(),
         export.fragment.clone(),
@@ -138,6 +233,17 @@ fn write_clipboard_export(export: &ClipboardExport, cx: &mut App) {
             resource_only: export.resource_only,
         })
     });
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CLIPBOARD_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_clipboard_write_for_test() {
+    FAIL_NEXT_CLIPBOARD_WRITE.with(|fail| fail.set(true));
 }
 
 #[cfg(test)]

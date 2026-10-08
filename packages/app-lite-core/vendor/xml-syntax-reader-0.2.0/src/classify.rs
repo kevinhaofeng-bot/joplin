@@ -7,21 +7,21 @@ use crate::bitstream::BitPlanes;
 #[allow(dead_code)] // Individual fields verified in tests; reader uses composites
 pub struct CharClassMasks {
     // Individual character classes
-    pub lt: u64,        // '<' 0x3C
-    pub gt: u64,        // '>' 0x3E
-    pub amp: u64,       // '&' 0x26
-    pub dquote: u64,    // '"' 0x22
-    pub squote: u64,    // '\'' 0x27
-    pub eq: u64,        // '=' 0x3D
-    pub slash: u64,     // '/' 0x2F
-    pub qmark: u64,     // '?' 0x3F
-    pub bang: u64,      // '!' 0x21
-    pub dash: u64,      // '-' 0x2D
-    pub lbracket: u64,  // '[' 0x5B
-    pub rbracket: u64,  // ']' 0x5D
-    pub semicolon: u64, // ';' 0x3B
-    pub hash: u64,      // '#' 0x23
-    pub colon: u64,     // ':' 0x3A
+    pub lt: u64,         // '<' 0x3C
+    pub gt: u64,         // '>' 0x3E
+    pub amp: u64,        // '&' 0x26
+    pub dquote: u64,     // '"' 0x22
+    pub squote: u64,     // '\'' 0x27
+    pub eq: u64,         // '=' 0x3D
+    pub slash: u64,      // '/' 0x2F
+    pub qmark: u64,      // '?' 0x3F
+    pub bang: u64,       // '!' 0x21
+    pub dash: u64,       // '-' 0x2D
+    pub lbracket: u64,   // '[' 0x5B
+    pub rbracket: u64,   // ']' 0x5D
+    pub semicolon: u64,  // ';' 0x3B
+    pub hash: u64,       // '#' 0x23
+    pub colon: u64,      // ':' 0x3A
     pub whitespace: u64, // SP(0x20) TAB(0x09) LF(0x0A) CR(0x0D)
 
     // Composite masks (precomputed for common state machine needs)

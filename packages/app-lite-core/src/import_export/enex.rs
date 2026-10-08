@@ -845,6 +845,7 @@ fn correlate_resources(report: &mut EnexScanReport, used: &mut usize) -> Result<
 /// handle removes only that directory; it never names or mutates a live one.
 pub struct EnexStagedProfile {
     directory: TempDir,
+    lease: Option<File>,
     report: EnexStageReport,
 }
 
@@ -854,6 +855,9 @@ impl EnexStagedProfile {
     }
     pub(crate) fn into_directory(self) -> TempDir {
         self.directory
+    }
+    pub(crate) fn take_import_lease(&mut self) -> Option<File> {
+        self.lease.take()
     }
     pub fn report(&self) -> &EnexStageReport {
         &self.report
@@ -1137,6 +1141,7 @@ fn stage_enex_file_inner(
     let directory = tempfile::Builder::new()
         .prefix("enex-stage-")
         .tempdir_in(&parent)?;
+    let lease = super::import_staging::claim(directory.path())?;
     let profile_path = directory.path().to_path_buf();
     let database = profile_path.join("library.sqlite");
     let repository = Arc::new(LibraryRepository::open(&database)?);
@@ -1206,7 +1211,7 @@ fn stage_enex_file_inner(
     {
         return Err(EnexStageError::Cancelled);
     }
-    Ok(EnexStagedProfile { directory, report })
+    Ok(EnexStagedProfile { directory, lease: Some(lease), report })
 }
 
 fn parse_enex_date(raw: &str) -> Option<i64> {

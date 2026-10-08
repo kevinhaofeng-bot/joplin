@@ -1,4 +1,4 @@
-use crate::types::{is_xml_whitespace, DeclaredEncoding, Encoding};
+use crate::types::{DeclaredEncoding, Encoding, is_xml_whitespace};
 
 /// Result of probing the encoding of an XML document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,9 +199,7 @@ fn extract_encoding_from_decl(data: &[u8]) -> Option<DeclaredEncoding> {
 
 /// Find the first occurrence of `needle` in `haystack`.
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

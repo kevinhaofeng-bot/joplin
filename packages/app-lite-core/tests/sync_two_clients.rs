@@ -68,6 +68,55 @@ fn save(client: &Client, id: &NoteId, title: &str, body: &str) {
 }
 
 #[test]
+fn colored_highlights_sync_and_reopen_on_both_clients_without_collapse() {
+    let (_root, store) = server();
+    let a = client();
+    let b = client();
+    let first = CanonicalDocument::parse_pasted_html(
+        "<p><span style=\"background-color:#ffe2d5\">红中文</span><span style=\"background-color:#ddf8e1\">绿😀</span>普通</p>",
+    ).unwrap().document;
+    let note = a
+        .repo
+        .create_note(CreateNote {
+            title: "六色同步".into(),
+            notebook_id: None,
+            document: first.clone(),
+        })
+        .unwrap();
+    sync(&a, &store);
+    sync(&b, &store);
+    let received = b.repo.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(
+        CanonicalDocument::parse_html(received.body_html.as_str()).unwrap(),
+        first
+    );
+    let second = CanonicalDocument::parse_pasted_html(
+        "<p><span style=\"background-color:#e0f7fd\">蓝中文</span><span style=\"background-color:#feead4\">橙😀</span>普通</p>",
+    ).unwrap().document;
+    b.repo
+        .save_note(SaveNote {
+            id: note.id.clone(),
+            expected_revision: received.revision,
+            title: received.title,
+            document: second.clone(),
+            resource_ids: vec![],
+            selected_thumbnail_id: None,
+        })
+        .unwrap();
+    sync(&b, &store);
+    sync(&a, &store);
+    for client in [&a, &b] {
+        let reopened = LibraryRepository::open(client._root.path().join("library.sqlite")).unwrap();
+        let loaded = reopened.load_note(&note.id).unwrap().unwrap();
+        assert_eq!(
+            CanonicalDocument::parse_html(loaded.body_html.as_str()).unwrap(),
+            second
+        );
+        assert_eq!(loaded.body_text.as_str(), "蓝中文橙😀普通");
+    }
+}
+
+#[test]
 fn a_new_device_receives_notes_organization_and_adopts_the_default_notebook() {
     let (_server_root, store) = server();
     let a = client();
@@ -310,14 +359,30 @@ fn a_malformed_remote_body_is_a_visible_failure_and_does_not_block_later_changes
 fn legacy_note_payload_works_but_invalid_cover_references_are_rejected() {
     let (_root, store) = server();
     let a = client();
-    let resource = a.repo.import_resource(b"file", "test.txt", "text/plain", "txt").unwrap();
+    let resource = a
+        .repo
+        .import_resource(b"file", "test.txt", "text/plain", "txt")
+        .unwrap();
     let document = CanonicalDocument::from_blocks(vec![Block::Attachment {
-        resource_id: resource.clone(), filename: "test.txt".into(), media_type: "text/plain".into(),
+        resource_id: resource.clone(),
+        filename: "test.txt".into(),
+        media_type: "text/plain".into(),
     }]);
-    a.repo.create_note(CreateNote { title: "seed".into(), notebook_id: None, document: document.clone() }).unwrap();
+    a.repo
+        .create_note(CreateNote {
+            title: "seed".into(),
+            notebook_id: None,
+            document: document.clone(),
+        })
+        .unwrap();
     sync(&a, &store);
-    let variants = [None, Some(serde_json::json!(7)), Some(serde_json::json!("../invalid")),
-        Some(serde_json::json!("a".repeat(32))), Some(serde_json::json!(resource.as_str()))];
+    let variants = [
+        None,
+        Some(serde_json::json!(7)),
+        Some(serde_json::json!("../invalid")),
+        Some(serde_json::json!("a".repeat(32))),
+        Some(serde_json::json!(resource.as_str())),
+    ];
     let device = "e".repeat(32);
     for (index, cover) in variants.into_iter().enumerate() {
         let mut payload = serde_json::json!({
@@ -326,21 +391,42 @@ fn legacy_note_payload_works_but_invalid_cover_references_are_rejected() {
             "tag_ids": [], "resource_ids": [resource.as_str()],
             "created_time": 1, "updated_time": 1, "deleted_time": 0,
         });
-        if let Some(cover) = cover { payload["selected_thumbnail_id"] = cover; }
-        store.push(PushRequest {
-            protocol: PROTOCOL_VERSION, device_id: device.clone(), ops: vec![Operation {
-                op_id: format!("{:032x}", index + 100), device_id: device.clone(),
-                entity: EntityRef { kind: EntityKind::Note, id: format!("{:032x}", index + 1) },
-                base_revision: 0, action: Action::Put { payload },
-            }],
-        }).unwrap();
+        if let Some(cover) = cover {
+            payload["selected_thumbnail_id"] = cover;
+        }
+        store
+            .push(PushRequest {
+                protocol: PROTOCOL_VERSION,
+                device_id: device.clone(),
+                ops: vec![Operation {
+                    op_id: format!("{:032x}", index + 100),
+                    device_id: device.clone(),
+                    entity: EntityRef {
+                        kind: EntityKind::Note,
+                        id: format!("{:032x}", index + 1),
+                    },
+                    base_revision: 0,
+                    action: Action::Put { payload },
+                }],
+            })
+            .unwrap();
     }
     let b = client();
     let report = sync(&b, &store);
     assert_eq!(report.skipped, 4);
-    assert!(b.repo.load_note(&NoteId::parse(format!("{:032x}", 1)).unwrap()).unwrap().is_some());
+    assert!(
+        b.repo
+            .load_note(&NoteId::parse(format!("{:032x}", 1)).unwrap())
+            .unwrap()
+            .is_some()
+    );
     for index in 2..=5 {
-        assert!(b.repo.load_note(&NoteId::parse(format!("{index:032x}")).unwrap()).unwrap().is_none());
+        assert!(
+            b.repo
+                .load_note(&NoteId::parse(format!("{index:032x}")).unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
     assert_eq!(b.repo.sync_failures().unwrap().len(), 4);
 }
@@ -756,4 +842,72 @@ fn round_trip_through_another_device(html: &str, edited: &str) {
         edited
     );
     drop(root);
+}
+
+// An existing notebook joining a stack, a new stack, and leaving it reaches
+// the other device as the same notebook (stable ID) with the right stack.
+#[test]
+fn notebook_stack_membership_changes_reach_another_device_under_the_same_ids() {
+    let (_server_root, store) = server();
+    let a = client();
+    let group = a.repo.create_stack("工作").unwrap();
+    let notebook = a.repo.create_notebook("合同", None).unwrap();
+    let note = a
+        .repo
+        .create_note(CreateNote {
+            title: "合同草稿".into(),
+            notebook_id: Some(notebook.id.clone()),
+            document: text("甲方乙方"),
+        })
+        .unwrap();
+    sync(&a, &store);
+    let b = client();
+    sync(&b, &store);
+
+    let membership = |client: &Client| {
+        let index = client.repo.list_navigation_index().unwrap();
+        let books: Vec<_> = index
+            .notebooks
+            .iter()
+            .filter(|book| book.title == "合同")
+            .map(|book| (book.id.clone(), book.stack_id.clone()))
+            .collect();
+        (books, index.stacks.len())
+    };
+
+    a.repo
+        .set_notebook_stack(&notebook.id, Some(&group.id))
+        .unwrap();
+    sync(&a, &store);
+    sync(&b, &store);
+    assert_eq!(
+        membership(&b).0,
+        vec![(notebook.id.clone(), Some(group.id.clone()))]
+    );
+
+    let fresh = a
+        .repo
+        .create_stack_for_notebook(&notebook.id, "新组")
+        .unwrap();
+    sync(&a, &store);
+    sync(&b, &store);
+    assert_eq!(
+        membership(&b).0,
+        vec![(notebook.id.clone(), Some(fresh.id.clone()))]
+    );
+
+    a.repo.set_notebook_stack(&notebook.id, None).unwrap();
+    sync(&a, &store);
+    sync(&b, &store);
+    // Syncing again changes nothing and duplicates nothing.
+    sync(&a, &store);
+    sync(&b, &store);
+    let (books, stacks) = membership(&b);
+    assert_eq!(books, vec![(notebook.id.clone(), None)]);
+    assert_eq!(stacks, membership(&a).1, "both stacks, once each");
+    assert_eq!(
+        b.repo.load_note(&note.id).unwrap().unwrap().notebook_id,
+        notebook.id
+    );
+    assert_eq!(b.repo.outbox_count().unwrap(), 0);
 }

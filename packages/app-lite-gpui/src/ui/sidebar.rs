@@ -5,7 +5,7 @@
 //! consumer of `NoteProjection` rows owned by `AppModel`.
 
 use super::LibraryShell;
-use app_lite_core::{LibraryNavigationIndex, LibraryRoute};
+use app_lite_core::{LibraryNavigationIndex, LibraryRoute, LibraryShortcut, NoteId, ShortcutTarget};
 use gpui::{
     App, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
     UniformListScrollHandle, Window, div, px, rgba, uniform_list,
@@ -26,6 +26,7 @@ struct RouteRow {
 enum SidebarEntry {
     Heading(&'static str),
     Route(RouteRow),
+    Shortcut(LibraryShortcut),
 }
 
 /// Builds the source-backed sidebar tree without touching a note projection.
@@ -39,6 +40,10 @@ fn entries(index: &LibraryNavigationIndex) -> Vec<SidebarEntry> {
         indent: 0,
     })];
 
+    if !index.shortcuts.is_empty() {
+        result.push(SidebarEntry::Heading("快捷入口"));
+        result.extend(index.shortcuts.iter().cloned().map(SidebarEntry::Shortcut));
+    }
     result.push(SidebarEntry::Heading("笔记本"));
     for stack in &index.stacks {
         result.push(SidebarEntry::Route(RouteRow {
@@ -104,17 +109,20 @@ fn entries(index: &LibraryNavigationIndex) -> Vec<SidebarEntry> {
 /// That lets GPUI's real `uniform_list` provide a bounded dynamic scroll area
 /// for large notebook/tag trees, matching the donor nav rather than clipping a
 /// fully materialized column at the window edge.
-pub fn render<F>(
+pub fn render<F, S>(
     width: u16,
     visible: bool,
     index: &LibraryNavigationIndex,
     selected_route: &LibraryRoute,
+    selected_note: Option<&NoteId>,
     scroll_handle: UniformListScrollHandle,
     cx: &mut Context<LibraryShell>,
     on_navigate: F,
+    on_shortcut: S,
 ) -> gpui::AnyElement
 where
     F: Fn(LibraryRoute, &mut Window, &mut App) + Clone + 'static,
+    S: Fn(ShortcutTarget, &mut Window, &mut App) + Clone + 'static,
 {
     let width = if visible { f32::from(width) } else { 0.0 };
     let mut pane = div()
@@ -133,6 +141,7 @@ where
 
     let rows = entries(index);
     let selected_for_processor = selected_route.clone();
+    let selected_note_for_processor = selected_note.cloned();
     let list = uniform_list(
         "library-sidebar-items",
         rows.len(),
@@ -143,7 +152,8 @@ where
             let _ = shell;
             range
                 .filter_map(|index| rows.get(index).cloned())
-                .map(|entry| render_entry(entry, &selected_for_processor, on_navigate.clone()))
+                .map(|entry| render_entry(entry, &selected_for_processor,
+                    selected_note_for_processor.as_ref(), on_navigate.clone(), on_shortcut.clone()))
                 .collect::<Vec<_>>()
         }),
     )
@@ -158,13 +168,16 @@ where
         .into_any_element()
 }
 
-fn render_entry<F>(
+fn render_entry<F, S>(
     entry: SidebarEntry,
     selected_route: &LibraryRoute,
+    selected_note: Option<&NoteId>,
     on_navigate: F,
+    on_shortcut: S,
 ) -> gpui::AnyElement
 where
     F: Fn(LibraryRoute, &mut Window, &mut App) + Clone + 'static,
+    S: Fn(ShortcutTarget, &mut Window, &mut App) + Clone + 'static,
 {
     match entry {
         SidebarEntry::Heading(label) if !label.is_empty() => div()
@@ -181,6 +194,30 @@ where
             .h(px(SIDEBAR_ENTRY_HEIGHT))
             .w_full()
             .into_any_element(),
+        SidebarEntry::Shortcut(shortcut) => {
+            let selected = match &shortcut.target {
+                ShortcutTarget::Note(id) => selected_note == Some(id),
+                ShortcutTarget::Notebook(id) => selected_route == &LibraryRoute::Notebook(id.clone()),
+                ShortcutTarget::Stack(id) => selected_route == &LibraryRoute::Stack(id.clone()),
+                ShortcutTarget::Tag(id) => matches!(selected_route, LibraryRoute::Tags(ids) if ids.len() == 1 && ids.contains(id)),
+            };
+            let selector = format!("library-sidebar-shortcut-{}", shortcut.id);
+            let row_id = stable_row_id(&selector);
+            let label = if shortcut.title.is_empty() { "无标题笔记".to_owned() } else { shortcut.title };
+            div().id(("library-sidebar-shortcut", row_id))
+                .debug_selector(move || selector.clone())
+                .h(px(SIDEBAR_ENTRY_HEIGHT)).w_full().px(px(10.0)).rounded(px(5.0))
+                .flex().items_center().gap(px(7.0)).overflow_hidden().text_size(px(13.0))
+                .cursor_pointer().bg(if selected { rgba(0x00a82d19) } else { rgba(0x00000000) })
+                .hover(|row| row.bg(rgba(0x00a82d10)))
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    window.prevent_default();
+                    on_shortcut(shortcut.target.clone(), window, cx);
+                })
+                .child(div().text_color(rgba(0x438250ff)).child("☆"))
+                .child(div().min_w(px(0.0)).truncate().child(label))
+                .into_any_element()
+        }
         SidebarEntry::Route(row) => {
             let selected = row.route == *selected_route;
             let route = row.route.clone();
@@ -274,6 +311,7 @@ mod tests {
             notebooks: vec![notebook.clone()],
             stacks: vec![stack.clone()],
             tags: vec![tag.clone()],
+            shortcuts: vec![],
         });
         assert!(entries.iter().any(|entry| matches!(
             entry,

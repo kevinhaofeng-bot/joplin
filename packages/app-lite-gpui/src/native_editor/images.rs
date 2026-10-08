@@ -808,17 +808,30 @@ pub fn resolve_clipboard_payload(
             ..ClipboardPayload::default()
         });
     }
+    // This app's own copy, from its native fragment type: GPUI sees only the
+    // plain text written beside it.
+    if native.fragment.is_some() {
+        return Some(native);
+    }
     let Some(gpui) = gpui else {
         return Some(native);
     };
+    let native_has_content = !native.images.is_empty()
+        || !native.file_urls.is_empty()
+        || native.html.is_some()
+        || native.rich_text.is_some();
     // A pasteboard can expose a plain-text representation alongside a GPUI
     // image entry. Merge representations before classification so the
     // image-first policy is preserved instead of letting native plain text
     // suppress the image returned by GPUI.
     Some(ClipboardPayload {
-        // Only GPUI reads its own metadata type; it is valid only while the
-        // plain text is still the one it was written with.
-        fragment: gpui.fragment,
+        // GPUI metadata (an older copy of this app's) beside another app's
+        // current content is stale.
+        fragment: if native_has_content {
+            None
+        } else {
+            gpui.fragment
+        },
         // Prefer the AppKit-owned byte copy over GPUI's duplicate image
         // representation; Finder file URLs still retain their own source.
         images: if !native.file_urls.is_empty() {
@@ -2543,6 +2556,11 @@ impl BudgetedImageCache {
         budget_bytes: usize,
         max_edge: u32,
     ) -> Result<Arc<RenderImage>, ImageCacheError> {
+        if let Some(proxy) = super::png_proxy::decode_plain_png(path, budget_bytes, max_edge) {
+            let buffer = ImageBuffer::from_raw(proxy.width, proxy.height, proxy.bgra)
+                .ok_or_else(|| ImageCacheError::from(anyhow!("plain PNG pixels invalid")))?;
+            return Ok(Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(buffer)])));
+        }
         use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType, CFURL};
         use objc2_core_foundation::{CGPoint, CGRect, CGSize};
         use objc2_core_graphics::{
@@ -2609,7 +2627,10 @@ impl BudgetedImageCache {
                 .checked_mul(height)
                 .and_then(|pixels| pixels.checked_mul(4))
                 .ok_or_else(|| ImageCacheError::from(anyhow!("thumbnail dimensions overflow")))?;
-            let mut pixels = vec![0u8; output_len];
+            let (mut pixels, needs_draw) = match super::image_pixels::copy_cgimage(&image, budget_bytes) {
+                Some(pixels) => (pixels, false),
+                None => (vec![0u8; output_len], true),
+            };
             let color_space = CGColorSpace::new_device_rgb().ok_or_else(|| {
                 ImageCacheError::from(anyhow!("CoreGraphics could not create RGB color space"))
             })?;
@@ -2618,7 +2639,7 @@ impl BudgetedImageCache {
                 .ok_or_else(|| ImageCacheError::from(anyhow!("thumbnail row overflows")))?;
             let bitmap_info =
                 CGImageAlphaInfo::PremultipliedFirst.0 | CGImageByteOrderInfo::Order32Little.0;
-            {
+            if needs_draw {
                 let context = unsafe {
                     CGBitmapContextCreate(
                         pixels.as_mut_ptr().cast(),
@@ -3240,6 +3261,20 @@ unsafe fn native_image_payload(
         .unwrap_or(NativeImageRead::Rejected)
 }
 
+/// The payload for this app's own fragment type as the native reader finds
+/// it: the fragment and its plain text, nothing else.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn native_fragment_payload(json: &str) -> Option<ClipboardPayload> {
+    let fragment = serde_json::from_str::<ClipboardFragment>(json)
+        .ok()
+        .filter(|fragment| fragment.version == CLIPBOARD_FRAGMENT_VERSION)?;
+    Some(ClipboardPayload {
+        text: Some(fragment.plain.clone()),
+        fragment: Some(fragment),
+        ..ClipboardPayload::default()
+    })
+}
+
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     // Narrow AppKit bridge: only pasteboard extraction happens here. The
@@ -3256,15 +3291,11 @@ pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
         let fragment_type = NSString::alloc(nil)
             .init_str(FRAGMENT_PASTEBOARD_TYPE)
             .autorelease();
-        if let Some(fragment) = native_string_value(pasteboard.stringForType(fragment_type))
-            .and_then(|json| serde_json::from_str::<ClipboardFragment>(&json).ok())
-            .filter(|fragment| fragment.version == CLIPBOARD_FRAGMENT_VERSION)
+        if let Some(payload) = native_string_value(pasteboard.stringForType(fragment_type))
+            .as_deref()
+            .and_then(native_fragment_payload)
         {
-            return Some(ClipboardPayload {
-                text: Some(fragment.plain.clone()),
-                fragment: Some(fragment),
-                ..ClipboardPayload::default()
-            });
+            return Some(payload);
         }
         match native_image_candidates_from(|format, uti, remaining_budget| {
             let ty = NSString::alloc(nil).init_str(uti).autorelease();
@@ -3341,9 +3372,27 @@ unsafe fn native_textual_forms(
 // GPUI's TestAppContext owns an in-memory clipboard but does not initialize
 // AppKit's general pasteboard. Keep the Paste action and payload resolution
 // real while replacing only the final OS read in unit tests.
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(all(not(test), not(target_os = "macos")))]
 pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
     None
+}
+
+// A test stands in for AppKit with what the native reader would return
+// for the next paste; nothing otherwise.
+#[cfg(test)]
+pub fn read_native_pasteboard() -> Option<ClipboardPayload> {
+    NEXT_NATIVE_PASTEBOARD_FOR_TEST.with(|next| next.borrow_mut().take())
+}
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_NATIVE_PASTEBOARD_FOR_TEST: std::cell::RefCell<Option<ClipboardPayload>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_next_native_pasteboard_for_test(payload: ClipboardPayload) {
+    NEXT_NATIVE_PASTEBOARD_FOR_TEST.with(|next| *next.borrow_mut() = Some(payload));
 }
 
 fn fixture_png_bytes() -> Vec<u8> {
@@ -3357,6 +3406,72 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use image::{ImageBuffer, Rgba};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_plain_png_decode_does_not_accumulate_native_bitmap_storage() {
+        const CHILD: &str = "JOPLIN_LITE_TEST_PNG_ALLOCATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "native_editor::images::tests::managed_plain_png_decode_does_not_accumulate_native_bitmap_storage", "--nocapture"])
+                .env(CHILD,"1").output().unwrap();
+            assert!(output.status.success(), "isolated actual-decoder child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        // A separate real process avoids global allocator statistics racing
+        // with unrelated CoreGraphics tests. No GUI or personal library opens.
+        #[repr(C)]
+        #[derive(Default)]
+        struct Statistics { blocks: u32, used: usize, high_water: usize, reserved: usize }
+        #[link(name="System")]
+        unsafe extern "C" {
+            fn malloc_default_purgeable_zone() -> *mut std::ffi::c_void;
+            fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut Statistics);
+        }
+        let source = image::RgbImage::from_pixel(2000,1500,image::Rgb([17,34,51]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(source).write_to(&mut encoded,image::ImageFormat::Png).unwrap();
+        let mut store = ImageStore::for_test();
+        store.insert_with_format(ImageMetadata::new("plain-allocation-263",2000,1500),encoded.into_inner(),ImageFormat::Png);
+        let path = store.source_path_for_resource("plain-allocation-263").unwrap().to_owned();
+        let mut before = Statistics::default();
+        unsafe { malloc_zone_statistics(malloc_default_purgeable_zone(), &mut before) };
+        for _ in 0..3 {
+            let rendered = BudgetedImageCache::decode_resource_bounded_with_max_edge(
+                &Resource::from(path.clone()),DECODED_IMAGE_CACHE_BUDGET,1024).unwrap();
+            assert_eq!((u32::from(rendered.size(0).width),u32::from(rendered.size(0).height)),(1024,768));
+            let pixels = rendered.as_bytes(0).unwrap();
+            assert_eq!(&pixels[..4], &[51,34,17,255]);
+            assert_eq!(&pixels[pixels.len()-4..], &[51,34,17,255]);
+            drop(rendered);
+        }
+        let mut after = Statistics::default();
+        unsafe { malloc_zone_statistics(malloc_default_purgeable_zone(), &mut after) };
+        assert_eq!(after.used,before.used,"managed plain PNG loading must not retain native thumbnail allocations");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_opaque_png_decode_keeps_row_order_and_bgra_channels() {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        let source = ImageBuffer::<image::Rgb<u8>, _>::from_raw(2, 3, vec![
+            255, 0, 0, 0, 255, 0, 0, 0, 255, 17, 31, 47, 128, 64, 32, 255, 255, 255,
+        ]).unwrap();
+        image::DynamicImage::ImageRgb8(source)
+            .write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        let mut store = ImageStore::for_test();
+        store.insert_with_format(ImageMetadata::new("opaque-260", 2, 3),
+            encoded.into_inner(), ImageFormat::Png);
+        let path = store.source_path_for_resource("opaque-260").unwrap().to_owned();
+        let result = BudgetedImageCache::decode_resource_bounded(
+            &Resource::from(path), DECODED_IMAGE_CACHE_BUDGET).unwrap();
+        assert_eq!(result.as_bytes(0).unwrap(), &[
+            0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 47, 31, 17, 255,
+            32, 64, 128, 255, 255, 255, 255, 255,
+        ]);
+        assert_eq!(result.frame_count(), 1);
+    }
 
     fn fixture_jpeg_bytes() -> Vec<u8> {
         let mut encoded = std::io::Cursor::new(Vec::new());
@@ -3589,6 +3704,133 @@ mod tests {
             classify_clipboard(merged),
             PasteIntent::Image { .. }
         ));
+    }
+
+    fn copied_fragment(html: &str, plain: &str) -> ClipboardFragment {
+        ClipboardFragment {
+            version: CLIPBOARD_FRAGMENT_VERSION,
+            html: html.into(),
+            plain: plain.into(),
+            resources: vec![FragmentResource {
+                id: "a".repeat(32),
+                sha256: "b".repeat(64),
+                title: "photo.png".into(),
+                mime: "image/png".into(),
+                file_extension: "png".into(),
+                size: 68,
+                file: None,
+            }],
+            open_start: true,
+            open_end: true,
+        }
+    }
+
+    // What the macOS reader returns for this app's own copy: the writer's
+    // JSON in the fragment type, read back by the production parser.
+    fn native_copy(fragment: &ClipboardFragment) -> ClipboardPayload {
+        native_fragment_payload(&serde_json::to_string(fragment).unwrap())
+            .expect("the native reader accepts this app's fragment")
+    }
+
+    fn gpui_plain(text: &str) -> ClipboardPayload {
+        ClipboardPayload::from_gpui(gpui::ClipboardItem::new_string(text.to_owned()))
+    }
+
+    fn gpui_with_metadata(fragment: &ClipboardFragment) -> ClipboardPayload {
+        ClipboardPayload::from_gpui(gpui::ClipboardItem::new_string_with_json_metadata(
+            fragment.plain.clone(),
+            fragment.clone(),
+        ))
+    }
+
+    // GPUI reads only the plain string beside the native fragment type (or
+    // nothing, or metadata from an older copy): the native fragment pastes.
+    #[test]
+    fn native_fragment_survives_whatever_gpui_reads_beside_it() {
+        let image = format!("<p><img src=\":/{}\" alt=\"\"></p>", "a".repeat(32));
+        let mixed = format!(
+            "<p>前<strong>粗</strong><img src=\":/{}\" alt=\"\">后</p>",
+            "a".repeat(32)
+        );
+        let only_image = copied_fragment(&image, "");
+        let formatted = copied_fragment(&mixed, "前粗后");
+        let older = copied_fragment("<p>前粗后</p>", "前粗后");
+        for (name, fragment, gpui) in [
+            ("image, GPUI empty plain", &only_image, Some(gpui_plain(""))),
+            ("image, no GPUI payload", &only_image, None),
+            (
+                "formatted, GPUI plain",
+                &formatted,
+                Some(gpui_plain("前粗后")),
+            ),
+            (
+                "formatted, older GPUI metadata",
+                &formatted,
+                Some(gpui_with_metadata(&older)),
+            ),
+        ] {
+            let merged =
+                resolve_clipboard_payload(Some(native_copy(fragment)), gpui).expect("a payload");
+            match classify_clipboard(merged) {
+                PasteIntent::Fragment { fragment: pasted } => {
+                    assert_eq!(&pasted, fragment, "{name}")
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        assert!(native_fragment_payload("{\"version\":1}").is_none());
+    }
+
+    // Another app's current native content still wins over metadata left by
+    // an older GPUI copy, and a rejected native image stays refused.
+    #[test]
+    fn older_gpui_metadata_does_not_override_current_native_content() {
+        let older = copied_fragment("<p>旧</p>", "旧");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(fixture_png_bytes());
+        for (name, native) in [
+            (
+                "rejected image",
+                ClipboardPayload {
+                    native_image_rejected: true,
+                    ..ClipboardPayload::default()
+                },
+            ),
+            (
+                "Finder file",
+                ClipboardPayload::default().with_file_url("/tmp/report.pdf"),
+            ),
+            (
+                "image bytes",
+                ClipboardPayload {
+                    images: vec![ImagePayload::new(ImageFormat::Png, fixture_png_bytes())],
+                    text: Some("旧".into()),
+                    ..ClipboardPayload::default()
+                },
+            ),
+            (
+                "encoded image",
+                ClipboardPayload {
+                    html: Some(format!("<img src=\"data:image/png;base64,{encoded}\">")),
+                    text: Some("旧".into()),
+                    ..ClipboardPayload::default()
+                },
+            ),
+        ] {
+            let alone =
+                classify_clipboard(resolve_clipboard_payload(Some(native.clone()), None).unwrap());
+            let merged = classify_clipboard(
+                resolve_clipboard_payload(Some(native), Some(gpui_with_metadata(&older))).unwrap(),
+            );
+            assert!(
+                !matches!(merged, PasteIntent::Fragment { .. }),
+                "{name}: {merged:?}"
+            );
+            assert_eq!(
+                std::mem::discriminant(&merged),
+                std::mem::discriminant(&alone),
+                "{name}"
+            );
+        }
     }
 
     #[test]

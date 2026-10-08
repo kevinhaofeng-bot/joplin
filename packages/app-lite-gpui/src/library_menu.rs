@@ -10,6 +10,7 @@ use crate::app::{
     BackupLibrary, CopyNote, CreateNote, CycleListViewMode, CycleSort, ExportCurrentNote,
     ExportLibraryReadable, ImportLibrary, InsertNoteTable, OpenSyncSettings, RestoreLibrary,
     RestoreLibraryReadable, ShowSyncFailures, SyncCurrent, SyncNow, ToggleNoteList, ToggleSidebar,
+    NavigateLibraryBack, NavigateLibraryForward,
     TrashSelected,
 };
 use crate::components::QuitApplication;
@@ -146,6 +147,8 @@ pub(crate) fn library_menu() -> Menu {
             MenuItem::action("移至废纸篓", TrashSelected),
             MenuItem::action("插入表格", InsertNoteTable),
             MenuItem::separator(),
+            MenuItem::action("后退", NavigateLibraryBack),
+            MenuItem::action("前进", NavigateLibraryForward),
             MenuItem::action("显示/隐藏侧栏", ToggleSidebar),
             MenuItem::action("显示/隐藏笔记列表", ToggleNoteList),
             MenuItem::action("切换列表视图", CycleListViewMode),

@@ -245,7 +245,11 @@ pub struct Marks {
     pub underline: bool,
     pub strikethrough: bool,
     pub highlight: bool,
+    /// Optional safe background color; None retains the legacy default mark.
+    pub highlight_color: Option<TextColor>,
     pub link: Option<String>,
+    /// Plain-text link tooltip, only meaningful together with a safe link.
+    pub link_title: Option<String>,
     pub inline_code: bool,
     pub script: Option<Script>,
     pub color: Option<TextColor>,
@@ -409,6 +413,9 @@ pub enum Script {
 pub struct ImagePresentation {
     pub natural_size: Option<(u32, u32)>,
     pub display_width: Option<u32>,
+    /// Alignment belongs to the image node, not its neighbouring paragraph.
+    /// None is the legacy/default left alignment.
+    pub alignment: Option<Alignment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -789,6 +796,11 @@ fn serialize_style_attributes(style: &BlockStyle, output: &mut String) {
 }
 
 fn search_text(document: &CanonicalDocument) -> String {
+    // Match serialize_html's empty-draft representation. Otherwise multiple
+    // empty editor paragraphs save HTML="" but text="\n", poisoning history.
+    if document.blocks.iter().all(block_is_empty) {
+        return String::new();
+    }
     let mut output = String::new();
     for (index, block) in document.blocks.iter().enumerate() {
         if index > 0 {
@@ -1126,6 +1138,9 @@ fn normalize_image_presentation(presentation: ImagePresentation) -> ImagePresent
     ImagePresentation {
         natural_size,
         display_width,
+        alignment: presentation
+            .alignment
+            .filter(|value| *value != Alignment::Left),
     }
 }
 
@@ -1145,6 +1160,11 @@ fn serialize_image_presentation(presentation: &ImagePresentation, output: &mut S
         output.push_str(" data-joplin-lite-display-width=\"");
         output.push_str(&width.to_string());
         output.push('\"');
+    }
+    match presentation.alignment {
+        Some(Alignment::Center) => output.push_str(" data-joplin-lite-image-align=\"center\""),
+        Some(Alignment::Right) => output.push_str(" data-joplin-lite-image-align=\"right\""),
+        Some(Alignment::Left) | None => {}
     }
 }
 
@@ -1221,13 +1241,22 @@ fn append_normalized_text(inlines: &mut Vec<Inline>, text: &str, marks: &Marks) 
 }
 
 fn normalize_marks(marks: &Marks) -> Marks {
+    let link = marks.link.clone().filter(|value| valid_link(value));
+    let link_title = marks
+        .link_title
+        .clone()
+        .filter(|value| link.is_some() && valid_link_title(value));
     Marks {
         bold: marks.bold,
         italic: marks.italic,
         underline: marks.underline,
         strikethrough: marks.strikethrough,
-        highlight: marks.highlight,
-        link: marks.link.clone().filter(|value| valid_link(value)),
+        highlight: marks.highlight || marks.highlight_color.is_some(),
+        highlight_color: marks
+            .highlight_color
+            .map(|color| color.with_simple_inversion(false)),
+        link,
+        link_title,
         inline_code: marks.inline_code,
         script: marks.script,
         color: marks.color,
@@ -1343,12 +1372,22 @@ fn serialize_text(
         if *tag == "a" {
             output.push_str("<a href=\"");
             escape_attribute(marks.link.as_deref().unwrap_or_default(), output);
+            if let Some(title) = &marks.link_title {
+                output.push_str("\" title=\"");
+                escape_attribute(title, output);
+            }
             output.push_str("\">");
         } else if *tag == "span"
             && let Some(color) = marks.color
         {
             output.push_str("<span style=\"");
             escape_attribute(&color.style(), output);
+            output.push_str("\">");
+        } else if *tag == "mark"
+            && let Some(color) = marks.highlight_color
+        {
+            output.push_str("<mark style=\"background-color: ");
+            escape_attribute(&color.css(), output);
             output.push_str("\">");
         } else {
             output.push('<');
@@ -2367,6 +2406,7 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         strikethrough: marks.strikethrough
                             || matches!(tag.as_str(), "del" | "s" | "strike"),
                         highlight: marks.highlight || tag == "mark",
+                        highlight_color: marks.highlight_color,
                         inline_code: marks.inline_code || tag == "code",
                         // The innermost one wins, as Evernote's `excludes`.
                         script: match tag.as_str() {
@@ -2383,22 +2423,33 @@ fn project_dom(root: &DomHandle, pasted: &mut Option<PastedState>) -> CanonicalD
                         } else {
                             None
                         },
+                        link_title: if marks.link.is_some() {
+                            marks.link_title.clone()
+                        } else if tag == "a" {
+                            attribute(&attrs.borrow(), "title")
+                                .filter(|value| valid_link_title(value))
+                                .map(Rc::from)
+                        } else {
+                            None
+                        },
                         color: marks.color,
                     };
                     // Inline CSS outranks the tag, as it does in a browser.
                     let next_marks = if pasted {
                         pasted_marks(&declarations, next_marks)
-                    } else if tag == "span"
-                        && let Some(color) = attribute(&attrs.borrow(), "style").and_then(|style| {
-                            declared_color(&parse_declarations(&style).collect::<Vec<_>>())
-                        })
-                    {
-                        // The stored form of a text colour.
-                        ProjectionMarks {
-                            color: Some(color),
-                            ..next_marks
-                        }
                     } else {
+                        let mut next_marks = next_marks;
+                        if let Some(style) = attribute(&attrs.borrow(), "style") {
+                            let declarations = parse_declarations(&style).collect::<Vec<_>>();
+                            if tag == "span"
+                                && let Some(color) = declared_color(&declarations)
+                            {
+                                next_marks.color = Some(color);
+                            }
+                            if matches!(tag.as_str(), "mark" | "span") {
+                                apply_highlight_declarations(&declarations, &mut next_marks);
+                            }
+                        }
                         next_marks
                     };
                     for child in children.into_iter().rev() {
@@ -2464,7 +2515,9 @@ struct ProjectionMarks {
     underline: bool,
     strikethrough: bool,
     highlight: bool,
+    highlight_color: Option<TextColor>,
     link: Option<Rc<str>>,
+    link_title: Option<Rc<str>>,
     inline_code: bool,
     script: Option<Script>,
     color: Option<TextColor>,
@@ -2476,7 +2529,9 @@ fn projection_marks_match(public: &Marks, projected: &ProjectionMarks) -> bool {
         && public.underline == projected.underline
         && public.strikethrough == projected.strikethrough
         && public.highlight == projected.highlight
+        && public.highlight_color == projected.highlight_color
         && public.link.as_deref() == projected.link.as_deref()
+        && public.link_title.as_deref() == projected.link_title.as_deref()
         && public.inline_code == projected.inline_code
         && public.script == projected.script
         && public.color == projected.color
@@ -2822,7 +2877,9 @@ impl Projection {
 
     fn materialize_marks(&mut self, projected: &ProjectionMarks) -> Marks {
         let link = projected.link.as_ref().and_then(|link| {
-            let length = link.len();
+            let length = link
+                .len()
+                .saturating_add(projected.link_title.as_ref().map_or(0, |title| title.len()));
             let within_budget = self
                 .retained_link_bytes
                 .checked_add(length)
@@ -2834,13 +2891,19 @@ impl Projection {
                 None
             }
         });
+        let link_title = link
+            .as_ref()
+            .and(projected.link_title.as_ref())
+            .map(|title| title.to_string());
         Marks {
             bold: projected.bold,
             italic: projected.italic,
             underline: projected.underline,
             strikethrough: projected.strikethrough,
             highlight: projected.highlight,
+            highlight_color: projected.highlight_color,
             link,
+            link_title,
             inline_code: projected.inline_code,
             script: projected.script,
             color: projected.color,
@@ -3027,6 +3090,11 @@ fn image_presentation(attrs: &[Attribute]) -> ImagePresentation {
     ImagePresentation {
         natural_size,
         display_width: image_dimension_attribute(attrs, "data-joplin-lite-display-width"),
+        alignment: match attribute(attrs, "data-joplin-lite-image-align").as_deref() {
+            Some("center") => Some(Alignment::Center),
+            Some("right") => Some(Alignment::Right),
+            _ => None,
+        },
     }
 }
 
@@ -3042,6 +3110,14 @@ fn image_dimension_attribute(attrs: &[Attribute], name: &str) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .filter(|&value| valid_persisted_image_dimension(value))
+}
+
+/// Bound tooltip metadata without treating it as a URL or displayed content.
+pub fn valid_link_title(value: &str) -> bool {
+    value.len() <= 4096
+        && !value
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r'))
 }
 
 pub(crate) fn valid_link(value: &str) -> bool {
@@ -3420,7 +3496,10 @@ fn pasted_marks(declarations: &[(String, String)], mut marks: ProjectionMarks) -
                 marks.strikethrough |= value.contains("line-through");
             }
             "background-color" | "background" => {
-                marks.highlight |= highlighting_background(value);
+                if let Some(color) = highlighting_background(value) {
+                    marks.highlight = color.is_some();
+                    marks.highlight_color = color;
+                }
             }
             "vertical-align" => match value.as_str() {
                 "super" => marks.script = Some(Script::Superscript),
@@ -3438,27 +3517,42 @@ fn pasted_marks(declarations: &[(String, String)], mut marks: ProjectionMarks) -
     marks
 }
 
-fn highlighting_background(value: &str) -> bool {
-    let compact = value.replace(' ', "");
-    let color = compact.split(['!', ')']).next().unwrap_or_default();
-    !(compact.is_empty()
-        || compact.starts_with("url(")
-        || matches!(
-            color,
-            "transparent"
-                | "initial"
-                | "inherit"
-                | "unset"
-                | "none"
-                | "white"
-                | "#fff"
-                | "#ffff"
-                | "#ffffff"
-                | "#ffffffff"
-                | "rgb(255,255,255"
-                | "rgba(255,255,255,1"
-        )
-        || (compact.starts_with("rgba(") && compact.ends_with(",0)")))
+fn apply_highlight_declarations(declarations: &[(String, String)], marks: &mut ProjectionMarks) {
+    for (name, value) in declarations {
+        if matches!(name.as_str(), "background" | "background-color")
+            && let Some(color) = highlighting_background(value)
+        {
+            marks.highlight = color.is_some();
+            marks.highlight_color = color;
+        }
+    }
+}
+
+/// Invalid declarations inherit; an explicit transparent/white color clears.
+/// Reuse the safe CSS parser, not arbitrary background strings. Evernote maps
+/// legacy palette colors to current semantic colors (defs.ts/schema.ts).
+pub(crate) fn highlighting_background(value: &str) -> Option<Option<TextColor>> {
+    let color = TextColor::parse(value)?.with_simple_inversion(false);
+    if color.alpha() == 0 || (color.alpha() == 255 && color.rgb() == [255, 255, 255]) {
+        return Some(None);
+    }
+    let color = if color.alpha() == 255 {
+        let rgb = match color.rgb() {
+            [0xff, 0xef, 0x9e] | [0xff, 0xfa, 0xa5] | [0xff, 0xcc, 0x66] | [0xf6, 0xee, 0x96] => {
+                [0xfd, 0xf3, 0xd0]
+            }
+            [0xfe, 0xc1, 0xd0] => [0xff, 0xe2, 0xd5],
+            [0xb7, 0xf7, 0xd1] => [0xdd, 0xf8, 0xe1],
+            [0xad, 0xec, 0xf4] => [0xe0, 0xf7, 0xfd],
+            [0xcb, 0xca, 0xff] => [0xed, 0xf0, 0xff],
+            [0xff, 0xd1, 0xb0] => [0xfe, 0xea, 0xd4],
+            rgb => rgb,
+        };
+        TextColor::new(rgb)
+    } else {
+        color
+    };
+    Some(Some(color))
 }
 
 fn pasted_block_style(
@@ -3557,6 +3651,7 @@ mod tests {
             presentation: ImagePresentation {
                 natural_size: Some((4032, 3024)),
                 display_width: Some(960),
+                alignment: None,
             },
             link: None,
         }]);
@@ -4559,7 +4654,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
             html,
             concat!(
                 "<h2 data-align=\"center\">Title <strong>bold</strong></h2>",
-                "<p>Plain <s><em><u>styled</u></em></s> <mark>marked</mark> clear <a href=\"https://example.com/x\">link</a></p>",
+                "<p>Plain <s><em><u>styled</u></em></s> <mark style=\"background-color: #ffff00\">marked</mark> clear <a href=\"https://example.com/x\">link</a></p>",
                 "<ul><li>one</li><li>two <img src=\":/image0\" alt=\"small\"></li></ul>",
                 "<p>before</p><img data-joplin-lite-block-image=\"true\" src=\":/image1\" alt=\"pic\"><p>after</p>",
                 // Evernote parseClipboard keeps a quote's paragraphs (quoteblock/schema.ts).
@@ -4619,7 +4714,7 @@ bad">控制字符</a><a href="//relative">相对路径</a></p>"#,
             styled.document.to_canonical_html().as_str(),
             concat!(
                 "<p data-align=\"center\"><strong>Head</strong></p>",
-                "<p>plain <strong>bold</strong> <em>ital</em> <u>under</u> <s>strike</s> <mark>mark</mark></p>"
+                "<p>plain <strong>bold</strong> <em>ital</em> <u>under</u> <s>strike</s> <mark style=\"background-color: #ffff0b\">mark</mark></p>"
             )
         );
         let canonical = CanonicalDocument::parse_html(

@@ -1,0 +1,7 @@
+# Context contains the SHA-verified, statically linked Linux product binary.
+# No registry download, package manager or shell inside the running image.
+FROM scratch
+COPY app-lite-server /app-lite-server
+USER 10001:10001
+ENTRYPOINT ["/app-lite-server"]
+CMD ["--root", "/data", "--listen", "0.0.0.0:8787"]

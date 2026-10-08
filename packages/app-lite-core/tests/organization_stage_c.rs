@@ -27,6 +27,14 @@ fn repository() -> (tempfile::TempDir, std::path::PathBuf, LibraryRepository) {
     (profile, path, repository)
 }
 
+// GC failure/shared-reference tests must exercise due queue entries rather
+// than bypass the production grace period. Only this isolated fixture ages.
+fn expire_queued_blobs(path: &std::path::Path) {
+    Connection::open(path).unwrap().execute(
+        "UPDATE resource_gc_queue SET created_time=0", [],
+    ).unwrap();
+}
+
 fn create_note(
     repository: &LibraryRepository,
     title: &str,
@@ -218,6 +226,90 @@ fn deleting_notebook_trashes_notes_and_deleting_tag_removes_its_route_relation()
     reopened.restore_note(&note).expect("restore");
     let restored = reopened.load_note(&note).expect("reload").expect("note");
     assert_eq!(restored.notebook_id, default.id, "its notebook is gone");
+}
+
+#[test]
+fn tag_deletion_324_preserves_live_and_trashed_rich_content_after_reopen() {
+    // The older combined test deletes the notebook first, so its note is
+    // already in Trash when the tag is deleted. Catch deletion accidentally
+    // trashing a live note, flattening rich text, or losing history-only bytes.
+    let (_profile, path, repository) = repository();
+    let removed = repository.create_tag("待删除324").unwrap();
+    let kept = repository.create_tag("保留324").unwrap();
+    let shared = repository.import_image(b"shared logical image bytes324", "shared.png", "image/png", "png").unwrap();
+    let historical = repository.import_resource(b"history-only bytes324", "history.txt", "text/plain", "txt").unwrap();
+    let rich = |text: &str, include_old: bool| {
+        let mut blocks = vec![Block::Paragraph {
+            style: BlockStyle::default(),
+            inlines: vec![
+                Inline::Text { text: text.into(), marks: app_lite_core::document::Marks {
+                    bold: true, underline: true, highlight: true,
+                    link: Some("https://example.com/324".into()), ..Default::default()
+                } },
+                Inline::Image { resource_id: shared.clone(), alt: "共同引用".into(), display_width: Some(200), link: None },
+            ],
+        }];
+        if include_old { blocks.push(Block::Attachment {
+            resource_id: historical.clone(), filename: "history.txt".into(), media_type: "text/plain".into(),
+        }); }
+        CanonicalDocument::from_blocks(blocks)
+    };
+    let first = repository.create_note(CreateNote {
+        title: "活笔记324".into(), notebook_id: None, document: rich("早期中文正文324", true),
+    }).unwrap();
+    let live = repository.save_note(SaveNote {
+        id: first.id, expected_revision: first.revision, title: first.title,
+        document: rich("最新中文正文324", false), resource_ids: vec![shared.clone()],
+        selected_thumbnail_id: Some(shared.clone()),
+    }).unwrap();
+    let trash = repository.create_note(CreateNote {
+        title: "废纸篓324".into(), notebook_id: None, document: rich("废纸篓中文324", false),
+    }).unwrap();
+    let untouched = repository.create_note(CreateNote {
+        title: "未关联标签324".into(), notebook_id: None, document: rich("无关正文324", false),
+    }).unwrap();
+    repository.set_tags_for_notes(&[live.id.clone(), trash.id.clone()], &[removed.id.clone(), kept.id.clone()]).unwrap();
+    repository.trash_note(&trash.id).unwrap();
+    let before: Vec<_> = [&live.id, &trash.id].into_iter().map(|id| (
+        repository.load_note(id).unwrap().unwrap(),
+        repository.readable_export_note_state(id, 100, 1024 * 1024).unwrap().unwrap(),
+    )).collect();
+    assert!(before[0].1.revisions.iter().any(|r| r.body_html.contains(historical.as_str())),
+        "fixture must retain an attachment only in history");
+    let queue_count = || Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+        .query_row("SELECT count(*) FROM sync_outbox", [], |row| row.get::<_, i64>(0)).unwrap();
+    let pending_before = queue_count();
+    repository.delete_tag(&removed.id).unwrap();
+    assert_eq!(queue_count(), pending_before + 3, "both notes and the tag must queue their real durable changes");
+    drop(repository);
+    let reopened = LibraryRepository::open(&path).unwrap();
+    for (old, history) in before {
+        let after = reopened.load_note(&old.id).unwrap().unwrap();
+        assert_eq!(after.id, old.id);
+        assert_eq!(after.title, old.title);
+        assert_eq!(after.body_html, old.body_html);
+        assert_eq!(after.body_text, old.body_text);
+        assert_eq!(after.snippet, old.snippet);
+        assert_eq!(after.notebook_id, old.notebook_id);
+        assert_eq!(after.created_time, old.created_time);
+        assert_eq!(after.deleted_time, old.deleted_time, "deleting a tag cannot change live/Trash state");
+        assert_eq!(after.resource_ids, old.resource_ids);
+        assert_eq!(after.tag_ids, vec![kept.id.clone()]);
+        assert_eq!(after.revision, old.revision + 1);
+        assert!(after.updated_time > old.updated_time);
+        assert_eq!(reopened.readable_export_note_state(&old.id, 100, 1024 * 1024).unwrap().unwrap(), history);
+    }
+    assert_eq!(reopened.load_note(&untouched.id).unwrap().unwrap(), untouched);
+    assert_eq!(reopened.read_resource_bytes(&shared).unwrap().unwrap(), b"shared logical image bytes324");
+    assert_eq!(reopened.read_resource_bytes(&historical).unwrap().unwrap(), b"history-only bytes324");
+    let tags = reopened.list_navigation_index().unwrap().tags;
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].id, kept.id);
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(db.query_row("SELECT count(*) FROM notes", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+    assert_eq!(db.query_row("SELECT count(*) FROM tombstones", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+    assert!(!db.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
 }
 
 /// Evernote's delete-notebook confirmation promises "Any notes in the
@@ -574,10 +666,10 @@ fn permanent_purge_reclaims_only_the_last_resource_occurrence_and_survives_reope
             .is_none(),
         "the final unique occurrence must not leave a resources row"
     );
-    assert!(
-        !blob_path(&unique_hash).exists(),
-        "the committed GC queue must reclaim the unreferenced unique blob"
-    );
+    assert!(blob_path(&unique_hash).exists(), "fresh orphan bytes wait for expiry");
+    expire_queued_blobs(&path);
+    let _collector = LibraryRepository::open(&path).unwrap();
+    assert!(!blob_path(&unique_hash).exists(), "due unique bytes are collected");
     assert!(
         repository
             .resource_metadata(&shared)
@@ -609,6 +701,9 @@ fn permanent_purge_reclaims_only_the_last_resource_occurrence_and_survives_reope
         .purge_note(&second_shared_note.id)
         .expect("purge final shared occurrence");
     assert!(repository.resource_metadata(&shared).unwrap().is_none());
+    assert!(blob_path(&shared_hash).exists());
+    expire_queued_blobs(&path);
+    let _collector = LibraryRepository::open(&path).unwrap();
     assert!(!blob_path(&shared_hash).exists());
 
     drop(repository);
@@ -702,6 +797,8 @@ fn failed_blob_unlink_stays_durable_and_is_recovered_on_the_next_open() {
         .purge_note(&note.id)
         .expect("database purge commits even when later cleanup is retryable");
     assert!(repository.resource_metadata(&resource).unwrap().is_none());
+    expire_queued_blobs(&path);
+    let _blocked_collector = LibraryRepository::open(&path).unwrap();
     assert!(
         blob.exists(),
         "failed unlink leaves only retryable disk garbage"
@@ -1150,6 +1247,9 @@ fn purging_several_notes_is_one_transaction_and_keeps_shared_attachments() {
         );
     }
     assert!(repository.resource_metadata(&own).unwrap().is_none());
+    assert!(own_blob.exists(), "fresh bytes have a grace period");
+    expire_queued_blobs(&path);
+    let _collector = LibraryRepository::open(&path).unwrap();
     assert!(!own_blob.exists());
     assert!(
         repository
@@ -1186,4 +1286,155 @@ fn purging_several_notes_is_one_transaction_and_keeps_shared_attachments() {
         reopened.load_note(&survivor).unwrap().unwrap().resource_ids,
         vec![shared_with_survivor]
     );
+}
+
+// Evernote stackAddNotebook / stackRemoveNotebook (main-readable module
+// 15467): the existing notebook's stack field changes, nothing else.
+#[test]
+fn existing_notebook_stack_assignment_keeps_identity_and_survives_reopen() {
+    let (_profile, path, repo) = repository();
+    let group = repo.create_stack("验收组").unwrap();
+    let book = repo.create_notebook("原本", None).unwrap();
+    let note_id = create_note(&repo, "保留原笔记", Some(book.id.clone()));
+    let assigned = repo.set_notebook_stack(&book.id, Some(&group.id)).unwrap();
+    assert_eq!(assigned.id, book.id);
+    assert_eq!(assigned.stack_id, Some(group.id.clone()));
+    let pending = repo.outbox_count().unwrap();
+    let repeated = repo.set_notebook_stack(&book.id, Some(&group.id)).unwrap();
+    assert_eq!(repeated.revision, assigned.revision);
+    assert_eq!(repo.outbox_count().unwrap(), pending);
+    drop(repo);
+    let reopened = LibraryRepository::open(path).unwrap();
+    let index = reopened.list_navigation_index().unwrap();
+    assert!(
+        index
+            .notebooks
+            .iter()
+            .any(|b| b.id == book.id && b.stack_id == Some(group.id.clone()))
+    );
+    let removed = reopened.set_notebook_stack(&book.id, None).unwrap();
+    assert_eq!(removed.id, book.id);
+    assert_eq!(removed.stack_id, None);
+    assert_eq!(
+        reopened.load_note(&note_id).unwrap().unwrap().notebook_id,
+        book.id
+    );
+    // Removing a notebook that is in no stack is no change (Evernote's
+    // stackRemoveNotebook returns an empty plan).
+    let pending = reopened.outbox_count().unwrap();
+    let again = reopened.set_notebook_stack(&book.id, None).unwrap();
+    assert_eq!(again.revision, removed.revision);
+    assert_eq!(reopened.outbox_count().unwrap(), pending);
+    assert!(
+        reopened
+            .list_navigation_index()
+            .unwrap()
+            .stacks
+            .iter()
+            .any(|stack| stack.id == group.id),
+        "removing a notebook keeps its former stack"
+    );
+}
+
+#[test]
+fn stack_assignment_refuses_missing_or_deleted_targets_without_change() {
+    let (_profile, _path, repo) = repository();
+    let group = repo.create_stack("组").unwrap();
+    let gone = repo.create_stack("已删组").unwrap();
+    repo.delete_stack(&gone.id).unwrap();
+    let book = repo.create_notebook("本", Some(&group.id)).unwrap();
+    let deleted_book = repo.create_notebook("已删本", None).unwrap();
+    repo.delete_notebook(&deleted_book.id).unwrap();
+    let missing_book = app_lite_core::NotebookId::parse("e".repeat(32)).unwrap();
+    let missing_stack = StackId::parse("f".repeat(32)).unwrap();
+    let before = repo.list_navigation_index().unwrap();
+    let pending = repo.outbox_count().unwrap();
+
+    assert!(
+        repo.set_notebook_stack(&missing_book, Some(&group.id))
+            .is_err()
+    );
+    assert!(
+        repo.set_notebook_stack(&book.id, Some(&missing_stack))
+            .is_err()
+    );
+    assert!(repo.set_notebook_stack(&book.id, Some(&gone.id)).is_err());
+    assert!(
+        repo.set_notebook_stack(&deleted_book.id, Some(&group.id))
+            .is_err()
+    );
+    assert!(
+        repo.create_stack_for_notebook(&missing_book, "新组")
+            .is_err()
+    );
+    assert!(
+        repo.create_stack_for_notebook(&deleted_book.id, "新组")
+            .is_err()
+    );
+    assert!(repo.create_stack_for_notebook(&book.id, "   ").is_err());
+
+    let after = repo.list_navigation_index().unwrap();
+    assert_eq!(after.stacks, before.stacks, "no stack created or changed");
+    assert_eq!(after.notebooks, before.notebooks, "no notebook changed");
+    assert_eq!(repo.outbox_count().unwrap(), pending);
+}
+
+// Evernote stackCreate: a new stack named for, and holding, the existing
+// notebook in one mutation plan. Notes, tags and images stay with the book.
+#[test]
+fn new_stack_for_an_existing_notebook_is_one_transaction() {
+    let (_profile, path, repo) = repository();
+    let book = repo.create_notebook("带图本", None).unwrap();
+    let tag = repo.create_tag("标签").unwrap();
+    let note_id = create_note(&repo, "带图笔记", Some(book.id.clone()));
+    let image = repo
+        .import_image(b"stack membership image", "photo", "image/png", "png")
+        .unwrap();
+    let note = repo.load_note(&note_id).unwrap().unwrap();
+    associate_images(&repo, &note, vec![image.clone()]);
+    repo.add_note_tag(&note_id, &tag.id).unwrap();
+    let note_before = repo.load_note(&note_id).unwrap().unwrap();
+
+    // A failure while moving the notebook must leave no new stack behind.
+    let blocker = Connection::open(&path).unwrap();
+    blocker
+        .execute_batch(
+            "CREATE TRIGGER block_stack_move BEFORE UPDATE OF stack_id ON notebooks
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .unwrap();
+    let stacks_before = repo.list_navigation_index().unwrap().stacks;
+    let pending = repo.outbox_count().unwrap();
+    assert!(repo.create_stack_for_notebook(&book.id, "失败组").is_err());
+    assert_eq!(repo.list_navigation_index().unwrap().stacks, stacks_before);
+    assert_eq!(repo.outbox_count().unwrap(), pending);
+    blocker
+        .execute_batch("DROP TRIGGER block_stack_move;")
+        .unwrap();
+
+    let stack = repo.create_stack_for_notebook(&book.id, "新组").unwrap();
+    assert_eq!(stack.title, "新组");
+    drop(repo);
+    let reopened = LibraryRepository::open(path).unwrap();
+    let index = reopened.list_navigation_index().unwrap();
+    assert!(
+        index
+            .stacks
+            .iter()
+            .any(|s| s.id == stack.id && s.title == "新组")
+    );
+    let books: Vec<_> = index
+        .notebooks
+        .iter()
+        .filter(|b| b.title == "带图本")
+        .collect();
+    assert_eq!(books.len(), 1, "the notebook is moved, not copied");
+    assert_eq!(books[0].id, book.id);
+    assert_eq!(books[0].stack_id, Some(stack.id.clone()));
+    let note_after = reopened.load_note(&note_id).unwrap().unwrap();
+    assert_eq!(note_after.notebook_id, book.id);
+    assert_eq!(note_after.body_html, note_before.body_html);
+    assert_eq!(note_after.resource_ids, vec![image]);
+    assert_eq!(note_after.tag_ids, note_before.tag_ids);
+    assert_eq!(note_after.revision, note_before.revision);
 }

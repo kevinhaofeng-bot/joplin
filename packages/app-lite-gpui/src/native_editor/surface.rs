@@ -8,7 +8,7 @@ use super::commands::{CommandArgument, CommandCatalogue, EditorCommand};
 use super::core::{AtomicBlockHit, EditorCore};
 use super::find::FindMatch;
 use super::images::BudgetedImageCache;
-use super::model::{BlockKind, DocPoint};
+use super::model::{BlockKind, DocPoint, Selection};
 use super::render;
 use crate::components::{
     BlockDown, BlockUp, BoldSelection, Copy, Cut, Delete, DeleteBack, End, FocusNext, FocusPrev,
@@ -163,7 +163,9 @@ impl Default for EditorSurfaceHooks {
 /// of the native editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EditorSurfaceEvent {
-    OpenLink { url: String },
+    OpenLink {
+        url: String,
+    },
     OpenAttachment {
         resource_id: String,
     },
@@ -200,16 +202,40 @@ pub struct EditorSurface {
     clipboard_to_owner: bool,
     accepts_pointer_input: bool,
     // A distant result first seeks through the height index. The next canvas
-    // pass shapes that viewport, then uses the exact text range to correct
-    // wrapped paragraphs before the result is considered revealed.
-    pending_find_reveal: Option<FindMatch>,
-    /// Frames left in which to bring the caret into view after a document
-    /// jump, as blocks newly in view are measured.
+    // passes shape that viewport and re-centre on the exact match until its
+    // geometry stops moving (wrapped text, image sizes published later).
+    pending_find_reveal: Option<FindRevealRequest>,
+    /// Frames left in which to bring the caret or restored selected atom
+    /// into view, as blocks newly in view are measured.
     pending_caret_reveal: u8,
+    /// Layout/hydration notifications must not pull a manually scrolled
+    /// viewport back to the old insertion point. Only a changed caret asks
+    /// to reveal the next edit position.
+    observed_selection: Selection,
+    observed_document_revision: u64,
     _editor_subscription: Subscription,
     #[cfg(test)]
     light_surface_paint_for_test: EditorSurfaceLightContract,
 }
+
+/// One Find reveal (a query or a Next/Previous): it lasts while that primary
+/// and that document revision do, and ends once two passes in a row find the
+/// match centred with no image size still to arrive. A user scroll ends it
+/// early.
+#[derive(Clone)]
+struct FindRevealRequest {
+    found: FindMatch,
+    revision: u64,
+    passes: u8,
+    // These passes run before the frame's paint, which is where images newly
+    // in view ask for their size; so one settled pass is confirmed by the
+    // next, after a paint has seen the revealed viewport.
+    settled_once: bool,
+}
+
+/// Bounds the passes of one request, so a geometry that never settles
+/// cannot keep taking the scroll position.
+const MAX_FIND_REVEAL_PASSES: u8 = 24;
 
 impl EventEmitter<EditorSurfaceEvent> for EditorSurface {}
 
@@ -243,7 +269,35 @@ impl EditorSurface {
         accepts_pointer_input: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscription = cx.observe(&editor, |_, _, cx| cx.notify());
+        let observed_selection = editor.read(cx).selection();
+        let observed_document_revision = editor.read(cx).document().revision();
+        let subscription = cx.observe(&editor, |surface, editor, cx| {
+            let editor = editor.read(cx);
+            let selection = editor.selection();
+            let revision = editor.document().revision();
+            let restored_atom =
+                revision != surface.observed_document_revision && selection_is_atom(editor);
+            if selection != surface.observed_selection
+                && surface.embedded_frame.is_none()
+                && (restored_atom
+                    || (selection.is_caret()
+                        && editor
+                            .document()
+                            .block(selection.head.node_id)
+                            .is_some_and(|block| block.content.as_text().is_some())))
+            {
+                // Evernote paragraph/keymap.ts insertParagraph explicitly
+                // requests scrollIntoView. Observe the shared editor here
+                // so Return, paste and native IME input use the same route.
+                // Its bundled prosemirror-history also requests it after
+                // restoring a NodeSelection. Ordinary pointer selections and
+                // hydration notifications must not steal the user's scroll.
+                surface.pending_caret_reveal = 6;
+            }
+            surface.observed_selection = selection;
+            surface.observed_document_revision = revision;
+            cx.notify();
+        });
         Self {
             editor,
             mode,
@@ -257,6 +311,8 @@ impl EditorSurface {
             accepts_pointer_input,
             pending_find_reveal: None,
             pending_caret_reveal: 0,
+            observed_selection,
+            observed_document_revision,
             _editor_subscription: subscription,
             #[cfg(test)]
             light_surface_paint_for_test: EditorSurfaceLightContract {
@@ -281,10 +337,20 @@ impl EditorSurface {
         self.mode
     }
 
+    /// Title forward-Tab enters the first body position and reveals it using
+    /// the same retained viewport path as document-start keyboard navigation.
+    pub fn focus_document_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_find_reveal = None;
+        jump_editor_to_document_edge(&self.editor, &self.scroll_handle, false, window, cx);
+    }
+
     /// The shell retains find visibility, while the focused canvas owns the
     /// Escape event that must not fall through to its command chrome.
     pub fn set_find_panel_open(&mut self, open: bool) {
         self.find_panel_open = open;
+        if !open {
+            self.pending_find_reveal = None;
+        }
     }
 
     /// Reveal the current find result without changing the editor selection.
@@ -294,32 +360,48 @@ impl EditorSurface {
     /// the result).
     pub fn reveal_find_primary(&mut self, cx: &mut Context<Self>) -> bool {
         let found = self.editor.read(cx).find_primary().cloned();
-        let target = found.as_ref().and_then(|found| {
-            let editor = self.editor.read(cx);
+        // A match in a wide table: its column first comes into the table's
+        // own horizontal view.
+        if let Some((node_id, cell)) = found
+            .as_ref()
+            .and_then(|found| found.cell.map(|cell| (found.node_id, cell)))
+        {
+            self.editor.update(cx, |editor, editor_cx| {
+                editor.reveal_find_table_column(node_id, cell.column);
+                editor_cx.notify();
+            });
+        }
+        let Some(found) = found else {
+            self.pending_find_reveal = None;
+            return false;
+        };
+        let editor = self.editor.read(cx);
+        let target = editor.layout().find_match_bounds(&found).or_else(|| {
             editor
                 .layout()
-                .range_bounds(found.node_id, found.utf8_range.clone())
+                .bounds_for_node(editor.document(), found.node_id)
         });
-        if let Some(target) = target {
-            reveal_scroll_bounds(&self.scroll_handle, target);
+        let Some(target) = target else {
             self.pending_find_reveal = None;
-            true
-        } else if let Some(found) = found {
-            let target = self
-                .editor
-                .read(cx)
-                .layout()
-                .bounds_for_node(self.editor.read(cx).document(), found.node_id);
-            if let Some(target) = target {
-                reveal_scroll_bounds(&self.scroll_handle, target);
-                self.pending_find_reveal = Some(found);
-                cx.notify();
-                return true;
-            }
-            false
-        } else {
-            false
-        }
+            return false;
+        };
+        let revision = editor.document().revision();
+        center_scroll_bounds(&self.scroll_handle, target);
+        // The first rect is not yet final: the next passes check it again
+        // with freshly measured layout.
+        self.pending_find_reveal = Some(FindRevealRequest {
+            found,
+            revision,
+            passes: 0,
+            settled_once: false,
+        });
+        cx.notify();
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_reveal_pending_for_test(&self) -> bool {
+        self.pending_find_reveal.is_some()
     }
 
     #[cfg(test)]
@@ -383,6 +465,31 @@ impl EditorSurface {
         self.light_surface_paint_for_test
     }
 
+    fn trace_pointer_route(
+        &self,
+        route: &str,
+        event: &MouseDownEvent,
+        window: &Window,
+        cx: &Context<Self>,
+    ) {
+        super::input_trace::record("body", "pointer_route", || {
+            let editor = self.editor.read(cx);
+            serde_json::json!({
+                "route": route,
+                "x": f32::from(event.position.x),
+                "y": f32::from(event.position.y),
+                "click_count": event.click_count,
+                "shift": event.modifiers.shift,
+                "command": event.modifiers.platform,
+                "undo_depth": editor.undo_depth(),
+                "redo_depth": editor.redo_depth(),
+                "revision": editor.document().revision(),
+                "selection": format!("{:?}", editor.selection()),
+                "focused": format!("{:?}", window.focused(cx)),
+            })
+        });
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -393,6 +500,7 @@ impl EditorSurface {
             cx.propagate();
             return;
         }
+        self.trace_pointer_route("entered", event, window, cx);
         if !self.mode.is_read_only() {
             let on_handle = self.editor.update(cx, |editor, editor_cx| {
                 let on_handle = editor
@@ -409,6 +517,7 @@ impl EditorSurface {
                 on_handle
             });
             if on_handle {
+                self.trace_pointer_route("resize_handle", event, window, cx);
                 self.pointer_anchor = None;
                 focus_editor(&self.editor, window, cx);
                 cx.stop_propagation();
@@ -425,6 +534,7 @@ impl EditorSurface {
                 Some(ticked)
             });
             if ticked.is_some() {
+                self.trace_pointer_route("check_marker", event, window, cx);
                 self.pointer_anchor = None;
                 focus_editor(&self.editor, window, cx);
                 cx.stop_propagation();
@@ -434,6 +544,7 @@ impl EditorSurface {
         // Evernote table/plugin.ts lets Cmd/Ctrl-click links bypass cell selection.
         if event.modifiers.platform || event.modifiers.control {
             if let Some(url) = self.editor.read(cx).layout().table_link_at(event.position) {
+                self.trace_pointer_route("table_link", event, window, cx);
                 self.pointer_anchor = None;
                 cx.emit(EditorSurfaceEvent::OpenLink { url });
                 cx.stop_propagation();
@@ -471,6 +582,7 @@ impl EditorSurface {
             None
         };
         if let Some(hit) = atomic {
+            self.trace_pointer_route("atomic", event, window, cx);
             self.pointer_anchor = None;
             focus_editor(&self.editor, window, cx);
             if event.click_count >= 2 {
@@ -522,6 +634,16 @@ impl EditorSurface {
                 anchor
             }
         });
+        self.trace_pointer_route(
+            if activate_dead_zone {
+                "dead_zone"
+            } else {
+                "text_selection"
+            },
+            event,
+            window,
+            cx,
+        );
         focus_editor(&self.editor, window, cx);
         cx.stop_propagation();
     }
@@ -585,6 +707,23 @@ impl EditorSurface {
             return;
         }
         if !event.keystroke.modifiers.shift {
+            return;
+        }
+        let modifiers = &event.keystroke.modifiers;
+        if cfg!(target_os = "macos")
+            && modifiers.platform
+            && !modifiers.control
+            && !modifiers.alt
+            && matches!(event.keystroke.key.as_str(), "up" | "down")
+        {
+            let to_end = event.keystroke.key == "down";
+            let _ = self.editor.update(cx, |editor, editor_cx| {
+                editor.select_document_edge(to_end);
+                editor_cx.notify();
+            });
+            self.pending_caret_reveal = 3;
+            cx.notify();
+            cx.stop_propagation();
             return;
         }
         let operation = match event.keystroke.key.as_str() {
@@ -691,13 +830,22 @@ impl Render for EditorSurface {
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
                 .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                     let delta = event.delta.pixel_delta(px(24.0));
-                    if delta.x.abs() <= delta.y.abs() { return; }
+                    // The user's own scroll wins over a Find reveal still settling.
+                    this.pending_find_reveal = None;
+                    this.pending_caret_reveal = 0;
+                    if delta.x.abs() <= delta.y.abs() {
+                        return;
+                    }
                     let handled = this.editor.update(cx, |editor, editor_cx| {
                         let handled = editor.scroll_table_at(event.position, f32::from(delta.x));
-                        if handled { editor_cx.notify(); }
+                        if handled {
+                            editor_cx.notify();
+                        }
                         handled
                     });
-                    if handled { cx.stop_propagation(); }
+                    if handled {
+                        cx.stop_propagation();
+                    }
                 }))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -842,50 +990,121 @@ impl Render for EditorSurface {
             content_height,
             move |window, cx| (before_shape.before_shape)(window, cx),
             move |_window, cx| {
-                // After a document jump: blocks newly in view were just
-                // measured and may differ from their estimate, so the canvas
-                // may only reach the caret next frame. Follow until it shows.
+                // An edit/jump can select text beyond the shaped viewport.
+                // Seek with the retained height index first, then refine with
+                // the actual caret once the next canvas pass shapes it.
                 if pending_caret_reveal > 0 {
                     let editor = caret_reveal_editor.read(cx);
-                    if let Some(caret) = editor
-                        .layout()
-                        .caret_bounds_for_point(editor.selection().head)
-                    {
-                        reveal_scroll_bounds(&caret_reveal_scroll_handle, caret);
-                        let viewport = caret_reveal_scroll_handle.bounds();
-                        if caret.top() < viewport.top() || caret.bottom() > viewport.bottom() {
-                            let _ = caret_reveal_surface.update(cx, |surface, surface_cx| {
-                                surface.pending_caret_reveal = pending_caret_reveal - 1;
-                                surface_cx.notify();
-                            });
+                    let atomic = selection_is_atom(editor);
+                    // ProseMirror view.scrollToSelection uses the whole node
+                    // rect for NodeSelection, not its adjacent caret line.
+                    let caret = if atomic {
+                        editor
+                            .layout()
+                            .visible()
+                            .iter()
+                            .find(|block| block.node_id == editor.selection().head.node_id)
+                            .map(|block| block.bounds)
+                    } else {
+                        editor
+                            .layout()
+                            .caret_bounds_for_point(editor.selection().head)
+                    };
+                    let viewport = caret_reveal_scroll_handle.bounds();
+                    let before = caret_reveal_scroll_handle.offset().y;
+                    let target = caret.or_else(|| {
+                        editor
+                            .layout()
+                            .bounds_for_node(editor.document(), editor.selection().head.node_id)
+                            .map(|mut estimate| {
+                                // Indexed boxes are document-local; shaped
+                                // carets already include the canvas translation.
+                                estimate.origin.y += viewport.top() + before + px(1.0);
+                                // Seek into a long paragraph, not past its end;
+                                // its exact insertion line is resolved next pass.
+                                if !atomic {
+                                    estimate.size.height = estimate.size.height.min(px(26.0));
+                                }
+                                estimate
+                            })
+                    });
+                    if let Some(mut target) = target {
+                        if atomic {
+                            // An image taller than the viewport cannot fit.
+                            // Reveal its top once, rather than alternating
+                            // between its top and bottom on settling passes.
+                            target.size.height = target
+                                .size
+                                .height
+                                .min((viewport.size.height - px(2.0)).max(px(1.0)));
                         }
+                        reveal_scroll_bounds(&caret_reveal_scroll_handle, target);
+                    }
+                    let moved = caret_reveal_scroll_handle.offset().y != before;
+                    let settling = editor.image_geometry_settling();
+                    if pending_caret_reveal > 1 && (caret.is_none() || moved || settling) {
+                        let _ = caret_reveal_surface.update(cx, |surface, surface_cx| {
+                            // Hydration will notify when geometry arrives;
+                            // don't spin frames while waiting for image IO.
+                            surface.pending_caret_reveal = if settling {
+                                pending_caret_reveal
+                            } else {
+                                pending_caret_reveal - 1
+                            };
+                            if moved || !settling {
+                                surface_cx.notify();
+                            }
+                        });
                     }
                 }
-                let Some(found) = pending_find_reveal.clone() else {
+                let Some(request) = pending_find_reveal.clone() else {
                     return;
                 };
-                let target = find_reveal_editor
-                    .read(cx)
-                    .layout()
-                    .range_bounds(found.node_id, found.utf8_range.clone());
-                let corrected = target.is_some();
-                if let Some(target) = target {
-                    reveal_scroll_bounds(&find_reveal_scroll_handle, target);
-                } else {
-                    let editor = find_reveal_editor.read(cx);
-                    if let Some(estimate) = editor
+                // Closing Find, another primary, a switched note or an edit
+                // ends the request; it never outlives what it was asked for.
+                let editor = find_reveal_editor.read(cx);
+                if editor.find_primary() != Some(&request.found)
+                    || editor.document().revision() != request.revision
+                {
+                    return;
+                }
+                let found = &request.found;
+                if let Some(cell) = found.cell {
+                    let _ = find_reveal_editor.update(cx, |editor, _| {
+                        editor.reveal_find_table_column(found.node_id, cell.column);
+                    });
+                }
+                let editor = find_reveal_editor.read(cx);
+                let target = editor.layout().find_match_bounds(found);
+                let exact = target.is_some();
+                let moved = match target {
+                    Some(target) => center_scroll_bounds(&find_reveal_scroll_handle, target),
+                    // The preceding pass may have measured wrapped text or an
+                    // image and shifted the retained height index. Seek again
+                    // until the primary's own text is shaped.
+                    None => editor
                         .layout()
                         .bounds_for_node(editor.document(), found.node_id)
-                    {
-                        // The preceding pass may have measured wrapped text
-                        // or an image and shifted the retained height index.
-                        // Seek again until the primary's own text is shaped.
-                        reveal_scroll_bounds(&find_reveal_scroll_handle, estimate);
-                    }
+                        .is_some_and(|estimate| {
+                            center_scroll_bounds(&find_reveal_scroll_handle, estimate)
+                        }),
+                };
+                // An image still loading can change heights above the match
+                // after this pass; its arrival repaints and re-checks.
+                let settling = editor.image_geometry_settling();
+                let settled = exact && !moved && !settling;
+                if (settled && request.settled_once) || request.passes >= MAX_FIND_REVEAL_PASSES {
+                    return;
                 }
                 let _ = find_reveal_surface.update(cx, |surface, surface_cx| {
-                    surface.pending_find_reveal = (!corrected).then_some(found);
-                    if !corrected {
+                    surface.pending_find_reveal = Some(FindRevealRequest {
+                        passes: request.passes + 1,
+                        settled_once: settled,
+                        ..request
+                    });
+                    // A loading image repaints this surface when its size
+                    // arrives; otherwise ask for the next pass now.
+                    if !settling {
                         surface_cx.notify();
                     }
                 });
@@ -1050,6 +1269,31 @@ fn move_editor_vertically_and_reveal(
         let line_step = px(48.0) * if direction < 0 { 1.0 } else { -1.0 };
         scroll_handle_by_pixels(scroll_handle, line_step);
     }
+}
+
+/// Find's reveal, as Evernote's `scrollIntoView({block: 'center'})`: the
+/// target's centre to the viewport's, or its top when it is taller than the
+/// viewport, within the scroll range. Whether the offset moved.
+fn center_scroll_bounds(scroll_handle: &ScrollHandle, target: gpui::Bounds<Pixels>) -> bool {
+    let viewport = scroll_handle.bounds();
+    let delta_y = if target.size.height >= viewport.size.height {
+        viewport.top() - target.top()
+    } else {
+        viewport.center().y - target.center().y
+    };
+    let before = scroll_handle.offset().y;
+    scroll_handle_by_pixels(scroll_handle, delta_y);
+    (scroll_handle.offset().y - before).abs() > px(0.5)
+}
+
+fn selection_is_atom(editor: &EditorCore) -> bool {
+    let selection = editor.selection();
+    !selection.is_caret()
+        && selection.anchor.node_id == selection.head.node_id
+        && editor
+            .document()
+            .block(selection.head.node_id)
+            .is_some_and(|block| block.content.as_text().is_none())
 }
 
 fn reveal_scroll_bounds(scroll_handle: &ScrollHandle, target: gpui::Bounds<Pixels>) {

@@ -33,6 +33,409 @@ use super::transaction::{ApplyOutcome, Transaction, TransactionBatch};
 
 struct CountingAllocator;
 
+fn clear_format_command_221(catalogue: &CommandCatalogue) -> EditorCommand {
+    catalogue.more_descriptors().into_iter()
+        .find(|descriptor| descriptor.label == "Clear formatting")
+        .expect("Evernote removeformat must be executable from More")
+        .command
+}
+
+#[gpui::test]
+fn clear_format_221_preserves_partial_links_and_unselected_unicode(cx: &mut gpui::TestAppContext) {
+    let source = app_lite_core::CanonicalDocument::parse_html(
+        "<p><a href=\"https://example.test\" title=\"保留\"><strong><em><u><s><mark><sup><span style=\"color: #fc1233\">甲乙丙</span></sup></mark></s></u></em></strong></a></p>").unwrap();
+    let mut editor = EditorCore::from_document(super::codec::import_canonical(&source).unwrap(), cx);
+    let node = editor.document().first_node_id().unwrap();
+    let selection = Selection::new(DocPoint::new(node, 6), DocPoint::new(node, 3));
+    editor.set_selection_for_test(selection);
+    let catalogue = CommandCatalogue::new();
+    let command = clear_format_command_221(&catalogue);
+    assert!(catalogue.state(command, &editor).enabled);
+    catalogue.execute(command, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(styled_segments(&editor, 0).iter().map(|(text, marks)| (text.as_str(), marks.clone())).collect::<Vec<_>>(), vec![
+        ("甲", vec![Mark::Bold, Mark::Italic, Mark::Underline, Mark::Strike, Mark::Highlight,
+            Mark::Link("https://example.test".into()), Mark::LinkTitle("保留".into()), Mark::Superscript,
+            Mark::Color(app_lite_core::TextColor::parse("#fc1233").unwrap())]),
+        ("乙", vec![Mark::Link("https://example.test".into()), Mark::LinkTitle("保留".into())]),
+        ("丙", vec![Mark::Bold, Mark::Italic, Mark::Underline, Mark::Strike, Mark::Highlight,
+            Mark::Link("https://example.test".into()), Mark::LinkTitle("保留".into()), Mark::Superscript,
+            Mark::Color(app_lite_core::TextColor::parse("#fc1233").unwrap())]),
+    ]);
+    assert_eq!(editor.undo_depth(), 1, "one clear action must be one undo");
+    editor.undo().unwrap();
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap(), source);
+    editor.redo().unwrap();
+    let saved = super::codec::export_canonical(editor.document()).unwrap();
+    assert_eq!(super::codec::export_canonical(&super::codec::import_canonical(&saved).unwrap()).unwrap(), saved);
+}
+
+#[gpui::test]
+fn clear_format_221_resets_paragraph_attributes_without_flattening_structure(cx: &mut gpui::TestAppContext) {
+    let source = app_lite_core::CanonicalDocument::parse_html(
+        "<h2 data-indent=\"2\" data-align=\"right\"><strong>标题</strong></h2><ul data-type=\"checklist\"><li data-checked=\"true\"><em>列表</em></li></ul><p data-align=\"center\"><mark>正文</mark></p>").unwrap();
+    let mut document = super::codec::import_canonical(&source).unwrap();
+    let end = document.end_selection();
+    document.apply(Transaction::InsertImage { selection: end,
+        resource_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), natural_size: (100, 80) }).unwrap();
+    let image = document.blocks().iter().find(|block| matches!(block.content, BlockContent::Image { .. })).unwrap().clone();
+    let mut editor = EditorCore::from_document(document, cx);
+    editor.select_all();
+    let before = editor.document().semantic_snapshot();
+    let catalogue = CommandCatalogue::new();
+    let command = clear_format_command_221(&catalogue);
+    catalogue.execute(command, CommandArgument::None, &mut editor).unwrap();
+    let blocks = editor.document().blocks();
+    assert_eq!(blocks[0].kind, BlockKind::Heading { level: 2 });
+    assert_eq!(blocks[0].indent, 0);
+    assert_eq!(blocks[0].alignment, TextAlignment::Left);
+    assert_eq!(blocks[1].kind, BlockKind::CheckItem { depth: 0, checked: true });
+    assert_eq!(blocks[2].alignment, TextAlignment::Left);
+    assert!(blocks.iter().filter_map(|block| block.content.styles()).all(|styles| styles.is_empty()));
+    assert_eq!(editor.document().block(image.id).unwrap(), &image, "media node must remain byte-for-byte unchanged");
+    assert_eq!(editor.undo_depth(), 1);
+    editor.undo().unwrap();
+    assert_eq!(editor.document().semantic_snapshot(), before);
+    editor.redo().unwrap();
+    let mut redone_image = editor.document().block(image.id).unwrap().clone();
+    // RestoreBlocks advances its local generation on Undo/Redo. Check every
+    // content/presentation/identity field, not that internal cache epoch.
+    redone_image.revision = image.revision;
+    assert_eq!(redone_image, image);
+}
+
+#[gpui::test]
+fn clear_format_221_disabled_caret_does_not_change_pending_style(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::new();
+    let command = clear_format_command_221(&catalogue);
+    let mut editor = EditorCore::for_test("ab", cx);
+    editor.set_caret_utf8(1);
+    catalogue.execute(EditorCommand::Bold, CommandArgument::None, &mut editor).unwrap();
+    assert!(!catalogue.state(command, &editor).enabled);
+    catalogue.execute(command, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(editor.undo_depth(), 0);
+    editor.insert_text("X").unwrap();
+    assert_eq!(styled_segments(&editor, 0), vec![("a".into(), vec![]), ("X".into(), vec![Mark::Bold]), ("b".into(), vec![])]);
+}
+
+#[gpui::test]
+fn clear_format_221_plain_selection_does_not_create_history(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::new();
+    let command = clear_format_command_221(&catalogue);
+    let mut editor = EditorCore::for_test("普通文本", cx);
+    editor.select_all();
+    let before = editor.document().semantic_snapshot();
+    catalogue.execute(command, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(editor.document().semantic_snapshot(), before);
+    assert_eq!(editor.undo_depth(), 0);
+}
+
+#[gpui::test]
+fn clear_format_221_grouped_media_keeps_projection_and_trims_endpoints(cx: &mut gpui::TestAppContext) {
+    let source = app_lite_core::CanonicalDocument::parse_html(
+        "<h2 data-align=\"right\" data-indent=\"2\"><u>前段</u><img src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"保留\"><strong>后段</strong></h2><p data-align=\"center\" data-indent=\"1\"><em>未选择</em></p>").unwrap();
+    let document = super::codec::import_canonical(&source).unwrap();
+    assert_eq!(document.inline_groups().len(), 1, "fixture must exercise a real semantic media parent");
+    let ids = document.blocks().iter().map(|block| block.id).collect::<Vec<_>>();
+    assert_eq!(ids.len(), 4);
+    let image = document.blocks()[1].clone();
+    let excluded = document.blocks()[3].clone();
+    let mut editor = EditorCore::from_document(document, cx);
+    // Reverse range ends at the next paragraph's start: that paragraph is
+    // not selected. Only 后段 loses marks, but its media parent's attributes
+    // reset consistently across both native text rows.
+    editor.set_selection_for_test(Selection::new(DocPoint::new(ids[3], 0), DocPoint::new(ids[2], 0)));
+    let before = editor.document().semantic_snapshot();
+    let catalogue = CommandCatalogue::new();
+    catalogue.execute(clear_format_command_221(&catalogue), CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(styled_segments(&editor, 0), vec![("前段".into(), vec![Mark::Underline])]);
+    assert_eq!(styled_segments(&editor, 2), vec![("后段".into(), vec![])]);
+    for index in [0, 2] {
+        assert_eq!(editor.document().blocks()[index].alignment, TextAlignment::Left);
+        assert_eq!(editor.document().blocks()[index].indent, 0);
+    }
+    assert_eq!(editor.document().block(image.id).unwrap(), &image);
+    assert_eq!(editor.document().block(excluded.id).unwrap(), &excluded);
+    let saved = super::codec::export_canonical(editor.document()).unwrap();
+    assert_eq!(saved.resource_ids(), source.resource_ids());
+    assert_eq!(super::codec::export_canonical(&super::codec::import_canonical(&saved).unwrap()).unwrap(), saved);
+    assert_eq!(editor.undo_depth(), 1);
+    editor.undo().unwrap();
+    assert_eq!(editor.document().semantic_snapshot(), before);
+    editor.redo().unwrap();
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap(), saved);
+}
+
+#[gpui::test]
+fn indent_trim_range_excludes_text_edge_only_paragraphs(cx: &mut gpui::TestAppContext) {
+    for reverse in [false, true] {
+        for trim_start in [false, true] {
+            let mut editor = EditorCore::for_test_paragraphs(["first", "second"], cx);
+            let a = editor.document().blocks()[0].id;
+            let b = editor.document().blocks()[1].id;
+            let (from, to) = if trim_start {
+                (DocPoint::new(a, 5), DocPoint::new(b, 6))
+            } else {
+                (DocPoint::new(a, 0), DocPoint::new(b, 0))
+            };
+            let selection = if reverse { Selection::new(to, from) } else { Selection::new(from, to) };
+            editor.set_selection_for_test(selection);
+            let catalogue = CommandCatalogue::default();
+            assert!(catalogue.state(EditorCommand::IndentList, &editor).enabled);
+            catalogue.execute(EditorCommand::IndentList, CommandArgument::None, &mut editor).unwrap();
+            assert_eq!(editor.document().blocks()[0].indent, u8::from(!trim_start));
+            assert_eq!(editor.document().blocks()[1].indent, u8::from(trim_start));
+            assert_eq!(editor.selection(), selection);
+            assert!(catalogue.state(EditorCommand::OutdentList, &editor).enabled,
+                "state and transaction must trim the same endpoints");
+            catalogue.execute(EditorCommand::Undo, CommandArgument::None, &mut editor).unwrap();
+            assert_eq!(editor.document().blocks()[0].indent, 0);
+            assert_eq!(editor.document().blocks()[1].indent, 0);
+            assert_eq!(editor.selection(), selection);
+        }
+    }
+}
+
+#[gpui::test]
+fn indent_trim_range_does_not_let_excluded_limit_block_disable_command(cx: &mut gpui::TestAppContext) {
+    let source = app_lite_core::CanonicalDocument::parse_html(
+        "<p data-indent=\"8\"><strong>first</strong></p><p><em>second</em></p>").unwrap();
+    let mut editor = EditorCore::from_document(super::codec::import_canonical(&source).unwrap(), cx);
+    let a = editor.document().blocks()[0].id;
+    let b = editor.document().blocks()[1].id;
+    let selection = Selection::new(DocPoint::new(a, 5), DocPoint::new(b, 6));
+    editor.set_selection_for_test(selection);
+    let catalogue = CommandCatalogue::default();
+    assert!(catalogue.state(EditorCommand::IndentList, &editor).enabled);
+    catalogue.execute(EditorCommand::IndentList, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap().to_canonical_html().as_str(),
+        "<p data-indent=\"8\"><strong>first</strong></p><p data-indent=\"1\"><em>second</em></p>");
+    catalogue.execute(EditorCommand::Undo, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap(), source);
+}
+
+#[gpui::test]
+fn indent_trim_range_empty_seam_is_noop_but_empty_caret_is_editable(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test_paragraphs(["first", "", "last"], cx);
+    let a = editor.document().blocks()[0].id;
+    let b = editor.document().blocks()[1].id;
+    let c = editor.document().blocks()[2].id;
+    let catalogue = CommandCatalogue::default();
+    for (from, to) in [(DocPoint::new(a, 5), DocPoint::new(b, 0)),
+                       (DocPoint::new(a, 5), DocPoint::new(c, 0))] {
+        let selection = Selection::new(to, from);
+        editor.set_selection_for_test(selection);
+        let before = editor.document().semantic_snapshot();
+        assert!(!catalogue.state(EditorCommand::IndentList, &editor).enabled);
+        editor.apply(Transaction::IndentList { selection }).unwrap();
+        assert_eq!(editor.document().semantic_snapshot(), before);
+        assert_eq!(editor.selection(), selection);
+    }
+    editor.set_selection_for_test(Selection::caret(DocPoint::new(b, 0)));
+    assert!(catalogue.state(EditorCommand::IndentList, &editor).enabled);
+    catalogue.execute(EditorCommand::IndentList, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(editor.document().blocks()[1].indent, 1);
+}
+
+#[gpui::test]
+fn indent_trim_range_preserves_list_edge_and_structural_affinity(cx: &mut gpui::TestAppContext) {
+    let source = app_lite_core::CanonicalDocument::parse_html(
+        "<ul><li data-indent=\"8\">first</li><li>second</li></ul>").unwrap();
+    let mut editor = EditorCore::from_document(super::codec::import_canonical(&source).unwrap(), cx);
+    let a = editor.document().blocks()[0].id;
+    let b = editor.document().blocks()[1].id;
+    let selection = Selection::new(DocPoint::new(b, 6), DocPoint::new(a, 5));
+    editor.set_selection_for_test(selection);
+    let catalogue = CommandCatalogue::default();
+    assert!(catalogue.state(EditorCommand::IndentList, &editor).enabled);
+    catalogue.execute(EditorCommand::IndentList, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(editor.document().blocks()[0].kind, BlockKind::BulletItem { depth: 8 });
+    assert_eq!(editor.document().blocks()[1].kind, BlockKind::BulletItem { depth: 1 });
+    let mut document = Document::from_paragraphs(["before", "after"]);
+    let id = document.blocks()[0].id;
+    document.apply(Transaction::InsertImage {
+        selection: Selection::caret(DocPoint::new(id, 6)),
+        resource_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(), natural_size: (100, 80),
+    }).unwrap();
+    let image = document.blocks().iter().find(|block| matches!(block.content, BlockContent::Image { .. })).unwrap().id;
+    let after = document.blocks().iter().find(|block| block.content.as_text() == Some("after")).unwrap().id;
+    let mut editor = EditorCore::from_document(document, cx);
+    editor.set_selection_for_test(Selection::new(
+        DocPoint::with_affinity(image, 0, Affinity::After), DocPoint::new(after, 5)));
+    assert!(catalogue.state(EditorCommand::IndentList, &editor).enabled,
+        "an unselected image boundary cannot disable text indentation");
+    catalogue.execute(EditorCommand::IndentList, CommandArgument::None, &mut editor).unwrap();
+    editor.set_selection_for_test(Selection::new(
+        DocPoint::with_affinity(image, 0, Affinity::Before), DocPoint::new(after, 5)));
+    assert!(!catalogue.state(EditorCommand::IndentList, &editor).enabled,
+        "a selected atom must remain in the range, not be trimmed away");
+}
+
+#[gpui::test]
+fn paragraph_indent_toolbar_preserves_selection_marks_and_history(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test_paragraphs(["甲乙", "second"], cx);
+    let catalogue = CommandCatalogue::default();
+    editor.select_all();
+    catalogue.execute(EditorCommand::Bold, CommandArgument::None, &mut editor).unwrap();
+    let selection = editor.selection();
+    assert!(catalogue.state(EditorCommand::IndentList, &editor).enabled,
+        "ordinary paragraphs must have a working indent command");
+    catalogue.execute(EditorCommand::IndentList, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(editor.selection(), selection);
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap().to_canonical_html().as_str(),
+        "<p data-indent=\"1\"><strong>甲乙</strong></p><p data-indent=\"1\"><strong>second</strong></p>");
+    assert!(catalogue.state(EditorCommand::OutdentList, &editor).enabled);
+    catalogue.execute(EditorCommand::Undo, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap().to_canonical_html().as_str(),
+        "<p><strong>甲乙</strong></p><p><strong>second</strong></p>");
+    catalogue.execute(EditorCommand::Redo, CommandArgument::None, &mut editor).unwrap();
+    catalogue.execute(EditorCommand::OutdentList, CommandArgument::None, &mut editor).unwrap();
+    assert!(!catalogue.state(EditorCommand::OutdentList, &editor).enabled);
+}
+
+#[test]
+fn paragraph_indent_transaction_and_split_round_trip() {
+    let mut doc = Document::from_paragraphs(["甲乙"]);
+    let id = doc.blocks()[0].id;
+    let selection = Selection::caret(DocPoint::new(id, "甲".len()));
+    doc.apply(Transaction::IndentList { selection }).unwrap();
+    assert_eq!(super::codec::export_canonical(&doc).unwrap().to_canonical_html().as_str(),
+        "<p data-indent=\"1\">甲乙</p>");
+    doc.apply(Transaction::SplitBlock { at: selection.head }).unwrap();
+    let saved = super::codec::export_canonical(&doc).unwrap();
+    assert_eq!(saved.to_canonical_html().as_str(), "<p data-indent=\"1\">甲</p><p data-indent=\"1\">乙</p>");
+    let reopened = super::codec::import_canonical(&saved).unwrap();
+    assert_eq!(super::codec::export_canonical(&reopened).unwrap(), saved);
+}
+
+#[test]
+fn paragraph_indent_canonical_loads_without_losing_attributes() {
+    let canonical = app_lite_core::CanonicalDocument::parse_html(
+        "<p data-align=\"right\" data-indent=\"2\"><strong>中文</strong>😀</p>").unwrap();
+    let native = super::codec::import_canonical(&canonical).expect("editable indented paragraph");
+    assert_eq!(super::codec::export_canonical(&native).unwrap(), canonical);
+}
+
+#[test]
+fn image_alignment_geometry_moves_atom_hitbox_without_moving_neighbor_text() {
+    // Catches left-only image geometry, including offscreen reveal/hit bounds.
+    let source = app_lite_core::CanonicalDocument::parse_html(
+        "<p>前</p><img data-joplin-lite-block-image=\"true\" src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"图\" data-joplin-lite-natural-width=\"100\" data-joplin-lite-natural-height=\"50\"><p>后</p>",
+    ).unwrap();
+    let mut native = super::codec::import_canonical(&source).unwrap();
+    let id = native.blocks()[1].id;
+    let selection = Selection::new(
+        DocPoint::with_affinity(id, 0, Affinity::Before),
+        DocPoint::with_affinity(id, 0, Affinity::After),
+    );
+    for (alignment, x) in [(TextAlignment::Center, 150.0), (TextAlignment::Right, 300.0), (TextAlignment::Left, 0.0)] {
+        native.apply(Transaction::SetAlignment { selection, alignment }).unwrap();
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&native, 0.0, 1000.0, 400.0);
+        let image = layout.block_layout(id).unwrap();
+        assert_eq!(image.bounds.left(), px(x));
+        assert_eq!(image.bounds.size, gpui::size(px(100.0), px(50.0)));
+        assert_eq!(layout.bounds_for_node(&native, id).unwrap(), image.bounds);
+        assert_eq!(layout.block_layout(native.blocks()[0].id).unwrap().bounds.left(), px(0.0));
+        assert_eq!(layout.block_layout(native.blocks()[2].id).unwrap().bounds.left(), px(0.0));
+    }
+}
+
+#[test]
+fn image_alignment_codec_retains_node_property_and_width() {
+    let html = "<img data-joplin-lite-block-image=\"true\" src=\":/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" alt=\"图\" data-joplin-lite-natural-width=\"400\" data-joplin-lite-natural-height=\"200\" data-joplin-lite-display-width=\"100\" data-joplin-lite-image-align=\"right\">";
+    let canonical = app_lite_core::CanonicalDocument::parse_html(html).unwrap();
+    assert_eq!(canonical.to_canonical_html().as_str(), html);
+    let native = super::codec::import_canonical(&canonical).unwrap();
+    assert_eq!(native.blocks()[0].alignment, TextAlignment::Right);
+    assert_eq!(super::codec::export_canonical(&native).unwrap().to_canonical_html().as_str(), html);
+}
+
+#[gpui::test]
+async fn paragraph_indent_layout_keeps_caret_and_selection_inside_padding(cx: &mut gpui::TestAppContext) {
+    let mut cx = cx.add_empty_window();
+    let mut document = Document::from_paragraph("中文 wrap ".repeat(30));
+    let node = document.first_node_id().unwrap();
+    let selection = Selection::caret(DocPoint::new(node, 0));
+    document.apply(Transaction::IndentList { selection }).unwrap();
+    document.apply(Transaction::IndentList { selection }).unwrap();
+    let mut layout = LayoutRegistry::new();
+    cx.update(|window, _| layout.shape_visible_with_window(&document, 0.0, 4000.0, 240.0, window));
+    let block = layout.block_layout(node).unwrap();
+    assert_eq!(block.bounds.left(), px(60.0), "actual Evernote paragraph indent uses 30px per step");
+    assert_eq!(block.bounds.size.width, px(180.0));
+    let caret = layout.caret_bounds_for_point(selection.head).unwrap();
+    assert_eq!(caret.left(), block.bounds.left());
+    let rects = layout.selection_rects(Selection::new(block.before, block.after));
+    assert!(!rects.is_empty());
+    assert!(rects.iter().all(|rect| rect.left() >= px(60.0) && rect.right() <= px(240.5)));
+    for alignment in [TextAlignment::Center, TextAlignment::Right] {
+        document.apply(Transaction::SetAlignment { selection, alignment }).unwrap();
+        let mut aligned = LayoutRegistry::new();
+        cx.update(|window, _| aligned.shape_visible_with_window(&document, 0.0, 4000.0, 240.0, window));
+        let block = aligned.block_layout(node).unwrap();
+        let rects = aligned.selection_rects(Selection::new(block.before, block.after));
+        assert!(!rects.is_empty());
+        assert!(rects.iter().all(|rect| rect.left() >= px(59.5) && rect.right() <= px(240.5)));
+        let caret = aligned.caret_bounds_for_point(selection.head).unwrap();
+        assert!(caret.left() >= px(60.0) && caret.right() <= px(240.5));
+    }
+}
+
+#[test]
+fn paragraph_indent_image_insertion_preserves_both_text_sides() {
+    let source = app_lite_core::CanonicalDocument::parse_html("<p data-indent=\"1\">甲乙</p>").unwrap();
+    let mut native = super::codec::import_canonical(&source).unwrap();
+    let node = native.blocks()[0].id;
+    native.apply(Transaction::InsertImage {
+        selection: Selection::caret(DocPoint::new(node, "甲".len())),
+        resource_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        natural_size: (100, 80),
+    }).unwrap();
+    let saved = super::codec::export_canonical(&native).unwrap();
+    let html = saved.to_canonical_html();
+    assert!(html.as_str().starts_with("<p data-indent=\"1\">甲</p><img"));
+    assert!(html.as_str().ends_with("<p data-indent=\"1\">乙</p>"));
+    let reopened = super::codec::import_canonical(&saved).unwrap();
+    assert_eq!(super::codec::export_canonical(&reopened).unwrap(), saved);
+}
+
+#[gpui::test]
+fn paragraph_indent_list_conversion_retains_depth_and_undo(cx: &mut gpui::TestAppContext) {
+    let source = app_lite_core::CanonicalDocument::parse_html("<p data-indent=\"2\">甲乙</p>").unwrap();
+    let mut editor = EditorCore::from_document(super::codec::import_canonical(&source).unwrap(), cx);
+    editor.select_all();
+    let catalogue = CommandCatalogue::default();
+    catalogue.execute(EditorCommand::BulletList, CommandArgument::None, &mut editor).unwrap();
+    let saved = super::codec::export_canonical(editor.document()).unwrap();
+    assert_eq!(saved.to_canonical_html().as_str(), "<ul><li data-indent=\"2\">甲乙</li></ul>");
+    let reopened = super::codec::import_canonical(&saved).unwrap();
+    assert_eq!(editor.document().blocks()[0].kind, reopened.blocks()[0].kind);
+    assert_eq!(editor.document().blocks()[0].indent, 0);
+    catalogue.execute(EditorCommand::Undo, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap(), source);
+}
+
+#[gpui::test]
+fn paragraph_indent_reverse_selection_and_limit_are_atomic(cx: &mut gpui::TestAppContext) {
+    let source = app_lite_core::CanonicalDocument::parse_html(
+        "<p data-indent=\"8\">limit</p><p><br></p>").unwrap();
+    let mut editor = EditorCore::from_document(super::codec::import_canonical(&source).unwrap(), cx);
+    let a = editor.document().blocks()[0].id;
+    let b = editor.document().blocks()[1].id;
+    let selection = Selection::new(DocPoint::new(b, 0), DocPoint::new(a, 0));
+    editor.set_selection_for_test(selection);
+    let catalogue = CommandCatalogue::default();
+    assert!(!catalogue.state(EditorCommand::IndentList, &editor).enabled);
+    let before = editor.document().semantic_snapshot();
+    assert!(editor.apply(Transaction::IndentList { selection }).is_err());
+    assert_eq!(editor.document().semantic_snapshot(), before);
+    editor.set_selection_for_test(Selection::caret(DocPoint::new(b, 0)));
+    catalogue.execute(EditorCommand::IndentList, CommandArgument::None, &mut editor).unwrap();
+    assert!(super::codec::export_canonical(editor.document()).unwrap().to_canonical_html().as_str()
+        .contains("<p data-indent=\"1\"><br></p>"));
+}
+
 thread_local! {
     // Keep the measurement state on the test worker that owns the real
     // selection call. A process-global counter lets another concurrently
@@ -147,6 +550,7 @@ fn ordered_fixture(count: usize) -> Vec<Block> {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("item-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -665,6 +1069,7 @@ fn ordered_tail_edit_has_bounded_numbering_scratch_and_keeps_marker() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("ordered-item-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -718,6 +1123,7 @@ fn ordered_tail_kind_depth_change_recomputes_locally_and_keeps_numbers_correct()
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("ordered-item-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -773,6 +1179,7 @@ fn structural_tail_return_merge_undo_redo_do_not_rebuild_numbering_for_100k_bloc
             kind: BlockKind::Paragraph,
             content: BlockContent::text(format!("paragraph-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -988,6 +1395,7 @@ fn batched_splices_and_restore_blocks_replay_in_order_through_history() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("restored"),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -1084,6 +1492,7 @@ fn restore_blocks_rejects_zero_and_internal_duplicate_ids_atomically() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("zero"),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -1201,6 +1610,7 @@ fn block_sequence_range_edges_use_right_boundary() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text(text),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -1461,6 +1871,7 @@ fn non_monotonic_node_ids_keep_selection_geometry_in_document_order() {
                 link: None,
             },
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -1489,6 +1900,7 @@ fn capacity_exhaustion_does_not_copy_a_100k_block_order_buffer() {
             kind: BlockKind::Paragraph,
             content: BlockContent::text(format!("paragraph-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -1560,6 +1972,7 @@ fn run_mixed_sum_tree_fixture(block_count: usize) -> (usize, usize) {
             },
             content: BlockContent::text(format!("row-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -1840,6 +2253,11 @@ fn retained_edit_probe(mut document: Document, structural: bool) -> usize {
 
 #[test]
 fn retained_sum_tree_allocations_scale_for_10k_and_100k_documents() {
+    println!(
+        "native layout bytes: mark={} styled_run={} block_content={} block={}",
+        size_of::<Mark>(), size_of::<StyledRun>(),
+        size_of::<BlockContent>(), size_of::<Block>(),
+    );
     let (small, small_construct, small_peak, small_allocated) = retained_document_fixture(10_000);
     let (large, large_construct, large_peak, large_allocated) = retained_document_fixture(100_000);
     assert!(small_construct > 0 && large_construct > small_construct);
@@ -1906,6 +2324,7 @@ fn max_node_id_cannot_be_allocated_again() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("max"),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -1929,6 +2348,7 @@ fn max_node_id_cannot_be_allocated_again() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("before"),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -1957,6 +2377,7 @@ fn same_id_restore_reports_non_structural_metadata() {
         kind: original.kind.clone(),
         content: BlockContent::text("after"),
         alignment: original.alignment,
+        indent: original.indent,
         quoted: original.quoted,
         quote_start: original.quote_start,
         revision: original.revision,
@@ -2054,6 +2475,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("prefix-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -2065,6 +2487,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             kind: BlockKind::Paragraph,
             content: BlockContent::text(format!("middle-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -2076,6 +2499,7 @@ fn plain_middle_splice_and_same_id_restore_stay_local() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("suffix-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -2616,6 +3040,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("left-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -2626,6 +3051,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text("boundary"),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -2636,6 +3062,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("right-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -2646,6 +3073,7 @@ fn ordered_middle_splice_does_not_touch_the_distant_sequences() {
         kind: BlockKind::Paragraph,
         content: BlockContent::text(format!("distant-suffix-{index}")),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -2694,6 +3122,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
             kind: BlockKind::OrderedItem { depth: 0 },
             content: BlockContent::text(format!("item-{index}")),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -2704,6 +3133,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
         kind: BlockKind::Paragraph,
         content: BlockContent::text("boundary"),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -2713,6 +3143,7 @@ fn changed_index_63_converges_at_the_first_clean_checkpoint_after_boundary_64() 
         kind: BlockKind::Paragraph,
         content: BlockContent::text(format!("suffix-{index}")),
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -3036,6 +3467,7 @@ fn validate_styles_scans_graphemes_once_per_text_on_transactions() {
             kind: BlockKind::Paragraph,
             content: BlockContent::Text { text, styles },
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -3242,6 +3674,103 @@ fn image_layout_preserves_natural_aspect_ratio_at_wide_and_narrow_widths() {
     let explicit_overwide = bounds_for((1600, 1200), Some(1200), 680.0);
     assert!((f32::from(explicit_overwide.size.width) - 680.0).abs() < 0.1);
     assert!((f32::from(explicit_overwide.size.height) - 510.0).abs() < 0.1);
+}
+
+#[gpui::test]
+fn image_resize_316_first_click_of_double_click_preserves_exact_undo_width(
+    cx: &mut gpui::TestAppContext,
+) {
+    // The native 303 failure was 369 -> double-click -> Undo -> 370.
+    // A 12px handle can be clicked either side of the image's exact edge;
+    // the first mouse-down/up must not create a hidden resize transaction.
+    for offset in [-5.0, -1.0, 1.0, 5.0] {
+        let mut document = Document::from_paragraph("图前文字");
+        document.apply(Transaction::InsertImage {
+            selection: document.end_selection(),
+            resource_id: "0123456789abcdef0123456789abcdef".into(),
+            natural_size: (2000, 1500),
+        }).unwrap();
+        let image_id = document.blocks()[1].id;
+        document.apply(Transaction::SetImageDisplayWidth {
+            node_id: image_id,
+            display_width: Some(369),
+        }).unwrap();
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 1600.0, 680.0);
+        let mut editor = EditorCore::from_document(document, cx);
+        editor.layout = layout;
+        let image = editor.layout.block_layout(image_id).unwrap().bounds;
+        editor.select_atomic_at(point(image.left() + px(2.0), image.top() + px(2.0)));
+        let pointer = point(image.right() + px(offset), image.bottom());
+        assert!(editor.begin_image_resize(pointer));
+        editor.update_image_resize(pointer);
+        assert_eq!(editor.image_resize_preview_bounds().unwrap().size.width, px(369.0));
+        assert!(!editor.finish_image_resize(pointer).unwrap(),
+            "a stationary handle click at offset {offset} is not a resize");
+        assert_eq!(editor.undo_depth(), 0);
+        assert!(editor.restore_selected_image_natural_width().unwrap());
+        assert_eq!(editor.undo_depth(), 1, "double-click restores natural size once");
+        editor.undo().unwrap();
+        match &editor.document().blocks()[1].content {
+            BlockContent::Image { display_width, .. } => assert_eq!(*display_width, Some(369)),
+            _ => panic!("image must survive natural-size Undo"),
+        }
+        editor.redo().unwrap();
+        match &editor.document().blocks()[1].content {
+            BlockContent::Image { display_width, .. } => assert_eq!(*display_width, None),
+            _ => panic!("image must survive natural-size Redo"),
+        }
+    }
+}
+
+#[gpui::test]
+fn image_resize_316_real_drag_still_clamps_and_undoes_once(cx: &mut gpui::TestAppContext) {
+    for (pointer_width, expected_width) in [(20.0, 50), (250.0, 250), (1000.0, 680)] {
+        let mut document = Document::from_paragraph("图前文字");
+        document.apply(Transaction::InsertImage {
+            selection: document.end_selection(),
+            resource_id: "0123456789abcdef0123456789abcdef".into(),
+            natural_size: (2000, 1500),
+        }).unwrap();
+        let image_id = document.blocks()[1].id;
+        document.apply(Transaction::SetImageDisplayWidth {
+            node_id: image_id,
+            display_width: Some(369),
+        }).unwrap();
+        let mut layout = LayoutRegistry::new();
+        layout.layout_document(&document, 0.0, 1600.0, 680.0);
+        let mut editor = EditorCore::from_document(document, cx);
+        editor.layout = layout;
+        let image = editor.layout.block_layout(image_id).unwrap().bounds;
+        editor.select_atomic_at(point(image.left() + px(2.0), image.top() + px(2.0)));
+        assert!(editor.begin_image_resize(point(image.right() + px(5.0), image.bottom())));
+        let target = point(image.left() + px(pointer_width), image.bottom());
+        editor.update_image_resize(target);
+        let preview = editor.image_resize_preview_bounds().unwrap();
+        assert_eq!(preview.size.width, px(expected_width as f32));
+        assert!((f32::from(preview.size.height) - expected_width as f32 * 0.75).abs() < 0.01);
+        assert_eq!(editor.undo_depth(), 0, "drag preview is not a document edit");
+        match &editor.document().blocks()[1].content {
+            BlockContent::Image { display_width, .. } => assert_eq!(*display_width, Some(369)),
+            _ => panic!("drag preview must retain image"),
+        }
+        assert!(editor.finish_image_resize(target).unwrap());
+        assert_eq!(editor.undo_depth(), 1);
+        match &editor.document().blocks()[1].content {
+            BlockContent::Image { display_width, .. } => assert_eq!(*display_width, Some(expected_width)),
+            _ => panic!("drag must retain image"),
+        }
+        editor.undo().unwrap();
+        match &editor.document().blocks()[1].content {
+            BlockContent::Image { display_width, .. } => assert_eq!(*display_width, Some(369)),
+            _ => panic!("drag Undo must retain image"),
+        }
+        editor.redo().unwrap();
+        match &editor.document().blocks()[1].content {
+            BlockContent::Image { display_width, .. } => assert_eq!(*display_width, Some(expected_width)),
+            _ => panic!("drag Redo must retain image"),
+        }
+    }
 }
 
 #[test]
@@ -5125,6 +5654,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             kind: BlockKind::Paragraph,
             content: BlockContent::text("nine"),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -5141,6 +5671,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
                 link: None,
             },
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -5150,6 +5681,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             kind: BlockKind::Divider,
             content: BlockContent::Empty,
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -5159,6 +5691,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
             kind: BlockKind::Paragraph,
             content: BlockContent::text("three"),
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -5175,6 +5708,7 @@ fn fractional_navigation_indexes_keep_order_and_classification_after_splices() {
                 link: None,
             },
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -6425,6 +6959,9 @@ fn all_visible_commands_execute_or_are_disabled(cx: &mut gpui::TestAppContext) {
     for descriptor in descriptors {
         let mut editor = EditorCore::for_test("第一行\n第二行", cx);
         editor.select_all();
+        if descriptor.command == EditorCommand::ClearFormatting {
+            catalogue.execute(EditorCommand::Bold, CommandArgument::None, &mut editor).unwrap();
+        }
         let before = editor.document().semantic_snapshot();
         let before_undo = editor.undo_depth();
         let argument = match descriptor.command {
@@ -8219,6 +8756,58 @@ fn inserting_a_table_splits_the_paragraph_saves_and_undoes(cx: &mut gpui::TestAp
     assert_eq!(editor.document().semantic_snapshot(), before);
 }
 
+#[test]
+fn table_insert_280_publishes_delta_for_text_boundaries_and_selection_replacement() {
+    let canonical = app_lite_core::CanonicalDocument::parse_html(
+        "<table><tr><td>单元格</td></tr></table>",
+    ).unwrap();
+    let imported = super::codec::import_canonical(&canonical).unwrap();
+    let BlockContent::Table(table) = &imported.blocks()[0].content else {
+        panic!("table fixture");
+    };
+    for (text, start, end) in [("前后", 0, 0), ("前后", 3, 3), ("前后", 6, 6), ("前后", 0, 6)] {
+        let mut document = Document::from_paragraph(text);
+        let node = document.first_node_id().unwrap();
+        let mut order = vec![node];
+        let outcome = document.apply(Transaction::InsertTable {
+            selection: Selection::new(DocPoint::new(node, start), DocPoint::new(node, end)),
+            table: table.clone(),
+        }).unwrap();
+        assert!(!outcome.structural_splices.is_empty(), "missing table delta at {start}..{end}");
+        for splice in &outcome.structural_splices {
+            assert_eq!(&order[splice.start_index..splice.start_index + splice.removed.len()], splice.removed.as_slice());
+            order.splice(splice.start_index..splice.start_index + splice.removed.len(), splice.inserted.iter().copied());
+        }
+        assert_eq!(order, document.blocks().iter().map(|block| block.id).collect::<Vec<_>>());
+        document.validate_selection(outcome.selection).unwrap();
+    }
+}
+
+#[gpui::test]
+fn table_insert_280_keeps_live_layout_valid_for_following_text_and_enter(cx: &mut gpui::TestAppContext) {
+    let mut editor = EditorCore::for_test("表格之前", cx);
+    editor.set_caret_utf8("表格之前".len());
+    let snapshot = editor.document().clone();
+    editor.layout.layout_document(&snapshot, 0.0, 640.0, 680.0);
+    let table = editor.insert_table(3, 3).unwrap();
+    // The real window renders between cell edits and returning to the body.
+    let snapshot = editor.document().clone();
+    editor.layout.layout_document(&snapshot, 0.0, 640.0, 680.0);
+    editor.set_table_cell(table, 0, 0, vec![app_lite_core::document::Inline::Text { text: "表头甲".into(), marks: Default::default() }]).unwrap();
+    editor.set_selection_for_test(editor.document().end_selection());
+    editor.insert_text("表格之后").unwrap();
+    editor.insert_paragraph_break().unwrap();
+    editor.insert_text("换行之后").unwrap();
+    let saved = super::codec::export_canonical(editor.document()).unwrap().to_canonical_html();
+    assert!(saved.as_str().ends_with("</table><p>表格之后</p><p>换行之后</p>"), "{}", saved.as_str());
+    for _ in 0..3 { editor.undo().unwrap(); }
+    for _ in 0..3 { editor.redo().unwrap(); }
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap().to_canonical_html(), saved);
+    let snapshot = editor.document().clone();
+    editor.layout.layout_document(&snapshot, 0.0, 640.0, 680.0);
+    snapshot.validate_invariants().unwrap();
+}
+
 #[gpui::test]
 fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
     cx: &mut gpui::TestAppContext,
@@ -8232,6 +8821,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
             styles: styles.into_iter().collect(),
         },
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -8256,6 +8846,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
                 link: None,
             },
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -8269,6 +8860,7 @@ fn copied_blocks_paste_back_with_kinds_marks_and_resources_in_one_undo_step(
                 media_type: "application/pdf".into(),
             },
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -8629,6 +9221,7 @@ fn a_run_never_keeps_both_script_marks() {
                 styles: smallvec::smallvec![StyledRun { range: 0..2, marks }],
             },
             alignment: TextAlignment::Left,
+            indent: 0,
             quoted: false,
             quote_start: false,
             revision: 0,
@@ -8821,6 +9414,61 @@ fn text_color_sets_replaces_resets_and_carries_at_the_caret(cx: &mut gpui::TestA
 }
 
 #[gpui::test]
+fn highlight_toggle_clears_an_explicit_color_and_undo_restores_it(cx: &mut gpui::TestAppContext) {
+    let source = app_lite_core::CanonicalDocument::parse_pasted_html(
+        "<p><span style=\"background-color:#ffe2d5\">abcd</span></p>",
+    ).unwrap().document;
+    let mut editor = EditorCore::from_document(super::codec::import_canonical(&source).unwrap(), cx);
+    let node = editor.document().first_node_id().unwrap();
+    editor.set_selection_for_test(Selection::new(DocPoint::new(node, 0), DocPoint::new(node, 4)));
+    let catalogue = CommandCatalogue::new();
+    assert_eq!(catalogue.state(EditorCommand::Highlight, &editor).toggle, ToggleState::On);
+    catalogue.execute(EditorCommand::Highlight, CommandArgument::None, &mut editor).unwrap();
+    assert_eq!(styled_segments(&editor, 0), vec![("abcd".to_owned(), vec![])]);
+    editor.undo().unwrap();
+    assert_eq!(super::codec::export_canonical(editor.document()).unwrap(), source);
+}
+
+#[gpui::test]
+fn highlight_color_replaces_partial_ranges_and_pending_typing(cx: &mut gpui::TestAppContext) {
+    let catalogue = CommandCatalogue::new();
+    let red = app_lite_core::TextColor::parse("#ffe2d5").unwrap();
+    let green = app_lite_core::TextColor::parse("#ddf8e1").unwrap();
+    let set = |editor: &mut EditorCore, color| catalogue.execute(
+        EditorCommand::Highlight, CommandArgument::HighlightColor(color), editor).unwrap();
+    let mut editor = EditorCore::for_test("abcd", cx);
+    let node = editor.document().first_node_id().unwrap();
+    editor.set_selection_for_test(Selection::new(DocPoint::new(node, 0), DocPoint::new(node, 2)));
+    set(&mut editor, Some(red));
+    editor.set_selection_for_test(Selection::new(DocPoint::new(node, 1), DocPoint::new(node, 4)));
+    assert_eq!(editor.selection_highlight_color(), TextColorState::Mixed);
+    set(&mut editor, Some(green));
+    assert_eq!(styled_segments(&editor, 0), vec![
+        ("a".to_owned(), vec![Mark::HighlightColor(red)]),
+        ("bcd".to_owned(), vec![Mark::HighlightColor(green)]),
+    ]);
+    editor.undo().unwrap();
+    assert_eq!(styled_segments(&editor, 0), vec![
+        ("ab".to_owned(), vec![Mark::HighlightColor(red)]), ("cd".to_owned(), vec![]),
+    ]);
+    editor.redo().unwrap();
+    assert_eq!(editor.selection_highlight_color(), TextColorState::Color(green));
+    editor.set_selection_for_test(Selection::new(DocPoint::new(node, 0), DocPoint::new(node, 4)));
+    set(&mut editor, None);
+    assert_eq!(styled_segments(&editor, 0), vec![("abcd".to_owned(), vec![])]);
+    editor.set_caret_utf8(4);
+    set(&mut editor, Some(red));
+    editor.insert_text("中").unwrap();
+    editor.insert_text("😀").unwrap();
+    assert_eq!(styled_segments(&editor, 0), vec![
+        ("abcd".to_owned(), vec![]), ("中😀".to_owned(), vec![Mark::HighlightColor(red)]),
+    ]);
+    set(&mut editor, None);
+    editor.insert_text("尾").unwrap();
+    assert_eq!(styled_segments(&editor, 0).last().unwrap(), &("尾".to_owned(), vec![]));
+}
+
+#[gpui::test]
 fn an_atom_only_document_starts_on_an_existing_block_and_edits_with_history(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -8837,6 +9485,7 @@ fn an_atom_only_document_starts_on_an_existing_block_and_edits_with_history(
         kind,
         content,
         alignment: TextAlignment::Left,
+        indent: 0,
         quoted: false,
         quote_start: false,
         revision: 0,
@@ -10193,4 +10842,339 @@ async fn cell_source_offset_inside_a_grapheme_maps_to_a_grapheme_boundary(
         split.is_empty(),
         "carets inside a grapheme (offset, caret): {split:?}"
     );
+}
+
+#[gpui::test]
+fn find_matches_visible_table_text(cx: &mut gpui::TestAppContext) {
+    let html = "<p>表格前段</p><table data-joplin-lite-table=\"true\"><tbody><tr><td>甲xr</td><td>你好<b>你好</b></td></tr></tbody></table><p>表格后段</p>";
+    let canonical = app_lite_core::CanonicalDocument::parse_html(html).unwrap();
+    let document = super::codec::import_canonical(&canonical).unwrap();
+    let mut editor = EditorCore::from_document(document, cx);
+    let before = editor.document().semantic_snapshot();
+    let revision = editor.document().revision();
+    let undo = editor.undo_depth();
+    editor.set_find_query("xr", false).unwrap();
+    assert_eq!(editor.find_summary().total, 1);
+    editor.set_find_query("你好你好", false).unwrap();
+    assert_eq!(editor.find_summary().total, 1);
+    assert_eq!(editor.document().semantic_snapshot(), before);
+    assert_eq!(editor.document().revision(), revision);
+    assert_eq!(editor.undo_depth(), undo);
+}
+
+// Table find locates each match in its cell's source offsets (the measured
+// layout's coordinates): runs join across marks, never across a cell, an
+// image or a line break; matching is literal and Unicode-exact.
+#[gpui::test]
+fn find_in_table_cells_locates_each_match_exactly(cx: &mut gpui::TestAppContext) {
+    use super::find::TableCellRef;
+    let image = "a".repeat(32);
+    let html = format!(
+        "<p>甲xr前</p><table data-joplin-lite-table=\"true\"><tbody>\
+         <tr><td>甲xr</td><td>你好<b>你好</b></td><td>a.b*c</td></tr>\
+         <tr><td>XR😀xr</td><td>甲</td><td>乙</td></tr>\
+         <tr><td>甲<img src=\":/{image}\" alt=\"\">乙</td><td>甲<br>乙</td><td>xr</td></tr>\
+         </tbody></table><p>后xr</p>"
+    );
+    let canonical = app_lite_core::CanonicalDocument::parse_html(&html).unwrap();
+    let document = super::codec::import_canonical(&canonical).unwrap();
+    let mut editor = EditorCore::from_document(document, cx);
+    let before = editor.document().semantic_snapshot();
+    let cell = |row, column| Some(TableCellRef { row, column });
+    let located = |editor: &EditorCore| {
+        editor
+            .find_matches()
+            .map(|found| (found.cell, found.utf8_range.clone()))
+            .collect::<Vec<_>>()
+    };
+    let xr = "xr".len();
+    let jia = "甲".len();
+    let smile = "😀".len();
+    for (query, case_sensitive, expected) in [
+        // Paragraph, then cells in reading order, then paragraph.
+        (
+            "xr",
+            false,
+            vec![
+                (None, jia..jia + xr),
+                (cell(0, 0), jia..jia + xr),
+                (cell(1, 0), 0..xr),
+                (cell(1, 0), xr + smile..2 * xr + smile),
+                (cell(2, 2), 0..xr),
+                (None, "后".len().."后".len() + xr),
+            ],
+        ),
+        (
+            "xr",
+            true,
+            vec![
+                (None, jia..jia + xr),
+                (cell(0, 0), jia..jia + xr),
+                (cell(1, 0), xr + smile..2 * xr + smile),
+                (cell(2, 2), 0..xr),
+                (None, "后".len().."后".len() + xr),
+            ],
+        ),
+        // Across a bold mark in one cell.
+        ("你好你好", false, vec![(cell(0, 1), 0.."你好你好".len())]),
+        // Literal symbols, not a pattern.
+        ("a.b*c", false, vec![(cell(0, 2), 0.."a.b*c".len())]),
+        ("a.b", false, vec![(cell(0, 2), 0.."a.b".len())]),
+        // Emoji and its neighbours, by byte range.
+        ("😀xr", false, vec![(cell(1, 0), xr..xr + smile + xr)]),
+        // Never across cells, an image or a line break.
+        ("甲乙", false, vec![]),
+    ] {
+        editor.set_find_query(query, case_sensitive).unwrap();
+        assert_eq!(
+            located(&editor),
+            expected,
+            "{query:?} case_sensitive={case_sensitive}"
+        );
+    }
+    // The cell after an image starts after the image's source length.
+    editor.set_find_query("乙", false).unwrap();
+    let after_image = jia + super::table_layout::MEDIA_SOURCE_LEN;
+    assert_eq!(
+        located(&editor),
+        vec![
+            (cell(1, 2), 0.."乙".len()),
+            (cell(2, 0), after_image..after_image + "乙".len()),
+            (cell(2, 1), jia + 1..jia + 1 + "乙".len()),
+        ]
+    );
+    assert_eq!(editor.document().semantic_snapshot(), before);
+}
+
+// Mounted: matches in table cells are painted on their own glyphs (after
+// "甲", after an image, in a far column of a wide table), navigation runs in
+// document order through paragraphs and cells and wraps, and revealing a
+// table match brings that cell into view (vertically and across the table).
+#[gpui::test]
+fn mounted_table_find_paints_cell_glyphs_and_reveals_in_order(cx: &mut gpui::TestAppContext) {
+    use super::find::TableCellRef;
+    const COLUMNS: usize = 40;
+    let image = "b".repeat(32);
+    let mut first_row = String::from("<td>甲xr</td>");
+    for column in 1..COLUMNS {
+        if column == COLUMNS - 1 {
+            first_row.push_str("<td>远xr</td>");
+        } else {
+            first_row.push_str(&format!("<td>格{column}</td>"));
+        }
+    }
+    let mut second_row = format!("<td>甲<img src=\":/{image}\" alt=\"\">乙xr</td>");
+    for _ in 1..COLUMNS {
+        second_row.push_str("<td>空</td>");
+    }
+    let mut html = String::from("<p>前xr</p>");
+    for index in 0..80 {
+        html.push_str(&format!("<p>填充段落 {index}</p>"));
+    }
+    html.push_str(&format!(
+        "<table data-joplin-lite-table=\"true\"><tbody><tr>{first_row}</tr><tr>{second_row}</tr></tbody></table><p>后xr</p>"
+    ));
+    let canonical = app_lite_core::CanonicalDocument::parse_html(&html).unwrap();
+    let document = super::codec::import_canonical(&canonical).unwrap();
+    let table = document
+        .blocks()
+        .iter()
+        .find(|block| matches!(block.content, BlockContent::Table(_)))
+        .expect("the table")
+        .id;
+    let (surface, cx) = cx.add_window_view(move |_window, cx| {
+        let editor = cx.new(|cx| EditorCore::new(document, cx));
+        EditorSurface::new(editor, EditorSurfaceMode::Editable, None, cx)
+    });
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, app| window.draw(app).clear());
+        cx.run_until_parked();
+    };
+    let (before, revision, undo) = surface.update(cx, |surface, surface_cx| {
+        surface.editor().update(surface_cx, |editor, _| {
+            let state = (
+                editor.document().semantic_snapshot(),
+                editor.document().revision(),
+                editor.undo_depth(),
+            );
+            editor.set_find_query("xr", false).unwrap();
+            state
+        })
+    });
+    draw(cx);
+    let cell = |row, column| Some(TableCellRef { row, column });
+    let order = surface.read_with(cx, |surface, app| {
+        surface
+            .editor()
+            .read(app)
+            .find_matches()
+            .map(|found| (found.node_id == table, found.cell))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        order,
+        vec![
+            (false, None),
+            (true, cell(0, 0)),
+            (true, cell(0, COLUMNS - 1)),
+            (true, cell(1, 0)),
+            (false, None),
+        ],
+        "paragraph, cells in reading order, paragraph"
+    );
+
+    // Step to each table match in turn and reveal it.
+    for (step, expected) in [cell(0, 0), cell(0, COLUMNS - 1), cell(1, 0)]
+        .into_iter()
+        .enumerate()
+    {
+        surface.update(cx, |surface, surface_cx| {
+            let primary = surface.editor().update(surface_cx, |editor, _| {
+                editor.find_next().map(|found| found.cell)
+            });
+            assert_eq!(primary, Some(expected), "step {step}");
+            assert!(surface.reveal_find_primary(surface_cx));
+        });
+        draw(cx);
+        draw(cx);
+        let (highlights, viewport, table_bounds, column_width, first_row_height, scroll) = surface
+            .read_with(cx, |surface, app| {
+                let editor = surface.editor().read(app);
+                let layout = editor.layout();
+                (
+                    render::table_find_highlights_for_test(editor),
+                    surface.scroll_metrics_for_test().viewport,
+                    layout.block_layout(table).expect("measured table").bounds,
+                    layout.table_layout(table).expect("measured").column_width,
+                    layout.table_layout(table).expect("measured").row_heights[0],
+                    layout.table_scroll_offset(table),
+                )
+            });
+        let primary = highlights
+            .iter()
+            .filter(|highlight| highlight.primary)
+            .collect::<Vec<_>>();
+        assert_eq!(primary.len(), 1, "step {step}: one primary: {highlights:?}");
+        let primary = primary[0].bounds;
+        assert!(primary.size.width > px(0.0) && primary.size.height > px(0.0));
+        assert!(
+            primary.bottom() >= viewport.top() && primary.top() <= viewport.bottom(),
+            "step {step}: revealed into the viewport: {primary:?} {viewport:?}"
+        );
+        let target = expected.unwrap();
+        let cell_left = table_bounds.left() - px(scroll) + px(column_width) * target.column as f32;
+        assert!(
+            primary.left() > cell_left && primary.right() <= cell_left + px(column_width),
+            "step {step}: on the cell's own glyphs, after its first character: {primary:?} cell_left={cell_left:?}"
+        );
+        if target.column == COLUMNS - 1 {
+            assert!(
+                scroll > 0.0,
+                "the far column was scrolled into the table's view"
+            );
+        }
+        if target.row == 1 {
+            assert!(
+                primary.top() >= table_bounds.top() + px(first_row_height),
+                "step {step}: in the second row: {primary:?}"
+            );
+        }
+    }
+    // The fifth match (closing paragraph), then it wraps to the first.
+    surface.update(cx, |surface, surface_cx| {
+        surface.editor().update(surface_cx, |editor, _| {
+            assert_eq!(editor.find_next().map(|found| found.cell), Some(None));
+            assert_eq!(editor.find_next().map(|found| found.cell), Some(None));
+            assert_eq!(
+                editor.find_summary().primary_index,
+                Some(0),
+                "wraps to the first"
+            );
+            assert_eq!(editor.find_previous().map(|found| found.cell), Some(None));
+            assert_eq!(editor.find_summary().primary_index, Some(4), "and back");
+        })
+    });
+    surface.read_with(cx, |surface, app| {
+        let editor = surface.editor().read(app);
+        assert_eq!(editor.document().semantic_snapshot(), before);
+        assert_eq!(editor.document().revision(), revision);
+        assert_eq!(editor.undo_depth(), undo);
+    });
+}
+
+// Cell edits, row/column insertion and deletion, Undo and Redo all leave the
+// table's matches exactly where the table now has them: no stale cell or
+// range survives, and the primary follows its match when rows move.
+#[gpui::test]
+fn table_find_follows_cell_and_structure_edits_and_history(cx: &mut gpui::TestAppContext) {
+    use super::find::TableCellRef;
+    let html = "<table data-joplin-lite-table=\"true\"><tbody><tr><td>甲xr</td><td>乙</td></tr><tr><td>丙</td><td>丁</td></tr></tbody></table>";
+    let canonical = app_lite_core::CanonicalDocument::parse_html(html).unwrap();
+    let document = super::codec::import_canonical(&canonical).unwrap();
+    let mut editor = EditorCore::from_document(document, cx);
+    let table = editor.document().first_node_id().unwrap();
+    let cell = |row, column| Some(TableCellRef { row, column });
+    let located = |editor: &EditorCore| {
+        editor
+            .find_matches()
+            .map(|found| (found.cell, found.utf8_range.clone()))
+            .collect::<Vec<_>>()
+    };
+    let jia = "甲".len();
+    editor.set_find_query("xr", false).unwrap();
+    assert_eq!(located(&editor), vec![(cell(0, 0), jia..jia + 2)]);
+
+    // A cell's own edit (the cell editor's Done writes through this).
+    editor
+        .set_table_cell(
+            table,
+            1,
+            1,
+            vec![app_lite_core::document::Inline::Text {
+                text: "xr丁".into(),
+                marks: Default::default(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        located(&editor),
+        vec![(cell(0, 0), jia..jia + 2), (cell(1, 1), 0..2)]
+    );
+    // The primary moves to the second match, then a row goes in above it.
+    editor.find_next();
+    assert_eq!(
+        editor.find_primary().and_then(|found| found.cell),
+        cell(1, 1)
+    );
+    editor.insert_table_row(table, 0).unwrap();
+    assert_eq!(
+        located(&editor),
+        vec![(cell(1, 0), jia..jia + 2), (cell(2, 1), 0..2)]
+    );
+    assert_eq!(
+        editor.find_primary().and_then(|found| found.cell),
+        cell(2, 1),
+        "the primary follows its match"
+    );
+    editor.insert_table_column(table, 0).unwrap();
+    assert_eq!(
+        located(&editor),
+        vec![(cell(1, 1), jia..jia + 2), (cell(2, 2), 0..2)]
+    );
+    editor.delete_table_column(table, 2).unwrap();
+    assert_eq!(located(&editor), vec![(cell(1, 1), jia..jia + 2)]);
+    editor.delete_table_row(table, 1).unwrap();
+    assert_eq!(located(&editor), vec![]);
+    assert_eq!(editor.find_summary().total, 0);
+
+    // Undo brings each step's matches back; Redo removes them again.
+    editor.undo().unwrap();
+    assert_eq!(located(&editor), vec![(cell(1, 1), jia..jia + 2)]);
+    editor.undo().unwrap();
+    assert_eq!(
+        located(&editor),
+        vec![(cell(1, 1), jia..jia + 2), (cell(2, 2), 0..2)]
+    );
+    editor.redo().unwrap();
+    assert_eq!(located(&editor), vec![(cell(1, 1), jia..jia + 2)]);
 }

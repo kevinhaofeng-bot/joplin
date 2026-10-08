@@ -10,6 +10,60 @@ const PDF: &str = "333333333333333333333333333333bb";
 const TARGET_IMAGE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TARGET_PDF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+#[test]
+fn legacy_font_colour_keeps_nested_marks_and_image_order_in_html_and_markdown_blocks() {
+    // Catch discarding legacy colour or leaking a child's colour into its siblings.
+    let body = format!(
+        "<p>前<font color=\"#12ab34\"><strong>绿</strong><font color=\"red\">红</font>绿</font>后<img src=\":/{IMAGE}\" alt=\"图\"></p>"
+    );
+    let expected = CanonicalDocument::parse_html(&format!(
+        "<p>前<span style=\"color: #12ab34\"><strong>绿</strong></span><span style=\"color: #ff0000\">红</span><span style=\"color: #12ab34\">绿</span>后<img src=\":/{TARGET_IMAGE}\" alt=\"图\"></p>"
+    )).unwrap();
+    for markup in [1, 2] {
+        let (converted, warning) = app_lite_core::convert_jex_note_body_or_degrade(
+            NOTE,
+            "legacy-colour.md",
+            markup,
+            &body,
+            &resources(),
+        )
+        .unwrap();
+        assert!(warning.is_none(), "markup={markup}: {warning:?}");
+        assert_eq!(converted.document, expected, "markup={markup}");
+        assert_eq!(converted.search_text, "前绿红绿后图");
+        assert_eq!(
+            converted.ordered_resource_occurrences,
+            vec![ResourceId::new(TARGET_IMAGE).unwrap()]
+        );
+        assert_eq!(
+            CanonicalDocument::parse_html(&converted.canonical_html).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn legacy_font_colour_does_not_silently_accept_size_face_or_unsafe_attributes() {
+    for opener in [
+        "<font>",
+        "<font color=\"\">",
+        "<font color=\"expression(alert(1))\">",
+        "<font color=\"red\" size=\"6\">",
+        "<font color=\"red\" face=\"serif\">",
+        "<font color=\"red\" onclick=\"alert(1)\">",
+        "<font color=\"red\" style=\"font-size: 20px\">",
+        "<font color=\"red\" COLOR=\"blue\">",
+    ] {
+        let body = format!("<p>{opener}保留原文</font></p>");
+        for markup in [1, 2] {
+            assert!(
+                convert_jex_note_body(NOTE, "unsupported-font.md", markup, &body, &resources())
+                    .is_err()
+            );
+        }
+    }
+}
+
 fn resources() -> BTreeMap<String, JexVerifiedResource> {
     BTreeMap::from([
         (

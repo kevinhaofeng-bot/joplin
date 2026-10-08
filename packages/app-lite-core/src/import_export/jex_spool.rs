@@ -5,7 +5,7 @@ use super::{
     JexPhysicalResourceFile, JexScanError, JexScanReport, JexScannedMetadataItem,
     MAX_JEX_ARCHIVE_ENTRIES, MAX_JEX_ITEM_BYTES, MAX_JEX_RESOURCE_BYTES, STREAM_BUFFER_BYTES,
     checked_archive_path, parse_item, physical_resource_id, raw_archive_path_for_error, read_item,
-    root_item_id, scan_jex_archive, tar_entry_kind, valid_joplin_id,
+    root_item_id, scan_jex_archive_with_cancel, tar_entry_kind, valid_joplin_id,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -61,9 +61,11 @@ pub struct JexRawSourceItem {
 /// `jex-source.sqlite` schema is source-only; no `library.sqlite` exists.
 pub struct JexPreparedSource {
     directory: TempDir,
+    _lease: File,
     report: JexScanReport,
     metadata_index: BTreeMap<String, usize>,
     resource_index: BTreeMap<String, usize>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl JexPreparedSource {
@@ -82,6 +84,7 @@ impl JexPreparedSource {
     /// Read one raw item, never the full archive, with the preflight digest
     /// rechecked before returning bytes to a later importer.
     pub fn raw_item(&self, source_id: &str) -> Result<Option<JexRawSourceItem>, JexPrepareError> {
+        check_cancel(&self.cancel)?;
         if !valid_joplin_id(source_id) {
             return Ok(None);
         }
@@ -143,7 +146,7 @@ impl JexPreparedSource {
             self.directory.path(),
             &expected.source_id,
         ))?;
-        verify_resource_file(&mut file, expected)?;
+        verify_resource_file(&mut file, expected, &self.cancel)?;
         file.seek(SeekFrom::Start(0))?;
         Ok(Some((expected.clone(), file)))
     }
@@ -195,7 +198,13 @@ fn prepare_inner(
         return Err(JexPrepareError::InvalidStagingParent);
     }
     check_cancel(&cancel)?;
-    let report = scan_jex_archive(source)?;
+    let report = scan_jex_archive_with_cancel(source, cancel.as_deref()).map_err(|error| {
+        if matches!(error, JexScanError::Cancelled) {
+            JexPrepareError::Cancelled
+        } else {
+            JexPrepareError::Scan(error)
+        }
+    })?;
     if !report.is_importable() {
         return Err(JexPrepareError::PreflightBlocked {
             report: Box::new(report),
@@ -204,6 +213,7 @@ fn prepare_inner(
     check_cancel(&cancel)?;
     after_preflight();
     let directory = Builder::new().prefix("jex-source-").tempdir_in(parent)?;
+    let lease = super::import_staging::claim(directory.path())?;
     fs::create_dir(directory.path().join("resources"))?;
     let database = directory.path().join(SPOOL_DATABASE);
     let mut db = Connection::open(&database)?;
@@ -221,7 +231,7 @@ fn prepare_inner(
     )?;
     ingest_second_pass(source, directory.path(), &mut db, &report, &cancel)?;
     drop(db);
-    verify_spool(directory.path(), &report)?;
+    verify_spool(directory.path(), &report, &cancel)?;
     check_cancel(&cancel)?;
     let metadata_index = report
         .metadata_items
@@ -237,9 +247,11 @@ fn prepare_inner(
         .collect();
     Ok(JexPreparedSource {
         directory,
+        _lease: lease,
         report,
         metadata_index,
         resource_index,
+        cancel,
     })
 }
 
@@ -412,7 +424,9 @@ fn ingest_second_pass(
 fn verify_resource_file(
     file: &mut File,
     expected: &JexPhysicalResourceFile,
+    cancel: &Option<Arc<AtomicBool>>,
 ) -> Result<(), JexPrepareError> {
+    check_cancel(cancel)?;
     if file.metadata()?.len() != expected.byte_count {
         return Err(JexPrepareError::Verification(format!(
             "resource {} size changed",
@@ -420,7 +434,12 @@ fn verify_resource_file(
         )));
     }
     let mut hash = Sha256::new();
-    let size = io::copy(file, &mut hash)?;
+    let copied = io::copy(
+        &mut super::cancellable_read::CancellableRead::new(file, cancel.as_deref()),
+        &mut hash,
+    );
+    check_cancel(cancel)?;
+    let size = copied?;
     if size != expected.byte_count || format!("{:x}", hash.finalize()) != expected.sha256 {
         return Err(JexPrepareError::Verification(format!(
             "resource {} hash changed",
@@ -430,7 +449,12 @@ fn verify_resource_file(
     Ok(())
 }
 
-fn verify_spool(directory: &Path, expected: &JexScanReport) -> Result<(), JexPrepareError> {
+fn verify_spool(
+    directory: &Path,
+    expected: &JexScanReport,
+    cancel: &Option<Arc<AtomicBool>>,
+) -> Result<(), JexPrepareError> {
+    check_cancel(cancel)?;
     let db = Connection::open(directory.join(SPOOL_DATABASE))?;
     let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -464,6 +488,7 @@ fn verify_spool(directory: &Path, expected: &JexScanReport) -> Result<(), JexPre
         ));
     }
     for item in &expected.metadata_items {
+        check_cancel(cancel)?;
         let (id, kind, size, raw_hash, body_hash, raw): (String, i64, i64, String, Option<String>, Vec<u8>) = db.query_row(
             "SELECT source_id,item_type,byte_count,raw_sha256,canonical_note_body_sha256,raw_bytes FROM jex_source_items WHERE archive_path=?1",
             [&item.archive_path], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?;
@@ -496,6 +521,7 @@ fn verify_spool(directory: &Path, expected: &JexScanReport) -> Result<(), JexPre
         }
     }
     for resource in &expected.physical_resource_files {
+        check_cancel(cancel)?;
         let (id, size, sha, relative): (String,i64,String,String) = db.query_row(
             "SELECT source_id,byte_count,sha256,relative_path FROM jex_source_resources WHERE archive_path=?1",
             [&resource.archive_path], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
@@ -510,7 +536,7 @@ fn verify_spool(directory: &Path, expected: &JexScanReport) -> Result<(), JexPre
             )));
         }
         let mut file = File::open(directory.join(relative))?;
-        verify_resource_file(&mut file, resource)?;
+        verify_resource_file(&mut file, resource, cancel)?;
     }
     Ok(())
 }

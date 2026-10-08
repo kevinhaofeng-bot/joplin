@@ -428,6 +428,7 @@ pub struct EditorCommandChrome {
     more_open: bool,
     link_popover: Option<Entity<LinkPopover>>,
     color_palette_anchor: Option<Point<Pixels>>,
+    color_palette_is_highlight: bool,
     more_trigger_bounds: Option<Bounds<Pixels>>,
     insert_image_dispatch: Arc<dyn Fn(AnyWindowHandle, &mut App)>,
     _editor_subscription: Subscription,
@@ -469,6 +470,7 @@ impl EditorCommandChrome {
             more_open: false,
             link_popover: None,
             color_palette_anchor: None,
+            color_palette_is_highlight: false,
             more_trigger_bounds: None,
             insert_image_dispatch: Arc::new(insert_image_dispatch),
             _editor_subscription: subscription,
@@ -777,6 +779,18 @@ impl EditorCommandChrome {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        super::input_trace::record("toolbar", "command_started", || {
+            let editor = self.editor.read(cx);
+            serde_json::json!({
+                "command": format!("{command:?}"),
+                "from_more": from_more,
+                "undo_depth": editor.undo_depth(),
+                "redo_depth": editor.redo_depth(),
+                "revision": editor.document().revision(),
+                "selection": format!("{:?}", editor.selection()),
+                "focused": format!("{:?}", window.focused(cx)),
+            })
+        });
         if command == EditorCommand::InsertImage {
             if from_more {
                 self.more_open = false;
@@ -802,15 +816,35 @@ impl EditorCommandChrome {
         }
         if command == EditorCommand::TextColor {
             self.more_open = false;
+            self.color_palette_is_highlight = false;
             self.color_palette_anchor = Some(anchor.unwrap_or_default());
             focus_editor(&self.editor, window, cx);
             cx.notify();
             return;
         }
         let _ = self.editor.update(cx, |editor, editor_cx| {
+            let undo_before = editor.undo_depth();
+            let redo_before = editor.redo_depth();
+            let revision_before = editor.document().revision();
+            let selection_before = editor.selection();
             let result = self
                 .catalogue
                 .execute(command, CommandArgument::None, editor);
+            super::input_trace::record("toolbar", "command_finished", || {
+                serde_json::json!({
+                    "command": format!("{command:?}"),
+                    "undo_before": undo_before,
+                    "undo_after": editor.undo_depth(),
+                    "redo_before": redo_before,
+                    "redo_after": editor.redo_depth(),
+                    "revision_before": revision_before,
+                    "revision_after": editor.document().revision(),
+                    "selection_before": format!("{selection_before:?}"),
+                    "selection_after": format!("{:?}", editor.selection()),
+                    "ok": result.is_ok(),
+                    "error": result.as_ref().err().map(|error| format!("{error:?}")),
+                })
+            });
             editor_cx.notify();
             result
         });
@@ -841,6 +875,26 @@ impl EditorCommandChrome {
         cx.notify();
     }
 
+    fn apply_highlight_color(
+        &mut self,
+        color: Option<app_lite_core::TextColor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.editor.update(cx, |editor, editor_cx| {
+            let result = self.catalogue.execute(
+                EditorCommand::Highlight,
+                CommandArgument::HighlightColor(color),
+                editor,
+            );
+            editor_cx.notify();
+            result
+        });
+        self.color_palette_anchor = None;
+        focus_editor(&self.editor, window, cx);
+        cx.notify();
+    }
+
     // Evernote's font colour dropdown: a default entry and the light theme's
     // forecolorPalette (common-editor apps/peso/defs.ts 50–61).
     fn render_color_palette(
@@ -849,7 +903,12 @@ impl EditorCommandChrome {
         content_mask: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let current = match self.editor.read(cx).selection_text_color() {
+        let highlight = self.color_palette_is_highlight;
+        let current = match if highlight {
+            self.editor.read(cx).selection_highlight_color()
+        } else {
+            self.editor.read(cx).selection_text_color()
+        } {
             TextColorState::Color(color) => Some(color),
             TextColorState::Default | TextColorState::Mixed => None,
         };
@@ -866,8 +925,19 @@ impl EditorCommandChrome {
             .max(mask_top);
         let chrome = cx.entity();
         let default_row = div()
-            .id("text-color-default")
-            .debug_selector(|| "text-color-default".to_owned())
+            .id(if highlight {
+                "highlight-color-clear"
+            } else {
+                "text-color-default"
+            })
+            .debug_selector(move || {
+                if highlight {
+                    "highlight-color-clear"
+                } else {
+                    "text-color-default"
+                }
+                .to_owned()
+            })
             .h(px(28.0))
             .px(px(6.0))
             .flex()
@@ -882,19 +952,43 @@ impl EditorCommandChrome {
                 move |_event, window, cx| {
                     cx.stop_propagation();
                     let _ = chrome.update(cx, |chrome, chrome_cx| {
-                        chrome.apply_text_color(None, window, chrome_cx)
+                        if highlight {
+                            chrome.apply_highlight_color(None, window, chrome_cx)
+                        } else {
+                            chrome.apply_text_color(None, window, chrome_cx)
+                        }
                     });
                 }
             })
-            .child("默认");
-        let swatches = TEXT_COLOR_PALETTE.iter().map(|hex| {
+            .child(if highlight { "清除高亮" } else { "默认" });
+        let palette = if highlight {
+            HIGHLIGHT_COLOR_PALETTE.as_slice()
+        } else {
+            TEXT_COLOR_PALETTE.as_slice()
+        };
+        let swatches = palette.iter().map(|hex| {
             let color = app_lite_core::TextColor::parse(hex).expect("palette colour");
-            let selected = current.is_some_and(|current| current.rgb() == color.rgb());
+            let selected = current.is_some_and(|current| {
+                if highlight {
+                    current.with_simple_inversion(false) == color
+                } else {
+                    current.rgb() == color.rgb()
+                }
+            });
             let chrome = chrome.clone();
             let [r, g, b] = color.rgb();
             div()
                 .id(*hex)
-                .debug_selector(move || format!("text-color-{hex}"))
+                .debug_selector(move || {
+                    format!(
+                        "{}-{hex}",
+                        if highlight {
+                            "highlight-color"
+                        } else {
+                            "text-color"
+                        }
+                    )
+                })
                 .size(px(24.0))
                 .rounded(px(4.0))
                 .bg(rgba(u32::from_be_bytes([r, g, b, 0xff])))
@@ -904,13 +998,28 @@ impl EditorCommandChrome {
                 .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                     cx.stop_propagation();
                     let _ = chrome.update(cx, |chrome, chrome_cx| {
-                        chrome.apply_text_color(Some(color), window, chrome_cx)
+                        if highlight {
+                            chrome.apply_highlight_color(Some(color), window, chrome_cx)
+                        } else {
+                            chrome.apply_text_color(Some(color), window, chrome_cx)
+                        }
                     });
                 })
         });
         div()
-            .id("text-color-palette")
-            .debug_selector(|| "text-color-palette".to_owned())
+            .id(if highlight {
+                "highlight-color-palette"
+            } else {
+                "text-color-palette"
+            })
+            .debug_selector(move || {
+                if highlight {
+                    "highlight-color-palette"
+                } else {
+                    "text-color-palette"
+                }
+                .to_owned()
+            })
             .absolute()
             .top(px(top))
             .left(px(left))
@@ -1260,6 +1369,21 @@ impl EditorCommandChrome {
                 .opacity(if state.enabled { 1.0 } else { 0.35 })
                 .child(icon)
         };
+        if command == EditorCommand::Highlight {
+            if let TextColorState::Color(color) = self.editor.read(cx).selection_highlight_color() {
+                button = button.relative().child(
+                    div()
+                        .id("highlight-current-color")
+                        .debug_selector(|| "highlight-current-color".to_owned())
+                        .absolute()
+                        .bottom(px(3.0))
+                        .left(px(8.0))
+                        .w(px(16.0))
+                        .h(px(3.0))
+                        .bg(super::layout::text_color(color)),
+                );
+            }
+        }
         if state.enabled {
             button = button.cursor_pointer().on_mouse_down(
                 MouseButton::Left,
@@ -1277,7 +1401,47 @@ impl EditorCommandChrome {
                 },
             );
         }
-        button.into_any_element()
+        if command == EditorCommand::Highlight {
+            let chrome = cx.entity();
+            let dropdown = div()
+                .id("highlight-color-trigger")
+                .debug_selector(|| "highlight-color-trigger".to_owned())
+                .w(px(16.0))
+                .h(px(32.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.0))
+                .text_color(foreground)
+                .child("▾");
+            let dropdown = if state.enabled {
+                dropdown.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    move |event, window, cx| {
+                        cx.stop_propagation();
+                        let _ = chrome.update(cx, |chrome, chrome_cx| {
+                            chrome.more_open = false;
+                            chrome.color_palette_is_highlight = true;
+                            chrome.color_palette_anchor = Some(event.position);
+                            focus_editor(&chrome.editor, window, chrome_cx);
+                            chrome_cx.notify();
+                        });
+                    },
+                )
+            } else {
+                dropdown.opacity(0.35)
+            };
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .child(button)
+                .child(dropdown)
+                .into_any_element()
+        } else {
+            button.into_any_element()
+        }
     }
 
     fn render_more_trigger(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1541,6 +1705,11 @@ impl EditorCommandChrome {
 const TEXT_COLOR_PALETTE: [&str; 14] = [
     "#333333", "#5A5A5A", "#8C8C8C", "#BFBFBF", "#FFFFFF", "#5724C2", "#B629D4", "#FC1233",
     "#FB5F2C", "#E59E25", "#18A841", "#1AA9B2", "#1885E2", "#0D3A99",
+];
+
+// common-editor apps/peso/defs.ts HIGHLIGHT_COLORS, resolved on white.
+const HIGHLIGHT_COLOR_PALETTE: [&str; 6] = [
+    "#fdf3d0", "#ffe2d5", "#ddf8e1", "#e0f7fd", "#edf0ff", "#feead4",
 ];
 
 fn toolbar_group(command: EditorCommand) -> u8 {

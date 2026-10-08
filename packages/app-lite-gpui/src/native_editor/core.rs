@@ -273,6 +273,9 @@ pub struct EditorCore {
     pending_image_hydration: HashSet<String>,
     active_image_hydration: HashSet<String>,
     failed_image_hydration: HashSet<String>,
+    /// The visible/prefetch image IDs of the latest paint, so a queued
+    /// request that scrolled away can be released instead of materialized.
+    resident_image_ids: HashSet<String>,
     /// Attachment bytes are never held by the editor. This small metadata map
     /// gives structural attachment nodes an honest filename/mime/size card;
     /// the note session materializes a verified source only for an explicit
@@ -337,6 +340,7 @@ const IMAGE_RESIZE_HANDLE_SIZE: f32 = 12.0;
 struct ImageResizeDrag {
     node_id: NodeId,
     origin: Point<Pixels>,
+    start_pointer_x: Pixels,
     aspect: f32,
     ceiling: f32,
     start_width: f32,
@@ -344,6 +348,10 @@ struct ImageResizeDrag {
 }
 
 impl ImageResizeDrag {
+    fn pointer_moved(&self, position: Point<Pixels>) -> bool {
+        f32::from(position.x - self.start_pointer_x).abs() >= 0.5
+    }
+
     fn clamped_width(&self, position: Point<Pixels>) -> f32 {
         f32::from(position.x - self.origin.x)
             .clamp(IMAGE_RESIZE_MIN_WIDTH.min(self.ceiling), self.ceiling)
@@ -506,6 +514,7 @@ impl EditorCore {
             pending_image_hydration: HashSet::new(),
             active_image_hydration: HashSet::new(),
             failed_image_hydration: HashSet::new(),
+            resident_image_ids: HashSet::new(),
             attachment_metadata: HashMap::new(),
             next_resource_insert_anchor: 1,
             pending_resource_insert_anchors: HashMap::new(),
@@ -596,6 +605,18 @@ impl EditorCore {
 
     pub(crate) fn find_has_matches_for_node(&self, node_id: NodeId) -> bool {
         self.find.has_matches_for_node(node_id)
+    }
+
+    pub(crate) fn find_matches_for_node(
+        &self,
+        node_id: NodeId,
+    ) -> impl Iterator<Item = (&FindMatch, bool)> {
+        self.find.matches_for_node(node_id)
+    }
+
+    /// Scroll a wide table so the primary match's column is in view.
+    pub(crate) fn reveal_find_table_column(&mut self, node_id: NodeId, column: usize) {
+        self.layout.reveal_table_column(node_id, column);
     }
 
     #[cfg(test)]
@@ -845,8 +866,10 @@ impl EditorCore {
             }
             Transaction::SetBlockKind { .. }
             | Transaction::ToggleMark { .. }
+            | Transaction::ClearFormatting { .. }
             | Transaction::SetLink { .. }
             | Transaction::SetTextColor { .. }
+            | Transaction::SetHighlightColor { .. }
             | Transaction::SetAlignment { .. }
             | Transaction::SetQuote { .. }
             | Transaction::ToggleCheck { .. }
@@ -919,19 +942,33 @@ impl EditorCore {
         // historical viewport would eventually stream an entire long note
         // after one quick scroll. The active request is allowed to finish,
         // while this slot always represents the newest resident/preload set.
-        let next = resource_ids.into_iter().find(|resource_id| {
+        let resident = resource_ids.into_iter().collect::<Vec<_>>();
+        let next = resident.iter().find(|resource_id| {
             let still_present = self.shows_image(resource_id);
             still_present
-                && !self.materialized_image_ids.contains(resource_id)
-                && !self.active_image_hydration.contains(resource_id)
-                && !self.failed_image_hydration.contains(resource_id)
+                && !self.materialized_image_ids.contains(*resource_id)
+                && !self.active_image_hydration.contains(*resource_id)
+                && !self.failed_image_hydration.contains(*resource_id)
         });
+        let next = next.cloned();
+        self.resident_image_ids = resident.into_iter().collect();
         let previous = self.pending_image_hydration.clone();
         self.pending_image_hydration.clear();
         if let Some(resource_id) = next {
             self.pending_image_hydration.insert(resource_id);
         }
         self.pending_image_hydration != previous
+    }
+
+    /// Whether an image the latest paint asked for has yet to publish its
+    /// size, so the measured layout may still move.
+    pub(crate) fn image_geometry_settling(&self) -> bool {
+        !self.pending_image_hydration.is_empty() || !self.active_image_hydration.is_empty()
+    }
+
+    /// Whether the latest paint still showed (or prefetched) this image.
+    pub(crate) fn image_hydration_resident(&self, resource_id: &str) -> bool {
+        self.resident_image_ids.contains(resource_id)
     }
 
     /// Drain renderer-demanded IDs in document order. `active` prevents a
@@ -1062,9 +1099,19 @@ impl EditorCore {
     /// (textformatter/commands/forecolor.ts `queryCommandValue`): one colour,
     /// the default, or mixed when the selected text differs.
     pub(crate) fn selection_text_color(&self) -> TextColorState {
+        self.selection_color(false)
+    }
+
+    pub(crate) fn selection_highlight_color(&self) -> TextColorState {
+        self.selection_color(true)
+    }
+
+    fn selection_color(&self, highlight: bool) -> TextColorState {
         let color_of = |marks: &[Mark]| {
             marks.iter().find_map(|mark| match mark {
-                Mark::Color(color) => Some(*color),
+                Mark::Color(color) if !highlight => Some(*color),
+                Mark::HighlightColor(color) if highlight => Some(*color),
+                Mark::Highlight if highlight => app_lite_core::TextColor::parse("#fdf3d0"),
                 _ => None,
             })
         };
@@ -1868,7 +1915,8 @@ impl EditorCore {
         let caret_toggle = matches!(
             &transaction,
             Transaction::ToggleMark { selection, .. }
-                | Transaction::SetTextColor { selection, .. } if selection.is_caret()
+                | Transaction::SetTextColor { selection, .. }
+                | Transaction::SetHighlightColor { selection, .. } if selection.is_caret()
         );
         let outcome =
             self.history
@@ -2699,6 +2747,19 @@ impl EditorCore {
         self.extend_with(|editor| editor.move_end());
     }
 
+    /// macOS Command-Shift-Up/Down extends to the document edge, while
+    /// ordinary Shift-Up/Down remains visual-row navigation. Keep the exact
+    /// existing anchor rather than collapsing a reverse selection first.
+    pub(crate) fn select_document_edge(&mut self, to_end: bool) {
+        let target = self.point_for_document_offset_with_affinity(
+            if to_end { self.document_len() } else { 0 },
+            if to_end { Affinity::After } else { Affinity::Before },
+        );
+        self.set_selection(Selection::new(self.selection.anchor, target));
+        self.preferred_x = None;
+        self.clear_composition();
+    }
+
     pub fn select_word_left(&mut self) {
         let anchor = self.selection.anchor;
         let head = self.selection.head;
@@ -2971,7 +3032,7 @@ impl EditorCore {
                 };
                 keeps.then(|| {
                     let mut marks = self.document.caret_marks(selection);
-                    marks.retain(|mark| !matches!(mark, Mark::Link(_) | Mark::InlineCode));
+                    marks.retain(|mark| !matches!(mark, Mark::Link(_) | Mark::LinkTitle(_) | Mark::InlineCode));
                     marks
                 })
             })
@@ -3064,6 +3125,7 @@ impl EditorCore {
         self.image_resize = Some(ImageResizeDrag {
             node_id,
             origin: image.origin,
+            start_pointer_x: position.x,
             aspect: f32::from(image.size.height).max(1.0) / width,
             ceiling: self.layout.image_available_width(&self.document, node_id),
             start_width: width,
@@ -3079,7 +3141,11 @@ impl EditorCore {
     /// Updates only the preview frame; the document is untouched.
     pub(crate) fn update_image_resize(&mut self, position: Point<Pixels>) {
         if let Some(drag) = self.image_resize.as_mut() {
-            drag.preview_width = drag.clamped_width(position);
+            drag.preview_width = if drag.pointer_moved(position) {
+                drag.clamped_width(position)
+            } else {
+                drag.start_width
+            };
         }
     }
 
@@ -3103,6 +3169,12 @@ impl EditorCore {
         let Some(drag) = self.image_resize.take() else {
             return Ok(false);
         };
+        // The 12px handle extends past the image edge. Its stationary
+        // pointer position is not an intended new width, especially for
+        // the first click of a double-click restoring natural size.
+        if !drag.pointer_moved(position) {
+            return Ok(false);
+        }
         let width = drag.clamped_width(position);
         if (width - drag.start_width).abs() < 0.5 {
             // A click without a drag (e.g. the first half of a double-click)
@@ -4264,6 +4336,7 @@ fn mark_state_for_range(
 
 fn contains_mark(marks: &[super::model::Mark], mark: &super::model::Mark) -> bool {
     marks.iter().any(|candidate| match (candidate, mark) {
+        (candidate, super::model::Mark::Highlight) => candidate.is_highlight(),
         (super::model::Mark::Link(_), super::model::Mark::Link(_)) => true,
         (candidate, mark) => candidate == mark,
     })

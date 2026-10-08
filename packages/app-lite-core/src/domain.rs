@@ -31,6 +31,22 @@ opaque_id!(NotebookId);
 opaque_id!(StackId);
 opaque_id!(TagId);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub enum ShortcutTarget {
+    Note(NoteId),
+    Notebook(NotebookId),
+    Stack(StackId),
+    Tag(TagId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryShortcut {
+    pub id: String,
+    pub target: ShortcutTarget,
+    pub title: String,
+    pub position: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityRef {
     Note(NoteId),
@@ -73,6 +89,7 @@ pub struct LibraryNavigationIndex {
     pub notebooks: Vec<Notebook>,
     pub stacks: Vec<Stack>,
     pub tags: Vec<Tag>,
+    pub shortcuts: Vec<LibraryShortcut>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

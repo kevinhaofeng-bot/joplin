@@ -342,11 +342,12 @@ fn prepare_restore(
     backup: &Path,
     parent: &Path,
     cancel: &AtomicBool,
-) -> Result<(RestoredLibrary, ManifestCounts), BackupError> {
+) -> Result<(RestoredLibrary, ManifestCounts, File), BackupError> {
     let manifest = read_manifest(backup)?;
     let temp = tempfile::Builder::new()
         .prefix(".restore-")
         .tempdir_in(parent)?;
+    let lease = super::restore_staging::claim(temp.path())?;
     let mut database =
         open_regular(&backup.join(DATABASE)).map_err(|_| BackupError::DatabaseMismatch)?;
     if database.metadata()?.len() != manifest.database.size {
@@ -410,7 +411,7 @@ fn prepare_restore(
     if counts != manifest.counts {
         return Err(BackupError::CountsMismatch);
     }
-    Ok((RestoredLibrary(temp), counts))
+    Ok((RestoredLibrary(temp), counts, lease))
 }
 
 /// Restore `backup` into a new library directory `destination`.
@@ -421,12 +422,16 @@ pub fn restore_library_backup(
 ) -> Result<PublishedLibrary, BackupError> {
     let parent: PathBuf = free_target(destination)?.to_path_buf();
     check(cancel)?;
-    let (restored, _) = prepare_restore(backup, &parent, cancel)?;
-    Ok(super::publish_staged_library(
+    super::cleanup_abandoned_restore_staging(&parent)?;
+    let (restored, _, lease) = prepare_restore(backup, &parent, cancel)?;
+    let published = super::publish_staged_library(
         restored,
         destination,
         cancel,
-    )?)
+    )?;
+    super::restore_staging::finish(&published.path);
+    drop(lease);
+    Ok(published)
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use app_lite_core::{LibraryRoute, NoteId, NotebookId, SortSpec, StackId, TagId};
+use app_lite_core::{LibraryRoute, NoteId, NotebookId, ShortcutTarget, SortSpec, StackId, TagId};
 
 gpui::actions!(
     notes_library,
@@ -19,6 +19,8 @@ gpui::actions!(
         ExportLibraryReadable,
         RestoreLibraryReadable,
         CopyNote,
+        NavigateLibraryBack,
+        NavigateLibraryForward,
         SyncNow,
         OpenSyncSettings,
         ShowSyncFailures,
@@ -98,6 +100,10 @@ impl NoteSort {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppAction {
+    AddShortcuts(Vec<ShortcutTarget>),
+    RemoveShortcuts(Vec<ShortcutTarget>),
+    OpenShortcut(ShortcutTarget),
+    OpenRecentNote(NoteId),
     CreateNote,
     CreateStack {
         title: String,
@@ -119,6 +125,14 @@ pub enum AppAction {
     },
     RenameTag {
         id: TagId,
+        title: String,
+    },
+    SetNotebookStack {
+        id: NotebookId,
+        stack_id: Option<StackId>,
+    },
+    CreateStackForNotebook {
+        id: NotebookId,
         title: String,
     },
     DeleteStack(StackId),

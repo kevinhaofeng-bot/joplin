@@ -287,3 +287,46 @@ fn restore_refuses_an_existing_target() {
         restore_library_backup(&backup, &source.profile, &AtomicBool::new(false)).unwrap_err();
     assert!(matches!(error, BackupError::TargetExists), "{error:?}");
 }
+
+#[test]
+fn restore_reclaims_only_unlocked_owned_interrupted_staging() {
+    use std::io::Write;
+    let source = library();
+    let (_keep, backup) = backup_of(&source);
+    let out = tempdir().unwrap();
+    let interrupted = out.path().join(".restore-interrupted");
+    fs::create_dir(&interrupted).unwrap();
+    fs::write(interrupted.join("library.sqlite"), b"partial database").unwrap();
+    fs::write(
+        interrupted.join(".joplin-lite-restore-lease"),
+        b"joplin-lite-owned-restore-stage-v1\n.restore-interrupted\n",
+    ).unwrap();
+
+    // A simultaneous restore owns its lock; its partially copied bytes
+    // must not be removed even if another restore/restart scans the parent.
+    let live = out.path().join(".restore-live");
+    fs::create_dir(&live).unwrap();
+    fs::write(live.join("library.sqlite"), b"live partial database").unwrap();
+    let mut lease = fs::OpenOptions::new().read(true).write(true).create_new(true)
+        .open(live.join(".joplin-lite-restore-lease")).unwrap();
+    lease.lock().unwrap();
+    lease.write_all(b"joplin-lite-owned-restore-stage-v1\n.restore-live\n").unwrap();
+    lease.sync_all().unwrap();
+
+    // Old, unmarked stages and unrelated/published data are not ours to delete.
+    let legacy = out.path().join(".restore-legacy");
+    fs::create_dir(&legacy).unwrap();
+    fs::write(legacy.join("library.sqlite"), b"unknown legacy data").unwrap();
+    let published = out.path().join("published-library");
+    fs::create_dir(&published).unwrap();
+    fs::write(published.join("library.sqlite"), b"published data").unwrap();
+
+    let restored = out.path().join("restored");
+    restore_library_backup(&backup, &restored, &AtomicBool::new(false)).unwrap();
+    assert!(!interrupted.exists(), "dead owned staging must be reclaimed");
+    assert_eq!(fs::read(live.join("library.sqlite")).unwrap(), b"live partial database");
+    assert_eq!(fs::read(legacy.join("library.sqlite")).unwrap(), b"unknown legacy data");
+    assert_eq!(fs::read(published.join("library.sqlite")).unwrap(), b"published data");
+    assert!(!restored.join(".joplin-lite-restore-lease").exists());
+    assert_same_notes(&source.profile, &restored, &source.notes);
+}

@@ -1,9 +1,9 @@
 use super::BitPlanes;
 
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::*;
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::*;
 
 /// SSE2 transposition of 64 bytes into 8 bit planes.
 ///

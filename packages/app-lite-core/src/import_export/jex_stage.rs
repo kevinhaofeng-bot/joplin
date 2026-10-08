@@ -2,8 +2,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    fs::{self, File}, io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use rusqlite::{Connection, params};
@@ -27,11 +31,13 @@ mod tags;
 use super::{
     JexBodyBlockerKind, JexBodyFidelityBlocker, JexPrepareError, JexScanCounts,
     JexVerifiedResource, convert_jex_note_body_or_degrade, parse_item, prepare_jex_source_archive,
+    prepare_jex_source_archive_with_cancel,
 };
 
 #[derive(Debug)]
 pub struct JexStagedProfile {
     directory: TempDir,
+    lease: Option<File>,
     report: JexStageReport,
 }
 
@@ -41,6 +47,9 @@ impl JexStagedProfile {
     }
     pub(crate) fn into_directory(self) -> TempDir {
         self.directory
+    }
+    pub(crate) fn take_import_lease(&mut self) -> Option<File> {
+        self.lease.take()
     }
     pub fn report(&self) -> &JexStageReport {
         &self.report
@@ -163,6 +172,8 @@ pub struct JexDegradedNote {
 
 #[derive(Debug, Error)]
 pub enum JexStageError {
+    #[error("JEX staging cancelled")]
+    Cancelled,
     #[error("JEX source preparation failed: {0}")]
     Prepare(#[from] JexPrepareError),
     #[error("JEX item class {item_type} at {source_id} is not supported by this staging cut")]
@@ -590,7 +601,20 @@ fn count(db: &Connection, table: &str) -> Result<i64, JexStageError> {
     )
 }
 
-fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageError> {
+fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), JexStageError> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(JexStageError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn verify(
+    database: &Path,
+    report: &mut JexStageReport,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), JexStageError> {
+    check_cancel(cancel)?;
     let repo = LibraryRepository::open(database)?;
     let db = Connection::open(database)?;
     let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -669,6 +693,7 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
         })
         .collect::<BTreeMap<_, _>>();
     for folder in &report.folders {
+        check_cancel(cancel)?;
         folders::verify_one(&db, folder, &folder_destinations)?;
     }
     tags::verify_all(&db, report)?;
@@ -680,9 +705,11 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
             .push(relation.destination_tag_id.clone());
     }
     for resource in &report.resources {
+        check_cancel(cancel)?;
         resources::verify_one(&repo, &db, resource)?;
     }
     for entry in &report.notes {
+        check_cancel(cancel)?;
         let note = repo
             .load_note(&entry.destination_id)?
             .ok_or_else(|| JexStageError::Verification("reopened note missing".into()))?;
@@ -783,6 +810,7 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
         ));
     }
     while repo.has_pending_search_jobs()? {
+        check_cancel(cancel)?;
         if repo.process_search_jobs()? == 0 {
             return Err(JexStageError::Verification(
                 "search queue did not drain".into(),
@@ -798,6 +826,7 @@ fn verify(database: &Path, report: &mut JexStageReport) -> Result<(), JexStageEr
         ));
     }
     for entry in &report.notes {
+        check_cancel(cancel)?;
         let note = repo
             .load_note(&entry.destination_id)?
             .ok_or_else(|| JexStageError::Verification("indexed note missing".into()))?;
@@ -829,9 +858,32 @@ pub fn stage_jex_file(
     source: impl AsRef<Path>,
     staging_parent: impl AsRef<Path>,
 ) -> Result<JexStagedProfile, JexStageError> {
-    let parent = fs::canonicalize(staging_parent.as_ref())
+    stage_jex_inner(source.as_ref(), staging_parent.as_ref(), None)
+}
+
+/// The ordinary importer supplies its existing cancellation signal through
+/// scan, spool, conversion and verification. The old API remains uncancelled.
+pub fn stage_jex_file_with_cancel(
+    source: impl AsRef<Path>,
+    staging_parent: impl AsRef<Path>,
+    cancel: Arc<AtomicBool>,
+) -> Result<JexStagedProfile, JexStageError> {
+    stage_jex_inner(source.as_ref(), staging_parent.as_ref(), Some(cancel))
+}
+
+fn stage_jex_inner(
+    source: &Path,
+    staging_parent: &Path,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<JexStagedProfile, JexStageError> {
+    check_cancel(cancel.as_deref())?;
+    let parent = fs::canonicalize(staging_parent)
         .map_err(|_| JexStageError::Prepare(JexPrepareError::InvalidStagingParent))?;
-    let prepared = match prepare_jex_source_archive(source, &parent) {
+    let preparation = match &cancel {
+        Some(flag) => prepare_jex_source_archive_with_cancel(source, &parent, flag.clone()),
+        None => prepare_jex_source_archive(source, &parent),
+    };
+    let prepared = match preparation {
         Ok(prepared) => prepared,
         Err(JexPrepareError::PreflightBlocked { report })
             if !report.orphan_note_tag_relations.is_empty() =>
@@ -866,7 +918,9 @@ pub fn stage_jex_file(
     }
     let folder_plan = folders::preflight(&prepared)?;
     let tag_plan = tags::preflight(&prepared)?;
+    check_cancel(cancel.as_deref())?;
     let directory = Builder::new().prefix("jex-stage-").tempdir_in(&parent)?;
+    let lease = super::import_staging::claim(directory.path())?;
     let database: PathBuf = directory.path().join("library.sqlite");
     let repo = LibraryRepository::open(&database)?;
     let audit = Connection::open(&database)?;
@@ -940,7 +994,9 @@ pub fn stage_jex_file(
     let tag_map = tags::create_tags(&tag_plan, &prepared, &repo, &audit, &mut report)?;
     let mut verified_resources = BTreeMap::new();
     for source in &scanned.resources {
-        let (mapped, verified, changes) = resources::import_one(&prepared, source, &repo, &audit)?;
+        check_cancel(cancel.as_deref())?;
+        let (mapped, verified, changes) =
+            resources::import_one(&prepared, source, &repo, &audit, cancel.as_deref())?;
         if !changes.is_empty() {
             report.normalized_resources.push(JexResourceNormalization {
                 source_id: mapped.source_id.clone(),
@@ -951,6 +1007,7 @@ pub fn stage_jex_file(
         report.resources.push(mapped);
     }
     for source_id in &scanned.source_ids.notes {
+        check_cancel(cancel.as_deref())?;
         let raw = prepared
             .raw_item(source_id)?
             .ok_or_else(|| JexStageError::Verification("verified note item disappeared".into()))?;
@@ -1012,6 +1069,7 @@ pub fn stage_jex_file(
         });
     }
     tags::create_relations(&tag_plan, &prepared, &repo, &audit, &mut report, &tag_map)?;
+    check_cancel(cancel.as_deref())?;
     drop(audit);
     drop(repo);
     let mut db = Connection::open(&database)?;
@@ -1021,7 +1079,8 @@ pub fn stage_jex_file(
     tx.execute("DELETE FROM sync_outbox", [])?;
     tx.commit()?;
     drop(db);
-    verify(&database, &mut report)?;
+    verify(&database, &mut report, cancel.as_deref())?;
+    check_cancel(cancel.as_deref())?;
     drop(prepared);
-    Ok(JexStagedProfile { directory, report })
+    Ok(JexStagedProfile { directory, lease: Some(lease), report })
 }

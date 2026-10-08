@@ -56,6 +56,33 @@ fn create(repository: &LibraryRepository, title: &str, document: CanonicalDocume
         .expect("create note")
 }
 
+#[gpui::test]
+async fn colored_highlights_survive_native_input_flush_and_fresh_session(cx: &mut gpui::TestAppContext) {
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let source = CanonicalDocument::parse_pasted_html(
+        "<p><span style=\"background-color:#ffe2d5\">红中文</span><span style=\"background-color:#ddf8e1\">绿😀</span>普通</p>",
+    ).unwrap().document;
+    let note = create(&repository, "颜色保存", source.clone());
+    let clock = Arc::new(ManualSaveClock::default());
+    let active = session(note.clone(), Arc::clone(&repository), Arc::clone(&clock), cx);
+    append_body_via_entity_input(&active, "尾", cx);
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    let loaded = repository.load_note(&note.id).unwrap().unwrap();
+    let expected = CanonicalDocument::parse_pasted_html(
+        "<p><span style=\"background-color:#ffe2d5\">红中文</span><span style=\"background-color:#ddf8e1\">绿😀</span>普通尾</p>",
+    ).unwrap().document;
+    assert_eq!(CanonicalDocument::parse_html(loaded.body_html.as_str()).unwrap(), expected);
+    let history = repository.readable_export_note_state(&note.id, 10_000, 16 * 1024 * 1024).unwrap().unwrap();
+    assert!(history.revisions.iter().any(|revision| revision.body_html.as_str() == source.to_canonical_html().as_str()));
+    drop(active);
+    let reopened = session(loaded, Arc::clone(&repository), clock, cx);
+    reopened.read_with(cx, |session, app| {
+        let native = session.editor().read(app);
+        assert_eq!(crate::native_editor::codec::export_canonical(native.document()).unwrap(), expected);
+    });
+}
+
 fn structural_png(width: u32, height: u32) -> Vec<u8> {
     let image = image::RgbaImage::from_pixel(width, height, image::Rgba([0x2d, 0x86, 0x5f, 0xff]));
     let mut encoded = Cursor::new(Vec::new());
@@ -1765,6 +1792,156 @@ async fn offscreen_legacy_image_keeps_unknown_geometry_until_visible_repair(
             .expect("repaired image atom")
     });
     assert_eq!(natural_size, (675, 1200));
+}
+
+#[gpui::test]
+async fn browsing_legacy_paragraph_image_310_does_not_save_or_split_the_source(
+    cx: &mut gpui::TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let image = repository.import_resource(
+        &structural_png(675, 1200), "migration-inline.png", "image/png", "png",
+    ).unwrap();
+    let source = CanonicalDocument::parse_html(&format!(
+        "<table><tr><td>迁移单元格</td></tr></table><p>图片前<img src=\":/{}\" alt=\"原图\">图片后<br>下一行</p><p>末尾</p>", image.as_str(),
+    )).unwrap();
+    let note = create(&repository, "只浏览迁移图文", source);
+    let before_outbox = repository.outbox_count().unwrap();
+    let active = session(note.clone(), Arc::clone(&repository), Arc::new(ManualSaveClock::default()), cx);
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            assert!(editor.request_image_hydration([image.as_str().to_owned()]));
+            editor_cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let (size, undo_depth) = active.read_with(cx, |session, app| {
+        let editor = session.editor().read(app);
+        let size = editor.document().blocks().iter().find_map(|block| match &block.content {
+            BlockContent::Image { natural_size, .. } => Some(*natural_size), _ => None,
+        }).unwrap();
+        (size, editor.undo_depth())
+    });
+    assert_eq!(size, (675, 1200), "reading must still hydrate the real image aspect ratio");
+    assert_eq!(undo_depth, 0);
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    let after = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(after.body_html, note.body_html, "hydration may not split source paragraphs");
+    assert_eq!(after.body_text, note.body_text);
+    assert_eq!(after.revision, note.revision);
+    assert_eq!(after.updated_time, note.updated_time);
+    assert_eq!(repository.outbox_count().unwrap(), before_outbox);
+}
+
+#[gpui::test]
+async fn browsing_image_only_legacy_paragraph_310_preserves_source_and_resource_commands(
+    cx: &mut gpui::TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let image = repository.import_resource(
+        &structural_png(675, 1200), "legacy-image-only.png", "image/png", "png",
+    ).unwrap();
+    let source = CanonicalDocument::parse_html(&format!(
+        "<p><img src=\":/{}\" alt=\"旧段落单图\"></p><p>末尾</p>", image.as_str(),
+    )).unwrap();
+    let note = create(&repository, "只浏览旧段落单图", source);
+    let before_outbox = repository.outbox_count().unwrap();
+    let active = session(note.clone(), Arc::clone(&repository), Arc::new(ManualSaveClock::default()), cx);
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            assert!(matches!(editor.document().blocks()[0].kind, crate::native_editor::model::BlockKind::Image));
+            assert!(editor.request_image_hydration([image.as_str().to_owned()]));
+            editor_cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let size = active.read_with(cx, |session, app| {
+        session.editor().read(app).document().blocks().iter().find_map(|block| match &block.content {
+            BlockContent::Image { natural_size, .. } => Some(*natural_size), _ => None,
+        }).unwrap()
+    });
+    assert_eq!(size, (675, 1200));
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    let after = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(after.body_html, note.body_html, "an image-only imported paragraph must not be rewritten merely by loading");
+    assert_eq!(after.body_text, note.body_text);
+    assert_eq!(after.revision, note.revision);
+    assert_eq!(after.updated_time, note.updated_time);
+    assert_eq!(repository.outbox_count().unwrap(), before_outbox);
+}
+
+#[gpui::test]
+async fn late_inline_image_geometry_310_does_not_swallow_real_title_or_body_input(
+    cx: &mut gpui::TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let image = repository.import_resource(
+        &structural_png(675, 1200), "late-inline.png", "image/png", "png",
+    ).unwrap();
+    let source = CanonicalDocument::parse_html(&format!(
+        "<p><img src=\":/{}\" alt=\"原图\"></p><p>正文</p>", image.as_str(),
+    )).unwrap();
+    let note = create(&repository, "原题", source);
+    let active = session(note.clone(), Arc::clone(&repository), Arc::new(ManualSaveClock::default()), cx);
+    let release = active.update(cx, |session, _| session.stall_next_image_hydration_for_test());
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            assert!(editor.request_image_hydration([image.as_str().to_owned()]));
+            editor_cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    append_body_via_entity_input(&active, "真实输入310", cx);
+    let title = active.read_with(cx, |session, _| session.title().clone());
+    cx.update(|window, app| {
+        title.update(app, |title, title_cx| {
+            <crate::native_editor::chrome::TitleInput as EntityInputHandler>::replace_text_in_range(
+                title, Some(0..2), "新题", window, title_cx,
+            );
+        });
+    });
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    let after = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(after.title, "新题");
+    assert!(after.body_text.contains("真实输入310"));
+    assert_eq!(after.resource_ids, note.resource_ids);
+    assert!(after.revision > note.revision);
+}
+
+#[gpui::test]
+async fn title_only_edit_313_preserves_imported_html_after_image_loading(
+    cx: &mut gpui::TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    let (_profile, repository) = repository();
+    let image = repository.import_resource(
+        &structural_png(675, 1200), "title-boundary.png", "image/png", "png",
+    ).unwrap();
+    let source = CanonicalDocument::parse_html(&format!(
+        "<p><strong>原有样式</strong></p><p><img src=\":/{}\" alt=\"段落单图\"></p><table><tr><td>迁移表格</td></tr></table><p>尾段</p>", image.as_str(),
+    )).unwrap();
+    let note = create(&repository, "原题", source);
+    let active = session(note.clone(), Arc::clone(&repository), Arc::new(ManualSaveClock::default()), cx);
+    active.update(cx, |session, session_cx| {
+        session.editor().update(session_cx, |editor, editor_cx| {
+            assert!(editor.request_image_hydration([image.as_str().to_owned()]));
+            editor_cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    append_title_via_entity_input(&active, "仅改标题313", cx);
+    flush_until_clean(&active, FlushReason::ManualSync, cx);
+    let after = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(after.title, "原题仅改标题313");
+    assert_eq!(after.body_html, note.body_html, "title metadata may not re-encode loaded source body");
+    assert_eq!(after.body_text, note.body_text);
+    assert_eq!(after.resource_ids, note.resource_ids);
+    assert_eq!(after.revision, note.revision + 1);
 }
 
 #[gpui::test]

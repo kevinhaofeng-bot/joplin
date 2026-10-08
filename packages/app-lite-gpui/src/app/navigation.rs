@@ -233,6 +233,12 @@ impl NavigationState {
         self.history.push(self.snapshot());
     }
 
+    pub(crate) fn restore_startup_snapshot(&mut self, snapshot: NavigationSnapshot) {
+        let snapshot = snapshot.normalized();
+        self.apply_history_snapshot(&snapshot);
+        self.history = NavigationHistory { entries: vec![snapshot], cursor: 0 };
+    }
+
     /// A destructive organization mutation can make the current typed route
     /// unavailable (for example a deleted notebook or tag). That is not a
     /// user navigation, so replace the current history snapshot instead of

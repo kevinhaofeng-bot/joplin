@@ -3,9 +3,9 @@ use crate::classify::{self, CharClassMasks};
 use crate::state::{DoctypeSubState, ParserState, QuoteStyle};
 #[cfg(feature = "dtd")]
 use crate::state::{DtdDeclContext, DtdDeclKind, DtdPhase};
-use crate::types::{is_xml_whitespace, Error, ErrorKind, ParseError, QName, Span};
 #[cfg(feature = "dtd")]
 use crate::types::EntityKind;
+use crate::types::{Error, ErrorKind, ParseError, QName, Span, is_xml_whitespace};
 use crate::visitor::Visitor;
 
 /// Maximum allowed length (in bytes) for XML names: element names, attribute
@@ -100,7 +100,9 @@ impl Reader {
         self.in_xml_decl = false;
         self.xml_decl_buf_len = 0;
         #[cfg(feature = "dtd")]
-        { self.dtd_phase = DtdPhase::Idle; }
+        {
+            self.dtd_phase = DtdPhase::Idle;
+        }
     }
 
     /// Transition back to Content state after completing a markup token.
@@ -161,18 +163,18 @@ impl Reader {
             while text_scan < limit {
                 let ch = buf[text_scan];
                 if ch == b'<' {
-                    if let Some(next) = self.try_inline_tag(
-                        buf, text_scan, stream_offset, visitor,
-                    )? {
+                    if let Some(next) =
+                        self.try_inline_tag(buf, text_scan, stream_offset, visitor)?
+                    {
                         pos = next;
                         continue 'peek;
                     }
                     self.text_start = Some(pos);
                     return Ok(Some((text_scan, text_scan / 64 * 64)));
                 } else if ch == b'&' {
-                    if let Some(next) = self.try_inline_ref(
-                        buf, text_scan, stream_offset, visitor,
-                    )? {
+                    if let Some(next) =
+                        self.try_inline_ref(buf, text_scan, stream_offset, visitor)?
+                    {
                         pos = next;
                         continue 'peek;
                     }
@@ -251,7 +253,9 @@ impl Reader {
             stream_offset + name_start as u64,
             stream_offset + name_end as u64,
         );
-        visitor.end_tag(make_qname(name, span)).map_err(ParseError::Visitor)?;
+        visitor
+            .end_tag(make_qname(name, span))
+            .map_err(ParseError::Visitor)?;
         Ok(Some(name_end + 1))
     }
 
@@ -284,12 +288,16 @@ impl Reader {
                 stream_offset + name_start as u64,
                 stream_offset + name_end as u64,
             );
-            visitor.start_tag_open(make_qname(name, name_span)).map_err(ParseError::Visitor)?;
+            visitor
+                .start_tag_open(make_qname(name, name_span))
+                .map_err(ParseError::Visitor)?;
             let close_span = Span::new(
                 stream_offset + name_end as u64,
                 stream_offset + name_end as u64 + 1,
             );
-            visitor.start_tag_close(close_span).map_err(ParseError::Visitor)?;
+            visitor
+                .start_tag_close(close_span)
+                .map_err(ParseError::Visitor)?;
             Ok(Some(name_end + 1))
         } else if byte == b'/' {
             let gt_pos = name_end + 1;
@@ -302,12 +310,16 @@ impl Reader {
                 stream_offset + name_start as u64,
                 stream_offset + name_end as u64,
             );
-            visitor.start_tag_open(make_qname(name, name_span)).map_err(ParseError::Visitor)?;
+            visitor
+                .start_tag_open(make_qname(name, name_span))
+                .map_err(ParseError::Visitor)?;
             let close_span = Span::new(
                 stream_offset + name_end as u64,
                 stream_offset + gt_pos as u64 + 1,
             );
-            visitor.empty_element_end(close_span).map_err(ParseError::Visitor)?;
+            visitor
+                .empty_element_end(close_span)
+                .map_err(ParseError::Visitor)?;
             Ok(Some(gt_pos + 1))
         } else {
             Ok(None)
@@ -347,7 +359,9 @@ impl Reader {
             stream_offset + name_start as u64,
             stream_offset + name_end as u64,
         );
-        visitor.entity_ref(name, span).map_err(ParseError::Visitor)?;
+        visitor
+            .entity_ref(name, span)
+            .map_err(ParseError::Visitor)?;
         Ok(Some(name_end + 1))
     }
 
@@ -485,9 +499,9 @@ impl Reader {
                                 self.text_start = Some(scan_start);
                             }
                             // Try inline processing to avoid SIMD overhead.
-                            if let Some((resume, block)) = self.try_inline_with_peek(
-                                buf, delim_pos, stream_offset, visitor,
-                            )? {
+                            if let Some((resume, block)) =
+                                self.try_inline_with_peek(buf, delim_pos, stream_offset, visitor)?
+                            {
                                 self.resume_pos = resume;
                                 block_offset = block;
                                 continue;
@@ -519,8 +533,15 @@ impl Reader {
                 0
             };
 
-            let final_buf_pos =
-                self.process_block(buf, block_offset, block_len, start_pos, &masks, stream_offset, visitor)?;
+            let final_buf_pos = self.process_block(
+                buf,
+                block_offset,
+                block_len,
+                start_pos,
+                &masks,
+                stream_offset,
+                visitor,
+            )?;
 
             self.resume_pos = final_buf_pos;
             block_offset += block_len;
@@ -618,25 +639,31 @@ impl Reader {
             if cs < consumed {
                 let content = &buf[cs..consumed];
                 if !content.is_empty() {
-                    let span = Span::new(
-                        stream_offset + cs as u64,
-                        stream_offset + consumed as u64,
-                    );
+                    let span =
+                        Span::new(stream_offset + cs as u64, stream_offset + consumed as u64);
                     match &self.state {
                         ParserState::CommentContent { .. } => {
-                            visitor.comment_content(content, span).map_err(ParseError::Visitor)?;
+                            visitor
+                                .comment_content(content, span)
+                                .map_err(ParseError::Visitor)?;
                         }
                         ParserState::CdataContent { .. } => {
-                            visitor.cdata_content(content, span).map_err(ParseError::Visitor)?;
+                            visitor
+                                .cdata_content(content, span)
+                                .map_err(ParseError::Visitor)?;
                         }
                         ParserState::PIContent { .. } => {
                             self.emit_pi_content(content, span, visitor)?;
                         }
                         ParserState::DoctypeContent { .. } => {
-                            visitor.doctype_content(content, span).map_err(ParseError::Visitor)?;
+                            visitor
+                                .doctype_content(content, span)
+                                .map_err(ParseError::Visitor)?;
                         }
                         ParserState::AttrValue { .. } => {
-                            visitor.attribute_value(content, span).map_err(ParseError::Visitor)?;
+                            visitor
+                                .attribute_value(content, span)
+                                .map_err(ParseError::Visitor)?;
                         }
                         #[cfg(feature = "dtd")]
                         ParserState::DtdInternalSubset => {
@@ -680,7 +707,13 @@ impl Reader {
             match self.state {
                 ParserState::Content => {
                     pos = self.scan_content(
-                        buf, block_offset, block_len, pos, masks, stream_offset, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        visitor,
                     )?;
                 }
 
@@ -720,11 +753,7 @@ impl Reader {
                     let Some((next, abs)) =
                         find_name_end(masks.name_end, pos, block_offset, block_len)
                     else {
-                        check_name_length(
-                            block_offset + block_len,
-                            name_start,
-                            stream_offset,
-                        )?;
+                        check_name_length(block_offset + block_len, name_start, stream_offset)?;
                         pos = block_len;
                         continue;
                     };
@@ -736,7 +765,8 @@ impl Reader {
                     visitor
                         .start_tag_open(make_qname(name, name_span))
                         .map_err(ParseError::Visitor)?;
-                    self.markup_stream_offset = Some(stream_offset + self.markup_start.unwrap() as u64);
+                    self.markup_stream_offset =
+                        Some(stream_offset + self.markup_start.unwrap() as u64);
                     self.markup_start = None;
 
                     let byte = buf[abs];
@@ -752,7 +782,11 @@ impl Reader {
                         }
                         b'/' => {
                             pos = self.handle_empty_element_slash(
-                                buf, abs, next, stream_offset, visitor,
+                                buf,
+                                abs,
+                                next,
+                                stream_offset,
+                                visitor,
                             )?;
                         }
                         _ => {
@@ -782,7 +816,11 @@ impl Reader {
                         }
                         b'/' => {
                             pos = self.handle_empty_element_slash(
-                                buf, abs, next, stream_offset, visitor,
+                                buf,
+                                abs,
+                                next,
+                                stream_offset,
+                                visitor,
                             )?;
                         }
                         _ if is_name_start_byte(byte) => {
@@ -824,11 +862,7 @@ impl Reader {
                     let Some((next, abs)) =
                         find_name_end(masks.name_end, pos, block_offset, block_len)
                     else {
-                        check_name_length(
-                            block_offset + block_len,
-                            name_start,
-                            stream_offset,
-                        )?;
+                        check_name_length(block_offset + block_len, name_start, stream_offset)?;
                         pos = block_len;
                         continue;
                     };
@@ -875,11 +909,15 @@ impl Reader {
                     let abs = block_offset + pos;
                     let byte = buf[abs];
                     if byte == b'"' {
-                        self.state = ParserState::AttrValue { quote: QuoteStyle::Double };
+                        self.state = ParserState::AttrValue {
+                            quote: QuoteStyle::Double,
+                        };
                         self.content_start = Some(abs + 1);
                         pos += 1;
                     } else if byte == b'\'' {
-                        self.state = ParserState::AttrValue { quote: QuoteStyle::Single };
+                        self.state = ParserState::AttrValue {
+                            quote: QuoteStyle::Single,
+                        };
                         self.content_start = Some(abs + 1);
                         pos += 1;
                     } else if is_xml_whitespace(byte) {
@@ -902,8 +940,7 @@ impl Reader {
                         QuoteStyle::Double => b'"',
                         QuoteStyle::Single => b'\'',
                     };
-                    let Some((next, abs)) =
-                        find_name_end(delim_mask, pos, block_offset, block_len)
+                    let Some((next, abs)) = find_name_end(delim_mask, pos, block_offset, block_len)
                     else {
                         pos = block_len;
                         continue;
@@ -920,10 +957,8 @@ impl Reader {
                                 .attribute_value(value, span)
                                 .map_err(ParseError::Visitor)?;
                         }
-                        let quote_span = Span::new(
-                            stream_offset + abs as u64,
-                            stream_offset + abs as u64 + 1,
-                        );
+                        let quote_span =
+                            Span::new(stream_offset + abs as u64, stream_offset + abs as u64 + 1);
                         visitor
                             .attribute_end(quote_span)
                             .map_err(ParseError::Visitor)?;
@@ -961,11 +996,7 @@ impl Reader {
                     let Some((next, abs)) =
                         find_name_end(masks.name_end, pos, block_offset, block_len)
                     else {
-                        check_name_length(
-                            block_offset + block_len,
-                            name_start,
-                            stream_offset,
-                        )?;
+                        check_name_length(block_offset + block_len, name_start, stream_offset)?;
                         pos = block_len;
                         continue;
                     };
@@ -1008,7 +1039,6 @@ impl Reader {
                 }
 
                 // --- Phase 2 states ---
-
                 ParserState::AfterLtBang => {
                     let abs = block_offset + pos;
                     let byte = buf[abs];
@@ -1046,12 +1076,11 @@ impl Reader {
                         visitor
                             .comment_start(start_span)
                             .map_err(ParseError::Visitor)?;
-                        self.markup_stream_offset = Some(stream_offset + self.markup_start.unwrap() as u64);
+                        self.markup_stream_offset =
+                            Some(stream_offset + self.markup_start.unwrap() as u64);
                         self.markup_start = None;
                         self.content_start = Some(abs + 1);
-                        self.state = ParserState::CommentContent {
-                            dash_count: 0,
-                        };
+                        self.state = ParserState::CommentContent { dash_count: 0 };
                         pos += 1;
                     } else {
                         return Err(ParseError::Xml(Error {
@@ -1063,8 +1092,14 @@ impl Reader {
 
                 ParserState::CommentContent { dash_count } => {
                     pos = self.scan_comment_content(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, dash_count, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        dash_count,
+                        visitor,
                     )?;
                 }
 
@@ -1083,14 +1118,15 @@ impl Reader {
                             visitor
                                 .cdata_start(start_span)
                                 .map_err(ParseError::Visitor)?;
-                            self.markup_stream_offset = Some(stream_offset + self.markup_start.unwrap() as u64);
+                            self.markup_stream_offset =
+                                Some(stream_offset + self.markup_start.unwrap() as u64);
                             self.markup_start = None;
                             self.content_start = Some(abs + 1);
-                            self.state = ParserState::CdataContent {
-                                bracket_count: 0,
-                            };
+                            self.state = ParserState::CdataContent { bracket_count: 0 };
                         } else {
-                            self.state = ParserState::AfterLtBangBracket { matched: new_matched };
+                            self.state = ParserState::AfterLtBangBracket {
+                                matched: new_matched,
+                            };
                         }
                         pos += 1;
                     } else {
@@ -1103,8 +1139,14 @@ impl Reader {
 
                 ParserState::CdataContent { bracket_count } => {
                     pos = self.scan_cdata_content(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, bracket_count, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        bracket_count,
+                        visitor,
                     )?;
                 }
 
@@ -1116,9 +1158,13 @@ impl Reader {
                         let new_matched = matched + 1;
                         if new_matched as usize == DOCTYPE_CHARS.len() {
                             // Use usize::MAX as sentinel: "need to skip whitespace first"
-                            self.state = ParserState::DoctypeName { name_start: usize::MAX };
+                            self.state = ParserState::DoctypeName {
+                                name_start: usize::MAX,
+                            };
                         } else {
-                            self.state = ParserState::AfterLtBangD { matched: new_matched };
+                            self.state = ParserState::AfterLtBangD {
+                                matched: new_matched,
+                            };
                         }
                         pos += 1;
                     } else {
@@ -1131,73 +1177,131 @@ impl Reader {
 
                 ParserState::DoctypeName { name_start } => {
                     pos = self.scan_doctype_name(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, name_start, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        name_start,
+                        visitor,
                     )?;
                 }
 
                 ParserState::DoctypeContent { depth, sub } => {
                     pos = self.scan_doctype_content(
-                        buf, block_offset, block_len, pos,
-                        stream_offset, depth, sub, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        stream_offset,
+                        depth,
+                        sub,
+                        visitor,
                     )?;
                 }
 
                 ParserState::PITarget { name_start } => {
                     pos = self.scan_pi_target(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, name_start, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        name_start,
+                        visitor,
                     )?;
                 }
 
                 ParserState::PIContent { saw_qmark } => {
                     pos = self.scan_pi_content(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, saw_qmark, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        saw_qmark,
+                        visitor,
                     )?;
                 }
 
                 ParserState::EntityRef { name_start } => {
                     pos = self.scan_entity_ref(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, name_start, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        name_start,
+                        visitor,
                     )?;
                 }
 
                 ParserState::CharRef { value_start } => {
                     pos = self.scan_char_ref(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, value_start, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        value_start,
+                        visitor,
                     )?;
                 }
 
                 ParserState::AttrEntityRef { name_start, quote } => {
                     pos = self.scan_attr_entity_ref(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, name_start, quote, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        name_start,
+                        quote,
+                        visitor,
                     )?;
                 }
 
                 ParserState::AttrCharRef { value_start, quote } => {
                     pos = self.scan_attr_char_ref(
-                        buf, block_offset, block_len, pos, masks,
-                        stream_offset, value_start, quote, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        masks,
+                        stream_offset,
+                        value_start,
+                        quote,
+                        visitor,
                     )?;
                 }
 
                 #[cfg(feature = "dtd")]
                 ParserState::DtdInternalSubset => {
                     pos = self.scan_dtd_internal_subset(
-                        buf, block_offset, block_len, pos,
-                        stream_offset, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        stream_offset,
+                        visitor,
                     )?;
                 }
 
                 #[cfg(feature = "dtd")]
                 ParserState::DoctypeAfterSubset => {
                     pos = self.scan_doctype_after_subset(
-                        buf, block_offset, block_len, pos,
-                        stream_offset, visitor,
+                        buf,
+                        block_offset,
+                        block_len,
+                        pos,
+                        stream_offset,
+                        visitor,
                     )?;
                 }
             }
@@ -1309,8 +1413,7 @@ impl Reader {
                                 return Ok(pos + next + 2);
                             }
                             _ if is_name_start_byte(b) => {
-                                self.state =
-                                    ParserState::StartTagName { name_start: after };
+                                self.state = ParserState::StartTagName { name_start: after };
                                 return Ok(pos + next + 1);
                             }
                             _ => {
@@ -1423,9 +1526,7 @@ impl Reader {
                         stream_offset + content_end as u64,
                         stream_offset + abs as u64 + 1,
                     );
-                    visitor
-                        .comment_end(end_span)
-                        .map_err(ParseError::Visitor)?;
+                    visitor.comment_end(end_span).map_err(ParseError::Visitor)?;
                     self.finish_content_body();
                     return Ok(pos + 1);
                 } else if dash_count >= 2 {
@@ -1517,9 +1618,7 @@ impl Reader {
                         stream_offset + content_end as u64,
                         stream_offset + abs as u64 + 1,
                     );
-                    visitor
-                        .cdata_end(end_span)
-                        .map_err(ParseError::Visitor)?;
+                    visitor.cdata_end(end_span).map_err(ParseError::Visitor)?;
                     self.finish_content_body();
                     return Ok(pos + 1);
                 } else {
@@ -1593,7 +1692,9 @@ impl Reader {
                     }));
                 }
                 // Got whitespace - transition to "skipping whitespace" sentinel
-                self.state = ParserState::DoctypeName { name_start: usize::MAX - 1 };
+                self.state = ParserState::DoctypeName {
+                    name_start: usize::MAX - 1,
+                };
                 return Ok(pos + 1);
             }
 
@@ -1616,7 +1717,9 @@ impl Reader {
                 }));
             }
             // Found name start - update state and continue scanning in same call
-            self.state = ParserState::DoctypeName { name_start: new_abs };
+            self.state = ParserState::DoctypeName {
+                name_start: new_abs,
+            };
             // Scan for name end from this position
             let shifted2 = masks.name_end >> (pos + next);
             if shifted2 == 0 {
@@ -1627,12 +1730,18 @@ impl Reader {
                 return Ok(block_len);
             }
             let end_abs = block_offset + pos + next + next2;
-            return self.finish_doctype_name(buf, pos + next + next2, end_abs, new_abs, stream_offset, visitor);
+            return self.finish_doctype_name(
+                buf,
+                pos + next + next2,
+                end_abs,
+                new_abs,
+                stream_offset,
+                visitor,
+            );
         }
 
         // Phase 2: scan for name end
-        let Some((next, end_abs)) =
-            find_name_end(masks.name_end, pos, block_offset, block_len)
+        let Some((next, end_abs)) = find_name_end(masks.name_end, pos, block_offset, block_len)
         else {
             check_name_length(block_offset + block_len, name_start, stream_offset)?;
             return Ok(block_len);
@@ -1671,9 +1780,7 @@ impl Reader {
                 stream_offset + end_abs as u64,
                 stream_offset + end_abs as u64 + 1,
             );
-            visitor
-                .doctype_end(end_span)
-                .map_err(ParseError::Visitor)?;
+            visitor.doctype_end(end_span).map_err(ParseError::Visitor)?;
             self.finish_markup();
             Ok(block_rel_pos + 1)
         } else {
@@ -1725,10 +1832,8 @@ impl Reader {
                                 .doctype_content(&buf[content_start..abs], span)
                                 .map_err(ParseError::Visitor)?;
                         }
-                        let bracket_span = Span::new(
-                            stream_offset + abs as u64,
-                            stream_offset + abs as u64 + 1,
-                        );
+                        let bracket_span =
+                            Span::new(stream_offset + abs as u64, stream_offset + abs as u64 + 1);
                         visitor
                             .doctype_internal_subset_start(bracket_span)
                             .map_err(ParseError::Visitor)?;
@@ -1769,9 +1874,7 @@ impl Reader {
                                 stream_offset + abs as u64,
                                 stream_offset + abs as u64 + 1,
                             );
-                            visitor
-                                .doctype_end(end_span)
-                                .map_err(ParseError::Visitor)?;
+                            visitor.doctype_end(end_span).map_err(ParseError::Visitor)?;
                             self.finish_content_body();
                             return Ok(pos + 1);
                         }
@@ -1785,17 +1888,26 @@ impl Reader {
                 DoctypeSubState::AfterLt => match byte {
                     b'!' => sub = DoctypeSubState::AfterLtBang,
                     b'?' => sub = DoctypeSubState::PI { saw_qmark: false },
-                    _ => { sub = DoctypeSubState::Normal; continue; }
+                    _ => {
+                        sub = DoctypeSubState::Normal;
+                        continue;
+                    }
                 },
 
                 DoctypeSubState::AfterLtBang => match byte {
                     b'-' => sub = DoctypeSubState::AfterLtBangDash,
-                    _ => { sub = DoctypeSubState::Normal; continue; }
+                    _ => {
+                        sub = DoctypeSubState::Normal;
+                        continue;
+                    }
                 },
 
                 DoctypeSubState::AfterLtBangDash => match byte {
                     b'-' => sub = DoctypeSubState::Comment { dash_count: 0 },
-                    _ => { sub = DoctypeSubState::Normal; continue; }
+                    _ => {
+                        sub = DoctypeSubState::Normal;
+                        continue;
+                    }
                 },
 
                 DoctypeSubState::Comment { ref mut dash_count } => match byte {
@@ -1811,11 +1923,15 @@ impl Reader {
                 },
 
                 DoctypeSubState::DoubleQuoted => {
-                    if byte == b'"' { sub = DoctypeSubState::Normal; }
+                    if byte == b'"' {
+                        sub = DoctypeSubState::Normal;
+                    }
                 }
 
                 DoctypeSubState::SingleQuoted => {
-                    if byte == b'\'' { sub = DoctypeSubState::Normal; }
+                    if byte == b'\'' {
+                        sub = DoctypeSubState::Normal;
+                    }
                 }
             }
 
@@ -1848,7 +1964,9 @@ impl Reader {
             self.xml_decl_buf_len = new_len;
             Ok(())
         } else {
-            visitor.pi_content(content, span).map_err(ParseError::Visitor)
+            visitor
+                .pi_content(content, span)
+                .map_err(ParseError::Visitor)
         }
     }
 
@@ -1885,9 +2003,7 @@ impl Reader {
         name_start: usize,
         visitor: &mut V,
     ) -> Result<usize, ParseError<V::Error>> {
-        let Some((next, abs)) =
-            find_name_end(masks.name_end, pos, block_offset, block_len)
-        else {
+        let Some((next, abs)) = find_name_end(masks.name_end, pos, block_offset, block_len) else {
             check_name_length(block_offset + block_len, name_start, stream_offset)?;
             return Ok(block_len);
         };
@@ -1934,9 +2050,7 @@ impl Reader {
                 self.markup_stream_offset = Some(stream_offset + self.markup_start.unwrap() as u64);
                 self.markup_start = None;
                 self.content_start = Some(abs + 1);
-                self.state = ParserState::PIContent {
-                    saw_qmark: true,
-                };
+                self.state = ParserState::PIContent { saw_qmark: true };
                 Ok(next + 1)
             }
         } else {
@@ -1944,9 +2058,7 @@ impl Reader {
             self.markup_stream_offset = Some(stream_offset + self.markup_start.unwrap() as u64);
             self.markup_start = None;
             self.content_start = Some(abs + 1);
-            self.state = ParserState::PIContent {
-                saw_qmark: false,
-            };
+            self.state = ParserState::PIContent { saw_qmark: false };
             Ok(next + 1)
         }
     }
@@ -2008,17 +2120,13 @@ impl Reader {
 
             let shifted = masks.qmark >> pos;
             if shifted == 0 {
-                self.state = ParserState::PIContent {
-                    saw_qmark: false,
-                };
+                self.state = ParserState::PIContent { saw_qmark: false };
                 return Ok(block_len);
             }
 
             let next = shifted.trailing_zeros() as usize;
             if pos + next >= block_len {
-                self.state = ParserState::PIContent {
-                    saw_qmark: false,
-                };
+                self.state = ParserState::PIContent { saw_qmark: false };
                 return Ok(block_len);
             }
 
@@ -2047,9 +2155,7 @@ impl Reader {
                 pos = pos + next + 1;
             } else {
                 // '?' at buffer end - save state
-                self.state = ParserState::PIContent {
-                    saw_qmark: true,
-                };
+                self.state = ParserState::PIContent { saw_qmark: true };
                 return Ok(pos + next + 1);
             }
         }
@@ -2077,9 +2183,15 @@ impl Reader {
         }
 
         let Some((name, span, next_pos)) = find_and_validate_entity_name(
-            buf, block_offset, block_len, pos, masks.semicolon,
-            stream_offset, name_start,
-        )? else {
+            buf,
+            block_offset,
+            block_len,
+            pos,
+            masks.semicolon,
+            stream_offset,
+            name_start,
+        )?
+        else {
             return Ok(block_len);
         };
 
@@ -2104,15 +2216,19 @@ impl Reader {
         visitor: &mut V,
     ) -> Result<usize, ParseError<V::Error>> {
         let Some((value, span, next_pos)) = find_and_validate_char_ref(
-            buf, block_offset, block_len, pos, masks.semicolon,
-            stream_offset, value_start,
-        )? else {
+            buf,
+            block_offset,
+            block_len,
+            pos,
+            masks.semicolon,
+            stream_offset,
+            value_start,
+        )?
+        else {
             return Ok(block_len);
         };
 
-        visitor
-            .char_ref(value, span)
-            .map_err(ParseError::Visitor)?;
+        visitor.char_ref(value, span).map_err(ParseError::Visitor)?;
 
         self.finish_markup();
         Ok(next_pos)
@@ -2142,9 +2258,15 @@ impl Reader {
         }
 
         let Some((name, span, next_pos)) = find_and_validate_entity_name(
-            buf, block_offset, block_len, pos, masks.semicolon,
-            stream_offset, name_start,
-        )? else {
+            buf,
+            block_offset,
+            block_len,
+            pos,
+            masks.semicolon,
+            stream_offset,
+            name_start,
+        )?
+        else {
             return Ok(block_len);
         };
 
@@ -2172,9 +2294,15 @@ impl Reader {
         visitor: &mut V,
     ) -> Result<usize, ParseError<V::Error>> {
         let Some((value, span, next_pos)) = find_and_validate_char_ref(
-            buf, block_offset, block_len, pos, masks.semicolon,
-            stream_offset, value_start,
-        )? else {
+            buf,
+            block_offset,
+            block_len,
+            pos,
+            masks.semicolon,
+            stream_offset,
+            value_start,
+        )?
+        else {
             return Ok(block_len);
         };
 
@@ -2218,10 +2346,8 @@ impl Reader {
             match self.dtd_phase {
                 DtdPhase::Idle => match byte {
                     b']' => {
-                        let span = Span::new(
-                            stream_offset + abs as u64,
-                            stream_offset + abs as u64 + 1,
-                        );
+                        let span =
+                            Span::new(stream_offset + abs as u64, stream_offset + abs as u64 + 1);
                         visitor
                             .doctype_internal_subset_end(span)
                             .map_err(ParseError::Visitor)?;
@@ -2234,7 +2360,9 @@ impl Reader {
                     }
                     b'%' => {
                         self.markup_start = Some(abs);
-                        self.dtd_phase = DtdPhase::PeRefName { name_start: abs + 1 };
+                        self.dtd_phase = DtdPhase::PeRefName {
+                            name_start: abs + 1,
+                        };
                     }
                     b if is_xml_whitespace(b) => { /* skip */ }
                     _ => {
@@ -2249,7 +2377,9 @@ impl Reader {
                     b'!' => self.dtd_phase = DtdPhase::AfterLtBang,
                     b'?' => {
                         // markup_start already set in Idle when we saw '<'
-                        self.dtd_phase = DtdPhase::PITarget { name_start: abs + 1 };
+                        self.dtd_phase = DtdPhase::PITarget {
+                            name_start: abs + 1,
+                        };
                     }
                     _ => {
                         return Err(ParseError::Xml(Error {
@@ -2260,59 +2390,60 @@ impl Reader {
                 },
 
                 DtdPhase::AfterLtBang => {
-                    let lt_offset = self.markup_start.map(|s| stream_offset + s as u64)
+                    let lt_offset = self
+                        .markup_start
+                        .map(|s| stream_offset + s as u64)
                         .unwrap_or(stream_offset + abs as u64);
                     match byte {
-                    b'-' => self.dtd_phase = DtdPhase::AfterLtBangDash,
-                    b'E' => {
-                        // Could be ELEMENT or ENTITY
-                        // markup_start already set in Idle when we saw '<'
-                        self.dtd_phase = DtdPhase::MatchKeyword {
-                            kind: DtdDeclKind::Element, // tentative, refined at byte 2
-                            matched: 1, // 'E' matched
-                        };
+                        b'-' => self.dtd_phase = DtdPhase::AfterLtBangDash,
+                        b'E' => {
+                            // Could be ELEMENT or ENTITY
+                            // markup_start already set in Idle when we saw '<'
+                            self.dtd_phase = DtdPhase::MatchKeyword {
+                                kind: DtdDeclKind::Element, // tentative, refined at byte 2
+                                matched: 1,                 // 'E' matched
+                            };
+                        }
+                        b'A' => {
+                            // markup_start already set in Idle
+                            self.dtd_phase = DtdPhase::MatchKeyword {
+                                kind: DtdDeclKind::Attlist,
+                                matched: 1,
+                            };
+                        }
+                        b'N' => {
+                            // markup_start already set in Idle
+                            self.dtd_phase = DtdPhase::MatchKeyword {
+                                kind: DtdDeclKind::Notation,
+                                matched: 1,
+                            };
+                        }
+                        b'[' => {
+                            // Conditional section — opaque scan (not yet supported, error for now)
+                            return Err(ParseError::Xml(Error {
+                                kind: ErrorKind::DtdInvalidMarkup,
+                                offset: lt_offset,
+                            }));
+                        }
+                        _ => {
+                            return Err(ParseError::Xml(Error {
+                                kind: ErrorKind::DtdInvalidMarkup,
+                                offset: lt_offset,
+                            }));
+                        }
                     }
-                    b'A' => {
-                        // markup_start already set in Idle
-                        self.dtd_phase = DtdPhase::MatchKeyword {
-                            kind: DtdDeclKind::Attlist,
-                            matched: 1,
-                        };
-                    }
-                    b'N' => {
-                        // markup_start already set in Idle
-                        self.dtd_phase = DtdPhase::MatchKeyword {
-                            kind: DtdDeclKind::Notation,
-                            matched: 1,
-                        };
-                    }
-                    b'[' => {
-                        // Conditional section — opaque scan (not yet supported, error for now)
-                        return Err(ParseError::Xml(Error {
-                            kind: ErrorKind::DtdInvalidMarkup,
-                            offset: lt_offset,
-                        }));
-                    }
-                    _ => {
-                        return Err(ParseError::Xml(Error {
-                            kind: ErrorKind::DtdInvalidMarkup,
-                            offset: lt_offset,
-                        }));
-                    }
-                    }
-                },
+                }
 
                 DtdPhase::AfterLtBangDash => {
-                    let lt_offset = self.markup_start.map(|s| stream_offset + s as u64)
+                    let lt_offset = self
+                        .markup_start
+                        .map(|s| stream_offset + s as u64)
                         .unwrap_or(stream_offset + abs as u64);
                     match byte {
                         b'-' => {
                             // Enter comment — clear markup_start so content body
                             // streaming works correctly at buffer boundaries.
-                            let span = Span::new(
-                                lt_offset,
-                                stream_offset + abs as u64 + 1,
-                            );
+                            let span = Span::new(lt_offset, stream_offset + abs as u64 + 1);
                             visitor.comment_start(span).map_err(ParseError::Visitor)?;
                             self.markup_stream_offset = Some(lt_offset);
                             self.markup_start = None;
@@ -2339,7 +2470,8 @@ impl Reader {
                                 stream_offset + content_start as u64,
                                 stream_offset + content_end as u64,
                             );
-                            visitor.comment_content(&buf[content_start..content_end], span)
+                            visitor
+                                .comment_content(&buf[content_start..content_end], span)
                                 .map_err(ParseError::Visitor)?;
                         }
                         let end_span = Span::new(
@@ -2384,7 +2516,8 @@ impl Reader {
                         );
                         visitor.pi_start(name, span).map_err(ParseError::Visitor)?;
                         // Clear markup_start for content body streaming.
-                        self.markup_stream_offset = Some(stream_offset + self.markup_start.unwrap() as u64);
+                        self.markup_stream_offset =
+                            Some(stream_offset + self.markup_start.unwrap() as u64);
                         self.markup_start = None;
                         if byte == b'?' {
                             self.dtd_phase = DtdPhase::PIContent { saw_qmark: true };
@@ -2398,7 +2531,7 @@ impl Reader {
                             offset: stream_offset + abs as u64,
                         }));
                     }
-                },
+                }
 
                 DtdPhase::PIContent { ref mut saw_qmark } => match byte {
                     b'?' => *saw_qmark = true,
@@ -2411,7 +2544,8 @@ impl Reader {
                                 stream_offset + content_start as u64,
                                 stream_offset + content_end as u64,
                             );
-                            visitor.pi_content(&buf[content_start..content_end], span)
+                            visitor
+                                .pi_content(&buf[content_start..content_end], span)
                                 .map_err(ParseError::Visitor)?;
                         }
                         let end_span = Span::new(
@@ -2438,10 +2572,16 @@ impl Reader {
                     if kind == DtdDeclKind::Element && matched == 1 {
                         if byte == b'L' {
                             // Still ELEMENT
-                            self.dtd_phase = DtdPhase::MatchKeyword { kind: DtdDeclKind::Element, matched: 2 };
+                            self.dtd_phase = DtdPhase::MatchKeyword {
+                                kind: DtdDeclKind::Element,
+                                matched: 2,
+                            };
                         } else if byte == b'N' {
                             // Switch to ENTITY
-                            self.dtd_phase = DtdPhase::MatchKeyword { kind: DtdDeclKind::Entity, matched: 2 };
+                            self.dtd_phase = DtdPhase::MatchKeyword {
+                                kind: DtdDeclKind::Entity,
+                                matched: 2,
+                            };
                         } else {
                             return Err(ParseError::Xml(Error {
                                 kind: ErrorKind::DtdInvalidMarkup,
@@ -2454,13 +2594,24 @@ impl Reader {
                             if (new_matched as usize) == target.len() {
                                 // Full keyword matched — require whitespace next
                                 match kind {
-                                    DtdDeclKind::Element => self.dtd_phase = DtdPhase::ElementRequireWs,
-                                    DtdDeclKind::Attlist => self.dtd_phase = DtdPhase::AttlistRequireWs,
-                                    DtdDeclKind::Entity => self.dtd_phase = DtdPhase::EntityRequireWs,
-                                    DtdDeclKind::Notation => self.dtd_phase = DtdPhase::NotationRequireWs,
+                                    DtdDeclKind::Element => {
+                                        self.dtd_phase = DtdPhase::ElementRequireWs
+                                    }
+                                    DtdDeclKind::Attlist => {
+                                        self.dtd_phase = DtdPhase::AttlistRequireWs
+                                    }
+                                    DtdDeclKind::Entity => {
+                                        self.dtd_phase = DtdPhase::EntityRequireWs
+                                    }
+                                    DtdDeclKind::Notation => {
+                                        self.dtd_phase = DtdPhase::NotationRequireWs
+                                    }
                                 }
                             } else {
-                                self.dtd_phase = DtdPhase::MatchKeyword { kind, matched: new_matched };
+                                self.dtd_phase = DtdPhase::MatchKeyword {
+                                    kind,
+                                    matched: new_matched,
+                                };
                             }
                         } else {
                             return Err(ParseError::Xml(Error {
@@ -2469,7 +2620,7 @@ impl Reader {
                             }));
                         }
                     }
-                },
+                }
 
                 // --- ELEMENT declaration ---
                 DtdPhase::ElementRequireWs => {
@@ -2482,8 +2633,8 @@ impl Reader {
                     self.dtd_phase = DtdPhase::ElementBeforeName;
                 }
                 DtdPhase::ElementBeforeName => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if is_name_start_byte(byte) {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if is_name_start_byte(byte) {
                         self.dtd_phase = DtdPhase::ElementName { name_start: abs };
                     } else {
                         return Err(ParseError::Xml(Error {
@@ -2499,14 +2650,16 @@ impl Reader {
                             stream_offset + name_start as u64,
                             stream_offset + abs as u64,
                         );
-                        visitor.element_decl_start(name, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .element_decl_start(name, span)
+                            .map_err(ParseError::Visitor)?;
                         self.dtd_phase = DtdPhase::ElementAfterName;
                         continue; // reprocess this byte
                     }
                 }
                 DtdPhase::ElementAfterName => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'(' {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'(' {
                         // Content model
                         self.content_start = Some(abs);
                         self.dtd_phase = DtdPhase::ElementContentModel { paren_depth: 1 };
@@ -2536,14 +2689,20 @@ impl Reader {
                                     stream_offset + abs as u64 + 1,
                                 );
                                 if first == b'E' {
-                                    visitor.element_decl_empty(span).map_err(ParseError::Visitor)?;
+                                    visitor
+                                        .element_decl_empty(span)
+                                        .map_err(ParseError::Visitor)?;
                                 } else {
-                                    visitor.element_decl_any(span).map_err(ParseError::Visitor)?;
+                                    visitor
+                                        .element_decl_any(span)
+                                        .map_err(ParseError::Visitor)?;
                                 }
                                 self.content_start = None;
                                 self.dtd_phase = DtdPhase::ElementAfterContentSpec;
                             } else {
-                                self.dtd_phase = DtdPhase::ElementContentSpecKeyword { matched: new_matched };
+                                self.dtd_phase = DtdPhase::ElementContentSpecKeyword {
+                                    matched: new_matched,
+                                };
                             }
                         } else {
                             return Err(ParseError::Xml(Error {
@@ -2553,7 +2712,9 @@ impl Reader {
                         }
                     }
                 }
-                DtdPhase::ElementContentModel { ref mut paren_depth } => {
+                DtdPhase::ElementContentModel {
+                    ref mut paren_depth,
+                } => {
                     match byte {
                         b'(' => {
                             *paren_depth += 1;
@@ -2584,9 +2745,9 @@ impl Reader {
                                         stream_offset + content_start as u64,
                                         stream_offset + end as u64,
                                     );
-                                    visitor.element_decl_content_spec(
-                                        &buf[content_start..end], span,
-                                    ).map_err(ParseError::Visitor)?;
+                                    visitor
+                                        .element_decl_content_spec(&buf[content_start..end], span)
+                                        .map_err(ParseError::Visitor)?;
                                     self.content_start = None;
                                     self.dtd_phase = DtdPhase::ElementAfterContentSpec;
                                     pos = end - block_offset;
@@ -2597,9 +2758,12 @@ impl Reader {
                                         stream_offset + content_start as u64,
                                         stream_offset + abs as u64 + 1,
                                     );
-                                    visitor.element_decl_content_spec(
-                                        &buf[content_start..abs + 1], span,
-                                    ).map_err(ParseError::Visitor)?;
+                                    visitor
+                                        .element_decl_content_spec(
+                                            &buf[content_start..abs + 1],
+                                            span,
+                                        )
+                                        .map_err(ParseError::Visitor)?;
                                     self.content_start = None;
                                     self.dtd_phase = DtdPhase::ElementAfterContentSpec;
                                 }
@@ -2618,9 +2782,9 @@ impl Reader {
                                     stream_offset + abs as u64,
                                     stream_offset + abs as u64 + 1,
                                 );
-                                visitor.element_decl_content_spec(
-                                    &buf[abs..abs + 1], span,
-                                ).map_err(ParseError::Visitor)?;
+                                visitor
+                                    .element_decl_content_spec(&buf[abs..abs + 1], span)
+                                    .map_err(ParseError::Visitor)?;
                             }
                         }
                         b'>' => {
@@ -2628,7 +2792,9 @@ impl Reader {
                                 stream_offset + abs as u64,
                                 stream_offset + abs as u64 + 1,
                             );
-                            visitor.element_decl_end(span).map_err(ParseError::Visitor)?;
+                            visitor
+                                .element_decl_end(span)
+                                .map_err(ParseError::Visitor)?;
                             self.markup_start = None;
                             self.dtd_phase = DtdPhase::Idle;
                         }
@@ -2650,7 +2816,9 @@ impl Reader {
                             stream_offset + (name_start - 1) as u64,
                             stream_offset + abs as u64 + 1,
                         );
-                        visitor.dtd_pe_reference(name, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .dtd_pe_reference(name, span)
+                            .map_err(ParseError::Visitor)?;
                         self.markup_start = None;
                         self.dtd_phase = DtdPhase::Idle;
                     } else {
@@ -2669,11 +2837,14 @@ impl Reader {
                     self.dtd_phase = DtdPhase::EntityCheckPercent;
                 }
                 DtdPhase::EntityCheckPercent => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'%' {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'%' {
                         self.dtd_phase = DtdPhase::EntityPercentRequireWs;
                     } else if is_name_start_byte(byte) {
-                        self.dtd_phase = DtdPhase::EntityName { name_start: abs, kind: EntityKind::General };
+                        self.dtd_phase = DtdPhase::EntityName {
+                            name_start: abs,
+                            kind: EntityKind::General,
+                        };
                     } else {
                         return Err(ParseError::Xml(Error {
                             kind: ErrorKind::DtdDeclMissingName,
@@ -2688,12 +2859,17 @@ impl Reader {
                             offset: stream_offset + abs as u64,
                         }));
                     }
-                    self.dtd_phase = DtdPhase::EntityBeforeName { kind: EntityKind::Parameter };
+                    self.dtd_phase = DtdPhase::EntityBeforeName {
+                        kind: EntityKind::Parameter,
+                    };
                 }
                 DtdPhase::EntityBeforeName { kind } => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if is_name_start_byte(byte) {
-                        self.dtd_phase = DtdPhase::EntityName { name_start: abs, kind };
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if is_name_start_byte(byte) {
+                        self.dtd_phase = DtdPhase::EntityName {
+                            name_start: abs,
+                            kind,
+                        };
                     } else {
                         return Err(ParseError::Xml(Error {
                             kind: ErrorKind::DtdDeclMissingName,
@@ -2708,15 +2884,16 @@ impl Reader {
                             stream_offset + name_start as u64,
                             stream_offset + abs as u64,
                         );
-                        visitor.entity_decl_start(name, kind, span)
+                        visitor
+                            .entity_decl_start(name, kind, span)
                             .map_err(ParseError::Visitor)?;
                         self.dtd_phase = DtdPhase::EntityBeforeDef { kind };
                         continue;
                     }
                 }
                 DtdPhase::EntityBeforeDef { kind } => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else {
                         self.dtd_phase = DtdPhase::EntityDefStart { kind };
                         continue;
                     }
@@ -2725,7 +2902,11 @@ impl Reader {
                     match byte {
                         b'"' | b'\'' => {
                             // Internal entity value
-                            let quote = if byte == b'"' { QuoteStyle::Double } else { QuoteStyle::Single };
+                            let quote = if byte == b'"' {
+                                QuoteStyle::Double
+                            } else {
+                                QuoteStyle::Single
+                            };
                             self.content_start = Some(abs + 1);
                             self.dtd_phase = DtdPhase::EntityValue { quote };
                         }
@@ -2746,7 +2927,11 @@ impl Reader {
                     }
                 }
                 DtdPhase::EntityValue { quote } => {
-                    let delim = if quote == QuoteStyle::Double { b'"' } else { b'\'' };
+                    let delim = if quote == QuoteStyle::Double {
+                        b'"'
+                    } else {
+                        b'\''
+                    };
                     match byte {
                         b if b == delim => {
                             // End of entity value
@@ -2756,14 +2941,17 @@ impl Reader {
                                     stream_offset + content_start as u64,
                                     stream_offset + abs as u64,
                                 );
-                                visitor.entity_decl_value(&buf[content_start..abs], span)
+                                visitor
+                                    .entity_decl_value(&buf[content_start..abs], span)
                                     .map_err(ParseError::Visitor)?;
                             }
                             let end_span = Span::new(
                                 stream_offset + abs as u64,
                                 stream_offset + abs as u64 + 1,
                             );
-                            visitor.entity_decl_value_end(end_span).map_err(ParseError::Visitor)?;
+                            visitor
+                                .entity_decl_value_end(end_span)
+                                .map_err(ParseError::Visitor)?;
                             self.content_start = None;
                             self.dtd_phase = DtdPhase::EntityBeforeClose;
                         }
@@ -2775,7 +2963,8 @@ impl Reader {
                                     stream_offset + content_start as u64,
                                     stream_offset + abs as u64,
                                 );
-                                visitor.entity_decl_value(&buf[content_start..abs], span)
+                                visitor
+                                    .entity_decl_value(&buf[content_start..abs], span)
                                     .map_err(ParseError::Visitor)?;
                             }
                             // Look ahead to see if it's &#
@@ -2801,7 +2990,8 @@ impl Reader {
                                     stream_offset + content_start as u64,
                                     stream_offset + abs as u64,
                                 );
-                                visitor.entity_decl_value(&buf[content_start..abs], span)
+                                visitor
+                                    .entity_decl_value(&buf[content_start..abs], span)
                                     .map_err(ParseError::Visitor)?;
                             }
                             self.content_start = None;
@@ -2820,7 +3010,9 @@ impl Reader {
                             stream_offset + (name_start - 1) as u64,
                             stream_offset + abs as u64 + 1,
                         );
-                        visitor.entity_decl_entity_ref(name, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .entity_decl_entity_ref(name, span)
+                            .map_err(ParseError::Visitor)?;
                         self.content_start = Some(abs + 1);
                         self.dtd_phase = DtdPhase::EntityValue { quote };
                     } else if abs == name_start && byte == b'#' {
@@ -2840,7 +3032,9 @@ impl Reader {
                             stream_offset + (value_start - 2) as u64, // from `&#`
                             stream_offset + abs as u64 + 1,
                         );
-                        visitor.entity_decl_char_ref(value, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .entity_decl_char_ref(value, span)
+                            .map_err(ParseError::Visitor)?;
                         self.content_start = Some(abs + 1);
                         self.dtd_phase = DtdPhase::EntityValue { quote };
                     }
@@ -2853,7 +3047,9 @@ impl Reader {
                             stream_offset + (name_start - 1) as u64,
                             stream_offset + abs as u64 + 1,
                         );
-                        visitor.entity_decl_pe_ref(name, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .entity_decl_pe_ref(name, span)
+                            .map_err(ParseError::Visitor)?;
                         self.content_start = Some(abs + 1);
                         self.dtd_phase = DtdPhase::EntityValue { quote };
                     } else {
@@ -2891,7 +3087,9 @@ impl Reader {
                             if (new_matched as usize) == NDATA.len() {
                                 self.dtd_phase = DtdPhase::EntityNdataRequireWs;
                             } else {
-                                self.dtd_phase = DtdPhase::EntityNdataKeyword { matched: new_matched };
+                                self.dtd_phase = DtdPhase::EntityNdataKeyword {
+                                    matched: new_matched,
+                                };
                             }
                         } else {
                             return Err(ParseError::Xml(Error {
@@ -2909,12 +3107,14 @@ impl Reader {
                         }));
                     }
                     // Reuse EntityBeforeName-like scanning for the notation name
-                    self.dtd_phase = DtdPhase::EntityNdataName { name_start: usize::MAX };
+                    self.dtd_phase = DtdPhase::EntityNdataName {
+                        name_start: usize::MAX,
+                    };
                 }
                 DtdPhase::EntityNdataName { name_start } => {
                     if name_start == usize::MAX {
-                        if is_xml_whitespace(byte) { /* skip */ }
-                        else if is_name_start_byte(byte) {
+                        if is_xml_whitespace(byte) { /* skip */
+                        } else if is_name_start_byte(byte) {
                             self.dtd_phase = DtdPhase::EntityNdataName { name_start: abs };
                         } else {
                             return Err(ParseError::Xml(Error {
@@ -2928,7 +3128,9 @@ impl Reader {
                             stream_offset + name_start as u64,
                             stream_offset + abs as u64,
                         );
-                        visitor.entity_decl_ndata(name, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .entity_decl_ndata(name, span)
+                            .map_err(ParseError::Visitor)?;
                         self.dtd_phase = DtdPhase::EntityBeforeClose;
                         continue;
                     }
@@ -2963,7 +3165,10 @@ impl Reader {
                             if (new_matched as usize) == SYSTEM.len() {
                                 self.dtd_phase = DtdPhase::ExternalIdBeforeSystemLit { ctx };
                             } else {
-                                self.dtd_phase = DtdPhase::ExternalIdSystemKw { ctx, matched: new_matched };
+                                self.dtd_phase = DtdPhase::ExternalIdSystemKw {
+                                    ctx,
+                                    matched: new_matched,
+                                };
                             }
                         } else {
                             return Err(ParseError::Xml(Error {
@@ -2981,7 +3186,10 @@ impl Reader {
                             if (new_matched as usize) == PUBLIC.len() {
                                 self.dtd_phase = DtdPhase::ExternalIdBeforePublicLit { ctx };
                             } else {
-                                self.dtd_phase = DtdPhase::ExternalIdPublicKw { ctx, matched: new_matched };
+                                self.dtd_phase = DtdPhase::ExternalIdPublicKw {
+                                    ctx,
+                                    matched: new_matched,
+                                };
                             }
                         } else {
                             return Err(ParseError::Xml(Error {
@@ -2992,10 +3200,18 @@ impl Reader {
                     }
                 }
                 DtdPhase::ExternalIdBeforeSystemLit { ctx } => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'"' || byte == b'\'' {
-                        let quote = if byte == b'"' { QuoteStyle::Double } else { QuoteStyle::Single };
-                        self.dtd_phase = DtdPhase::ExternalIdSystemLit { ctx, quote, literal_start: abs + 1 };
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'"' || byte == b'\'' {
+                        let quote = if byte == b'"' {
+                            QuoteStyle::Double
+                        } else {
+                            QuoteStyle::Single
+                        };
+                        self.dtd_phase = DtdPhase::ExternalIdSystemLit {
+                            ctx,
+                            quote,
+                            literal_start: abs + 1,
+                        };
                     } else {
                         return Err(ParseError::Xml(Error {
                             kind: ErrorKind::ExpectedQuote(byte),
@@ -3003,8 +3219,16 @@ impl Reader {
                         }));
                     }
                 }
-                DtdPhase::ExternalIdSystemLit { ctx, quote, literal_start } => {
-                    let delim = if quote == QuoteStyle::Double { b'"' } else { b'\'' };
+                DtdPhase::ExternalIdSystemLit {
+                    ctx,
+                    quote,
+                    literal_start,
+                } => {
+                    let delim = if quote == QuoteStyle::Double {
+                        b'"'
+                    } else {
+                        b'\''
+                    };
                     if byte == delim {
                         let literal = &buf[literal_start..abs];
                         if literal.len() > Self::MAX_LITERAL_LENGTH {
@@ -3019,11 +3243,13 @@ impl Reader {
                         );
                         match ctx {
                             DtdDeclContext::Entity { .. } => {
-                                visitor.entity_decl_system_id(literal, span)
+                                visitor
+                                    .entity_decl_system_id(literal, span)
                                     .map_err(ParseError::Visitor)?;
                             }
                             DtdDeclContext::Notation => {
-                                visitor.notation_decl_system_id(literal, span)
+                                visitor
+                                    .notation_decl_system_id(literal, span)
                                     .map_err(ParseError::Visitor)?;
                             }
                         }
@@ -3038,10 +3264,18 @@ impl Reader {
                     }
                 }
                 DtdPhase::ExternalIdBeforePublicLit { ctx } => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'"' || byte == b'\'' {
-                        let quote = if byte == b'"' { QuoteStyle::Double } else { QuoteStyle::Single };
-                        self.dtd_phase = DtdPhase::ExternalIdPublicLit { ctx, quote, literal_start: abs + 1 };
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'"' || byte == b'\'' {
+                        let quote = if byte == b'"' {
+                            QuoteStyle::Double
+                        } else {
+                            QuoteStyle::Single
+                        };
+                        self.dtd_phase = DtdPhase::ExternalIdPublicLit {
+                            ctx,
+                            quote,
+                            literal_start: abs + 1,
+                        };
                     } else {
                         return Err(ParseError::Xml(Error {
                             kind: ErrorKind::ExpectedQuote(byte),
@@ -3049,8 +3283,16 @@ impl Reader {
                         }));
                     }
                 }
-                DtdPhase::ExternalIdPublicLit { ctx, quote, literal_start } => {
-                    let delim = if quote == QuoteStyle::Double { b'"' } else { b'\'' };
+                DtdPhase::ExternalIdPublicLit {
+                    ctx,
+                    quote,
+                    literal_start,
+                } => {
+                    let delim = if quote == QuoteStyle::Double {
+                        b'"'
+                    } else {
+                        b'\''
+                    };
                     if byte == delim {
                         let literal = &buf[literal_start..abs];
                         if literal.len() > Self::MAX_LITERAL_LENGTH {
@@ -3065,11 +3307,13 @@ impl Reader {
                         );
                         match ctx {
                             DtdDeclContext::Entity { .. } => {
-                                visitor.entity_decl_public_id(literal, span)
+                                visitor
+                                    .entity_decl_public_id(literal, span)
                                     .map_err(ParseError::Visitor)?;
                             }
                             DtdDeclContext::Notation => {
-                                visitor.notation_decl_public_id(literal, span)
+                                visitor
+                                    .notation_decl_public_id(literal, span)
                                     .map_err(ParseError::Visitor)?;
                             }
                         }
@@ -3077,11 +3321,19 @@ impl Reader {
                     }
                 }
                 DtdPhase::ExternalIdBetweenLiterals { ctx } => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'"' || byte == b'\'' {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'"' || byte == b'\'' {
                         // System literal follows public literal
-                        let quote = if byte == b'"' { QuoteStyle::Double } else { QuoteStyle::Single };
-                        self.dtd_phase = DtdPhase::ExternalIdSystemLit { ctx, quote, literal_start: abs + 1 };
+                        let quote = if byte == b'"' {
+                            QuoteStyle::Double
+                        } else {
+                            QuoteStyle::Single
+                        };
+                        self.dtd_phase = DtdPhase::ExternalIdSystemLit {
+                            ctx,
+                            quote,
+                            literal_start: abs + 1,
+                        };
                     } else if byte == b'>' {
                         // PUBLIC with no system literal (NOTATION only allows this)
                         match ctx {
@@ -3090,7 +3342,9 @@ impl Reader {
                                     stream_offset + abs as u64,
                                     stream_offset + abs as u64 + 1,
                                 );
-                                visitor.notation_decl_end(span).map_err(ParseError::Visitor)?;
+                                visitor
+                                    .notation_decl_end(span)
+                                    .map_err(ParseError::Visitor)?;
                                 self.markup_start = None;
                                 self.dtd_phase = DtdPhase::Idle;
                             }
@@ -3120,8 +3374,8 @@ impl Reader {
                     self.dtd_phase = DtdPhase::NotationBeforeName;
                 }
                 DtdPhase::NotationBeforeName => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if is_name_start_byte(byte) {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if is_name_start_byte(byte) {
                         self.dtd_phase = DtdPhase::NotationName { name_start: abs };
                     } else {
                         return Err(ParseError::Xml(Error {
@@ -3137,14 +3391,16 @@ impl Reader {
                             stream_offset + name_start as u64,
                             stream_offset + abs as u64,
                         );
-                        visitor.notation_decl_start(name, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .notation_decl_start(name, span)
+                            .map_err(ParseError::Visitor)?;
                         self.dtd_phase = DtdPhase::NotationBeforeDef;
                         continue;
                     }
                 }
                 DtdPhase::NotationBeforeDef => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'S' {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'S' {
                         let ctx = DtdDeclContext::Notation;
                         self.dtd_phase = DtdPhase::ExternalIdSystemKw { ctx, matched: 1 };
                     } else if byte == b'P' {
@@ -3164,7 +3420,9 @@ impl Reader {
                                 stream_offset + abs as u64,
                                 stream_offset + abs as u64 + 1,
                             );
-                            visitor.notation_decl_end(span).map_err(ParseError::Visitor)?;
+                            visitor
+                                .notation_decl_end(span)
+                                .map_err(ParseError::Visitor)?;
                             self.markup_start = None;
                             self.dtd_phase = DtdPhase::Idle;
                         }
@@ -3189,8 +3447,8 @@ impl Reader {
                     self.dtd_phase = DtdPhase::AttlistBeforeName;
                 }
                 DtdPhase::AttlistBeforeName => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if is_name_start_byte(byte) {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if is_name_start_byte(byte) {
                         self.dtd_phase = DtdPhase::AttlistName { name_start: abs };
                     } else {
                         return Err(ParseError::Xml(Error {
@@ -3206,19 +3464,21 @@ impl Reader {
                             stream_offset + name_start as u64,
                             stream_offset + abs as u64,
                         );
-                        visitor.attlist_decl_start(name, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .attlist_decl_start(name, span)
+                            .map_err(ParseError::Visitor)?;
                         self.dtd_phase = DtdPhase::AttlistIdle;
                         continue;
                     }
                 }
                 DtdPhase::AttlistIdle => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'>' {
-                        let span = Span::new(
-                            stream_offset + abs as u64,
-                            stream_offset + abs as u64 + 1,
-                        );
-                        visitor.attlist_decl_end(span).map_err(ParseError::Visitor)?;
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'>' {
+                        let span =
+                            Span::new(stream_offset + abs as u64, stream_offset + abs as u64 + 1);
+                        visitor
+                            .attlist_decl_end(span)
+                            .map_err(ParseError::Visitor)?;
                         self.markup_start = None;
                         self.dtd_phase = DtdPhase::Idle;
                     } else if is_name_start_byte(byte) {
@@ -3237,14 +3497,16 @@ impl Reader {
                             stream_offset + name_start as u64,
                             stream_offset + abs as u64,
                         );
-                        visitor.attlist_attr_name(name, span).map_err(ParseError::Visitor)?;
+                        visitor
+                            .attlist_attr_name(name, span)
+                            .map_err(ParseError::Visitor)?;
                         self.dtd_phase = DtdPhase::AttlistBeforeType;
                         continue;
                     }
                 }
                 DtdPhase::AttlistBeforeType => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else {
                         self.dtd_phase = DtdPhase::AttlistTypeStart;
                         continue;
                     }
@@ -3270,14 +3532,19 @@ impl Reader {
                     }
                 }
                 DtdPhase::AttlistTypeKeyword { start } => {
-                    if is_xml_whitespace(byte) || byte == b'(' || byte == b'#' || byte == b'"' || byte == b'\'' {
+                    if is_xml_whitespace(byte)
+                        || byte == b'('
+                        || byte == b'#'
+                        || byte == b'"'
+                        || byte == b'\''
+                    {
                         // End of type keyword
                         let content = &buf[start..abs];
-                        let span = Span::new(
-                            stream_offset + start as u64,
-                            stream_offset + abs as u64,
-                        );
-                        visitor.attlist_attr_type(content, span).map_err(ParseError::Visitor)?;
+                        let span =
+                            Span::new(stream_offset + start as u64, stream_offset + abs as u64);
+                        visitor
+                            .attlist_attr_type(content, span)
+                            .map_err(ParseError::Visitor)?;
                         self.content_start = None;
 
                         // Check if this was NOTATION — if so, expect `(` for enumeration
@@ -3292,8 +3559,8 @@ impl Reader {
                     // Keep scanning keyword
                 }
                 DtdPhase::AttlistTypeNotationBeforeParen => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'(' {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'(' {
                         self.content_start = Some(abs);
                         self.dtd_phase = DtdPhase::AttlistTypeEnum { paren_depth: 1 };
                     } else {
@@ -3303,7 +3570,9 @@ impl Reader {
                         }));
                     }
                 }
-                DtdPhase::AttlistTypeEnum { ref mut paren_depth } => {
+                DtdPhase::AttlistTypeEnum {
+                    ref mut paren_depth,
+                } => {
                     match byte {
                         b'(' => {
                             *paren_depth += 1;
@@ -3322,7 +3591,8 @@ impl Reader {
                                     stream_offset + content_start as u64,
                                     stream_offset + abs as u64 + 1,
                                 );
-                                visitor.attlist_attr_type(&buf[content_start..abs + 1], span)
+                                visitor
+                                    .attlist_attr_type(&buf[content_start..abs + 1], span)
                                     .map_err(ParseError::Visitor)?;
                                 self.content_start = None;
                                 self.dtd_phase = DtdPhase::AttlistBeforeDefault;
@@ -3332,17 +3602,21 @@ impl Reader {
                     }
                 }
                 DtdPhase::AttlistBeforeDefault => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'#' {
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'#' {
                         self.dtd_phase = DtdPhase::AttlistDefaultHash { start: abs };
                     } else if byte == b'"' || byte == b'\'' {
                         // Plain default value (no keyword)
-                        let quote = if byte == b'"' { QuoteStyle::Double } else { QuoteStyle::Single };
-                        let span = Span::new(
-                            stream_offset + abs as u64,
-                            stream_offset + abs as u64 + 1,
-                        );
-                        visitor.attlist_attr_default_start(false, span).map_err(ParseError::Visitor)?;
+                        let quote = if byte == b'"' {
+                            QuoteStyle::Double
+                        } else {
+                            QuoteStyle::Single
+                        };
+                        let span =
+                            Span::new(stream_offset + abs as u64, stream_offset + abs as u64 + 1);
+                        visitor
+                            .attlist_attr_default_start(false, span)
+                            .map_err(ParseError::Visitor)?;
                         self.content_start = Some(abs + 1);
                         self.dtd_phase = DtdPhase::AttlistDefaultValue { quote };
                     } else {
@@ -3356,18 +3630,20 @@ impl Reader {
                     // Matching #REQUIRED, #IMPLIED, or #FIXED
                     if is_xml_whitespace(byte) || byte == b'>' || byte == b'"' || byte == b'\'' {
                         let keyword = &buf[start..abs];
-                        let span = Span::new(
-                            stream_offset + start as u64,
-                            stream_offset + abs as u64,
-                        );
+                        let span =
+                            Span::new(stream_offset + start as u64, stream_offset + abs as u64);
                         match keyword {
                             b"#REQUIRED" => {
-                                visitor.attlist_attr_required(span).map_err(ParseError::Visitor)?;
+                                visitor
+                                    .attlist_attr_required(span)
+                                    .map_err(ParseError::Visitor)?;
                                 self.dtd_phase = DtdPhase::AttlistIdle;
                                 continue;
                             }
                             b"#IMPLIED" => {
-                                visitor.attlist_attr_implied(span).map_err(ParseError::Visitor)?;
+                                visitor
+                                    .attlist_attr_implied(span)
+                                    .map_err(ParseError::Visitor)?;
                                 self.dtd_phase = DtdPhase::AttlistIdle;
                                 continue;
                             }
@@ -3386,14 +3662,18 @@ impl Reader {
                     // Keep scanning keyword characters
                 }
                 DtdPhase::AttlistFixedBeforeValue => {
-                    if is_xml_whitespace(byte) { /* skip */ }
-                    else if byte == b'"' || byte == b'\'' {
-                        let quote = if byte == b'"' { QuoteStyle::Double } else { QuoteStyle::Single };
-                        let span = Span::new(
-                            stream_offset + abs as u64,
-                            stream_offset + abs as u64 + 1,
-                        );
-                        visitor.attlist_attr_default_start(true, span).map_err(ParseError::Visitor)?;
+                    if is_xml_whitespace(byte) { /* skip */
+                    } else if byte == b'"' || byte == b'\'' {
+                        let quote = if byte == b'"' {
+                            QuoteStyle::Double
+                        } else {
+                            QuoteStyle::Single
+                        };
+                        let span =
+                            Span::new(stream_offset + abs as u64, stream_offset + abs as u64 + 1);
+                        visitor
+                            .attlist_attr_default_start(true, span)
+                            .map_err(ParseError::Visitor)?;
                         self.content_start = Some(abs + 1);
                         self.dtd_phase = DtdPhase::AttlistDefaultValue { quote };
                     } else {
@@ -3404,7 +3684,11 @@ impl Reader {
                     }
                 }
                 DtdPhase::AttlistDefaultValue { quote } => {
-                    let delim = if quote == QuoteStyle::Double { b'"' } else { b'\'' };
+                    let delim = if quote == QuoteStyle::Double {
+                        b'"'
+                    } else {
+                        b'\''
+                    };
                     match byte {
                         b if b == delim => {
                             let content_start = self.content_start.unwrap();
@@ -3413,14 +3697,17 @@ impl Reader {
                                     stream_offset + content_start as u64,
                                     stream_offset + abs as u64,
                                 );
-                                visitor.attlist_attr_default_value(&buf[content_start..abs], span)
+                                visitor
+                                    .attlist_attr_default_value(&buf[content_start..abs], span)
                                     .map_err(ParseError::Visitor)?;
                             }
                             let end_span = Span::new(
                                 stream_offset + abs as u64,
                                 stream_offset + abs as u64 + 1,
                             );
-                            visitor.attlist_attr_default_end(end_span).map_err(ParseError::Visitor)?;
+                            visitor
+                                .attlist_attr_default_end(end_span)
+                                .map_err(ParseError::Visitor)?;
                             self.content_start = None;
                             self.dtd_phase = DtdPhase::AttlistIdle;
                         }
@@ -3431,7 +3718,8 @@ impl Reader {
                                     stream_offset + content_start as u64,
                                     stream_offset + abs as u64,
                                 );
-                                visitor.attlist_attr_default_value(&buf[content_start..abs], span)
+                                visitor
+                                    .attlist_attr_default_value(&buf[content_start..abs], span)
                                     .map_err(ParseError::Visitor)?;
                             }
                             if abs + 1 < buf.len() && buf[abs + 1] == b'#' {
@@ -3458,7 +3746,8 @@ impl Reader {
                             stream_offset + (name_start - 1) as u64,
                             stream_offset + abs as u64 + 1,
                         );
-                        visitor.attlist_attr_default_entity_ref(name, span)
+                        visitor
+                            .attlist_attr_default_entity_ref(name, span)
                             .map_err(ParseError::Visitor)?;
                         self.content_start = Some(abs + 1);
                         self.dtd_phase = DtdPhase::AttlistDefaultValue { quote };
@@ -3479,7 +3768,8 @@ impl Reader {
                             stream_offset + (value_start - 2) as u64,
                             stream_offset + abs as u64 + 1,
                         );
-                        visitor.attlist_attr_default_char_ref(value, span)
+                        visitor
+                            .attlist_attr_default_char_ref(value, span)
                             .map_err(ParseError::Visitor)?;
                         self.content_start = Some(abs + 1);
                         self.dtd_phase = DtdPhase::AttlistDefaultValue { quote };
@@ -3509,10 +3799,8 @@ impl Reader {
             let byte = buf[abs];
             match byte {
                 b'>' => {
-                    let end_span = Span::new(
-                        stream_offset + abs as u64,
-                        stream_offset + abs as u64 + 1,
-                    );
+                    let end_span =
+                        Span::new(stream_offset + abs as u64, stream_offset + abs as u64 + 1);
                     visitor.doctype_end(end_span).map_err(ParseError::Visitor)?;
                     self.finish_content_body();
                     return Ok(pos + 1);
@@ -3540,22 +3828,34 @@ impl Reader {
     ) -> Result<(), ParseError<V::Error>> {
         match self.dtd_phase {
             DtdPhase::Comment { .. } => {
-                visitor.comment_content(content, span).map_err(ParseError::Visitor)?;
+                visitor
+                    .comment_content(content, span)
+                    .map_err(ParseError::Visitor)?;
             }
             DtdPhase::PIContent { .. } => {
-                visitor.pi_content(content, span).map_err(ParseError::Visitor)?;
+                visitor
+                    .pi_content(content, span)
+                    .map_err(ParseError::Visitor)?;
             }
             DtdPhase::ElementContentModel { .. } => {
-                visitor.element_decl_content_spec(content, span).map_err(ParseError::Visitor)?;
+                visitor
+                    .element_decl_content_spec(content, span)
+                    .map_err(ParseError::Visitor)?;
             }
             DtdPhase::EntityValue { .. } => {
-                visitor.entity_decl_value(content, span).map_err(ParseError::Visitor)?;
+                visitor
+                    .entity_decl_value(content, span)
+                    .map_err(ParseError::Visitor)?;
             }
             DtdPhase::AttlistTypeEnum { .. } | DtdPhase::AttlistTypeKeyword { .. } => {
-                visitor.attlist_attr_type(content, span).map_err(ParseError::Visitor)?;
+                visitor
+                    .attlist_attr_type(content, span)
+                    .map_err(ParseError::Visitor)?;
             }
             DtdPhase::AttlistDefaultValue { .. } => {
-                visitor.attlist_attr_default_value(content, span).map_err(ParseError::Visitor)?;
+                visitor
+                    .attlist_attr_default_value(content, span)
+                    .map_err(ParseError::Visitor)?;
             }
             _ => {}
         }

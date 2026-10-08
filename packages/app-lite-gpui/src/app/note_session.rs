@@ -77,6 +77,10 @@ struct SessionSnapshot {
 struct NativeSessionSnapshot {
     title: String,
     document: crate::native_editor::model::Document,
+    /// No body edit has occurred since the matching durable checkpoint.
+    /// Title-only saves reuse that checkpoint's exact canonical body, rather
+    /// than round-tripping an imported paragraph through native block atoms.
+    body_is_durable: bool,
     /// The resource identities which this retained session is allowed to
     /// reference. This is an authorization set inherited from the durable
     /// base plus IDs introduced by a validated staged insert; it is *not* the
@@ -182,6 +186,24 @@ struct PersistedImageHydration {
     natural_size: (u32, u32),
     legacy_node_ids: Vec<NodeId>,
     inline_node_ids: Vec<NodeId>,
+}
+
+/// One image to materialize into an open table cell editor's own store. The
+/// editor is weak and `open` is cleared when the cell closes, so a late
+/// result for a closed or replaced cell is dropped.
+struct CellImageHydration {
+    editor: gpui::WeakEntity<EditorCore>,
+    open: Arc<std::sync::atomic::AtomicBool>,
+    resource_id: String,
+}
+
+impl CellImageHydration {
+    fn live_editor(&self) -> Option<Entity<EditorCore>> {
+        self.open
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| self.editor.upgrade())
+            .flatten()
+    }
 }
 
 struct ImageHydrationJob {
@@ -620,14 +642,13 @@ pub(crate) struct AttachmentOpenSuccess {
 fn system_attachment_opener(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let status = std::process::Command::new("/usr/bin/open")
-            .arg(path)
+        let status = super::attachment_open::system_open_command(path)
             .status()
-            .map_err(|error| format!("无法交给系统默认应用：{error}"))?;
+            .map_err(|error| format!("无法交给系统应用预览或打开：{error}"))?;
         if status.success() {
             Ok(())
         } else {
-            Err(format!("系统默认应用打开命令退出失败：{status}"))
+            Err(format!("系统应用打开命令退出失败：{status}"))
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -1096,6 +1117,19 @@ pub(crate) struct PasteOutcome {
 /// Resource bytes exported per copy, at most; larger ones stay references.
 const MAX_CLIPBOARD_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CLIPBOARD_FILE_EXPORT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Makes the next copy's resource file fail to be written, as a full disk
+/// or a refused temporary directory would.
+#[cfg(test)]
+pub(crate) fn fail_next_clipboard_file_export_for_test() {
+    FAIL_NEXT_CLIPBOARD_FILE_EXPORT.with(|fail| fail.set(true));
+}
+
 /// A new private directory for one copy's resource files. Older ones are
 /// removed: the clipboard holds only the latest copy.
 /// A copy replaces only its owner's earlier export: another running
@@ -1430,6 +1464,7 @@ pub(crate) fn replace_pasted_image_fallback(
                     presentation: ImagePresentation {
                         natural_size,
                         display_width: None,
+                        alignment: None,
                     },
                     link: job.link.clone(),
                 };
@@ -1896,6 +1931,12 @@ pub(crate) struct NoteSession {
     _image_hydration_task: Option<Task<()>>,
     persisted_image_hydration: HashMap<String, PersistedImageHydration>,
     pending_image_hydration: VecDeque<String>,
+    /// An open table cell's editor has its own ImageStore; its images are
+    /// materialized into that store by one worker at a time, separately from
+    /// the body's queue.
+    _cell_image_hydration_task: Option<Task<()>>,
+    pending_cell_image_hydration: VecDeque<CellImageHydration>,
+    running_cell_image_hydration: Option<(gpui::EntityId, String)>,
     pasted_images: Arc<HashMap<ResourceId, PastedPlaceholder>>,
     /// Web images just pasted, for the shell to fetch; the fetch outlives
     /// this session and is recorded in the library until it finishes.
@@ -1942,6 +1983,8 @@ pub(crate) struct NoteSession {
     next_resource_commit_gate: Option<Arc<BackgroundResourceGate>>,
     #[cfg(test)]
     next_image_hydration_gate: Option<Arc<BackgroundResourceGate>>,
+    #[cfg(test)]
+    next_cell_image_hydration_gate: Option<Arc<BackgroundResourceGate>>,
     #[cfg(test)]
     next_attachment_open_gate: Option<Arc<BackgroundAttachmentOpenGate>>,
     #[cfg(test)]
@@ -2106,6 +2149,7 @@ impl NoteSession {
         let committed_snapshot = NativeSessionSnapshot {
             title: snapshot.title.clone(),
             document: document.clone(),
+            body_is_durable: snapshot.document == journal_base.document,
             allowed_resource_ids: snapshot.resource_ids.clone(),
             pasted_images: Arc::clone(&pasted_images),
         };
@@ -2218,6 +2262,9 @@ impl NoteSession {
             _image_hydration_task: None,
             persisted_image_hydration,
             pending_image_hydration: VecDeque::new(),
+            _cell_image_hydration_task: None,
+            pending_cell_image_hydration: VecDeque::new(),
+            running_cell_image_hydration: None,
             pasted_images,
             new_pasted_image_jobs: Vec::new(),
             awaiting_pasted_images: Default::default(),
@@ -2244,6 +2291,8 @@ impl NoteSession {
             next_resource_commit_gate: None,
             #[cfg(test)]
             next_image_hydration_gate: None,
+            #[cfg(test)]
+            next_cell_image_hydration_gate: None,
             #[cfg(test)]
             next_attachment_open_gate: None,
             #[cfg(test)]
@@ -2363,7 +2412,9 @@ impl NoteSession {
         if matches!(self.save.state(), SaveState::Clean) && self.pending_flush.is_none() {
             return Ok(None);
         }
-        let snapshot = Self::encode_snapshot(self.snapshot(), "保留未保存的编辑")?;
+        let snapshot = Self::encode_snapshot(
+            self.snapshot(), "保留未保存的编辑", Some(&self.journal_base),
+        )?;
         Ok(Some((snapshot.title, snapshot.document)))
     }
 
@@ -2735,6 +2786,7 @@ impl NoteSession {
         let snapshot = NativeSessionSnapshot {
             title: self.title.read(cx).text().to_owned(),
             document: prepared_editor_commit.document().clone(),
+            body_is_durable: false,
             allowed_resource_ids: resource_ids.clone(),
             pasted_images: Arc::clone(&self.pasted_images),
         };
@@ -2973,7 +3025,7 @@ impl NoteSession {
                 injected_failure: _,
         } = job;
         let resource_id = staged.staged.resource_id().clone();
-        let snapshot = match Self::encode_snapshot(native_snapshot, "编码资源插入快照") {
+        let snapshot = match Self::encode_snapshot(native_snapshot, "编码资源插入快照", None) {
             Ok(snapshot) => snapshot,
             Err(error) => return ResourceCommitCompletion::Failure { staged, error },
         };
@@ -3077,29 +3129,25 @@ impl NoteSession {
                 } = success;
                 let note = committed.note;
                 let selected_thumbnail_id = committed.selected_thumbnail_id;
-                if let (
-                    Some(cell_editor),
-                    ResourceKind::Image {
-                        format,
-                        natural_size,
-                    },
-                    Ok(Some(source)),
-                ) = (
-                    self.resource_commit_cell
-                        .take()
-                        .and_then(|target| target.live_editor()),
-                    kind,
-                    materialized_image_source.as_ref(),
-                ) {
-                    cell_editor.update(cx, |editor, editor_cx| {
-                        let _ = editor.register_materialized_durable_image(
-                            resource_id.as_str(),
-                            natural_size,
-                            source.clone(),
-                            format,
-                        );
-                        editor_cx.notify();
-                    });
+                // The cell's ImageStore owns its own directory and refuses the
+                // body editor's source. Now that the resource is durable it
+                // takes it like a reopened cell does, in the background.
+                if let (Some(target), ResourceKind::Image { .. }) =
+                    (self.resource_commit_cell.take(), kind)
+                {
+                    // A paint during the commit marked it failed (not yet
+                    // durable then); it may be asked for again now.
+                    if let Some(cell_editor) = target.live_editor() {
+                        cell_editor.update(cx, |editor, _| {
+                            editor.finish_image_hydration_request(resource_id.as_str(), true);
+                        });
+                    }
+                    self.queue_cell_image_hydration(
+                        &target.editor,
+                        &target.open,
+                        resource_id.as_str().to_owned(),
+                        cx,
+                    );
                 }
                 let presentation_warning = self.editor.update(cx, |editor, editor_cx| {
                     let registration = match kind {
@@ -3173,6 +3221,7 @@ impl NoteSession {
                 if !matches!(self.save.state(), SaveState::Failed(_)) {
                     self.save.snapshotted(resource_generation);
                     if completes_current_generation {
+                        self.committed_snapshot.body_is_durable = true;
                         self._journal_deadline_task = None;
                         self._settled_deadline_task = None;
                         self._hard_deadline_task = None;
@@ -3652,6 +3701,7 @@ impl NoteSession {
         self.committed_snapshot = NativeSessionSnapshot {
             title: self.observed_title.clone(),
             document: editor.read(cx).document().clone(),
+            body_is_durable: true,
             allowed_resource_ids: self.resource_ids.clone(),
             pasted_images: Arc::clone(&self.pasted_images),
         };
@@ -3681,7 +3731,17 @@ impl NoteSession {
         &self,
         cx: &gpui::App,
     ) -> Result<Option<ClipboardExport>, SaveError> {
-        let copied = self.editor.read(cx).copy_blocks();
+        self.copy_selection_of(&self.editor, cx)
+    }
+
+    /// The same export for another editor of this note (an open table
+    /// cell), checked against this note's resources.
+    pub(crate) fn copy_selection_of(
+        &self,
+        editor: &Entity<EditorCore>,
+        cx: &gpui::App,
+    ) -> Result<Option<ClipboardExport>, SaveError> {
+        let copied = editor.read(cx).copy_blocks();
         let (blocks, open_start, open_end) = (copied.blocks, copied.open_start, copied.open_end);
         if blocks.is_empty() {
             return Ok(None);
@@ -3724,11 +3784,23 @@ impl NoteSession {
                 match self.repository.open_verified_resource_file(&id)? {
                     Some((_, mut source)) => {
                         let path = directory.join(clipboard_file_name(&stored, files.len()));
-                        let mut target = OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .mode(0o600)
-                            .open(&path)
+                        #[cfg(test)]
+                        let failed = FAIL_NEXT_CLIPBOARD_FILE_EXPORT
+                            .with(|fail| fail.replace(false))
+                            .then(|| std::io::Error::other("injected clipboard export failure"));
+                        #[cfg(not(test))]
+                        let failed: Option<std::io::Error> = None;
+                        let mut target = failed
+                            .map_or_else(
+                                || {
+                                    OpenOptions::new()
+                                        .write(true)
+                                        .create_new(true)
+                                        .mode(0o600)
+                                        .open(&path)
+                                },
+                                Err,
+                            )
                             .and_then(|mut target| {
                                 std::io::copy(&mut source, &mut target)?;
                                 target.sync_all()?;
@@ -3746,7 +3818,13 @@ impl NoteSession {
                                 files.push(path.clone());
                                 Some(path)
                             }
-                            Err(_) => None,
+                            // A copy whose file could not be written is not
+                            // complete: another library could not get the
+                            // resource, and a cut must not delete it.
+                            Err(error) => {
+                                let _ = std::fs::remove_dir_all(&directory);
+                                return Err(SaveError::new(format!("无法导出剪贴板文件：{error}")));
+                            }
                         }
                     }
                     None => None,
@@ -4308,12 +4386,13 @@ impl NoteSession {
         });
         for resource_id in requested {
             if self.persisted_image_hydration.contains_key(&resource_id) {
-                // Coalesce behind the one active worker. The core has already
-                // pruned by the latest visible/prefetch set; replacing this
-                // slot avoids rebuilding a long historical scroll queue in
-                // the retained session between paint notifications.
-                self.pending_image_hydration.clear();
-                self.pending_image_hydration.push_back(resource_id);
+                // Queue behind the one active worker. Each ID here is active
+                // in the core until finished, so dropping it would leave it
+                // a placeholder for the rest of the session; one that has
+                // scrolled away is released when the worker frees up.
+                if !self.pending_image_hydration.contains(&resource_id) {
+                    self.pending_image_hydration.push_back(resource_id);
+                }
             } else if let Some(id) = ResourceId::new(&resource_id)
                 .ok()
                 .filter(|id| self.resource_ids.contains(id))
@@ -4346,8 +4425,9 @@ impl NoteSession {
                         inline_node_ids: Vec::new(),
                     },
                 );
-                self.pending_image_hydration.clear();
-                self.pending_image_hydration.push_back(resource_id);
+                if !self.pending_image_hydration.contains(&resource_id) {
+                    self.pending_image_hydration.push_back(resource_id);
+                }
             } else if ResourceId::new(&resource_id).is_ok_and(|id| {
                 self.pasted_images
                     .get(&id)
@@ -4383,6 +4463,14 @@ impl NoteSession {
                 });
                 continue;
             };
+            // Scrolled away while queued: release it, not as a failure, so
+            // the renderer asks again only if it is shown again.
+            if !self.editor.read(cx).image_hydration_resident(&resource_id) {
+                let _ = self.editor.update(cx, |editor, _| {
+                    editor.finish_image_hydration_request(&resource_id, true);
+                });
+                continue;
+            }
             let image_staging_parent = self
                 .editor
                 .read(cx)
@@ -4409,6 +4497,168 @@ impl NoteSession {
             }));
             return;
         }
+    }
+
+    /// The open cell editor painted images it has no source for: take them
+    /// through the cell's own background hydration.
+    pub(crate) fn drain_cell_image_hydration_requests(
+        &mut self,
+        cell_editor: &Entity<EditorCore>,
+        open: &Arc<std::sync::atomic::AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
+        let requested = cell_editor.update(cx, |editor, _| {
+            editor.take_pending_image_hydration_requests()
+        });
+        for resource_id in requested {
+            self.queue_cell_image_hydration(&cell_editor.downgrade(), open, resource_id, cx);
+        }
+    }
+
+    fn queue_cell_image_hydration(
+        &mut self,
+        editor: &gpui::WeakEntity<EditorCore>,
+        open: &Arc<std::sync::atomic::AtomicBool>,
+        resource_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let job = CellImageHydration {
+            editor: editor.clone(),
+            open: Arc::clone(open),
+            resource_id,
+        };
+        let Some(cell_editor) = job.live_editor() else {
+            return;
+        };
+        // Only a resource this note may reference and the library already
+        // holds; one still being stored is queued when its commit lands.
+        let durable = ResourceId::new(&job.resource_id).ok().is_some_and(|id| {
+            self.resource_ids.contains(&id)
+                && self.committing_resource.as_ref() != Some(&id)
+                && self
+                    .pending_failed_resource_commit
+                    .as_ref()
+                    .is_none_or(|staged| staged.staged.resource_id() != &id)
+        });
+        if !durable {
+            cell_editor.update(cx, |editor, _| {
+                editor.finish_image_hydration_request(&job.resource_id, false);
+            });
+            return;
+        }
+        // A queued request keeps its active marker until the worker
+        // registers a source or fails; clearing it here would let every
+        // paint ask again while the copy is in flight.
+        let key = (cell_editor.entity_id(), job.resource_id.clone());
+        let queued = self.running_cell_image_hydration.as_ref() == Some(&key)
+            || self
+                .pending_cell_image_hydration
+                .iter()
+                .any(|pending| pending.editor.entity_id() == key.0 && pending.resource_id == key.1);
+        if !queued {
+            self.pending_cell_image_hydration.push_back(job);
+        }
+        self.start_next_cell_image_hydration(cx);
+    }
+
+    fn start_next_cell_image_hydration(&mut self, cx: &mut Context<Self>) {
+        if self._cell_image_hydration_task.is_some() {
+            return;
+        }
+        while let Some(job) = self.pending_cell_image_hydration.pop_front() {
+            let Some(cell_editor) = job.live_editor() else {
+                continue;
+            };
+            let Ok(resource_id) = ResourceId::new(&job.resource_id) else {
+                continue;
+            };
+            // A sibling of the cell editor's own root, adopted into it on
+            // the UI thread only while that editor is still the open cell.
+            let image_staging_parent = cell_editor
+                .read(cx)
+                .image_materialization_root()
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+            let work = ImageHydrationJob {
+                hydration: PersistedImageHydration {
+                    resource_id,
+                    natural_size: (0, 0),
+                    legacy_node_ids: Vec::new(),
+                    inline_node_ids: Vec::new(),
+                },
+                repository: Arc::clone(&self.repository),
+                image_staging_parent,
+                #[cfg(test)]
+                gate: self.next_cell_image_hydration_gate.take(),
+            };
+            self.running_cell_image_hydration =
+                Some((cell_editor.entity_id(), job.resource_id.clone()));
+            let task = cx
+                .background_executor()
+                .spawn(async move { Self::perform_image_hydration_on_worker(work).await });
+            self._cell_image_hydration_task = Some(cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |session, session_cx| {
+                    session._cell_image_hydration_task = None;
+                    session.running_cell_image_hydration = None;
+                    session.finish_cell_image_hydration(job, result, session_cx);
+                });
+            }));
+            return;
+        }
+    }
+
+    fn finish_cell_image_hydration(
+        &mut self,
+        job: CellImageHydration,
+        result: ImageHydrationCompletion,
+        cx: &mut Context<Self>,
+    ) {
+        let resource_id = job.resource_id.clone();
+        // Closed, replaced or no longer showing the image: drop the staged
+        // copy (its directory goes with it) and touch no editor.
+        let target = job
+            .live_editor()
+            .filter(|editor| editor.read(cx).shows_image(&resource_id));
+        if let Some(cell_editor) = target {
+            // Every outcome for a live cell ends its active request: a
+            // source, or a recorded failure that stops per-frame re-requests
+            // until the cell is reopened.
+            let outcome = cell_editor.update(cx, |editor, editor_cx| {
+                let outcome = match result {
+                    ImageHydrationCompletion::Success {
+                        staging,
+                        format,
+                        cache_natural_size,
+                        ..
+                    } => staging
+                        .adopt_into(&editor.image_materialization_root())
+                        .map_err(|error| format!("无法放入单元格缓存：{error}"))
+                        .and_then(|source| {
+                            editor
+                                .register_materialized_durable_image(
+                                    &resource_id,
+                                    cache_natural_size,
+                                    source,
+                                    format,
+                                )
+                                .map_err(|error| error.to_string())
+                        }),
+                    ImageHydrationCompletion::Failure { error, .. } => Err(error.to_string()),
+                };
+                editor.finish_image_hydration_request(&resource_id, outcome.is_ok());
+                editor_cx.notify();
+                outcome
+            });
+            if let Err(error) = outcome {
+                self.push_resource_load_warning(format!(
+                    "单元格图片 {resource_id} 暂不可用：{error}"
+                ));
+            }
+        }
+        self.start_next_cell_image_hydration(cx);
+        cx.notify();
     }
 
     fn perform_image_hydration(job: ImageHydrationJob) -> ImageHydrationCompletion {
@@ -4665,7 +4915,25 @@ impl NoteSession {
         // (no semantic document change). Drain it before the equality return
         // below; otherwise a freshly painted placeholder would never start
         // its retained background worker.
+        // A legacy inline source can need geometry while being represented by
+        // native block atoms. Loading it is not user input: do not rewrite its
+        // durable paragraph boundaries/timestamps solely to persist that size.
+        // Check the pre-repair body and checkpoint identity. A title-only
+        // dirty generation still needs presentation geometry without turning
+        // that notification into a body edit; its title is observed below.
+        let loaded_inline_geometry_only = !self.pending_legacy_image_repairs.is_empty()
+            && self.committed_snapshot.body_is_durable
+            && self.journal_base.document.blocks().iter().any(|block| {
+                matches!(block, app_lite_core::document::Block::Paragraph { inlines, .. }
+                    if inlines.iter().any(|inline| matches!(inline, Inline::Image { .. })))
+            })
+            && editor.read(cx).document().semantic_snapshot() == self.observed_document;
         self.apply_pending_legacy_image_repairs(editor, cx);
+        if loaded_inline_geometry_only {
+            // Keep the committed payload and durable base untouched. The next
+            // genuine edit captures the measured model in its normal snapshot.
+            self.observed_document = editor.read(cx).document().semantic_snapshot();
+        }
         self.drain_image_hydration_requests(editor, cx);
         let composition_was_active = self.save.is_composing();
         self.save.resolve_composition();
@@ -4718,6 +4986,8 @@ impl NoteSession {
         NativeSessionSnapshot {
             title,
             document: editor.read(cx).document().clone(),
+            body_is_durable: self.committed_snapshot.body_is_durable
+                && editor.read(cx).document().semantic_snapshot() == self.observed_document,
             allowed_resource_ids: self.resource_ids.clone(),
             pasted_images: Arc::clone(&self.pasted_images),
         }
@@ -4745,7 +5015,15 @@ impl NoteSession {
     fn encode_snapshot(
         snapshot: NativeSessionSnapshot,
         stage: &str,
+        durable_base: Option<&SessionSnapshot>,
     ) -> Result<SessionSnapshot, SaveError> {
+        if let Some(base) = durable_base.filter(|_| snapshot.body_is_durable) {
+            return Ok(SessionSnapshot {
+                title: snapshot.title,
+                document: base.document.clone(),
+                resource_ids: base.document.resource_ids(),
+            });
+        }
         let document = export_with_pasted_images(
             &snapshot.document,
             &snapshot.allowed_resource_ids,
@@ -4769,7 +5047,7 @@ impl NoteSession {
         };
         match job.work {
             SaveWork::Journal { .. } => {
-                let snapshot = Self::encode_snapshot(job.snapshot, "写入编辑日志")?;
+                let snapshot = Self::encode_snapshot(job.snapshot, "写入编辑日志", Some(&job.journal_base))?;
                 let payload = JournalPayload::from_snapshots(
                     &job.note_id,
                     job.expected_revision,
@@ -4793,7 +5071,7 @@ impl NoteSession {
                 Ok(SaveCompletion::Journal { ownership })
             }
             SaveWork::Snapshot { .. } => {
-                let snapshot = Self::encode_snapshot(job.snapshot, "保存快照")?;
+                let snapshot = Self::encode_snapshot(job.snapshot, "保存快照", Some(&job.journal_base))?;
                 let note = job.repository.flush_snapshot_note(
                     SaveNote {
                         id: job.note_id,
@@ -4864,6 +5142,7 @@ impl NoteSession {
                 // input generation is already dirty. It must not cancel that
                 // newer generation's retained 100/500/15s deadline tasks.
                 if publishes_current_generation {
+                    self.committed_snapshot.body_is_durable = true;
                     self._journal_deadline_task = None;
                     self._settled_deadline_task = None;
                     self._hard_deadline_task = None;
@@ -5025,6 +5304,17 @@ impl NoteSession {
     pub(crate) fn stall_next_resource_commit_for_test(&mut self) -> oneshot::Sender<()> {
         let (sender, receiver) = oneshot::channel();
         self.next_resource_commit_gate = Some(Arc::new(BackgroundResourceGate {
+            release: Mutex::new(Some(receiver)),
+        }));
+        sender
+    }
+
+    /// Holds the next table-cell image materialization in its worker, so a
+    /// test can paint the cell while the copy is in flight.
+    #[cfg(test)]
+    pub(crate) fn stall_next_cell_image_hydration_for_test(&mut self) -> oneshot::Sender<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.next_cell_image_hydration_gate = Some(Arc::new(BackgroundResourceGate {
             release: Mutex::new(Some(receiver)),
         }));
         sender

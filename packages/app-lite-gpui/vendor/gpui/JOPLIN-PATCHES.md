@@ -7,6 +7,28 @@ Cargo.toml because their sources are not vendored.
 Local changes are listed here, each in its own commit after the unmodified
 import.
 
+## Releasing shared Metal atlas image tiles
+
+`platform/mac/metal_atlas.rs::remove` kept a removed image's key while other
+images shared its texture, and did not release its allocator rectangle. A
+second removal could release the sibling's texture, and reinserting the key
+returned the old pixels instead of uploading the new image. Repeated temporary
+images also consumed new textures despite available released space.
+
+The key is now removed once before looking up its texture, and the exact tile
+allocation is deallocated before decrementing the live-key count. Existing
+whole-texture release and free-list behavior is retained. This is a local GPUI
+platform correction, not an Evernote implementation or an editor/data-model
+change. It is currently uncommitted together with its tests.
+
+Three tests in `platform::mac::metal_atlas::tests` use an actual Metal device,
+upload literal BGRA pixels and read them back: rebuilding a removed shared key,
+repeated removal preserving its sibling, and twelve insert/remove cycles
+reusing texture space while an anchor image stays live. All three failed on
+the original implementation, then passed after the correction. The full
+vendored library suite passed 91 tests with one ignored. Product-suite and
+ordinary-App acceptance are tracked separately in the delivery evidence.
+
 ## Per-run script size and baseline
 
 Superscript and subscript need text shaped smaller and off the baseline, with

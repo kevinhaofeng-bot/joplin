@@ -1,5 +1,7 @@
 mod actions;
 mod navigation;
+mod shortcuts;
+mod attachment_open;
 pub(crate) mod note_session;
 pub(crate) mod save_coordinator;
 
@@ -8,7 +10,7 @@ pub use navigation::*;
 
 use app_lite_core::{
     CanonicalDocument, CreateNote as RepositoryCreateNote, LibraryError, LibraryEvent,
-    LibraryNavigationIndex, LibraryRepository, LibraryRoute, LibraryShellState, ListQuery, Note,
+    LibraryNavigationIndex, LibraryRepository, LibraryRoute, LibraryShellLocation, LibraryShellState, ListQuery, Note,
     NoteId, NoteOrganizationState, NoteProjection, NotebookId, ResourceId, SearchHit,
     SortDirection, SortField, SortSpec, TagId,
 };
@@ -355,9 +357,30 @@ impl AppModel {
             .map(|value| ListViewPreferences::from_setting_value(&value))
             .unwrap_or_default();
         let navigation_index = repository.list_navigation_index()?;
-        let projections = repository.list_notes(
-            ListQuery::for_route(navigation.route().clone()).with_sort(navigation.sort()),
-        )?;
+        let mut stale_location = false;
+        let snapshot = match &saved_shell_state.location {
+            LibraryShellLocation::Browse(route) => {
+                let route = if route_is_available(route, &navigation_index) {
+                    route.clone()
+                } else {
+                    stale_location = true;
+                    LibraryRoute::AllNotes
+                };
+                NavigationSnapshot::library(route, None)
+            }
+            LibraryShellLocation::Search(query) => NavigationSnapshot::search(
+                query.clone(), saved_shell_state.selected_note_id.clone(),
+            ),
+        };
+        navigation.restore_startup_snapshot(snapshot);
+        let restoring_search = navigation.search_query().is_some();
+        let projections = if restoring_search {
+            Vec::new()
+        } else {
+            repository.list_notes(
+                ListQuery::for_route(navigation.route().clone()).with_sort(navigation.sort()),
+            )?
+        };
         let mut model = Self {
             extra_selection: Vec::new(),
             repository,
@@ -365,8 +388,8 @@ impl AppModel {
             projections,
             search_generation: 0,
             search_request: None,
-            search_refresh_pending: false,
-            search_refresh_generation: 0,
+            search_refresh_pending: restoring_search,
+            search_refresh_generation: u64::from(restoring_search),
             navigation_index,
             active_session: None,
             panes,
@@ -382,7 +405,7 @@ impl AppModel {
             #[cfg(test)]
             projection_event_refreshes: 0,
         };
-        if let Some(id) = saved_shell_state.selected_note_id {
+        if !restoring_search && let Some(id) = saved_shell_state.selected_note_id {
             if model
                 .projections
                 .iter()
@@ -394,6 +417,9 @@ impl AppModel {
                 // launch. The typed atomic write also preserves the panes.
                 model.persist_shell_state()?;
             }
+        }
+        if stale_location {
+            model.persist_shell_state()?;
         }
         Ok(model)
     }
@@ -417,8 +443,9 @@ impl AppModel {
                 | AppAction::PurgeNotes(_)
                 | AppAction::PurgeSelected
         );
+        let opens_shortcut = matches!(&action, AppAction::OpenShortcut(_) | AppAction::OpenRecentNote(_));
         let result = self.dispatch_inner(action);
-        if clears_multi_selection {
+        if clears_multi_selection || (opens_shortcut && result.is_ok()) {
             self.extra_selection.clear();
         }
         result
@@ -428,12 +455,16 @@ impl AppModel {
         let action_can_recover_partial = matches!(
             &action,
             AppAction::CreateNote
+                | AppAction::AddShortcuts(_)
+                | AppAction::RemoveShortcuts(_)
                 | AppAction::CreateStack { .. }
                 | AppAction::CreateNotebook { .. }
                 | AppAction::CreateTag { .. }
                 | AppAction::RenameStack { .. }
                 | AppAction::RenameNotebook { .. }
                 | AppAction::RenameTag { .. }
+                | AppAction::SetNotebookStack { .. }
+                | AppAction::CreateStackForNotebook { .. }
                 | AppAction::DeleteStack(_)
                 | AppAction::DeleteNotebook(_)
                 | AppAction::DeleteTag(_)
@@ -451,6 +482,16 @@ impl AppModel {
                 | AppAction::PurgeSelected
         );
         let result = match action {
+            AppAction::AddShortcuts(targets) => self
+                .apply_organization_mutation("快捷入口已添加", move |repository| {
+                    repository.add_shortcuts(&targets)
+                }),
+            AppAction::RemoveShortcuts(targets) => self
+                .apply_organization_mutation("快捷入口已移除", move |repository| {
+                    repository.remove_shortcuts(&targets)
+                }),
+            AppAction::OpenShortcut(target) => self.open_shortcut(target),
+            AppAction::OpenRecentNote(id) => self.open_recent_note(id),
             AppAction::CreateNote => self.create_note(),
             AppAction::CreateStack { title } => self
                 .apply_organization_mutation("笔记本组已创建", move |repository| {
@@ -479,6 +520,25 @@ impl AppModel {
                 .apply_organization_mutation("标签已重命名", move |repository| {
                     repository.rename_tag(&id, &title).map(|_| ())
                 }),
+            AppAction::SetNotebookStack { id, stack_id } => self.apply_organization_mutation(
+                if stack_id.is_some() {
+                    "笔记本已加入组"
+                } else {
+                    "笔记本已移出组"
+                },
+                move |repository| {
+                    repository
+                        .set_notebook_stack(&id, stack_id.as_ref())
+                        .map(|_| ())
+                },
+            ),
+            AppAction::CreateStackForNotebook { id, title } => {
+                self.apply_organization_mutation("笔记本已加入新组", move |repository| {
+                    repository
+                        .create_stack_for_notebook(&id, &title)
+                        .map(|_| ())
+                })
+            }
             AppAction::DeleteStack(id) => self
                 .apply_organization_mutation("笔记本组已解散", move |repository| {
                     repository.delete_stack(&id)
@@ -1001,7 +1061,7 @@ impl AppModel {
                 },
                 None => None,
             };
-            if navigation.selected_note_id() != self.navigation.selected_note_id() {
+            if navigation.snapshot() != self.navigation.snapshot() {
                 self.persist_shell_state_for(&navigation)?;
             }
             return Ok(PreparedOrganizationCommit {
@@ -1059,7 +1119,7 @@ impl AppModel {
             }),
             None => None,
         };
-        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+        if navigation.snapshot() != self.navigation.snapshot() {
             self.persist_shell_state_for(&navigation)?;
         }
         Ok(PreparedOrganizationCommit {
@@ -1192,7 +1252,7 @@ impl AppModel {
                 if active_session.is_none() {
                     navigation.select(None);
                 }
-                if navigation.selected_note_id() != self.navigation.selected_note_id() {
+                if navigation.snapshot() != self.navigation.snapshot() {
                     self.persist_shell_state_for(&navigation)?;
                 }
                 self.navigation_index = navigation_index;
@@ -1202,6 +1262,10 @@ impl AppModel {
                 self.partial_commit_message = None;
                 self.status = AppStatus::Ready;
                 self.status_origin = StatusOrigin::Neutral;
+            } else {
+                // Shortcuts consume current target metadata even when the
+                // visible card packet belongs to SearchRoute. No body reload.
+                self.navigation_index.shortcuts = self.repository.list_shortcuts()?;
             }
             self.mark_search_refresh_pending();
             return Ok(true);
@@ -1233,7 +1297,15 @@ impl AppModel {
                 }
             }
         }
-        let result = self.refresh_list();
+        let result: Result<(), LibraryError> = (|| {
+            // Prepare the fallible metadata read before publishing either
+            // cache; a failed shortcut query must not leave a partly refreshed
+            // navigation index paired with the new card packet.
+            let shortcuts = self.repository.list_shortcuts()?;
+            self.refresh_list()?;
+            self.navigation_index.shortcuts = shortcuts;
+            Ok(())
+        })();
         match &result {
             Ok(()) if self.status_origin != StatusOrigin::Action => {
                 self.status = AppStatus::Ready;
@@ -1362,6 +1434,10 @@ impl AppModel {
                 sidebar_visible: self.panes.sidebar_visible,
                 list_visible: self.panes.list_visible,
                 selected_note_id: navigation.selected_note_id().cloned(),
+                location: match navigation.snapshot().destination {
+                    AppDestination::Library(route) => LibraryShellLocation::Browse(route),
+                    AppDestination::SearchRoute { query } => LibraryShellLocation::Search(query),
+                },
             })
     }
     pub fn navigation(&self) -> &NavigationState {
@@ -1458,6 +1534,11 @@ impl AppModel {
             return;
         }
         active.note = note.clone();
+        for shortcut in &mut self.navigation_index.shortcuts {
+            if matches!(&shortcut.target, app_lite_core::ShortcutTarget::Note(id) if id == &note.id) {
+                shortcut.title.clone_from(&note.title);
+            }
+        }
         if let Some(projection) = self
             .projections
             .iter_mut()
@@ -1596,13 +1677,31 @@ impl AppModel {
                     }),
                 }
             }
-            Some(_) => {
-                navigation.select(None);
-                None
-            }
+            // A refresh of the same search only replaces the cards. The note
+            // being edited that no longer matches (its edit removed the
+            // match) stays open with its undo history while it is still a
+            // live note; Evernote's list consumer (11.34.8 943.js) likewise
+            // reselects only when the note itself stops being valid, not
+            // because it left the result array. A trashed or purged note is
+            // not kept editable.
+            Some(id) => match self.active_session.as_ref() {
+                Some(active)
+                    if active.note.id == id
+                        && self
+                            .repository
+                            .note_organization_state(&id)?
+                            .is_some_and(|state| state.deleted_time.is_none()) =>
+                {
+                    Some(active.clone())
+                }
+                _ => {
+                    navigation.select(None);
+                    None
+                }
+            },
             None => None,
         };
-        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+        if navigation.snapshot() != self.navigation.snapshot() {
             self.persist_shell_state_for(&navigation)?;
         }
         self.navigation = navigation;
@@ -1662,7 +1761,7 @@ impl AppModel {
             }
             None => None,
         };
-        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+        if navigation.snapshot() != self.navigation.snapshot() {
             self.persist_shell_state_for(&navigation)?;
         }
         // `snapshot` is intentionally consumed only after all fallible work:
@@ -1697,7 +1796,7 @@ impl AppModel {
             return Ok(false);
         }
         let mut navigation = self.navigation.clone();
-        navigation.navigate_to(NavigationSnapshot::search(query, selected_note_id));
+        navigation.navigate_to(NavigationSnapshot::search(query.clone(), selected_note_id));
         let projections = hits.into_iter().map(|hit| hit.note).collect::<Vec<_>>();
         let selected = navigation.selected_note_id().cloned();
         let active_session = match selected {
@@ -1718,7 +1817,7 @@ impl AppModel {
             }
             None => None,
         };
-        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+        if navigation.snapshot() != self.navigation.snapshot() {
             self.persist_shell_state_for(&navigation)?;
         }
         self.navigation = navigation;
@@ -1726,6 +1825,14 @@ impl AppModel {
         self.active_session = active_session;
         self.search_refresh_pending = false;
         self.search_request = None;
+        // A preference failure must not discard a successfully opened note.
+        // Previews, stale packets and zero-result queries never enter history.
+        if !self.projections.is_empty() {
+            if let Err(error) = self.repository.record_search(&query) {
+                self.status = AppStatus::Error(format!("搜索已打开，但历史保存失败：{error}"));
+                self.status_origin = StatusOrigin::Action;
+            }
+        }
         Ok(true)
     }
     pub fn set_panes(&mut self, panes: PaneState) {
@@ -1754,6 +1861,16 @@ impl AppModel {
                     .cloned()
             })
             .collect();
+    }
+
+    fn open_recent_note(&mut self, id: NoteId) -> Result<(), LibraryError> {
+        // A retained recent row is an exact navigation intent, never a
+        // fallback to the first card if its target has since been deleted.
+        let mut candidate = self.navigation.clone();
+        candidate.navigate_to(NavigationSnapshot::library(LibraryRoute::AllNotes, Some(id.clone())));
+        let prepared = self.prepare_navigation_commit_requiring_note(candidate, Some(&id))?;
+        self.commit_navigation(prepared);
+        Ok(())
     }
 
     fn navigate_to(
@@ -1789,7 +1906,19 @@ impl AppModel {
 
     fn prepare_navigation_commit(
         &mut self,
+        navigation: NavigationState,
+    ) -> Result<PreparedNavigationCommit, LibraryError> {
+        self.prepare_navigation_commit_requiring_note(navigation, None)
+    }
+
+    /// A note shortcut has an exact identity, not a best-effort container
+    /// selection. Reject a concurrently removed target before persisting or
+    /// publishing any navigation state. Ordinary navigation keeps its existing
+    /// empty-selection fallback through the wrapper above.
+    fn prepare_navigation_commit_requiring_note(
+        &mut self,
         mut navigation: NavigationState,
+        required_note: Option<&NoteId>,
     ) -> Result<PreparedNavigationCommit, LibraryError> {
         // Search history has to be restored from an already-computed
         // background packet. Never let a browser-style Forward action quietly
@@ -1798,6 +1927,12 @@ impl AppModel {
             return Err(LibraryError::InvalidSnapshot);
         }
         let projections = self.load_projections_for(&navigation)?;
+        if required_note.is_some_and(|id| {
+            navigation.selected_note_id() != Some(id)
+                || !projections.iter().any(|projection| &projection.id == id)
+        }) {
+            return Err(LibraryError::NotFound);
+        }
         let active_session = match navigation.selected_note_id().cloned() {
             Some(id) if projections.iter().any(|projection| projection.id == id) => {
                 match self.active_session.as_ref() {
@@ -1816,7 +1951,7 @@ impl AppModel {
             }
             None => None,
         };
-        if navigation.selected_note_id() != self.navigation.selected_note_id() {
+        if navigation.snapshot() != self.navigation.snapshot() {
             self.persist_shell_state_for(&navigation)?;
         }
         Ok(PreparedNavigationCommit {
@@ -2003,3 +2138,5 @@ mod image_flow_tests;
 mod note_session_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod restart_tests;

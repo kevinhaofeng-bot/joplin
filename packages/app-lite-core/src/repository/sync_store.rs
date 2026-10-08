@@ -949,7 +949,11 @@ impl LibraryRepository {
                 )?;
                 if orphan != 0 {
                     transaction.execute(
-                        "INSERT OR IGNORE INTO resource_gc_queue (sha256, created_time) VALUES (?1, ?2)",
+                        // Local reimport can revive an already queued hash.
+                        // This new orphan transition starts its own grace;
+                        // duplicate pages skip the absent/known entity above.
+                        "INSERT INTO resource_gc_queue (sha256, created_time) VALUES (?1, ?2)
+                         ON CONFLICT(sha256) DO UPDATE SET created_time=excluded.created_time",
                         params![sha, now],
                     )?;
                 }
@@ -1150,7 +1154,9 @@ impl RemoteNote {
                     "SELECT EXISTS(SELECT 1 FROM resources WHERE id=?1 AND deleted_time=0 AND mime LIKE 'image/%')",
                     [resource.as_str()], |row| row.get(0),
                 )?;
-                if !valid { return Ok(Err(Skip("thumbnail is not an image".into()))); }
+                if !valid {
+                    return Ok(Err(Skip("thumbnail is not an image".into())));
+                }
                 Some(resource)
             }
             _ => return Ok(Err(Skip("invalid thumbnail id".into()))),
@@ -1219,7 +1225,9 @@ impl RemoteNote {
         // explicit cover is visible note state and must not be discarded just
         // because its title and body match a pending local edit.
         let cover_matches = match self.selected_thumbnail_id.as_ref() {
-            Some(remote) => super::selected_thumbnail_id(transaction, id, None)?.as_ref() == Some(remote),
+            Some(remote) => {
+                super::selected_thumbnail_id(transaction, id, None)?.as_ref() == Some(remote)
+            }
             None => true,
         };
         Ok(title == self.title
@@ -1276,7 +1284,12 @@ impl RemoteNote {
         super::replace_note_resources(transaction, id, &self.resource_ids)?;
         transaction.execute(
             "UPDATE notes SET selected_thumbnail_id=?2 WHERE id=?1",
-            params![id.as_str(), super::selected_thumbnail_id(transaction, id, self.selected_thumbnail_id.as_ref())?.as_ref().map(crate::ResourceId::as_str)],
+            params![
+                id.as_str(),
+                super::selected_thumbnail_id(transaction, id, self.selected_thumbnail_id.as_ref())?
+                    .as_ref()
+                    .map(crate::ResourceId::as_str)
+            ],
         )?;
         super::queue_search(transaction, id, now, "remote")?;
         super::queue_derived_text_for_note(transaction, id, now)?;
@@ -1536,6 +1549,79 @@ impl LibraryRepository {
 }
 
 const ANCHOR_NAME: &str = "anchor";
+
+#[cfg(all(test, feature = "test-support"))]
+mod retention_tests {
+    use super::*;
+    use crate::{CanonicalDocument, CreateNote, RepositoryClock, RepositoryIdSource};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+    struct Clock(AtomicI64);
+    impl RepositoryClock for Clock {
+        fn now_millis(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    struct Ids(AtomicU64);
+    impl RepositoryIdSource for Ids {
+        fn next_id(&self) -> Result<String, LibraryError> {
+            Ok(format!("{:032x}", self.0.fetch_add(1, Ordering::SeqCst)))
+        }
+    }
+
+    #[test]
+    fn remote_last_reference_removal_renews_grace_but_replayed_page_does_not() {
+        // Catches preserving a prior local purge timestamp when a remote
+        // tombstone removes metadata for a locally reimported same-hash blob.
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("library.sqlite");
+        let start = 1_700_000_000_000;
+        let clock = Arc::new(Clock(AtomicI64::new(start)));
+        let ids = Arc::new(Ids(AtomicU64::new(1)));
+        let repo = LibraryRepository::open_with_sources(&path, clock.clone(), ids.clone()).unwrap();
+        let first = repo.import_resource(b"retained remote bytes", "remote.txt", "text/plain", "txt").unwrap();
+        let hash = repo.resource_metadata(&first).unwrap().unwrap().sha256;
+        let note = repo.create_note(CreateNote {
+            title: "owned remote retention fixture".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![crate::document::Block::Attachment {
+                resource_id: first,
+                filename: "remote.txt".into(),
+                media_type: "text/plain".into(),
+            }]),
+        }).unwrap();
+        repo.trash_note(&note.id).unwrap();
+        repo.purge_note(&note.id).unwrap();
+        clock.0.store(start + 518_400_000, Ordering::SeqCst); // six days
+        let renewed = repo.import_resource(b"retained remote bytes", "renewed.txt", "text/plain", "txt").unwrap();
+        let change = app_lite_protocol::Change {
+            cursor: 1,
+            entity: app_lite_protocol::EntityRef {
+                kind: app_lite_protocol::EntityKind::Resource,
+                id: renewed.as_str().to_owned(),
+            },
+            revision: 1,
+            deleted: true,
+            payload: None,
+            op_id: "remote-purge-retention-1".into(),
+            device_id: "another-device".into(),
+        };
+        assert_eq!(repo.sync_apply_page(std::slice::from_ref(&change), 1).unwrap().applied, 1);
+        assert!(repo.resource_metadata(&renewed).unwrap().is_none());
+        let blob = fixture.path().join("resources/blobs").join(hash.as_str());
+        drop(repo);
+        clock.0.store(start + 604_800_000, Ordering::SeqCst); // original deadline
+        let repo = LibraryRepository::open_with_sources(&path, clock.clone(), ids.clone()).unwrap();
+        assert!(blob.exists(), "remote removal needs a full grace period after the latest metadata removal");
+        clock.0.store(start + 1_036_800_000, Ordering::SeqCst); // day twelve
+        assert_eq!(repo.sync_apply_page(std::slice::from_ref(&change), 1).unwrap().applied, 0);
+        drop(repo);
+        clock.0.store(start + 1_123_200_000, Ordering::SeqCst); // day thirteen
+        let _repo = LibraryRepository::open_with_sources(&path, clock, ids).unwrap();
+        assert!(!blob.exists(), "replaying the same page must not renew the deadline indefinitely");
+    }
+}
 
 impl LibraryRepository {
     /// The highest server change this client knows of (pulled or its own

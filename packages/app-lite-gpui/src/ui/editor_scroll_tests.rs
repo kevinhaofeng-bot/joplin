@@ -30,9 +30,18 @@ fn mount_shell_at_900x700(
     repository: Arc<LibraryRepository>,
     cx: &mut TestAppContext,
 ) -> (Entity<LibraryShell>, VisualTestContext) {
+    mount_shell_at_frame(repository, 900.0, 700.0, cx)
+}
+
+fn mount_shell_at_frame(
+    repository: Arc<LibraryRepository>,
+    width: f32,
+    height: f32,
+    cx: &mut TestAppContext,
+) -> (Entity<LibraryShell>, VisualTestContext) {
     let model = cx.new(|_| AppModel::open(repository).expect("open model"));
     let window = cx.update(|app| {
-        let bounds = Bounds::centered(None, size(px(900.0), px(700.0)), app);
+        let bounds = Bounds::centered(None, size(px(width), px(height)), app);
         app.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -58,6 +67,314 @@ fn tiny_png() -> Vec<u8> {
     .write_to(&mut encoded, image::ImageFormat::Png)
     .expect("encode image fixture");
     encoded.into_inner()
+}
+
+#[gpui::test]
+async fn mounted_typing_after_large_image_reveals_new_paragraph(cx: &mut TestAppContext) {
+    assert_typing_after_large_image_reveals_new_paragraph(cx, 900.0, 700.0);
+}
+
+#[gpui::test]
+async fn mounted_typing_after_large_image_reveals_unshaped_paragraph_in_wide_window(cx: &mut TestAppContext) {
+    // The source image is capped at its natural width. Keep the viewport
+    // shallow enough that its tail is also outside the one-viewport prefetch.
+    assert_typing_after_large_image_reveals_new_paragraph(cx, 2320.0, 700.0);
+}
+
+fn assert_typing_after_large_image_reveals_new_paragraph(cx: &mut TestAppContext, width: f32, height: f32) {
+    // Return/input must reveal their own selection, without a subsequent
+    // navigation command, wheel, or reopening the note doing it for them.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let resource_id = repository
+        .import_resource(
+            include_bytes!("../../assets/AppIcon-dock-v2.png"),
+            "caret.png", "image/png", "png",
+        )
+        .unwrap();
+    let note = repository.create_note(CreateNote {
+        title: "图片后输入必须滚入".into(),
+        notebook_id: None,
+        document: CanonicalDocument::from_blocks(vec![
+            Block::Paragraph {
+                style: BlockStyle::default(),
+                inlines: vec![Inline::Text { text: "图前".into(), marks: Marks::default() }],
+            },
+            Block::Image {
+                resource_id,
+                alt: "caret fixture".into(),
+                presentation: ImagePresentation {
+                    natural_size: Some((1254, 1254)), display_width: None,
+                    alignment: None,
+                },
+                link: None,
+            },
+        ]),
+    }).unwrap();
+    let (view, mut cx) = mount_shell_at_frame(repository, width, height, cx);
+    cx.update(|window, app| view.update(app, |shell, shell_cx| {
+        shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+        shell.apply_action(AppAction::ToggleSidebar, window, shell_cx);
+        shell.apply_action(AppAction::ToggleNoteList, window, shell_cx);
+    }));
+    redraw(&mut cx);
+    let editor = view.read_with(&cx, |shell, app| {
+        shell.note_session.as_ref().unwrap().read(app).editor().clone()
+    });
+    cx.update(|window, app| {
+        editor.update(app, |editor, editor_cx| {
+            let end = editor.document_len();
+            editor.select_document_range(end, end);
+            editor_cx.notify();
+        });
+        crate::native_editor::surface::focus_editor(&editor, window, app);
+    });
+    redraw(&mut cx);
+    cx.simulate_keystrokes("enter");
+    redraw(&mut cx);
+    cx.simulate_input("你好");
+    for _ in 0..6 { redraw(&mut cx); }
+    let (head_text, caret) = editor.read_with(&cx, |editor, _| {
+        (
+            editor.document().block(editor.selection().head.node_id)
+                .unwrap().content.as_text().unwrap().to_owned(),
+            editor.layout().caret_bounds_for_point(editor.selection().head),
+        )
+    });
+    assert_eq!(head_text, "你好", "Return/input must actually edit a new image-tail paragraph");
+    let metrics = view.read_with(&cx, |shell, app| {
+        shell.editor_surface.as_ref().unwrap().read(app).scroll_metrics_for_test()
+    });
+    assert!(metrics.max_offset.height > px(200.0), "image fixture must overflow");
+    assert!(metrics.offset.y < px(-200.0), "typing after the image must scroll automatically: {metrics:?}, caret={caret:?}");
+    let caret = caret.expect("the input selection must be shaped after reveal");
+    assert!(caret.top() >= metrics.viewport.top() && caret.bottom() <= metrics.viewport.bottom(),
+        "typed caret must stay fully inside the body viewport: {metrics:?}, caret={caret:?}");
+}
+
+#[gpui::test]
+async fn mounted_wheel_paints_text_entering_view_between_large_images(cx: &mut TestAppContext) {
+    let _paint_scope = crate::native_editor::render::observe_test_text_paints();
+    // A wheel must repaint text newly entering the clip without a selection
+    // change. Merely retaining the text in SQLite/layout is not acceptance.
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let resource_id = repository
+        .import_resource(
+            include_bytes!("../../assets/AppIcon-dock-v2.png"),
+            "wheel.png",
+            "image/png",
+            "png",
+        )
+        .unwrap();
+    let paragraph = |text: &str| Block::Paragraph {
+        style: BlockStyle::default(),
+        inlines: vec![Inline::Text {
+            text: text.into(),
+            marks: Marks::default(),
+        }],
+    };
+    let image = || Block::Image {
+        resource_id: resource_id.clone(),
+        alt: "scroll fixture".into(),
+        presentation: ImagePresentation {
+            natural_size: Some((1254, 1254)),
+            display_width: None,
+            alignment: None,
+        },
+        link: None,
+    };
+    let note = repository
+        .create_note(CreateNote {
+            title: "滚轮图间文字".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(vec![
+                paragraph("图前"),
+                image(),
+                paragraph("中文测试"),
+                paragraph("你好图片"),
+                image(),
+                image(),
+                paragraph("世界"),
+            ]),
+        })
+        .unwrap();
+    let before = repository.load_note(&note.id).unwrap().unwrap();
+    let (view, mut cx) = mount_shell_at_900x700(Arc::clone(&repository), cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx);
+            shell.apply_action(AppAction::ToggleSidebar, window, shell_cx);
+            shell.apply_action(AppAction::ToggleNoteList, window, shell_cx);
+        })
+    });
+    redraw(&mut cx);
+    let editor = view.read_with(&cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    let between_nodes = editor.read_with(&cx, |editor, _| {
+        editor
+            .document()
+            .blocks()
+            .iter()
+            .filter_map(|block| {
+                matches!(block.content.as_text(), Some("中文测试" | "你好图片")).then_some(block.id)
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(between_nodes.len(), 2);
+    let initial = view.read_with(&cx, |shell, app| {
+        shell
+            .editor_surface
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .scroll_metrics_for_test()
+    });
+    let mut checked = false;
+    for _ in 0..12 {
+        crate::native_editor::render::take_test_text_paints();
+        cx.simulate_event(ScrollWheelEvent {
+            position: initial.viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            ..Default::default()
+        });
+        redraw(&mut cx);
+        let metrics = view.read_with(&cx, |shell, app| {
+            shell
+                .editor_surface
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .scroll_metrics_for_test()
+        });
+        let bounds = editor.read_with(&cx, |editor, _| {
+            between_nodes
+                .iter()
+                .filter_map(|id| {
+                    editor
+                        .layout()
+                        .block_layout(*id)
+                        .map(|layout| layout.bounds)
+                })
+                .collect::<Vec<_>>()
+        });
+        if bounds.len() != 2
+            || bounds
+                .iter()
+                .any(|b| b.top() < metrics.viewport.top() || b.bottom() > metrics.viewport.bottom())
+        {
+            continue;
+        }
+        let paints = crate::native_editor::render::take_test_text_paints();
+        for expected in ["中文测试", "你好图片"] {
+            assert!(
+                paints.iter().any(|paint| {
+                    paint.editor == editor.entity_id()
+                        && paint.text == expected
+                        && paint.bounds.top() >= paint.content_mask.top()
+                        && paint.bounds.bottom() <= paint.content_mask.bottom()
+                }),
+                "newly visible text must reach the glyph painter after wheel alone: expected={expected}, metrics={metrics:?}, layout={bounds:?}, paints={paints:?}"
+            );
+        }
+        assert!(metrics.offset.y < px(0.0), "fixture must really scroll");
+        checked = true;
+        break;
+    }
+    assert!(
+        checked,
+        "wheel fixture must reach both intervening paragraphs"
+    );
+    let after = repository.load_note(&note.id).unwrap().unwrap();
+    assert_eq!(after.body_html, before.body_html);
+    assert_eq!(after.revision, before.revision);
+}
+
+#[gpui::test]
+async fn mounted_title_tab_reveals_body_start_after_scrolling_to_the_end(cx: &mut TestAppContext) {
+    cx.update(|app| crate::components::init(app));
+    let (_profile, repository) = repository();
+    let note = repository
+        .create_note(CreateNote {
+            title: "标题Tab长文165".into(),
+            notebook_id: None,
+            document: CanonicalDocument::from_blocks(
+                (0..100)
+                    .map(|index| Block::Paragraph {
+                        style: BlockStyle::default(),
+                        inlines: vec![Inline::Text {
+                            text: format!("长文段落{index} 原文"),
+                            marks: Marks::default(),
+                        }],
+                    })
+                    .collect(),
+            ),
+        })
+        .unwrap();
+    let (view, mut cx) = mount_shell_at_900x700(repository, cx);
+    cx.update(|window, app| {
+        view.update(app, |shell, shell_cx| {
+            shell.apply_action(AppAction::SelectNote(note.id.clone()), window, shell_cx)
+        })
+    });
+    redraw(&mut cx);
+    let editor = view.read_with(&cx, |shell, app| {
+        shell
+            .note_session
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .editor()
+            .clone()
+    });
+    cx.update(|window, app| crate::native_editor::surface::focus_editor(&editor, window, app));
+    cx.simulate_keystrokes("cmd-down");
+    redraw(&mut cx);
+    let offset = view.read_with(&cx, |shell, app| {
+        shell
+            .editor_surface
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .scroll_metrics_for_test()
+            .offset
+            .y
+    });
+    assert!(
+        offset < px(-200.0),
+        "fixture must really be scrolled below the first paragraph"
+    );
+    let title = cx.debug_bounds("library-note-title").unwrap();
+    cx.simulate_click(title.center(), Modifiers::default());
+    cx.simulate_keystrokes("tab");
+    redraw(&mut cx);
+    let metrics = view.read_with(&cx, |shell, app| {
+        shell
+            .editor_surface
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .scroll_metrics_for_test()
+    });
+    assert_eq!(
+        metrics.offset.y,
+        px(0.0),
+        "title Tab must reveal the body start immediately, before typing"
+    );
+    cx.simulate_input("X");
+    redraw(&mut cx);
+    assert!(
+        editor
+            .read_with(&cx, |editor, _| editor.copy_all_plain_text())
+            .starts_with("X长文段落0 原文")
+    );
 }
 
 #[gpui::test]
@@ -445,6 +762,7 @@ async fn mounted_long_image_before_pdf_has_a_scrollable_editor_viewport_and_page
                     presentation: ImagePresentation {
                         natural_size: Some((1218, 2494)),
                         display_width: None,
+                        alignment: None,
                     },
                     link: None,
                 },

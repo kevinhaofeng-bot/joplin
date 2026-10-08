@@ -65,23 +65,25 @@
 extern crate std;
 
 #[forbid(unsafe_code)]
-mod types;
-#[forbid(unsafe_code)]
-mod visitor;
-#[forbid(unsafe_code)]
 mod classify;
 #[forbid(unsafe_code)]
-mod state;
+mod encoding;
 #[forbid(unsafe_code)]
 mod reader;
 #[forbid(unsafe_code)]
-mod encoding;
+mod state;
+#[forbid(unsafe_code)]
+mod types;
+#[forbid(unsafe_code)]
+mod visitor;
 
 mod bitstream;
 
-pub use types::{DeclaredEncoding, Encoding, EntityKind, Error, ErrorKind, ParseError, QName, Span};
-pub use visitor::Visitor;
+pub use encoding::{ProbeResult, probe_encoding};
 pub use reader::Reader;
 #[cfg(feature = "std")]
-pub use reader::{parse_read, parse_read_with_capacity, ReadError};
-pub use encoding::{probe_encoding, ProbeResult};
+pub use reader::{ReadError, parse_read, parse_read_with_capacity};
+pub use types::{
+    DeclaredEncoding, Encoding, EntityKind, Error, ErrorKind, ParseError, QName, Span,
+};
+pub use visitor::Visitor;

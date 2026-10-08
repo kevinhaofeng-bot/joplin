@@ -1,0 +1,16 @@
+{
+  "data-root": "/volume1/Projects/joplin-lite-runtime/docker",
+  "exec-root": "/run/joplin-lite-docker",
+  "pidfile": "/run/joplin-lite-docker.pid",
+  "hosts": ["unix:///run/joplin-lite-docker.sock"],
+  "group": "root",
+  "bridge": "none",
+  "iptables": false,
+  "ip6tables": false,
+  "ip-forward": false,
+  "ip-masq": false,
+  "userland-proxy": false,
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "5m", "max-file": "2"}
+}

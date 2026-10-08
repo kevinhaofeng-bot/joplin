@@ -1,5 +1,11 @@
 use crate::PastedImageJob;
+mod search_history;
+mod recent_notes;
+mod shell_location;
+mod shortcuts;
 mod sync_store;
+pub use search_history::RecentSearch;
+pub use shell_location::LibraryShellLocation;
 pub use sync_store::{RemoteResourceRef, SyncConflict, SyncFailure, SyncInflight};
 
 use crate::resource::{
@@ -30,19 +36,23 @@ use thiserror::Error;
 
 const LIBRARY_SHELL_PANES_SETTING: &str = "library-shell.panes";
 const LIBRARY_SHELL_SELECTED_NOTE_SETTING: &str = "library-shell.selected-note-id";
+const LIBRARY_SHELL_LOCATION_SETTING: &str = "library-shell.location-v1";
 const MAX_DERIVED_TEXT_BYTES: usize = 1024 * 1024;
+// Physical orphan bytes outlive the immediate logical purge. This does not
+// resurrect a deleted note/resource; it gives durable GC a seven-day grace.
+const RESOURCE_GC_RETENTION_MILLIS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 fn is_reserved_library_shell_setting(key: &str) -> bool {
     matches!(
         key,
-        LIBRARY_SHELL_PANES_SETTING | LIBRARY_SHELL_SELECTED_NOTE_SETTING
+        LIBRARY_SHELL_PANES_SETTING | LIBRARY_SHELL_SELECTED_NOTE_SETTING | LIBRARY_SHELL_LOCATION_SETTING
     )
 }
 
 /// The durable, application-owned portion of the library window state.
 ///
 /// Keeping this DTO in core prevents the GPUI shell from making unrelated
-/// string writes for panes and selection.  The two fields are committed in one
+/// string writes for panes, location and selection. The fields are committed in one
 /// SQLite transaction so an interrupted write cannot resurrect an old
 /// selection alongside new pane settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +62,7 @@ pub struct LibraryShellState {
     pub sidebar_visible: bool,
     pub list_visible: bool,
     pub selected_note_id: Option<NoteId>,
+    pub location: LibraryShellLocation,
 }
 
 /// A bounded immutable note revision view used by the readable-export path.
@@ -109,6 +120,7 @@ impl LibraryShellState {
             sidebar_visible: true,
             list_visible: true,
             selected_note_id: None,
+            location: LibraryShellLocation::Browse(crate::LibraryRoute::AllNotes),
         }
     }
 
@@ -124,7 +136,7 @@ impl LibraryShellState {
         if Self::pane_width_is_valid(self.sidebar_width)
             && Self::pane_width_is_valid(self.list_width)
         {
-            Ok(())
+            self.location.validate()
         } else {
             Err(LibraryError::InvalidLibraryShellState)
         }
@@ -153,11 +165,12 @@ impl LibraryShellState {
         )
     }
 
-    fn from_settings(panes: Option<&str>, selected_note_id: Option<&str>) -> Self {
+    fn from_settings(panes: Option<&str>, selected_note_id: Option<&str>, location: Option<&str>) -> Self {
         let mut state = panes
             .and_then(Self::parse_panes)
             .unwrap_or_else(Self::default);
         state.selected_note_id = selected_note_id.and_then(|id| NoteId::parse(id).ok());
+        state.location = location.and_then(LibraryShellLocation::from_setting).unwrap_or_default();
         state
     }
 
@@ -187,6 +200,7 @@ impl LibraryShellState {
             sidebar_visible,
             list_visible,
             selected_note_id: None,
+            location: LibraryShellLocation::default(),
         })
     }
 }
@@ -934,7 +948,14 @@ impl LibraryRepository {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        let state = LibraryShellState::from_settings(panes.as_deref(), selected_note_id.as_deref());
+        let location = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [LIBRARY_SHELL_LOCATION_SETTING],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let state = LibraryShellState::from_settings(panes.as_deref(), selected_note_id.as_deref(), location.as_deref());
         transaction.commit()?;
         Ok(state)
     }
@@ -963,6 +984,18 @@ impl LibraryRepository {
                 "DELETE FROM settings WHERE key = ?1",
                 [LIBRARY_SHELL_SELECTED_NOTE_SETTING],
             )?;
+        }
+        if state.location == LibraryShellLocation::default() {
+            transaction.execute("DELETE FROM settings WHERE key = ?1", [LIBRARY_SHELL_LOCATION_SETTING])?;
+        } else {
+            transaction.execute(
+                "INSERT INTO settings (key, value, updated_time) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_time = excluded.updated_time",
+                params![LIBRARY_SHELL_LOCATION_SETTING, state.location.setting_value()?, now],
+            )?;
+        }
+        if let Some(id) = &state.selected_note_id {
+            recent_notes::record_selected_note(&transaction, id, now)?;
         }
         transaction.commit()?;
         Ok(())
@@ -1107,11 +1140,13 @@ impl LibraryRepository {
                 let rows = statement.query_map([], row_to_tag)?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
+            let shortcuts = shortcuts::list_shortcuts_on(&transaction)?;
             transaction.commit()?;
             Ok(LibraryNavigationIndex {
                 notebooks,
                 stacks,
                 tags,
+                shortcuts,
             })
         })();
         #[cfg(any(test, feature = "test-support"))]
@@ -1813,7 +1848,11 @@ impl LibraryRepository {
                     [candidate.sha256.as_str()],
                 )?;
                 transaction.execute(
-                    "INSERT OR IGNORE INTO resource_gc_queue (sha256, created_time) VALUES (?1, ?2)",
+                    // Reused bytes may still have a queue row from a prior
+                    // purge. Only this new last-reference removal renews it;
+                    // retrying the physical unlink never moves the deadline.
+                    "INSERT INTO resource_gc_queue (sha256, created_time) VALUES (?1, ?2)
+                     ON CONFLICT(sha256) DO UPDATE SET created_time=excluded.created_time",
                     params![candidate.sha256.as_str(), now],
                 )?;
             }
@@ -1827,17 +1866,27 @@ impl LibraryRepository {
             let mut connection = self.connection.lock().expect("library mutex poisoned");
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let queued: Option<String> = transaction
+            let queued: Option<(String, i64)> = transaction
                 .query_row(
-                    "SELECT sha256 FROM resource_gc_queue ORDER BY created_time, sha256 LIMIT 1",
+                    "SELECT sha256, created_time FROM resource_gc_queue ORDER BY created_time, sha256 LIMIT 1",
                     [],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let Some(queued) = queued else {
+            let Some((queued, created_time)) = queued else {
                 transaction.commit()?;
                 return Ok(());
             };
+            // Do not consume a clock sample on an empty queue. Oldest first
+            // means if this row is too young, all remaining rows are too.
+            if self
+                .now()
+                .checked_sub(RESOURCE_GC_RETENTION_MILLIS)
+                .is_none_or(|cutoff| created_time > cutoff)
+            {
+                transaction.commit()?;
+                return Ok(());
+            }
             let sha256 = BlobHash::new(&queued).map_err(|_| LibraryError::InvalidSnapshot)?;
             let metadata_reappeared: i64 = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM resource_blobs WHERE sha256 = ?1)",
@@ -2040,6 +2089,77 @@ impl LibraryRepository {
                 .map_err(|_| LibraryError::InvalidId)?,
             revision,
             is_default: is_default != 0,
+        })
+    }
+
+    /// Puts an existing notebook into a stack, or out of any (Evernote
+    /// stackAddNotebook / stackRemoveNotebook). The notebook keeps its ID and
+    /// notes; asking for its current stack is no change.
+    pub fn set_notebook_stack(
+        &self,
+        id: &NotebookId,
+        stack_id: Option<&StackId>,
+    ) -> Result<Notebook, LibraryError> {
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        if let Some(stack_id) = stack_id {
+            require_stack(&transaction, stack_id)?;
+        }
+        let (notebook, changed) =
+            assign_notebook_stack(&transaction, self.id_source.as_ref(), id, stack_id, now)?;
+        if !changed {
+            return Ok(notebook);
+        }
+        transaction.commit()?;
+        self.publish(vec![
+            LibraryEvent::OrganizationChanged,
+            LibraryEvent::SyncQueued(EntityRef::Notebook(id.clone())),
+        ]);
+        Ok(notebook)
+    }
+
+    /// Creates a stack holding an existing notebook (Evernote stackCreate):
+    /// the stack and the move commit together or not at all.
+    pub fn create_stack_for_notebook(
+        &self,
+        id: &NotebookId,
+        title: &str,
+    ) -> Result<Stack, LibraryError> {
+        let title = organization_title(title)?;
+        let now = self.now();
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let transaction = connection.transaction()?;
+        require_entity(&transaction, "notebooks", id.as_str())?;
+        let (raw_id, _) = self.insert_with_unique_id(&transaction, "stacks", |candidate| {
+            transaction.execute("INSERT INTO stacks (id, title, revision, created_time, updated_time) VALUES (?1, ?2, 1, ?3, ?3)", params![candidate, title, now])
+        })?;
+        let stack_id = StackId::parse(raw_id).expect("validated generated ID is valid");
+        enqueue_sync(
+            &transaction,
+            self.id_source.as_ref(),
+            &EntityRef::Stack(stack_id.clone()),
+            1,
+            "create",
+            now,
+        )?;
+        assign_notebook_stack(
+            &transaction,
+            self.id_source.as_ref(),
+            id,
+            Some(&stack_id),
+            now,
+        )?;
+        transaction.commit()?;
+        self.publish(vec![
+            LibraryEvent::OrganizationChanged,
+            LibraryEvent::SyncQueued(EntityRef::Stack(stack_id.clone())),
+            LibraryEvent::SyncQueued(EntityRef::Notebook(id.clone())),
+        ]);
+        Ok(Stack {
+            id: stack_id,
+            title,
+            revision: 1,
         })
     }
 
@@ -3334,6 +3454,63 @@ impl LibraryRepository {
         )?)
     }
 
+    /// A platform worker may gain support for one MIME without invalidating
+    /// every completed projection. Atomically mark that capability and park
+    /// only exact old Unsupported identities for the existing live-job gate.
+    /// This is metadata-only and background-only. Detached/history/trash jobs
+    /// can remain pending, but cannot execute until associated with a live note.
+    /// A subsequent deterministic failure is not retried by this capability.
+    pub fn requeue_unsupported_derived_text_for_capability(
+        &self,
+        mime: &str,
+        capability: &str,
+    ) -> Result<usize, LibraryError> {
+        if mime.is_empty()
+            || mime.len() > 128
+            || capability.is_empty()
+            || capability.len() > 128
+            || !capability.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.'
+            })
+        {
+            return Err(LibraryError::InvalidSnapshot);
+        }
+        let key = format!("derived-text.capability.{capability}");
+        let value = format!("{mime}|{DERIVED_TEXT_EXTRACTOR_VERSION}");
+        let mut connection = self.connection.lock().expect("library mutex poisoned");
+        let read_marker = |connection: &Connection| -> Result<Option<String>, rusqlite::Error> {
+            connection
+                .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| row.get(0))
+                .optional()
+        };
+        // The common metadata probe after migration needs only a read; do not
+        // acquire a SQLite writer lock on every image in a large backlog.
+        if read_marker(&connection)?.as_deref() == Some(value.as_str()) {
+            return Ok(0);
+        }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A second repository/process may have completed the same capability
+        // while this connection waited to become the SQLite writer.
+        if read_marker(&transaction)?.as_deref() == Some(value.as_str()) {
+            transaction.commit()?;
+            return Ok(0);
+        }
+        let changed = transaction.execute(
+            "UPDATE derived_text_jobs SET state='pending',failure=NULL
+             WHERE state='failed' AND failure='unsupported' AND extractor_version=?1
+               AND EXISTS(SELECT 1 FROM resources r WHERE r.id=derived_text_jobs.resource_id
+                          AND r.sha256=derived_text_jobs.sha256 AND r.deleted_time=0 AND r.mime=?2)",
+            params![DERIVED_TEXT_EXTRACTOR_VERSION, mime],
+        )?;
+        transaction.execute(
+            "INSERT INTO settings(key,value,updated_time) VALUES(?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_time=excluded.updated_time",
+            params![key, value, self.now()],
+        )?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
     pub fn retry_derived_text(&self, job: &DerivedTextJob) -> Result<bool, LibraryError> {
         let now = self.now();
         let connection = self.connection.lock().expect("library mutex poisoned");
@@ -3577,13 +3754,15 @@ impl LibraryRepository {
             }
         }
         for term in &query.terms {
-            let (text, negated) = match term {
-                SearchTerm::Text(text) | SearchTerm::Phrase(text) => (text, false),
-                SearchTerm::NegatedText(text) | SearchTerm::NegatedPhrase(text) => (text, true),
+            let (text, negated, prefix) = match term {
+                SearchTerm::Text(text) => (text, false, true),
+                SearchTerm::Phrase(text) => (text, false, false),
+                SearchTerm::NegatedText(text) => (text, true, true),
+                SearchTerm::NegatedPhrase(text) => (text, true, false),
             };
             if !negated {
-                ordinary_filename_provenance.push(text.clone());
-                ordinary_derived_text_provenance.push(text.clone());
+                ordinary_filename_provenance.push((text.clone(), prefix));
+                ordinary_derived_text_provenance.push((text.clone(), prefix));
             }
             let condition = if contains_short_cjk(text) {
                 values.push(rusqlite::types::Value::Text(like_contains(text)));
@@ -3603,14 +3782,24 @@ impl LibraryRepository {
                 values.push(rusqlite::types::Value::Text(fts_literal(text)));
                 "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE search_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_trigram rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_trigram MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_trigram dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version=? AND derived_text_trigram MATCH ?))".to_owned()
             } else {
-                let fts = fts_literal(text);
+                let fts = fts_term_query(text, prefix);
                 values.push(rusqlite::types::Value::Text(fts.clone()));
+                // The prototype uses a trigram note-title FTS, unlike its
+                // content/recognition FTS. Keep unicode word/diacritic matches
+                // and add an indexed title-only fragment channel, not a body
+                // substring scan. Trigrams cannot address fewer than 3 chars.
+                let title_fragment = if text.chars().count() >= 3 {
+                    values.push(rusqlite::types::Value::Text(fts.clone()));
+                    " OR n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_trigram st ON st.rowid=sim.fts_rowid WHERE st.title MATCH ?)"
+                } else {
+                    ""
+                };
                 values.push(rusqlite::types::Value::Text(fts));
                 values.push(rusqlite::types::Value::Text(
                     DERIVED_TEXT_EXTRACTOR_VERSION.into(),
                 ));
-                values.push(rusqlite::types::Value::Text(fts_literal(text)));
-                "(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_unicode rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_unicode dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version=? AND derived_text_unicode MATCH ?))".to_owned()
+                values.push(rusqlite::types::Value::Text(fts_term_query(text, prefix)));
+                format!("(n.id IN (SELECT sim.note_id FROM search_index_rows sim JOIN search_unicode su ON su.rowid=sim.fts_rowid WHERE search_unicode MATCH ?){title_fragment} OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN resource_search_rows rsr ON rsr.resource_id=r.id JOIN resource_filename_unicode rf ON rf.rowid=rsr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND resource_filename_unicode MATCH ?) OR n.id IN (SELECT nr.note_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id JOIN derived_text_rows dr ON dr.resource_id=r.id JOIN derived_text_jobs dj ON dj.resource_id=r.id JOIN derived_text_unicode dt ON dt.rowid=dr.fts_rowid WHERE nr.is_associated=1 AND r.deleted_time=0 AND r.sha256=dr.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version=? AND derived_text_unicode MATCH ?))")
             };
             predicates.push(if negated {
                 format!("NOT ({condition})")
@@ -3631,8 +3820,8 @@ impl LibraryRepository {
             "(SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime LIKE ? ESCAPE '\\' ORDER BY nr.position,nr.resource_id LIMIT 1)".into()
         } else if !ordinary_filename_provenance.is_empty() {
             let mut matches = Vec::new();
-            for term in &ordinary_filename_provenance {
-                let (subquery, value) = filename_provenance_subquery(term);
+            for (term, prefix) in &ordinary_filename_provenance {
+                let (subquery, value) = filename_provenance_subquery(term, *prefix);
                 matches.push(subquery);
                 provenance_values.push(value);
             }
@@ -3646,8 +3835,8 @@ impl LibraryRepository {
                 format!("COALESCE({})", matches.join(","))
             };
             let mut derived_matches = Vec::new();
-            for term in &ordinary_derived_text_provenance {
-                let (subquery, mut values) = derived_text_provenance_subquery(term);
+            for (term, prefix) in &ordinary_derived_text_provenance {
+                let (subquery, mut values) = derived_text_provenance_subquery(term, *prefix);
                 derived_matches.push(subquery);
                 provenance_values.append(&mut values);
             }
@@ -3670,8 +3859,22 @@ impl LibraryRepository {
             i64::try_from(query.offset()).map_err(|_| SearchQueryError::SqlIntegerOverflow)?;
         values.push(rusqlite::types::Value::Integer(limit));
         values.push(rusqlite::types::Value::Integer(offset));
+        // Excerpts are selected only for the exact live provenance resource
+        // in this page. Slice inside SQLite, before transferring a row to
+        // Rust; a search packet must never carry full extracted documents.
+        let mut excerpts = Vec::new();
+        for (term, prefix) in &ordinary_derived_text_provenance {
+            let (subquery, mut parameters) = derived_text_excerpt_subquery(term, *prefix);
+            excerpts.push(subquery);
+            values.append(&mut parameters);
+        }
+        let excerpt = match excerpts.len() {
+            0 => "NULL".to_owned(),
+            1 => excerpts.pop().expect("one excerpt predicate"),
+            _ => format!("COALESCE({})", excerpts.join(",")),
+        };
         let sql = format!(
-            "WITH matched AS (SELECT n.id, substr(n.title,1,120) AS title_prefix, substr(n.snippet,1,160) AS snippet, n.updated_time, n.deleted_time, n.notebook_id, COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id=snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')), (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime IN ('image/png','image/jpeg') ORDER BY nr.position,nr.resource_id LIMIT 1)) AS selected_thumbnail_id, (SELECT count(*) FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0) AS attachment_count, {matched_resource} AS matched_resource FROM notes n WHERE {} ORDER BY n.updated_time DESC, n.id ASC LIMIT ? OFFSET ?) SELECT m.id,m.title_prefix,m.snippet,m.updated_time,m.deleted_time,m.notebook_id,m.selected_thumbnail_id,m.attachment_count,m.matched_resource,r.title FROM matched m LEFT JOIN resources r ON r.id=m.matched_resource ORDER BY m.updated_time DESC,m.id ASC",
+            "WITH matched AS (SELECT n.id, substr(n.title,1,120) AS title_prefix, substr(n.snippet,1,160) AS snippet, n.updated_time, n.deleted_time, n.notebook_id, COALESCE((SELECT n.selected_thumbnail_id WHERE EXISTS (SELECT 1 FROM note_resources snr JOIN resources sr ON sr.id=snr.resource_id WHERE snr.note_id=n.id AND snr.resource_id=n.selected_thumbnail_id AND snr.is_associated=1 AND sr.deleted_time=0 AND sr.mime LIKE 'image/%')), (SELECT nr.resource_id FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0 AND r.mime IN ('image/png','image/jpeg') ORDER BY nr.position,nr.resource_id LIMIT 1)) AS selected_thumbnail_id, (SELECT count(*) FROM note_resources nr JOIN resources r ON r.id=nr.resource_id WHERE nr.note_id=n.id AND nr.is_associated=1 AND r.deleted_time=0) AS attachment_count, {matched_resource} AS matched_resource FROM notes n WHERE {} ORDER BY n.updated_time DESC, n.id ASC LIMIT ? OFFSET ?) SELECT m.id,m.title_prefix,m.snippet,m.updated_time,m.deleted_time,m.notebook_id,CASE WHEN r.mime LIKE 'image/%' THEN m.matched_resource ELSE m.selected_thumbnail_id END,m.attachment_count,m.matched_resource,r.title,{excerpt} FROM matched m LEFT JOIN resources r ON r.id=m.matched_resource ORDER BY m.updated_time DESC,m.id ASC",
             predicates.join(" AND "),
         );
         #[cfg(any(test, feature = "test-support"))]
@@ -3712,7 +3915,9 @@ impl LibraryRepository {
                         .map_err(invalid_column)?;
                     let snippet = match (&matched_resource, row.get::<_, Option<String>>(9)?) {
                         (Some(_), Some(filename)) => {
-                            attachment_provenance_snippet(&row.get::<_, String>(2)?, &filename)
+                            let context = row.get::<_, Option<String>>(10)?
+                                .unwrap_or(row.get::<_, String>(2)?);
+                            attachment_provenance_snippet(&context, &filename)
                         }
                         _ => row.get(2)?,
                     };
@@ -3998,8 +4203,11 @@ fn attachment_provenance_snippet(note_snippet: &str, filename: &str) -> String {
     if context.trim().is_empty() || context == safe_filename {
         return source;
     }
+    // Display context is not document layout: preserve its text, not blank
+    // image/paragraph lines that would turn one result into a tall document.
+    let context = context.split_whitespace().collect::<Vec<_>>().join(" ");
     let body_limit = SEARCH_SNIPPET_LIMIT.saturating_sub(source.chars().count() + 1);
-    let body = truncate_search_snippet(context, body_limit);
+    let body = truncate_search_snippet(&context, body_limit);
     format!("{body}\n{source}")
 }
 
@@ -4053,6 +4261,60 @@ fn organization_title(value: &str) -> Result<String, LibraryError> {
 /// Organization table names at these private call sites are static literals;
 /// keeping the column/table shape here avoids public stringly-typed mutation
 /// APIs while retaining a single revision/timestamp rule for all entities.
+/// Moves an active notebook to `stack_id` inside the caller's transaction
+/// and queues it for sync; reports whether anything changed.
+fn assign_notebook_stack(
+    transaction: &Transaction<'_>,
+    id_source: &dyn RepositoryIdSource,
+    id: &NotebookId,
+    stack_id: Option<&StackId>,
+    now: i64,
+) -> Result<(Notebook, bool), LibraryError> {
+    let (title, current, is_default, revision): (String, Option<String>, i64, i64) = transaction
+        .query_row(
+            "SELECT title, stack_id, is_default, revision FROM notebooks
+             WHERE id = ?1 AND deleted_time = 0",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or(LibraryError::NotFound)?;
+    let notebook = |revision| Notebook {
+        id: id.clone(),
+        title: title.clone(),
+        stack_id: stack_id.cloned(),
+        revision,
+        is_default: is_default != 0,
+    };
+    if current.as_deref() == stack_id.map(StackId::as_str) {
+        return Ok((notebook(revision), false));
+    }
+    let revision = next_organization_revision(transaction, "notebooks", id.as_str())?;
+    let updated_time = next_organization_time(transaction, "notebooks", id.as_str(), now)?;
+    transaction.execute(
+        "UPDATE notebooks SET stack_id = ?2, revision = ?3, updated_time = ?4 WHERE id = ?1",
+        params![
+            id.as_str(),
+            stack_id.map(StackId::as_str),
+            revision,
+            updated_time
+        ],
+    )?;
+    enqueue_sync(
+        transaction,
+        id_source,
+        &EntityRef::Notebook(id.clone()),
+        revision,
+        if stack_id.is_some() {
+            "stack_add"
+        } else {
+            "stack_remove"
+        },
+        updated_time,
+    )?;
+    Ok((notebook(revision), true))
+}
+
 fn next_organization_revision(
     transaction: &Transaction<'_>,
     table: &str,
@@ -4379,7 +4641,11 @@ fn queue_derived_text_for_note(
          SELECT DISTINCT r.id,r.sha256,?2,'pending',NULL,0,?3
          FROM note_resources nr JOIN resources r ON r.id=nr.resource_id
          WHERE nr.note_id=?1 AND nr.is_associated=1 AND r.deleted_time=0
-           AND (r.mime='application/pdf' OR r.mime LIKE 'image/%')
+           AND (r.mime='application/pdf' OR r.mime LIKE 'image/%'
+                OR lower(trim(r.mime))='text/plain'
+                OR (lower(trim(r.mime)) IN ('application/octet-stream','unknown','')
+                    AND (lower(r.file_extension)='txt'
+                         OR (length(r.title)>4 AND lower(r.title) LIKE '%.txt'))))
          ON CONFLICT(resource_id) DO UPDATE SET sha256=excluded.sha256,extractor_version=excluded.extractor_version,state='pending',failure=NULL,attempts=0,updated_time=excluded.updated_time
          WHERE derived_text_jobs.sha256<>excluded.sha256 OR derived_text_jobs.extractor_version<>excluded.extractor_version",
         params![note_id.as_str(), DERIVED_TEXT_EXTRACTOR_VERSION, now],
@@ -4407,6 +4673,18 @@ fn fts_literal(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// Match the prototype's unquoted-word prefix sanitizer while retaining our
+/// quoted CJK channel and exact phrase boundaries. The star is syntax we own;
+/// all user text remains escaped inside the FTS literal.
+fn fts_term_query(value: &str, prefix: bool) -> String {
+    let literal = fts_literal(value);
+    if prefix && !contains_cjk(value) {
+        format!("{literal}*")
+    } else {
+        literal
+    }
+}
+
 fn like_contains(value: &str) -> String {
     format!(
         "%{}%",
@@ -4421,7 +4699,7 @@ fn like_contains(value: &str) -> String {
 /// branch.  In particular, Latin terms remain token-boundary FTS matches,
 /// rather than silently becoming substring `LIKE` matches while selecting an
 /// attachment for the UI.
-fn filename_provenance_subquery(term: &str) -> (String, rusqlite::types::Value) {
+fn filename_provenance_subquery(term: &str, prefix: bool) -> (String, rusqlite::types::Value) {
     let (table, predicate, value) = if contains_short_cjk(term) {
         (
             "resource_filename_trigram",
@@ -4432,13 +4710,13 @@ fn filename_provenance_subquery(term: &str) -> (String, rusqlite::types::Value) 
         (
             "resource_filename_trigram",
             "resource_filename_trigram MATCH ?",
-            rusqlite::types::Value::Text(fts_literal(term)),
+            rusqlite::types::Value::Text(fts_term_query(term, prefix)),
         )
     } else {
         (
             "resource_filename_unicode",
             "resource_filename_unicode MATCH ?",
-            rusqlite::types::Value::Text(fts_literal(term)),
+            rusqlite::types::Value::Text(fts_term_query(term, prefix)),
         )
     };
     (
@@ -4449,7 +4727,7 @@ fn filename_provenance_subquery(term: &str) -> (String, rusqlite::types::Value) 
     )
 }
 
-fn derived_text_provenance_subquery(term: &str) -> (String, Vec<rusqlite::types::Value>) {
+fn derived_text_provenance_subquery(term: &str, prefix: bool) -> (String, Vec<rusqlite::types::Value>) {
     let (table, predicate, value) = if contains_short_cjk(term) {
         (
             "derived_text_trigram",
@@ -4460,13 +4738,13 @@ fn derived_text_provenance_subquery(term: &str) -> (String, Vec<rusqlite::types:
         (
             "derived_text_trigram",
             "derived_text_trigram MATCH ?",
-            rusqlite::types::Value::Text(fts_literal(term)),
+            rusqlite::types::Value::Text(fts_term_query(term, prefix)),
         )
     } else {
         (
             "derived_text_unicode",
             "derived_text_unicode MATCH ?",
-            rusqlite::types::Value::Text(fts_literal(term)),
+            rusqlite::types::Value::Text(fts_term_query(term, prefix)),
         )
     };
     (
@@ -4477,6 +4755,43 @@ fn derived_text_provenance_subquery(term: &str) -> (String, Vec<rusqlite::types:
             rusqlite::types::Value::Text(DERIVED_TEXT_EXTRACTOR_VERSION.into()),
             value,
         ],
+    )
+}
+
+fn derived_text_excerpt_subquery(term: &str, prefix: bool) -> (String, Vec<rusqlite::types::Value>) {
+    let (table, excerpt, predicate, mut values) = if contains_short_cjk(term) {
+        // FTS5 trigram MATCH cannot index a one/two-character term. Use the
+        // same literal LIKE fallback as search, and position the short text
+        // window around that match rather than the beginning of the file.
+        (
+            "derived_text_trigram",
+            "substr(dt.text,max(1,instr(lower(dt.text),lower(?))-24),160)".to_owned(),
+            "dt.text LIKE ? ESCAPE '\\'",
+            vec![rusqlite::types::Value::Text(term.into())],
+        )
+    } else {
+        let table = if contains_cjk(term) { "derived_text_trigram" } else { "derived_text_unicode" };
+        // A token-count snippet may spend all 160 characters on long words
+        // before the hit. Locate the FTS-marked hit before the character slice
+        // so the source line's later display budget cannot hide the match.
+        // These temporary control markers never leave this SQL projection.
+        let marked = format!("snippet({table},1,char(1),char(2),'…',16)");
+        (
+            table,
+            format!("replace(replace(substr({marked},max(1,instr({marked},char(1))-24),160),char(1),''),char(2),'')"),
+            if contains_cjk(term) { "derived_text_trigram MATCH ?" } else { "derived_text_unicode MATCH ?" },
+            Vec::new(),
+        )
+    };
+    values.push(rusqlite::types::Value::Text(DERIVED_TEXT_EXTRACTOR_VERSION.into()));
+    values.push(rusqlite::types::Value::Text(if contains_short_cjk(term) {
+        like_contains(term)
+    } else {
+        fts_term_query(term, prefix)
+    }));
+    (
+        format!("(SELECT {excerpt} FROM derived_text_rows dr JOIN derived_text_jobs dj ON dj.resource_id=dr.resource_id JOIN {table} dt ON dt.rowid=dr.fts_rowid WHERE dr.resource_id=m.matched_resource AND dr.sha256=r.sha256 AND dj.state='indexed' AND dj.sha256=r.sha256 AND dj.extractor_version=dr.extractor_version AND dj.extractor_version=? AND {predicate} LIMIT 1)"),
+        values,
     )
 }
 
@@ -4617,15 +4932,19 @@ mod tests {
                 .expect("publish exact synthetic text")
         );
 
-        for term in ["甲", "甲乙", "甲乙丙", "\"alpha beta\""] {
+        for (term, expected_match) in [
+            ("甲", "甲"), ("甲乙", "甲乙"), ("甲乙丙", "甲乙丙"),
+            ("\"alpha beta\"", "alpha beta"),
+        ] {
             let hits = repository
                 .search(SearchQuery::parse(term))
                 .expect("search derived text");
             assert_eq!(hits.len(), 1, "{term}");
             assert_eq!(hits[0].note.id, note.id);
             assert_eq!(hits[0].matched_resource, Some(resource.clone()));
-            assert_eq!(hits[0].snippet, "匹配附件：evidence.pdf");
-            assert_eq!(hits[0].note.snippet, "匹配附件：evidence.pdf");
+            assert!(hits[0].snippet.contains(expected_match), "{term}: {:?}", hits[0].snippet);
+            assert!(hits[0].snippet.ends_with("匹配附件：evidence.pdf"));
+            assert_eq!(hits[0].note.snippet, hits[0].snippet);
         }
 
         // `replace_note_resources` deletes then reinserts rows. An ordinary
@@ -5042,6 +5361,13 @@ mod tests {
             .purge_note(&note.id)
             .expect("purge commits its durable queue before physical cleanup");
         assert!(repository.resource_metadata(&original).unwrap().is_none());
+        // The physical failure/race fixture is due, not a fresh orphan in
+        // the grace period. Keep the actual unlink failure and later GC race.
+        repository.connection.lock().unwrap().execute(
+            "UPDATE resource_gc_queue SET created_time=0 WHERE sha256=?1",
+            [hash.as_str()],
+        ).unwrap();
+        assert!(repository.drain_resource_gc().is_err());
         // `put_reader` always creates a descriptor-relative temporary first,
         // even when an equal final blob is already present. Restore writes
         // only after the purge's automatic drain has failed, then keep the
@@ -5078,6 +5404,7 @@ mod tests {
             sidebar_visible: true,
             list_visible: false,
             selected_note_id: Some(NoteId::parse("11111111111111111111111111111111").unwrap()),
+            location: LibraryShellLocation::Browse(crate::LibraryRoute::Trash),
         };
         let new = LibraryShellState {
             sidebar_width: 300,
@@ -5085,6 +5412,7 @@ mod tests {
             sidebar_visible: false,
             list_visible: true,
             selected_note_id: Some(NoteId::parse("22222222222222222222222222222222").unwrap()),
+            location: LibraryShellLocation::Search("next-generation".into()),
         };
         reader
             .write_library_shell_state(&old)
