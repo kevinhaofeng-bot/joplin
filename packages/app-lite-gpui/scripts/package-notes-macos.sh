@@ -67,9 +67,10 @@ BUILD_NUMBER="$(git -C "$REPO_ROOT" rev-list --count HEAD)"
 APP_DIR="$OUT_DIR/$APP_NAME.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BINARY" "$APP_DIR/Contents/MacOS/$EXECUTABLE"
-# The simplified non-green Dock mouse (evidence57); the older large artwork
-# stays in the repository unchanged and is not packaged.
-ICON_SOURCE="$PROJECT_ROOT/assets/AppIcon-dock-v2.png"
+# Product icon selected by the user: the green notebook with the small white
+# mouse, cut out onto real alpha transparency so Finder and Dock do not render
+# the original generator's large opaque white canvas.
+ICON_SOURCE="$PROJECT_ROOT/assets/AppIcon-green-mouse-transparent.png"
 ICON_FILE="$APP_DIR/Contents/Resources/AppIcon.icns"
 "$PROJECT_ROOT/scripts/make-app-icon.sh" "$ICON_SOURCE" "$ICON_FILE"
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
