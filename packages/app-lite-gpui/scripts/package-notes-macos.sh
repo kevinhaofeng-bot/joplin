@@ -41,7 +41,7 @@ fi
 
 COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 SHORT="$(git -C "$REPO_ROOT" rev-parse --short=9 HEAD)"
-SOURCE_STATUS="$(git -C "$REPO_ROOT" status --porcelain -- "$PROJECT_ROOT" "$REPO_ROOT/packages/app-lite-core")"
+SOURCE_STATUS="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no -- "$PROJECT_ROOT" "$REPO_ROOT/packages/app-lite-core")"
 DIRTY=no
 if [[ -n "$SOURCE_STATUS" ]]; then DIRTY=yes; fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
